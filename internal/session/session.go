@@ -4,6 +4,7 @@
 package session
 
 import (
+	"log"
 	"sync"
 
 	"rainier/internal/eventlog"
@@ -53,6 +54,10 @@ func New(cfg Config, start func(argv []string, cols, rows int, onOutput func([]b
 		s.mu.Lock()
 		s.exitC = code
 		for _, v := range s.viewers { s.trySend(v, wire.ServerMsg{Type: "exit", ExitCode: code}) }
+		// Attachment.Msgs is documented "closed on detach/exit": finish the
+		// lifecycle for every viewer still attached at exit time.
+		for _, v := range s.viewers { close(v.ch) }
+		s.viewers = map[int]*viewer{}
 		s.mu.Unlock()
 		close(s.exited)
 	}()
@@ -63,7 +68,14 @@ func (s *Session) onOutput(b []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.emu.Feed(b)
-	seq, _ := s.log.Append("output", b)
+	seq, err := s.log.Append("output", b)
+	if err != nil {
+		// Seq 0 marks an unlogged frame: clients ignore Seq 0 as a resume
+		// cursor, so a viewer that later resumes across this point simply
+		// misses it. A persistent log failure therefore degrades resume
+		// correctness only for the frames it drops; accepted for v0.
+		log.Printf("event log append failed: %v", err)
+	}
 	msg := wire.ServerMsg{Type: "output", Seq: seq, Data: append([]byte(nil), b...)}
 	for _, v := range s.viewers { s.trySend(v, msg) }
 }
@@ -86,15 +98,28 @@ type Attachment struct {
 func (s *Session) Attach(since uint64, size Size) (*Attachment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	v := &viewer{id: s.nextID, ch: make(chan wire.ServerMsg, 256), size: size}
+
+	replay := since > 0 && since <= s.log.LastSeq()
+	var entries []eventlog.Entry
+	if replay {
+		var err error
+		entries, err = s.log.Since(since)
+		if err != nil { replay = false }
+	}
+
+	// The replay path stages len(entries) sends into the viewer's channel
+	// before any caller is reading it (Attach still holds s.mu the whole
+	// time). Size the channel so the entire backlog fits without blocking;
+	// a fresh snapshot-only attach only ever needs the steady-state 256.
+	chCap := 256
+	if replay { chCap = len(entries) + 256 }
+	v := &viewer{id: s.nextID, ch: make(chan wire.ServerMsg, chCap), size: size}
 	s.nextID++
 	s.viewers[v.id] = v
-	if since > 0 && since <= s.log.LastSeq() {
-		entries, err := s.log.Since(since)
-		if err == nil {
-			for _, e := range entries {
-				v.ch <- wire.ServerMsg{Type: "output", Seq: e.Seq, Data: e.Data}
-			}
+
+	if replay {
+		for _, e := range entries {
+			v.ch <- wire.ServerMsg{Type: "output", Seq: e.Seq, Data: append([]byte(nil), e.Data...)}
 		}
 	} else {
 		scr := s.emu.Screen()
@@ -103,6 +128,19 @@ func (s *Session) Attach(since uint64, size Size) (*Attachment, error) {
 			Data: term.Serialize(scr), Cols: scr.Cols, Rows: scr.Rows,
 		}
 	}
+
+	// Late attach after the child has already exited: the exit goroutine's
+	// fan-out only reaches viewers that existed at exit time, so tell this
+	// one directly and close out its lifecycle immediately, matching the
+	// "closed on detach/exit" contract for every attach path.
+	select {
+	case <-s.exited:
+		v.ch <- wire.ServerMsg{Type: "exit", ExitCode: s.exitC}
+		delete(s.viewers, v.id)
+		close(v.ch)
+	default:
+	}
+
 	s.applySizeLocked()
 	return &Attachment{ID: v.id, Msgs: v.ch}, nil
 }

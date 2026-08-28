@@ -45,6 +45,18 @@ func recv(t *testing.T, ch <-chan wire.ServerMsg) wire.ServerMsg {
 	}
 }
 
+// drainN reads exactly n messages off ch, each guarded by recv's timeout, so
+// a stuck sender (e.g. a deadlocked Attach) fails the test instead of
+// hanging the suite.
+func drainN(t *testing.T, ch <-chan wire.ServerMsg, n int) []wire.ServerMsg {
+	t.Helper()
+	out := make([]wire.ServerMsg, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, recv(t, ch))
+	}
+	return out
+}
+
 func TestFreshAttachGetsSnapshotThenLive(t *testing.T) {
 	s, fp := newFakeSession(t)
 	fp.onOutput([]byte("hello"))
@@ -93,4 +105,64 @@ func TestSmallestViewerResizesProc(t *testing.T) {
 	got := <-fp.resizes
 	if got != (Size{80, 40}) { t.Fatalf("resize = %+v, want {80 40}", got) }
 	_ = b
+}
+
+// Fix round 1 #1: a replay backlog longer than the channel's steady-state
+// 256 buffer must not deadlock Attach (which stages the whole replay while
+// holding s.mu, before any caller can drain the channel).
+func TestReplayLargerThanBufferDoesNotDeadlock(t *testing.T) {
+	s, fp := newFakeSession(t)
+	const n = 400
+	for i := 0; i < n; i++ {
+		fp.onOutput([]byte{byte('a' + i%26)})
+	}
+	a, err := s.Attach(1, Size{20, 5})
+	if err != nil { t.Fatal(err) }
+	msgs := drainN(t, a.Msgs, n-1) // since=1: entries with seq 2..n replay (n-1 frames)
+	for i, m := range msgs {
+		wantSeq := uint64(i + 2)
+		wantByte := byte('a' + int(wantSeq-1)%26)
+		if m.Type != "output" || m.Seq != wantSeq || len(m.Data) != 1 || m.Data[0] != wantByte {
+			t.Fatalf("frame %d: = %+v, want seq=%d byte=%q", i, m, wantSeq, wantByte)
+		}
+	}
+}
+
+// Fix round 1 #2a: exit must close a viewer's channel after the exit
+// message, not just send it.
+func TestExitSendsExitThenClosesViewerChannel(t *testing.T) {
+	s, fp := newFakeSession(t)
+	a, err := s.Attach(0, Size{20, 5})
+	if err != nil { t.Fatal(err) }
+	recv(t, a.Msgs) // snapshot
+	fp.Stop()
+	m := recv(t, a.Msgs)
+	if m.Type != "exit" || m.ExitCode != 0 { t.Fatalf("exit msg = %+v", m) }
+	select {
+	case _, ok := <-a.Msgs:
+		if ok { t.Fatalf("channel not closed after exit") }
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for channel close")
+	}
+}
+
+// Fix round 1 #2b: a viewer that attaches after the child has already
+// exited must still get a snapshot, then the exit message, then closure —
+// not silence.
+func TestAttachAfterExitGetsSnapshotThenExit(t *testing.T) {
+	s, fp := newFakeSession(t)
+	fp.Stop()
+	<-s.Exited() // deterministic: exit goroutine has fully run
+	a, err := s.Attach(0, Size{20, 5})
+	if err != nil { t.Fatal(err) }
+	m1 := recv(t, a.Msgs)
+	if m1.Type != "snapshot" { t.Fatalf("first = %+v", m1) }
+	m2 := recv(t, a.Msgs)
+	if m2.Type != "exit" || m2.ExitCode != 0 { t.Fatalf("exit = %+v", m2) }
+	select {
+	case _, ok := <-a.Msgs:
+		if ok { t.Fatalf("channel not closed after exit") }
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for channel close")
+	}
 }
