@@ -1,0 +1,10 @@
+[?1049h[?1h=##
+# Host Database
+#
+# localhost is used to configure the loopback interface
+# when the system is booting.  Do not change this entry.
+##
+127.0.0.1       localhost
+255.255.255.255 broadcasthost
+::1             localhost
+[7m/etc/hosts (END)[27m[K[K[?1l>[?1049l

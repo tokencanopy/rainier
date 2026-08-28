@@ -1,6 +1,10 @@
 package term
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // fixtures: name → input bytes fed to a fresh 20x5 emulator
 var fixtures = map[string][]byte{
@@ -66,4 +70,24 @@ func TestResize(t *testing.T) {
 	e.Resize(40, 10)
 	s := e.Screen()
 	if s.Cols != 40 || s.Rows != 10 { t.Fatalf("size = %dx%d", s.Cols, s.Rows) }
+}
+
+// TestSnapshotRoundTripFiles runs the same round-trip property as
+// TestSnapshotRoundTrip over recorded fixtures of real TUI output captured
+// by cmd/vtcap, at the 120x32 size vtcap records with.
+func TestSnapshotRoundTripFiles(t *testing.T) {
+	files, _ := filepath.Glob("../../testdata/vt/*.input")
+	if len(files) == 0 { t.Skip("no recorded fixtures yet") }
+	for _, f := range files {
+		t.Run(filepath.Base(f), func(t *testing.T) {
+			input, err := os.ReadFile(f)
+			if err != nil { t.Fatal(err) }
+			a := NewEmulator(120, 32)
+			a.Feed(input)
+			sa := a.Screen()
+			b := NewEmulator(120, 32)
+			b.Feed(Serialize(sa))
+			screensEqual(t, sa, b.Screen())
+		})
+	}
 }
