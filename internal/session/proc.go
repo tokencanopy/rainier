@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	"sync"
@@ -27,6 +28,10 @@ type Proc interface {
 	Stop()
 }
 
+// StartProc spawns argv on a new PTY. onOutput is called from a single
+// goroutine with each chunk read from the PTY until child exit. The byte slice
+// passed to onOutput is only valid for the duration of the call; consumers that
+// retain the bytes must copy them.
 func StartProc(argv []string, cols, rows int, onOutput func([]byte)) (Proc, error) {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
@@ -39,8 +44,11 @@ func StartProc(argv []string, cols, rows int, onOutput func([]byte)) (Proc, erro
 			n, err := ptmx.Read(buf)
 			if n > 0 { onOutput(buf[:n]) }
 			if err != nil {
-				// Linux returns EIO from the PTY master when the child exits.
-				if errors.Is(err, io.EOF) || isEIO(err) { break }
+				// EOF (macOS) and EIO (Linux) are the PTY's normal end-of-stream
+				// signals when the child exits; anything else is diagnostic-worthy.
+				if !errors.Is(err, io.EOF) && !isEIO(err) {
+					log.Printf("pty read error: %v", err)
+				}
 				break
 			}
 		}
