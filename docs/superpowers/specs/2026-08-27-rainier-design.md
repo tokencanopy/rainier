@@ -74,7 +74,11 @@ client-visible changes.
   runs the headless VT emulator, appends the event log, hosts the adapter,
   multiplexes everything over one outbound WebSocket.
 - **egressd**: per-VM CONNECT proxy. Default-deny, per-session allowlist,
-  destination audit log. Per-container iptables redirect.
+  destination audit log. v0 mechanism (amended 2026-08-27): session containers
+  live on an internal Docker network (no default route); egressd bridges it to
+  the outside and sessions carry standard proxy env vars — the pattern proven
+  in agent-os, portable to the K8s driver. Kernel-level enforcement (iptables /
+  NetworkPolicy) hardens this in a later driver iteration.
 - **CLI** (Go): `login`, `new`, `ls`, `attach`, `config-ssh`, device-flow auth.
 - **Web dashboard** (TS/React): fleet view, read-only terminal, permission
   approvals, transcript view for ACP sessions.
