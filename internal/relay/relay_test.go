@@ -175,18 +175,26 @@ func TestSessionConnDeathClosesClient(t *testing.T) {
 	sessConn.Close()
 
 	// The death must cascade all the way to the client: assert its next Read
-	// errors out within a bounded deadline, rather than hanging forever.
+	// errors out promptly. The inner Read deliberately carries no deadline of
+	// its own (context.Background()) — the *only* bound on this wait is the
+	// outer select's time.After. That matters: if the Read instead used its
+	// own e.g. 3s inner context.WithTimeout, a reverted/broken cascade would
+	// leave the client conn open forever, its Read would still return a
+	// non-nil error (context.DeadlineExceeded) once that inner deadline
+	// fired, and a check for "any error" would wrongly call that a pass —
+	// the test would never catch a regression of the cascade it exists to
+	// guard. With no inner deadline, a broken cascade instead blocks the
+	// background Read forever, so only the outer time.After fires, and it
+	// fails the test via t.Fatal below rather than a false pass.
 	done := make(chan error, 1)
 	go func() {
-		rctx, rcancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer rcancel()
-		_, err := client.Read(rctx)
+		_, err := client.Read(context.Background())
 		done <- err
 	}()
 	select {
 	case err := <-done:
 		if err == nil { t.Fatal("expected client conn Read to error after session conn death, got nil") }
 	case <-time.After(3 * time.Second):
-		t.Fatal("client conn was never closed after session conn death")
+		t.Fatal("client conn was never closed after session conn death — cascade failed")
 	}
 }
