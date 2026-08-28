@@ -4,6 +4,7 @@ package runnerd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 
 	"rainier/internal/driver"
 	"rainier/internal/relay"
+	"rainier/internal/rwire"
 	"rainier/internal/wire"
 )
 
@@ -26,12 +28,37 @@ type Server struct {
 	dialBase    string // e.g. ws://runnerd:8080 — what sessiond dials to register
 	seq         atomic.Int64
 	egressAdmin string // http://egressd:3129 (optional)
+	// proxyURL, when non-empty, is injected into every driver.Spec this
+	// server creates (egress R4). Zero value "" in HTTP-only mode (New
+	// never sets it) — that's today's exact behavior, since Spec.ProxyURL
+	// was simply never populated before Task 6. RunAgent sets it from
+	// AgentConfig.ProxyURL before dialing.
+	proxyURL string
 	// OnEvent, when set, is called with "running" after a successful
 	// register() setHub and "dead" when the crash path destroys a
 	// container. Nil-safe: HTTP-only mode (no control conn) leaves it nil.
 	// Task 6 wires it to the control conn.
 	OnEvent func(sessionID, state string)
 }
+
+// Sentinel errors returned by the extracted core ops (CreateWithID/Op/Delete)
+// so the HTTP handlers can map them to the right status code and the agent's
+// execute can special-case them (e.g. destroy on an already-gone session is
+// still "ok" — desired state reached) without string-matching error text.
+var (
+	errNoSuchSession   = errors.New("no such session")
+	errSessionStarting = errors.New("session still starting")
+	errUnknownOp       = errors.New("unknown op")
+)
+
+// egressError wraps a pushEgress failure so CreateWithID's caller can tell it
+// apart from a driver.Create failure (502 vs 500) without string-matching,
+// while Error() still renders the exact "egress setup: <cause>" text the HTTP
+// handler used to construct inline.
+type egressError struct{ err error }
+
+func (e *egressError) Error() string { return "egress setup: " + e.err.Error() }
+func (e *egressError) Unwrap() error { return e.err }
 
 func New(drv driver.Driver, dialBase, egressAdmin string) *Server {
 	return &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin}
@@ -95,29 +122,16 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 		}
 		json.NewDecoder(r.Body).Decode(&body)
 		id := s.newID()
-		spec := driver.Spec{
-			Name: body.Name, Image: body.Image, Cmd: body.Cmd,
-			SessionID: id, DialURL: s.dialBase + "/register",
-			EgressAllow: body.EgressAllow,
-		}
-		if err := s.pushEgress(id, body.EgressAllow); err != nil {
-			http.Error(w, "egress setup: "+err.Error(), http.StatusBadGateway)
+		spec := driver.Spec{Name: body.Name, Image: body.Image, Cmd: body.Cmd, EgressAllow: body.EgressAllow}
+		if err := s.CreateWithID(r.Context(), id, spec, body.EgressAllow); err != nil {
+			var ee *egressError
+			if errors.As(err, &ee) {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+			} else {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
 			return
 		}
-		// Register the entry before the driver call, not after: a real
-		// container's sessiond can dial /register the instant drv.Create's
-		// `docker run -d` returns, often faster than this goroutine reaching
-		// a put() that came after it — see registry.setHandle's doc comment
-		// for what that race used to do.
-		s.reg.put(id, &sessionEntry{id: id, state: "starting", allow: body.EgressAllow})
-		h, err := s.drv.Create(r.Context(), spec)
-		if err != nil {
-			s.reg.remove(id)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		s.reg.setHandle(id, h.ID)
-		s.reg.setState(id, "running")
 		json.NewEncoder(w).Encode(map[string]string{"session_id": id})
 	case http.MethodGet:
 		type row struct{ ID, State string }
@@ -131,50 +145,49 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// CreateWithID runs a session's full creation sequence under a caller-chosen
+// id: push its egress rules, register a "starting" registry entry BEFORE the
+// driver call (a real container's sessiond can dial /register the instant
+// drv.Create's `docker run -d` returns, often faster than a put() that came
+// after it — see registry.setHandle's doc comment for what that race used to
+// do), create it, then land the handle and "running" state. Both fronts
+// (POST /sessions' HTTP handler and the agent's execute) drive this same
+// sequence — id minting (POST /sessions mints one via newID; the agent uses
+// controld's session id verbatim) and status-code/JSON mapping are each
+// caller's own job, not this one's.
+//
+// spec's SessionID/DialURL/ProxyURL are set here, not by the caller: they're
+// this server's own concerns (the id parameter, s.dialBase, s.proxyURL), not
+// anything a caller — HTTP body or rwire.Spec — should be trusted to supply.
+func (s *Server) CreateWithID(ctx context.Context, id string, spec driver.Spec, allow []string) error {
+	if err := s.pushEgress(id, allow); err != nil {
+		return &egressError{err: err}
+	}
+	s.reg.put(id, &sessionEntry{id: id, state: "starting", allow: allow})
+	spec.SessionID = id
+	spec.DialURL = s.dialBase + "/register"
+	spec.ProxyURL = s.proxyURL
+	h, err := s.drv.Create(ctx, spec)
+	if err != nil {
+		s.reg.remove(id)
+		return err
+	}
+	s.reg.setHandle(id, h.ID)
+	s.reg.setState(id, "running")
+	return nil
+}
+
 func (s *Server) sessionOp(w http.ResponseWriter, r *http.Request) {
 	// /sessions/{id} (DELETE) or /sessions/{id}/{op} (POST)
 	rest := strings.TrimPrefix(r.URL.Path, "/sessions/")
 	parts := strings.SplitN(rest, "/", 2)
 	id := parts[0]
-	// opTarget, not get()+e.handle: handle is now a post-put field (set by
-	// POST /sessions' setHandle once drv.Create returns), so reading it off
-	// an unlocked pointer returned by get() would race that write. See
-	// registry.opTarget's doc comment.
-	handle, state, ok := s.reg.opTarget(id)
-	if !ok {
-		http.Error(w, "no such session", http.StatusNotFound)
-		return
-	}
-	// A "starting" entry (handle == "") means POST /sessions is still inside
-	// drv.Create — there is no driver handle yet for any of these ops to act
-	// on. Ids are sequential/guessable, so a DELETE (or suspend/resume/
-	// snapshot) can land in exactly that window; reject rather than either
-	// no-op on an empty handle (DELETE previously did this: it'd Destroy(""),
-	// remove the registry entry, and return 204 while Create was still
-	// running — Create then succeeds into an orphaned container the registry
-	// no longer knows about, whose sessiond gets a 404 on /register and
-	// fatally exits) or block the request until Create finishes.
-	if state == "starting" {
-		http.Error(w, "session still starting", http.StatusConflict)
-		return
-	}
 	ctx := r.Context()
 	if r.Method == http.MethodDelete {
-		// Close the hub (if the session ever registered) before removing the
-		// entry: hub.Close() cancels its ctx, which is what unblocks
-		// register()'s own `<-hub.Done()` wait so that goroutine cleans up
-		// synchronously with this deliberate teardown instead of being left
-		// to find out later. register() also calls reg.remove/hub.Close on
-		// its own unblock — both are safe, idempotent no-ops the second time.
-		if h, ok := s.reg.hub(id); ok {
-			h.Close()
-		}
-		s.drv.Destroy(ctx, handle)
-		s.reg.remove(id)
-		w.WriteHeader(http.StatusNoContent)
+		mapOpErr(w, s.Delete(ctx, id), func() { w.WriteHeader(http.StatusNoContent) })
 		return
 	}
-	// Every other op below is a mutation (suspend/resume) or driver call
+	// Every op below is a mutation (suspend/resume) or driver call
 	// (snapshot); only POST may trigger them — a GET on
 	// /sessions/{id}/suspend must not be able to execute one.
 	if r.Method != http.MethodPost {
@@ -185,26 +198,77 @@ func (s *Server) sessionOp(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 2 {
 		op = parts[1]
 	}
+	warm := op == "suspend" && r.URL.Query().Get("warm") != "false"
+	ref, err := s.Op(ctx, id, op, warm)
+	mapOpErr(w, err, func() {
+		if op == "snapshot" {
+			json.NewEncoder(w).Encode(map[string]string{"ref": ref})
+		} else {
+			w.WriteHeader(http.StatusNoContent)
+		}
+	})
+}
+
+// mapOpErr maps Op/Delete's sentinel errors to the status codes the HTTP
+// surface has always returned, or calls onOK to write the success response
+// (which varies: 204 for delete/suspend/resume, a JSON ref for snapshot).
+func mapOpErr(w http.ResponseWriter, err error, onOK func()) {
+	switch {
+	case err == nil:
+		onOK()
+	case errors.Is(err, errNoSuchSession):
+		http.Error(w, "no such session", http.StatusNotFound)
+	case errors.Is(err, errSessionStarting):
+		http.Error(w, "session still starting", http.StatusConflict)
+	case errors.Is(err, errUnknownOp):
+		http.Error(w, "unknown op", http.StatusBadRequest)
+	default:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// Op runs suspend/resume/snapshot against a session's current driver handle,
+// returning the snapshot ref (snapshot only; empty otherwise). Both fronts
+// (sessionOp's HTTP handler and the agent's execute) drive this same
+// sequence; warm is pre-parsed by the caller (HTTP's `?warm=` query, or the
+// agent's rwire.ToRunner.Warm) since query-string parsing is an HTTP concern
+// this function has no business knowing about.
+func (s *Server) Op(ctx context.Context, id, op string, warm bool) (snapshotRef string, err error) {
+	// opTarget, not get()+e.handle: handle is a post-put field (set by
+	// CreateWithID's setHandle once drv.Create returns), so reading it off an
+	// unlocked pointer returned by get() would race that write. See
+	// registry.opTarget's doc comment.
+	handle, state, ok := s.reg.opTarget(id)
+	if !ok {
+		return "", errNoSuchSession
+	}
+	// A "starting" entry (handle == "") means CreateWithID is still inside
+	// drv.Create — there is no driver handle yet for any of these ops to act
+	// on. Ids can be predictable (POST /sessions' sequential newID) or
+	// externally chosen (the agent's controld-supplied id), so an op can land
+	// in exactly that window; reject rather than either no-op on an empty
+	// handle or block the request until Create finishes.
+	if state == "starting" {
+		return "", errSessionStarting
+	}
 	switch op {
 	case "suspend":
-		warm := r.URL.Query().Get("warm") != "false"
 		if !warm {
 			// Cold suspend (docker stop) kills the container's sessiond,
 			// which closes its /register conn — the exact same socket-level
 			// event as a crash. Mark "suspending" BEFORE calling Suspend so
-			// the register goroutine's onHubDeath (which can fire the
-			// instant the container dies, racing ahead of the setState
-			// below) sees a state that means "keep the entry" rather than
-			// defaulting to the crash path and destroying a container we
-			// deliberately just stopped.
+			// the register goroutine's hubDied (which can fire the instant
+			// the container dies, racing ahead of the setState below) sees a
+			// state that means "keep the entry" rather than defaulting to
+			// the crash path and destroying a container we deliberately just
+			// stopped.
 			s.reg.setState(id, "suspending")
 		}
 		if err := s.drv.Suspend(ctx, handle, warm); err != nil {
 			if !warm {
 				s.reg.setState(id, "running") // stop failed: we're still running
 			}
-			http.Error(w, err.Error(), 500)
-			return
+			return "", err
 		}
 		// e.state is mutated here from a concurrent request goroutine, so it
 		// goes through the registry lock rather than a direct field write —
@@ -212,24 +276,72 @@ func (s *Server) sessionOp(w http.ResponseWriter, r *http.Request) {
 		// sessiond, so its conn — and the hub — stay alive; the state still
 		// lands on "suspended" either way for a consistent GET /sessions view.
 		s.reg.setState(id, "suspended")
-		w.WriteHeader(http.StatusNoContent)
+		return "", nil
 	case "resume":
 		if err := s.drv.Resume(ctx, handle); err != nil {
-			http.Error(w, err.Error(), 500)
-			return
+			return "", err
 		}
 		s.reg.setState(id, "running")
-		w.WriteHeader(http.StatusNoContent)
+		return "", nil
 	case "snapshot":
 		snap, err := s.drv.Snapshot(ctx, handle)
 		if err != nil {
-			http.Error(w, err.Error(), 500)
-			return
+			return "", err
 		}
-		json.NewEncoder(w).Encode(map[string]string{"ref": snap.Ref})
+		return snap.Ref, nil
 	default:
-		http.Error(w, "unknown op", http.StatusBadRequest)
+		return "", errUnknownOp
 	}
+}
+
+// Delete tears down a session: close its hub (if it ever registered) before
+// removing the registry entry and destroying the driver resource, then
+// remove the entry. hub.Close() cancels its ctx, which is what unblocks
+// register()'s own `<-hub.Done()` wait so that goroutine cleans up
+// synchronously with this deliberate teardown instead of being left to find
+// out later. register() also calls reg.remove/hub.Close on its own unblock —
+// both are safe, idempotent no-ops the second time.
+func (s *Server) Delete(ctx context.Context, id string) error {
+	handle, state, ok := s.reg.opTarget(id)
+	if !ok {
+		return errNoSuchSession
+	}
+	if state == "starting" {
+		return errSessionStarting
+	}
+	if h, ok := s.reg.hub(id); ok {
+		h.Close()
+	}
+	s.drv.Destroy(ctx, handle)
+	s.reg.remove(id)
+	return nil
+}
+
+// Announce snapshots the registry in rwire's session-state vocabulary, for
+// the agent's announce message (and reconnect re-announces). "starting"
+// entries are skipped — they're mid-CreateWithID, and that call's own result
+// (a "create" command's result, or the id simply appearing once it finishes)
+// speaks for them once they land; a half-created session has nothing
+// meaningful to report yet. "suspending" (mid-cold-suspend, socket not yet
+// confirmed dead) is skipped for the same reason.
+func (s *Server) Announce() []rwire.SessionInfo {
+	var out []rwire.SessionInfo
+	for _, e := range s.reg.list() {
+		var state string
+		switch {
+		case e.state == "running":
+			state = "running"
+		case e.state == "suspended" && e.hub != nil:
+			// Warm pause keeps sessiond's conn (and the hub) alive.
+			state = "suspended_warm"
+		case e.state == "suspended":
+			state = "suspended_cold"
+		default:
+			continue
+		}
+		out = append(out, rwire.SessionInfo{ID: e.id, State: state})
+	}
+	return out
 }
 
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
