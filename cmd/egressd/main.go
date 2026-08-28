@@ -24,6 +24,10 @@ func main() {
 	http.HandleFunc("/allow", func(w http.ResponseWriter, r *http.Request) {
 		s := r.URL.Query().Get("session")
 		hosts := r.URL.Query()["host"]
+		if s == "" || len(hosts) == 0 {
+			http.Error(w, "session required", http.StatusBadRequest)
+			return
+		}
 		p.SetAllow(s, hosts)
 		w.WriteHeader(http.StatusNoContent)
 	})

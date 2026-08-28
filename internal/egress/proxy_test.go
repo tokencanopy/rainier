@@ -69,3 +69,65 @@ func TestDefaultDenyAndAllow(t *testing.T) {
 		t.Fatalf("audit missing decisions: %s", audit.String())
 	}
 }
+
+// TestWildcardBoundary regression-tests the *.suffix matcher against the
+// bypass-prone cases: a real subdomain must be permitted, but a look-alike
+// hostname that merely contains the pattern (no dot boundary, or a wrong
+// tail) or the bare apex domain itself must not be.
+func TestWildcardBoundary(t *testing.T) {
+	var audit bytes.Buffer
+	p := New(&audit)
+	srv := httptest.NewServer(p.Handler()); defer srv.Close()
+
+	p.SetAllow("sessB", []string{"*.example.com"})
+
+	// Permitted: a genuine subdomain under the wildcard suffix. The upstream
+	// dial for this synthetic hostname will typically fail (no such host),
+	// but that's irrelevant here — we only assert the allow gate passed,
+	// i.e. the proxy never answered 403 for it.
+	resp, conn := connectThrough(t, srv.URL, "a.example.com:443", "sessB")
+	if resp.StatusCode == http.StatusForbidden {
+		t.Fatalf("expected a.example.com to be permitted by *.example.com, got 403")
+	}
+	conn.Close()
+
+	denyCases := []string{
+		"evil-example.com:443",         // shares the suffix text but no dot boundary
+		"example.com.attacker.net:443", // contains the pattern, wrong tail
+		"example.com:443",              // bare apex domain, not a subdomain
+	}
+	for _, target := range denyCases {
+		resp, _ := connectThrough(t, srv.URL, target, "sessB")
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected %s to be denied (403), got %d", target, resp.StatusCode)
+		}
+	}
+
+	if !strings.Contains(audit.String(), `"host":"a.example.com"`) ||
+		!strings.Contains(audit.String(), `"decision":"allow"`) {
+		t.Fatalf("audit missing allow line for wildcard subdomain: %s", audit.String())
+	}
+}
+
+// TestMissingAuthHeaderDenied regression-tests that a CONNECT with no
+// Proxy-Authorization header at all resolves to the empty-string session,
+// which (per default-deny) must never be implicitly allowed.
+func TestMissingAuthHeaderDenied(t *testing.T) {
+	var audit bytes.Buffer
+	p := New(&audit)
+	srv := httptest.NewServer(p.Handler()); defer srv.Close()
+
+	u := strings.TrimPrefix(srv.URL, "http://")
+	conn, err := net.Dial("tcp", u)
+	if err != nil { t.Fatal(err) }
+	defer conn.Close()
+
+	target := "example.com:443"
+	req := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target)
+	if _, err := conn.Write([]byte(req)); err != nil { t.Fatal(err) }
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil { t.Fatal(err) }
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 for CONNECT with no Proxy-Authorization header, got %d", resp.StatusCode)
+	}
+}
