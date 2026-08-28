@@ -26,6 +26,11 @@ type Server struct {
 	dialBase    string // e.g. ws://runnerd:8080 — what sessiond dials to register
 	seq         atomic.Int64
 	egressAdmin string // http://egressd:3129 (optional)
+	// OnEvent, when set, is called with "running" after a successful
+	// register() setHub and "dead" when the crash path destroys a
+	// container. Nil-safe: HTTP-only mode (no control conn) leaves it nil.
+	// Task 6 wires it to the control conn.
+	OnEvent func(sessionID, state string)
 }
 
 func New(drv driver.Driver, dialBase, egressAdmin string) *Server {
@@ -249,6 +254,9 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("session %s registered", id)
+	if s.OnEvent != nil {
+		s.OnEvent(id, "running")
+	}
 	// Block on the hub's own liveness signal, not r.Context(). websocket.Accept
 	// hijacks the connection for HTTP/1.1, and net/http only cancels
 	// r.Context() when this handler itself returns (conn.serve's deferred
@@ -264,16 +272,26 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	// this on r.Context() instead would leak both per session, forever, on
 	// every abrupt death or explicit rm.
 	<-hub.Done()
-	// onHubDeath distinguishes why the hub died: a deliberate cold suspend
-	// (docker stop kills sessiond too, closing this same conn) keeps the
-	// entry — state "suspended", hub cleared so resume's re-register can
-	// setHub a fresh one — while a crash removes the entry and hands back
-	// the handle so its container gets destroyed here, reclaiming the
-	// capacity slot instead of leaking it. See registry.onHubDeath.
-	handle, destroy := s.reg.onHubDeath(id, hub)
+	handle, state, ok := s.reg.hubDied(id, hub)
 	hub.Close()
-	if destroy && handle != "" {
+	if !ok {
+		return
+	} // stale: a newer hub already replaced this one
+	if state == "suspending" || state == "suspended" {
+		return
+	} // deliberate cold suspend: keep
+	// The conn died but that no longer proves the container did: sessiond
+	// now survives conn loss and redials (see cmd/sessiond). Ask the driver.
+	h, err := s.drv.Inspect(context.Background(), handle)
+	if err == nil && h.State == driver.StateRunning {
+		log.Printf("session %s lost its conn but the container is alive; awaiting re-register", id)
+		return
+	}
+	if s.reg.removeIfHubless(id) {
 		s.drv.Destroy(context.Background(), handle)
+		if s.OnEvent != nil {
+			s.OnEvent(id, "dead")
+		}
 	}
 }
 
