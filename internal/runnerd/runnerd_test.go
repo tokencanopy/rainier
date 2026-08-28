@@ -869,11 +869,11 @@ func TestOnEventFiresRunningAndDead(t *testing.T) {
 	type event struct{ sessionID, state string }
 	var mu sync.Mutex
 	var events []event
-	rd.OnEvent = func(sessionID, state string) {
+	rd.SetOnEvent(func(sessionID, state string) {
 		mu.Lock()
 		events = append(events, event{sessionID, state})
 		mu.Unlock()
-	}
+	})
 
 	srv := httptest.NewServer(rd.Handler())
 	defer srv.Close()
@@ -907,6 +907,27 @@ func TestOnEventFiresRunningAndDead(t *testing.T) {
 	mu.Unlock()
 	if len(got) != 2 || got[0] != (event{id, "running"}) || got[1] != (event{id, "dead"}) {
 		t.Fatalf("OnEvent calls = %+v, want [{%s running} {%s dead}]", got, id, id)
+	}
+}
+
+// TestSessionOpGetUnknownSessionReturns404 is the regression test for review
+// round 1, finding 4: the Step 1 refactor briefly reordered sessionOp to
+// check the request method before checking session existence, so a GET on
+// an unknown session's op path returned 405 (method not allowed) instead of
+// 404 (no such session). The pre-refactor handler always checked existence
+// first, for every method including GET — restored, and pinned here.
+func TestSessionOpGetUnknownSessionReturns404(t *testing.T) {
+	rd := New(driver.NewFake(4), "", "")
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/sessions/does-not-exist/suspend")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET on unknown session op path = %d, want %d", resp.StatusCode, http.StatusNotFound)
 	}
 }
 

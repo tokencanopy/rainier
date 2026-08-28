@@ -23,6 +23,27 @@ type registry struct {
 func newRegistry() *registry { return &registry{items: map[string]*sessionEntry{}} }
 
 func (r *registry) put(id string, e *sessionEntry) { r.mu.Lock(); r.items[id] = e; r.mu.Unlock() }
+
+// putIfAbsent inserts e under id only if no entry exists yet, as a single
+// locked check-and-reserve step. CreateWithID uses this (not a separate
+// get()-then-put() pair) as its very first action so a concurrent caller
+// racing the same id can only ever find the id already claimed, never
+// observe "absent" itself — closing the idempotent-create TOCTOU where two
+// racing create commands for the same id (e.g. a retried create the sender
+// is unsure landed) could otherwise both pass an existence check and both
+// reach drv.Create, producing a duplicate/orphaned container (review round
+// 1, finding 2). Reports whether it inserted (true) or found an existing
+// entry and left it untouched (false).
+func (r *registry) putIfAbsent(id string, e *sessionEntry) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.items[id]; exists {
+		return false
+	}
+	r.items[id] = e
+	return true
+}
+
 func (r *registry) get(id string) (*sessionEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

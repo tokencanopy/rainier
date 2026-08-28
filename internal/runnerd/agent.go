@@ -7,6 +7,7 @@ import (
 	"log"
 	mrand "math/rand"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/coder/websocket"
@@ -65,6 +66,17 @@ func (s *Server) RunAgent(ctx context.Context, cfg AgentConfig) error {
 
 // agentSession dials controld once, sends the announce as the FIRST message
 // on the conn, then serves rwire.ToRunner commands until the conn ends.
+//
+// agentSession does not return until its writer goroutine has actually
+// stopped (writerDone.Wait(), gated by connCtx). Review round 1, finding 3:
+// the writer used to have no exit signal other than a future failed send —
+// a quiet disconnect (nothing left to write, ever) left it (and the `out`
+// channel it closed over) running forever, once per reconnect. connCtx is
+// this one connection's scope: canceling it — on return here, or from the
+// writer's own write-failure branch below — makes coder/websocket close the
+// underlying conn out from under any in-flight Read/Write using it, which is
+// what actually unblocks a stalled reader when only the write direction has
+// died (not just the writer itself).
 func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 	hdr := http.Header{"Authorization": {"Bearer " + cfg.Token}}
 	c, _, err := websocket.Dial(ctx, cfg.ControldURL+"/v1/runners/connect", &websocket.DialOptions{HTTPHeader: hdr})
@@ -74,11 +86,25 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 	defer c.CloseNow()
 	c.SetReadLimit(16 << 20)
 
+	connCtx, cancel := context.WithCancel(ctx)
+	var writerDone sync.WaitGroup
+	// Registered right after connCtx's cancel so it's unconditionally
+	// deferred on every path out of this function (satisfies go vet's
+	// lostcancel check) while still doing cancel-THEN-wait in that exact
+	// order: canceling first is what gives writerDone.Wait() something to
+	// wait FOR (either the writer noticing connCtx.Done(), or — if the
+	// writer hasn't even started yet, e.g. the announce write below failed
+	// first — an Add-less WaitGroup, whose Wait() is then a no-op).
+	defer func() {
+		cancel()
+		writerDone.Wait()
+	}()
+
 	out := make(chan rwire.FromRunner, 64)
 	send := func(m rwire.FromRunner) {
-		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		cctx, ccancel := context.WithTimeout(ctx, 5*time.Second)
 		m.Used, m.Total, _ = s.drv.Capacity(cctx) // best-effort; piggybacked on every message
-		cancel()
+		ccancel()
 		select {
 		case out <- m:
 		default: // drop under absurd backlog; a later announce restores truth
@@ -86,22 +112,33 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 	}
 	// OnEvent must be swapped atomically per connection and cleared on exit,
 	// or a dead conn's closure keeps receiving events (and writing to an out
-	// channel nothing drains any more).
-	s.OnEvent = func(id, state string) { send(rwire.FromRunner{Type: "event", Session: id, State: state}) }
-	defer func() { s.OnEvent = nil }()
+	// channel nothing drains any more). SetOnEvent/fireEvent are the
+	// synchronized accessors — see the Server.onEvent field's doc comment.
+	s.SetOnEvent(func(id, state string) { send(rwire.FromRunner{Type: "event", Session: id, State: state}) })
+	defer s.SetOnEvent(nil)
 
 	used, total, _ := s.drv.Capacity(ctx)
 	ann := rwire.FromRunner{Type: "announce", Proto: rwire.Proto, Runner: cfg.RunnerName,
 		Sessions: s.Announce(), Used: used, Total: total}
-	if err := wsjson.Write(ctx, c, ann); err != nil {
+	if err := wsjson.Write(connCtx, c, ann); err != nil {
 		return err
 	}
 
-	writeDone := make(chan error, 1)
+	writerDone.Add(1)
+	s.agentWriterCount.Add(1)
 	go func() { // single writer: every FromRunner goes out over this one goroutine
-		for m := range out {
-			if err := wsjson.Write(ctx, c, m); err != nil {
-				writeDone <- err
+		defer s.agentWriterCount.Add(-1)
+		defer writerDone.Done()
+		for {
+			select {
+			case m := <-out:
+				if err := wsjson.Write(connCtx, c, m); err != nil {
+					cancel() // a dead write direction means this connection
+					// is done; unblock the reader below too, not just this
+					// goroutine.
+					return
+				}
+			case <-connCtx.Done():
 				return
 			}
 		}
@@ -109,7 +146,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 
 	for {
 		var m rwire.ToRunner
-		if err := wsjson.Read(ctx, c, &m); err != nil {
+		if err := wsjson.Read(connCtx, c, &m); err != nil {
 			return err
 		}
 		go s.execute(ctx, m, send, cfg) // ops are slow (docker); never block the reader
@@ -122,24 +159,24 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.FromRunner), cfg AgentConfig) {
 	switch m.Type {
 	case "create":
-		// Idempotency first: an id already in the registry means a prior
-		// create already landed (or is mid-flight — CreateWithID's own
-		// "starting" entry counts). controld may resend a create it's
-		// unsure reached us (e.g. after its own reconnect); re-running
-		// drv.Create against an id that already has a container would be
-		// wrong, not merely redundant.
-		if _, ok := s.reg.get(m.Session); ok {
-			send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: true})
-			return
-		}
 		var spec driver.Spec
 		var allow []string
 		if m.Spec != nil {
 			spec = driver.Spec{Name: m.Spec.Name, Image: m.Spec.Image, Cmd: m.Spec.Cmd, EgressAllow: m.Spec.EgressAllow}
 			allow = m.Spec.EgressAllow
 		}
+		// Idempotency lives inside CreateWithID's own putIfAbsent now, not a
+		// separate reg.get check here — review round 1, finding 2: a
+		// pre-check-then-put pair is two lock acquisitions with a window
+		// between them where two racing creates for the same id (controld
+		// resending one it's unsure landed) could both pass the check and
+		// both reach drv.Create. errSessionExists means some caller (this
+		// one or a concurrent one) already claimed the id; either way the
+		// desired state — a session exists under this id — is reached, so
+		// it's reported the same as a fresh success.
 		err := s.CreateWithID(ctx, m.Session, spec, allow)
-		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: errText(err)})
+		ok := err == nil || errors.Is(err, errSessionExists)
+		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: ok, Detail: errTextUnless(err, errSessionExists)})
 	case "suspend", "resume", "snapshot":
 		ref, err := s.Op(ctx, m.Session, m.Type, m.Warm)
 		detail := ref
@@ -164,16 +201,10 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 	}
 }
 
-func errText(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
-}
-
-// errTextUnless is errText, but also suppresses the message for an error
-// matching sentinel (used by destroy: errNoSuchSession is a success case,
-// not a failure detail worth surfacing).
+// errTextUnless returns err's message, or "" if err is nil or matches
+// sentinel — used by destroy (errNoSuchSession) and create
+// (errSessionExists), where that particular error is a success case, not a
+// failure detail worth surfacing.
 func errTextUnless(err, sentinel error) string {
 	if err == nil || errors.Is(err, sentinel) {
 		return ""
