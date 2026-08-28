@@ -122,9 +122,35 @@ func (d *Docker) destroyAllLabeled(ctx context.Context) {
 	}
 }
 
-// Stubs until Tasks 7-8.
-func (d *Docker) Suspend(ctx context.Context, id string, warm bool) error { return errNotImpl }
-func (d *Docker) Resume(ctx context.Context, id string) error             { return errNotImpl }
+func (d *Docker) Suspend(ctx context.Context, id string, warm bool) error {
+	if warm {
+		_, err := dockerRun(ctx, "pause", id)
+		return err
+	}
+	_, err := dockerRun(ctx, "stop", id)
+	return err
+}
+
+func (d *Docker) Resume(ctx context.Context, id string) error {
+	// Determine current status to pick unpause vs start.
+	out, err := dockerRun(ctx, "inspect", "-f", "{{.State.Status}}", id)
+	if err != nil {
+		return err
+	}
+	switch out {
+	case "paused":
+		_, err = dockerRun(ctx, "unpause", id)
+	case "exited", "created":
+		_, err = dockerRun(ctx, "start", id)
+	case "running":
+		err = nil // already running
+	default:
+		_, err = dockerRun(ctx, "start", id)
+	}
+	return err
+}
+
+// Stub until Task 8.
 func (d *Docker) Snapshot(ctx context.Context, id string) (Snapshot, error) {
 	return Snapshot{}, errNotImpl
 }
