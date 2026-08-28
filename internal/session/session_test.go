@@ -166,3 +166,35 @@ func TestAttachAfterExitGetsSnapshotThenExit(t *testing.T) {
 		t.Fatal("timeout waiting for channel close")
 	}
 }
+
+// Fix round 2: the exit goroutine used to clear s.viewers, unlock s.mu, and
+// only then close(s.exited) — leaving a window where a concurrent Attach
+// could lock s.mu, see the cleared viewers map, but still observe s.exited
+// as not-yet-closed (default branch), registering a viewer that would never
+// be exit-notified or closed. This hammers that window across many attempts
+// and asserts the invariant that must always hold: every attachment
+// obtained around an exit eventually has its Msgs channel closed.
+func TestConcurrentAttachDuringExitNeverStrands(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		s, fp := newFakeSession(t)
+		done := make(chan *Attachment, 8)
+		go func() {
+			for j := 0; j < 4; j++ {
+				if a, err := s.Attach(0, Size{20, 5}); err == nil { done <- a }
+			}
+			close(done)
+		}()
+		fp.exit <- 0 // trigger exit concurrently
+		for a := range done {
+			deadline := time.After(2 * time.Second)
+			for open := true; open; {
+				select {
+				case _, ok := <-a.Msgs:
+					open = ok // drain until closed
+				case <-deadline:
+					t.Fatal("attachment channel never closed after exit")
+				}
+			}
+		}
+	}
+}

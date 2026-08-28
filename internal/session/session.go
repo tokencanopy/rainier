@@ -58,8 +58,14 @@ func New(cfg Config, start func(argv []string, cols, rows int, onOutput func([]b
 		// lifecycle for every viewer still attached at exit time.
 		for _, v := range s.viewers { close(v.ch) }
 		s.viewers = map[int]*viewer{}
-		s.mu.Unlock()
+		// Close s.exited before releasing s.mu: any Attach that acquires
+		// s.mu after this point is guaranteed (via the mutex) to observe it
+		// closed, so its non-blocking `select` on s.exited can never take
+		// the default branch for a session that has, in fact, already
+		// exited — which would otherwise strand that viewer with no future
+		// exit notice or channel close.
 		close(s.exited)
+		s.mu.Unlock()
 	}()
 	return s, nil
 }
