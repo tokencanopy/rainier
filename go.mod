@@ -6,6 +6,7 @@ require (
 	github.com/charmbracelet/ultraviolet v0.0.0-20260303162955-0b88c25f3fff
 	github.com/charmbracelet/x/ansi v0.11.7
 	github.com/charmbracelet/x/vt v0.0.0-20260823001701-96af6d2cb5f6
+	github.com/coder/websocket v1.8.15
 	github.com/creack/pty v1.1.24
 )
 
