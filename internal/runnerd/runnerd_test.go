@@ -509,6 +509,90 @@ func TestHubDeathDuringColdSuspendKeepsEntry(t *testing.T) {
 // synchronously with the 204 response, and stay gone (register()'s own
 // unblock-and-cleanup racing the same removal must be a no-op, not a re-add
 // or a panic) for a subsequent GET /sessions.
+// TestRecoverRebuildsRegistryFromDriverLabels is the regression test for
+// Recover: on restart, runnerd's in-memory registry starts empty even though
+// the driver's labeled containers (and the sessions they represent) are
+// still alive. Recover must rebuild the registry from drv.List so a
+// redialing sessiond finds its session instead of 404ing on /register, and
+// a cold (stopped) session can still be resumed and re-registered.
+func TestRecoverRebuildsRegistryFromDriverLabels(t *testing.T) {
+	fd := driver.NewFake(4)
+	ctx := context.Background()
+
+	// Seed the driver directly (bypassing the runnerd API entirely), the way
+	// containers from a PREVIOUS runnerd process would already exist when
+	// this one starts up.
+	if _, err := fd.Create(ctx, driver.Spec{SessionID: "sess-running"}); err != nil {
+		t.Fatal(err)
+	}
+	hCold, err := fd.Create(ctx, driver.Spec{SessionID: "sess-cold"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fd.Suspend(ctx, hCold.ID, false); err != nil { // cold
+		t.Fatal(err)
+	}
+
+	rd := New(fd, "", "")
+	if err := rd.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+	base := strings.Replace(srv.URL, "http", "ws", 1)
+
+	// GET /sessions must list both recovered sessions with the right states.
+	resp, err := http.Get(srv.URL + "/sessions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []struct{ ID, State string }
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	got := map[string]string{}
+	for _, row := range rows {
+		got[row.ID] = row.State
+	}
+	if len(got) != 2 {
+		t.Fatalf("GET /sessions after Recover = %+v, want 2 entries", rows)
+	}
+	if got["sess-running"] != "running" {
+		t.Fatalf("sess-running state = %q, want \"running\"", got["sess-running"])
+	}
+	if got["sess-cold"] != "suspended" {
+		t.Fatalf("sess-cold state = %q, want \"suspended\"", got["sess-cold"])
+	}
+
+	// A redialing sessiond for the running session must find its (recovered,
+	// hub-less) entry rather than 404 on /register — that's the whole point
+	// of Recover. dialRegisterAndServe's websocket.Dial would itself fail
+	// (non-101 response) if /register 404'd here.
+	dialRegisterAndServe(t, ctx, base, "sess-running")
+	waitForHub(t, rd, "sess-running")
+	attachAndAssertEcho(t, ctx, base, "sess-running", "recovered-running-marker")
+
+	// The cold-suspended session must be resumable, and its sessiond's
+	// re-register (post `docker start`) must work too.
+	resumeResp, err := http.Post(srv.URL+"/sessions/sess-cold/resume", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumeResp.Body.Close()
+	if resumeResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("resume status = %d, want %d", resumeResp.StatusCode, http.StatusNoContent)
+	}
+	dialRegisterAndServe(t, ctx, base, "sess-cold")
+	waitForHub(t, rd, "sess-cold")
+	attachAndAssertEcho(t, ctx, base, "sess-cold", "recovered-cold-marker")
+
+	if _, state, ok := rd.reg.opTarget("sess-cold"); !ok || state != "running" {
+		t.Fatalf("sess-cold state after resume+re-register = %q (ok=%v), want \"running\"", state, ok)
+	}
+}
+
 func TestDeleteSessionRemovesRegistryEntryAndClosesHub(t *testing.T) {
 	rd := New(driver.NewFake(4), "", "")
 	srv := httptest.NewServer(rd.Handler())

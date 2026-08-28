@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net/http"
@@ -21,6 +22,14 @@ func main() {
 
 	drv := driver.NewDocker(driver.DockerOpts{Image: *image, Network: *network, TotalSlots: *slots})
 	s := runnerd.New(drv, *dialBase, *egressAdmin)
+
+	// Rebuild the registry from the driver's labeled containers before
+	// serving, so a restart is truthful about sessions that outlived it
+	// instead of forgetting them outright.
+	if err := s.Recover(context.Background()); err != nil {
+		log.Fatalf("recover: %v", err)
+	}
+
 	log.Printf("runnerd on %s (dial-base %s)", *listen, *dialBase)
 	log.Fatal(http.ListenAndServe(*listen, s.Handler()))
 }
