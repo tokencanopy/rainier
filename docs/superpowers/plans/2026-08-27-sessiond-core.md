@@ -1697,6 +1697,69 @@ git commit -m "feat: vtcap fixture recorder and file-based round-trip suite"
 
 ---
 
+### Task 12: Local fleet acceptance (cmux)
+
+**Files:**
+- Create: `scripts/fleet-up.sh`, `scripts/fleet-down.sh`, `docker-compose.fleet.yml`
+
+**Interfaces:**
+- Consumes: Docker image (Task 10), `rattach` (Task 9)
+- Produces: a 5-session local fleet for manual acceptance from cmux.
+
+- [ ] **Step 1: Write compose file**
+
+```yaml
+# docker-compose.fleet.yml — five independent sessions on ports 7071-7075
+services:
+  s1: { image: rainier-sessiond, ports: ["7071:7070"] }
+  s2: { image: rainier-sessiond, ports: ["7072:7070"] }
+  s3: { image: rainier-sessiond, ports: ["7073:7070"] }
+  s4: { image: rainier-sessiond, ports: ["7074:7070"] }
+  s5: { image: rainier-sessiond, ports: ["7075:7070"] }
+```
+
+- [ ] **Step 2: Write helper scripts**
+
+```bash
+#!/usr/bin/env bash
+# scripts/fleet-up.sh
+set -euo pipefail
+docker build -q -t rainier-sessiond .
+docker compose -f docker-compose.fleet.yml up -d
+echo "Fleet up. Attach from any terminal (one per cmux pane):"
+for p in 7071 7072 7073 7074 7075; do echo "  ./bin/rattach --url ws://127.0.0.1:$p"; done
+```
+
+```bash
+#!/usr/bin/env bash
+# scripts/fleet-down.sh
+docker compose -f docker-compose.fleet.yml down
+```
+
+```bash
+chmod +x scripts/fleet-up.sh scripts/fleet-down.sh
+```
+
+- [ ] **Step 3: Manual acceptance from cmux (the user drives this)**
+
+1. `./scripts/fleet-up.sh`
+2. In cmux, open five panes/tabs; run one `rattach` command per pane.
+3. In each: start distinct work (`top`, an editor, a long build).
+4. Detach some (Ctrl-]), close a pane entirely, quit and reopen cmux.
+5. Reattach each session — every screen must repaint with its prior state.
+6. `./scripts/fleet-down.sh`
+
+Pass criteria: all five sessions independent; no session lost to any client-side event; reattach latency feels instant.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add docker-compose.fleet.yml scripts/fleet-up.sh scripts/fleet-down.sh
+git commit -m "feat: local docker fleet for cmux acceptance testing"
+```
+
+---
+
 ## Self-Review Notes
 
 - **Spec coverage (this plan's slice):** §5.1 PTY ownership → Tasks 5, 7; §5.2 VT emulator + snapshot-on-attach → Tasks 3, 4, 7; §5.3 event log + `attach(since_seq)` → Tasks 1, 7, 8; smallest-viewer resize → Tasks 6, 7; §11.1 golden fixtures → Tasks 3, 11; §11.4 e2e attach/detach/reattach → Tasks 8, 10; portability rule 1 (PID 1 static binary) → Tasks 8, 10; rule 3 staging → `serve(conn)` note in Task 8. Deferred to later plans (per spec): adapters, egress, suspend/resume, snapshot(), controld relay, multiplexed outbound connection.
