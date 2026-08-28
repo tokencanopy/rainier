@@ -83,17 +83,22 @@ Data flow: clients talk only to controld; controld talks only over connections
 runnerd/sessiond opened outward. The team exposes controld's HTTPS port however
 they like (LB+TLS, Tailscale, Cloudflare Tunnel).
 
-**Session definition:** one agent process + its PTY + its sandbox + its own git
-worktree/branch. A user runs many sessions; two sessions on one repo get
-independent clones and branches. The session is the unit of attach, permissions,
-diff, and lifecycle.
+**Session definition:** one agent process + its PTY + **its own sandboxed
+filesystem** (the session volume). The volume may contain zero or more repo
+checkouts, declared in the spec as `repos: [{repo, base_branch}, ...]` —
+zero-repo scratch sessions and multi-repo (cross-repo task) sessions are
+first-class; the common case is one repo. Each checkout is an independent clone
+with a session branch per repo; two sessions on one repo never share files. A
+session's identity is "an FS born from environment X with repos Y checked out."
+The session is the unit of attach, permissions, diff, and lifecycle.
 
 ## 4. Runner API and the v0 Docker driver
 
 Contract (controld → runnerd over the runner's outbound connection):
 
-- `create_session(spec) → session_id` — spec: environment image (OCI ref), repo +
-  base branch, resources, egress policy, adapter + mode, secret references.
+- `create_session(spec) → session_id` — spec: environment image (OCI ref),
+  `repos: [{repo, base_branch}, ...]` (0..n), resources, egress policy,
+  adapter + mode, secret references.
 - `suspend(id)` / `resume(id)` — semantics defined at the API level:
   **warm suspend** (processes in RAM, CPU freed) and **cold park** (processes
   stopped, volume retained; resume uses the agent's native session-resume).
@@ -103,7 +108,8 @@ Contract (controld → runnerd over the runner's outbound connection):
 
 Docker driver: one container per session — environment image, sessiond as PID 1,
 non-root, `no-new-privileges`, default seccomp, CPU/memory limits, read-only root
-except the session volume (worktree + agent home). Only network route is egressd.
+except the session volume (session FS incl. repo checkouts + agent home). Only
+network route is egressd.
 Placement: capacity bin-packing across the team's VMs. Suspend mapping: warm =
 `docker pause`; cold = stop + keep volume. Idle policy (configurable): warm
 suspend ~10 min, cold park after a few hours, destroy only explicit/TTL.
@@ -145,7 +151,8 @@ receive the raw byte stream.
 Adapters normalize one agent's signals into **ACP vocabulary** (`message.delta`,
 `tool.call`, `plan.updated`, `permission.requested`) plus fleet extensions
 (`status.changed` over `working / awaiting-permission / awaiting-input / idle /
-error / disconnected`, `diff.updated` from git vs session base, `cost.updated`),
+error / disconnected`, `diff.updated` per repo checkout (git vs its base
+branch; the fleet view aggregates), `cost.updated`),
 and accept follow-up prompts + permission decisions. Compiled into sessiond,
 selected in the session spec.
 
@@ -182,7 +189,8 @@ Therefore Claude runs in TUI mode on subscriptions; the ACP bridge
 **Three planes:**
 
 1. **Control (REST, versioned JSON):** `POST /sessions`, `GET /sessions` (fleet:
-   status, repo/branch, pending-permission, cost, last activity),
+   status, repo/branch chips per session ("scratch" when none),
+   pending-permission, cost, last activity),
    `POST /sessions/:id/messages`, `POST /permissions/:id/decision`,
    `GET /sessions/:id/transcript?since=`, `GET /sessions/:id/diff`, plus
    environments, repos, users.
@@ -221,7 +229,8 @@ GitHub is the v0 implementation; GitLab/Bitbucket are future providers.
   and PRs attribute to the actual human; authorization mirrors the user's real
   GitHub access.
 - App mode (opt-in): per-install GitHub App via manifest flow; installation
-  tokens (1 h, down-scoped to repo + `contents:write` + `pull_requests:write`)
+  tokens (1 h, down-scoped to the session's repo set + `contents:write` +
+  `pull_requests:write`)
   for system-initiated work (background PR creation; later webhook-triggered
   sessions). Bot-authored commits carry `Co-authored-by:` the human.
 - Sessions push only their own branch by convention + audit in v0
@@ -239,14 +248,17 @@ v0, documented as such. Token injection at the proxy + two-phase network are v1.
 
 ## 9. Environments, lifecycle, fast start
 
-**Environment** (per repo, shareable): base OCI image + setup script + env/secret
+**Environment** (commonly one per repo, shareable; defines image/setup/egress
+while the session spec's `repos` list defines initial contents): base OCI image
++ setup script + env/secret
 refs + egress allowlist. First session runs setup live (streamed to the attached
 terminal), then `snapshot()` caches the environment image; later sessions boot
 from it. `devcontainer.json` `image` field read as a hint; full spec compat later.
 
 **v0 fast path:** environment images pre-pulled to VMs on snapshot creation;
-per-VM bare-repo mirror (worktree checkout in ~hundreds of ms, no network
-clone); container start ~100 ms; agent CLI boot is the honest long pole (~few s).
+per-VM bare-repo mirror (local clone with hardlinked objects in ~hundreds of
+ms, no network clone); container start ~100 ms; agent CLI boot is the honest
+long pole (~few s).
 **Attach immediately and stream everything** — user watches the session come up
 within ~1 s even when total readiness is ~5 s. Instrument create-to-attach
 latency from day one; warm pools/memory snapshots wait for measurements.
