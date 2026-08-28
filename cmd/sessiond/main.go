@@ -15,6 +15,14 @@ import (
 )
 
 func main() {
+	// Install the SIGCHLD reaper before anything can spawn a child: SIGCHLD's
+	// default disposition is ignore, and the kernel discards an ignored
+	// signal at generation (it is never queued for later delivery). If the
+	// agent's exit raced a later Start() call, that SIGCHLD would be lost
+	// forever — sessiond hosts exactly one child, so there's no next SIGCHLD
+	// to catch it, and AwaitExit would then block indefinitely.
+	reap.Start() // single authoritative waiter on Linux; agent exit code flows back through Proc.Wait via Session
+
 	listen := flag.String("listen", "127.0.0.1:7070", "dev listener address")
 	logPath := flag.String("log", "/tmp/session.log", "event log path")
 	cols := flag.Int("cols", 120, "initial cols")
@@ -30,8 +38,6 @@ func main() {
 		<-s.Exited()
 		log.Printf("child exited with code %d; sessiond stays up for viewers", s.ExitCode())
 	}()
-
-	reap.Start() // single authoritative waiter on Linux; agent exit code flows back through Proc.Wait via Session
 
 	term := make(chan os.Signal, 1)
 	signal.Notify(term, syscall.SIGTERM, syscall.SIGINT)
