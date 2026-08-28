@@ -79,6 +79,22 @@ func (r *registry) setState(id, state string) {
 	if e, ok := r.items[id]; ok { e.state = state }
 }
 
+// opTarget returns an entry's driver handle and state under the registry
+// lock, for sessionOp's DELETE/suspend/resume/snapshot handlers. Those used
+// to call get() and then read the returned pointer's .handle field directly
+// (unsynchronized against setHandle's locked write — a real data race once
+// handle became a post-put field, not merely a hypothetical one: setHandle
+// runs on the POST /sessions goroutine while sessionOp runs on a concurrent
+// request goroutine). Callers must also check state: a "starting" entry
+// (handle == "") means Create hasn't returned yet, so there is nothing yet
+// for a driver call to act on — see sessionOp's http.StatusConflict guard.
+func (r *registry) opTarget(id string) (handle, state string, ok bool) {
+	r.mu.Lock(); defer r.mu.Unlock()
+	e, ok := r.items[id]
+	if !ok { return "", "", false }
+	return e.handle, e.state, true
+}
+
 // setHandle assigns an entry's driver handle id once its container has
 // actually started. POST /sessions now calls put() with a handle-less entry
 // before it calls the driver's Create — a real container's sessiond can dial

@@ -102,9 +102,26 @@ func (s *Server) sessionOp(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/sessions/")
 	parts := strings.SplitN(rest, "/", 2)
 	id := parts[0]
-	e, ok := s.reg.get(id)
+	// opTarget, not get()+e.handle: handle is now a post-put field (set by
+	// POST /sessions' setHandle once drv.Create returns), so reading it off
+	// an unlocked pointer returned by get() would race that write. See
+	// registry.opTarget's doc comment.
+	handle, state, ok := s.reg.opTarget(id)
 	if !ok {
 		http.Error(w, "no such session", http.StatusNotFound)
+		return
+	}
+	// A "starting" entry (handle == "") means POST /sessions is still inside
+	// drv.Create — there is no driver handle yet for any of these ops to act
+	// on. Ids are sequential/guessable, so a DELETE (or suspend/resume/
+	// snapshot) can land in exactly that window; reject rather than either
+	// no-op on an empty handle (DELETE previously did this: it'd Destroy(""),
+	// remove the registry entry, and return 204 while Create was still
+	// running — Create then succeeds into an orphaned container the registry
+	// no longer knows about, whose sessiond gets a 404 on /register and
+	// fatally exits) or block the request until Create finishes.
+	if state == "starting" {
+		http.Error(w, "session still starting", http.StatusConflict)
 		return
 	}
 	ctx := r.Context()
@@ -118,7 +135,7 @@ func (s *Server) sessionOp(w http.ResponseWriter, r *http.Request) {
 		if h, ok := s.reg.hub(id); ok {
 			h.Close()
 		}
-		s.drv.Destroy(ctx, e.handle)
+		s.drv.Destroy(ctx, handle)
 		s.reg.remove(id)
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -137,7 +154,7 @@ func (s *Server) sessionOp(w http.ResponseWriter, r *http.Request) {
 	switch op {
 	case "suspend":
 		warm := r.URL.Query().Get("warm") != "false"
-		if err := s.drv.Suspend(ctx, e.handle, warm); err != nil {
+		if err := s.drv.Suspend(ctx, handle, warm); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
@@ -147,14 +164,14 @@ func (s *Server) sessionOp(w http.ResponseWriter, r *http.Request) {
 		s.reg.setState(id, "suspended")
 		w.WriteHeader(http.StatusNoContent)
 	case "resume":
-		if err := s.drv.Resume(ctx, e.handle); err != nil {
+		if err := s.drv.Resume(ctx, handle); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}
 		s.reg.setState(id, "running")
 		w.WriteHeader(http.StatusNoContent)
 	case "snapshot":
-		snap, err := s.drv.Snapshot(ctx, e.handle)
+		snap, err := s.drv.Snapshot(ctx, handle)
 		if err != nil {
 			http.Error(w, err.Error(), 500)
 			return

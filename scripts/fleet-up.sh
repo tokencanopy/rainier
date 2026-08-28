@@ -22,7 +22,12 @@ go build -o bin/runnerctl ./cmd/runnerctl
 # throwaway container on the network and prefer host.docker.internal;
 # fall back to the bridge gateway when it doesn't resolve.
 BRIDGE_GW=$(docker network inspect rainier-internal -f '{{ (index .IPAM.Config 0).Gateway }}')
-HDI=$(docker run --rm --network rainier-internal alpine:3.20 getent hosts host.docker.internal 2>/dev/null | awk '{print $1}')
+# `|| true`: under `set -o pipefail`, a plain Linux dockerd (no
+# host.docker.internal) makes getent exit non-zero inside the container,
+# which docker run propagates as its own exit status — without this guard
+# that failure would abort the whole script right here (set -e) instead of
+# falling through to the bridge-gateway fallback below.
+HDI=$(docker run --rm --network rainier-internal alpine:3.20 getent hosts host.docker.internal 2>/dev/null | awk '{print $1}') || true
 GW="${HDI:-$BRIDGE_GW}"
 echo "internal network bridge gateway: $BRIDGE_GW; host reachable via: $GW"
 

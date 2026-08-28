@@ -149,6 +149,125 @@ func TestSessionsConcurrentCreateUniqueIDs(t *testing.T) {
 	}
 }
 
+// slowFake wraps driver.Fake but blocks inside Create until the test closes
+// (or sends on) unblock. It lets a test deterministically land a request in
+// POST /sessions' window between registry.put (state "starting", handle "")
+// and drv.Create returning — the exact window I1's fix (registry.opTarget +
+// sessionOp's "starting" guard) protects.
+type slowFake struct {
+	*driver.Fake
+	unblock chan struct{}
+}
+
+func newSlowFake(total int) *slowFake {
+	return &slowFake{Fake: driver.NewFake(total), unblock: make(chan struct{})}
+}
+
+// Create shadows the embedded Fake's Create so slowFake satisfies
+// driver.Driver with a blocking Create while every other method (Inspect,
+// Destroy, Suspend, Resume, Snapshot, Capacity) still goes straight through
+// to the real Fake.
+func (f *slowFake) Create(ctx context.Context, spec driver.Spec) (driver.Handle, error) {
+	<-f.unblock
+	return f.Fake.Create(ctx, spec)
+}
+
+// TestSessionOpRejectsStartingSession is the regression test for I1: a
+// DELETE (or suspend/resume/snapshot) landing between registry.put and
+// drv.Create returning used to read handle=="" unlocked, act on it as a
+// no-op (Destroy("") for DELETE), and remove the registry entry — while
+// POST /sessions was still inside Create. Create then succeeded into a
+// container the registry no longer tracked: its sessiond would dial
+// /register, get a 404 (no registry entry), and fatally exit — an orphaned,
+// exited container invisible to runnerd. Ops on a "starting" entry must be
+// rejected (409), and the session must complete normally — not be
+// orphaned — once Create actually finishes.
+func TestSessionOpRejectsStartingSession(t *testing.T) {
+	fd := newSlowFake(4)
+	rd := New(fd, "", "")
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+
+	type createResult struct {
+		id  string
+		err error
+	}
+	resultCh := make(chan createResult, 1)
+	go func() {
+		id, err := postSession(srv.URL)
+		resultCh <- createResult{id, err}
+	}()
+
+	// Poll GET /sessions until the starting entry shows up (Create is
+	// blocked, so this must observe the pre-Create registry.put).
+	var id string
+	deadline := time.Now().Add(2 * time.Second)
+	for id == "" && time.Now().Before(deadline) {
+		resp, err := http.Get(srv.URL + "/sessions")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rows []struct{ ID, State string }
+		json.NewDecoder(resp.Body).Decode(&rows)
+		resp.Body.Close()
+		if len(rows) == 1 && rows[0].State == "starting" {
+			id = rows[0].ID
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if id == "" {
+		t.Fatal("session never appeared as \"starting\" in GET /sessions while Create was blocked")
+	}
+
+	// DELETE while Create is still blocked (handle=="") must be rejected,
+	// not act on an empty handle and remove the entry out from under the
+	// in-flight Create.
+	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/sessions/"+id, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("DELETE on starting session = %d, want %d", resp.StatusCode, http.StatusConflict)
+	}
+	// The entry must still be there (not removed by the rejected DELETE).
+	if _, _, ok := rd.reg.opTarget(id); !ok {
+		t.Fatal("rejected DELETE removed the registry entry anyway")
+	}
+
+	// Unblock Create; POST /sessions must complete normally.
+	close(fd.unblock)
+	select {
+	case r := <-resultCh:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if r.id != id {
+			t.Fatalf("create id = %q, want %q", r.id, id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("POST /sessions never returned after unblocking Create")
+	}
+
+	// The session must become running with a real handle — not orphaned —
+	// and the fake driver's own item must still exist (never Destroy()'d by
+	// the rejected DELETE).
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		handle, state, ok := rd.reg.opTarget(id)
+		if ok && state == "running" && handle != "" {
+			h, err := fd.Inspect(context.Background(), handle)
+			if err != nil || h.State != driver.StateRunning {
+				t.Fatalf("fake driver's container not running post-create (orphan/destroyed?): %+v, %v", h, err)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("session never became running with a handle after Create unblocked")
+}
+
 // dialRegisterAndServe simulates a container's sessiond: it creates a real
 // (Docker-free) session.Session running argv, dials /register?session=id,
 // and pumps relay.ServeSession over that connection in the background. It
