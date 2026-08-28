@@ -19,11 +19,20 @@ import (
 func ServeSession(ctx context.Context, conn Conn, s *session.Session) error {
 	var mu sync.Mutex
 	atts := map[uint64]*session.Attachment{}
-	write := func(f Frame) { b, _ := Encode(f); conn.Write(ctx, b) }
+	write := func(f Frame) error { b, _ := Encode(f); return conn.Write(ctx, b) }
 
 	for {
 		raw, err := conn.Read(ctx)
-		if err != nil { return err }
+		if err != nil {
+			// Outbound conn is dead — detach every live attachment so its
+			// forwarder goroutine (ranging att.Msgs) exits and the session
+			// stops clamping/serving a viewer that can no longer be reached.
+			mu.Lock()
+			for _, att := range atts { s.Detach(att.ID) }
+			atts = map[uint64]*session.Attachment{}
+			mu.Unlock()
+			return err
+		}
 		f, err := Decode(raw)
 		if err != nil { continue }
 		switch f.Type {
@@ -34,7 +43,17 @@ func ServeSession(ctx context.Context, conn Conn, s *session.Session) error {
 			go func(id uint64, a *session.Attachment) {
 				for msg := range a.Msgs {
 					p, _ := json.Marshal(msg)
-					write(Frame{Type: FrameServer, AttachID: id, Payload: p})
+					if write(Frame{Type: FrameServer, AttachID: id, Payload: p}) != nil {
+						// conn is dead: stop pumping and detach locally so
+						// this viewer slot is freed instead of held (and
+						// clamping terminal size) forever. The outer loop's
+						// own conn-death cleanup above may race this and
+						// detach the same id too — s.Detach is idempotent,
+						// so that's safe, not a bug.
+						mu.Lock(); delete(atts, id); mu.Unlock()
+						s.Detach(a.ID)
+						return
+					}
 				}
 				write(Frame{Type: FrameClose, AttachID: id})
 				mu.Lock(); delete(atts, id); mu.Unlock()
