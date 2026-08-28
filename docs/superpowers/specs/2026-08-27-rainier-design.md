@@ -1,19 +1,20 @@
-# agentcloud — Design Spec
+# rainier — Design Spec
 
 **Date:** 2026-08-27 · **Status:** Draft for review · **Author:** Jace (with Josh)
-**Working name:** `agentcloud` (placeholder; final name TBD by Josh)
+**Name:** Rainier (decided by Josh, 2026-08-27) · **Version:** this spec covers v0
+**License:** Apache-2.0 · **Standalone:** separate from agent-os initially
 **Research basis:** four-track landscape research, 2026-08-27 (report: claude.ai artifact `2cc53a9a`)
 
 ## 1. Overview
 
-agentcloud is self-hostable infrastructure that runs a developer's coding agents
+rainier is self-hostable infrastructure that runs a developer's coding agents
 (Claude Code, Codex, Gemini CLI, Goose, later OpenCode/pi) in the cloud while
 feeling like local terminal sessions. A small team installs it in their own cloud
 (GCP, AWS, Azure, or any Linux VMs); each agent runs in an isolated sandbox that
 survives laptop sleep, network changes, and device switches. Users keep their own
 AI subscriptions and their own GitHub identity.
 
-### Goals (v1)
+### Goals (v0)
 
 - Sessions survive any client disconnect; reattach is instant from any machine.
 - Attach shows the agent's real TUI, byte-for-byte (terminal-first).
@@ -25,13 +26,13 @@ AI subscriptions and their own GitHub identity.
 - Runtime is agent-agnostic and compute-agnostic by construction (runner API,
   adapter layer).
 
-### Non-goals (v1)
+### Non-goals (v0)
 
 Mobile client; K8s/gVisor driver; warm pools and memory snapshots; egress
 token-injection and two-phase networking; OpenCode/pi adapters; GitLab/Bitbucket;
 webhook-triggered sessions; hosted (SaaS) control plane; Cloudflare driver;
 predictive local echo; session recordings / hash-chained audit; session sharing;
-multi-tenant control plane. See §12 for the v2 line.
+multi-tenant control plane. See §12 for the v1 line.
 
 ## 2. Locked decisions
 
@@ -39,10 +40,10 @@ multi-tenant control plane. See §12 for the v2 line.
 |---|---|
 | Repo model | Standalone repo, designed for small-team adoption (including Josh) |
 | Deploy model | All-in-their-cloud: control plane + data plane in the team's cloud; single-tenant per install; VPC = tenant boundary |
-| v1 substrate | VMs + Docker sessions behind the runner API; K8s + gVisor is a v2 driver |
+| v0 substrate | VMs + Docker sessions behind the runner API; K8s + gVisor is a v1 driver |
 | Agent layer | Agent-agnostic runtime; ACP as internal event vocabulary; pluggable adapters; universal PTY plane; per-session mode (TUI / ACP) |
-| v1 adapters | Claude Code (TUI mode), generic ACP (structured mode), screen-diff fallback |
-| Clients | Terminal-first: CLI + minimal web fleet dashboard in v1; mobile (responsive web + push) is the first fast-follow |
+| v0 adapters | Claude Code (TUI mode), generic ACP (structured mode), screen-diff fallback |
+| Clients | Terminal-first: CLI + minimal web fleet dashboard in v0; mobile (responsive web + push) is the first fast-follow |
 | Stack | Go for controld/runnerd/sessiond/CLI; TS/React for web |
 | Auth | GitHub device flow (shared OAuth app client ID) as default; per-install GitHub App as opt-in org hardening; git-provider interface for future GitLab/Bitbucket |
 | State rule | Ephemeral state in process memory, reconstructed from reconnections; durable state in Postgres; no Redis/second store until a measured bottleneck |
@@ -87,7 +88,7 @@ worktree/branch. A user runs many sessions; two sessions on one repo get
 independent clones and branches. The session is the unit of attach, permissions,
 diff, and lifecycle.
 
-## 4. Runner API and the v1 Docker driver
+## 4. Runner API and the v0 Docker driver
 
 Contract (controld → runnerd over the runner's outbound connection):
 
@@ -111,7 +112,7 @@ suspend ~10 min, cold park after a few hours, destroy only explicit/TTL.
 
 1. **Owns the PTY**: allocates it, spawns the agent CLI onto it, holds the
    controlling side forever; propagates resize (smallest-active-viewer wins in
-   v1), delivers signals, reaps children. The agent cannot tell it isn't local —
+   v0), delivers signals, reaps children. The agent cannot tell it isn't local —
    which also keeps the unmodified-CLI compliance property.
 2. **Terminal state**: headless VT emulator maintains the current screen grid
    (incl. alternate screen) + ~10k-line scrollback ring. Attach = snapshot + live
@@ -156,9 +157,9 @@ selected in the session spec.
   structured-first (CLI renders transcript + input line; web likewise). PTY plane
   still exists: attach drops into a shell in the session workspace.
 
-Both modes ship in v1; usage decides emphasis.
+Both modes ship in v0; usage decides emphasis.
 
-**v1 adapters:**
+**v0 adapters:**
 
 1. **Claude Code (TUI)** — unmodified CLI on the PTY (the compliant subscription
    path). Transcript: tail the session JSONL. Status/notifications: hooks
@@ -200,7 +201,7 @@ install / CLI keychain. Web login uses the same OAuth app (browser flow).
 hardening: a per-install **GitHub App** (manifest flow) for selected-repo
 scoping and for system-initiated work (§8). Roles: admin (fleet, environments,
 egress policy, GitHub config) and member (own sessions). Fleet view is
-team-visible by default (trust-your-team v1).
+team-visible by default (trust-your-team v0).
 
 **State:** Postgres holds users, sessions (spec + lifecycle + placement),
 environments, permission decisions, and event summaries for the dashboard. Full
@@ -210,7 +211,7 @@ No Redis (see state rule, §2).
 ## 8. Git provider, credentials, secrets
 
 **Git provider interface** (auth flow, token minting, PR creation, webhooks);
-GitHub is the v1 implementation; GitLab/Bitbucket are future providers.
+GitHub is the v0 implementation; GitLab/Bitbucket are future providers.
 
 **GitHub:**
 
@@ -223,7 +224,7 @@ GitHub is the v1 implementation; GitLab/Bitbucket are future providers.
   tokens (1 h, down-scoped to repo + `contents:write` + `pull_requests:write`)
   for system-initiated work (background PR creation; later webhook-triggered
   sessions). Bot-authored commits carry `Co-authored-by:` the human.
-- Sessions push only their own branch by convention + audit in v1
+- Sessions push only their own branch by convention + audit in v0
   (proxy-enforced later); branch protections respected; PRs via API.
 
 **Subscription login:** per user, per agent, a persistent **credential volume**
@@ -231,10 +232,10 @@ mounted into all their sessions. First session: user attaches and completes the
 vendor's own login in the TUI (Claude OAuth; Codex device code). Credentials
 never transit controld, never touch Postgres. API-key users use team secrets.
 
-**Secrets & egress (v1 honesty):** egressd = CONNECT proxy, default-deny,
+**Secrets & egress (v0 honesty):** egressd = CONNECT proxy, default-deny,
 per-environment allowlist, destination logging (no payload MITM). Team secrets
 encrypted in Postgres, injected as env vars at session start — agent-readable in
-v1, documented as such. Token injection at the proxy + two-phase network are v2.
+v0, documented as such. Token injection at the proxy + two-phase network are v1.
 
 ## 9. Environments, lifecycle, fast start
 
@@ -243,7 +244,7 @@ refs + egress allowlist. First session runs setup live (streamed to the attached
 terminal), then `snapshot()` caches the environment image; later sessions boot
 from it. `devcontainer.json` `image` field read as a hint; full spec compat later.
 
-**v1 fast path:** environment images pre-pulled to VMs on snapshot creation;
+**v0 fast path:** environment images pre-pulled to VMs on snapshot creation;
 per-VM bare-repo mirror (worktree checkout in ~hundreds of ms, no network
 clone); container start ~100 ms; agent CLI boot is the honest long pole (~few s).
 **Attach immediately and stream everything** — user watches the session come up
@@ -256,10 +257,10 @@ only explicit/TTL. Warm resume near-instant; cold resume = agent native
 
 ## 10. Security model & failure handling
 
-**Threat model (v1):** defend against a misbehaving or prompt-injected agent —
+**Threat model (v0):** defend against a misbehaving or prompt-injected agent —
 not hostile co-tenants (single-team install; VPC is the tenant boundary).
 Controls: hardened containers (§4), egressd default-deny, per-user credential
-volumes, short-lived git tokens, authenticated client traffic. Known v1 gaps
+volumes, short-lived git tokens, authenticated client traffic. Known v0 gaps
 (documented): env-var secrets agent-readable; no payload inspection; push-branch
 discipline by convention.
 
@@ -269,8 +270,8 @@ discipline by convention.
   attach unavailable during outage (accepted).
 - sessiond/container crash → runnerd restarts via cold-resume path.
 - VM reboot → cold resume.
-- VM loss → v1 durability is git: session branches push early and often
-  (adapter-nudged). Unpushed work on a dead VM is lost in v1 (see §12).
+- VM loss → v0 durability is git: session branches push early and often
+  (adapter-nudged). Unpushed work on a dead VM is lost in v0 (see §12).
 
 ## 11. Testing strategy
 
@@ -284,7 +285,7 @@ discipline by convention.
 5. Chaos runs: kill controld / kill sessiond / network flap; assert resume
    invariants. Real-agent smoke tests behind API keys.
 
-## 12. v2 roadmap
+## 12. v1 roadmap
 
 - **Durability** (headline): (a) shadow-branch auto-push to
   `refs/sessions/<id>` every few minutes / per turn (restore = fetch);
@@ -302,15 +303,15 @@ discipline by convention.
   loops); predictive local echo; session recordings + hash-chained audit;
   session sharing; hosted control plane.
 
-## 13. Open questions (Josh's call)
+## 13. Decisions log & open questions
 
-- Final product/repo name (placeholder: `agentcloud`).
-- Open-source licensing posture (Apache-everything vs AGPL-core vs BSL) and
-  pricing shape (orchestration seats — decided direction: never token margin).
-- First wedge emphasis: solo prosumers vs small teams (design serves both; GTM
-  ordering open).
-- Relationship to agent-os: share the runner-API/WorkerBackend abstraction
-  vs. keep them parallel initially.
+Decided (Josh, 2026-08-27): name **Rainier**; this scope is **v0** (roadmap in
+§12 is v1); license **Apache-2.0**; Rainier stays a **standalone project**,
+separate from agent-os initially. Pricing direction: orchestration seats, never
+token margin.
+
+Open (Josh's call): first wedge emphasis — solo prosumers vs small teams (the
+design serves both; go-to-market ordering open). Exact pricing shape.
 
 ## 14. References
 
