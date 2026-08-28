@@ -127,8 +127,15 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 	writerDone.Add(1)
 	s.agentWriterCount.Add(1)
 	go func() { // single writer: every FromRunner goes out over this one goroutine
-		defer s.agentWriterCount.Add(-1)
+		// Deferred in this order (LIFO: Add(-1) runs before Done()) so that
+		// by the time writerDone.Wait() (agentSession's own teardown defer)
+		// unblocks, agentWriterCount has already been decremented — without
+		// this ordering, Wait() could return while the count still briefly
+		// reads the old value, and a caller that starts a new writer right
+		// after Wait() returns (RunAgent's next agentSession) could observe
+		// 2 instead of the 0-or-1 the count is meant to guarantee.
 		defer writerDone.Done()
+		defer s.agentWriterCount.Add(-1)
 		for {
 			select {
 			case m := <-out:

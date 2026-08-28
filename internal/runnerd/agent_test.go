@@ -140,6 +140,14 @@ func TestAgentAnnounces(t *testing.T) {
 	if err := rd.CreateWithID(context.Background(), "sess-1", driver.Spec{Image: "img"}, nil); err != nil {
 		t.Fatal(err)
 	}
+	// A "suspending" entry (mid cold-suspend — drv.Suspend's `docker stop` in
+	// flight, no HTTP path reaches this transient state deterministically,
+	// so it's seeded directly) must appear as suspended_cold, not be
+	// omitted — review round 2's finding: omission here is unhealable
+	// (controld's reconciliation would see it in Postgres but absent from
+	// the announce and mark it permanently dead), unlike "starting", which
+	// stays safely omitted (see Announce's doc comment).
+	rd.reg.put("sess-suspending", &sessionEntry{id: "sess-suspending", state: "suspending"})
 
 	fc := newFakeControld(t, testToken)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -153,8 +161,18 @@ func TestAgentAnnounces(t *testing.T) {
 	if ann.Runner != "vm1" {
 		t.Fatalf("Runner = %q, want \"vm1\"", ann.Runner)
 	}
-	if len(ann.Sessions) != 1 || ann.Sessions[0].ID != "sess-1" || ann.Sessions[0].State != "running" {
-		t.Fatalf("Sessions = %+v, want one {sess-1 running}", ann.Sessions)
+	got := map[string]string{}
+	for _, si := range ann.Sessions {
+		got[si.ID] = si.State
+	}
+	want := map[string]string{"sess-1": "running", "sess-suspending": "suspended_cold"}
+	if len(got) != len(want) {
+		t.Fatalf("Sessions = %+v, want %+v", ann.Sessions, want)
+	}
+	for id, state := range want {
+		if got[id] != state {
+			t.Fatalf("Sessions[%s] state = %q, want %q (full: %+v)", id, got[id], state, ann.Sessions)
+		}
 	}
 	if ann.Total == 0 {
 		t.Fatal("Total not populated (want the fake driver's capacity)")
