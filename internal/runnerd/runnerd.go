@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -22,7 +23,7 @@ type Server struct {
 	drv         driver.Driver
 	reg         *registry
 	dialBase    string // e.g. ws://runnerd:8080 — what sessiond dials to register
-	seq         int
+	seq         atomic.Int64
 	egressAdmin string // http://egressd:3129 (optional)
 }
 
@@ -39,7 +40,14 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-func (s *Server) newID() string { s.seq++; return "sess-" + strconv.Itoa(s.seq) }
+// newID is called from concurrent POST /sessions handlers (the normal fleet
+// operating mode — many callers creating sessions at once), so the counter
+// must be a real atomic increment: a plain s.seq++ is a read-modify-write
+// with no synchronization, and two concurrent POSTs can both read the same
+// value, both increment to the same next value, and mint the same id —
+// registry.put then silently overwrites the first session's entry, making
+// its driver handle unreachable and its capacity accounting wrong.
+func (s *Server) newID() string { return "sess-" + strconv.FormatInt(s.seq.Add(1), 10) }
 
 func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -92,9 +100,25 @@ func (s *Server) sessionOp(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 	if r.Method == http.MethodDelete {
+		// Close the hub (if the session ever registered) before removing the
+		// entry: hub.Close() cancels its ctx, which is what unblocks
+		// register()'s own `<-hub.Done()` wait so that goroutine cleans up
+		// synchronously with this deliberate teardown instead of being left
+		// to find out later. register() also calls reg.remove/hub.Close on
+		// its own unblock — both are safe, idempotent no-ops the second time.
+		if h, ok := s.reg.hub(id); ok {
+			h.Close()
+		}
 		s.drv.Destroy(ctx, e.handle)
 		s.reg.remove(id)
 		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// Every other op below is a mutation (suspend/resume) or driver call
+	// (snapshot); only POST may trigger them — a GET on
+	// /sessions/{id}/suspend must not be able to execute one.
+	if r.Method != http.MethodPost {
+		http.Error(w, "method", http.StatusMethodNotAllowed)
 		return
 	}
 	op := ""
@@ -144,25 +168,31 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	}
 	c.SetReadLimit(16 << 20)
 	hub := relay.NewHub(r.Context(), relay.WSConn(c))
-	s.reg.setHub(id, hub)
-	// Block until the session conn closes, keeping this handler goroutine
-	// (and therefore the hub it owns) alive for the container's lifetime.
-	//
-	// KNOWN LIMITATION: r.Context() is canceled by net/http only when this
-	// handler returns (see conn.serve's deferred w.cancelCtx) or the server's
-	// base context is canceled — for a hijacked connection (which
-	// websocket.Accept performs under the hood for HTTP/1.1), the stdlib's
-	// background-read-based "cancel on peer close" watcher is explicitly
-	// stopped by Hijack(). So if the container dies and sessiond's socket
-	// drops out from under hub.readLoop (which does notice — it calls
-	// h.cancel() on its own derived context and tears down every attached
-	// client), this handler itself keeps blocking here: the registry entry
-	// is never removed and this goroutine is never reclaimed. Fixing that
-	// needs an independent liveness signal (e.g. a Ping loop like server.go's
-	// viewer-liveness ping) since relay.Hub exposes no "session conn died"
-	// signal to key off directly; left as a v0 gap — the only way this
-	// unblocks today is r.Context() actually canceling (server shutdown).
-	<-r.Context().Done()
+	if !s.reg.setHub(id, hub) {
+		// The entry vanished between our existence check above and now — a
+		// concurrent DELETE raced this dial-in (session torn down while its
+		// container was still booting). No registry entry will ever exist to
+		// reap this hub later, so close it now rather than leak its readLoop
+		// goroutine and the underlying fd.
+		hub.Close()
+		return
+	}
+	// Block on the hub's own liveness signal, not r.Context(). websocket.Accept
+	// hijacks the connection for HTTP/1.1, and net/http only cancels
+	// r.Context() when this handler itself returns (conn.serve's deferred
+	// w.cancelCtx) or the server's base context is canceled — the stdlib's
+	// background-read-based "cancel ctx on peer close" watcher is explicitly
+	// stopped by Hijack(), so r.Context() never reflects sessiond's socket
+	// actually dying. hub.Done() does: it closes both when hub.readLoop
+	// notices h.conn.Read fail (container/network death — readLoop already
+	// cancels the hub's own ctx and tears down every attached client) and
+	// when sessionOp's DELETE branch calls hub.Close() directly (deliberate
+	// teardown). Either way, unblocking here is what lets us actually remove
+	// the now-dead entry and let this goroutine (and its fd) go — leaving
+	// this on r.Context() instead would leak both per session, forever, on
+	// every abrupt death or explicit rm.
+	<-hub.Done()
+	s.reg.remove(id)
 	hub.Close()
 }
 

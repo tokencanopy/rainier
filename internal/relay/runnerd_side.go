@@ -110,4 +110,20 @@ func (h *Hub) AttachClient(ctx context.Context, client Conn, since uint64, cols,
 	}
 }
 
+// Done reports when the session conn has died — either readLoop noticed
+// h.conn.Read fail on its own (container/network death) and called
+// h.cancel(), or a caller invoked Close() directly. Both converge on the
+// same h.ctx cancellation, so this is the one signal a caller needs to learn
+// "this hub is no longer serving a live session conn" without duplicating
+// readLoop's own liveness detection.
+func (h *Hub) Done() <-chan struct{} { return h.ctx.Done() }
+
+// Close is idempotent and safe to call more than once, including
+// concurrently with itself or with readLoop's own h.cancel() call: cancel
+// (from context.WithCancel) tolerates repeat calls by contract, and
+// coder/websocket's CloseNow is a best-effort immediate close that likewise
+// tolerates being called again on an already-closed conn. Callers relying on
+// this: runnerd's /register handler calls it after Done() fires, and
+// sessionOp's DELETE branch calls it directly to force that same Done() —
+// both can legitimately race to close the same hub.
 func (h *Hub) Close() { h.cancel(); h.conn.Close() }

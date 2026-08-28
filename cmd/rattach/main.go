@@ -8,8 +8,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/coder/websocket"
@@ -21,13 +23,29 @@ import (
 
 const detachKey = 0x1d // Ctrl-]
 
+// attachURL builds the /attach URL from a base (sessiond directly, or
+// runnerd's relay — same contract either way). session is appended as an
+// extra query param only when non-empty: direct sessiond has no use for it
+// and ignores unknown params, while runnerd's /attach handler reads it to
+// find the right hub. Factored out so the URL contract (base is just
+// "scheme://host[:port]", never anything with a path already on it) has one
+// place to get right and one place to unit test.
+func attachURL(base string, since uint64, session string) string {
+	u := base + "/attach?since=" + strconv.FormatUint(since, 10)
+	if session != "" {
+		u += "&session=" + url.QueryEscape(session)
+	}
+	return u
+}
+
 func main() {
-	url := flag.String("url", "ws://127.0.0.1:7070", "sessiond base URL")
+	baseURL := flag.String("url", "ws://127.0.0.1:7070", "sessiond/runnerd base URL (no path)")
 	since := flag.Uint64("since", 0, "resume from sequence number")
+	session := flag.String("session", "", "session id — required when --url points at runnerd's relay; ignored (and unnecessary) when attaching directly to sessiond")
 	flag.Parse()
 
 	ctx := context.Background()
-	c, _, err := websocket.Dial(ctx, fmt.Sprintf("%s/attach?since=%d", *url, *since), nil)
+	c, _, err := websocket.Dial(ctx, attachURL(*baseURL, *since, *session), nil)
 	if err != nil {
 		log.Fatal(err)
 	}

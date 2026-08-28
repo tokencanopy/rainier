@@ -40,27 +40,46 @@ func main() {
 		io.Copy(os.Stdout, resp.Body)
 		fmt.Println()
 	case "attach":
-		id := args[1]
-		wsURL := strings.Replace(*base, "http", "ws", 1) + "/attach?session=" + id
-		cmd := exec.Command("./bin/rattach", "--url", wsURL)
+		id := requireID(args, "attach")
+		// rattach's --url is a BASE it appends /attach?since=... to itself
+		// (see attachURL in cmd/rattach/main.go); passing it a URL that
+		// already has /attach?session=<id> on it would double up the path
+		// and mangle the session id into the since query string. Pass the
+		// bare ws://host:port base and the session id separately instead —
+		// rattach folds them into the same URL contract it uses talking to
+		// sessiond directly.
+		wsBase := strings.Replace(*base, "http", "ws", 1)
+		cmd := exec.Command("./bin/rattach", "--url", wsBase, "--session", id)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		cmd.Run()
 	case "suspend":
-		post(*base + "/sessions/" + args[1] + "/suspend")
+		post(*base + "/sessions/" + requireID(args, "suspend") + "/suspend")
 	case "resume":
-		post(*base + "/sessions/" + args[1] + "/resume")
+		post(*base + "/sessions/" + requireID(args, "resume") + "/resume")
 	case "snapshot":
-		post(*base + "/sessions/" + args[1] + "/snapshot")
+		post(*base + "/sessions/" + requireID(args, "snapshot") + "/snapshot")
 	case "rm":
-		req, _ := http.NewRequest(http.MethodDelete, *base+"/sessions/"+args[1], nil)
+		id := requireID(args, "rm")
+		req, _ := http.NewRequest(http.MethodDelete, *base+"/sessions/"+id, nil)
 		resp, err := http.DefaultClient.Do(req)
 		check(err)
 		resp.Body.Close()
-		fmt.Println("removed", args[1])
+		fmt.Println("removed", id)
 	default:
 		fmt.Fprintln(os.Stderr, "unknown command", args[0])
 		os.Exit(2)
 	}
+}
+
+// requireID pulls the session-id positional argument for a subcommand that
+// needs one, exiting with a usage message instead of panicking with an
+// index-out-of-range when it's missing.
+func requireID(args []string, cmd string) string {
+	if len(args) < 2 {
+		fmt.Fprintf(os.Stderr, "usage: runnerctl %s <session-id>\n", cmd)
+		os.Exit(2)
+	}
+	return args[1]
 }
 func post(url string) {
 	resp, err := http.Post(url, "application/json", nil)

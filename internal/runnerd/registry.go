@@ -44,9 +44,18 @@ func (r *registry) list() []sessionEntry {
 	for _, e := range r.items { out = append(out, *e) }
 	return out
 }
-func (r *registry) setHub(id string, h *relay.Hub) {
+// setHub reports whether the entry still existed to receive the hub. It can
+// return false when a concurrent DELETE removed the entry between register's
+// existence check and this call (session deleted while its container was
+// still booting/dialing in) — the caller has a live hub with a running
+// readLoop goroutine that will now never be found through the registry, so
+// it must close that hub itself instead of leaking it.
+func (r *registry) setHub(id string, h *relay.Hub) bool {
 	r.mu.Lock(); defer r.mu.Unlock()
-	if e, ok := r.items[id]; ok { e.hub = h }
+	e, ok := r.items[id]
+	if !ok { return false }
+	e.hub = h
+	return true
 }
 
 // hub reads an entry's hub field under the registry lock. attach's
