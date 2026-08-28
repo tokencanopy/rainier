@@ -16,6 +16,12 @@ func Serialize(s Screen) []byte {
 		b.WriteString(fmt.Sprintf("\x1b[%d;1H", y+1))
 		for x := 0; x < s.Cols; x++ {
 			c := cellAt(s, y, x)
+			if c.Width == 0 {
+				// Placeholder trailing a wide cell we already emitted one
+				// column ago; the target terminal's cursor already moved
+				// past this column when it processed that wide rune.
+				continue
+			}
 			k := keyOf(c)
 			if k != cur {
 				b.WriteString("\x1b[0m")
@@ -35,7 +41,7 @@ func Serialize(s Screen) []byte {
 
 func cellAt(s Screen, y, x int) Cell {
 	if y < len(s.Cells) && x < len(s.Cells[y]) { return s.Cells[y][x] }
-	return Cell{R: ' '}
+	return Cell{R: ' ', Width: 1}
 }
 
 type styleKey struct {

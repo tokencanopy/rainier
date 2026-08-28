@@ -15,6 +15,7 @@ var fixtures = map[string][]byte{
 	"clear":     []byte("junk junk junk\x1b[2J\x1b[Hclean"),
 	"altscreen": []byte("main\x1b[?1049halt-content"),
 	"wrap":      []byte("aaaaaaaaaaaaaaaaaaaaaaaaaa"), // wider than 20 cols
+	"wide":      []byte("你好 ab\r\n中文"),                // CJK width-2 runes must not shift trailing cells
 }
 
 func screensEqual(t *testing.T, a, b Screen) {
@@ -43,6 +44,48 @@ func TestSnapshotRoundTrip(t *testing.T) {
 			b.Feed(Serialize(sa))
 			screensEqual(t, sa, b.Screen())
 		})
+	}
+}
+
+// TestWideRuneCellWidth pins the exact symptom this fixture was diagnosed
+// from: without carrying cell width through, the "好" continuation cell's
+// serialized space shifts every following cell one column to the right, so
+// "b" (which directly follows "你好 a" in the fixture) lands in column 7
+// instead of column 6.
+func TestWideRuneCellWidth(t *testing.T) {
+	e := NewEmulator(20, 5)
+	e.Feed(fixtures["wide"])
+	s := e.Screen()
+
+	if s.Cells[0][0].R != '你' || s.Cells[0][0].Width != 2 {
+		t.Fatalf("cell(0,0) = %+v, want lead cell of 你 with Width 2", s.Cells[0][0])
+	}
+	if s.Cells[0][1].Width != 0 {
+		t.Fatalf("cell(0,1) = %+v, want the 你 continuation cell (Width 0)", s.Cells[0][1])
+	}
+	if s.Cells[0][2].R != '好' || s.Cells[0][2].Width != 2 {
+		t.Fatalf("cell(0,2) = %+v, want lead cell of 好 with Width 2", s.Cells[0][2])
+	}
+	if s.Cells[0][3].Width != 0 {
+		t.Fatalf("cell(0,3) = %+v, want the 好 continuation cell (Width 0)", s.Cells[0][3])
+	}
+	if s.Cells[0][4].R != ' ' {
+		t.Fatalf("cell(0,4) = %q, want the literal space", s.Cells[0][4].R)
+	}
+	if s.Cells[0][5].R != 'a' {
+		t.Fatalf("cell(0,5) = %q, want 'a'", s.Cells[0][5].R)
+	}
+	if s.Cells[0][6].R != 'b' {
+		t.Fatalf("cell(0,6) = %q, want 'b' (regression: previously landed in column 7)", s.Cells[0][6].R)
+	}
+
+	// Round-trip through Serialize and confirm the target emulator agrees
+	// column-for-column, not just on this row's raw feed.
+	b := NewEmulator(20, 5)
+	b.Feed(Serialize(s))
+	rt := b.Screen()
+	if rt.Cells[0][6].R != 'b' {
+		t.Fatalf("after round-trip, cell(0,6) = %q, want 'b'", rt.Cells[0][6].R)
 	}
 }
 

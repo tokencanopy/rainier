@@ -76,12 +76,24 @@ func (e *emu) Screen() Screen {
 // convertCell maps a *uv.Cell (the vt library's per-cell rune + style type)
 // to term.Cell.
 func convertCell(c *uv.Cell) Cell {
-	if c == nil || c.Content == "" {
-		return Cell{R: ' '}
+	if c == nil {
+		return Cell{R: ' ', Width: 1}
+	}
+	if c.Content == "" {
+		// The vt library represents the column(s) after a wide cell's lead
+		// column as zero-value placeholder cells (empty Content, Width 0) —
+		// see charmbracelet/ultraviolet's Line.Set. Carry that Width 0
+		// through unchanged so Serialize knows to skip it.
+		return Cell{Width: 0}
 	}
 	r := []rune(c.Content)[0]
+	w := c.Width
+	if w <= 0 {
+		w = 1
+	}
 	return Cell{
 		R:         r,
+		Width:     w,
 		FG:        convertColor(c.Style.Fg),
 		BG:        convertColor(c.Style.Bg),
 		Bold:      c.Style.Attrs&uv.AttrBold != 0,
