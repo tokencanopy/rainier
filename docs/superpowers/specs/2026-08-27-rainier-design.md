@@ -236,10 +236,42 @@ GitHub is the v0 implementation; GitLab/Bitbucket are future providers.
 - Sessions push only their own branch by convention + audit in v0
   (proxy-enforced later); branch protections respected; PRs via API.
 
-**Subscription login:** per user, per agent, a persistent **credential volume**
-mounted into all their sessions. First session: user attaches and completes the
-vendor's own login in the TUI (Claude OAuth; Codex device code). Credentials
-never transit controld, never touch Postgres. API-key users use team secrets.
+**Subscription login:** each user gets one persistent **credential volume**
+holding their agent home directories (`~/.claude`, `~/.codex`, …), mounted into
+every session they own and nobody else's. Log in once per agent; all current
+and future sessions are authenticated. Credentials never transit controld,
+never touch Postgres. API-key users use team or per-user secrets instead.
+
+**Agent login flows** (`rainier agent-login <agent>` starts a throwaway session
+and attaches the user for a guided first login):
+
+- **Claude Code:** `/login` in the real TUI prints Anthropic's OAuth URL —
+  clickable in the user's local terminal because attach is their real terminal;
+  authenticate in the local browser, paste the code back into the TUI. On
+  headless Linux the credential lands in `~/.claude/.credentials.json` on the
+  user's volume (supported no-keychain path). Alternative: user runs
+  `claude setup-token` on their laptop and stores the long-lived token as a
+  per-user secret (`CLAUDE_CODE_OAUTH_TOKEN`) — Anthropic's own headless
+  mechanism.
+- **Codex:** `codex login --device-auth` (code + URL, approve on laptop;
+  credential → `~/.codex/auth.json`). Document the caveat: ChatGPT workspace
+  admins must enable "Allow device code login". Additionally, the CLI supports
+  **login port-forwarding**: forwarding an agent's localhost OAuth-callback
+  port from the user's laptop into the sandbox during login, so ordinary
+  browser-callback flows complete as if local — generalizes to any agent whose
+  login assumes localhost.
+- **Others:** Gemini CLI/Goose via device-style flows or API keys; OpenCode via
+  per-provider API keys (its Anthropic subscription auth was disabled
+  server-side by Anthropic — Claude subscriptions run through Claude Code on
+  Rainier). Universal fallback: API keys as secrets.
+
+Compliance recap: unmodified binaries; every login completes through the
+vendor's own flow with the user's own account; device/paste-back codes pass
+through the PTY as ordinary keystrokes; tokens live only on the user's volume
+in the team's infrastructure. Ops notes for docs: concurrent sessions share one
+agent home exactly as N local instances do; N parallel sessions on one Pro/Max
+plan will hit vendor "ordinary individual usage" throttles — the dashboard
+surfaces rate-limit state so it doesn't present as a Rainier failure.
 
 **Secrets & egress (v0 honesty):** egressd = CONNECT proxy, default-deny,
 per-environment allowlist, destination logging (no payload MITM). Team secrets
