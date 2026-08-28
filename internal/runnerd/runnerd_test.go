@@ -306,11 +306,19 @@ func waitForHub(t *testing.T, rd *Server, id string) {
 }
 
 // TestRegisterCleansUpOnSessionConnDeath is the regression test for the
-// register-lifetime fix: killing the sessiond-side conn (simulating the
-// container dying) must reap the registry entry within a bounded deadline,
-// not leak it (and the /register handler goroutine) forever.
+// register-lifetime fix: when the container is actually gone (confirmed via
+// Inspect, not merely inferred from the conn closing — see Task 5's
+// inspect-before-destroy change), killing the sessiond-side conn must reap
+// the registry entry within a bounded deadline, not leak it (and the
+// /register handler goroutine) forever. Before Task 5 any conn death alone
+// was treated as proof of a crash; now the fake driver's item is explicitly
+// destroyed (simulating the container having actually died) so this test
+// still exercises "the container is really gone" rather than the
+// alive-container/redial branch TestHubDeathAliveContainerKeepsSession
+// covers.
 func TestRegisterCleansUpOnSessionConnDeath(t *testing.T) {
-	rd := New(driver.NewFake(4), "", "")
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "")
 	srv := httptest.NewServer(rd.Handler())
 	defer srv.Close()
 	base := strings.Replace(srv.URL, "http", "ws", 1)
@@ -347,8 +355,19 @@ func TestRegisterCleansUpOnSessionConnDeath(t *testing.T) {
 	}
 	cli.CloseNow()
 
-	// Simulate the container dying: close the sessiond-side conn out from
-	// under the hub.
+	handle, _, ok := rd.reg.opTarget(id)
+	if !ok || handle == "" {
+		t.Fatal("session has no handle before killing the conn")
+	}
+	// Simulate the container itself dying (not just its conn): with
+	// inspect-before-destroy, a conn death alone is no longer enough — the
+	// driver must confirm the container is actually gone.
+	if err := fd.Destroy(ctx, handle); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the container's sessiond exiting with it: close the
+	// sessiond-side conn out from under the hub.
 	regConn.CloseNow()
 
 	deadline := time.Now().Add(3 * time.Second)
@@ -590,6 +609,225 @@ func TestRecoverRebuildsRegistryFromDriverLabels(t *testing.T) {
 
 	if _, state, ok := rd.reg.opTarget("sess-cold"); !ok || state != "running" {
 		t.Fatalf("sess-cold state after resume+re-register = %q (ok=%v), want \"running\"", state, ok)
+	}
+}
+
+// destroyTrackingFake wraps driver.Fake to record every id passed to
+// Destroy, so a test can assert whether runnerd's own hub-death path called
+// it — as opposed to merely observing the fake's post-hoc state (which
+// Destroy and a test's own setup calls would otherwise look identical
+// through). Everything but Destroy goes straight through to the embedded
+// *driver.Fake, matching the slowFake pattern above.
+type destroyTrackingFake struct {
+	*driver.Fake
+	mu        sync.Mutex
+	destroyed []string
+}
+
+func newDestroyTrackingFake(total int) *destroyTrackingFake {
+	return &destroyTrackingFake{Fake: driver.NewFake(total)}
+}
+
+func (f *destroyTrackingFake) Destroy(ctx context.Context, id string) error {
+	f.mu.Lock()
+	f.destroyed = append(f.destroyed, id)
+	f.mu.Unlock()
+	return f.Fake.Destroy(ctx, id)
+}
+
+func (f *destroyTrackingFake) destroyCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.destroyed))
+	copy(out, f.destroyed)
+	return out
+}
+
+// TestHubDeathAliveContainerKeepsSession is the regression test for §4.8:
+// hub death no longer implies container death, because sessiond now survives
+// conn loss and redials (Task 5) instead of dying with it. Before this fix,
+// ANY hub death (other than a marked cold-suspend) destroyed the container
+// unconditionally — which used to be correct (sessiond dying was the only
+// way its conn could die) but stopped being correct the moment sessiond
+// started redialing: a runnerd restart, or any transient network blip, kills
+// every conn without killing a single container. This asserts the container
+// is inspected, found alive, and both the registry entry and the container
+// survive — and that a fresh /register dial-in (simulating sessiond's
+// redial) picks the session back up.
+func TestHubDeathAliveContainerKeepsSession(t *testing.T) {
+	fd := newDestroyTrackingFake(4)
+	rd := New(fd, "", "")
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+	base := strings.Replace(srv.URL, "http", "ws", 1)
+	ctx := context.Background()
+
+	id := createSession(t, srv.URL)
+	regConn := dialRegisterAndServe(t, ctx, base, id)
+	waitForHub(t, rd, id)
+
+	attachAndAssertEcho(t, ctx, base, id, "pre-death-marker")
+
+	handleBefore, state, ok := rd.reg.opTarget(id)
+	if !ok || state != "running" || handleBefore == "" {
+		t.Fatalf("session not running with a handle before hub death: state=%q ok=%v handle=%q", state, ok, handleBefore)
+	}
+
+	// Kill the sessiond-side conn but leave the fake container alive
+	// (StateRunning) — the runnerd-restart / network-blip case, not a crash.
+	regConn.CloseNow()
+
+	// Poll until the hub clears (hubDied has run) rather than sleeping a
+	// fixed duration, mirroring TestHubDeathDuringColdSuspendKeepsEntry.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, ok := rd.reg.get(id); !ok {
+			t.Fatal("registry entry removed on alive-container hub death (container is still running; should be kept for a redial)")
+		}
+		if _, hubOK := rd.reg.hub(id); !hubOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("hub never cleared after alive-container hub death")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// hubDied clearing the hub races slightly ahead of the Inspect-based
+	// keep/destroy decision in register()'s tail (same goroutine, but give it
+	// a moment rather than asserting in the same instant).
+	time.Sleep(200 * time.Millisecond)
+
+	if calls := fd.destroyCalls(); len(calls) != 0 {
+		t.Fatalf("Destroy called on an alive container's hub death: %v", calls)
+	}
+	handle, state, ok := rd.reg.opTarget(id)
+	if !ok {
+		t.Fatal("registry entry removed even though the container is still alive")
+	}
+	if state != "running" {
+		t.Fatalf("state after alive-container hub death = %q, want \"running\"", state)
+	}
+	if handle != handleBefore {
+		t.Fatalf("handle changed across hub death: %q -> %q", handleBefore, handle)
+	}
+
+	// A fresh /register dial-in for the same id (sessiond's redial) must
+	// succeed, and attach must work over the new hub.
+	dialRegisterAndServe(t, ctx, base, id)
+	waitForHub(t, rd, id)
+	attachAndAssertEcho(t, ctx, base, id, "post-redial-marker")
+}
+
+// TestHubDeathGoneContainerDestroys is TestHubDeathAliveContainerKeepsSession's
+// companion: when the driver's Inspect reports the container actually gone
+// (a real crash — the process died, unlike the redial case above), today's
+// behavior must be preserved — the registry entry is removed and the
+// container is destroyed to reclaim its capacity slot (I1).
+func TestHubDeathGoneContainerDestroys(t *testing.T) {
+	fd := newDestroyTrackingFake(4)
+	rd := New(fd, "", "")
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+	base := strings.Replace(srv.URL, "http", "ws", 1)
+	ctx := context.Background()
+
+	id := createSession(t, srv.URL)
+	regConn := dialRegisterAndServe(t, ctx, base, id)
+	waitForHub(t, rd, id)
+
+	attachAndAssertEcho(t, ctx, base, id, "pre-crash-marker")
+
+	handle, state, ok := rd.reg.opTarget(id)
+	if !ok || state != "running" || handle == "" {
+		t.Fatalf("session not running with a handle before crash: state=%q ok=%v handle=%q", state, ok, handle)
+	}
+
+	// Simulate the container itself already being gone by the time runnerd
+	// asks (crashed and reaped) — call the embedded *driver.Fake directly, not
+	// through the tracking wrapper, so this setup step isn't mistaken for
+	// runnerd's own Destroy call below.
+	if err := fd.Fake.Destroy(ctx, handle); err != nil {
+		t.Fatal(err)
+	}
+
+	// Kill the sessiond-side conn — socket-level indistinguishable from every
+	// other hub-death test; what differs is what Inspect reports afterward.
+	regConn.CloseNow()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := rd.reg.get(id); !ok {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, ok := rd.reg.get(id); ok {
+		t.Fatal("registry entry survived a gone-container hub death (should be removed, matching today's crash behavior)")
+	}
+
+	calls := fd.destroyCalls()
+	found := false
+	for _, c := range calls {
+		if c == handle {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Destroy(%q) not called by runnerd's own crash path; calls=%v", handle, calls)
+	}
+}
+
+// TestOnEventFiresRunningAndDead is the regression test for the OnEvent hook
+// Task 6 wires to the control conn: "running" must fire after a successful
+// register() setHub, and "dead" must fire when the crash path (gone
+// container on hub death) actually destroys the container. It must stay
+// nil-safe everywhere else — every other test in this file runs with
+// OnEvent unset and must keep passing.
+func TestOnEventFiresRunningAndDead(t *testing.T) {
+	fd := newDestroyTrackingFake(4)
+	rd := New(fd, "", "")
+
+	type event struct{ sessionID, state string }
+	var mu sync.Mutex
+	var events []event
+	rd.OnEvent = func(sessionID, state string) {
+		mu.Lock()
+		events = append(events, event{sessionID, state})
+		mu.Unlock()
+	}
+
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+	base := strings.Replace(srv.URL, "http", "ws", 1)
+	ctx := context.Background()
+
+	id := createSession(t, srv.URL)
+	regConn := dialRegisterAndServe(t, ctx, base, id)
+	waitForHub(t, rd, id)
+
+	handle, _, ok := rd.reg.opTarget(id)
+	if !ok || handle == "" {
+		t.Fatal("session has no handle after register")
+	}
+	// Make the crash path's Inspect see the container as gone.
+	if err := fd.Fake.Destroy(ctx, handle); err != nil {
+		t.Fatal(err)
+	}
+	regConn.CloseNow()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := rd.reg.get(id); !ok {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	mu.Lock()
+	got := append([]event(nil), events...)
+	mu.Unlock()
+	if len(got) != 2 || got[0] != (event{id, "running"}) || got[1] != (event{id, "dead"}) {
+		t.Fatalf("OnEvent calls = %+v, want [{%s running} {%s dead}]", got, id, id)
 	}
 }
 

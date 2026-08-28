@@ -24,8 +24,10 @@ func newRegistry() *registry { return &registry{items: map[string]*sessionEntry{
 
 func (r *registry) put(id string, e *sessionEntry) { r.mu.Lock(); r.items[id] = e; r.mu.Unlock() }
 func (r *registry) get(id string) (*sessionEntry, bool) {
-	r.mu.Lock(); defer r.mu.Unlock()
-	e, ok := r.items[id]; return e, ok
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.items[id]
+	return e, ok
 }
 func (r *registry) remove(id string) { r.mu.Lock(); delete(r.items, id); r.mu.Unlock() }
 
@@ -39,11 +41,15 @@ func (r *registry) remove(id string) { r.mu.Lock(); delete(r.items, id); r.mu.Un
 // concurrent GET /sessions, run on different goroutines. Copying under the
 // lock makes every returned snapshot internally consistent and race-free.
 func (r *registry) list() []sessionEntry {
-	r.mu.Lock(); defer r.mu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	out := make([]sessionEntry, 0, len(r.items))
-	for _, e := range r.items { out = append(out, *e) }
+	for _, e := range r.items {
+		out = append(out, *e)
+	}
 	return out
 }
+
 // setHub reports whether the entry still existed to receive the hub. It can
 // return false when a concurrent DELETE removed the entry between register's
 // existence check and this call (session deleted while its container was
@@ -51,9 +57,12 @@ func (r *registry) list() []sessionEntry {
 // readLoop goroutine that will now never be found through the registry, so
 // it must close that hub itself instead of leaking it.
 func (r *registry) setHub(id string, h *relay.Hub) bool {
-	r.mu.Lock(); defer r.mu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	e, ok := r.items[id]
-	if !ok { return false }
+	if !ok {
+		return false
+	}
 	e.hub = h
 	return true
 }
@@ -64,9 +73,12 @@ func (r *registry) setHub(id string, h *relay.Hub) bool {
 // unlocked field read would race against setHub's locked write from the
 // concurrent /register handler.
 func (r *registry) hub(id string) (*relay.Hub, bool) {
-	r.mu.Lock(); defer r.mu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	e, ok := r.items[id]
-	if !ok || e.hub == nil { return nil, false }
+	if !ok || e.hub == nil {
+		return nil, false
+	}
 	return e.hub, true
 }
 
@@ -75,8 +87,11 @@ func (r *registry) hub(id string) (*relay.Hub, bool) {
 // both touch e.state from different request goroutines, so it needs the same
 // protection as hub.
 func (r *registry) setState(id, state string) {
-	r.mu.Lock(); defer r.mu.Unlock()
-	if e, ok := r.items[id]; ok { e.state = state }
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok {
+		e.state = state
+	}
 }
 
 // opTarget returns an entry's driver handle and state under the registry
@@ -89,41 +104,69 @@ func (r *registry) setState(id, state string) {
 // (handle == "") means Create hasn't returned yet, so there is nothing yet
 // for a driver call to act on — see sessionOp's http.StatusConflict guard.
 func (r *registry) opTarget(id string) (handle, state string, ok bool) {
-	r.mu.Lock(); defer r.mu.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	e, ok := r.items[id]
-	if !ok { return "", "", false }
+	if !ok {
+		return "", "", false
+	}
 	return e.handle, e.state, true
 }
 
-// onHubDeath is called when a session's relay hub dies (its conn closed).
-// It distinguishes a deliberate cold suspend (keep the entry, clear the hub
-// so resume can re-arm it) from a crash (remove the entry; the caller
-// destroys the container to reclaim the slot). Before this, the register
-// goroutine unconditionally removed the entry on any hub death — correct
-// for a crash, but wrong for `docker stop` (cold Suspend): that kills the
-// container's sessiond too, which is indistinguishable at the socket level
-// from a real crash, so the entry was removed and a later resume 404'd
-// forever, with the (stopped, still-existing) container orphaned. On an
-// actual crash the entry was removed but the container itself was never
-// destroyed, leaking its capacity slot forever (I1).
+// hubDied is called when a session's relay hub dies (its conn closed). It
+// always clears the entry's hub (the connection is dead either way — a stale
+// hub left in place only blocks a fresh register from installing its
+// replacement) but, unlike the onHubDeath it replaces, never removes the
+// entry itself: hub death no longer implies container death now that
+// sessiond survives conn loss and redials (see cmd/sessiond's dialLoop), so
+// deciding whether the container is actually gone means asking the driver —
+// the caller's job, via Inspect, done AFTER this returns. See
+// removeIfHubless for the other half of that decision.
 //
-// deadHub guards against a resume that already installed a fresh hub before
-// this call runs (register's own goroutine for the OLD conn getting here
-// after a new one has already re-registered): if the entry's current hub
-// isn't the one that just died, this is stale and must not touch the entry
-// at all. Returns the handle to destroy, or ("", false) to keep the entry.
-func (r *registry) onHubDeath(id string, deadHub *relay.Hub) (handle string, destroy bool) {
-	r.mu.Lock(); defer r.mu.Unlock()
-	e, ok := r.items[id]
-	if !ok || e.hub != deadHub { return "", false }
-	if e.state == "suspending" || e.state == "suspended" {
-		e.hub = nil // resume's re-register will setHub a fresh one
-		e.state = "suspended"
-		return "", false // keep the entry, don't destroy
+// The suspend-state normalization is unchanged from onHubDeath: a deliberate
+// cold suspend (`docker stop`) kills the container's sessiond too, closing
+// this same conn — indistinguishable at the socket level from a crash or a
+// conn drop. state "suspending" or "suspended" here means "keep, and land on
+// suspended" so a later resume's re-register can setHub a fresh hub onto the
+// same entry, rather than falling into the caller's Inspect-then-destroy
+// path.
+//
+// deadHub guards against a redial that already installed a fresh hub before
+// this call runs (this goroutine is for the OLD conn, running after a newer
+// one has already re-registered): if the entry's current hub isn't the one
+// that just died, this is stale and must not touch the entry at all — ok
+// reports that.
+func (r *registry) hubDied(id string, deadHub *relay.Hub) (handle, state string, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, exists := r.items[id]
+	if !exists || e.hub != deadHub {
+		return "", "", false
 	}
-	h := e.handle
+	e.hub = nil
+	if e.state == "suspending" || e.state == "suspended" {
+		e.state = "suspended"
+	}
+	return e.handle, e.state, true
+}
+
+// removeIfHubless removes the entry only if it still has no hub installed —
+// the guard that makes register()'s inspect-then-remove tail safe against a
+// redial that raced ahead of the driver.Inspect call and already set a fresh
+// hub on this entry (in which case removing now would delete a session that
+// just came back, out from under its new hub). Only call after Inspect has
+// confirmed the container is actually gone. Reports whether it actually
+// removed the entry, so the caller knows it — not some other, later
+// register() call — owns destroying the container.
+func (r *registry) removeIfHubless(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.items[id]
+	if !ok || e.hub != nil {
+		return false
+	}
 	delete(r.items, id)
-	return h, true // crash: caller destroys the container
+	return true
 }
 
 // setHandle assigns an entry's driver handle id once its container has
@@ -135,6 +178,9 @@ func (r *registry) onHubDeath(id string, deadHub *relay.Hub) (handle string, des
 // and exits — see cmd/sessiond). setHandle fills in the handle afterward
 // under the same lock as every other post-creation mutation.
 func (r *registry) setHandle(id, handle string) {
-	r.mu.Lock(); defer r.mu.Unlock()
-	if e, ok := r.items[id]; ok { e.handle = handle }
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok {
+		e.handle = handle
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	mrand "math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -39,7 +40,9 @@ func main() {
 		log.Fatal("usage: sessiond [flags] -- <command> [args...]")
 	}
 	s, err := session.New(session.Config{Argv: argv, Cols: *cols, Rows: *rows, LogPath: *logPath}, session.StartProc)
-	if err != nil { log.Fatal(err) }
+	if err != nil {
+		log.Fatal(err)
+	}
 	go func() {
 		<-s.Exited()
 		log.Printf("child exited with code %d; sessiond stays up for viewers", s.ExitCode())
@@ -62,22 +65,18 @@ func main() {
 	// Env fallback: the Docker driver injects RAINIER_DIAL/RAINIER_SESSION as
 	// env vars, not flags, so honor them whenever the flags were left empty.
 	if *dial == "" {
-		if v := os.Getenv("RAINIER_DIAL"); v != "" { *dial = v }
+		if v := os.Getenv("RAINIER_DIAL"); v != "" {
+			*dial = v
+		}
 	}
 	if *sessionID == "" {
-		if v := os.Getenv("RAINIER_SESSION"); v != "" { *sessionID = v }
+		if v := os.Getenv("RAINIER_SESSION"); v != "" {
+			*sessionID = v
+		}
 	}
 
 	if *dial != "" {
-		ctx := context.Background()
-		url := *dial + "?session=" + *sessionID
-		c, _, err := websocket.Dial(ctx, url, nil)
-		if err != nil { log.Fatalf("dial runnerd: %v", err) }
-		c.SetReadLimit(16 << 20)
-		log.Printf("sessiond registered with runnerd as %s", *sessionID)
-		if err := relay.ServeSession(ctx, relay.WSConn(c), s); err != nil {
-			log.Printf("relay ended: %v", err)
-		}
+		dialLoop(context.Background(), *dial, *sessionID, s)
 		return
 	}
 
@@ -86,4 +85,40 @@ func main() {
 		log.Fatal(err)
 	}
 	_ = os.Stdout
+}
+
+// dialLoop keeps sessiond registered with runnerd for the life of the
+// process: dial failures at boot and conn deaths later both retry with
+// jittered exponential backoff (1s..30s cap). The session — the PTY, the
+// agent, the event log — is never coupled to any single connection's
+// lifetime (spec §10: sessions outlive everything else). A destroyed
+// session's container is removed by runnerd itself, which is what actually
+// ends this loop (SIGTERM → main's handler).
+func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session) {
+	backoff := time.Second
+	for {
+		c, _, err := websocket.Dial(ctx, dial+"?session="+sessionID, nil)
+		if err == nil {
+			c.SetReadLimit(16 << 20)
+			log.Printf("sessiond registered with runnerd as %s", sessionID)
+			backoff = time.Second
+			if err := relay.ServeSession(ctx, relay.WSConn(c), s); err != nil {
+				log.Printf("relay ended: %v; redialing", err)
+			}
+		} else {
+			log.Printf("dial runnerd: %v; retrying in %s", err, backoff)
+		}
+		// mrand jitter: timing spread to avoid a reconnect thundering herd
+		// after a runnerd restart, not a security-sensitive use of
+		// randomness — math/rand is fine here.
+		jitter := time.Duration(mrand.Int63n(int64(backoff / 2)))
+		select {
+		case <-time.After(backoff + jitter):
+		case <-ctx.Done():
+			return
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
 }
