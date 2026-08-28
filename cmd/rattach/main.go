@@ -106,13 +106,24 @@ func main() {
 			// or session exit — or the process gets killed externally.
 			select {}
 		}
+		detach := -1
 		for i := 0; i < n; i++ {
 			if buf[i] == detachKey {
-				restore()
-				fmt.Printf("\r\n[detached at seq %d; session still running]\r\n", lastSeq)
-				return
+				detach = i
+				break
 			}
 		}
-		wsjson.Write(ctx, c, wire.ClientMsg{Type: "stdin", Data: append([]byte(nil), buf[:n]...)})
+		if detach < 0 {
+			wsjson.Write(ctx, c, wire.ClientMsg{Type: "stdin", Data: append([]byte(nil), buf[:n]...)})
+			continue
+		}
+		// Forward whatever preceded the detach key in this chunk before
+		// detaching; anything after it in the same chunk is discarded.
+		if detach > 0 {
+			wsjson.Write(ctx, c, wire.ClientMsg{Type: "stdin", Data: append([]byte(nil), buf[:detach]...)})
+		}
+		restore()
+		fmt.Printf("\r\n[detached at seq %d; session still running]\r\n", lastSeq)
+		return
 	}
 }
