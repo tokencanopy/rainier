@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -41,6 +42,20 @@ func dial(t *testing.T, url string, since string) *websocket.Conn {
 	return c
 }
 
+func dialSize(t *testing.T, url string, cols, rows int) *websocket.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, _, err := websocket.Dial(ctx, strings.Replace(url, "http", "ws", 1)+"/attach?since=0", nil)
+	if err != nil { t.Fatal(err) }
+	// Match the real client fix (cmd/rattach): raise the default 32KiB
+	// per-message read limit so an oversized PTY-output frame doesn't close
+	// the test connection with StatusMessageTooBig.
+	c.SetReadLimit(16 << 20)
+	wsjson.Write(ctx, c, wire.ClientMsg{Type: "resize", Cols: cols, Rows: rows})
+	return c
+}
+
 func readUntil(t *testing.T, c *websocket.Conn, want string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -53,6 +68,76 @@ func readUntil(t *testing.T, c *websocket.Conn, want string) {
 		}
 		all.Write(m.Data)
 		if strings.Contains(all.String(), want) { return }
+	}
+}
+
+// connPump is a background goroutine that reads ServerMsgs off one *websocket.Conn
+// forever and forwards them (or the terminal read error) to a channel.
+//
+// readUntilOrTimeout cannot simply call wsjson.Read with a short-lived
+// context the way readUntil does: coder/websocket treats the context passed
+// to Read as a hard connection deadline, not a soft "give up on this one
+// read" signal — (*Conn).setupReadTimeout arms a context.AfterFunc that
+// calls (*Conn).close() the instant that context is done (see
+// github.com/coder/websocket@v1.8.15/conn.go). A bounded polling call whose
+// context simply expires because nothing matched yet would therefore tear
+// down the whole connection out from under every later poll, rather than
+// just abandoning that one wait. Routing every read through one long-lived
+// pump goroutine (started once, read with context.Background() so it never
+// expires) and having each bounded wait select against its output channel
+// keeps polling non-destructive, and keeps every read serialized through a
+// single goroutine per connection — coder/websocket only guarantees Read is
+// safe to call from one goroutine at a time.
+type connPump struct {
+	msgs chan wire.ServerMsg
+	err  chan error
+}
+
+var (
+	connPumpsMu sync.Mutex
+	connPumps   = map[*websocket.Conn]*connPump{}
+)
+
+func pumpFor(c *websocket.Conn) *connPump {
+	connPumpsMu.Lock()
+	defer connPumpsMu.Unlock()
+	if p, ok := connPumps[c]; ok { return p }
+	p := &connPump{msgs: make(chan wire.ServerMsg, 256), err: make(chan error, 1)}
+	connPumps[c] = p
+	go func() {
+		for {
+			var m wire.ServerMsg
+			if err := wsjson.Read(context.Background(), c, &m); err != nil {
+				p.err <- err
+				close(p.msgs)
+				return
+			}
+			p.msgs <- m
+		}
+	}()
+	return p
+}
+
+// readUntilOrTimeout is readUntil but bounded by a per-call deadline and
+// returning bool instead of failing the test — used to poll for a condition
+// that may take a few retries (e.g. waiting on a liveness ping interval)
+// without accumulating one giant fixed sleep or fatal-ing on the first miss.
+// A call that times out leaves c open and unread messages queued for the
+// next call (see connPump above) rather than closing the connection.
+func readUntilOrTimeout(t *testing.T, c *websocket.Conn, want string, timeout time.Duration) bool {
+	t.Helper()
+	p := pumpFor(c)
+	deadline := time.After(timeout)
+	var all strings.Builder
+	for {
+		select {
+		case m, ok := <-p.msgs:
+			if !ok { return false } // connection's read loop ended (err on p.err)
+			all.Write(m.Data)
+			if strings.Contains(all.String(), want) { return true }
+		case <-deadline:
+			return false
+		}
 	}
 }
 

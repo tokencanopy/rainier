@@ -6,6 +6,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -14,11 +15,18 @@ import (
 	"rainier/internal/wire"
 )
 
-type handler struct{ s *session.Session }
+const defaultPingInterval = 15 * time.Second
 
-func New(s *session.Session) http.Handler {
+type handler struct {
+	s            *session.Session
+	pingInterval time.Duration
+}
+
+func New(s *session.Session) http.Handler { return NewWithKeepalive(s, defaultPingInterval) }
+
+func NewWithKeepalive(s *session.Session, pingInterval time.Duration) http.Handler {
 	mux := http.NewServeMux()
-	h := &handler{s: s}
+	h := &handler{s: s, pingInterval: pingInterval}
 	mux.HandleFunc("/attach", h.attach)
 	return mux
 }
@@ -36,10 +44,10 @@ func (h *handler) attach(w http.ResponseWriter, r *http.Request) {
 	// cap, not unlimited (-1); a real protocol-level max-frame size is
 	// deferred to Plan 2.
 	c.SetReadLimit(16 << 20)
-	serve(r.Context(), c, h.s, since)
+	serve(r.Context(), c, h.s, since, h.pingInterval)
 }
 
-func serve(ctx context.Context, c *websocket.Conn, s *session.Session, since uint64) {
+func serve(ctx context.Context, c *websocket.Conn, s *session.Session, since uint64, pingInterval time.Duration) {
 	// First message must announce viewer size.
 	var first wire.ClientMsg
 	if err := wsjson.Read(ctx, c, &first); err != nil || first.Type != "resize" {
@@ -48,6 +56,37 @@ func serve(ctx context.Context, c *websocket.Conn, s *session.Session, since uin
 	att, err := s.Attach(since, session.Size{Cols: first.Cols, Rows: first.Rows})
 	if err != nil { return }
 	defer s.Detach(att.ID)
+
+	// Liveness: a viewer whose transport has died (terminal closed, laptop
+	// slept, network vanished) never sends a close frame and never errors
+	// out of the reader loop below on its own — it just parks forever,
+	// still counted by EffectiveSize, still clamping every other viewer's
+	// PTY to its last-known size. A periodic ping/pong round trip is the
+	// only way to notice a peer that TCP itself hasn't yet noticed is gone;
+	// a failed ping forces the socket closed so the reader's blocked Read
+	// unblocks with an error, serve returns, and the deferred Detach above
+	// runs — after which applySizeLocked (Plan 1) recomputes EffectiveSize
+	// from the survivors and they regrow.
+	pingCtx, cancelPing := context.WithCancel(ctx)
+	defer cancelPing()
+	go func() {
+		t := time.NewTicker(pingInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-pingCtx.Done():
+				return
+			case <-t.C:
+				pctx, cancel := context.WithTimeout(pingCtx, pingInterval)
+				err := c.Ping(pctx)
+				cancel()
+				if err != nil {
+					c.CloseNow() // triggers reader error → serve returns → Detach
+					return
+				}
+			}
+		}
+	}()
 
 	// Writer: session → client. att.Msgs closes on detach AND on session exit
 	// (including attach-after-exit), so this goroutine always ends on its own.
