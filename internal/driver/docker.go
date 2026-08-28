@@ -41,15 +41,12 @@ func (d *Docker) Create(ctx context.Context, spec Spec) (Handle, error) {
 		return Handle{}, fmt.Errorf("no capacity: %d/%d", used, total)
 	}
 
-	// RunContract's generic subtests always pass a placeholder Spec.Image
-	// (e.g. "test") that isn't a real pullable ref — it exists only so the
-	// contract stays driver-agnostic (the Fake driver never inspects it).
-	// A real Docker backend has no such image, so it trusts its own
-	// configured default session image and falls back to spec.Image only
-	// when no default is configured.
-	image := d.opts.Image
+	// Per-session image selection is the whole point of Spec.Image: it wins
+	// when set, and d.opts.Image (the fleet's configured default session
+	// image) is only the fallback.
+	image := spec.Image
 	if image == "" {
-		image = spec.Image
+		image = d.opts.Image
 	}
 	args := []string{"run", "-d",
 		"--label", d.opts.Label + "=" + spec.SessionID,
