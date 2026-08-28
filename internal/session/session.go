@@ -184,3 +184,7 @@ func (s *Session) applySizeLocked() {
 
 func (s *Session) Exited() <-chan struct{} { return s.exited }
 func (s *Session) ExitCode() int           { return s.exitC }
+
+// Stop signals the agent process to terminate (SIGTERM). The normal exit
+// path (close viewers, close exited) then runs. Safe to call more than once.
+func (s *Session) Stop() { s.proc.Stop() }

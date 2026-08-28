@@ -5,7 +5,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
+	"rainier/internal/reap"
 	"rainier/internal/server"
 	"rainier/internal/session"
 )
@@ -25,6 +29,22 @@ func main() {
 	go func() {
 		<-s.Exited()
 		log.Printf("child exited with code %d; sessiond stays up for viewers", s.ExitCode())
+	}()
+
+	reap.Reap(-1) // reap orphaned grandchildren; agent status still comes from Proc.Wait via Session
+
+	term := make(chan os.Signal, 1)
+	signal.Notify(term, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-term
+		// Graceful: ask the agent to exit; the exit path closes viewers and the
+		// process ends when the child is reaped. Give it a moment, then hard-exit.
+		s.Stop()
+		select {
+		case <-s.Exited():
+		case <-time.After(5 * time.Second):
+		}
+		os.Exit(0)
 	}()
 	log.Printf("sessiond listening on %s", *listen)
 	if err := http.ListenAndServe(*listen, server.New(s)); err != nil {
