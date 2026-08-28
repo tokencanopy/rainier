@@ -32,6 +32,12 @@ func main() {
 		log.Fatal(err)
 	}
 	defer c.CloseNow()
+	// See internal/server/server.go: match the server's raised read limit so
+	// a single oversized PTY-output frame (live or replayed from the event
+	// log) doesn't close the connection with StatusMessageTooBig. 16MiB
+	// explicit cap, not unlimited (-1); a real protocol-level max-frame size
+	// is deferred to Plan 2.
+	c.SetReadLimit(16 << 20)
 
 	fd := int(os.Stdin.Fd())
 	isTTY := term.IsTerminal(fd)

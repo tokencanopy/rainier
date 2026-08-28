@@ -28,6 +28,14 @@ func (h *handler) attach(w http.ResponseWriter, r *http.Request) {
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil { return }
 	defer c.CloseNow()
+	// coder/websocket defaults to a 32KiB/message read limit and closes the
+	// connection with StatusMessageTooBig past it. PTY output frames (and
+	// therefore their ~1.37x JSON envelope) can exceed that on a single
+	// bursty write, which would wedge both the live attach path and replay
+	// of that frame from the event log forever. 16MiB is a generous explicit
+	// cap, not unlimited (-1); a real protocol-level max-frame size is
+	// deferred to Plan 2.
+	c.SetReadLimit(16 << 20)
 	serve(r.Context(), c, h.s, since)
 }
 

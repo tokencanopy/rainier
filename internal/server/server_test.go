@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http/httptest"
@@ -32,6 +33,10 @@ func dial(t *testing.T, url string, since string) *websocket.Conn {
 	defer cancel()
 	c, _, err := websocket.Dial(ctx, strings.Replace(url, "http", "ws", 1)+"/attach?since="+since, nil)
 	if err != nil { t.Fatal(err) }
+	// Match the real client fix (cmd/rattach): raise the default 32KiB
+	// per-message read limit so an oversized PTY-output frame doesn't close
+	// the test connection with StatusMessageTooBig.
+	c.SetReadLimit(16 << 20)
 	wsjson.Write(ctx, c, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24})
 	return c
 }
@@ -118,4 +123,91 @@ func TestAttachTypeReattach(t *testing.T) {
 	c2 := dial(t, srv.URL, "0") // fresh attach → snapshot must contain prior output
 	readUntil(t, c2, "marker-123")
 	c2.Close(websocket.StatusNormalClosure, "")
+}
+
+// burstProc is a minimal session.Proc that skips a real PTY and calls
+// onOutput directly via session.New's dependency-injected start function.
+//
+// A real child process can't be used here: on this platform the PTY read
+// queue caps individual reads at ~1KB (confirmed by direct measurement of
+// internal/session.StartProc's chunking — a `head -c 40000 | tr` burst like
+// the one this finding was diagnosed from arrives as ~40 separate ~1KB
+// onOutput calls, never one chunk anywhere near coder/websocket's 32768-byte
+// default per-message read limit). The defect is about a single oversized
+// write reaching the websocket layer as one JSON message, so a scripted fake
+// that issues that single write directly is what actually exercises it —
+// deterministically, and independent of the host OS's tty buffering.
+type burstProc struct{ done chan struct{} }
+
+func (p *burstProc) Write(b []byte) (int, error) { return len(b), nil }
+func (p *burstProc) Resize(cols, rows int) error  { return nil }
+func (p *burstProc) Wait() int                    { <-p.done; return 0 }
+func (p *burstProc) Stop()                        {}
+
+// startBurst scripts: a small "start" marker (giving a since=1 reattach
+// something to resume after), a pause (so a test client can be attached and
+// reading *before* the burst arrives — proving the live path, not just a
+// snapshot), a single >32KB write, then an end-of-burst marker.
+func startBurst(argv []string, cols, rows int, onOutput func([]byte)) (session.Proc, error) {
+	p := &burstProc{done: make(chan struct{})}
+	go func() {
+		onOutput([]byte("start\n"))
+		time.Sleep(300 * time.Millisecond)
+		onOutput(bytes.Repeat([]byte("x"), 40000)) // > 32768-byte default read limit
+		onOutput([]byte("END-MARKER\n"))
+		close(p.done)
+	}()
+	return p, nil
+}
+
+// TestOversizedFrameSurvivesLiveAndReplay is the regression test for the
+// 32KiB default coder/websocket read limit: a single output frame that
+// exceeds it closes the connection with StatusMessageTooBig, and since that
+// oversized frame is what lands in the event log, --since replay would hit
+// the exact same wall forever without SetReadLimit raised on both ends.
+func TestOversizedFrameSurvivesLiveAndReplay(t *testing.T) {
+	s, err := session.New(
+		session.Config{
+			Argv:    []string{"fake-burst"},
+			Cols:    80, Rows: 24,
+			LogPath: filepath.Join(t.TempDir(), "s.log"),
+		},
+		startBurst,
+	)
+	if err != nil { t.Fatal(err) }
+	srv := httptest.NewServer(New(s))
+	defer srv.Close()
+
+	// Live path: attach before the burst happens and read straight through
+	// it. Without SetReadLimit, the >32KB frame kills the connection and
+	// readUntil's wsjson.Read fails before it ever sees END-MARKER.
+	c1 := dial(t, srv.URL, "0")
+	readUntil(t, c1, "start")
+	readUntil(t, c1, "END-MARKER")
+	c1.Close(websocket.StatusNormalClosure, "live done")
+
+	// Wait for the child to fully exit so the whole burst is guaranteed
+	// flushed to the event log before we test replay against it.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	select {
+	case <-s.Exited():
+	case <-ctx.Done():
+		t.Fatal("session did not exit in time")
+	}
+
+	// Snapshot-path reattach: since=0 attaches fresh and gets a
+	// term.Serialize() repaint of the current screen, not the raw logged
+	// frame — a basic sanity check that the fixed clients still work here.
+	c2 := dial(t, srv.URL, "0")
+	readUntil(t, c2, "END-MARKER")
+	c2.Close(websocket.StatusNormalClosure, "snapshot reattach done")
+
+	// Replay path: since=1 forces the server to resend everything logged
+	// after the "start" marker (seq 1) — including the oversized raw output
+	// frame(s) verbatim. This is the path that previously died forever once
+	// that frame was written to the log.
+	c3 := dial(t, srv.URL, "1")
+	readUntil(t, c3, "END-MARKER")
+	c3.Close(websocket.StatusNormalClosure, "replay done")
 }
