@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  s1:
+    image: rainier-sessiond
+    ports:
+      - "7071:7070"
+  s2:
+    image: rainier-sessiond
+    ports:
+      - "7072:7070"
+  s3:
+    image: rainier-sessiond
+    ports:
+      - "7073:7070"
+  s4:
+    image: rainier-sessiond
+    ports:
+      - "7074:7070"
+  s5:
+    image: rainier-sessiond
+    ports:
+      - "7075:7070"
