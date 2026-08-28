@@ -34,17 +34,39 @@ func Open(path string) (*Log, error) {
 	l := &Log{f: f}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+
+	var offset int64
+	var lastGoodOffset int64
+
 	for sc.Scan() {
+		lineBytes := sc.Bytes()
 		var e Entry
-		if json.Unmarshal(sc.Bytes(), &e) == nil {
+		if json.Unmarshal(lineBytes, &e) == nil {
 			l.entries = append(l.entries, e)
 			l.last = e.Seq
+			lastGoodOffset = offset + int64(len(lineBytes)) + 1 // +1 for newline
+		} else {
+			// First unmarshal failure - truncate at last good offset
+			if err := f.Truncate(lastGoodOffset); err != nil {
+				f.Close()
+				return nil, err
+			}
+			break
 		}
+		offset += int64(len(lineBytes)) + 1 // +1 for newline
 	}
+
 	if err := sc.Err(); err != nil {
 		f.Close()
 		return nil, err
 	}
+
+	// Seek to end of file for appending
+	if _, err := f.Seek(0, 2); err != nil {
+		f.Close()
+		return nil, err
+	}
+
 	l.w = bufio.NewWriter(f)
 	return l, nil
 }
