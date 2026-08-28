@@ -8,10 +8,11 @@ import (
 )
 
 type Fake struct {
-	mu    sync.Mutex
-	total int
-	seq   int
-	items map[string]State
+	mu      sync.Mutex
+	total   int
+	seq     int
+	snapSeq int // per-call uniqueness for Snapshot refs — mirrors Docker's snapSeq
+	items   map[string]State
 }
 
 func NewFake(total int) *Fake { return &Fake{total: total, items: map[string]State{}} }
@@ -36,7 +37,8 @@ func (f *Fake) Resume(_ context.Context, id string) error             { return f
 func (f *Fake) Snapshot(_ context.Context, id string) (Snapshot, error) {
 	f.mu.Lock(); defer f.mu.Unlock()
 	if _, ok := f.items[id]; !ok { return Snapshot{}, fmt.Errorf("no such id %s", id) }
-	return Snapshot{Ref: "fake-image:" + id}, nil
+	f.snapSeq++
+	return Snapshot{Ref: "fake-image:" + id + "-" + fmt.Sprint(f.snapSeq)}, nil
 }
 func (f *Fake) Destroy(_ context.Context, id string) error {
 	f.mu.Lock(); defer f.mu.Unlock()

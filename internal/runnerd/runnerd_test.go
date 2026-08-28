@@ -361,6 +361,149 @@ func TestRegisterCleansUpOnSessionConnDeath(t *testing.T) {
 	t.Fatalf("session %s still in registry 3s after sessiond conn closed", id)
 }
 
+// attachAndAssertEcho dials /attach for id, sends marker as stdin, and fails
+// the test if it doesn't come back through an "output" frame within 5s.
+// Local to this file's cold-suspend test so the two round-trip echo checks
+// (pre-suspend, post-resume) don't duplicate the dial/resize/read loop.
+func attachAndAssertEcho(t *testing.T, ctx context.Context, base, id, marker string) {
+	t.Helper()
+	cli, _, err := websocket.Dial(ctx, base+"/attach?session="+id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.CloseNow()
+	cli.SetReadLimit(16 << 20)
+	wsjson.Write(ctx, cli, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24})
+	wsjson.Write(ctx, cli, wire.ClientMsg{Type: "stdin", Data: []byte("echo " + marker + "\n")})
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("no %s through the relay", marker)
+		default:
+		}
+		var m wire.ServerMsg
+		if err := wsjson.Read(ctx, cli, &m); err != nil {
+			t.Fatal(err)
+		}
+		if m.Type == "output" && strings.Contains(string(m.Data), marker) {
+			return
+		}
+	}
+}
+
+// TestHubDeathDuringColdSuspendKeepsEntry is the regression test for C1/I1:
+// `docker stop` (cold Suspend) kills the container's sessiond, which closes
+// its /register conn — at the socket level this is indistinguishable from a
+// crash. Before this fix, the register goroutine unconditionally removed
+// the registry entry on ANY hub death, so a deliberate cold suspend 404'd
+// every future resume forever, with the (stopped, still-existing) container
+// orphaned; conversely, on an actual crash the entry was removed but the
+// container itself was never destroyed, leaking its capacity slot forever
+// (I1). This asserts the suspend path end to end: the entry SURVIVES hub
+// death with state "suspended" and a cleared hub, the fake driver's
+// container is NOT destroyed, and a subsequent resume + re-register
+// (simulating `docker start` re-execing sessiond) re-arms a fresh hub that
+// a new /attach can relay through.
+func TestHubDeathDuringColdSuspendKeepsEntry(t *testing.T) {
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "")
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+	base := strings.Replace(srv.URL, "http", "ws", 1)
+	ctx := context.Background()
+
+	id := createSession(t, srv.URL)
+	regConn := dialRegisterAndServe(t, ctx, base, id)
+	waitForHub(t, rd, id)
+
+	// Confirm the path works before suspending, so a later failure is
+	// unambiguously about the suspend/hub-death interaction, not plumbing.
+	attachAndAssertEcho(t, ctx, base, id, "pre-suspend-marker")
+
+	handleBefore, _, ok := rd.reg.opTarget(id)
+	if !ok || handleBefore == "" {
+		t.Fatal("session has no handle before suspend")
+	}
+
+	// Cold suspend: POST .../suspend?warm=false. The fake driver's Suspend
+	// just flips its own state map — it doesn't touch the register conn —
+	// so the hub death below is a separate, explicit step simulating what a
+	// real `docker stop` would also do to the container's sessiond.
+	resp, err := http.Post(srv.URL+"/sessions/"+id+"/suspend?warm=false", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("suspend status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	// Simulate docker stop killing sessiond: close the sessiond-side conn
+	// out from under the hub — same mechanism TestRegisterCleansUpOnSessionConnDeath
+	// uses for a crash; what differs is the registry state this lands in.
+	regConn.CloseNow()
+
+	// The entry must SURVIVE (not be removed like a crash would) and its hub
+	// must clear (nil) so a later resume's re-register can setHub a fresh
+	// one instead of finding a stale one still occupying the slot. Poll on
+	// the hub clearing, not on state=="suspended" alone: the suspend POST
+	// above already set state "suspended" BEFORE regConn.CloseNow() ever
+	// ran, so state=="suspended" is true from the very first iteration and
+	// proves nothing about whether onHubDeath has actually processed the
+	// hub death yet — the hub going from present to absent is the real
+	// completion signal for that.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, ok := rd.reg.get(id); !ok {
+			t.Fatal("registry entry removed on cold-suspend hub death (should survive, not be treated as a crash)")
+		}
+		if _, hubOK := rd.reg.hub(id); !hubOK {
+			break // onHubDeath has run and cleared the hub
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("hub never cleared after cold-suspend hub death (onHubDeath never ran, or kept the stale hub)")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	handle, state, ok := rd.reg.opTarget(id)
+	if !ok {
+		t.Fatal("registry entry vanished right after the hub cleared")
+	}
+	if state != "suspended" {
+		t.Fatalf("state after cold-suspend hub death = %q, want \"suspended\"", state)
+	}
+	if handle != handleBefore {
+		t.Fatalf("handle changed across hub death: %q -> %q", handleBefore, handle)
+	}
+
+	// The fake driver's own container must NOT have been destroyed.
+	h, err := fd.Inspect(ctx, handleBefore)
+	if err != nil || h.State == driver.StateGone {
+		t.Fatalf("container was destroyed on cold-suspend hub death (should be kept, not destroyed): %+v, %v", h, err)
+	}
+
+	// Resume, then re-dial /register with the same session id — what a real
+	// container does on `docker start`: sessiond re-execs and redials.
+	resp, err = http.Post(srv.URL+"/sessions/"+id+"/resume", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("resume status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+	}
+
+	dialRegisterAndServe(t, ctx, base, id)
+	waitForHub(t, rd, id)
+
+	if _, state, ok := rd.reg.opTarget(id); !ok || state != "running" {
+		t.Fatalf("state after resume+re-register = %q (ok=%v), want \"running\"", state, ok)
+	}
+
+	attachAndAssertEcho(t, ctx, base, id, "post-resume-marker")
+}
+
 // TestDeleteSessionRemovesRegistryEntryAndClosesHub is the regression test
 // for DELETE now closing a registered session's hub: the entry must be gone
 // synchronously with the 204 response, and stay gone (register()'s own

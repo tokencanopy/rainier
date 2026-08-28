@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 var errNotImpl = errors.New("not implemented yet")
@@ -14,6 +15,7 @@ var errNotImpl = errors.New("not implemented yet")
 type Docker struct {
 	opts       DockerOpts
 	defaultCmd []string
+	snapSeq    atomic.Int64 // per-call uniqueness for Snapshot refs — see Snapshot
 }
 
 type DockerOpts struct {
@@ -159,7 +161,13 @@ func (d *Docker) Snapshot(ctx context.Context, id string) (Snapshot, error) {
 	if len(short) > 12 {
 		short = short[:12]
 	}
-	ref := "rainier-snap:" + short + "-" + strconv.FormatInt(int64(len(short)), 10)
+	// The suffix must make each call's ref unique, not just each container's:
+	// snapshotting the same container twice used to reuse len(short) (always
+	// 12 for a real container id) as the suffix, so both calls produced the
+	// identical ref and the second `docker commit` silently overwrote the
+	// first snapshot under the same tag. A per-call atomic counter fixes that
+	// regardless of how many times Snapshot is called on the same handle.
+	ref := "rainier-snap:" + short + "-" + strconv.FormatInt(d.snapSeq.Add(1), 10)
 	if _, err := dockerRun(ctx, "commit", id, ref); err != nil {
 		return Snapshot{}, err
 	}

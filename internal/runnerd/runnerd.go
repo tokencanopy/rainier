@@ -154,13 +154,29 @@ func (s *Server) sessionOp(w http.ResponseWriter, r *http.Request) {
 	switch op {
 	case "suspend":
 		warm := r.URL.Query().Get("warm") != "false"
+		if !warm {
+			// Cold suspend (docker stop) kills the container's sessiond,
+			// which closes its /register conn — the exact same socket-level
+			// event as a crash. Mark "suspending" BEFORE calling Suspend so
+			// the register goroutine's onHubDeath (which can fire the
+			// instant the container dies, racing ahead of the setState
+			// below) sees a state that means "keep the entry" rather than
+			// defaulting to the crash path and destroying a container we
+			// deliberately just stopped.
+			s.reg.setState(id, "suspending")
+		}
 		if err := s.drv.Suspend(ctx, handle, warm); err != nil {
+			if !warm {
+				s.reg.setState(id, "running") // stop failed: we're still running
+			}
 			http.Error(w, err.Error(), 500)
 			return
 		}
 		// e.state is mutated here from a concurrent request goroutine, so it
 		// goes through the registry lock rather than a direct field write —
-		// see registry.setState.
+		// see registry.setState. Warm suspend (docker pause) doesn't kill
+		// sessiond, so its conn — and the hub — stay alive; the state still
+		// lands on "suspended" either way for a consistent GET /sessions view.
 		s.reg.setState(id, "suspended")
 		w.WriteHeader(http.StatusNoContent)
 	case "resume":
@@ -219,8 +235,17 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	// this on r.Context() instead would leak both per session, forever, on
 	// every abrupt death or explicit rm.
 	<-hub.Done()
-	s.reg.remove(id)
+	// onHubDeath distinguishes why the hub died: a deliberate cold suspend
+	// (docker stop kills sessiond too, closing this same conn) keeps the
+	// entry — state "suspended", hub cleared so resume's re-register can
+	// setHub a fresh one — while a crash removes the entry and hands back
+	// the handle so its container gets destroyed here, reclaiming the
+	// capacity slot instead of leaking it. See registry.onHubDeath.
+	handle, destroy := s.reg.onHubDeath(id, hub)
 	hub.Close()
+	if destroy && handle != "" {
+		s.drv.Destroy(context.Background(), handle)
+	}
 }
 
 func (s *Server) attach(w http.ResponseWriter, r *http.Request) {

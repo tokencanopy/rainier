@@ -39,6 +39,14 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 		defer d.Destroy(ctx, h.ID)
 		snap, err := d.Snapshot(ctx, h.ID)
 		if err != nil || snap.Ref == "" { t.Fatalf("snapshot = %+v, %v", snap, err) }
+		// Two snapshots of the SAME handle must get distinct refs: a fixed
+		// per-container suffix (e.g. derived only from the container id's
+		// length) makes every snapshot of that container collide on the same
+		// ref, so a second `docker commit` silently overwrites the first
+		// snapshot under the same tag instead of producing a new one.
+		snap2, err := d.Snapshot(ctx, h.ID)
+		if err != nil || snap2.Ref == "" { t.Fatalf("second snapshot = %+v, %v", snap2, err) }
+		if snap2.Ref == snap.Ref { t.Fatalf("two snapshots of the same handle got the same ref: %q", snap.Ref) }
 	})
 
 	t.Run("capacity", func(t *testing.T) {

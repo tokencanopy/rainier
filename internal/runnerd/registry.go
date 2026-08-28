@@ -95,6 +95,37 @@ func (r *registry) opTarget(id string) (handle, state string, ok bool) {
 	return e.handle, e.state, true
 }
 
+// onHubDeath is called when a session's relay hub dies (its conn closed).
+// It distinguishes a deliberate cold suspend (keep the entry, clear the hub
+// so resume can re-arm it) from a crash (remove the entry; the caller
+// destroys the container to reclaim the slot). Before this, the register
+// goroutine unconditionally removed the entry on any hub death — correct
+// for a crash, but wrong for `docker stop` (cold Suspend): that kills the
+// container's sessiond too, which is indistinguishable at the socket level
+// from a real crash, so the entry was removed and a later resume 404'd
+// forever, with the (stopped, still-existing) container orphaned. On an
+// actual crash the entry was removed but the container itself was never
+// destroyed, leaking its capacity slot forever (I1).
+//
+// deadHub guards against a resume that already installed a fresh hub before
+// this call runs (register's own goroutine for the OLD conn getting here
+// after a new one has already re-registered): if the entry's current hub
+// isn't the one that just died, this is stale and must not touch the entry
+// at all. Returns the handle to destroy, or ("", false) to keep the entry.
+func (r *registry) onHubDeath(id string, deadHub *relay.Hub) (handle string, destroy bool) {
+	r.mu.Lock(); defer r.mu.Unlock()
+	e, ok := r.items[id]
+	if !ok || e.hub != deadHub { return "", false }
+	if e.state == "suspending" || e.state == "suspended" {
+		e.hub = nil // resume's re-register will setHub a fresh one
+		e.state = "suspended"
+		return "", false // keep the entry, don't destroy
+	}
+	h := e.handle
+	delete(r.items, id)
+	return h, true // crash: caller destroys the container
+}
+
 // setHandle assigns an entry's driver handle id once its container has
 // actually started. POST /sessions now calls put() with a handle-less entry
 // before it calls the driver's Create — a real container's sessiond can dial

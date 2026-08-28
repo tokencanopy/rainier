@@ -4,4 +4,4 @@
 networks:
   rainier-internal:
     name: rainier-internal
-    internal: false   # v0: allow egressd (on gateway) reachability; sessions still route only via proxy env
+    internal: false   # v0: egress enforcement NOT active — sessions have direct egress until the network is internal AND proxy env is injected (R4, Plan 3+). egressd is exercised only by its unit tests today.
