@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -774,6 +775,84 @@ func TestHubDeathGoneContainerDestroys(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("Destroy(%q) not called by runnerd's own crash path; calls=%v", handle, calls)
+	}
+}
+
+// inspectErrFake wraps destroyTrackingFake (inheriting its Destroy-call
+// tracking and the underlying *driver.Fake) but makes Inspect always fail —
+// simulating a transient driver failure (docker daemon hiccup, timeout) at
+// exactly the moment register()'s hub-death tail asks it whether the
+// container is still alive. Used by TestHubDeathInspectErrorKeepsSession.
+type inspectErrFake struct {
+	*destroyTrackingFake
+}
+
+func newInspectErrFake(total int) *inspectErrFake {
+	return &inspectErrFake{destroyTrackingFake: newDestroyTrackingFake(total)}
+}
+
+func (f *inspectErrFake) Inspect(context.Context, string) (driver.Handle, error) {
+	return driver.Handle{}, errors.New("inspect: docker daemon unreachable")
+}
+
+// TestHubDeathInspectErrorKeepsSession is the regression test for
+// review-round-1 Finding 2: an Inspect failure is NOT proof the container is
+// gone — it's proof runnerd couldn't get an answer. Destroying on that
+// uncertainty risks killing a still-running container (the catastrophic
+// direction); keeping a hub-less entry around risks nothing worse than a
+// stale registry row until a later hub death (once Inspect works again) or a
+// restart's Recover resolves it (the safe direction). Before this fix, the
+// hub-death tail's `if err == nil && h.State == driver.StateRunning { keep
+// }` fell through to the destroy branch on ANY Inspect error, including this
+// one that says nothing about the container's actual state.
+func TestHubDeathInspectErrorKeepsSession(t *testing.T) {
+	fd := newInspectErrFake(4)
+	rd := New(fd, "", "")
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+	base := strings.Replace(srv.URL, "http", "ws", 1)
+	ctx := context.Background()
+
+	id := createSession(t, srv.URL)
+	regConn := dialRegisterAndServe(t, ctx, base, id)
+	waitForHub(t, rd, id)
+
+	handleBefore, state, ok := rd.reg.opTarget(id)
+	if !ok || state != "running" || handleBefore == "" {
+		t.Fatalf("session not running with a handle before hub death: state=%q ok=%v handle=%q", state, ok, handleBefore)
+	}
+
+	regConn.CloseNow()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, ok := rd.reg.get(id); !ok {
+			t.Fatal("registry entry removed on an Inspect error (should be kept — destroying on uncertainty is the catastrophic direction)")
+		}
+		if _, hubOK := rd.reg.hub(id); !hubOK {
+			break // hubDied has run and cleared the hub
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("hub never cleared after hub death")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Give the Inspect-error branch a moment to run past the hub clearing,
+	// mirroring TestHubDeathAliveContainerKeepsSession.
+	time.Sleep(200 * time.Millisecond)
+
+	if calls := fd.destroyCalls(); len(calls) != 0 {
+		t.Fatalf("Destroy called despite an Inspect error (uncertain, not confirmed gone): %v", calls)
+	}
+	handle, state, ok := rd.reg.opTarget(id)
+	if !ok {
+		t.Fatal("registry entry removed even though Inspect only errored, never confirmed the container gone")
+	}
+	if state != "running" {
+		t.Fatalf("state after Inspect-error hub death = %q, want \"running\"", state)
+	}
+	if handle != handleBefore {
+		t.Fatalf("handle changed across hub death: %q -> %q", handleBefore, handle)
 	}
 }
 

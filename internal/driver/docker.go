@@ -98,11 +98,33 @@ func (d *Docker) Destroy(ctx context.Context, id string) error {
 	return err
 }
 
+// isNotFoundErr reports whether a dockerRun error indicates the object
+// genuinely does not exist — Docker's own "No such object" message — as
+// opposed to some other, non-terminal failure (daemon unreachable, a
+// context timeout, a permission error). dockerRun wraps the command's
+// stderr into the returned error's text (see dockerRun in docker_exec.go),
+// so this is a substring check on that text rather than a distinct error
+// type or exit code. Review-round-1 Finding 3: Inspect used to treat EVERY
+// dockerRun failure as "gone", so a transient docker hiccup at hub-death
+// time (internal/runnerd's register()) read as a confirmed-gone container
+// and destroyed one that was, in fact, still alive.
+func isNotFoundErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "No such object")
+}
+
 func (d *Docker) Inspect(ctx context.Context, id string) (Handle, error) {
 	out, err := dockerRun(ctx, "inspect", "-f", "{{.State.Status}}", id)
 	if err != nil {
-		// `docker inspect` errors when the container no longer exists.
-		return Handle{ID: id, State: StateGone}, nil
+		if isNotFoundErr(err) {
+			// `docker inspect` reports this when the container genuinely no
+			// longer exists — a real "gone", not a transient failure.
+			return Handle{ID: id, State: StateGone}, nil
+		}
+		// Any other failure is NOT proof the container is gone — propagate
+		// it so callers (notably runnerd's hub-death path) don't mistake
+		// "we couldn't get an answer" for "the container doesn't exist" and
+		// destroy something that may still be running.
+		return Handle{}, err
 	}
 	st := StateRunning
 	switch out {
