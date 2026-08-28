@@ -404,12 +404,30 @@ func (s *Server) Delete(ctx context.Context, id string) error {
 }
 
 // Announce snapshots the registry in rwire's session-state vocabulary, for
-// the agent's announce message (and reconnect re-announces). "starting"
-// entries are skipped — they're mid-CreateWithID, and that call's own result
-// (a "create" command's result, or the id simply appearing once it finishes)
-// speaks for them once they land; a half-created session has nothing
-// meaningful to report yet. "suspending" (mid-cold-suspend, socket not yet
-// confirmed dead) is skipped for the same reason.
+// the agent's announce message (and reconnect re-announces).
+//
+// "starting" entries are skipped — they're mid-CreateWithID, and that call's
+// own result (a "create" command's result, or the id simply appearing once
+// it finishes) speaks for them once they land. Omitting "starting" is safe
+// specifically because Postgres shows that session as "creating" on
+// controld's side, and controld's reconciliation requeues a "creating"
+// session it doesn't see in an announce idempotently — a later announce, or
+// a later create result, is enough to correct it either way.
+//
+// "suspending" (mid-cold-suspend — drv.Suspend's `docker stop` is in flight,
+// hub not yet confirmed dead) is NOT skipped, unlike "starting" — review
+// round 2's finding: omitting it creates an unhealable race. If the
+// controld connection reconnects while a cold suspend is mid-flight,
+// omitting that session from the announce reads to controld's
+// reconciliation as "in Postgres but absent from announce", which marks it
+// dead — a TERMINAL state that no later announce can revive, for a session
+// that is (or will shortly be) perfectly healthy. So "suspending" reports
+// suspended_cold immediately instead: if the stop then fails and Op's
+// suspend case rolls the entry back to "running", the very next announce
+// simply reports "running" and controld adopts it. Every non-terminal state
+// heals itself on the next announce; only omission does not — so nothing
+// runnerd doesn't know for certain is dead, dead, or gone should ever be
+// omitted here.
 func (s *Server) Announce() []rwire.SessionInfo {
 	var out []rwire.SessionInfo
 	for _, e := range s.reg.list() {
@@ -420,10 +438,10 @@ func (s *Server) Announce() []rwire.SessionInfo {
 		case e.state == "suspended" && e.hub != nil:
 			// Warm pause keeps sessiond's conn (and the hub) alive.
 			state = "suspended_warm"
-		case e.state == "suspended":
+		case e.state == "suspended", e.state == "suspending":
 			state = "suspended_cold"
 		default:
-			continue
+			continue // "starting" only — see doc comment above
 		}
 		out = append(out, rwire.SessionInfo{ID: e.id, State: state})
 	}
