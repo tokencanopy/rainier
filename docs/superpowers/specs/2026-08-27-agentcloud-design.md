@@ -123,6 +123,22 @@ suspend ~10 min, cold park after a few hours, destroy only explicit/TTL.
 4. **Hosts the adapter** (§6) and multiplexes terminal + events + control over
    one outbound WebSocket to runnerd → controld; reconnects with backoff.
 
+**Decision note — no tmux.** sessiond adopts tmux's process model (server-side
+PTY owner, ephemeral viewers) but implements it directly: we need terminal state
+as data (snapshot-on-attach, screen-diff status, permission-menu detection) and
+a sequence-numbered event log, neither of which tmux exposes except via fragile
+capture-pane/control-mode scraping; tmux also adds chrome/key interception that
+risks TUI fidelity, and a C dependency in every sandbox image (portability rule
+1). Users may still run tmux inside a session. Implementation basis:
+`creack/pty` (MIT, de facto standard; handle Linux EIO-on-child-exit as EOF and
+drive resize via Setsize) for PTY ownership, plus an embedded Go VT emulator —
+leading candidate `charmbracelet/x/vt` (MIT, active, alternate screen +
+scrollback; pinned version since it lives in Charm's experimental repo), with
+`hinshun/vt10x` as minimal fallback. The §11 golden-fixture suite (real Claude
+Code captures) is the acceptance gate for the emulator choice. Emulator
+imperfections degrade snapshots/status detection only — live viewers always
+receive the raw byte stream.
+
 ## 6. Adapter layer
 
 Adapters normalize one agent's signals into **ACP vocabulary** (`message.delta`,
