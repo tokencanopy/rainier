@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -150,7 +151,17 @@ func (d *Docker) Resume(ctx context.Context, id string) error {
 	return err
 }
 
-// Stub until Task 8.
 func (d *Docker) Snapshot(ctx context.Context, id string) (Snapshot, error) {
-	return Snapshot{}, errNotImpl
+	if _, err := dockerRun(ctx, "inspect", "-f", "{{.Id}}", id); err != nil {
+		return Snapshot{}, fmt.Errorf("snapshot: no such container %s: %w", id, err)
+	}
+	short := id
+	if len(short) > 12 {
+		short = short[:12]
+	}
+	ref := "rainier-snap:" + short + "-" + strconv.FormatInt(int64(len(short)), 10)
+	if _, err := dockerRun(ctx, "commit", id, ref); err != nil {
+		return Snapshot{}, err
+	}
+	return Snapshot{Ref: ref}, nil
 }
