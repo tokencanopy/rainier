@@ -1,0 +1,133 @@
+// internal/driver/docker.go
+package driver
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+)
+
+var errNotImpl = errors.New("not implemented yet")
+
+type Docker struct {
+	opts       DockerOpts
+	defaultCmd []string
+}
+
+type DockerOpts struct {
+	Image      string // default session image
+	Network    string // internal docker network name (created by fleet compose)
+	TotalSlots int    // capacity budget
+	Label      string // docker label key marking rainier-managed containers
+}
+
+func NewDocker(opts DockerOpts) *Docker {
+	if opts.Label == "" {
+		opts.Label = "rainier.session"
+	}
+	if opts.TotalSlots == 0 {
+		opts.TotalSlots = 16
+	}
+	return &Docker{opts: opts}
+}
+
+func (d *Docker) Create(ctx context.Context, spec Spec) (Handle, error) {
+	used, total, err := d.Capacity(ctx)
+	if err != nil {
+		return Handle{}, err
+	}
+	if used >= total {
+		return Handle{}, fmt.Errorf("no capacity: %d/%d", used, total)
+	}
+
+	// RunContract's generic subtests always pass a placeholder Spec.Image
+	// (e.g. "test") that isn't a real pullable ref — it exists only so the
+	// contract stays driver-agnostic (the Fake driver never inspects it).
+	// A real Docker backend has no such image, so it trusts its own
+	// configured default session image and falls back to spec.Image only
+	// when no default is configured.
+	image := d.opts.Image
+	if image == "" {
+		image = spec.Image
+	}
+	args := []string{"run", "-d",
+		"--label", d.opts.Label + "=" + spec.SessionID,
+		"--user", "1000:1000",
+		"--security-opt", "no-new-privileges",
+		"--read-only", "--tmpfs", "/tmp",
+	}
+	if d.opts.Network != "" {
+		args = append(args, "--network", d.opts.Network)
+	}
+	if spec.DialURL != "" {
+		args = append(args, "-e", "RAINIER_DIAL="+spec.DialURL)
+	}
+	if spec.SessionID != "" {
+		args = append(args, "-e", "RAINIER_SESSION="+spec.SessionID)
+	}
+	args = append(args, image)
+	cmd := spec.Cmd
+	if len(cmd) == 0 {
+		cmd = d.defaultCmd
+	}
+	args = append(args, cmd...)
+
+	id, err := dockerRun(ctx, args...)
+	if err != nil {
+		return Handle{}, err
+	}
+	return Handle{ID: id, State: StateRunning}, nil
+}
+
+func (d *Docker) Destroy(ctx context.Context, id string) error {
+	_, err := dockerRun(ctx, "rm", "-f", id)
+	return err
+}
+
+func (d *Docker) Inspect(ctx context.Context, id string) (Handle, error) {
+	out, err := dockerRun(ctx, "inspect", "-f", "{{.State.Status}}", id)
+	if err != nil {
+		// `docker inspect` errors when the container no longer exists.
+		return Handle{ID: id, State: StateGone}, nil
+	}
+	st := StateRunning
+	switch out {
+	case "running":
+		st = StateRunning
+	case "paused", "exited", "created":
+		st = StateSuspended
+	default:
+		st = StateSuspended
+	}
+	return Handle{ID: id, State: st}, nil
+}
+
+func (d *Docker) Capacity(ctx context.Context) (int, int, error) {
+	out, err := dockerRun(ctx, "ps", "-aq", "--filter", "label="+d.opts.Label)
+	if err != nil {
+		return 0, d.opts.TotalSlots, err
+	}
+	used := 0
+	if strings.TrimSpace(out) != "" {
+		used = len(strings.Split(strings.TrimSpace(out), "\n"))
+	}
+	return used, d.opts.TotalSlots, nil
+}
+
+func (d *Docker) destroyAllLabeled(ctx context.Context) {
+	out, err := dockerRun(ctx, "ps", "-aq", "--filter", "label="+d.opts.Label)
+	if err != nil || strings.TrimSpace(out) == "" {
+		return
+	}
+	for _, id := range strings.Split(strings.TrimSpace(out), "\n") {
+		dockerRun(ctx, "rm", "-f", id)
+	}
+}
+
+// Stubs until Tasks 7-8.
+func (d *Docker) Suspend(ctx context.Context, id string, warm bool) error { return errNotImpl }
+func (d *Docker) Resume(ctx context.Context, id string) error             { return errNotImpl }
+func (d *Docker) Snapshot(ctx context.Context, id string) (Snapshot, error) {
+	return Snapshot{}, errNotImpl
+}
