@@ -298,8 +298,17 @@ Postgres doesn't know is by definition an orphan.
   made safe by id-idempotent dispatch. A broker (Pub/Sub/NATS/Redis streams)
   would add no guarantee this pair doesn't already provide, while breaking the
   spec's state rule and adding an operational dependency for every self-hosting
-  team. If dispatch ever measures as a bottleneck, the seam is the scheduler's
-  dispatch function — swapping its transport touches no API or schema.
+  team. **River** (the Postgres-native job queue) was considered separately
+  since it respects the state rule (asked by Josh, 2026-08-28): rejected for
+  the scheduler because dispatch is not a background job — it is a placement
+  decision over live connection state that must execute on the process holding
+  the runner's WebSocket, which anonymous SKIP-LOCKED workers cannot express —
+  and because River's job rows would be a second source of truth beside
+  `sessions.state`, retrying in parallel with reconciliation. River is the
+  named candidate for v1's genuinely background jobs (event-log streaming,
+  snapshot checkpoints, TTL sweeps); adopting it then is purely additive. If
+  dispatch ever measures as a bottleneck, the seam is the scheduler's dispatch
+  function — swapping its transport touches no API or schema.
 - **Burst by adding metal:** a fresh VM + runnerd + join token = capacity, no
   controld touch (success criterion 6). This is the horizontal-scaling story for
   the data plane, and a future autoscaler is just automation of this join path.
