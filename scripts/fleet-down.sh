@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
 command -v docker >/dev/null || export PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"
-command -v docker >/dev/null || { echo "docker CLI not found" >&2; exit 1; }
-
-docker compose -f docker-compose.fleet.yml down
+for pidf in /tmp/rainier-runnerd.pid /tmp/rainier-egressd.pid; do
+  [ -f "$pidf" ] && kill "$(cat "$pidf")" 2>/dev/null; rm -f "$pidf"
+done
+# Remove any rainier-managed session containers.
+ids=$(docker ps -aq --filter label=rainier.session 2>/dev/null || true)
+[ -n "$ids" ] && docker rm -f $ids >/dev/null 2>&1 || true
+echo "fleet down."

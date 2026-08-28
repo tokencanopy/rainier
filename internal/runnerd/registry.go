@@ -78,3 +78,16 @@ func (r *registry) setState(id, state string) {
 	r.mu.Lock(); defer r.mu.Unlock()
 	if e, ok := r.items[id]; ok { e.state = state }
 }
+
+// setHandle assigns an entry's driver handle id once its container has
+// actually started. POST /sessions now calls put() with a handle-less entry
+// before it calls the driver's Create — a real container's sessiond can dial
+// /register the instant `docker run -d` returns, which can race ahead of a
+// put() that used to follow Create() (that /register would 404 on a session
+// it can't find yet, and sessiond treats a non-101 dial response as fatal
+// and exits — see cmd/sessiond). setHandle fills in the handle afterward
+// under the same lock as every other post-creation mutation.
+func (r *registry) setHandle(id, handle string) {
+	r.mu.Lock(); defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok { e.handle = handle }
+}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -69,12 +70,20 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "egress setup: "+err.Error(), http.StatusBadGateway)
 			return
 		}
+		// Register the entry before the driver call, not after: a real
+		// container's sessiond can dial /register the instant drv.Create's
+		// `docker run -d` returns, often faster than this goroutine reaching
+		// a put() that came after it — see registry.setHandle's doc comment
+		// for what that race used to do.
+		s.reg.put(id, &sessionEntry{id: id, state: "starting", allow: body.EgressAllow})
 		h, err := s.drv.Create(r.Context(), spec)
 		if err != nil {
+			s.reg.remove(id)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		s.reg.put(id, &sessionEntry{id: id, handle: h.ID, state: "running", allow: body.EgressAllow})
+		s.reg.setHandle(id, h.ID)
+		s.reg.setState(id, "running")
 		json.NewEncoder(w).Encode(map[string]string{"session_id": id})
 	case http.MethodGet:
 		type row struct{ ID, State string }
@@ -177,6 +186,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		hub.Close()
 		return
 	}
+	log.Printf("session %s registered", id)
 	// Block on the hub's own liveness signal, not r.Context(). websocket.Accept
 	// hijacks the connection for HTTP/1.1, and net/http only cancels
 	// r.Context() when this handler itself returns (conn.serve's deferred

@@ -1,23 +1,7 @@
-version: '3.8'
-
-services:
-  s1:
-    image: rainier-sessiond
-    ports:
-      - "127.0.0.1:7071:7070"
-  s2:
-    image: rainier-sessiond
-    ports:
-      - "127.0.0.1:7072:7070"
-  s3:
-    image: rainier-sessiond
-    ports:
-      - "127.0.0.1:7073:7070"
-  s4:
-    image: rainier-sessiond
-    ports:
-      - "127.0.0.1:7074:7070"
-  s5:
-    image: rainier-sessiond
-    ports:
-      - "127.0.0.1:7075:7070"
+# docker-compose.fleet.yml — v0 fleet: an internal network for sessions.
+# runnerd and egressd run on the HOST (see scripts/fleet-up.sh), driving the
+# docker CLI and bound to this network's gateway. This avoids docker-in-docker.
+networks:
+  rainier-internal:
+    name: rainier-internal
+    internal: false   # v0: allow egressd (on gateway) reachability; sessions still route only via proxy env
