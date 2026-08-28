@@ -66,6 +66,19 @@ func (d *Docker) Create(ctx context.Context, spec Spec) (Handle, error) {
 	if spec.SessionID != "" {
 		args = append(args, "-e", "RAINIER_SESSION="+spec.SessionID)
 	}
+	if spec.ProxyURL != "" {
+		// Inject both cases of each var: tools disagree on which they read —
+		// BusyBox wget and curl read lowercase, many Go/Node tools read
+		// uppercase — so set both rather than guess what's inside the image.
+		args = append(args,
+			"-e", "HTTP_PROXY="+spec.ProxyURL,
+			"-e", "http_proxy="+spec.ProxyURL,
+			"-e", "HTTPS_PROXY="+spec.ProxyURL,
+			"-e", "https_proxy="+spec.ProxyURL,
+			"-e", "NO_PROXY=localhost,127.0.0.1,host.docker.internal",
+			"-e", "no_proxy=localhost,127.0.0.1,host.docker.internal",
+		)
+	}
 	args = append(args, image)
 	cmd := spec.Cmd
 	if len(cmd) == 0 {
@@ -103,8 +116,19 @@ func (d *Docker) Inspect(ctx context.Context, id string) (Handle, error) {
 	return Handle{ID: id, State: st}, nil
 }
 
+// Capacity counts only slot-occupying containers — running or paused (warm
+// suspend) — not cold-parked (stopped) ones. A stopped container still
+// exists (its volume is kept for Resume) but isn't using a runtime slot, so
+// counting it here would make cold sessions eat capacity they don't need.
+// The two `--filter status=` flags OR together in `docker ps`, unlike most
+// docker ps filters of the same key which AND across categories but OR
+// within one — see https://docs.docker.com/reference/cli/docker/container/ls/#filter.
 func (d *Docker) Capacity(ctx context.Context) (int, int, error) {
-	out, err := dockerRun(ctx, "ps", "-aq", "--filter", "label="+d.opts.Label)
+	out, err := dockerRun(ctx, "ps", "-q",
+		"--filter", "label="+d.opts.Label,
+		"--filter", "status=running",
+		"--filter", "status=paused",
+	)
 	if err != nil {
 		return 0, d.opts.TotalSlots, err
 	}
@@ -113,6 +137,41 @@ func (d *Docker) Capacity(ctx context.Context) (int, int, error) {
 		used = len(strings.Split(strings.TrimSpace(out), "\n"))
 	}
 	return used, d.opts.TotalSlots, nil
+}
+
+// List returns every rainier-labeled container, in any state — unlike
+// Capacity, which only counts slot-occupying ones. Used by runnerd.Recover
+// to rebuild its registry after a restart.
+func (d *Docker) List(ctx context.Context) ([]Listed, error) {
+	format := `{{.ID}}` + "\t" + `{{.Label "` + d.opts.Label + `"}}` + "\t" + `{{.State}}`
+	// --no-trunc: docker ps's default {{.ID}} is the 12-char short id, but
+	// Create's Handle.ID is the full id `docker run` prints — without this,
+	// every listed handle would mismatch the one Create/Inspect/Destroy use.
+	out, err := dockerRun(ctx, "ps", "-a", "--no-trunc", "--filter", "label="+d.opts.Label, "--format", format)
+	if err != nil {
+		return nil, err
+	}
+	trimmed := strings.TrimSpace(out)
+	if trimmed == "" {
+		return nil, nil
+	}
+	lines := strings.Split(trimmed, "\n")
+	listed := make([]Listed, 0, len(lines))
+	for _, line := range lines {
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		id, sessionID, state := parts[0], parts[1], parts[2]
+		// Same mapping as Inspect: only "running" maps to StateRunning,
+		// everything else (paused, exited, created, ...) is StateSuspended.
+		st := StateRunning
+		if state != "running" {
+			st = StateSuspended
+		}
+		listed = append(listed, Listed{SessionID: sessionID, Handle: Handle{ID: id, State: st}})
+	}
+	return listed, nil
 }
 
 func (d *Docker) destroyAllLabeled(ctx context.Context) {

@@ -9,6 +9,12 @@ type Spec struct {
 	DialURL     string   // runnerd URL the container's sessiond dials (relay)
 	SessionID   string   // stable id runnerd assigns; sessiond registers with it
 	EgressAllow []string // hostnames the session may reach
+	// ProxyURL, when non-empty, is the egress proxy the session's outbound
+	// traffic must route through. Injected as both cases of HTTP_PROXY/
+	// HTTPS_PROXY (tools disagree on which they read: BusyBox wget and curl
+	// read lowercase, many Go/Node tools read uppercase) plus NO_PROXY/
+	// no_proxy for loopback and the docker-desktop host alias.
+	ProxyURL string
 }
 
 type State string
@@ -28,6 +34,13 @@ type Snapshot struct {
 	Ref string // OCI image ref or tar path
 }
 
+// Listed pairs a driver handle with the session id it belongs to, for List's
+// bulk view of every rainier-managed resource.
+type Listed struct {
+	SessionID string
+	Handle    Handle
+}
+
 type Driver interface {
 	Create(ctx context.Context, spec Spec) (Handle, error)
 	Suspend(ctx context.Context, id string, warm bool) error // warm=pause, cold=stop
@@ -36,4 +49,9 @@ type Driver interface {
 	Destroy(ctx context.Context, id string) error
 	Inspect(ctx context.Context, id string) (Handle, error)
 	Capacity(ctx context.Context) (used, total int, err error)
+	// List returns every rainier-labeled resource, in any state (running,
+	// suspended, or otherwise still present) — unlike Capacity, which counts
+	// only slot-occupying ones. Used by runnerd.Recover to rebuild its
+	// registry from what the driver actually has after a restart.
+	List(ctx context.Context) ([]Listed, error)
 }

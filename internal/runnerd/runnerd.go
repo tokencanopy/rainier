@@ -32,6 +32,35 @@ func New(drv driver.Driver, dialBase, egressAdmin string) *Server {
 	return &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin}
 }
 
+// Recover rebuilds the in-memory registry from the driver's labeled
+// containers, so a restarted runnerd is truthful about sessions that
+// outlived it instead of forgetting them outright. Hubs stay nil until each
+// sessiond redials /register — with the entry already present, that redial
+// finds its session instead of 404ing; actually driving sessiond to redial
+// on reconnect is Task 5's job, not this one.
+//
+// Recovered entries carry allow: nil — egress rules were pushed to egressd
+// (a separate process) at create time and it still holds them, so there is
+// nothing to re-push here. If egressd itself restarts and loses its rules,
+// that's a separate, already-ledgered known gap: v0 has no reconciliation
+// between the two processes' restarts.
+func (s *Server) Recover(ctx context.Context) error {
+	listed, err := s.drv.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, l := range listed {
+		state := "running"
+		if l.Handle.State == driver.StateSuspended {
+			state = "suspended"
+		}
+		e := &sessionEntry{id: l.SessionID, handle: l.Handle.ID, state: state}
+		s.reg.put(l.SessionID, e)
+	}
+	log.Printf("runnerd: recovered %d session(s) from labeled containers", len(listed))
+	return nil
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/sessions", s.sessions)   // POST create, GET list
