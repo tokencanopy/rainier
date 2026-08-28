@@ -1014,7 +1014,9 @@ Route → behavior map (each line is a contract test):
 - [ ] **Step 4: `cmd/controld/main.go`** — flags (env-overridable, flag wins): `--listen :9090`, `--db` DSN (**required**), `--runner-token` (**required**, or env `RAINIER_RUNNER_TOKEN`), `--admins`, `--members` (comma-separated logins), `--external-url` (**required**; printed at startup), `--github-api` (default `https://api.github.com`). Wire `pgstore.Open` → `controld.New` → `go srv.Run(ctx)` → `http.ListenAndServe(listen, srv.Handler())`. Startup log states admin/member counts and warns loudly when both are empty (nobody can log in). `make build` clean.
 - [ ] **Step 5: Commit** — `git commit -m "feat: controld REST API for sessions and runners; cmd/controld"`
 
----### Task 11: attach plane — pairing, dial-back, splice
+---
+
+### Task 11: attach plane — pairing, dial-back, splice
 
 **Files:**
 - Create: `internal/controld/attach.go`
