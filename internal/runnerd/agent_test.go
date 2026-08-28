@@ -3,6 +3,7 @@ package runnerd
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -227,6 +228,53 @@ func TestAgentIdempotentCreate(t *testing.T) {
 	}
 }
 
+// TestCreateWithIDConcurrentSameIDCallsDriverOnce is the regression test for
+// review round 1, finding 2: TestAgentIdempotentCreate's two sends are
+// strictly sequential (the second is only sent after the first's result
+// comes back), so it never actually exercised the race — two create
+// commands for the SAME id genuinely concurrent with each other, both
+// racing CreateWithID's id-claim. Before the fix, that claim was a separate
+// reg.get (in execute) followed by a separate reg.put (in CreateWithID) —
+// two distinct lock acquisitions with a window where both could observe
+// "absent" and both reach drv.Create, which has no id-uniqueness guard of
+// its own. This drives CreateWithID directly from many goroutines released
+// simultaneously off one barrier channel (rather than over the WS conn,
+// where read-loop scheduling timing would make the actual overlap
+// non-deterministic and this test flaky) and asserts the driver saw exactly
+// one Create call, with every caller getting a success outcome (nil or
+// errSessionExists) — never a rejection.
+func TestCreateWithIDConcurrentSameIDCallsDriverOnce(t *testing.T) {
+	fd := newCreateTrackingFake(4)
+	rd := New(fd, "", "")
+
+	const n = 8
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = rd.CreateWithID(context.Background(), "sess_race", driver.Spec{Image: "img"}, nil)
+		}(i)
+	}
+	close(start) // release all n goroutines at once, maximizing overlap
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil && !errors.Is(err, errSessionExists) {
+			t.Fatalf("goroutine %d: CreateWithID = %v, want nil or errSessionExists", i, err)
+		}
+	}
+	if calls := fd.createCalls(); len(calls) != 1 {
+		t.Fatalf("Create called %d times, want exactly 1; calls=%+v", len(calls), calls)
+	}
+	if calls := fd.createCalls(); calls[0].SessionID != "sess_race" || calls[0].Image != "img" {
+		t.Fatalf("Create spec = %+v, want SessionID=sess_race Image=img", calls[0])
+	}
+}
+
 // TestAgentForwardsEvents asserts a sessiond registering over the local HTTP
 // surface (as tests today simulate a container's sessiond) forwards a
 // "running" event over the control conn.
@@ -276,4 +324,61 @@ func TestAgentReconnects(t *testing.T) {
 
 	conn2 := fc.nextConn(t)
 	conn2.readAnnounce(t)
+}
+
+// waitForAgentWriterCount polls rd's agentWriterCount until it equals want,
+// or fails the test after 2s. Deterministic and flake-free by construction
+// (unlike runtime.NumGoroutine(), which counts every goroutine in the test
+// binary): agentSession now increments this before starting its writer and
+// decrements it in that goroutine's own deferred cleanup, and — the actual
+// fix under test — agentSession does not return to RunAgent's loop until
+// writerDone.Wait() confirms the writer has already stopped. Since RunAgent
+// never runs two agentSession calls concurrently, this count can only ever
+// be observed as 0 or 1 for a single Server; anything else, or a value that
+// never settles, means a writer leaked.
+func waitForAgentWriterCount(t *testing.T, rd *Server, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if n := rd.agentWriterCount.Load(); n == want {
+			return
+		} else if time.Now().After(deadline) {
+			t.Fatalf("agentWriterCount = %d after 2s, want %d", n, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestAgentReconnectDoesNotLeakWriterGoroutine is the regression test for
+// review round 1, finding 3: a quiet disconnect — one where the writer never
+// saw a failed send, e.g. the reader simply hit a read error first — used to
+// leave the PREVIOUS connection's writer goroutine (and the `out` channel it
+// closed over) blocked forever, since a future failed send was its only
+// exit signal. By the time a SECOND announce arrives (proof RunAgent has
+// already looped back into a fresh agentSession — which only happens after
+// the first agentSession call has fully returned), the first connection's
+// writer must already be gone.
+func TestAgentReconnectDoesNotLeakWriterGoroutine(t *testing.T) {
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "")
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1"})
+
+	conn1 := fc.nextConn(t)
+	conn1.readAnnounce(t)
+	waitForAgentWriterCount(t, rd, 1) // conn1's writer is up
+
+	conn1.c.Close(websocket.StatusNormalClosure, "bye") // quiet disconnect: no failed send ever occurs
+
+	conn2 := fc.nextConn(t)
+	conn2.readAnnounce(t)
+	// conn1's writer must already be gone by now — not still lingering
+	// alongside conn2's — or this settles at 2, never 1.
+	waitForAgentWriterCount(t, rd, 1)
+
+	cancel() // shut the agent down entirely
+	waitForAgentWriterCount(t, rd, 0)
 }

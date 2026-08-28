@@ -34,21 +34,62 @@ type Server struct {
 	// was simply never populated before Task 6. RunAgent sets it from
 	// AgentConfig.ProxyURL before dialing.
 	proxyURL string
-	// OnEvent, when set, is called with "running" after a successful
-	// register() setHub and "dead" when the crash path destroys a
-	// container. Nil-safe: HTTP-only mode (no control conn) leaves it nil.
-	// Task 6 wires it to the control conn.
-	OnEvent func(sessionID, state string)
+	// onEvent is fired with "running" after a successful register() setHub
+	// and "dead" when the crash path destroys a container. Guarded by
+	// atomic.Pointer, not a plain field: register()'s and the hub-death
+	// path's net/http request goroutines call fireEvent (reading it)
+	// concurrently with agentSession swapping it in/out on every
+	// (re)connect (review round 1, finding 1) — a plain field read/write
+	// pair across goroutines with no synchronization is undefined behavior
+	// under the Go memory model regardless of whether `-race` happens to
+	// catch a given test run's particular interleaving. nil (unset) is the
+	// correct zero value: HTTP-only mode never calls SetOnEvent, and
+	// fireEvent's nil check is then a no-op, matching the old field's
+	// nil-safety.
+	onEvent atomic.Pointer[func(sessionID, state string)]
+	// agentWriterCount tracks currently-running agentSession writer
+	// goroutines. It exists solely so agent_test.go can assert the
+	// writer-goroutine-leak fix (review round 1, finding 3)
+	// deterministically — polling this to 0/1 — instead of via
+	// runtime.NumGoroutine(), which is too easily perturbed by unrelated
+	// goroutines elsewhere in the test binary to be a reliable per-test
+	// signal. No production code reads it.
+	agentWriterCount atomic.Int64
+}
+
+// SetOnEvent installs f as the session-event callback (nil clears it).
+// Synchronized against fireEvent via atomic.Pointer so register()'s and the
+// hub-death path's request goroutines can call fireEvent concurrently with
+// agentSession swapping the callback in on every (re)connect and clearing it
+// via defer on exit — see the onEvent field's doc comment.
+func (s *Server) SetOnEvent(f func(sessionID, state string)) {
+	if f == nil {
+		s.onEvent.Store(nil)
+		return
+	}
+	s.onEvent.Store(&f)
+}
+
+// fireEvent calls the current OnEvent callback, if any is installed.
+func (s *Server) fireEvent(sessionID, state string) {
+	if p := s.onEvent.Load(); p != nil {
+		(*p)(sessionID, state)
+	}
 }
 
 // Sentinel errors returned by the extracted core ops (CreateWithID/Op/Delete)
 // so the HTTP handlers can map them to the right status code and the agent's
-// execute can special-case them (e.g. destroy on an already-gone session is
-// still "ok" — desired state reached) without string-matching error text.
+// execute can special-case them (e.g. destroy on an already-gone session, or
+// create on an id that already exists, are both still "ok" — desired state
+// reached) without string-matching error text.
 var (
 	errNoSuchSession   = errors.New("no such session")
 	errSessionStarting = errors.New("session still starting")
 	errUnknownOp       = errors.New("unknown op")
+	// errSessionExists is CreateWithID's answer when its putIfAbsent finds
+	// the id already claimed — see CreateWithID's doc comment for the race
+	// this closes.
+	errSessionExists = errors.New("session already exists")
 )
 
 // egressError wraps a pushEgress failure so CreateWithID's caller can tell it
@@ -125,9 +166,16 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 		spec := driver.Spec{Name: body.Name, Image: body.Image, Cmd: body.Cmd, EgressAllow: body.EgressAllow}
 		if err := s.CreateWithID(r.Context(), id, spec, body.EgressAllow); err != nil {
 			var ee *egressError
-			if errors.As(err, &ee) {
+			switch {
+			case errors.As(err, &ee):
 				http.Error(w, err.Error(), http.StatusBadGateway)
-			} else {
+			case errors.Is(err, errSessionExists):
+				// newID's atomic counter makes this practically unreachable
+				// here (unlike the agent's controld-supplied ids), but
+				// CreateWithID's contract covers both callers — map it
+				// rather than let it fall through to a bare 500.
+				http.Error(w, "session id already exists", http.StatusConflict)
+			default:
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 			}
 			return
@@ -146,24 +194,47 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 }
 
 // CreateWithID runs a session's full creation sequence under a caller-chosen
-// id: push its egress rules, register a "starting" registry entry BEFORE the
-// driver call (a real container's sessiond can dial /register the instant
-// drv.Create's `docker run -d` returns, often faster than a put() that came
-// after it — see registry.setHandle's doc comment for what that race used to
-// do), create it, then land the handle and "running" state. Both fronts
-// (POST /sessions' HTTP handler and the agent's execute) drive this same
+// id: atomically claim the id, push its egress rules, create it via the
+// driver, then land the handle and "running" state. Both fronts (POST
+// /sessions' HTTP handler and the agent's execute) drive this same
 // sequence — id minting (POST /sessions mints one via newID; the agent uses
 // controld's session id verbatim) and status-code/JSON mapping are each
 // caller's own job, not this one's.
+//
+// The id claim (reg.putIfAbsent) is a single locked call and runs FIRST,
+// before anything else — this is what makes create idempotent-by-id under
+// real concurrency (review round 1, finding 2, design §4.8's binding
+// requirement). Before this fix, the caller (the agent's execute) checked
+// existence via a separate reg.get, then this function did its own
+// reg.put — two distinct lock acquisitions with a window between them where
+// two racing create commands for the same controld-supplied id (e.g. a
+// retried create the sender is unsure landed) could both observe "absent"
+// and both reach drv.Create: `docker run` has no name-uniqueness guard, so
+// that produced a duplicate, orphaned container. Now there is exactly one
+// lock acquisition deciding "is this id claimed", so at most one caller ever
+// gets past it; every other one gets errSessionExists back immediately,
+// before touching egress or the driver at all — the caller (agent's
+// execute, or in principle the HTTP handler) treats that the same as a
+// successful create, since the desired state (a session exists under this
+// id) is already reached either way.
+//
+// This does mean pushEgress now runs AFTER the entry is claimed, not
+// before as the pre-Task-6 handler had it — a required reordering, not
+// incidental: the claim has to be the very first thing that can fail
+// nothing else can jump the queue on. A pushEgress failure now rolls the
+// claim back (reg.remove) so the id isn't left stuck "starting" forever.
 //
 // spec's SessionID/DialURL/ProxyURL are set here, not by the caller: they're
 // this server's own concerns (the id parameter, s.dialBase, s.proxyURL), not
 // anything a caller — HTTP body or rwire.Spec — should be trusted to supply.
 func (s *Server) CreateWithID(ctx context.Context, id string, spec driver.Spec, allow []string) error {
+	if !s.reg.putIfAbsent(id, &sessionEntry{id: id, state: "starting", allow: allow}) {
+		return errSessionExists
+	}
 	if err := s.pushEgress(id, allow); err != nil {
+		s.reg.remove(id)
 		return &egressError{err: err}
 	}
-	s.reg.put(id, &sessionEntry{id: id, state: "starting", allow: allow})
 	spec.SessionID = id
 	spec.DialURL = s.dialBase + "/register"
 	spec.ProxyURL = s.proxyURL
@@ -182,6 +253,21 @@ func (s *Server) sessionOp(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/sessions/")
 	parts := strings.SplitN(rest, "/", 2)
 	id := parts[0]
+	// Existence/starting is checked BEFORE the method branch below, for
+	// every method — including GET — exactly like the pre-refactor handler
+	// did. Review round 1, finding 4: an earlier version of this refactor
+	// checked method first, so GET on an unknown or still-starting session
+	// returned 405 instead of 404/409; no test caught it (nothing here
+	// sends GET), but it was a real, if narrow, behavior change from the
+	// behavior-preserving mandate — restored, and now pinned by
+	// TestSessionOpGetUnknownSessionReturns404.
+	if _, state, ok := s.reg.opTarget(id); !ok {
+		http.Error(w, "no such session", http.StatusNotFound)
+		return
+	} else if state == "starting" {
+		http.Error(w, "session still starting", http.StatusConflict)
+		return
+	}
 	ctx := r.Context()
 	if r.Method == http.MethodDelete {
 		mapOpErr(w, s.Delete(ctx, id), func() { w.WriteHeader(http.StatusNoContent) })
@@ -366,9 +452,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("session %s registered", id)
-	if s.OnEvent != nil {
-		s.OnEvent(id, "running")
-	}
+	s.fireEvent(id, "running")
 	// Block on the hub's own liveness signal, not r.Context(). websocket.Accept
 	// hijacks the connection for HTTP/1.1, and net/http only cancels
 	// r.Context() when this handler itself returns (conn.serve's deferred
@@ -415,9 +499,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.reg.removeIfHubless(id) {
 		s.drv.Destroy(context.Background(), handle)
-		if s.OnEvent != nil {
-			s.OnEvent(id, "dead")
-		}
+		s.fireEvent(id, "dead")
 	}
 }
 
