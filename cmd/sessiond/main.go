@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net/http"
@@ -9,7 +10,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"rainier/internal/reap"
+	"rainier/internal/relay"
 	"rainier/internal/server"
 	"rainier/internal/session"
 )
@@ -27,6 +31,8 @@ func main() {
 	logPath := flag.String("log", "/tmp/session.log", "event log path")
 	cols := flag.Int("cols", 120, "initial cols")
 	rows := flag.Int("rows", 32, "initial rows")
+	dial := flag.String("dial", "", "runnerd URL to dial and register with (relay mode)")
+	sessionID := flag.String("session", "", "session id to register as (relay mode)")
 	flag.Parse()
 	argv := flag.Args()
 	if len(argv) == 0 {
@@ -52,6 +58,29 @@ func main() {
 		}
 		os.Exit(0)
 	}()
+
+	// Env fallback: the Docker driver injects RAINIER_DIAL/RAINIER_SESSION as
+	// env vars, not flags, so honor them whenever the flags were left empty.
+	if *dial == "" {
+		if v := os.Getenv("RAINIER_DIAL"); v != "" { *dial = v }
+	}
+	if *sessionID == "" {
+		if v := os.Getenv("RAINIER_SESSION"); v != "" { *sessionID = v }
+	}
+
+	if *dial != "" {
+		ctx := context.Background()
+		url := *dial + "?session=" + *sessionID
+		c, _, err := websocket.Dial(ctx, url, nil)
+		if err != nil { log.Fatalf("dial runnerd: %v", err) }
+		c.SetReadLimit(16 << 20)
+		log.Printf("sessiond registered with runnerd as %s", *sessionID)
+		if err := relay.ServeSession(ctx, relay.WSConn(c), s); err != nil {
+			log.Printf("relay ended: %v", err)
+		}
+		return
+	}
+
 	log.Printf("sessiond listening on %s", *listen)
 	if err := http.ListenAndServe(*listen, server.New(s)); err != nil {
 		log.Fatal(err)
