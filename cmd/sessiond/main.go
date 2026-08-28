@@ -117,8 +117,22 @@ func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session) {
 		case <-ctx.Done():
 			return
 		}
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
+		backoff = nextBackoff(backoff)
 	}
+}
+
+// nextBackoff doubles d and clamps to the 30s cap. Extracted as a pure step
+// (no loop, no clock) so the cap arithmetic is table-testable on its own:
+// the previous inline `if backoff < 30*time.Second { backoff *= 2 }` guarded
+// on the PRE-doubled value, so 16s (< 30s) still passed and doubled to 32s —
+// one step over the design's stated 1s..30s cap, and every step after that
+// also failed the guard, freezing backoff at 32s forever instead of 30s.
+// Doubling unconditionally and clamping the RESULT is what actually holds
+// the cap.
+func nextBackoff(d time.Duration) time.Duration {
+	d *= 2
+	if d > 30*time.Second {
+		d = 30 * time.Second
+	}
+	return d
 }

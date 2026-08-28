@@ -281,9 +281,23 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	} // deliberate cold suspend: keep
 	// The conn died but that no longer proves the container did: sessiond
-	// now survives conn loss and redials (see cmd/sessiond). Ask the driver.
-	h, err := s.drv.Inspect(context.Background(), handle)
-	if err == nil && h.State == driver.StateRunning {
+	// now survives conn loss and redials (see cmd/sessiond). Ask the driver
+	// — bounded, so a hung docker daemon can't strand this goroutine (and
+	// the entry) forever.
+	inspectCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	h, err := s.drv.Inspect(inspectCtx, handle)
+	cancel()
+	if err != nil {
+		// Inspect failing is NOT proof the container is gone — it's proof we
+		// couldn't get an answer (daemon hiccup, timeout, ...). Destroying on
+		// that uncertainty risks killing a still-running container, which is
+		// the catastrophic direction; keeping a hub-less entry around risks
+		// nothing worse than a stale row until a later hub death or a
+		// restart's Recover resolves it. Always pick the safe direction.
+		log.Printf("session %s: inspect failed after hub death (%v); keeping the entry rather than risk destroying a live container", id, err)
+		return
+	}
+	if h.State == driver.StateRunning {
 		log.Printf("session %s lost its conn but the container is alive; awaiting re-register", id)
 		return
 	}

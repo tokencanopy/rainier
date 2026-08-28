@@ -3,6 +3,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"strings"
 	"testing"
@@ -15,6 +16,45 @@ func dockerAvailable(t *testing.T) {
 	}
 	if err := exec.Command(mustDockerPath(t), "info").Run(); err != nil {
 		t.Skip("docker daemon not responding; skipping")
+	}
+}
+
+// TestIsNotFoundErr pins the classification Docker.Inspect relies on to
+// distinguish a genuinely-gone container from any other dockerRun failure
+// (daemon unreachable, timeout, permission — review-round-1 Finding 3).
+// dockerRun wraps a failed command's stderr into the returned error's text
+// (see dockerRun in docker_exec.go), so the classification is a substring
+// check on that text, not a distinct error type or exit code — real
+// `docker inspect` on a missing id emits "Error: No such object: <id>" on
+// stderr, confirmed against a live docker daemon.
+func TestIsNotFoundErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{
+			"genuine not-found, real dockerRun wrap shape",
+			errors.New(`docker inspect -f {{.State.Status}} deadbeef: exit status 1: Error: No such object: deadbeef`),
+			true,
+		},
+		{
+			"daemon unreachable — must NOT be classified as gone",
+			errors.New(`docker inspect -f {{.State.Status}} deadbeef: exit status 1: Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?`),
+			false,
+		},
+		{
+			"context deadline exceeded — must NOT be classified as gone",
+			errors.New(`docker inspect -f {{.State.Status}} deadbeef: signal: killed: `),
+			false,
+		},
+		{"empty message", errors.New(""), false},
+	}
+	for _, c := range cases {
+		if got := isNotFoundErr(c.err); got != c.want {
+			t.Errorf("%s: isNotFoundErr(%v) = %v, want %v", c.name, c.err, got, c.want)
+		}
 	}
 }
 
