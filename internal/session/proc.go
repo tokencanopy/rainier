@@ -11,6 +11,8 @@ import (
 	"syscall"
 
 	"github.com/creack/pty"
+
+	"rainier/internal/reap"
 )
 
 type proc struct {
@@ -52,7 +54,14 @@ func StartProc(argv []string, cols, rows int, onOutput func([]byte)) (Proc, erro
 				break
 			}
 		}
-		p.code = waitCode(cmd)
+		if code, ok := reap.AwaitExit(p.cmd.Process.Pid); ok {
+			p.code = code
+			// Release Go-side resources; the child is already reaped, so Wait
+			// returns ECHILD — ignore it, we already have the authoritative code.
+			_ = p.cmd.Wait()
+		} else {
+			p.code = waitCode(p.cmd) // non-Linux: no reaper, cmd.Wait is the waiter
+		}
 		ptmx.Close()
 		close(p.done)
 	}()

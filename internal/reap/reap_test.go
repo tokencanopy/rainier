@@ -15,11 +15,24 @@ func TestReapOnNonLinuxIsNoop(t *testing.T) {
 	if runtime.GOOS == "linux" {
 		t.Skip("linux has real reaping")
 	}
-	ch := Reap(0)
-	select {
-	case <-ch:
-		t.Fatal("no-op reaper must never fire")
-	case <-time.After(200 * time.Millisecond):
+	Start()
+	if code, ok := AwaitExit(1234); ok || code != 0 {
+		t.Fatalf("AwaitExit on non-linux = (%d, %v), want (0, false)", code, ok)
+	}
+}
+
+func TestReaperDeliversChildCode(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("reaping is linux-only")
+	}
+	Start()
+	cmd := exec.Command("sh", "-c", "exit 7")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	code, ok := AwaitExit(cmd.Process.Pid)
+	if !ok || code != 7 {
+		t.Fatalf("AwaitExit = (%d, %v), want (7, true)", code, ok)
 	}
 }
 
@@ -29,12 +42,14 @@ func TestReapCollectsOrphan(t *testing.T) {
 	}
 	// A process whose parent exits before it does becomes an orphan reparented
 	// to the subreaper. `sh -c '(sleep 0.2 &) ; exit 0'` leaves a grandchild.
-	Reap(-1) // reap everything; we only assert no zombie accumulates
+	Start()
 	cmd := exec.Command("sh", "-c", "(sleep 0.2 &) ; exit 0")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	cmd.Wait()
+	if _, ok := AwaitExit(cmd.Process.Pid); !ok {
+		t.Fatal("AwaitExit did not report the direct child's exit")
+	}
 	time.Sleep(400 * time.Millisecond)
 	// If reaping works, the orphaned `sleep` has been collected — assert no
 	// defunct child remains by reading /proc for our zombie children.

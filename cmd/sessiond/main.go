@@ -31,7 +31,7 @@ func main() {
 		log.Printf("child exited with code %d; sessiond stays up for viewers", s.ExitCode())
 	}()
 
-	reap.Reap(-1) // reap orphaned grandchildren; agent status still comes from Proc.Wait via Session
+	reap.Start() // single authoritative waiter on Linux; agent exit code flows back through Proc.Wait via Session
 
 	term := make(chan os.Signal, 1)
 	signal.Notify(term, syscall.SIGTERM, syscall.SIGINT)
