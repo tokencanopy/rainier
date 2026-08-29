@@ -107,11 +107,11 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// Run hosts controld's background loops and blocks until ctx is done. The
-// scheduler loop lands here in Task 8; callers already start it as
-// `go srv.Run(ctx)` so that arrival changes nothing at the call site.
+// Run hosts controld's background loops and blocks until ctx is done.
+// schedulerLoop already returns on ctx.Done(), so Run needs nothing further
+// of its own to block on.
 func (s *Server) Run(ctx context.Context) {
-	<-ctx.Done()
+	s.schedulerLoop(ctx)
 }
 
 // wakeScheduler tells the scheduler loop that capacity or the queue may have
