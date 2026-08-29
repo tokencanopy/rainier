@@ -332,6 +332,17 @@ func seedSession(t *testing.T, st Store, s Session) Session {
 	return out
 }
 
+// seedSetupSession seeds a session exactly as a create dispatch leaves one
+// whose setup script is still running: placed on runner, resolved to the
+// environment's image, and carrying the pin of the script it was dispatched
+// with (see Session.SetupHash). Tests that want a DIFFERENT provenance say so
+// by writing the row themselves.
+func seedSetupSession(t *testing.T, st Store, id, runner string, env Environment) Session {
+	t.Helper()
+	return seedSession(t, st, Session{ID: id, State: StateRunning, Runner: runner,
+		EnvironmentID: env.ID, ResolvedImage: env.Image, SetupHash: SetupHash(env.Image, env.Setup)})
+}
+
 func envRow(t *testing.T, st Store, id string) Environment {
 	t.Helper()
 	e, err := st.GetEnvironment(context.Background(), id)
@@ -1107,8 +1118,7 @@ func TestSetupDoneNoOps(t *testing.T) {
 		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "echo hi"})
 		const ref = "rainier-env:already-cached"
 		env = cacheEnvSnapshot(t, st, env, ref, "vm2")
-		seedSession(t, st, Session{ID: "sess_cached", State: StateRunning, Runner: "vm1",
-			EnvironmentID: env.ID, ResolvedImage: env.Image})
+		seedSetupSession(t, st, "sess_cached", "vm1", env)
 
 		f.eventDetail(t, "sess_cached", "setup_done", "")
 		wantEventHandled(t, st, f, "sess_sync_cached")
@@ -1124,8 +1134,7 @@ func TestSetupDoneNoOps(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 		env := seedEnv(t, st, Environment{Name: "doomed", Image: "img:1", Setup: "echo hi"})
-		seedSession(t, st, Session{ID: "sess_orphan", State: StateRunning, Runner: "vm1",
-			EnvironmentID: env.ID, ResolvedImage: env.Image})
+		seedSetupSession(t, st, "sess_orphan", "vm1", env)
 		if err := st.DeleteEnvironment(context.Background(), env.ID); err != nil {
 			t.Fatalf("DeleteEnvironment: %v", err)
 		}
@@ -1145,7 +1154,8 @@ func TestSetupDoneNoOps(t *testing.T) {
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "echo hi"})
 		seedSession(t, st, Session{ID: "sess_override", State: StateRunning, Runner: "vm1",
-			Image: "myfork:latest", EnvironmentID: env.ID, ResolvedImage: "myfork:latest"})
+			Image: "myfork:latest", EnvironmentID: env.ID, ResolvedImage: "myfork:latest",
+			SetupHash: SetupHash("myfork:latest", env.Setup)})
 
 		f.eventDetail(t, "sess_override", "setup_done", "")
 		wantEventHandled(t, st, f, "sess_sync_override")
@@ -1208,8 +1218,7 @@ func TestSetupEventsFromANonPlacedRunnerAreIgnored(t *testing.T) {
 	env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "echo hi"})
 
 	t.Run("setup_failed for a session placed elsewhere", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_elsewhere_failed", State: StateRunning, Runner: "vm2",
-			EnvironmentID: env.ID, ResolvedImage: env.Image})
+		seedSetupSession(t, st, "sess_elsewhere_failed", "vm2", env)
 
 		f.eventDetail(t, "sess_elsewhere_failed", "setup_failed", "rc 1: boom")
 		wantEventHandled(t, st, f, "sess_sync_ef")
@@ -1222,7 +1231,7 @@ func TestSetupEventsFromANonPlacedRunnerAreIgnored(t *testing.T) {
 
 	t.Run("setup_failed for an unplaced (requeued) row", func(t *testing.T) {
 		seedSession(t, st, Session{ID: "sess_requeued_failed", State: StateQueued,
-			EnvironmentID: env.ID, ResolvedImage: env.Image})
+			EnvironmentID: env.ID, ResolvedImage: env.Image, SetupHash: SetupHash(env.Image, env.Setup)})
 
 		f.eventDetail(t, "sess_requeued_failed", "setup_failed", "rc 1: boom")
 		wantEventHandled(t, st, f, "sess_sync_rf")
@@ -1234,8 +1243,7 @@ func TestSetupEventsFromANonPlacedRunnerAreIgnored(t *testing.T) {
 	})
 
 	t.Run("setup_done for a session placed elsewhere", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_elsewhere_done", State: StateRunning, Runner: "vm2",
-			EnvironmentID: env.ID, ResolvedImage: env.Image})
+		seedSetupSession(t, st, "sess_elsewhere_done", "vm2", env)
 
 		f.eventDetail(t, "sess_elsewhere_done", "setup_done", "")
 		wantEventHandled(t, st, f, "sess_sync_ed")
@@ -1248,7 +1256,7 @@ func TestSetupEventsFromANonPlacedRunnerAreIgnored(t *testing.T) {
 
 	t.Run("setup_done for an unplaced (requeued) row", func(t *testing.T) {
 		seedSession(t, st, Session{ID: "sess_requeued_done", State: StateQueued,
-			EnvironmentID: env.ID, ResolvedImage: env.Image})
+			EnvironmentID: env.ID, ResolvedImage: env.Image, SetupHash: SetupHash(env.Image, env.Setup)})
 
 		f.eventDetail(t, "sess_requeued_done", "setup_done", "")
 		wantEventHandled(t, st, f, "sess_sync_rd")
@@ -1258,6 +1266,56 @@ func TestSetupEventsFromANonPlacedRunnerAreIgnored(t *testing.T) {
 			t.Fatalf("environment cached as %q from an unplaced row", got.SnapshotRef)
 		}
 	})
+}
+
+// TestSetupDoneAfterAScriptEditDoesNotCache is the window the session's
+// pinned SetupHash exists for: the environment's SCRIPT is edited while the
+// first session's setup is still running. Nothing else can see it — the row's
+// resolved image still matches, and the hash recomputed at event time is the
+// NEW one, which the guarded store write would happily accept — so without
+// the pin the old script's container would be published as the new script's
+// cache, and every later session would get the wrong toolchain silently.
+func TestSetupDoneAfterAScriptEditDoesNotCache(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+
+	env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "install v1"})
+	seedSession(t, st, Session{ID: "sess_edited", State: StateQueued, Name: "edited",
+		EnvironmentID: env.ID, ResolvedImage: env.Image, CreatedAt: time.Now().Add(-time.Hour)})
+	startRun(t, s)
+
+	// The dispatch carries v1 of the script and pins it (production code, not
+	// the test, writes that pin).
+	create := nextCreate(t, f)
+	if create.Spec == nil || create.Spec.Setup != "install v1" {
+		t.Fatalf("create spec = %+v, want the v1 setup script", create.Spec)
+	}
+	f.reply(t, create, true, "")
+	eventually(t, 3*time.Second, func() error {
+		if got := getSession(t, st, "sess_edited"); got.SetupHash != SetupHash(env.Image, "install v1") {
+			return fmt.Errorf("session setup hash = %q, want the dispatched script's", got.SetupHash)
+		}
+		return nil
+	})
+
+	// ...and the script changes while it runs.
+	edited := env
+	edited.Setup = "install v2"
+	if _, err := st.UpdateEnvironment(context.Background(), edited); err != nil {
+		t.Fatalf("UpdateEnvironment: %v", err)
+	}
+
+	f.event(t, "sess_edited", "running")
+	wantState(t, st, "sess_edited", StateRunning)
+	f.eventDetail(t, "sess_edited", "setup_done", "")
+	wantEventHandled(t, st, f, "sess_sync_edited")
+
+	// No snapshot may be dispatched at all: what that container holds is v1.
+	wantNothingQueued(t, s, f)
+	if got := envRow(t, st, env.ID); got.SnapshotRef != "" || got.SnapshotHash != "" {
+		t.Fatalf("environment cached as %q/%q from a container that ran the pre-edit script",
+			got.SnapshotRef, got.SnapshotHash)
+	}
 }
 
 // envSnapshotSpy records the outcome of every SetEnvironmentSnapshot the
@@ -1292,8 +1350,7 @@ func TestSetupDoneStaleEnvironmentIsDropped(t *testing.T) {
 	f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 4})
 
 	env := seedEnv(t, spy, Environment{Name: "dev", Image: "img:1", Setup: "echo one"})
-	seedSession(t, spy, Session{ID: "sess_stale", State: StateRunning, Runner: "vm1",
-		EnvironmentID: env.ID, ResolvedImage: env.Image})
+	seedSetupSession(t, spy, "sess_stale", "vm1", env)
 
 	f1.eventDetail(t, "sess_stale", "setup_done", "")
 	snap := nextOfType(t, f1, "snapshot")
@@ -1337,8 +1394,7 @@ func TestSetupDoneSnapshotFailureRecordsNothing(t *testing.T) {
 	f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 4})
 
 	env := seedEnv(t, spy, Environment{Name: "dev", Image: "img:1", Setup: "echo one"})
-	seedSession(t, spy, Session{ID: "sess_snapfail", State: StateRunning, Runner: "vm1",
-		EnvironmentID: env.ID, ResolvedImage: env.Image})
+	seedSetupSession(t, spy, "sess_snapfail", "vm1", env)
 
 	f1.eventDetail(t, "sess_snapfail", "setup_done", "")
 	snap := nextOfType(t, f1, "snapshot")

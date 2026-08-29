@@ -304,6 +304,18 @@ func (m *memStore) Transition(ctx context.Context, id string, from []SessionStat
 	return nil
 }
 
+func (m *memStore) SetSessionSetupHash(ctx context.Context, id, hash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok {
+		return ErrNotFound
+	}
+	s.SetupHash = hash
+	s.UpdatedAt = time.Now()
+	return nil
+}
+
 func (m *memStore) UpsertRunner(ctx context.Context, r Runner) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
