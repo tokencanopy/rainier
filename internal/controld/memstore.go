@@ -2,6 +2,7 @@
 package controld
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -13,7 +14,7 @@ import (
 	"time"
 )
 
-// memStore is an in-memory Store. It holds one mutex guarding four maps and
+// memStore is an in-memory Store. It holds one mutex guarding six maps and
 // never leaks a live pointer across the lock boundary — every method
 // returns value copies, same discipline as internal/runnerd/registry.go's
 // list(). It exists for tests and local development; controld's production
@@ -26,6 +27,16 @@ type memStore struct {
 	tokens        map[string]string // token hash -> user id
 	sessions      map[string]*Session
 	runners       map[string]*Runner
+	environments  map[string]*Environment
+	secrets       map[string]*secretRow // by secret name
+}
+
+// secretRow is one stored secret: the sealed bytes plus the metadata
+// ListSecrets is allowed to hand out.
+type secretRow struct {
+	meta       SecretMeta
+	ciphertext []byte
+	nonce      []byte
 }
 
 // NewMemStore returns a fresh in-memory Store.
@@ -36,6 +47,8 @@ func NewMemStore() Store {
 		tokens:        map[string]string{},
 		sessions:      map[string]*Session{},
 		runners:       map[string]*Runner{},
+		environments:  map[string]*Environment{},
+		secrets:       map[string]*secretRow{},
 	}
 }
 
@@ -319,6 +332,212 @@ func (m *memStore) ListRunners(ctx context.Context) ([]Runner, error) {
 		out = append(out, *r)
 	}
 	return out, nil
+}
+
+// cloneEnvironment returns a deep copy of e. A plain struct copy would still
+// share the slice backing arrays with the map's own row, so a caller who
+// appended to a returned EgressAllow could reach back into the store; every
+// value that crosses the mutex is cloned instead.
+func cloneEnvironment(e Environment) Environment {
+	cp := e
+	cp.EgressAllow = slices.Clone(e.EgressAllow)
+	cp.SecretRefs = slices.Clone(e.SecretRefs)
+	if e.Connectors != nil {
+		cp.Connectors = make([]Connector, len(e.Connectors))
+		for i, c := range e.Connectors {
+			c.Raw = bytes.Clone(c.Raw)
+			cp.Connectors[i] = c
+		}
+	}
+	return cp
+}
+
+func (m *memStore) CreateEnvironment(ctx context.Context, e Environment) (Environment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.environments[e.ID]; ok {
+		return Environment{}, ErrConflict
+	}
+	for _, existing := range m.environments {
+		if existing.Name == e.Name {
+			return Environment{}, ErrConflict
+		}
+	}
+
+	now := time.Now()
+	if e.CreatedAt.IsZero() {
+		e.CreatedAt = now
+	}
+	if e.UpdatedAt.IsZero() {
+		e.UpdatedAt = now
+	}
+	e.SetupHash = SetupHash(e.Image, e.Setup)
+	// A brand-new environment has no cached snapshot, whatever the caller
+	// passed — only SetEnvironmentSnapshot writes these.
+	e.SnapshotRef, e.SnapshotRunner, e.SnapshotHash = "", "", ""
+
+	cp := cloneEnvironment(e)
+	m.environments[e.ID] = &cp
+	return cloneEnvironment(cp), nil
+}
+
+func (m *memStore) GetEnvironment(ctx context.Context, id string) (Environment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.environments[id]
+	if !ok {
+		return Environment{}, ErrNotFound
+	}
+	return cloneEnvironment(*e), nil
+}
+
+func (m *memStore) GetEnvironmentByName(ctx context.Context, name string) (Environment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.environments {
+		if e.Name == name {
+			return cloneEnvironment(*e), nil
+		}
+	}
+	return Environment{}, ErrNotFound
+}
+
+func (m *memStore) ListEnvironments(ctx context.Context) ([]Environment, error) {
+	m.mu.Lock()
+	out := make([]Environment, 0, len(m.environments))
+	for _, e := range m.environments {
+		out = append(out, cloneEnvironment(*e))
+	}
+	m.mu.Unlock()
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (m *memStore) UpdateEnvironment(ctx context.Context, e Environment) (Environment, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	cur, ok := m.environments[e.ID]
+	if !ok {
+		return Environment{}, ErrNotFound
+	}
+	for id, existing := range m.environments {
+		if id != e.ID && existing.Name == e.Name {
+			return Environment{}, ErrConflict
+		}
+	}
+
+	upd := cloneEnvironment(e)
+	upd.CreatedAt = cur.CreatedAt
+	// The snapshot columns are the store's: an update that moves SetupHash
+	// leaves the old snapshot in place, visibly stale, for the caching path
+	// to notice and rebuild.
+	upd.SnapshotRef, upd.SnapshotRunner, upd.SnapshotHash = cur.SnapshotRef, cur.SnapshotRunner, cur.SnapshotHash
+	upd.SetupHash = SetupHash(upd.Image, upd.Setup)
+	upd.UpdatedAt = time.Now()
+
+	m.environments[e.ID] = &upd
+	return cloneEnvironment(upd), nil
+}
+
+func (m *memStore) DeleteEnvironment(ctx context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.environments[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.environments, id)
+	return nil
+}
+
+func (m *memStore) CountSessionsByEnvironment(ctx context.Context, envID string, states []SessionState) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var stateSet map[SessionState]bool
+	if len(states) > 0 {
+		stateSet = make(map[SessionState]bool, len(states))
+		for _, st := range states {
+			stateSet[st] = true
+		}
+	}
+
+	n := 0
+	for _, s := range m.sessions {
+		if s.EnvironmentID != envID {
+			continue
+		}
+		if stateSet != nil && !stateSet[s.State] {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
+func (m *memStore) SetEnvironmentSnapshot(ctx context.Context, envID, expectHash, ref, runner string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Compare-and-set: the environment must still be the one this snapshot
+	// was built from. A missing environment fails the same way — there is
+	// nothing left for the snapshot to belong to.
+	e, ok := m.environments[envID]
+	if !ok || e.SetupHash != expectHash {
+		return ErrConflict
+	}
+	e.SnapshotRef, e.SnapshotRunner, e.SnapshotHash = ref, runner, expectHash
+	e.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *memStore) PutSecret(ctx context.Context, name string, ciphertext, nonce []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	row, ok := m.secrets[name]
+	if !ok {
+		row = &secretRow{meta: SecretMeta{Name: name, CreatedAt: now}}
+		m.secrets[name] = row
+	}
+	row.ciphertext = bytes.Clone(ciphertext)
+	row.nonce = bytes.Clone(nonce)
+	row.meta.UpdatedAt = now
+	return nil
+}
+
+func (m *memStore) ListSecrets(ctx context.Context) ([]SecretMeta, error) {
+	m.mu.Lock()
+	out := make([]SecretMeta, 0, len(m.secrets))
+	for _, row := range m.secrets {
+		out = append(out, row.meta)
+	}
+	m.mu.Unlock()
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (m *memStore) GetSecret(ctx context.Context, name string) ([]byte, []byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.secrets[name]
+	if !ok {
+		return nil, nil, ErrNotFound
+	}
+	return bytes.Clone(row.ciphertext), bytes.Clone(row.nonce), nil
+}
+
+func (m *memStore) DeleteSecret(ctx context.Context, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.secrets[name]; !ok {
+		return ErrNotFound
+	}
+	delete(m.secrets, name)
+	return nil
 }
 
 // encodeCursor and decodeCursor implement ListSessions's opaque page
