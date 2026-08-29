@@ -1,7 +1,7 @@
 # Rainier
 
 <p align="center">
-  <img src="assets/project-rainier-lockup.svg" alt="Project Rainier logo: snowcapped mountain and pine trees" width="512">
+  <img src="assets/project-rainier-lockup.png" alt="Project Rainier logo: snowcapped mountain and pine trees" width="512">
 </p>
 
 Self-hostable infrastructure for running your coding agents — Claude Code,
