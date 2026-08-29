@@ -117,10 +117,10 @@ func (s *Store) UserByToken(ctx context.Context, tokenHash string) (controld.Use
 
 // --- sessions -----------------------------------------------------------
 
-const selectSessionCols = `id, owner_id, name, image, cmd, egress_allow, state, runner, idempotency_key, error, created_at, updated_at, last_event_at`
+const selectSessionCols = `id, owner_id, name, image, cmd, egress_allow, state, runner, idempotency_key, error, environment_id, resolved_image, created_at, updated_at, last_event_at`
 
-// sessionScanner is satisfied by both pgx.Row and pgx.Rows.
-type sessionScanner interface {
+// rowScanner is satisfied by both pgx.Row and pgx.Rows.
+type rowScanner interface {
 	Scan(dest ...any) error
 }
 
@@ -133,14 +133,15 @@ func nonNilStrings(ss []string) []string {
 	return ss
 }
 
-func scanSession(row sessionScanner) (controld.Session, error) {
+func scanSession(row rowScanner) (controld.Session, error) {
 	var sess controld.Session
 	var state string
 	var idem *string
 	var cmdBytes, egressBytes []byte
 
 	if err := row.Scan(&sess.ID, &sess.OwnerID, &sess.Name, &sess.Image, &cmdBytes, &egressBytes,
-		&state, &sess.Runner, &idem, &sess.Error, &sess.CreatedAt, &sess.UpdatedAt, &sess.LastEventAt); err != nil {
+		&state, &sess.Runner, &idem, &sess.Error, &sess.EnvironmentID, &sess.ResolvedImage,
+		&sess.CreatedAt, &sess.UpdatedAt, &sess.LastEventAt); err != nil {
 		return controld.Session{}, err
 	}
 	sess.State = controld.SessionState(state)
@@ -194,11 +195,11 @@ func (s *Store) CreateSession(ctx context.Context, sess controld.Session) (contr
 	}
 
 	row := s.pool.QueryRow(ctx, `
-		INSERT INTO sessions (id, owner_id, name, image, cmd, egress_allow, state, runner, idempotency_key, error, created_at, updated_at, last_event_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		INSERT INTO sessions (id, owner_id, name, image, cmd, egress_allow, state, runner, idempotency_key, error, environment_id, resolved_image, created_at, updated_at, last_event_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		RETURNING `+selectSessionCols,
 		sess.ID, sess.OwnerID, sess.Name, sess.Image, cmd, egress, string(sess.State), sess.Runner, idem, sess.Error,
-		createdAt, updatedAt, lastEventAt)
+		sess.EnvironmentID, sess.ResolvedImage, createdAt, updatedAt, lastEventAt)
 
 	out, err := scanSession(row)
 	if err != nil {
@@ -456,6 +457,315 @@ func (s *Store) ListRunners(ctx context.Context) ([]controld.Runner, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// --- environments ---------------------------------------------------------
+
+const selectEnvironmentCols = `id, name, image, setup, setup_hash, egress_allow, secret_refs, connectors, placement, setup_timeout_sec, snapshot_ref, snapshot_runner, snapshot_hash, created_at, updated_at`
+
+// encodeConnectors renders cs as the JSON array the connectors column holds:
+// each element is that connector's own object, passed through untouched, so
+// members this build knows nothing about survive a round trip. (jsonb still
+// normalizes whitespace and member order on the way in — it stores a value,
+// not a byte string — but adds, drops, and rewrites nothing.) A connector
+// carrying no Raw, built in code rather than decoded from a request, is
+// stored as the bare envelope {"type": ...} so the column never holds a
+// JSON null.
+func encodeConnectors(cs []controld.Connector) ([]byte, error) {
+	raws := make([]json.RawMessage, 0, len(cs))
+	for _, c := range cs {
+		if len(c.Raw) == 0 {
+			b, err := json.Marshal(c)
+			if err != nil {
+				return nil, err
+			}
+			raws = append(raws, b)
+			continue
+		}
+		raws = append(raws, c.Raw)
+	}
+	return json.Marshal(raws)
+}
+
+// decodeConnectors is encodeConnectors's inverse: it splits the stored array
+// into one Connector per element, keeping that element's bytes in Raw and
+// lifting its "type" member into Type.
+func decodeConnectors(b []byte) ([]controld.Connector, error) {
+	if len(b) == 0 {
+		return nil, nil
+	}
+	var raws []json.RawMessage
+	if err := json.Unmarshal(b, &raws); err != nil {
+		return nil, err
+	}
+	if len(raws) == 0 {
+		return nil, nil
+	}
+	out := make([]controld.Connector, 0, len(raws))
+	for _, raw := range raws {
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(raw, &envelope); err != nil {
+			return nil, err
+		}
+		out = append(out, controld.Connector{Type: envelope.Type, Raw: raw})
+	}
+	return out, nil
+}
+
+func scanEnvironment(row rowScanner) (controld.Environment, error) {
+	var e controld.Environment
+	var egressBytes, refsBytes, connectorBytes []byte
+
+	if err := row.Scan(&e.ID, &e.Name, &e.Image, &e.Setup, &e.SetupHash, &egressBytes, &refsBytes,
+		&connectorBytes, &e.Placement, &e.SetupTimeoutSec, &e.SnapshotRef, &e.SnapshotRunner, &e.SnapshotHash,
+		&e.CreatedAt, &e.UpdatedAt); err != nil {
+		return controld.Environment{}, err
+	}
+	if len(egressBytes) > 0 {
+		if err := json.Unmarshal(egressBytes, &e.EgressAllow); err != nil {
+			return controld.Environment{}, fmt.Errorf("pgstore: decode egress_allow: %w", err)
+		}
+	}
+	if len(refsBytes) > 0 {
+		if err := json.Unmarshal(refsBytes, &e.SecretRefs); err != nil {
+			return controld.Environment{}, fmt.Errorf("pgstore: decode secret_refs: %w", err)
+		}
+	}
+	connectors, err := decodeConnectors(connectorBytes)
+	if err != nil {
+		return controld.Environment{}, fmt.Errorf("pgstore: decode connectors: %w", err)
+	}
+	e.Connectors = connectors
+	return e, nil
+}
+
+// environmentColumns marshals the jsonb columns an insert or update writes.
+func environmentColumns(e controld.Environment) (egress, refs, connectors []byte, err error) {
+	if egress, err = json.Marshal(nonNilStrings(e.EgressAllow)); err != nil {
+		return nil, nil, nil, fmt.Errorf("pgstore: encode egress_allow: %w", err)
+	}
+	if refs, err = json.Marshal(nonNilStrings(e.SecretRefs)); err != nil {
+		return nil, nil, nil, fmt.Errorf("pgstore: encode secret_refs: %w", err)
+	}
+	if connectors, err = encodeConnectors(e.Connectors); err != nil {
+		return nil, nil, nil, fmt.Errorf("pgstore: encode connectors: %w", err)
+	}
+	return egress, refs, connectors, nil
+}
+
+func (s *Store) CreateEnvironment(ctx context.Context, e controld.Environment) (controld.Environment, error) {
+	now := time.Now()
+	createdAt, updatedAt := e.CreatedAt, e.UpdatedAt
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	if updatedAt.IsZero() {
+		updatedAt = now
+	}
+	egress, refs, connectors, err := environmentColumns(e)
+	if err != nil {
+		return controld.Environment{}, err
+	}
+
+	// The snapshot columns are left at their '' defaults: a new environment
+	// has no cache, and only SetEnvironmentSnapshot ever writes one.
+	row := s.pool.QueryRow(ctx, `
+		INSERT INTO environments (id, name, image, setup, setup_hash, egress_allow, secret_refs, connectors, placement, setup_timeout_sec, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		RETURNING `+selectEnvironmentCols,
+		e.ID, e.Name, e.Image, e.Setup, controld.SetupHash(e.Image, e.Setup),
+		egress, refs, connectors, e.Placement, e.SetupTimeoutSec, createdAt, updatedAt)
+
+	out, err := scanEnvironment(row)
+	if err != nil {
+		// environments has exactly two unique constraints — the primary key
+		// and the name — and either one means the caller lost a race for an
+		// identity that is already taken.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return controld.Environment{}, controld.ErrConflict
+		}
+		return controld.Environment{}, fmt.Errorf("pgstore: create environment: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) GetEnvironment(ctx context.Context, id string) (controld.Environment, error) {
+	row := s.pool.QueryRow(ctx, `SELECT `+selectEnvironmentCols+` FROM environments WHERE id = $1`, id)
+	e, err := scanEnvironment(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controld.Environment{}, controld.ErrNotFound
+		}
+		return controld.Environment{}, fmt.Errorf("pgstore: get environment: %w", err)
+	}
+	return e, nil
+}
+
+func (s *Store) GetEnvironmentByName(ctx context.Context, name string) (controld.Environment, error) {
+	row := s.pool.QueryRow(ctx, `SELECT `+selectEnvironmentCols+` FROM environments WHERE name = $1`, name)
+	e, err := scanEnvironment(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controld.Environment{}, controld.ErrNotFound
+		}
+		return controld.Environment{}, fmt.Errorf("pgstore: get environment by name: %w", err)
+	}
+	return e, nil
+}
+
+func (s *Store) ListEnvironments(ctx context.Context) ([]controld.Environment, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+selectEnvironmentCols+` FROM environments ORDER BY name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("pgstore: list environments: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]controld.Environment, 0)
+	for rows.Next() {
+		e, err := scanEnvironment(rows)
+		if err != nil {
+			return nil, fmt.Errorf("pgstore: list environments: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpdateEnvironment(ctx context.Context, e controld.Environment) (controld.Environment, error) {
+	egress, refs, connectors, err := environmentColumns(e)
+	if err != nil {
+		return controld.Environment{}, err
+	}
+
+	// created_at and the snapshot columns are absent on purpose: an update
+	// re-states what the operator asked for, and leaves a stale snapshot
+	// standing for the caching path to rebuild.
+	row := s.pool.QueryRow(ctx, `
+		UPDATE environments SET
+			name = $2, image = $3, setup = $4, setup_hash = $5, egress_allow = $6, secret_refs = $7,
+			connectors = $8, placement = $9, setup_timeout_sec = $10, updated_at = now()
+		WHERE id = $1
+		RETURNING `+selectEnvironmentCols,
+		e.ID, e.Name, e.Image, e.Setup, controld.SetupHash(e.Image, e.Setup),
+		egress, refs, connectors, e.Placement, e.SetupTimeoutSec)
+
+	out, err := scanEnvironment(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controld.Environment{}, controld.ErrNotFound
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return controld.Environment{}, controld.ErrConflict
+		}
+		return controld.Environment{}, fmt.Errorf("pgstore: update environment: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) DeleteEnvironment(ctx context.Context, id string) error {
+	ct, err := s.pool.Exec(ctx, `DELETE FROM environments WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("pgstore: delete environment: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return controld.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) CountSessionsByEnvironment(ctx context.Context, envID string, states []controld.SessionState) (int, error) {
+	sql := `SELECT count(*) FROM sessions WHERE environment_id = $1`
+	args := []any{envID}
+	if len(states) > 0 {
+		strs := make([]string, len(states))
+		for i, st := range states {
+			strs[i] = string(st)
+		}
+		args = append(args, strs)
+		sql += ` AND state = ANY($2)`
+	}
+
+	var n int
+	if err := s.pool.QueryRow(ctx, sql, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("pgstore: count sessions by environment: %w", err)
+	}
+	return n, nil
+}
+
+func (s *Store) SetEnvironmentSnapshot(ctx context.Context, envID, expectHash, ref, runner string) error {
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE environments SET snapshot_ref = $3, snapshot_runner = $4, snapshot_hash = $2, updated_at = now()
+		WHERE id = $1 AND setup_hash = $2`, envID, expectHash, ref, runner)
+	if err != nil {
+		return fmt.Errorf("pgstore: set environment snapshot: %w", err)
+	}
+	// No row matched: the environment's setup moved on (or the environment
+	// is gone), so this snapshot is for a build nobody wants any more.
+	if ct.RowsAffected() == 0 {
+		return controld.ErrConflict
+	}
+	return nil
+}
+
+// --- secrets --------------------------------------------------------------
+
+func (s *Store) PutSecret(ctx context.Context, name string, ciphertext, nonce []byte) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO secrets (name, ciphertext, nonce) VALUES ($1, $2, $3)
+		ON CONFLICT (name) DO UPDATE SET
+			ciphertext = EXCLUDED.ciphertext, nonce = EXCLUDED.nonce, updated_at = now()`,
+		name, ciphertext, nonce)
+	if err != nil {
+		return fmt.Errorf("pgstore: put secret: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ListSecrets(ctx context.Context) ([]controld.SecretMeta, error) {
+	// The ciphertext and nonce columns are deliberately not selected: a
+	// listing has no business carrying secret material.
+	rows, err := s.pool.Query(ctx, `SELECT name, created_at, updated_at FROM secrets ORDER BY name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("pgstore: list secrets: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]controld.SecretMeta, 0)
+	for rows.Next() {
+		var m controld.SecretMeta
+		if err := rows.Scan(&m.Name, &m.CreatedAt, &m.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("pgstore: list secrets: %w", err)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetSecret(ctx context.Context, name string) ([]byte, []byte, error) {
+	var ciphertext, nonce []byte
+	err := s.pool.QueryRow(ctx, `SELECT ciphertext, nonce FROM secrets WHERE name = $1`, name).Scan(&ciphertext, &nonce)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil, controld.ErrNotFound
+		}
+		return nil, nil, fmt.Errorf("pgstore: get secret: %w", err)
+	}
+	return ciphertext, nonce, nil
+}
+
+func (s *Store) DeleteSecret(ctx context.Context, name string) error {
+	ct, err := s.pool.Exec(ctx, `DELETE FROM secrets WHERE name = $1`, name)
+	if err != nil {
+		return fmt.Errorf("pgstore: delete secret: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return controld.ErrNotFound
+	}
+	return nil
 }
 
 // --- cursor ---------------------------------------------------------------

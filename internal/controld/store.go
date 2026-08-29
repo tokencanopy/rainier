@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -76,9 +77,59 @@ type Session struct {
 	Runner         string // runner name; "" until placed
 	IdempotencyKey string // "" = none
 	Error          string
+	EnvironmentID  string // environment this session came from; "" for scratch
+	ResolvedImage  string // image actually dispatched (snapshot or env image); "" for scratch
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	LastEventAt    time.Time
+}
+
+// Connector is one entry of an Environment's connectors array: the "type"
+// member decoded out, plus the whole original object kept verbatim in Raw.
+// The store treats a connector as opaque — it persists Raw as-is and decodes
+// Type back out of it; the API layer is what validates a connector's shape
+// per type.
+type Connector struct {
+	Type string          `json:"type"`
+	Raw  json.RawMessage `json:"-"` // full original object, stored verbatim
+}
+
+// Environment is a named, reusable template a session starts from: the image
+// and setup script that define its filesystem, plus the egress, secrets, and
+// connectors it may use.
+//
+// Four fields belong to the store, not to callers. SetupHash is recomputed
+// from Image and Setup on every create and update — whatever a caller puts
+// there is ignored. The three Snapshot fields are written only by
+// SetEnvironmentSnapshot: create leaves them empty and update leaves them
+// exactly as they were, so a snapshot built from a superseded SetupHash
+// stays visibly stale (SnapshotHash != SetupHash) instead of being silently
+// adopted or silently dropped.
+type Environment struct {
+	ID              string
+	Name            string
+	Image           string
+	Setup           string
+	SetupHash       string // sha256(image+"\x00"+setup); store-maintained
+	EgressAllow     []string
+	SecretRefs      []string
+	Connectors      []Connector
+	Placement       string // runner name, or "" for any runner
+	SetupTimeoutSec int
+	SnapshotRef     string // "" until cached
+	SnapshotRunner  string // runner that built the cache
+	SnapshotHash    string // setup_hash the snapshot was built from
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
+// SecretMeta is everything about a stored secret except the secret: its name
+// and timestamps. Listing secrets returns these, so no listing path can leak
+// ciphertext — only GetSecret hands the bytes back.
+type SecretMeta struct {
+	Name      string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Runner is a registered runnerd fleet member and its current capacity.
@@ -142,6 +193,38 @@ type Store interface {
 	UpsertRunner(ctx context.Context, r Runner) error // by Name; sets connected/capacity/last_seen
 	SetRunnerConnected(ctx context.Context, name string, connected bool) error
 	ListRunners(ctx context.Context) ([]Runner, error)
+
+	// CreateEnvironment stores e with a freshly computed SetupHash and no
+	// snapshot, and returns the stored row. ErrConflict if the name is
+	// already held.
+	CreateEnvironment(ctx context.Context, e Environment) (Environment, error)
+	GetEnvironment(ctx context.Context, id string) (Environment, error)
+	GetEnvironmentByName(ctx context.Context, name string) (Environment, error)
+	// ListEnvironments returns every environment, name ascending. There are
+	// few environments per deployment, so this page is the whole table.
+	ListEnvironments(ctx context.Context) ([]Environment, error)
+	// UpdateEnvironment replaces the mutable columns of the environment with
+	// e.ID, recomputes SetupHash, and leaves created_at and the snapshot
+	// columns alone. ErrNotFound if no such id, ErrConflict if e.Name is
+	// held by another environment.
+	UpdateEnvironment(ctx context.Context, e Environment) (Environment, error)
+	DeleteEnvironment(ctx context.Context, id string) error // ErrNotFound
+	// CountSessionsByEnvironment counts sessions on envID whose state is in
+	// states; an empty states counts every session on the environment.
+	CountSessionsByEnvironment(ctx context.Context, envID string, states []SessionState) (int, error)
+	// SetEnvironmentSnapshot records a built snapshot against the
+	// environment, but only while its SetupHash is still expectHash. A
+	// snapshot built from setup that has since been edited must not land, so
+	// a hash mismatch — like an environment that no longer exists — returns
+	// ErrConflict and changes nothing.
+	SetEnvironmentSnapshot(ctx context.Context, envID, expectHash, ref, runner string) error
+
+	// PutSecret stores (or replaces) the sealed value of name. Sealing
+	// happens above the store: ciphertext and nonce are opaque bytes here.
+	PutSecret(ctx context.Context, name string, ciphertext, nonce []byte) error
+	ListSecrets(ctx context.Context) ([]SecretMeta, error) // name asc; never ciphertext
+	GetSecret(ctx context.Context, name string) (ciphertext, nonce []byte, err error)
+	DeleteSecret(ctx context.Context, name string) error // ErrNotFound
 }
 
 // randHex returns n random bytes, hex-encoded (2n hex characters), sourced
@@ -164,6 +247,20 @@ func NewSessionID() string { return "sess_" + randHex(16) }
 // NewUserID returns a fresh user id: "usr_" + 32 lowercase hex chars (16
 // random bytes).
 func NewUserID() string { return "usr_" + randHex(16) }
+
+// NewEnvironmentID returns a fresh environment id: "env_" + 32 lowercase hex
+// chars (16 random bytes).
+func NewEnvironmentID() string { return "env_" + randHex(16) }
+
+// SetupHash returns the identity of an environment's build inputs: the
+// hex-encoded SHA-256 of image + "\x00" + setup. The NUL separator keeps the
+// pair unambiguous, so no image/setup split can collide with another. A
+// snapshot is a cache keyed by this hash: it is usable exactly while the
+// environment's SetupHash still equals the hash it was built from.
+func SetupHash(image, setup string) string {
+	h := sha256.Sum256([]byte(image + "\x00" + setup))
+	return hex.EncodeToString(h[:])
+}
 
 // NewToken returns a fresh bearer token ("rnr_" + 64 lowercase hex chars,
 // 32 random bytes) and the hex-encoded SHA-256 hash that InsertToken should
