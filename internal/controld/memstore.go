@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// memStore is an in-memory Store. It holds one mutex guarding six maps and
+// memStore is an in-memory Store. It holds one mutex guarding seven maps and
 // never leaks a live pointer across the lock boundary — every method
 // returns value copies, same discipline as internal/runnerd/registry.go's
 // list(). It exists for tests and local development; controld's production
@@ -29,6 +29,7 @@ type memStore struct {
 	runners       map[string]*Runner
 	environments  map[string]*Environment
 	secrets       map[string]*secretRow // by secret name
+	credentials   map[credKey]*Credential
 }
 
 // secretRow is one stored secret: the sealed bytes plus the metadata
@@ -37,6 +38,13 @@ type secretRow struct {
 	meta       SecretMeta
 	ciphertext []byte
 	nonce      []byte
+}
+
+// credKey is the credentials table's composite primary key, spelled as a Go
+// map key.
+type credKey struct {
+	userID   string
+	provider string
 }
 
 // NewMemStore returns a fresh in-memory Store.
@@ -49,6 +57,7 @@ func NewMemStore() Store {
 		runners:       map[string]*Runner{},
 		environments:  map[string]*Environment{},
 		secrets:       map[string]*secretRow{},
+		credentials:   map[credKey]*Credential{},
 	}
 }
 
@@ -95,6 +104,22 @@ func (m *memStore) UserByToken(ctx context.Context, tokenHash string) (User, err
 	return *u, nil
 }
 
+// cloneSession returns a deep copy of s. A plain struct copy would still
+// share Cmd's and EgressAllow's backing arrays — and, worse, the
+// ChildExitCode pointer — with the map's own row, so a caller could write
+// straight through into the store. Every session that crosses the mutex is
+// cloned instead, same discipline as cloneEnvironment.
+func cloneSession(s Session) Session {
+	cp := s
+	cp.Cmd = slices.Clone(s.Cmd)
+	cp.EgressAllow = slices.Clone(s.EgressAllow)
+	if s.ChildExitCode != nil {
+		code := *s.ChildExitCode
+		cp.ChildExitCode = &code
+	}
+	return cp
+}
+
 func (m *memStore) CreateSession(ctx context.Context, s Session) (Session, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -124,9 +149,12 @@ func (m *memStore) CreateSession(ctx context.Context, s Session) (Session, error
 	if s.LastEventAt.IsZero() {
 		s.LastEventAt = now
 	}
-	cp := s
+	// child_exit_code is the store's, not the caller's: nothing has exited at
+	// create time, and only SetChildExitCode ever writes it.
+	s.ChildExitCode = nil
+	cp := cloneSession(s)
 	m.sessions[s.ID] = &cp
-	return cp, nil
+	return cloneSession(cp), nil
 }
 
 func (m *memStore) GetSession(ctx context.Context, id string) (Session, error) {
@@ -136,7 +164,7 @@ func (m *memStore) GetSession(ctx context.Context, id string) (Session, error) {
 	if !ok {
 		return Session{}, ErrNotFound
 	}
-	return *s, nil
+	return cloneSession(*s), nil
 }
 
 func (m *memStore) SessionByIdem(ctx context.Context, ownerID, key string) (Session, error) {
@@ -147,7 +175,7 @@ func (m *memStore) SessionByIdem(ctx context.Context, ownerID, key string) (Sess
 	}
 	for _, s := range m.sessions {
 		if s.OwnerID == ownerID && s.IdempotencyKey == key {
-			return *s, nil
+			return cloneSession(*s), nil
 		}
 	}
 	return Session{}, ErrNotFound
@@ -161,7 +189,7 @@ func (m *memStore) SessionByName(ctx context.Context, ownerID, name string) (Ses
 	}
 	for _, s := range m.sessions {
 		if s.OwnerID == ownerID && s.Name == name && !s.State.Terminal() {
-			return *s, nil
+			return cloneSession(*s), nil
 		}
 	}
 	return Session{}, ErrNotFound
@@ -171,7 +199,7 @@ func (m *memStore) ListSessions(ctx context.Context, q SessionQuery) ([]Session,
 	m.mu.Lock()
 	all := make([]Session, 0, len(m.sessions))
 	for _, s := range m.sessions {
-		all = append(all, *s)
+		all = append(all, cloneSession(*s))
 	}
 	m.mu.Unlock()
 
@@ -257,7 +285,7 @@ func (m *memStore) SessionsOnRunner(ctx context.Context, runner string, states [
 		if stateSet != nil && !stateSet[s.State] {
 			continue
 		}
-		out = append(out, *s)
+		out = append(out, cloneSession(*s))
 	}
 	return out, nil
 }
@@ -267,7 +295,7 @@ func (m *memStore) OldestQueued(ctx context.Context) ([]Session, error) {
 	out := make([]Session, 0)
 	for _, s := range m.sessions {
 		if s.State == StateQueued {
-			out = append(out, *s)
+			out = append(out, cloneSession(*s))
 		}
 	}
 	m.mu.Unlock()
@@ -312,6 +340,20 @@ func (m *memStore) SetSessionSetupHash(ctx context.Context, id, hash string) err
 		return ErrNotFound
 	}
 	s.SetupHash = hash
+	s.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *memStore) SetChildExitCode(ctx context.Context, id string, code int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[id]
+	if !ok {
+		return ErrNotFound
+	}
+	// A fresh pointer, never the caller's: the row must not alias anything
+	// outside the store.
+	s.ChildExitCode = &code
 	s.UpdatedAt = time.Now()
 	return nil
 }
@@ -550,6 +592,100 @@ func (m *memStore) DeleteSecret(ctx context.Context, name string) error {
 	}
 	delete(m.secrets, name)
 	return nil
+}
+
+// cloneCredential returns a deep copy of c: the four sealed byte slices and
+// the ExpiresAt pointer are all reallocated, so nothing a caller holds can
+// reach back into the store's row (or, worse, be mutated underneath another
+// caller mid-mint).
+func cloneCredential(c Credential) Credential {
+	cp := c
+	cp.Ciphertext = bytes.Clone(c.Ciphertext)
+	cp.Nonce = bytes.Clone(c.Nonce)
+	cp.RefreshCiphertext = bytes.Clone(c.RefreshCiphertext)
+	cp.RefreshNonce = bytes.Clone(c.RefreshNonce)
+	if c.ExpiresAt != nil {
+		exp := *c.ExpiresAt
+		cp.ExpiresAt = &exp
+	}
+	return cp
+}
+
+func (m *memStore) UpsertCredential(ctx context.Context, c Credential) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := time.Now()
+	if c.Status == "" {
+		c.Status = CredentialValid
+	}
+	if c.ObtainedAt.IsZero() {
+		c.ObtainedAt = now
+	}
+	if c.LastVerifiedAt.IsZero() {
+		c.LastVerifiedAt = now
+	}
+	if c.LastUsedAt.IsZero() {
+		c.LastUsedAt = now
+	}
+	if c.UpdatedAt.IsZero() {
+		c.UpdatedAt = now
+	}
+
+	// A whole-row replace: an upsert is a fresh login, so nothing survives
+	// from the credential it supersedes.
+	cp := cloneCredential(c)
+	m.credentials[credKey{c.UserID, c.Provider}] = &cp
+	return nil
+}
+
+func (m *memStore) GetCredential(ctx context.Context, userID, provider string) (Credential, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.credentials[credKey{userID, provider}]
+	if !ok {
+		return Credential{}, ErrNotFound
+	}
+	return cloneCredential(*c), nil
+}
+
+func (m *memStore) SetCredentialStatus(ctx context.Context, userID, provider, status string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.credentials[credKey{userID, provider}]
+	if !ok {
+		return ErrNotFound
+	}
+	c.Status = status
+	c.UpdatedAt = time.Now()
+	return nil
+}
+
+func (m *memStore) TouchCredentialUsed(ctx context.Context, userID, provider string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.credentials[credKey{userID, provider}]
+	if !ok {
+		return ErrNotFound
+	}
+	// last_used_at only: updated_at is the edit clock, and a mint is a read.
+	c.LastUsedAt = time.Now()
+	return nil
+}
+
+func (m *memStore) ListCredentials(ctx context.Context, userID string) ([]Credential, error) {
+	m.mu.Lock()
+	out := make([]Credential, 0)
+	for key, c := range m.credentials {
+		if key.userID != userID {
+			continue
+		}
+		out = append(out, cloneCredential(*c))
+	}
+	m.mu.Unlock()
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Provider < out[j].Provider })
+	return out, nil
 }
 
 // encodeCursor and decodeCursor implement ListSessions's opaque page

@@ -1078,6 +1078,8 @@ type environmentView struct {
 	Image           string            `json:"image"`
 	Setup           string            `json:"setup"`
 	SetupHash       string            `json:"setup_hash"`
+	Init            string            `json:"init"`
+	InitTimeoutSec  int               `json:"init_timeout_sec"`
 	EgressAllow     []string          `json:"egress_allow"`
 	SecretRefs      []string          `json:"secret_refs"`
 	Connectors      []json.RawMessage `json:"connectors"`
@@ -1106,6 +1108,8 @@ func environmentJSON(e Environment) environmentView {
 		Image:           e.Image,
 		Setup:           e.Setup,
 		SetupHash:       e.SetupHash,
+		Init:            e.Init,
+		InitTimeoutSec:  e.InitTimeoutSec,
 		EgressAllow:     emptyIfNil(e.EgressAllow),
 		SecretRefs:      emptyIfNil(e.SecretRefs),
 		Connectors:      connectorsJSON(e.Connectors),
@@ -1325,6 +1329,8 @@ type createEnvironmentRequest struct {
 	Name            string          `json:"name,omitempty"`
 	Image           string          `json:"image,omitempty"`
 	Setup           string          `json:"setup,omitempty"`
+	Init            string          `json:"init,omitempty"`
+	InitTimeoutSec  int             `json:"init_timeout_sec,omitempty"`
 	EgressAllow     []string        `json:"egress_allow,omitempty"`
 	SecretRefs      []string        `json:"secret_refs,omitempty"`
 	Connectors      json.RawMessage `json:"connectors,omitempty"`
@@ -1340,6 +1346,8 @@ type patchEnvironmentRequest struct {
 	Name            *string         `json:"name,omitempty"`
 	Image           *string         `json:"image,omitempty"`
 	Setup           *string         `json:"setup,omitempty"`
+	Init            *string         `json:"init,omitempty"`
+	InitTimeoutSec  *int            `json:"init_timeout_sec,omitempty"`
 	EgressAllow     *[]string       `json:"egress_allow,omitempty"`
 	SecretRefs      *[]string       `json:"secret_refs,omitempty"`
 	Connectors      json.RawMessage `json:"connectors,omitempty"`
@@ -1347,12 +1355,13 @@ type patchEnvironmentRequest struct {
 	SetupTimeoutSec *int            `json:"setup_timeout_sec,omitempty"`
 }
 
-// validateEnvironmentBasics checks the three scalar rules create and patch
+// validateEnvironmentBasics checks the four scalar rules create and patch
 // share, returning a client-facing message (or "" when the row is fine).
 // Placement is deliberately unchecked: an environment may be pinned to a
 // runner that hasn't joined the fleet yet, which is exactly how the hardware
-// case is set up (design §4.6).
-func validateEnvironmentBasics(name, image string, setupTimeoutSec int) string {
+// case is set up (design §4.6). Neither script is checked either — a shell
+// script is only wrong once it runs.
+func validateEnvironmentBasics(name, image string, setupTimeoutSec, initTimeoutSec int) string {
 	switch {
 	case !envNamePattern.MatchString(name):
 		return "name must match [a-z0-9-]{1,64}"
@@ -1360,6 +1369,8 @@ func validateEnvironmentBasics(name, image string, setupTimeoutSec int) string {
 		return "image is required"
 	case setupTimeoutSec < 0:
 		return "setup_timeout_sec must not be negative"
+	case initTimeoutSec < 0:
+		return "init_timeout_sec must not be negative"
 	}
 	return ""
 }
@@ -1405,7 +1416,7 @@ func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request,
 	if !decodeJSONBodyLimit(w, r, &req, environmentsBodyLimit) {
 		return
 	}
-	if bad := validateEnvironmentBasics(req.Name, req.Image, req.SetupTimeoutSec); bad != "" {
+	if bad := validateEnvironmentBasics(req.Name, req.Image, req.SetupTimeoutSec, req.InitTimeoutSec); bad != "" {
 		writeErr(w, http.StatusBadRequest, "invalid_request", bad)
 		return
 	}
@@ -1430,6 +1441,8 @@ func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request,
 		Name:            req.Name,
 		Image:           req.Image,
 		Setup:           req.Setup,
+		Init:            req.Init,
+		InitTimeoutSec:  req.InitTimeoutSec,
 		EgressAllow:     req.EgressAllow,
 		SecretRefs:      req.SecretRefs,
 		Connectors:      conns,
@@ -1521,6 +1534,12 @@ func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request,
 	if req.Setup != nil {
 		next.Setup = *req.Setup
 	}
+	if req.Init != nil {
+		next.Init = *req.Init
+	}
+	if req.InitTimeoutSec != nil {
+		next.InitTimeoutSec = *req.InitTimeoutSec
+	}
 	if req.EgressAllow != nil {
 		next.EgressAllow = *req.EgressAllow
 	}
@@ -1531,7 +1550,7 @@ func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request,
 		next.SetupTimeoutSec = *req.SetupTimeoutSec
 	}
 
-	if bad := validateEnvironmentBasics(next.Name, next.Image, next.SetupTimeoutSec); bad != "" {
+	if bad := validateEnvironmentBasics(next.Name, next.Image, next.SetupTimeoutSec, next.InitTimeoutSec); bad != "" {
 		writeErr(w, http.StatusBadRequest, "invalid_request", bad)
 		return
 	}

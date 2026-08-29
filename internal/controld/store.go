@@ -87,10 +87,17 @@ type Session struct {
 	// the environment as it stands NOW — the environment may have been edited
 	// while the script ran, and the row carries no other trace of which script
 	// that was.
-	SetupHash   string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	LastEventAt time.Time
+	SetupHash string
+	// ChildExitCode is the exit status of the session's agent process, once
+	// it has exited. It is a pointer because "the child has not exited" and
+	// "the child exited 0" are different facts and a plain int cannot tell
+	// them apart — a session whose agent finished cleanly still has a live
+	// container and a shell the operator can attach to. Only
+	// SetChildExitCode writes it; create always leaves it nil.
+	ChildExitCode *int
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	LastEventAt   time.Time
 }
 
 // effectiveImage is the image this session actually runs: the one resolution
@@ -127,12 +134,20 @@ type Connector struct {
 // exactly as they were, so a snapshot built from a superseded SetupHash
 // stays visibly stale (SnapshotHash != SetupHash) instead of being silently
 // adopted or silently dropped.
+//
+// Init and InitTimeoutSec are deliberately absent from SetupHash. Setup
+// builds the filesystem once and is cached as a snapshot; init runs on every
+// session boot, after the code is in place, so editing it changes nothing
+// about the image the snapshot holds. Folding init into the hash would throw
+// away a whole team's cache for a change that cannot affect it.
 type Environment struct {
 	ID              string
 	Name            string
 	Image           string
 	Setup           string
 	SetupHash       string // sha256(image+"\x00"+setup); store-maintained
+	Init            string // per-boot hook, run after setup and clone
+	InitTimeoutSec  int
 	EgressAllow     []string
 	SecretRefs      []string
 	Connectors      []Connector
@@ -152,6 +167,37 @@ type SecretMeta struct {
 	Name      string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// Credential status vocabulary. A credential is either usable as far as
+// anyone knows (CredentialValid) or known to have been rejected by the
+// provider (CredentialNeedsRefresh) — there is no third state, because the
+// vault never calls the provider to find out: it mints optimistically and
+// only ever learns from an observed failure.
+const (
+	CredentialValid        = "valid"
+	CredentialNeedsRefresh = "needs_refresh"
+)
+
+// Credential is one user's sealed access credential for one provider, keyed
+// by (UserID, Provider).
+//
+// The store never interprets the sealed bytes: Ciphertext/Nonce (and the
+// refresh pair, unused in v0) are opaque here exactly as a secret's are, and
+// sealing happens above the store. No method on this type, and no error any
+// store returns about one, may carry a credential value — a stack trace or a
+// log line naming the token would defeat the vault entirely.
+type Credential struct {
+	UserID, Provider                string
+	Ciphertext, Nonce               []byte // sealed access token
+	RefreshCiphertext, RefreshNonce []byte // nullable; unused in v0
+	Status                          string // CredentialValid | CredentialNeedsRefresh
+	Scopes                          string // informational; what the provider said it granted
+	ObtainedAt                      time.Time
+	ExpiresAt                       *time.Time // nil when the provider named no expiry
+	LastVerifiedAt                  time.Time
+	LastUsedAt                      time.Time
+	UpdatedAt                       time.Time
 }
 
 // Runner is a registered runnerd fleet member and its current capacity.
@@ -216,6 +262,11 @@ type Store interface {
 	// create dispatch writes it once, before the command goes out — and
 	// returns ErrNotFound if id doesn't exist.
 	SetSessionSetupHash(ctx context.Context, id, hash string) error
+	// SetChildExitCode records the exit status of a session's agent process
+	// (see Session.ChildExitCode). Like SetSessionSetupHash it is unguarded
+	// and state-agnostic — the child exiting is an observation, not a
+	// lifecycle transition — and returns ErrNotFound if id doesn't exist.
+	SetChildExitCode(ctx context.Context, id string, code int) error
 
 	UpsertRunner(ctx context.Context, r Runner) error // by Name; sets connected/capacity/last_seen
 	SetRunnerConnected(ctx context.Context, name string, connected bool) error
@@ -259,6 +310,26 @@ type Store interface {
 	ListSecrets(ctx context.Context) ([]SecretMeta, error) // name asc; never ciphertext
 	GetSecret(ctx context.Context, name string) (ciphertext, nonce []byte, err error)
 	DeleteSecret(ctx context.Context, name string) error // ErrNotFound
+
+	// UpsertCredential stores (or wholly replaces) the credential for
+	// (c.UserID, c.Provider). A re-upsert is a fresh login — new bytes, new
+	// scopes, new clocks — so it restamps every zero timestamp with now and
+	// keeps nothing from the row it replaces. An empty Status stores
+	// CredentialValid, matching the column's own default.
+	UpsertCredential(ctx context.Context, c Credential) error
+	GetCredential(ctx context.Context, userID, provider string) (Credential, error) // ErrNotFound
+	// SetCredentialStatus flips a credential's status (and bumps updated_at),
+	// leaving its value, scopes, and other clocks alone. ErrNotFound if the
+	// user has no credential for that provider.
+	SetCredentialStatus(ctx context.Context, userID, provider, status string) error
+	// TouchCredentialUsed stamps last_used_at. It is a read-path write, so it
+	// deliberately leaves updated_at alone — that clock belongs to edits.
+	// ErrNotFound if there is no such credential.
+	TouchCredentialUsed(ctx context.Context, userID, provider string) error
+	// ListCredentials returns userID's credentials, provider ascending, and
+	// never another user's. The rows carry sealed bytes like any other read;
+	// stripping them for a client-facing view is the caller's job.
+	ListCredentials(ctx context.Context, userID string) ([]Credential, error)
 }
 
 // randHex returns n random bytes, hex-encoded (2n hex characters), sourced

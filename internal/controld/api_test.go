@@ -2444,7 +2444,7 @@ func TestCreateEnvironment(t *testing.T) {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
 		assertKeySet(t, string(outer["environment"]),
-			"id", "name", "image", "setup", "setup_hash", "egress_allow", "secret_refs",
+			"id", "name", "image", "setup", "setup_hash", "init", "init_timeout_sec", "egress_allow", "secret_refs",
 			"connectors", "placement", "setup_timeout_sec", "snapshot_ref", "snapshot_runner",
 			"snapshot_hash", "created_at", "updated_at")
 	})
@@ -2499,6 +2499,45 @@ func TestCreateEnvironment(t *testing.T) {
 		}
 		if e := decodeErrBody(t, raw); e.Error.Code != "invalid_request" || !strings.Contains(e.Error.Message, "image") {
 			t.Errorf("error = %+v, want invalid_request naming image", e.Error)
+		}
+	})
+
+	// init is the per-boot hook. It rides on the same create/patch paths as
+	// setup but must stay OUT of setup_hash: editing it cannot change the
+	// image a cached snapshot holds, so it must not invalidate that cache.
+	t.Run("init round-trips and does not move setup_hash", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+
+		got := createEnv(t, ts, adminTok, envCreateBody("dev", map[string]any{
+			"setup":            "make deps",
+			"init":             "make dev-server &",
+			"init_timeout_sec": 120,
+		}))
+		if got.Init != "make dev-server &" || got.InitTimeoutSec != 120 {
+			t.Errorf("init/init_timeout_sec = %q/%d", got.Init, got.InitTimeoutSec)
+		}
+		if got.SetupHash != SetupHash("img:1", "make deps") {
+			t.Errorf("setup_hash = %q, want the image+setup hash alone", got.SetupHash)
+		}
+		// An environment that names no init gets the empty pair, not a null.
+		bare := createEnv(t, ts, adminTok, envCreateBody("bare", nil))
+		if bare.Init != "" || bare.InitTimeoutSec != 0 {
+			t.Errorf("bare environment init = %q/%d, want empty", bare.Init, bare.InitTimeoutSec)
+		}
+	})
+
+	t.Run("a negative init_timeout_sec is rejected", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok,
+			envCreateBody("dev", map[string]any{"init_timeout_sec": -1}), nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); !strings.Contains(e.Error.Message, "init_timeout_sec") {
+			t.Errorf("message = %q, want it to name init_timeout_sec", e.Error.Message)
 		}
 	})
 
@@ -2671,7 +2710,7 @@ func TestListEnvironments(t *testing.T) {
 			t.Fatalf("decode environments array: %v", err)
 		}
 		assertKeySet(t, string(arr[0]),
-			"id", "name", "image", "setup", "setup_hash", "egress_allow", "secret_refs",
+			"id", "name", "image", "setup", "setup_hash", "init", "init_timeout_sec", "egress_allow", "secret_refs",
 			"connectors", "placement", "setup_timeout_sec", "snapshot_ref", "snapshot_runner",
 			"snapshot_hash", "created_at", "updated_at")
 	})
@@ -2794,6 +2833,44 @@ func TestUpdateEnvironment(t *testing.T) {
 		}
 	})
 
+	// Patching init is the case the whole "init is not a build input" rule
+	// exists for: an operator edits the boot hook and the team's cached
+	// snapshot must still be usable afterwards.
+	t.Run("patching init leaves setup_hash and a cached snapshot alone", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", map[string]any{
+			"setup": "echo hi", "init": "old-init", "init_timeout_sec": 60,
+		}))
+		if err := st.SetEnvironmentSnapshot(context.Background(), created.ID, created.SetupHash, "rainier-env:dev-aaaa", "vm1"); err != nil {
+			t.Fatalf("SetEnvironmentSnapshot: %v", err)
+		}
+
+		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/dev", adminTok,
+			map[string]any{"init": "new-init", "init_timeout_sec": 300}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
+		}
+		var env environmentEnvelope
+		if err := json.Unmarshal([]byte(raw), &env); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		got := env.Environment
+		if got.Init != "new-init" || got.InitTimeoutSec != 300 {
+			t.Errorf("init/init_timeout_sec = %q/%d, want them patched", got.Init, got.InitTimeoutSec)
+		}
+		if got.Setup != "echo hi" {
+			t.Errorf("setup = %q, want it untouched", got.Setup)
+		}
+		if got.SetupHash != created.SetupHash {
+			t.Errorf("setup_hash = %q, want it unchanged (%q) — init is not a build input", got.SetupHash, created.SetupHash)
+		}
+		if got.SnapshotHash != got.SetupHash {
+			t.Errorf("an init-only patch must leave the cache valid: snapshot_hash %q vs setup_hash %q", got.SnapshotHash, got.SetupHash)
+		}
+	})
+
 	t.Run("the snapshot columns survive a patch, visibly stale", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
@@ -2885,6 +2962,7 @@ func TestUpdateEnvironment(t *testing.T) {
 			{"bad name", map[string]any{"name": "NOPE"}, "name"},
 			{"empty image", map[string]any{"image": ""}, "image"},
 			{"negative timeout", map[string]any{"setup_timeout_sec": -5}, "setup_timeout_sec"},
+			{"negative init timeout", map[string]any{"init_timeout_sec": -5}, "init_timeout_sec"},
 			{"unknown connector type", map[string]any{"connectors": connectorArray(`{"type":"gitlab"}`)}, "gitlab"},
 			{"missing secret", map[string]any{"secret_refs": []string{"ABSENT"}}, "ABSENT"},
 		}

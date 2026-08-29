@@ -55,6 +55,7 @@ func RunContract(t *testing.T, open func(t *testing.T) controld.Store) {
 		e, err := st.CreateEnvironment(ctx, controld.Environment{
 			ID: controld.NewEnvironmentID(), Name: name,
 			Image: "img:1", Setup: "make deps",
+			Init: "make dev-server &", InitTimeoutSec: 120,
 			EgressAllow: []string{"github.com"},
 			SecretRefs:  []string{"GITHUB_TOKEN"},
 			Connectors:  []controld.Connector{{Type: "github", Raw: json.RawMessage(connectorJSON)}},
@@ -625,6 +626,337 @@ func RunContract(t *testing.T, open func(t *testing.T) controld.Store) {
 
 		if err := st.SetSessionSetupHash(ctx, "sess_nosuch", atDispatch); !errors.Is(err, controld.ErrNotFound) {
 			t.Fatalf("SetSessionSetupHash on an unknown id = %v, want ErrNotFound", err)
+		}
+	})
+
+	// An environment's init hook runs on every session boot, not once at build
+	// time, so it is deliberately NOT part of setup_hash: editing init must
+	// leave a cached snapshot usable. That is the whole point of the column,
+	// and the assertion below is what stops a future refactor from folding it
+	// into the hash and silently invalidating every team's cache.
+	t.Run("environment init round-trips and stays out of setup_hash", func(t *testing.T) {
+		st := open(t)
+		e := mkEnv(t, st, "dev")
+
+		if e.Init != "make dev-server &" || e.InitTimeoutSec != 120 {
+			t.Fatalf("create must return init columns: %+v", e)
+		}
+		if e.SetupHash != controld.SetupHash(e.Image, e.Setup) {
+			t.Fatalf("setup_hash must come from image+setup alone, got %q", e.SetupHash)
+		}
+
+		byID, err := st.GetEnvironment(ctx, e.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if byID.Init != "make dev-server &" || byID.InitTimeoutSec != 120 {
+			t.Fatalf("get must return init columns: %+v", byID)
+		}
+		byName, err := st.GetEnvironmentByName(ctx, "dev")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if byName.Init != e.Init || byName.InitTimeoutSec != e.InitTimeoutSec {
+			t.Fatalf("get by name must return init columns: %+v", byName)
+		}
+		rows, err := st.ListEnvironments(ctx)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("list: %v %+v", err, rows)
+		}
+		if rows[0].Init != e.Init || rows[0].InitTimeoutSec != e.InitTimeoutSec {
+			t.Fatalf("list must return init columns: %+v", rows[0])
+		}
+
+		// UpdateEnvironment carries init exactly like setup...
+		upd := byID
+		upd.Init = "make dev-server --port 8080 &"
+		upd.InitTimeoutSec = 300
+		moved, err := st.UpdateEnvironment(ctx, upd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if moved.Init != upd.Init || moved.InitTimeoutSec != 300 {
+			t.Fatalf("update must persist init columns: %+v", moved)
+		}
+		// ...but an init-only change must NOT move setup_hash: the build
+		// inputs are unchanged, so a cached snapshot stays valid.
+		if moved.SetupHash != e.SetupHash {
+			t.Fatalf("init-only change must not move setup_hash: %q vs %q", moved.SetupHash, e.SetupHash)
+		}
+		if reread, err := st.GetEnvironment(ctx, e.ID); err != nil ||
+			reread.Init != upd.Init || reread.InitTimeoutSec != 300 || reread.SetupHash != e.SetupHash {
+			t.Fatalf("update must persist: %v %+v", err, reread)
+		}
+
+		// An environment with no init at all keeps the columns empty.
+		bare, err := st.CreateEnvironment(ctx, controld.Environment{
+			ID: controld.NewEnvironmentID(), Name: "bare", Image: "img:1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bare.Init != "" || bare.InitTimeoutSec != 0 {
+			t.Fatalf("an environment with no init: %+v", bare)
+		}
+	})
+
+	// child_exit_code is the agent process's own verdict, recorded when the
+	// child exits while the session itself stays up (the operator still has a
+	// shell). It is nullable because "no exit yet" and "exited 0" are
+	// different facts — a plain int column could not tell them apart.
+	t.Run("session child exit code is nullable and settable", func(t *testing.T) {
+		st := open(t)
+		u := mkUser(t, st)
+
+		// A caller-supplied value at create is ignored: nothing has exited yet.
+		code := 3
+		s, err := st.CreateSession(ctx, controld.Session{
+			ID: controld.NewSessionID(), OwnerID: u.ID, Name: "work",
+			Image: "img", State: controld.StateQueued, ChildExitCode: &code})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.ChildExitCode != nil {
+			t.Fatalf("create must ignore a caller-supplied child_exit_code, got %d", *s.ChildExitCode)
+		}
+		got, err := st.GetSession(ctx, s.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ChildExitCode != nil {
+			t.Fatalf("a fresh session has no child exit code, got %d", *got.ChildExitCode)
+		}
+
+		// Zero is a real exit code, and must not read as "never exited".
+		if err := st.SetChildExitCode(ctx, s.ID, 0); err != nil {
+			t.Fatalf("SetChildExitCode: %v", err)
+		}
+		got, err = st.GetSession(ctx, s.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ChildExitCode == nil || *got.ChildExitCode != 0 {
+			t.Fatalf("exit 0 must persist as a set value, got %v", got.ChildExitCode)
+		}
+
+		if err := st.SetChildExitCode(ctx, s.ID, 137); err != nil {
+			t.Fatal(err)
+		}
+		got, err = st.GetSession(ctx, s.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.ChildExitCode == nil || *got.ChildExitCode != 137 {
+			t.Fatalf("get child_exit_code = %v, want 137", got.ChildExitCode)
+		}
+		rows, _, err := st.ListSessions(ctx, controld.SessionQuery{Limit: 10})
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("list: %v %+v", err, rows)
+		}
+		if rows[0].ChildExitCode == nil || *rows[0].ChildExitCode != 137 {
+			t.Fatalf("list child_exit_code = %v, want 137", rows[0].ChildExitCode)
+		}
+		onRunner, err := st.SessionsOnRunner(ctx, "", []controld.SessionState{controld.StateQueued})
+		if err != nil || len(onRunner) != 1 {
+			t.Fatalf("sessions on runner: %v %+v", err, onRunner)
+		}
+		if onRunner[0].ChildExitCode == nil || *onRunner[0].ChildExitCode != 137 {
+			t.Fatalf("sessions-on-runner child_exit_code = %v, want 137", onRunner[0].ChildExitCode)
+		}
+
+		if err := st.SetChildExitCode(ctx, "sess_nosuch", 1); !errors.Is(err, controld.ErrNotFound) {
+			t.Fatalf("SetChildExitCode on an unknown id = %v, want ErrNotFound", err)
+		}
+	})
+
+	// The credential vault: one row per (user, provider), holding sealed bytes
+	// the store never interprets. Every assertion here is about the row's
+	// lifecycle — the seal itself lives above the store.
+	t.Run("credential upsert, get, status, touch, and list", func(t *testing.T) {
+		st := open(t)
+		alice := mkUser(t, st)
+		bob, err := st.UpsertUser(ctx, 43, "bob", "member")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ct1, nonce1 := []byte{0x00, 0x01, 0xfe, 0xff}, []byte("nonce-aaaaaa")
+		if err := st.UpsertCredential(ctx, controld.Credential{
+			UserID: alice.ID, Provider: "github",
+			Ciphertext: ct1, Nonce: nonce1,
+			Scopes: "repo read:user",
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		first, err := st.GetCredential(ctx, alice.ID, "github")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first.UserID != alice.ID || first.Provider != "github" {
+			t.Fatalf("identity round trip: %+v", first)
+		}
+		if !bytes.Equal(first.Ciphertext, ct1) || !bytes.Equal(first.Nonce, nonce1) {
+			t.Fatalf("sealed bytes round trip: %x %x", first.Ciphertext, first.Nonce)
+		}
+		if first.Scopes != "repo read:user" {
+			t.Fatalf("scopes = %q", first.Scopes)
+		}
+		// An upsert that names no status stores the healthy one, matching the
+		// column's own default.
+		if first.Status != controld.CredentialValid {
+			t.Fatalf("status = %q, want %q", first.Status, controld.CredentialValid)
+		}
+		if first.ObtainedAt.IsZero() || first.LastVerifiedAt.IsZero() ||
+			first.LastUsedAt.IsZero() || first.UpdatedAt.IsZero() {
+			t.Fatalf("upsert must stamp timestamps: %+v", first)
+		}
+		// v0 stores no refresh token and no expiry: both stay absent, not zero
+		// values dressed up as real ones.
+		if first.RefreshCiphertext != nil || first.RefreshNonce != nil {
+			t.Fatalf("refresh columns must stay unset: %x %x", first.RefreshCiphertext, first.RefreshNonce)
+		}
+		if first.ExpiresAt != nil {
+			t.Fatalf("expires_at must stay NULL, got %v", *first.ExpiresAt)
+		}
+
+		// The returned bytes are the caller's own copy: writing through them
+		// must not reach back into the store.
+		first.Ciphertext[0] ^= 0xff
+		if again, err := st.GetCredential(ctx, alice.ID, "github"); err != nil || !bytes.Equal(again.Ciphertext, ct1) {
+			t.Fatalf("stored ciphertext aliased the caller's slice: %v %x", err, again.Ciphertext)
+		}
+
+		// Upserting again replaces the whole credential: a fresh login is a
+		// new token, so its bytes, scopes, and clocks all move.
+		time.Sleep(2 * time.Millisecond)
+		ct2, nonce2 := []byte{0x09}, []byte("nonce-cccccc")
+		rct, rnonce := []byte{0x11, 0x22}, []byte("nonce-dddddd")
+		exp := time.Now().Add(time.Hour).UTC().Truncate(time.Millisecond)
+		if err := st.UpsertCredential(ctx, controld.Credential{
+			UserID: alice.ID, Provider: "github",
+			Ciphertext: ct2, Nonce: nonce2,
+			RefreshCiphertext: rct, RefreshNonce: rnonce,
+			Status: controld.CredentialValid, Scopes: "repo",
+			ExpiresAt: &exp,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		second, err := st.GetCredential(ctx, alice.ID, "github")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(second.Ciphertext, ct2) || !bytes.Equal(second.Nonce, nonce2) {
+			t.Fatalf("upsert must replace the sealed bytes: %x %x", second.Ciphertext, second.Nonce)
+		}
+		if !bytes.Equal(second.RefreshCiphertext, rct) || !bytes.Equal(second.RefreshNonce, rnonce) {
+			t.Fatalf("upsert must store the refresh bytes: %x %x", second.RefreshCiphertext, second.RefreshNonce)
+		}
+		if second.Scopes != "repo" {
+			t.Fatalf("scopes = %q, want repo", second.Scopes)
+		}
+		if second.ExpiresAt == nil || !second.ExpiresAt.Equal(exp) {
+			t.Fatalf("expires_at = %v, want %v", second.ExpiresAt, exp)
+		}
+		if !second.ObtainedAt.After(first.ObtainedAt) {
+			t.Fatalf("re-upsert must restamp obtained_at: %v vs %v", second.ObtainedAt, first.ObtainedAt)
+		}
+
+		// A status flip is a small write: it moves status and updated_at, and
+		// nothing else.
+		time.Sleep(2 * time.Millisecond)
+		if err := st.SetCredentialStatus(ctx, alice.ID, "github", controld.CredentialNeedsRefresh); err != nil {
+			t.Fatal(err)
+		}
+		flipped, err := st.GetCredential(ctx, alice.ID, "github")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if flipped.Status != controld.CredentialNeedsRefresh {
+			t.Fatalf("status = %q, want %q", flipped.Status, controld.CredentialNeedsRefresh)
+		}
+		if !flipped.UpdatedAt.After(second.UpdatedAt) {
+			t.Fatalf("status change must bump updated_at: %v vs %v", flipped.UpdatedAt, second.UpdatedAt)
+		}
+		if !bytes.Equal(flipped.Ciphertext, ct2) || !flipped.ObtainedAt.Equal(second.ObtainedAt) {
+			t.Fatalf("status change must touch nothing else: %+v", flipped)
+		}
+
+		// A use touches last_used_at only. It is a read-path stamp, so it must
+		// not move updated_at — that clock belongs to edits.
+		time.Sleep(2 * time.Millisecond)
+		if err := st.TouchCredentialUsed(ctx, alice.ID, "github"); err != nil {
+			t.Fatal(err)
+		}
+		used, err := st.GetCredential(ctx, alice.ID, "github")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !used.LastUsedAt.After(flipped.LastUsedAt) {
+			t.Fatalf("touch must bump last_used_at: %v vs %v", used.LastUsedAt, flipped.LastUsedAt)
+		}
+		if !used.UpdatedAt.Equal(flipped.UpdatedAt) {
+			t.Fatalf("touch must not move updated_at: %v vs %v", used.UpdatedAt, flipped.UpdatedAt)
+		}
+		if used.Status != controld.CredentialNeedsRefresh || !used.LastVerifiedAt.Equal(flipped.LastVerifiedAt) {
+			t.Fatalf("touch must not change status or last_verified_at: %+v", used)
+		}
+
+		// A listing is per-user and provider-ordered; another user's rows are
+		// invisible, in both directions.
+		if err := st.UpsertCredential(ctx, controld.Credential{
+			UserID: alice.ID, Provider: "aprovider", Ciphertext: []byte{0x1}, Nonce: []byte("n1")}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.UpsertCredential(ctx, controld.Credential{
+			UserID: bob.ID, Provider: "github", Ciphertext: []byte{0x2}, Nonce: []byte("n2")}); err != nil {
+			t.Fatal(err)
+		}
+
+		mine, err := st.ListCredentials(ctx, alice.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(mine) != 2 {
+			t.Fatalf("list: want alice's 2 rows, got %+v", mine)
+		}
+		if mine[0].Provider != "aprovider" || mine[1].Provider != "github" {
+			t.Fatalf("list must be provider asc: %q %q", mine[0].Provider, mine[1].Provider)
+		}
+		for _, c := range mine {
+			if c.UserID != alice.ID {
+				t.Fatalf("another user's credential leaked into the listing: %+v", c)
+			}
+		}
+		his, err := st.ListCredentials(ctx, bob.ID)
+		if err != nil || len(his) != 1 || his[0].UserID != bob.ID || !bytes.Equal(his[0].Ciphertext, []byte{0x2}) {
+			t.Fatalf("bob's listing: %v %+v", err, his)
+		}
+		if none, err := st.ListCredentials(ctx, "usr_nosuch"); err != nil || len(none) != 0 {
+			t.Fatalf("unknown user: want an empty listing, got %v %+v", err, none)
+		}
+
+		// Every lookup by an identity nothing answers to is ErrNotFound —
+		// including a provider this user has but another user's row holds.
+		if _, err := st.GetCredential(ctx, alice.ID, "nosuch"); !errors.Is(err, controld.ErrNotFound) {
+			t.Fatalf("unknown provider: want ErrNotFound, got %v", err)
+		}
+		if _, err := st.GetCredential(ctx, "usr_nosuch", "github"); !errors.Is(err, controld.ErrNotFound) {
+			t.Fatalf("unknown user: want ErrNotFound, got %v", err)
+		}
+		if _, err := st.GetCredential(ctx, bob.ID, "aprovider"); !errors.Is(err, controld.ErrNotFound) {
+			t.Fatalf("another user's provider: want ErrNotFound, got %v", err)
+		}
+		if err := st.SetCredentialStatus(ctx, alice.ID, "nosuch", controld.CredentialNeedsRefresh); !errors.Is(err, controld.ErrNotFound) {
+			t.Fatalf("SetCredentialStatus on an unknown provider: want ErrNotFound, got %v", err)
+		}
+		if err := st.SetCredentialStatus(ctx, "usr_nosuch", "github", controld.CredentialNeedsRefresh); !errors.Is(err, controld.ErrNotFound) {
+			t.Fatalf("SetCredentialStatus on an unknown user: want ErrNotFound, got %v", err)
+		}
+		if err := st.TouchCredentialUsed(ctx, alice.ID, "nosuch"); !errors.Is(err, controld.ErrNotFound) {
+			t.Fatalf("TouchCredentialUsed on an unknown provider: want ErrNotFound, got %v", err)
+		}
+		if err := st.TouchCredentialUsed(ctx, "usr_nosuch", "github"); !errors.Is(err, controld.ErrNotFound) {
+			t.Fatalf("TouchCredentialUsed on an unknown user: want ErrNotFound, got %v", err)
 		}
 	})
 }
