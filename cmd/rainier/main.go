@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,8 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -56,6 +59,8 @@ func main() {
 		err = runRm(rest)
 	case "secret":
 		err = runSecret(rest)
+	case "env":
+		err = runEnv(rest)
 	case "-h", "--help", "help":
 		printUsage()
 		return
@@ -83,6 +88,7 @@ commands:
   snapshot <id|name>
   rm       <id|name>
   secret   set <NAME> [--value V] | ls | rm <NAME>
+  env      create <name> [flags] | ls | show <ref> | update <ref> [flags] | rm <ref>
 
 secret set reads the value from stdin when --value is omitted, so it never
 lands in your shell history:  cat token.txt | rainier secret set GH_TOKEN
@@ -168,6 +174,49 @@ type secretsEnvelope struct {
 
 type putSecretRequest struct {
 	Value string `json:"value"`
+}
+
+// environment mirrors controld's environment view. Connectors are kept as
+// raw JSON on purpose: this CLI passes an operator's connector objects
+// through untouched in both directions, so a key the server would reject
+// never becomes a key the CLI silently drops. (The server preserves the JSON
+// value, not necessarily the byte sequence — Postgres jsonb re-renders
+// whitespace and member order.)
+type environment struct {
+	ID              string            `json:"id"`
+	Name            string            `json:"name"`
+	Image           string            `json:"image"`
+	Setup           string            `json:"setup"`
+	SetupHash       string            `json:"setup_hash"`
+	EgressAllow     []string          `json:"egress_allow"`
+	SecretRefs      []string          `json:"secret_refs"`
+	Connectors      []json.RawMessage `json:"connectors"`
+	Placement       string            `json:"placement"`
+	SetupTimeoutSec int               `json:"setup_timeout_sec"`
+	SnapshotRef     string            `json:"snapshot_ref"`
+	SnapshotRunner  string            `json:"snapshot_runner"`
+	SnapshotHash    string            `json:"snapshot_hash"`
+	CreatedAt       string            `json:"created_at"`
+	UpdatedAt       string            `json:"updated_at"`
+}
+
+type environmentEnvelope struct {
+	Environment environment `json:"environment"`
+}
+
+type environmentsEnvelope struct {
+	Environments []environment `json:"environments"`
+}
+
+type createEnvironmentRequest struct {
+	Name            string          `json:"name"`
+	Image           string          `json:"image"`
+	Setup           string          `json:"setup,omitempty"`
+	EgressAllow     []string        `json:"egress_allow,omitempty"`
+	SecretRefs      []string        `json:"secret_refs,omitempty"`
+	Connectors      json.RawMessage `json:"connectors,omitempty"`
+	Placement       string          `json:"placement,omitempty"`
+	SetupTimeoutSec int             `json:"setup_timeout_sec,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -728,6 +777,523 @@ func requireSecretName(fs *flag.FlagSet, usage string) string {
 		os.Exit(2)
 	}
 	return args[0]
+}
+
+// ---------------------------------------------------------------------------
+// env create / ls / show / update / rm
+// ---------------------------------------------------------------------------
+
+const envUsage = `usage: rainier env <create|ls|show|update|rm> [args]
+
+  env create <name> [flags]     define an environment; admin only
+  env ls                        list environments (NAME ID IMAGE CACHED)
+  env show <id|name>            print one environment as JSON
+  env update <id|name> [flags]  change only the fields you pass; admin only
+  env rm <id|name>              delete an environment; admin only
+
+flags for create and update:
+  --image IMG                base container image (required at create)
+  --setup-file ./setup.sh    shell script run once when a session is first built
+  --egress a.com,b.com       default egress allowlist ("" clears it)
+  --secret-ref NAME          team secret to inject; repeatable ("" clears them)
+  --placement RUNNER         pin this environment's sessions to one runner
+  --setup-timeout-sec N      how long setup may run (0 = server default)
+  --connector-json '<json>'  a connector object, or an array of them; repeatable
+  --from-devcontainer [dir]  take --image from a devcontainer.json (create only)
+  --name NEW                 rename (update only)
+
+Connectors are passed as raw JSON in v0 — the vocabulary is github, files,
+tunnel and browser, validated by the server and stored verbatim; the plans
+that give them behavior bring friendlier flags with them. Example:
+
+  rainier env create dev --image golang:1.22 --setup-file ./setup.sh \
+    --connector-json '{"type":"github","repo":"acme/widgets"}'
+
+CACHED in "env ls" is yes while a built snapshot still matches the
+environment's current image+setup; editing either makes it no until the next
+session rebuilds the cache.`
+
+func runEnv(args []string) error {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, envUsage)
+		os.Exit(2)
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "create":
+		return runEnvCreate(rest)
+	case "ls":
+		return runEnvLs(rest)
+	case "show":
+		return runEnvShow(rest)
+	case "update":
+		return runEnvUpdate(rest)
+	case "rm":
+		return runEnvRm(rest)
+	case "-h", "--help", "help":
+		fmt.Fprintln(os.Stderr, envUsage)
+		return nil
+	default:
+		fmt.Fprintf(os.Stderr, "rainier env: unknown subcommand %q\n%s\n", sub, envUsage)
+		os.Exit(2)
+		return nil
+	}
+}
+
+// envFlags is the flag set `env create` and `env update` share, registered
+// on fs. Both commands read the same fields; only what they do with an
+// unpassed one differs (create sends its zero value, update omits it).
+type envFlags struct {
+	image        *string
+	setupFile    *string
+	egress       *string
+	placement    *string
+	timeout      *int
+	name         *string
+	secretRefs   stringsFlag
+	connectors   stringsFlag
+	devcontainer optionalPathFlag
+}
+
+func registerEnvFlags(fs *flag.FlagSet, forUpdate bool) *envFlags {
+	f := &envFlags{
+		image:     fs.String("image", "", "base container image"),
+		setupFile: fs.String("setup-file", "", "path to a shell script run once when a session is first built"),
+		egress:    fs.String("egress", "", "comma-separated egress allowlist"),
+		placement: fs.String("placement", "", "pin this environment's sessions to one runner"),
+		timeout:   fs.Int("setup-timeout-sec", 0, "how long the setup script may run (0 = server default)"),
+	}
+	fs.Var(&f.secretRefs, "secret-ref", "name of a team secret to inject; repeatable")
+	fs.Var(&f.connectors, "connector-json", "a connector object, or an array of them, as raw JSON; repeatable")
+	if forUpdate {
+		f.name = fs.String("name", "", "new name for this environment")
+	} else {
+		fs.Var(&f.devcontainer, "from-devcontainer", "read image from a devcontainer.json (optionally in this dir)")
+	}
+	return f
+}
+
+func runEnvCreate(args []string) error {
+	fs := flag.NewFlagSet("env create", flag.ExitOnError)
+	f := registerEnvFlags(fs, false)
+	fs.Parse(reorderArgs(fs, args))
+	name := requireEnvRef(fs, "rainier env create <name> [flags]")
+
+	image := *f.image
+	dcDir, extra := devcontainerDir(f.devcontainer, fs.Args()[1:])
+	if len(extra) > 0 {
+		return fmt.Errorf("unexpected argument(s) after the environment name: %s", strings.Join(extra, " "))
+	}
+	if f.devcontainer.set {
+		dc, err := readDevcontainer(dcDir)
+		if err != nil {
+			return err
+		}
+		// Straight to stderr: what was ignored is a message for the operator,
+		// and stdout stays the new environment's id for a script to capture.
+		for _, line := range dc.report() {
+			fmt.Fprintln(os.Stderr, line)
+		}
+		if image == "" {
+			image = dc.Image
+		}
+	}
+	if image == "" {
+		return fmt.Errorf("an image is required: pass --image (a devcontainer that builds from a Dockerfile has no image for rainier to take)")
+	}
+
+	setup, err := readSetupFile(*f.setupFile)
+	if err != nil {
+		return err
+	}
+	connectors, err := assembleConnectors(f.connectors)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := requireLogin()
+	if err != nil {
+		return err
+	}
+	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+
+	body := createEnvironmentRequest{
+		Name:            name,
+		Image:           image,
+		Setup:           setup,
+		EgressAllow:     splitList(*f.egress),
+		SecretRefs:      nonEmpty(f.secretRefs),
+		Connectors:      connectors,
+		Placement:       *f.placement,
+		SetupTimeoutSec: *f.timeout,
+	}
+	var resp environmentEnvelope
+	if err := c.Do(http.MethodPost, "/v1/environments", body, &resp); err != nil {
+		return err
+	}
+	fmt.Println(resp.Environment.ID)
+	return nil
+}
+
+func runEnvLs(args []string) error {
+	fs := flag.NewFlagSet("env ls", flag.ExitOnError)
+	fs.Parse(args)
+
+	cfg, err := requireLogin()
+	if err != nil {
+		return err
+	}
+	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+
+	var resp environmentsEnvelope
+	if err := c.Do(http.MethodGet, "/v1/environments", nil, &resp); err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tID\tIMAGE\tCACHED")
+	for _, e := range resp.Environments {
+		cached := "no"
+		if envCached(e) {
+			cached = "yes"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", e.Name, e.ID, e.Image, cached)
+	}
+	return w.Flush()
+}
+
+// envCached reports whether an environment's cached snapshot was built from
+// the image+setup it still has. A snapshot from superseded setup is not a
+// cache at all — the next session rebuilds — so it must not read as one.
+func envCached(e environment) bool {
+	return e.SnapshotHash != "" && e.SnapshotHash == e.SetupHash
+}
+
+func runEnvShow(args []string) error {
+	fs := flag.NewFlagSet("env show", flag.ExitOnError)
+	fs.Parse(args)
+	ref := requireEnvRef(fs, "rainier env show <id|name>")
+
+	cfg, err := requireLogin()
+	if err != nil {
+		return err
+	}
+	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+
+	// Decoded as raw JSON and re-indented, so what's printed is exactly what
+	// the server said — including any field this CLI's own struct doesn't
+	// know about yet.
+	var resp struct {
+		Environment json.RawMessage `json:"environment"`
+	}
+	if err := c.Do(http.MethodGet, "/v1/environments/"+url.PathEscape(ref), nil, &resp); err != nil {
+		return err
+	}
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, resp.Environment, "", "  "); err != nil {
+		return err
+	}
+	fmt.Println(pretty.String())
+	return nil
+}
+
+func runEnvUpdate(args []string) error {
+	fs := flag.NewFlagSet("env update", flag.ExitOnError)
+	f := registerEnvFlags(fs, true)
+	fs.Parse(reorderArgs(fs, args))
+	ref := requireEnvRef(fs, "rainier env update <id|name> [flags]")
+
+	// A patch carries only the fields the caller actually passed: an absent
+	// flag means "leave it alone", which is not the same request as a flag
+	// set to its zero value ("clear it").
+	passed := passedFlags(fs)
+	patch := map[string]any{}
+	if passed["name"] {
+		patch["name"] = *f.name
+	}
+	if passed["image"] {
+		patch["image"] = *f.image
+	}
+	if passed["setup-file"] {
+		setup, err := readSetupFile(*f.setupFile)
+		if err != nil {
+			return err
+		}
+		patch["setup"] = setup
+	}
+	if passed["egress"] {
+		patch["egress_allow"] = splitList(*f.egress)
+	}
+	if passed["secret-ref"] {
+		patch["secret_refs"] = nonEmpty(f.secretRefs)
+	}
+	if passed["connector-json"] {
+		connectors, err := assembleConnectors(f.connectors)
+		if err != nil {
+			return err
+		}
+		patch["connectors"] = connectors
+	}
+	if passed["placement"] {
+		patch["placement"] = *f.placement
+	}
+	if passed["setup-timeout-sec"] {
+		patch["setup_timeout_sec"] = *f.timeout
+	}
+	if len(patch) == 0 {
+		return fmt.Errorf("nothing to update: pass at least one of --name, --image, --setup-file, --egress, --secret-ref, --connector-json, --placement, --setup-timeout-sec")
+	}
+
+	cfg, err := requireLogin()
+	if err != nil {
+		return err
+	}
+	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+
+	var resp environmentEnvelope
+	if err := c.Do(http.MethodPatch, "/v1/environments/"+url.PathEscape(ref), patch, &resp); err != nil {
+		return err
+	}
+	fmt.Println(resp.Environment.ID)
+	return nil
+}
+
+func runEnvRm(args []string) error {
+	fs := flag.NewFlagSet("env rm", flag.ExitOnError)
+	fs.Parse(args)
+	ref := requireEnvRef(fs, "rainier env rm <id|name>")
+
+	cfg, err := requireLogin()
+	if err != nil {
+		return err
+	}
+	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	if err := c.Do(http.MethodDelete, "/v1/environments/"+url.PathEscape(ref), nil, nil); err != nil {
+		return err
+	}
+	fmt.Println("removed", ref)
+	return nil
+}
+
+// requireEnvRef pulls the <name> or <id|name> positional an env subcommand
+// needs, exiting with usage (exit 2) rather than panicking when it's absent.
+func requireEnvRef(fs *flag.FlagSet, usage string) string {
+	args := fs.Args()
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "usage: %s\n", usage)
+		os.Exit(2)
+	}
+	return args[0]
+}
+
+// passedFlags returns the name of every flag the caller actually passed —
+// flag.FlagSet.Visit's whole purpose, and what makes `env update` a patch
+// rather than a full replacement.
+func passedFlags(fs *flag.FlagSet) map[string]bool {
+	out := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { out[f.Name] = true })
+	return out
+}
+
+// stringsFlag collects a repeatable string flag (--secret-ref,
+// --connector-json).
+type stringsFlag []string
+
+func (s *stringsFlag) String() string { return strings.Join(*s, ",") }
+
+func (s *stringsFlag) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
+// optionalPathFlag is a flag whose value is optional: "--from-devcontainer"
+// alone means the current directory, "--from-devcontainer=./repo" names one.
+// IsBoolFlag is what makes the bare form legal — and, just as importantly,
+// what stops flag.Parse and reorderArgs from swallowing the environment name
+// that follows it as this flag's value.
+type optionalPathFlag struct {
+	set  bool
+	path string
+}
+
+func (f *optionalPathFlag) String() string { return f.path }
+
+func (f *optionalPathFlag) Set(v string) error {
+	f.set = true
+	if v == "" || v == "true" {
+		f.path = "."
+	} else {
+		f.path = v
+	}
+	return nil
+}
+
+func (f *optionalPathFlag) IsBoolFlag() bool { return true }
+
+// devcontainerDir resolves the directory --from-devcontainer names, given the
+// flag and whatever positional arguments were left over after the
+// environment name.
+//
+// An optional-value flag never consumes the next token (that is what
+// IsBoolFlag means), so "--from-devcontainer ./repo" — the spelling with a
+// space, which is what anyone types first — leaves ./repo sitting in the
+// positionals instead. Taking it from there is what makes both that and
+// "--from-devcontainer=./repo" mean the same thing. Anything else left over
+// is returned as rest, for the caller to refuse rather than silently ignore.
+func devcontainerDir(f optionalPathFlag, extra []string) (dir string, rest []string) {
+	if f.set && f.path == "." && len(extra) == 1 {
+		return extra[0], nil
+	}
+	return f.path, extra
+}
+
+// splitList splits a comma-separated flag value into its entries, dropping
+// blanks. An empty value is an empty list, which is how `env update
+// --egress ""` clears one.
+func splitList(v string) []string {
+	out := []string{}
+	for _, part := range strings.Split(v, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// nonEmpty drops blank entries from a repeatable flag's values, so
+// `--secret-ref ""` clears the list rather than asking the server to inject a
+// secret with no name.
+func nonEmpty(values []string) []string {
+	out := []string{}
+	for _, v := range values {
+		if v = strings.TrimSpace(v); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// readSetupFile reads a --setup-file path, or returns "" when none was given.
+func readSetupFile(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading the setup script: %w", err)
+	}
+	return string(data), nil
+}
+
+// assembleConnectors turns the --connector-json values into the JSON array
+// the API takes. Each value may be one connector object or an array of them,
+// and every value's bytes are passed through UNCHANGED: the server rejects
+// unknown fields, and a CLI that re-marshaled these would turn a typo the
+// server would have caught into a key it silently dropped.
+func assembleConnectors(values []string) (json.RawMessage, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	out := []json.RawMessage{}
+	for _, v := range values {
+		trimmed := strings.TrimSpace(v)
+		var arr []json.RawMessage
+		if err := json.Unmarshal([]byte(trimmed), &arr); err == nil {
+			out = append(out, arr...)
+			continue
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
+			return nil, fmt.Errorf("--connector-json %s: must be a JSON connector object, or an array of them", v)
+		}
+		out = append(out, json.RawMessage(trimmed))
+	}
+	return json.Marshal(out)
+}
+
+// devcontainerHints is everything `--from-devcontainer` takes from a
+// devcontainer.json: the image, and the name of every other key that was
+// present.
+type devcontainerHints struct {
+	Path    string   // the file that was read
+	Image   string   // the "image" field, "" when it has none
+	Ignored []string // every other key present, sorted
+}
+
+// readDevcontainer reads dir's devcontainer.json — dir itself if it names a
+// file, else ".devcontainer/devcontainer.json", else "devcontainer.json"
+// beside it — and returns its image plus every other key it saw.
+//
+// rainier reads exactly ONE field. A devcontainer is a far larger contract
+// (features, mounts, lifecycle commands, host requirements) and honoring half
+// of it silently would be worse than ignoring it loudly, so the caller prints
+// what was ignored rather than pretending the file was applied.
+func readDevcontainer(dir string) (devcontainerHints, error) {
+	if dir == "" {
+		dir = "."
+	}
+	var candidates []string
+	if fi, err := os.Stat(dir); err == nil && !fi.IsDir() {
+		candidates = []string{dir}
+	} else {
+		candidates = []string{
+			filepath.Join(dir, ".devcontainer", "devcontainer.json"),
+			filepath.Join(dir, "devcontainer.json"),
+		}
+	}
+
+	var path string
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			path = c
+			break
+		}
+	}
+	if path == "" {
+		return devcontainerHints{}, fmt.Errorf("no devcontainer.json found (looked at %s)", strings.Join(candidates, ", "))
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return devcontainerHints{}, fmt.Errorf("reading %s: %w", path, err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		// devcontainer.json is officially JSONC; rainier parses plain JSON, so
+		// say so instead of leaving the operator with a bare offset.
+		return devcontainerHints{}, fmt.Errorf("%s: %v — rainier reads plain JSON here, so comments and trailing commas are not supported; pass --image instead", path, err)
+	}
+
+	hints := devcontainerHints{Path: path}
+	for key, value := range raw {
+		if key == "image" {
+			if err := json.Unmarshal(value, &hints.Image); err != nil {
+				return devcontainerHints{}, fmt.Errorf("%s: image must be a string", path)
+			}
+			continue
+		}
+		hints.Ignored = append(hints.Ignored, key)
+	}
+	slices.Sort(hints.Ignored)
+	return hints, nil
+}
+
+// report is what --from-devcontainer prints: the file it read, the image it
+// took, and the name of every key it ignored — the whole point of the flag
+// being that you can see it did not honor the rest.
+func (d devcontainerHints) report() []string {
+	image := d.Image
+	if image == "" {
+		image = "(none — the file names no image)"
+	}
+	lines := []string{fmt.Sprintf("read %s: image = %s", d.Path, image)}
+	if len(d.Ignored) == 0 {
+		lines = append(lines, "ignored no other devcontainer keys")
+	} else {
+		lines = append(lines, fmt.Sprintf("ignored %d other devcontainer key(s): %s",
+			len(d.Ignored), strings.Join(d.Ignored, ", ")))
+	}
+	return lines
 }
 
 // ---------------------------------------------------------------------------

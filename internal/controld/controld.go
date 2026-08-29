@@ -167,6 +167,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/secrets", s.requireUser(s.handleListSecrets))
 	mux.HandleFunc("DELETE /v1/secrets/{name}", s.requireAdmin(s.handleDeleteSecret))
 
+	// Environments belong to the whole team, so like secrets they have no
+	// owner to fall back on: mutations are admin-only, reads team-visible
+	// (design §4.5). The {id} routes take an id or a name.
+	mux.HandleFunc("POST /v1/environments", s.requireAdmin(s.handleCreateEnvironment))
+	mux.HandleFunc("GET /v1/environments", s.requireUser(s.handleListEnvironments))
+	mux.HandleFunc("GET /v1/environments/{id}", s.requireUser(s.handleGetEnvironment))
+	mux.HandleFunc("PATCH /v1/environments/{id}", s.requireAdmin(s.handleUpdateEnvironment))
+	mux.HandleFunc("DELETE /v1/environments/{id}", s.requireAdmin(s.handleDeleteEnvironment))
+
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
 	return withMiddleware(mux)

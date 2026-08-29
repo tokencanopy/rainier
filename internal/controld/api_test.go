@@ -1640,6 +1640,961 @@ func TestDeleteSecret(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// connector vocabulary (unit): validateConnectors
+// ---------------------------------------------------------------------------
+
+// The four connector shapes the v0 vocabulary defines, one canonical example
+// each. They are string constants rather than Go values because what this API
+// promises about a connector is the object itself: what a client sent is what
+// the store keeps and what every later response hands back, with no member
+// added, dropped, or rewritten.
+const (
+	ghConnJSON      = `{"type":"github","repo":"acme/widgets","base_branch":"trunk"}`
+	filesConnJSON   = `{"type":"files","paths":["/etc/hosts","notes.md"]}`
+	tunnelConnJSON  = `{"type":"tunnel","name":"mav","target_host":"127.0.0.1","target_port":14550}`
+	browserConnJSON = `{"type":"browser","tier":"dedicated"}`
+)
+
+// connectorArray renders elems as the JSON array "connectors" accepts.
+func connectorArray(elems ...string) json.RawMessage {
+	return json.RawMessage("[" + strings.Join(elems, ",") + "]")
+}
+
+func TestValidateConnectors(t *testing.T) {
+	t.Run("absent and empty both mean no connectors", func(t *testing.T) {
+		got, err := validateConnectors(nil)
+		if err != nil || len(got) != 0 {
+			t.Fatalf("validateConnectors(nil) = %+v, %v; want none, nil", got, err)
+		}
+		got, err = validateConnectors(json.RawMessage(`[]`))
+		if err != nil || len(got) != 0 {
+			t.Fatalf("validateConnectors([]) = %+v, %v; want none, nil", got, err)
+		}
+	})
+
+	t.Run("one of each type is accepted, type decoded and bytes kept verbatim", func(t *testing.T) {
+		want := []string{ghConnJSON, filesConnJSON, tunnelConnJSON, browserConnJSON}
+		wantTypes := []string{"github", "files", "tunnel", "browser"}
+
+		got, err := validateConnectors(connectorArray(want...))
+		if err != nil {
+			t.Fatalf("validateConnectors: %v", err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("got %d connectors, want %d", len(got), len(want))
+		}
+		for i := range got {
+			if got[i].Type != wantTypes[i] {
+				t.Errorf("connector %d type = %q, want %q", i, got[i].Type, wantTypes[i])
+			}
+			// Raw is never empty and never re-rendered: the stores diverge on
+			// how they persist an empty Raw, so the API must keep that case
+			// out of reachable space entirely.
+			if string(got[i].Raw) != want[i] {
+				t.Errorf("connector %d raw = %s, want %s", i, got[i].Raw, want[i])
+			}
+		}
+	})
+
+	t.Run("a github connector may omit base_branch (it defaults to main)", func(t *testing.T) {
+		const in = `{"type":"github","repo":"acme/widgets"}`
+		got, err := validateConnectors(connectorArray(in))
+		if err != nil {
+			t.Fatalf("validateConnectors: %v", err)
+		}
+		// The default is a decode-time value, not a stored one: the bytes
+		// stay exactly as the client wrote them.
+		if len(got) != 1 || string(got[0].Raw) != in {
+			t.Fatalf("got %+v, want the original bytes kept verbatim", got)
+		}
+		gh, err := decodeGitHubConnector(json.RawMessage(in))
+		if err != nil {
+			t.Fatalf("decodeGitHubConnector: %v", err)
+		}
+		if gh.BaseBranch == nil || *gh.BaseBranch != "main" {
+			t.Errorf("base_branch = %v, want the default main filled in", gh.BaseBranch)
+		}
+	})
+
+	t.Run("rejections name what was wrong", func(t *testing.T) {
+		cases := []struct {
+			name, in, want string
+		}{
+			{"not an array", `{"type":"browser","tier":"dedicated"}`, "array"},
+			{"element is not an object", `["github"]`, "connectors[0]"},
+			{"missing type", `[{"repo":"acme/widgets"}]`, "type"},
+			{"unknown type", `[{"type":"gitlab","repo":"acme/widgets"}]`, "gitlab"},
+			{"unknown type is named even in a later element", `[` + ghConnJSON + `,{"type":"gitlab"}]`, "gitlab"},
+			{"unknown field on github", `[{"type":"github","repo":"x/y","extra":1}]`, "extra"},
+			{"unknown field on files", `[{"type":"files","paths":["a"],"recursive":true}]`, "recursive"},
+			{"unknown field on tunnel", `[{"type":"tunnel","name":"n","target_host":"h","target_port":1,"proto":"tcp"}]`, "proto"},
+			{"unknown field on browser", `[{"type":"browser","tier":"dedicated","profile":"x"}]`, "profile"},
+			{"repo without an owner", `[{"type":"github","repo":"widgets"}]`, "repo"},
+			{"repo with a space", `[{"type":"github","repo":"acme/wid gets"}]`, "repo"},
+			{"repo with a path segment too many", `[{"type":"github","repo":"acme/widgets/deep"}]`, "repo"},
+			{"explicitly empty base_branch", `[{"type":"github","repo":"a/b","base_branch":""}]`, "base_branch"},
+			{"files with no paths", `[{"type":"files","paths":[]}]`, "paths"},
+			{"files with a missing paths key", `[{"type":"files"}]`, "paths"},
+			{"files with an empty path", `[{"type":"files","paths":["ok",""]}]`, "paths"},
+			{"tunnel without a name", `[{"type":"tunnel","target_host":"h","target_port":22}]`, "name"},
+			{"tunnel without a host", `[{"type":"tunnel","name":"n","target_port":22}]`, "target_host"},
+			{"tunnel port 0", `[{"type":"tunnel","name":"n","target_host":"h","target_port":0}]`, "target_port"},
+			{"tunnel port 65536", `[{"type":"tunnel","name":"n","target_host":"h","target_port":65536}]`, "target_port"},
+			{"tunnel port negative", `[{"type":"tunnel","name":"n","target_host":"h","target_port":-1}]`, "target_port"},
+			{"browser with an unknown tier", `[{"type":"browser","tier":"daily"}]`, "tier"},
+			{"browser with no tier", `[{"type":"browser"}]`, "tier"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				got, err := validateConnectors(json.RawMessage(tc.in))
+				if err == nil {
+					t.Fatalf("validateConnectors(%s) = %+v, want an error", tc.in, got)
+				}
+				if !strings.Contains(err.Error(), tc.want) {
+					t.Errorf("error = %q, want it to mention %q", err, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("boundary ports are accepted", func(t *testing.T) {
+		for _, port := range []int{1, 65535} {
+			in := fmt.Sprintf(`{"type":"tunnel","name":"n","target_host":"h","target_port":%d}`, port)
+			if _, err := validateConnectors(connectorArray(in)); err != nil {
+				t.Errorf("port %d: %v", port, err)
+			}
+		}
+	})
+
+	t.Run("both browser tiers are accepted", func(t *testing.T) {
+		for _, tier := range []string{"dedicated", "extension"} {
+			in := fmt.Sprintf(`{"type":"browser","tier":%q}`, tier)
+			if _, err := validateConnectors(connectorArray(in)); err != nil {
+				t.Errorf("tier %s: %v", tier, err)
+			}
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// environments: shared test helpers
+// ---------------------------------------------------------------------------
+
+// envCreateBody is the minimal valid POST /v1/environments body, with over
+// merged in.
+func envCreateBody(name string, over map[string]any) map[string]any {
+	body := map[string]any{"name": name, "image": "img:1"}
+	for k, v := range over {
+		body[k] = v
+	}
+	return body
+}
+
+// createEnv POSTs body as tok and fails the test unless it is a 201,
+// returning the decoded environment.
+func createEnv(t *testing.T, ts *httptest.Server, tok string, body map[string]any) environmentView {
+	t.Helper()
+	resp := doJSON(t, ts, http.MethodPost, "/v1/environments", tok, body, nil)
+	raw := readBody(t, resp)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /v1/environments status = %d, want 201; body=%s", resp.StatusCode, raw)
+	}
+	var env environmentEnvelope
+	if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, raw)
+	}
+	return env.Environment
+}
+
+// getEnv GETs ref and fails unless it is a 200, returning the environment.
+func getEnv(t *testing.T, ts *httptest.Server, tok, ref string) environmentView {
+	t.Helper()
+	resp := doRequest(t, ts, http.MethodGet, "/v1/environments/"+ref, tok, nil, nil)
+	raw := readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/environments/%s status = %d, want 200; body=%s", ref, resp.StatusCode, raw)
+	}
+	var env environmentEnvelope
+	if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, raw)
+	}
+	return env.Environment
+}
+
+// putSecretDirect seals and stores a secret straight into st, so an
+// environment test can reference a real secret without going through the
+// admin PUT route.
+func putSecretDirect(t *testing.T, st Store, name string) {
+	t.Helper()
+	ct, nonce, err := Seal(testSecretsKey, []byte("v"))
+	if err != nil {
+		t.Fatalf("Seal(%s): %v", name, err)
+	}
+	if err := st.PutSecret(context.Background(), name, ct, nonce); err != nil {
+		t.Fatalf("PutSecret(%s): %v", name, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/environments
+// ---------------------------------------------------------------------------
+
+func TestCreateEnvironment(t *testing.T) {
+	t.Run("happy path stores the row and answers 201 with Location", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		putSecretDirect(t, st, "GH_TOKEN")
+
+		body := envCreateBody("dev", map[string]any{
+			"setup":             "echo hi",
+			"egress_allow":      []string{"api.github.com"},
+			"secret_refs":       []string{"GH_TOKEN"},
+			"connectors":        connectorArray(ghConnJSON, browserConnJSON),
+			"placement":         "rainier-1",
+			"setup_timeout_sec": 600,
+		})
+		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok, body, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("status = %d, want 201; body=%s", resp.StatusCode, raw)
+		}
+		var env environmentEnvelope
+		if err := json.Unmarshal([]byte(raw), &env); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		got := env.Environment
+		if !strings.HasPrefix(got.ID, "env_") {
+			t.Errorf("id = %q, want an env_ prefix", got.ID)
+		}
+		if loc := resp.Header.Get("Location"); loc != "/v1/environments/"+got.ID {
+			t.Errorf("Location = %q, want /v1/environments/%s", loc, got.ID)
+		}
+		if got.Name != "dev" || got.Image != "img:1" || got.Setup != "echo hi" {
+			t.Errorf("name/image/setup = %q/%q/%q", got.Name, got.Image, got.Setup)
+		}
+		if got.SetupHash != SetupHash("img:1", "echo hi") {
+			t.Errorf("setup_hash = %q, want %q", got.SetupHash, SetupHash("img:1", "echo hi"))
+		}
+		if !slices.Equal(got.EgressAllow, []string{"api.github.com"}) || !slices.Equal(got.SecretRefs, []string{"GH_TOKEN"}) {
+			t.Errorf("egress/secret_refs = %v / %v", got.EgressAllow, got.SecretRefs)
+		}
+		if got.Placement != "rainier-1" || got.SetupTimeoutSec != 600 {
+			t.Errorf("placement/timeout = %q/%d", got.Placement, got.SetupTimeoutSec)
+		}
+		// A brand-new environment has no cache yet: the three snapshot fields
+		// are present in the response and empty.
+		if got.SnapshotRef != "" || got.SnapshotRunner != "" || got.SnapshotHash != "" {
+			t.Errorf("snapshot fields = %q/%q/%q, want all empty", got.SnapshotRef, got.SnapshotRunner, got.SnapshotHash)
+		}
+		if _, err := time.Parse(time.RFC3339, got.CreatedAt); err != nil {
+			t.Errorf("created_at = %q: %v", got.CreatedAt, err)
+		}
+		if _, err := time.Parse(time.RFC3339, got.UpdatedAt); err != nil {
+			t.Errorf("updated_at = %q: %v", got.UpdatedAt, err)
+		}
+
+		// The row the store actually holds, including verbatim connector bytes.
+		row, err := st.GetEnvironment(context.Background(), got.ID)
+		if err != nil {
+			t.Fatalf("GetEnvironment: %v", err)
+		}
+		if len(row.Connectors) != 2 {
+			t.Fatalf("stored connectors = %+v, want 2", row.Connectors)
+		}
+		if row.Connectors[0].Type != "github" || string(row.Connectors[0].Raw) != ghConnJSON {
+			t.Errorf("stored connector 0 = %+v, want %s", row.Connectors[0], ghConnJSON)
+		}
+		for i, c := range row.Connectors {
+			if len(c.Raw) == 0 {
+				t.Errorf("stored connector %d has empty Raw", i)
+			}
+		}
+	})
+
+	// Byte equality holds end to end over memstore, which is what pins that
+	// neither the API nor the store rewrites a connector. Over pgstore the
+	// contract is the JSON VALUE (jsonb re-renders whitespace and member
+	// order) — storetest's sameJSON is where that half lives.
+	t.Run("connectors round-trip verbatim in the response", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		all := connectorArray(ghConnJSON, filesConnJSON, tunnelConnJSON, browserConnJSON)
+
+		got := createEnv(t, ts, adminTok, envCreateBody("dev", map[string]any{"connectors": all}))
+		var want, have bytes.Buffer
+		if err := json.Compact(&want, all); err != nil {
+			t.Fatalf("compact want: %v", err)
+		}
+		encoded, err := json.Marshal(got.Connectors)
+		if err != nil {
+			t.Fatalf("marshal connectors: %v", err)
+		}
+		if err := json.Compact(&have, encoded); err != nil {
+			t.Fatalf("compact have: %v", err)
+		}
+		if have.String() != want.String() {
+			t.Fatalf("connectors = %s, want %s", have.String(), want.String())
+		}
+	})
+
+	t.Run("response shape is pinned", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok, envCreateBody("dev", nil), nil)
+		raw := readBody(t, resp)
+		assertKeySet(t, raw, "environment")
+		var outer map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &outer); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		assertKeySet(t, string(outer["environment"]),
+			"id", "name", "image", "setup", "setup_hash", "egress_allow", "secret_refs",
+			"connectors", "placement", "setup_timeout_sec", "snapshot_ref", "snapshot_runner",
+			"snapshot_hash", "created_at", "updated_at")
+	})
+
+	t.Run("empty lists render as [] and never null", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok, envCreateBody("dev", nil), nil)
+		raw := readBody(t, resp)
+		for _, key := range []string{"egress_allow", "secret_refs", "connectors"} {
+			if strings.Contains(raw, `"`+key+`":null`) {
+				t.Errorf("%s rendered as null: %s", key, raw)
+			}
+			if !strings.Contains(raw, `"`+key+`":[]`) {
+				t.Errorf("%s did not render as []: %s", key, raw)
+			}
+		}
+	})
+
+	t.Run("the name must match [a-z0-9-]{1,64}", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		for _, name := range []string{
+			"", "UPPER", "under_score", "has.dot", "has space", "héllo", "slash/ed",
+			strings.Repeat("a", 65),
+		} {
+			resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok, envCreateBody(name, nil), nil)
+			raw := readBody(t, resp)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("name=%q status = %d, want 400; body=%s", name, resp.StatusCode, raw)
+				continue
+			}
+			if e := decodeErrBody(t, raw); e.Error.Code != "invalid_request" {
+				t.Errorf("name=%q code = %q, want invalid_request", name, e.Error.Code)
+			}
+		}
+	})
+
+	t.Run("a 64-character name is accepted (the boundary)", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		createEnv(t, ts, adminTok, envCreateBody(strings.Repeat("a", 64), nil))
+	})
+
+	t.Run("image is required", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok, map[string]any{"name": "dev"}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "invalid_request" || !strings.Contains(e.Error.Message, "image") {
+			t.Errorf("error = %+v, want invalid_request naming image", e.Error)
+		}
+	})
+
+	t.Run("a negative setup_timeout_sec is rejected", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok,
+			envCreateBody("dev", map[string]any{"setup_timeout_sec": -1}), nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); !strings.Contains(e.Error.Message, "setup_timeout_sec") {
+			t.Errorf("message = %q, want it to name setup_timeout_sec", e.Error.Message)
+		}
+	})
+
+	t.Run("a duplicate name is 409 conflict", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		createEnv(t, ts, adminTok, envCreateBody("dev", nil))
+
+		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok,
+			envCreateBody("dev", map[string]any{"image": "img:2"}), nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "conflict" {
+			t.Errorf("code = %q, want conflict", e.Error.Code)
+		}
+	})
+
+	t.Run("secret_refs must all exist, and the missing one is named", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		putSecretDirect(t, st, "PRESENT")
+
+		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok,
+			envCreateBody("dev", map[string]any{"secret_refs": []string{"PRESENT", "ABSENT"}}), nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+		}
+		e := decodeErrBody(t, raw)
+		if e.Error.Code != "invalid_request" || !strings.Contains(e.Error.Message, "ABSENT") {
+			t.Errorf("error = %+v, want invalid_request naming ABSENT", e.Error)
+		}
+		if envs, err := st.ListEnvironments(context.Background()); err != nil || len(envs) != 0 {
+			t.Errorf("environments after a rejected create = %+v (err %v), want none", envs, err)
+		}
+	})
+
+	t.Run("connector validation is enforced at the route", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		cases := []struct{ name, conn, want string }{
+			{"unknown type", `{"type":"gitlab","repo":"a/b"}`, "gitlab"},
+			{"unknown field", `{"type":"github","repo":"x/y","extra":1}`, "extra"},
+			{"bad tier", `{"type":"browser","tier":"daily"}`, "tier"},
+			{"bad port", `{"type":"tunnel","name":"n","target_host":"h","target_port":70000}`, "target_port"},
+			{"empty paths", `{"type":"files","paths":[]}`, "paths"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok,
+					envCreateBody("dev", map[string]any{"connectors": connectorArray(tc.conn)}), nil)
+				raw := readBody(t, resp)
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+				}
+				e := decodeErrBody(t, raw)
+				if e.Error.Code != "invalid_request" || !strings.Contains(e.Error.Message, tc.want) {
+					t.Errorf("error = %+v, want invalid_request naming %q", e.Error, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("an unknown body field is 400 invalid_request", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doRaw(t, ts, http.MethodPost, "/v1/environments", adminTok, `{"name":"dev","image":"i","bogus":true}`)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+		}
+	})
+
+	t.Run("a member is 403 forbidden and stores nothing", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, memberTok := loginUser(t, st, "alice", "member")
+		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", memberTok, envCreateBody("dev", nil), nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "forbidden" {
+			t.Errorf("code = %q, want forbidden", e.Error.Code)
+		}
+		if envs, err := st.ListEnvironments(context.Background()); err != nil || len(envs) != 0 {
+			t.Errorf("environments after a member's create = %+v (err %v), want none", envs, err)
+		}
+	})
+
+	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
+		_, _, ts := newTestControld(t)
+		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", "", envCreateBody("dev", nil), nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "unauthenticated" {
+			t.Errorf("code = %q, want unauthenticated", e.Error.Code)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/environments
+// ---------------------------------------------------------------------------
+
+func TestListEnvironments(t *testing.T) {
+	t.Run("happy path lists every environment, name ascending", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		_, memberTok := loginUser(t, st, "alice", "member")
+		createEnv(t, ts, adminTok, envCreateBody("zulu", nil))
+		createEnv(t, ts, adminTok, envCreateBody("alpha", nil))
+
+		resp := doRequest(t, ts, http.MethodGet, "/v1/environments", memberTok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
+		}
+		var body environmentsEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		if len(body.Environments) != 2 {
+			t.Fatalf("environments = %+v, want 2", body.Environments)
+		}
+		if body.Environments[0].Name != "alpha" || body.Environments[1].Name != "zulu" {
+			t.Errorf("order = %q, %q; want alpha, zulu", body.Environments[0].Name, body.Environments[1].Name)
+		}
+	})
+
+	t.Run("no environments render as an empty array, not null", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, tok := loginUser(t, st, "alice", "member")
+		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v1/environments", tok, nil, nil))
+		if strings.Contains(raw, `"environments":null`) {
+			t.Fatalf("empty list rendered as JSON null: %s", raw)
+		}
+	})
+
+	t.Run("response shape is pinned", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		createEnv(t, ts, adminTok, envCreateBody("dev", nil))
+
+		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v1/environments", adminTok, nil, nil))
+		assertKeySet(t, raw, "environments")
+		var outer map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &outer); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		var arr []json.RawMessage
+		if err := json.Unmarshal(outer["environments"], &arr); err != nil {
+			t.Fatalf("decode environments array: %v", err)
+		}
+		assertKeySet(t, string(arr[0]),
+			"id", "name", "image", "setup", "setup_hash", "egress_allow", "secret_refs",
+			"connectors", "placement", "setup_timeout_sec", "snapshot_ref", "snapshot_runner",
+			"snapshot_hash", "created_at", "updated_at")
+	})
+
+	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
+		_, _, ts := newTestControld(t)
+		resp := doRequest(t, ts, http.MethodGet, "/v1/environments", "", nil, nil)
+		readBody(t, resp)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", resp.StatusCode)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/environments/{id}
+// ---------------------------------------------------------------------------
+
+func TestGetEnvironment(t *testing.T) {
+	t.Run("by id and by name resolve to the same row", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		_, memberTok := loginUser(t, st, "alice", "member")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
+
+		byID := getEnv(t, ts, memberTok, created.ID)
+		byName := getEnv(t, ts, memberTok, "dev")
+		if byID.ID != created.ID || byName.ID != created.ID {
+			t.Fatalf("byID=%q byName=%q, want %q", byID.ID, byName.ID, created.ID)
+		}
+	})
+
+	t.Run("an unknown id or name is 404 not_found", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, tok := loginUser(t, st, "alice", "member")
+		for _, ref := range []string{"env_" + strings.Repeat("0", 32), "nosuch"} {
+			resp := doRequest(t, ts, http.MethodGet, "/v1/environments/"+ref, tok, nil, nil)
+			raw := readBody(t, resp)
+			if resp.StatusCode != http.StatusNotFound {
+				t.Errorf("ref=%q status = %d, want 404; body=%s", ref, resp.StatusCode, raw)
+				continue
+			}
+			if e := decodeErrBody(t, raw); e.Error.Code != "not_found" {
+				t.Errorf("ref=%q code = %q, want not_found", ref, e.Error.Code)
+			}
+		}
+	})
+
+	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
+		_, _, ts := newTestControld(t)
+		resp := doRequest(t, ts, http.MethodGet, "/v1/environments/dev", "", nil, nil)
+		readBody(t, resp)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", resp.StatusCode)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /v1/environments/{id}
+// ---------------------------------------------------------------------------
+
+func TestUpdateEnvironment(t *testing.T) {
+	t.Run("a partial patch changes only what it names", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", map[string]any{
+			"setup":        "echo hi",
+			"egress_allow": []string{"api.github.com"},
+			"connectors":   connectorArray(ghConnJSON),
+			"placement":    "rainier-1",
+		}))
+
+		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/"+created.ID, adminTok,
+			map[string]any{"image": "img:2"}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
+		}
+		var env environmentEnvelope
+		if err := json.Unmarshal([]byte(raw), &env); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		got := env.Environment
+		if got.Image != "img:2" {
+			t.Errorf("image = %q, want img:2", got.Image)
+		}
+		if got.Name != "dev" || got.Setup != "echo hi" || got.Placement != "rainier-1" {
+			t.Errorf("untouched fields changed: %+v", got)
+		}
+		if !slices.Equal(got.EgressAllow, []string{"api.github.com"}) {
+			t.Errorf("egress_allow = %v, want it untouched", got.EgressAllow)
+		}
+		if len(got.Connectors) != 1 || string(got.Connectors[0]) != ghConnJSON {
+			t.Errorf("connectors = %v, want them untouched", got.Connectors)
+		}
+		// image is half of the setup hash, so this patch must move it.
+		if got.SetupHash != SetupHash("img:2", "echo hi") {
+			t.Errorf("setup_hash = %q, want it recomputed", got.SetupHash)
+		}
+	})
+
+	t.Run("a patch that touches neither image nor setup leaves the hash alone", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", map[string]any{"setup": "echo hi"}))
+
+		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/dev", adminTok,
+			map[string]any{"egress_allow": []string{"example.com"}}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
+		}
+		var env environmentEnvelope
+		if err := json.Unmarshal([]byte(raw), &env); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		if env.Environment.SetupHash != created.SetupHash {
+			t.Errorf("setup_hash = %q, want it unchanged (%q)", env.Environment.SetupHash, created.SetupHash)
+		}
+	})
+
+	t.Run("the snapshot columns survive a patch, visibly stale", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
+		if err := st.SetEnvironmentSnapshot(context.Background(), created.ID, created.SetupHash, "rainier-env:dev-aaaa", "vm1"); err != nil {
+			t.Fatalf("SetEnvironmentSnapshot: %v", err)
+		}
+
+		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/"+created.ID, adminTok,
+			map[string]any{"setup": "echo changed"}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
+		}
+		var env environmentEnvelope
+		if err := json.Unmarshal([]byte(raw), &env); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		got := env.Environment
+		if got.SnapshotRef != "rainier-env:dev-aaaa" || got.SnapshotRunner != "vm1" {
+			t.Errorf("snapshot ref/runner = %q/%q, want them preserved", got.SnapshotRef, got.SnapshotRunner)
+		}
+		if got.SnapshotHash == got.SetupHash {
+			t.Errorf("snapshot_hash %q still equals setup_hash after a setup change — the cache must read as stale", got.SnapshotHash)
+		}
+	})
+
+	t.Run("clearing a list clears it", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", map[string]any{
+			"egress_allow": []string{"api.github.com"},
+			"connectors":   connectorArray(ghConnJSON),
+		}))
+
+		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/"+created.ID, adminTok,
+			map[string]any{"egress_allow": []string{}, "connectors": json.RawMessage(`[]`)}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
+		}
+		var env environmentEnvelope
+		if err := json.Unmarshal([]byte(raw), &env); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		if len(env.Environment.EgressAllow) != 0 || len(env.Environment.Connectors) != 0 {
+			t.Fatalf("after clearing: egress=%v connectors=%v", env.Environment.EgressAllow, env.Environment.Connectors)
+		}
+	})
+
+	t.Run("a rename works, and a rename onto a taken name is 409", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		createEnv(t, ts, adminTok, envCreateBody("taken", nil))
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
+
+		got := getEnv(t, ts, adminTok, created.ID)
+		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/"+got.ID, adminTok,
+			map[string]any{"name": "renamed"}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("rename status = %d, want 200; body=%s", resp.StatusCode, raw)
+		}
+		if after := getEnv(t, ts, adminTok, "renamed"); after.ID != created.ID {
+			t.Errorf("renamed lookup = %q, want %q", after.ID, created.ID)
+		}
+
+		resp = doJSON(t, ts, http.MethodPatch, "/v1/environments/renamed", adminTok,
+			map[string]any{"name": "taken"}, nil)
+		raw = readBody(t, resp)
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("collision status = %d, want 409; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "conflict" {
+			t.Errorf("code = %q, want conflict", e.Error.Code)
+		}
+	})
+
+	t.Run("the patched row is validated like a create", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
+
+		cases := []struct {
+			name  string
+			patch map[string]any
+			want  string
+		}{
+			{"bad name", map[string]any{"name": "NOPE"}, "name"},
+			{"empty image", map[string]any{"image": ""}, "image"},
+			{"negative timeout", map[string]any{"setup_timeout_sec": -5}, "setup_timeout_sec"},
+			{"unknown connector type", map[string]any{"connectors": connectorArray(`{"type":"gitlab"}`)}, "gitlab"},
+			{"missing secret", map[string]any{"secret_refs": []string{"ABSENT"}}, "ABSENT"},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/"+created.ID, adminTok, tc.patch, nil)
+				raw := readBody(t, resp)
+				if resp.StatusCode != http.StatusBadRequest {
+					t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+				}
+				e := decodeErrBody(t, raw)
+				if e.Error.Code != "invalid_request" || !strings.Contains(e.Error.Message, tc.want) {
+					t.Errorf("error = %+v, want invalid_request naming %q", e.Error, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("an unknown environment is 404 not_found", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/nosuch", adminTok, map[string]any{"image": "img:2"}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "not_found" {
+			t.Errorf("code = %q, want not_found", e.Error.Code)
+		}
+	})
+
+	t.Run("a member is 403 forbidden and the row survives", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		_, memberTok := loginUser(t, st, "alice", "member")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
+
+		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/"+created.ID, memberTok,
+			map[string]any{"image": "img:evil"}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, raw)
+		}
+		if got := getEnv(t, ts, adminTok, created.ID); got.Image != "img:1" {
+			t.Errorf("image after a member's patch = %q, want img:1", got.Image)
+		}
+	})
+
+	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
+		_, _, ts := newTestControld(t)
+		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/dev", "", map[string]any{"image": "i"}, nil)
+		readBody(t, resp)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("an unknown body field is 400 invalid_request", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
+		resp := doRaw(t, ts, http.MethodPatch, "/v1/environments/"+created.ID, adminTok, `{"bogus":true}`)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /v1/environments/{id}
+// ---------------------------------------------------------------------------
+
+func TestDeleteEnvironment(t *testing.T) {
+	t.Run("happy path is 204 and the environment is gone", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
+
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/"+created.ID, adminTok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, raw)
+		}
+		if raw != "" {
+			t.Errorf("204 carried a body: %q", raw)
+		}
+		if _, err := st.GetEnvironment(context.Background(), created.ID); !errors.Is(err, ErrNotFound) {
+			t.Errorf("GetEnvironment after delete: err = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("a name ref deletes the environment it names", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
+
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/dev", adminTok, nil, nil)
+		readBody(t, resp)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", resp.StatusCode)
+		}
+		if _, err := st.GetEnvironment(context.Background(), created.ID); !errors.Is(err, ErrNotFound) {
+			t.Errorf("GetEnvironment after delete by name: err = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("non-terminal sessions block the delete with a 409 naming the count", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		u, adminTok := loginUser(t, st, "root", "admin")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
+		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, EnvironmentID: created.ID, State: StateRunning})
+		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, EnvironmentID: created.ID, State: StateQueued})
+		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, EnvironmentID: created.ID, State: StateDestroyed})
+
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/dev", adminTok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
+		}
+		e := decodeErrBody(t, raw)
+		if e.Error.Code != "conflict" || !strings.Contains(e.Error.Message, "2") {
+			t.Errorf("error = %+v, want conflict naming the count 2", e.Error)
+		}
+		if _, err := st.GetEnvironment(context.Background(), created.ID); err != nil {
+			t.Errorf("a refused delete removed the environment anyway: %v", err)
+		}
+	})
+
+	t.Run("only terminal sessions do not block the delete", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		u, adminTok := loginUser(t, st, "root", "admin")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
+		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, EnvironmentID: created.ID, State: StateDestroyed})
+
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/dev", adminTok, nil, nil)
+		readBody(t, resp)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", resp.StatusCode)
+		}
+	})
+
+	// The regression that made the count take a resolved id: scratch sessions
+	// carry environment_id "", so counting against an unresolved ref (or an
+	// empty string) would count them and refuse a delete that has nothing to
+	// do with them.
+	t.Run("scratch sessions never block an environment delete", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		u, adminTok := loginUser(t, st, "root", "admin")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
+		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, State: StateRunning})
+		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, State: StateQueued})
+
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/dev", adminTok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, raw)
+		}
+		if _, err := st.GetEnvironment(context.Background(), created.ID); !errors.Is(err, ErrNotFound) {
+			t.Errorf("GetEnvironment after delete: err = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("an unknown environment is 404 not_found", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/nosuch", adminTok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "not_found" {
+			t.Errorf("code = %q, want not_found", e.Error.Code)
+		}
+	})
+
+	t.Run("a member is 403 forbidden and the row survives", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		_, memberTok := loginUser(t, st, "alice", "member")
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
+
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/dev", memberTok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "forbidden" {
+			t.Errorf("code = %q, want forbidden", e.Error.Code)
+		}
+		if _, err := st.GetEnvironment(context.Background(), created.ID); err != nil {
+			t.Errorf("a member's delete removed the environment anyway: %v", err)
+		}
+	})
+
+	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
+		_, _, ts := newTestControld(t)
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/dev", "", nil, nil)
+		readBody(t, resp)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", resp.StatusCode)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // GET /v1/runners
 // ---------------------------------------------------------------------------
 

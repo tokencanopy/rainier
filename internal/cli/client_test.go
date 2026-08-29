@@ -348,6 +348,29 @@ type smokeSecretsEnvelope struct {
 	Secrets []smokeSecret `json:"secrets"`
 }
 
+// smokeEnvironment mirrors controld's environment view. Connectors stay raw:
+// the CLI's own `env create` passes an operator's connector JSON through
+// untouched, and this smoke asserts the same bytes come back out.
+type smokeEnvironment struct {
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	Image        string            `json:"image"`
+	Setup        string            `json:"setup"`
+	SetupHash    string            `json:"setup_hash"`
+	SecretRefs   []string          `json:"secret_refs"`
+	Connectors   []json.RawMessage `json:"connectors"`
+	Placement    string            `json:"placement"`
+	SnapshotHash string            `json:"snapshot_hash"`
+}
+
+type smokeEnvironmentEnvelope struct {
+	Environment smokeEnvironment `json:"environment"`
+}
+
+type smokeEnvironmentsEnvelope struct {
+	Environments []smokeEnvironment `json:"environments"`
+}
+
 // newSmokeGitHub fakes GitHub's GET /user: 200 with {"id":99,"login":"alice"}
 // for the smokeGHToken bearer and {"id":1,"login":"root"} for
 // smokeAdminGHToken (the fixture's admin), 401 for anything else.
@@ -713,6 +736,63 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 		t.Fatalf("secret timestamps = %+v, want both populated", secrets.Secrets[0])
 	}
 
+	// --- environments: exactly the calls cmd/rainier's `env create|ls|show`
+	// make. Mutations are admin-only, reads are team-visible, and the
+	// connector object the operator wrote comes back unrewritten (byte-for-
+	// byte over this fixture's memstore; the value, over pgstore's jsonb) ---
+	const smokeConnector = `{"type":"github","repo":"acme/widgets"}`
+	envBody := map[string]any{
+		"name":        "smoke-env",
+		"image":       "smoke-image",
+		"setup":       "echo provisioning",
+		"secret_refs": []string{"SMOKE_TOKEN"},
+		"connectors":  json.RawMessage("[" + smokeConnector + "]"),
+		"placement":   "vm1",
+	}
+
+	// The environment's secret_refs must name a secret that exists, so this
+	// runs while SMOKE_TOKEN is still stored (above) — the API refuses a
+	// dangling reference, which is itself worth smoking.
+	var createdEnv smokeEnvironmentEnvelope
+	if err := admin.Do(http.MethodPost, "/v1/environments", envBody, &createdEnv); err != nil {
+		t.Fatalf("POST /v1/environments as admin: %v", err)
+	}
+	if !strings.HasPrefix(createdEnv.Environment.ID, "env_") {
+		t.Fatalf("created environment id = %q, want an env_ prefix", createdEnv.Environment.ID)
+	}
+	if createdEnv.Environment.SetupHash == "" || createdEnv.Environment.SnapshotHash != "" {
+		t.Fatalf("new environment = %+v, want a setup hash and no snapshot yet", createdEnv.Environment)
+	}
+	if len(createdEnv.Environment.Connectors) != 1 || string(createdEnv.Environment.Connectors[0]) != smokeConnector {
+		t.Fatalf("connectors = %v, want the operator's bytes verbatim (%s)", createdEnv.Environment.Connectors, smokeConnector)
+	}
+
+	// A member may not define one.
+	memberEnvErr := c.Do(http.MethodPost, "/v1/environments", map[string]any{"name": "member-env", "image": "i"}, nil)
+	if memberEnvErr == nil || !strings.Contains(memberEnvErr.Error(), "forbidden") {
+		t.Fatalf("POST /v1/environments as a member = %v, want a forbidden error", memberEnvErr)
+	}
+
+	// `env ls` (team-visible) and `env show <name>` (the name→id resolution
+	// the route does server-side).
+	var envList smokeEnvironmentsEnvelope
+	if err := c.Do(http.MethodGet, "/v1/environments", nil, &envList); err != nil {
+		t.Fatalf("GET /v1/environments as a member: %v", err)
+	}
+	if len(envList.Environments) != 1 || envList.Environments[0].Name != "smoke-env" {
+		t.Fatalf("environments = %+v, want exactly smoke-env (the member's rejected create stored nothing)", envList.Environments)
+	}
+	var shown smokeEnvironmentEnvelope
+	if err := c.Do(http.MethodGet, "/v1/environments/smoke-env", nil, &shown); err != nil {
+		t.Fatalf("GET /v1/environments/smoke-env as a member: %v", err)
+	}
+	if shown.Environment.ID != createdEnv.Environment.ID || shown.Environment.Placement != "vm1" {
+		t.Fatalf("shown environment = %+v, want %s pinned to vm1", shown.Environment, createdEnv.Environment.ID)
+	}
+
+	// The secret delete runs last of the secrets calls: the environment above
+	// had to reference a secret that still existed (the API refuses a
+	// dangling secret_ref at create).
 	if err := admin.Do(http.MethodDelete, "/v1/secrets/SMOKE_TOKEN", nil, nil); err != nil {
 		t.Fatalf("DELETE /v1/secrets/SMOKE_TOKEN as admin: %v", err)
 	}
