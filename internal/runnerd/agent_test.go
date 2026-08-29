@@ -137,7 +137,7 @@ func (fcn *fakeConn) send(t *testing.T, m rwire.ToRunner) {
 // not just zero-valued fields).
 func TestAgentAnnounces(t *testing.T) {
 	fd := driver.NewFake(4)
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 	if err := rd.CreateWithID(context.Background(), "sess-1", driver.Spec{Image: "img"}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +188,7 @@ func TestAgentAnnounces(t *testing.T) {
 // by req_id.
 func TestAgentExecutesCreateAndReportsResult(t *testing.T) {
 	fd := newCreateTrackingFake(4)
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 
 	fc := newFakeControld(t, testToken)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -218,7 +218,7 @@ func TestAgentExecutesCreateAndReportsResult(t *testing.T) {
 // second driver Create call.
 func TestAgentIdempotentCreate(t *testing.T) {
 	fd := newCreateTrackingFake(4)
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 
 	fc := newFakeControld(t, testToken)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -264,7 +264,7 @@ func TestAgentIdempotentCreate(t *testing.T) {
 // errSessionExists) — never a rejection.
 func TestCreateWithIDConcurrentSameIDCallsDriverOnce(t *testing.T) {
 	fd := newCreateTrackingFake(4)
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 
 	const n = 8
 	start := make(chan struct{})
@@ -299,7 +299,7 @@ func TestCreateWithIDConcurrentSameIDCallsDriverOnce(t *testing.T) {
 // "running" event over the control conn.
 func TestAgentForwardsEvents(t *testing.T) {
 	fd := driver.NewFake(4)
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 	httpSrv := httptest.NewServer(rd.Handler())
 	defer httpSrv.Close()
 	wsBase := strings.Replace(httpSrv.URL, "http", "ws", 1)
@@ -330,7 +330,7 @@ func TestAgentForwardsEvents(t *testing.T) {
 // announce lands within nextConn's 5s bound.
 func TestAgentReconnects(t *testing.T) {
 	fd := driver.NewFake(4)
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 
 	fc := newFakeControld(t, testToken)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -363,7 +363,7 @@ func TestDialAttachBackChecksTargetOrigin(t *testing.T) {
 	dial := func(t *testing.T, controldURL string) int64 {
 		t.Helper()
 		hits.Store(0)
-		rd := New(driver.NewFake(4), "", "")
+		rd := New(driver.NewFake(4), "", "", "")
 		msg := rwire.ToRunner{Type: "dial_attach", Session: "sess_x", Attach: &rwire.Attach{
 			AttachID: "0123456789abcdef", Cols: 80, Rows: 24,
 			TargetURL: probeWS + "/v1/runners/attach-back?attach_id=0123456789abcdef",
@@ -447,7 +447,7 @@ func waitForAgentWriterCount(t *testing.T, rd *Server, want int64) {
 // writer must already be gone.
 func TestAgentReconnectDoesNotLeakWriterGoroutine(t *testing.T) {
 	fd := driver.NewFake(4)
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 
 	fc := newFakeControld(t, testToken)
 	ctx, cancel := context.WithCancel(context.Background())

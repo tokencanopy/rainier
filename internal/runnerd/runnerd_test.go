@@ -27,7 +27,7 @@ import (
 // in-process sessiond bound to a real session.Session, then attach a client
 // via /attach and assert output flows.
 func TestRunnerdCreateRegisterAttach(t *testing.T) {
-	srv := httptest.NewServer(New(driver.NewFake(4), "", "").Handler())
+	srv := httptest.NewServer(New(driver.NewFake(4), "", "", "").Handler())
 	defer srv.Close()
 	base := strings.Replace(srv.URL, "http", "ws", 1)
 	ctx := context.Background()
@@ -97,6 +97,26 @@ func postSession(baseURL string) (string, error) {
 	return out.SessionID, nil
 }
 
+// TestNewPlumbsProxyURLToHTTPOnlyCreate is the regression test for Task 13's
+// finding that the HTTP-only surface (cmd/runnerd with no --controld set —
+// today's default, and every dev/CI compose run) never got a proxy URL onto
+// driver.Spec at all: RunAgent set s.proxyURL from AgentConfig.ProxyURL, but
+// New (which is all the HTTP-only path ever calls) had no way to set it,
+// so CreateWithID's `spec.ProxyURL = s.proxyURL` was always "" outside
+// agent (dial) mode. New must accept a proxyURL and CreateWithID must carry
+// it onto every driver.Spec it builds, exactly like dialBase/egressAdmin.
+func TestNewPlumbsProxyURLToHTTPOnlyCreate(t *testing.T) {
+	fd := driver.NewFake(4)
+	srv := httptest.NewServer(New(fd, "", "", "http://gw:3128").Handler())
+	defer srv.Close()
+
+	createSession(t, srv.URL)
+
+	if got := fd.LastSpec().ProxyURL; got != "http://gw:3128" {
+		t.Fatalf("driver.Spec.ProxyURL = %q, want %q (New's proxyURL never reached CreateWithID's HTTP path)", got, "http://gw:3128")
+	}
+}
+
 // TestSessionsConcurrentCreateUniqueIDs is the regression test for C1: newID
 // used to do an unsynchronized s.seq++, so concurrent POST /sessions (the
 // normal fleet operating mode — many callers creating sessions at once)
@@ -104,7 +124,7 @@ func postSession(baseURL string) (string, error) {
 // the first session's entry.
 func TestSessionsConcurrentCreateUniqueIDs(t *testing.T) {
 	const n = 20
-	srv := httptest.NewServer(New(driver.NewFake(n), "", "").Handler())
+	srv := httptest.NewServer(New(driver.NewFake(n), "", "", "").Handler())
 	defer srv.Close()
 
 	var wg sync.WaitGroup
@@ -185,7 +205,7 @@ func (f *slowFake) Create(ctx context.Context, spec driver.Spec) (driver.Handle,
 // orphaned — once Create actually finishes.
 func TestSessionOpRejectsStartingSession(t *testing.T) {
 	fd := newSlowFake(4)
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 	srv := httptest.NewServer(rd.Handler())
 	defer srv.Close()
 
@@ -319,7 +339,7 @@ func waitForHub(t *testing.T, rd *Server, id string) {
 // covers.
 func TestRegisterCleansUpOnSessionConnDeath(t *testing.T) {
 	fd := driver.NewFake(4)
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 	srv := httptest.NewServer(rd.Handler())
 	defer srv.Close()
 	base := strings.Replace(srv.URL, "http", "ws", 1)
@@ -427,7 +447,7 @@ func attachAndAssertEcho(t *testing.T, ctx context.Context, base, id, marker str
 // a new /attach can relay through.
 func TestHubDeathDuringColdSuspendKeepsEntry(t *testing.T) {
 	fd := driver.NewFake(4)
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 	srv := httptest.NewServer(rd.Handler())
 	defer srv.Close()
 	base := strings.Replace(srv.URL, "http", "ws", 1)
@@ -553,7 +573,7 @@ func TestRecoverRebuildsRegistryFromDriverLabels(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 	if err := rd.Recover(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -657,7 +677,7 @@ func (f *destroyTrackingFake) destroyCalls() []string {
 // redial) picks the session back up.
 func TestHubDeathAliveContainerKeepsSession(t *testing.T) {
 	fd := newDestroyTrackingFake(4)
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 	srv := httptest.NewServer(rd.Handler())
 	defer srv.Close()
 	base := strings.Replace(srv.URL, "http", "ws", 1)
@@ -726,7 +746,7 @@ func TestHubDeathAliveContainerKeepsSession(t *testing.T) {
 // container is destroyed to reclaim its capacity slot (I1).
 func TestHubDeathGoneContainerDestroys(t *testing.T) {
 	fd := newDestroyTrackingFake(4)
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 	srv := httptest.NewServer(rd.Handler())
 	defer srv.Close()
 	base := strings.Replace(srv.URL, "http", "ws", 1)
@@ -807,7 +827,7 @@ func (f *inspectErrFake) Inspect(context.Context, string) (driver.Handle, error)
 // one that says nothing about the container's actual state.
 func TestHubDeathInspectErrorKeepsSession(t *testing.T) {
 	fd := newInspectErrFake(4)
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 	srv := httptest.NewServer(rd.Handler())
 	defer srv.Close()
 	base := strings.Replace(srv.URL, "http", "ws", 1)
@@ -864,7 +884,7 @@ func TestHubDeathInspectErrorKeepsSession(t *testing.T) {
 // OnEvent unset and must keep passing.
 func TestOnEventFiresRunningAndDead(t *testing.T) {
 	fd := newDestroyTrackingFake(4)
-	rd := New(fd, "", "")
+	rd := New(fd, "", "", "")
 
 	type event struct{ sessionID, state string }
 	var mu sync.Mutex
@@ -917,7 +937,7 @@ func TestOnEventFiresRunningAndDead(t *testing.T) {
 // 404 (no such session). The pre-refactor handler always checked existence
 // first, for every method including GET — restored, and pinned here.
 func TestSessionOpGetUnknownSessionReturns404(t *testing.T) {
-	rd := New(driver.NewFake(4), "", "")
+	rd := New(driver.NewFake(4), "", "", "")
 	srv := httptest.NewServer(rd.Handler())
 	defer srv.Close()
 
@@ -932,7 +952,7 @@ func TestSessionOpGetUnknownSessionReturns404(t *testing.T) {
 }
 
 func TestDeleteSessionRemovesRegistryEntryAndClosesHub(t *testing.T) {
-	rd := New(driver.NewFake(4), "", "")
+	rd := New(driver.NewFake(4), "", "", "")
 	srv := httptest.NewServer(rd.Handler())
 	defer srv.Close()
 	base := strings.Replace(srv.URL, "http", "ws", 1)

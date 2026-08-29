@@ -27,7 +27,10 @@ func main() {
 	flag.Parse()
 
 	drv := driver.NewDocker(driver.DockerOpts{Image: *image, Network: *network, TotalSlots: *slots})
-	s := runnerd.New(drv, *dialBase, *egressAdmin)
+	// *proxyURL reaches New directly now (Task 13) so the local HTTP-only
+	// surface — today's default, and every dev/CI compose run — injects it
+	// into every driver.Spec too, not just agent (dial) mode below.
+	s := runnerd.New(drv, *dialBase, *egressAdmin, *proxyURL)
 
 	// Rebuild the registry from the driver's labeled containers before
 	// serving, so a restart is truthful about sessions that outlived it

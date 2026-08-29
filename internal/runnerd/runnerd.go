@@ -29,10 +29,15 @@ type Server struct {
 	seq         atomic.Int64
 	egressAdmin string // http://egressd:3129 (optional)
 	// proxyURL, when non-empty, is injected into every driver.Spec this
-	// server creates (egress R4). Zero value "" in HTTP-only mode (New
-	// never sets it) — that's today's exact behavior, since Spec.ProxyURL
-	// was simply never populated before Task 6. RunAgent sets it from
-	// AgentConfig.ProxyURL before dialing.
+	// server creates (egress R4). New sets it from its proxyURL parameter
+	// (cmd/runnerd's --proxy-url, forwarded from fleet-up.sh's derived
+	// value) so the HTTP-only surface gets it too, not just agent (dial)
+	// mode — Task 13's fix: before this, HTTP-only mode's CreateWithID
+	// always saw Spec.ProxyURL == "" (New had no way to set it), even
+	// though driver.Create had supported injecting it since Task 4.
+	// RunAgent overwrites it from AgentConfig.ProxyURL before dialing —
+	// today cmd/runnerd passes the same flag value to both, so that's a
+	// harmless no-op reassignment, not a second source of truth.
 	proxyURL string
 	// onEvent is fired with "running" after a successful register() setHub
 	// and "dead" when the crash path destroys a container. Guarded by
@@ -101,8 +106,8 @@ type egressError struct{ err error }
 func (e *egressError) Error() string { return "egress setup: " + e.err.Error() }
 func (e *egressError) Unwrap() error { return e.err }
 
-func New(drv driver.Driver, dialBase, egressAdmin string) *Server {
-	return &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin}
+func New(drv driver.Driver, dialBase, egressAdmin, proxyURL string) *Server {
+	return &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin, proxyURL: proxyURL}
 }
 
 // Recover rebuilds the in-memory registry from the driver's labeled

@@ -267,7 +267,7 @@ func newAttachFixture(t *testing.T) *attachFixture {
 
 	// A real runnerd: fake driver, its own HTTP surface for the session's
 	// /register dial-in, and RunAgent holding the control conn to controld.
-	rd := runnerd.New(driver.NewFake(4), "", "")
+	rd := runnerd.New(driver.NewFake(4), "", "", "")
 	rsrv := httptest.NewServer(rd.Handler())
 	t.Cleanup(rsrv.Close)
 	rbase := "ws" + strings.TrimPrefix(rsrv.URL, "http")

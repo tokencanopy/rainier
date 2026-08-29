@@ -77,7 +77,14 @@ func TestDockerDriverContract(t *testing.T) {
 // TestDockerCreateInjectsProxyEnv asserts that Spec.ProxyURL, when set,
 // injects both cases of HTTP_PROXY/HTTPS_PROXY/NO_PROXY — tools disagree on
 // which they read (BusyBox wget and curl read lowercase, many Go/Node tools
-// read uppercase), so both must be present rather than just one.
+// read uppercase), so both must be present rather than just one. The proxy
+// URL itself carries the session id as URL userinfo
+// (http://<session-id>:@host:port, Task 13 egress R4): curl-family tools
+// send that automatically as `Proxy-Authorization: Basic
+// base64(session-id:)` on every CONNECT, which is the only way a plain
+// env-var proxy flow can carry identity for egressd's allowlist lookup at
+// all (verified against real curl during the Task 13 spike). NO_PROXY
+// carries no userinfo — it's a bare host list, not a proxy URL.
 func TestDockerCreateInjectsProxyEnv(t *testing.T) {
 	dockerAvailable(t)
 	d := NewDocker(DockerOpts{
@@ -109,11 +116,12 @@ func TestDockerCreateInjectsProxyEnv(t *testing.T) {
 			env[k] = v
 		}
 	}
+	const wantProxy = "http://sproxy:@proxy.internal:3128"
 	want := map[string]string{
-		"HTTP_PROXY":  "http://proxy.internal:3128",
-		"http_proxy":  "http://proxy.internal:3128",
-		"HTTPS_PROXY": "http://proxy.internal:3128",
-		"https_proxy": "http://proxy.internal:3128",
+		"HTTP_PROXY":  wantProxy,
+		"http_proxy":  wantProxy,
+		"HTTPS_PROXY": wantProxy,
+		"https_proxy": wantProxy,
 		"NO_PROXY":    "localhost,127.0.0.1,host.docker.internal",
 		"no_proxy":    "localhost,127.0.0.1,host.docker.internal",
 	}
@@ -121,5 +129,36 @@ func TestDockerCreateInjectsProxyEnv(t *testing.T) {
 		if got := env[k]; got != wantV {
 			t.Errorf("env %s = %q, want %q", k, got, wantV)
 		}
+	}
+}
+
+// TestWithSessionUserinfo unit-tests the pure URL-construction helper
+// directly (no docker daemon needed), including the edge cases the
+// docker-gated integration test above can't cheaply cover: no session id,
+// and an unparseable base URL.
+func TestWithSessionUserinfo(t *testing.T) {
+	cases := []struct {
+		name      string
+		base      string
+		sessionID string
+		want      string
+	}{
+		{"normal case", "http://proxy.internal:3128", "sess-1", "http://sess-1:@proxy.internal:3128"},
+		{"empty session id leaves the URL unchanged", "http://proxy.internal:3128", "", "http://proxy.internal:3128"},
+		{
+			// Control characters are invalid in a URL and make url.Parse fail
+			// — falling back to the unmodified base (no userinfo, so
+			// egressd's allowlist lookup would deny) is safer than a panic
+			// or a mangled URL passed to `docker run -e`.
+			"unparseable base URL falls back unchanged",
+			"http://proxy.internal:3128/\x7f", "sess-1", "http://proxy.internal:3128/\x7f",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := withSessionUserinfo(c.base, c.sessionID); got != c.want {
+				t.Errorf("withSessionUserinfo(%q, %q) = %q, want %q", c.base, c.sessionID, got, c.want)
+			}
+		})
 	}
 }

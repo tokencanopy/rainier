@@ -566,7 +566,7 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	c := &Client{Base: controldTS.URL, Token: auth.Token}
 
 	// --- a real runnerd (fake driver) connected to controld ---
-	rd := runnerd.New(driver.NewFake(4), "", "")
+	rd := runnerd.New(driver.NewFake(4), "", "", "")
 	rsrv := httptest.NewServer(rd.Handler())
 	t.Cleanup(rsrv.Close)
 
