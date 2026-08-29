@@ -33,7 +33,13 @@ and billed:
 ```
 
 It creates `rainier-1` if it isn't there, installs Docker, Tailscale, git and
-a Go toolchain, and stops. Re-running it is safe and cheap.
+Go, and stops. Re-running it is safe and cheap.
+
+**Go comes from the official tarball into `/usr/local/go`, not from apt.**
+Debian bookworm's `golang-go` is 1.19 and this repo's `go.mod` requires
+1.25.0, so an apt Go fails `make build` outright with `go.mod requires go >=
+1.25.0`. `gce-up.sh` installs `GO_VERSION` (default 1.25.0) and appends
+`/usr/local/go/bin` to `~/.profile`; bump `GO_VERSION` and re-run to upgrade.
 
 Then join the tailnet, on the VM:
 
@@ -42,10 +48,13 @@ gcloud compute ssh rainier-1 --project rainier --zone us-west1-b
 sudo tailscale up                   # authenticate in the browser it prints
 tailscale status                    # note the MagicDNS name — "rainier-1" below
 exit && gcloud compute ssh rainier-1 --project rainier --zone us-west1-b
+go version                          # → go1.25.0 (from ~/.profile's PATH)
 ```
 
-The second ssh is not superstition: `usermod -aG docker` only takes effect on
-a new login, and every step below drives docker as your own user.
+The second ssh is not superstition: `usermod -aG docker` and the new PATH both
+only take effect on a fresh login, and every step below needs both. If
+`go version` prints 1.19 or nothing, your shell found apt's Go (or none) —
+`export PATH=$PATH:/usr/local/go/bin` and check `~/.profile`.
 
 From your laptop, confirm the tailnet actually resolves the VM — everything
 after this depends on it:
@@ -193,16 +202,24 @@ ticking the box.
 | 2 | Kill controld mid-attach; restart it; `rainier attach` reconnects to the same session with full scrollback. The agent process never noticed. | Attach, type something, `kill $(pgrep controld)` on the VM, restart it with the step-4 command, `rainier attach <id>` again. | ☐ | _not yet run_ |
 | 3 | Kill runnerd on a VM with live sessions; restart it; sessions re-register and are attachable. No container is destroyed. | `docker ps` before, `./scripts/fleet-down.sh`, re-run step 5, `docker ps` after, then attach. | ☐ | _not yet run_ |
 | 4 | A session survives the laptop sleeping overnight; reattach next morning shows the live TUI. | Attach, start something long-running, close the laptop. Reattach in the morning. **Spans a day — start it the evening before and note the start time.** | ☐ | _not yet run_ |
-| 5 | Burst 10 creates against a fleet with 4 free slots: 4 run, 6 sit visibly `queued`, and the queue drains as capacity frees — no failed creates, no lost sessions. | Covered by `go test ./internal/e2e/ -run TestBurstQueuesAndDrains` (two 2-slot runners, real HTTP, real websockets). To re-run it here, restart runnerd with `--slots 4` and create ten sessions with `rainier new --detach`. | ☑ | Automated: green under `-race -count=5` (memstore and pgstore). |
+| 5 | Burst 10 creates against a fleet with 4 free slots: 4 run, 6 sit visibly `queued`, and the queue drains as capacity frees — no failed creates, no lost sessions. | Covered by `go test ./internal/e2e/ -run TestBurstQueuesAndDrains` (two 2-slot runners, real HTTP, real websockets). To re-run it here: `./scripts/fleet-down.sh`, bring the fleet back with `SLOTS=4` added to the step-5 environment, then `for i in $(seq 10); do rainier new --detach --name burst-$i; done` and watch `rainier ls`. | ☑ | Automated: green under `-race -count=5` (memstore and pgstore). |
 | 6 | A fresh VM running runnerd with the join token appears in the fleet and receives placements with zero controld config changes or restarts. | Provision a second VM (step 1), build (step 2), run step 5 with `RUNNER_NAME=rainier-2`. Watch `rainier ls` place new sessions on it. | ☐ | _not yet run_ |
 | 7 | Egress R4 closed: a session reaches an allowlisted host through egressd and cannot reach anything else (verified by an acceptance script). | `./scripts/egress-check.sh` on the VM. On Linux dockerd it must exit **0** — exit 3 (SKIPPED) means the network came up non-internal and something is wrong with the platform probe. | ☐ | _not yet run_ |
 
 **Where each criterion can go wrong, so you know what you're looking at:**
 
+- **1, before you even get there** — `make build` fails with `go.mod requires
+  go >= 1.25.0`: your shell is finding Debian's apt Go (1.19), not
+  `/usr/local/go/bin/go`. Log out and back in, or export the PATH by hand (see
+  step 1). `docker: permission denied`: same cause, the `docker` group needs a
+  fresh login too.
 - **1** — `login` 403s: your GitHub login isn't in `--admins`. `new` sits
   `queued`: no runner joined (check `/tmp/controld.log` and `/tmp/runnerd.log`).
   `attach` says `runner_unreachable`: `--external-url` doesn't match what the
-  runner dialed.
+  runner dialed. A session that reaches `creating` and stays there means its
+  sessiond can't reach runnerd's register listener — check the container's own
+  log (`docker logs $(docker ps -q --filter label=rainier.session)`); a `405`
+  there means the dial is being sent through egressd.
 - **2** — Attach downtime is expected and accepted (design §4.8); state loss is
   not. After the restart the session must still be `running` on the same
   runner, with an empty `error`.

@@ -27,7 +27,12 @@ command -v docker >/dev/null || export PATH="/Applications/Docker.app/Contents/R
 command -v docker >/dev/null || { echo "docker CLI not found" >&2; exit 2; }
 command -v curl >/dev/null || { echo "curl not found" >&2; exit 2; }
 
-PG_CONTAINER=${PG_CONTAINER:-rainier-pg}
+# NOT "rainier-pg": that is the name docs/deploy-gce.md gives the real,
+# `--restart unless-stopped`, named-volume Postgres on the dogfood VM, and
+# this script does `docker rm -f` on its own container by name before
+# starting it. A rehearsal run on the VM must not delete the fleet's actual
+# database.
+PG_CONTAINER=${PG_CONTAINER:-rainier-pg-e2e}
 # 5433 by default so this never collides with a local Postgres on 5432. It is
 # env-overridable because a dev box often has several throwaway databases
 # mapped into the low 54xx range already — and docker's own "port is already
@@ -63,8 +68,21 @@ ok()    { printf 'PASS: %s\n' "$*"; }
 fail()  { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 setup_error() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 
+# Ownership flags. Teardown destroys state, and this script must only ever
+# destroy state IT created: an abort before we own anything — the preflight
+# finding another fleet on these ports, a build failure, a missing binary —
+# has to leave that other fleet, its session containers, its controld and its
+# database exactly as they were. Each flag flips only once the corresponding
+# thing is actually ours.
+PG_STARTED=0
+CONTROLD_STARTED=0
+FLEET_STARTED=0
+
 cleanup() {
   local rc=$?
+  if [ "$PG_STARTED$CONTROLD_STARTED$FLEET_STARTED" = "000" ]; then
+    return $rc # nothing of ours ever started; destroy nothing
+  fi
   if [ "${KEEP:-0}" = "1" ]; then
     echo
     echo "KEEP=1: leaving the stack up (controld $CONTROLD_HTTP, postgres 127.0.0.1:$PG_PORT)."
@@ -73,9 +91,12 @@ cleanup() {
   fi
   echo
   echo "--- tearing the stack down (logs kept: $CONTROLD_LOG /tmp/runnerd.log /tmp/egressd.log)"
-  ./scripts/fleet-down.sh >/dev/null 2>&1 || true
-  [ -f "$CONTROLD_PID" ] && { kill "$(cat "$CONTROLD_PID")" 2>/dev/null || true; rm -f "$CONTROLD_PID"; }
-  docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
+  [ "$FLEET_STARTED" = "1" ] && { ./scripts/fleet-down.sh >/dev/null 2>&1 || true; }
+  if [ "$CONTROLD_STARTED" = "1" ] && [ -f "$CONTROLD_PID" ]; then
+    kill "$(cat "$CONTROLD_PID")" 2>/dev/null || true
+    rm -f "$CONTROLD_PID"
+  fi
+  [ "$PG_STARTED" = "1" ] && { docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true; }
   return $rc
 }
 trap cleanup EXIT
@@ -122,7 +143,11 @@ echo "built: $(ls bin | tr '\n' ' ')"
 # ---------------------------------------------------------------------------
 step "postgres ($PG_CONTAINER on 127.0.0.1:$PG_PORT)"
 # ---------------------------------------------------------------------------
+# Removing a stale container of OUR OWN name (see PG_CONTAINER's comment —
+# never the deploy's "rainier-pg") is the first thing this run does that
+# touches shared state, so ownership starts here.
 docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
+PG_STARTED=1
 if ! PG_ERR=$(docker run -d --name "$PG_CONTAINER" \
   -e POSTGRES_PASSWORD="$PG_PASS" -e POSTGRES_DB="$PG_DB" \
   -p "127.0.0.1:${PG_PORT}:5432" postgres:16-alpine 2>&1); then
@@ -176,6 +201,7 @@ RUNNER_TOKEN="dev-$(openssl rand -hex 8)"
   --runner-token "$RUNNER_TOKEN" --external-url "$CONTROLD_HTTP" \
   --admins "$ADMIN" >"$CONTROLD_LOG" 2>&1 &
 echo $! > "$CONTROLD_PID"
+CONTROLD_STARTED=1
 # Off the job table: the teardown kills it by pid, and without this bash
 # prints a "Terminated" notice over the final summary when it reaps the job.
 disown %% 2>/dev/null || true
@@ -186,6 +212,7 @@ ok "controld healthy (migrations applied against $PG_CONTAINER)"
 # ---------------------------------------------------------------------------
 step "fleet (egressd + dial-mode runnerd)"
 # ---------------------------------------------------------------------------
+FLEET_STARTED=1
 CONTROLD_URL="$CONTROLD_WS" RAINIER_RUNNER_TOKEN="$RUNNER_TOKEN" RUNNER_NAME="${RUNNER_NAME:-vm-local}" \
   ./scripts/fleet-up.sh
 waitfor "grep -q 'runner .* connected' $CONTROLD_LOG" 30 "runner join" \
@@ -249,16 +276,33 @@ step "rainier attach (non-tty, piped stdin)"
 # Enter; \035 is Ctrl-], the detach key. The PTY echoes the typed line AND
 # bash prints the command's output, so a working end-to-end terminal plane
 # shows the marker at least twice.
+#
+# stdin is a FIFO rather than a `{ …; sleep 5; … } |` pipeline so the detach
+# key is sent when the marker has actually come back, not after a fixed wait:
+# on a fast machine that wait was four wasted seconds, and on a loaded one it
+# was a flake waiting to happen.
 ATTACH_OUT=/tmp/rainier-e2e-attach.txt
-set +e
-{ printf 'echo %s\r' "$MARK"; sleep 5; printf '\035'; sleep 1; } \
-  | ./bin/rainier attach "$SID" >"$ATTACH_OUT" 2>&1
-set -e
-HITS=$(grep -c "$MARK" "$ATTACH_OUT" || true)
-if [ "${HITS:-0}" -lt 2 ]; then
+ATTACH_FIFO=/tmp/rainier-e2e-attach.fifo
+rm -f "$ATTACH_FIFO"; mkfifo "$ATTACH_FIFO"
+marker_hits() { grep -c "$MARK" "$ATTACH_OUT" 2>/dev/null || true; }
+
+: > "$ATTACH_OUT"
+./bin/rainier attach "$SID" <"$ATTACH_FIFO" >"$ATTACH_OUT" 2>&1 &
+ATTACH_JOB=$!
+exec 9>"$ATTACH_FIFO"          # holds the write end open for the whole attach
+printf 'echo %s\r' "$MARK" >&9
+
+if ! waitfor '[ "$(marker_hits)" -ge 2 ]' 30 "the shell to echo the marker"; then
+  printf '\035' >&9; exec 9>&-; wait "$ATTACH_JOB" 2>/dev/null || true
   echo "--- attach output ---"; cat -v "$ATTACH_OUT"; echo "---------------------"
-  fail "attach echoed the marker $HITS time(s), want >= 2 (typed line + command output)"
+  fail "attach echoed the marker $(marker_hits) time(s) in 30s, want >= 2 (typed line + command output)"
 fi
+HITS=$(marker_hits)
+printf '\035' >&9                # Ctrl-]: detach
+exec 9>&-
+wait "$ATTACH_JOB" 2>/dev/null || true
+rm -f "$ATTACH_FIFO"
+
 grep -q "detached at seq" "$ATTACH_OUT" || fail "attach did not print the detach status line"
 ok "attach relayed a live shell and detached cleanly (marker seen $HITS times)"
 
@@ -278,8 +322,13 @@ step "rainier rm"
 ./bin/rainier rm "$SID" | grep -q "removed" || fail "rm did not report removal"
 waitfor '[ -z "$(session_state)" ]' 30 "session gone from ls" \
   || fail "$SID still listed after rm (state: $(session_state))"
-./bin/rainier ls --all | grep -q "destroyed" || fail "ls --all does not show the destroyed session"
-ok "removed; the terminal row is still visible under ls --all"
+# Scoped to THIS session's row: a bare `grep -q destroyed` over the whole
+# --all listing passes on any leftover destroyed session from an earlier run
+# — including one this run's rm never touched.
+session_state_all() { ./bin/rainier ls --all | awk -v id="$SID" '$1 == id { print $3 }'; }
+[ "$(session_state_all)" = "destroyed" ] \
+  || fail "ls --all shows $SID as \"$(session_state_all)\", want destroyed"
+ok "removed; $SID's terminal row is still visible under ls --all"
 
 # ---------------------------------------------------------------------------
 step "egress R4 acceptance"

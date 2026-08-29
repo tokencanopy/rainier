@@ -113,43 +113,54 @@ func (d *Docker) Create(ctx context.Context, spec Spec) (Handle, error) {
 const noProxyBase = "localhost,127.0.0.1,host.docker.internal"
 
 // noProxyFor returns the NO_PROXY value for a session whose sessiond dials
-// dialURL to reach runnerd, which is noProxyBase plus that URL's host.
+// dialURL to reach runnerd: noProxyBase plus that URL's exact host AND port.
 //
-// That addition is load-bearing, not defensive. sessiond's register dial is
-// a ws:// URL, and Go's http.ProxyFromEnvironment applies to ws/wss exactly
-// as it does to http/https — so with HTTP_PROXY set (every session, since
-// Task 13) and the runnerd host absent from NO_PROXY, sessiond's dial home
-// is sent to egressd as a plain non-CONNECT request, which egressd correctly
-// answers 405. The session then never registers, never reaches `running`,
-// and is unattachable: a container that is alive but permanently mute.
-// (Found by scripts/e2e-fleet.sh's first end-to-end run, Task 14 — the
-// egress acceptance script never caught it because it only needs `docker
-// exec` into the container, not a registered session.)
+// The addition is load-bearing, not defensive. sessiond's register dial is a
+// ws:// URL, and Go's proxy env handling applies to it exactly as to
+// http/https — so with HTTP_PROXY set (every session, since Task 13) and the
+// runnerd listener absent from NO_PROXY, sessiond's dial home is sent to
+// egressd as a plain non-CONNECT request, which egressd correctly answers
+// 405. The session then never registers, never reaches `running`, and is
+// unattachable: a container that is alive but permanently mute. (Found by
+// scripts/e2e-fleet.sh's first end-to-end run, Task 14 — the egress
+// acceptance script never caught it because it only needs `docker exec` into
+// the container, not a registered session.)
+//
+// The exemption is host:port, not host: NO_PROXY entries carry an optional
+// port and Go honors it (golang.org/x/net/http/httpproxy), so naming
+// "172.17.0.1:8080" exempts exactly the register listener while every other
+// port on the same address — egressd's own, anything else a session might
+// try to reach on the gateway — still goes through the proxy. A host-wide
+// exemption would have quietly widened the R4 hole from one port to all of
+// them on the one address every session can route to.
 //
 // fleet-up.sh derives the dial base from an IP (host.docker.internal's
 // resolved address on VM-backed docker, the bridge gateway on Linux), so
-// noProxyBase's literal "host.docker.internal" never matches it — the host
-// has to come from the dial URL itself. Excluding it costs no isolation: the
-// route to the host gateway is what the whole architecture already requires
-// (design §3), and network-level enforcement is unaffected by an env var.
+// noProxyBase's literal "host.docker.internal" never matches it — the
+// listener has to come from the dial URL itself. Exempting it costs no
+// isolation: reaching runnerd's register listener is what the whole
+// architecture already requires (design §3), and an env var was never what
+// enforced anything.
 //
 // A dialURL that is empty or unparseable falls back to noProxyBase, the
-// pre-Task-14 value: no dial URL means no host to exclude.
+// pre-Task-14 value: no dial URL means no listener to exempt. A dial URL
+// whose hostname is already in noProxyBase is likewise left alone — that
+// entry has no port, so it already covers every port on that name.
 func noProxyFor(dialURL string) string {
 	u, err := url.Parse(dialURL)
-	if err != nil {
-		return noProxyBase
-	}
-	host := u.Hostname()
-	if host == "" {
+	if err != nil || u.Host == "" {
 		return noProxyBase
 	}
 	for _, existing := range strings.Split(noProxyBase, ",") {
-		if existing == host {
+		if existing == u.Hostname() {
 			return noProxyBase
 		}
 	}
-	return noProxyBase + "," + host
+	// u.Host, not u.Hostname(): it carries the port when the URL has one,
+	// which is the whole point (see above). A dial URL with no port yields a
+	// bare host, correctly exempting every port on it — but fleet-up.sh, the
+	// compose default, and cmd/runnerd's --dial-base all name one.
+	return noProxyBase + "," + u.Host
 }
 
 // withSessionUserinfo embeds sessionID as base's URL userinfo

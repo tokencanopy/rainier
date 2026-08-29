@@ -4,6 +4,8 @@ package driver
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/url"
 	"os/exec"
 	"strings"
 	"testing"
@@ -167,23 +169,24 @@ func TestWithSessionUserinfo(t *testing.T) {
 	}
 }
 
-// TestNoProxyForExcludesTheDialHost is the regression test for the bug
+// TestNoProxyForExemptsTheRegisterListener is the regression test for the bug
 // scripts/e2e-fleet.sh's first run surfaced: with HTTP_PROXY set and the
-// runnerd host missing from NO_PROXY, sessiond's ws:// register dial goes
+// runnerd listener missing from NO_PROXY, sessiond's ws:// register dial goes
 // through egressd (Go proxies ws/wss from the same env vars as http/https),
 // which answers 405 — the container comes up and is permanently mute. The
-// dial URL's host has to be in NO_PROXY, and it cannot come from the literal
-// "host.docker.internal" in the base list because fleet-up.sh resolves that
-// name to an IP before handing it over as --dial-base.
-func TestNoProxyForExcludesTheDialHost(t *testing.T) {
+// dial URL's host:port has to be in NO_PROXY, and it cannot come from the
+// literal "host.docker.internal" in the base list because fleet-up.sh
+// resolves that name to an IP before handing it over as --dial-base.
+func TestNoProxyForExemptsTheRegisterListener(t *testing.T) {
 	cases := []struct {
 		name    string
 		dialURL string
 		want    string
 	}{
-		{"ip dial base", "ws://192.168.5.2:8080/register", noProxyBase + ",192.168.5.2"},
-		{"bridge gateway", "ws://172.17.0.1:8080/register", noProxyBase + ",172.17.0.1"},
-		{"named host", "ws://runnerd:8080/register", noProxyBase + ",runnerd"},
+		{"ip dial base", "ws://192.168.5.2:8080/register", noProxyBase + ",192.168.5.2:8080"},
+		{"bridge gateway", "ws://172.17.0.1:8080/register", noProxyBase + ",172.17.0.1:8080"},
+		{"named host", "ws://runnerd:8080/register", noProxyBase + ",runnerd:8080"},
+		{"no port exempts the whole host", "ws://runnerd/register", noProxyBase + ",runnerd"},
 		{"already in the base list", "ws://host.docker.internal:8080/register", noProxyBase},
 		{"no dial url", "", noProxyBase},
 		{"unparseable", "ws://[::1", noProxyBase},
@@ -194,5 +197,55 @@ func TestNoProxyForExcludesTheDialHost(t *testing.T) {
 				t.Fatalf("noProxyFor(%q) = %q, want %q", tc.dialURL, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestNoProxyForIsHonoredByGoProxyResolution is the half of the regression
+// that matters: not "the string looks right" but "Go's own proxy resolution
+// bypasses the proxy for the register dial, and still proxies everything
+// else on that same address". The second assertion is what pins the
+// exemption to one port — a host-wide NO_PROXY entry passes the first check
+// and fails this one.
+//
+// coder/websocket dials ws:// as an ordinary http:// request through
+// http.DefaultTransport, so http scheme + ProxyFromEnvironment is exactly the
+// code path sessiond takes. net/http caches its proxy config on first use per
+// process (there is no exported reset), so this test makes both its calls
+// against one env and skips if something already primed that cache — an
+// honest "couldn't measure" rather than a false pass.
+func TestNoProxyForIsHonoredByGoProxyResolution(t *testing.T) {
+	const dialURL = "ws://172.17.0.1:8080/register"
+	t.Setenv("HTTP_PROXY", "http://egressd.invalid:3128")
+	t.Setenv("HTTPS_PROXY", "http://egressd.invalid:3128")
+	t.Setenv("NO_PROXY", noProxyFor(dialURL))
+
+	proxyFor := func(t *testing.T, raw string) *url.URL {
+		t.Helper()
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", raw, err)
+		}
+		p, err := http.ProxyFromEnvironment(&http.Request{URL: u})
+		if err != nil {
+			t.Fatalf("ProxyFromEnvironment(%q): %v", raw, err)
+		}
+		return p
+	}
+
+	// A URL nothing exempts must resolve to the proxy. If it doesn't, this
+	// process cached a proxy config before this test set its env, and neither
+	// assertion below would mean anything.
+	if p := proxyFor(t, "http://not-exempt.invalid/"); p == nil {
+		t.Skip("net/http cached a proxy config before this test set its env; nothing to measure here")
+	}
+
+	// The register listener: no proxy, or sessiond never gets home.
+	if p := proxyFor(t, "http://172.17.0.1:8080/register"); p != nil {
+		t.Errorf("the register dial resolves to proxy %s; it must bypass the proxy entirely", p)
+	}
+	// Any other port on the same address: still proxied. This is what keeps
+	// the exemption one port wide instead of one host wide.
+	if p := proxyFor(t, "http://172.17.0.1:9999/"); p == nil {
+		t.Error("another port on the runnerd host bypasses the proxy; the NO_PROXY exemption is host-wide, not listener-wide")
 	}
 }
