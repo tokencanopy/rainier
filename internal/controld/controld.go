@@ -29,12 +29,18 @@ const (
 	defaultAttachPairTTL = 15 * time.Second
 )
 
-// Config is controld's startup configuration. RunnerToken and ExternalURL
-// are required; the rest default.
+// Config is controld's startup configuration. RunnerToken, ExternalURL, and
+// SecretsKey are required; the rest default.
 type Config struct {
 	// RunnerToken is the fleet-wide bearer every runnerd presents on
 	// /v1/runners/connect (and, later, on the attach-back dial).
 	RunnerToken string
+	// SecretsKey is the AES-256 key team secrets are sealed under at rest
+	// (seal.go), parsed from RAINIER_SECRETS_KEY by ParseSecretsKey. It is
+	// required and has no default: a zero key means "unconfigured", and New
+	// refuses to start rather than seal every team secret under a key of
+	// zeros. Losing it loses secret values and nothing else.
+	SecretsKey [32]byte
 	// Admins and Members are GitHub logins; a login in neither list cannot
 	// log in at all (fail closed — an empty allowlist admits nobody).
 	Admins  []string
@@ -100,6 +106,12 @@ func New(st Store, cfg Config) (*Server, error) {
 	if cfg.ExternalURL == "" {
 		return nil, errors.New("controld: ExternalURL is required")
 	}
+	if cfg.SecretsKey == ([32]byte{}) {
+		// Fail closed, like the runner token: a controld that came up
+		// without a key would either refuse every secret at runtime (a
+		// puzzling half-broken fleet) or, worse, seal them all under zeros.
+		return nil, errors.New("controld: SecretsKey is required (set RAINIER_SECRETS_KEY to 64 hex characters; generate one with: openssl rand -hex 32)")
+	}
 	u, err := url.Parse(cfg.ExternalURL)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return nil, fmt.Errorf("controld: ExternalURL must be an absolute http(s) URL, got %q", cfg.ExternalURL)
@@ -148,6 +160,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{id}/snapshot", s.requireUser(s.handleSnapshotSession))
 	mux.HandleFunc("GET /v1/sessions/{id}/attach", s.requireUser(s.handleClientAttach))
 	mux.HandleFunc("GET /v1/runners", s.requireUser(s.handleListRunners))
+
+	// Secrets: writes are admin-only, the listing is team-visible (names and
+	// timestamps only — values are write-only at this API, design §4.5).
+	mux.HandleFunc("PUT /v1/secrets/{name}", s.requireAdmin(s.handlePutSecret))
+	mux.HandleFunc("GET /v1/secrets", s.requireUser(s.handleListSecrets))
+	mux.HandleFunc("DELETE /v1/secrets/{name}", s.requireAdmin(s.handleDeleteSecret))
+
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
 	return withMiddleware(mux)

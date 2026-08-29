@@ -299,6 +299,7 @@ func TestRoleForPrecedenceAndFailClosed(t *testing.T) {
 	s, err := New(NewMemStore(), Config{
 		RunnerToken: "tok",
 		ExternalURL: "http://controld.test",
+		SecretsKey:  testSecretsKey,
 		Admins:      []string{"alice"},
 		Members:     []string{"alice", "Bob"},
 	})

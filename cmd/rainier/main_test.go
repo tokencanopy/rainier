@@ -4,11 +4,60 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
 	"rainier/internal/cli"
 )
+
+// ---------------------------------------------------------------------------
+// secret set: the stdin path (the one that keeps values out of shell history)
+// ---------------------------------------------------------------------------
+
+// TestReadSecretFromStdin pins exactly how much of a piped value is kept: a
+// single trailing newline is the shell's, not the secret's, and everything
+// else — interior newlines, leading and trailing spaces, blank lines before
+// the last — belongs to the value and must survive verbatim. A secret that
+// silently gains or loses a byte here fails much later, as an unexplainable
+// 401 from whatever service it was for.
+func TestReadSecretFromStdin(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"no trailing newline", "hunter2", "hunter2"},
+		{"one trailing newline is stripped", "hunter2\n", "hunter2"},
+		{"a trailing CRLF is stripped", "hunter2\r\n", "hunter2"},
+		{"only the final newline is stripped", "line1\nline2\n\n", "line1\nline2\n"},
+		{"interior and edge spaces are preserved", "  spaced value  \n", "  spaced value  "},
+		{"a PEM keeps its internal newlines", "-----BEGIN-----\nabc\n-----END-----\n", "-----BEGIN-----\nabc\n-----END-----"},
+		{"empty stdin", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, w, err := os.Pipe()
+			if err != nil {
+				t.Fatalf("os.Pipe: %v", err)
+			}
+			orig := os.Stdin
+			os.Stdin = r
+			t.Cleanup(func() { os.Stdin = orig })
+
+			go func() {
+				w.WriteString(tc.in)
+				w.Close()
+			}()
+
+			got, err := readSecretFromStdin()
+			if err != nil {
+				t.Fatalf("readSecretFromStdin: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("readSecretFromStdin() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
 
 // ---------------------------------------------------------------------------
 // resolveSessionID — review round 1, finding 3: names are unique only

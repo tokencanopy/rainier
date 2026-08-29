@@ -43,6 +43,7 @@ func newTestControldOver(t *testing.T, st Store, opts ...func(*Config)) (*Server
 	cfg := Config{
 		RunnerToken: testRunnerToken,
 		ExternalURL: "http://controld.test:9090",
+		SecretsKey:  testSecretsKey,
 		OpTimeout:   2 * time.Second,
 	}
 	for _, o := range opts {
@@ -293,22 +294,22 @@ func wantState(t *testing.T, st Store, id string, want SessionState) Session {
 
 func TestNewValidatesConfig(t *testing.T) {
 	t.Run("runner token required", func(t *testing.T) {
-		if _, err := New(NewMemStore(), Config{ExternalURL: "http://x:9090"}); err == nil {
+		if _, err := New(NewMemStore(), Config{ExternalURL: "http://x:9090", SecretsKey: testSecretsKey}); err == nil {
 			t.Fatal("New with empty RunnerToken: want error, got nil")
 		}
 	})
 	t.Run("external url required", func(t *testing.T) {
-		if _, err := New(NewMemStore(), Config{RunnerToken: "t"}); err == nil {
+		if _, err := New(NewMemStore(), Config{RunnerToken: "t", SecretsKey: testSecretsKey}); err == nil {
 			t.Fatal("New with empty ExternalURL: want error, got nil")
 		}
 	})
 	t.Run("external url must be absolute http", func(t *testing.T) {
-		if _, err := New(NewMemStore(), Config{RunnerToken: "t", ExternalURL: "controld.test:9090"}); err == nil {
+		if _, err := New(NewMemStore(), Config{RunnerToken: "t", ExternalURL: "controld.test:9090", SecretsKey: testSecretsKey}); err == nil {
 			t.Fatal("New with schemeless ExternalURL: want error, got nil")
 		}
 	})
 	t.Run("defaults", func(t *testing.T) {
-		s, err := New(NewMemStore(), Config{RunnerToken: "t", ExternalURL: "http://x:9090"})
+		s, err := New(NewMemStore(), Config{RunnerToken: "t", ExternalURL: "http://x:9090", SecretsKey: testSecretsKey})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}

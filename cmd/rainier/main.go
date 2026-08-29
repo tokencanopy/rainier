@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -53,6 +54,8 @@ func main() {
 		err = runSnapshot(rest)
 	case "rm":
 		err = runRm(rest)
+	case "secret":
+		err = runSecret(rest)
 	case "-h", "--help", "help":
 		printUsage()
 		return
@@ -79,6 +82,13 @@ commands:
   resume   <id|name>
   snapshot <id|name>
   rm       <id|name>
+  secret   set <NAME> [--value V] | ls | rm <NAME>
+
+secret set reads the value from stdin when --value is omitted, so it never
+lands in your shell history:  cat token.txt | rainier secret set GH_TOKEN
+Secret values are write-only: this API never gives one back, and "secret ls"
+shows names and timestamps only. Names are [A-Z0-9_], up to 64 characters —
+they become environment variables inside your sessions.
 
 <id|name>: a "sess_" prefix is used as a session id directly. Anything else
 is resolved by name against your team's non-terminal sessions — names are
@@ -141,6 +151,23 @@ type createSessionRequest struct {
 
 type suspendRequest struct {
 	Warm *bool `json:"warm,omitempty"`
+}
+
+// secret mirrors one element of GET /v1/secrets. There is no value field
+// here for the same reason there is none server-side: the API never returns
+// one.
+type secret struct {
+	Name      string `json:"name"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+type secretsEnvelope struct {
+	Secrets []secret `json:"secrets"`
+}
+
+type putSecretRequest struct {
+	Value string `json:"value"`
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +577,157 @@ func runRm(args []string) error {
 	}
 	fmt.Println("removed", id)
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// secret set / ls / rm
+// ---------------------------------------------------------------------------
+
+// secretUsage is printed for `rainier secret` with no (or an unknown)
+// subcommand, and for a subcommand missing its NAME.
+const secretUsage = `usage: rainier secret <set|ls|rm> [args]
+
+  secret set <NAME> [--value V]   store (or replace) a secret; admin only
+  secret ls                       list secret names and timestamps
+  secret rm <NAME>                delete a secret; admin only
+
+With no --value, "secret set" reads the value from stdin — a pipe or a
+redirect keeps it out of your shell history and out of the process table:
+
+  cat token.txt | rainier secret set GH_TOKEN
+  rainier secret set GH_TOKEN < token.txt
+
+One trailing newline is stripped, so an "echo value |" pipeline stores what
+you'd expect. Values are write-only: nothing in this CLI or the API can read
+one back — replace it if you lose it.`
+
+func runSecret(args []string) error {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, secretUsage)
+		os.Exit(2)
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "set":
+		return runSecretSet(rest)
+	case "ls":
+		return runSecretLs(rest)
+	case "rm":
+		return runSecretRm(rest)
+	case "-h", "--help", "help":
+		fmt.Fprintln(os.Stderr, secretUsage)
+		return nil
+	default:
+		fmt.Fprintf(os.Stderr, "rainier secret: unknown subcommand %q\n%s\n", sub, secretUsage)
+		os.Exit(2)
+		return nil
+	}
+}
+
+func runSecretSet(args []string) error {
+	fs := flag.NewFlagSet("secret set", flag.ExitOnError)
+	value := fs.String("value", "", "the secret value; omit it to read the value from stdin, which keeps it out of your shell history")
+	fs.Parse(reorderArgs(fs, args))
+	name := requireSecretName(fs, "rainier secret set <NAME> [--value V]")
+
+	cfg, err := requireLogin()
+	if err != nil {
+		return err
+	}
+
+	v := *value
+	if v == "" {
+		v, err = readSecretFromStdin()
+		if err != nil {
+			return err
+		}
+	}
+	if v == "" {
+		return fmt.Errorf("secret value is empty: pass --value, or pipe the value on stdin")
+	}
+
+	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	if err := c.Do(http.MethodPut, "/v1/secrets/"+url.PathEscape(name), putSecretRequest{Value: v}, nil); err != nil {
+		return err
+	}
+	// The name, never the value — this line can land in a terminal recording
+	// or a CI log.
+	fmt.Printf("set %s\n", name)
+	return nil
+}
+
+// readSecretFromStdin reads the whole of stdin as one secret value,
+// stripping a single trailing newline (so `echo hunter2 | rainier secret
+// set` stores "hunter2", not "hunter2\n") and nothing else — a value that
+// genuinely ends in blank lines keeps all but that last one.
+//
+// When stdin is a terminal there is nothing piped in, and a silent wait for
+// EOF looks exactly like a hang, so say what's happening first.
+func readSecretFromStdin() (string, error) {
+	if fi, err := os.Stdin.Stat(); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+		fmt.Fprintln(os.Stderr, "reading the secret value from stdin; end with Ctrl-D (or pass --value)")
+	}
+	raw, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return "", fmt.Errorf("reading the secret value from stdin: %w", err)
+	}
+	v := string(raw)
+	v = strings.TrimSuffix(v, "\n")
+	v = strings.TrimSuffix(v, "\r")
+	return v, nil
+}
+
+func runSecretLs(args []string) error {
+	fs := flag.NewFlagSet("secret ls", flag.ExitOnError)
+	fs.Parse(args)
+
+	cfg, err := requireLogin()
+	if err != nil {
+		return err
+	}
+	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+
+	var resp secretsEnvelope
+	if err := c.Do(http.MethodGet, "/v1/secrets", nil, &resp); err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tCREATED\tUPDATED")
+	for _, s := range resp.Secrets {
+		fmt.Fprintf(w, "%s\t%s\t%s\n", s.Name, formatAge(s.CreatedAt), formatAge(s.UpdatedAt))
+	}
+	return w.Flush()
+}
+
+func runSecretRm(args []string) error {
+	fs := flag.NewFlagSet("secret rm", flag.ExitOnError)
+	fs.Parse(args)
+	name := requireSecretName(fs, "rainier secret rm <NAME>")
+
+	cfg, err := requireLogin()
+	if err != nil {
+		return err
+	}
+	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	if err := c.Do(http.MethodDelete, "/v1/secrets/"+url.PathEscape(name), nil, nil); err != nil {
+		return err
+	}
+	fmt.Println("removed", name)
+	return nil
+}
+
+// requireSecretName pulls the <NAME> positional a secret subcommand needs,
+// exiting with usage (exit 2) rather than panicking when it's absent — the
+// same shape as requireRef, with its own usage line since a secret name is
+// not an <id|name> session ref.
+func requireSecretName(fs *flag.FlagSet, usage string) string {
+	args := fs.Args()
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "usage: %s\n", usage)
+		os.Exit(2)
+	}
+	return args[0]
 }
 
 // ---------------------------------------------------------------------------

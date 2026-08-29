@@ -199,8 +199,13 @@ fi
 step "controld ($CONTROLD_HTTP)"
 # ---------------------------------------------------------------------------
 RUNNER_TOKEN="dev-$(openssl rand -hex 8)"
+# A fresh secrets key per run: controld requires one (team secrets are
+# AES-GCM-sealed at rest under it), and a throwaway fleet has no secrets
+# worth carrying across runs.
+SECRETS_KEY="$(openssl rand -hex 32)"
 ./bin/controld --listen "${CONTROLD_HOST}:${CONTROLD_PORT}" --db "$DSN" \
   --runner-token "$RUNNER_TOKEN" --external-url "$CONTROLD_HTTP" \
+  --secrets-key "$SECRETS_KEY" \
   --admins "$ADMIN" >"$CONTROLD_LOG" 2>&1 &
 echo $! > "$CONTROLD_PID"
 CONTROLD_STARTED=1
