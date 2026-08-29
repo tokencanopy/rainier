@@ -245,7 +245,7 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 	<-pa.done
 }
 
-// waitRunning polls id's row until the session is running, bounded by
+// waitRunning polls id's row until the session is attachable, bounded by
 // cfg.AttachWait. A session created a moment ago is legitimately a few
 // seconds from running (§5's "attach to a not-yet-running session"), and
 // holding the request open for that is friendlier than making every client
@@ -261,6 +261,11 @@ func (s *Server) waitRunning(ctx context.Context, id string) (Session, error) {
 		switch {
 		case row.State == StateRunning:
 			return row, nil
+		case s.failedButAttachable(row):
+			// Immediately, without consuming any of the budget: this state is
+			// as settled as running is, and the whole point of admitting it is
+			// that the diagnosis is waiting on the other side.
+			return row, nil
 		case row.State.Terminal():
 			// Terminal is permanent: waiting out the budget would buy the
 			// client nothing but a slower identical answer.
@@ -274,6 +279,43 @@ func (s *Server) waitRunning(ctx context.Context, id string) (Session, error) {
 			return Session{}, ctx.Err()
 		}
 	}
+}
+
+// failedButAttachable reports whether a `failed` session can still be attached
+// to: it is placed on a runner this replica holds a control connection to.
+//
+// A failed setup is the case this exists for. The session's error column
+// carries only the last 2KB the script printed, and the rest of the log — the
+// package that actually 404'd, the compiler line that broke — is inside the
+// container, where sessiond is still running and still serving viewers (it
+// only ever execs the agent on rc 0; the process itself stays up). Refusing
+// the attach left a user with a truncated tail and a container burning a slot
+// they had no reason to keep. Design §4.3's "attach --since 0 shows
+// everything" is written about setup output; it holds for the failures too, or
+// it means nothing where it matters most.
+//
+// Only `failed`, never the other terminal states: canceled and destroyed have
+// no container by construction, and `dead` is the runner reporting the
+// container gone. And only while the runner is connected, because the dial-back
+// is the only way in.
+//
+// A create that failed BEFORE its container existed (failCreate — a bad spec, a
+// secret deleted mid-flight) also lands here and is also admitted: the row
+// looks identical, and the runner is the only authority on whether a container
+// is there. That attach ends in the pairing TTL closing the client rather than
+// an immediate 503 — a slower "no", for the case where the diagnosis was in the
+// error column all along. Discriminating it here would mean parsing the error
+// text, which nothing else in this codebase does and which would go stale the
+// first time the wording changed.
+//
+// The window is one control connection wide, and deliberately not widened: the
+// next announce from that runner carries a container the store has already
+// finished, and reconciliation collects it as an orphan (§4.8). Keeping a
+// failed session's container across reconnects would mean exempting it from
+// that rule with nothing left to reap it. Documented in deploy-gce.md §7 as
+// "read the log before restarting runnerd".
+func (s *Server) failedButAttachable(row Session) bool {
+	return row.State == StateFailed && row.Runner != "" && s.runnerConnected(row.Runner)
 }
 
 // readFirstResize reads exactly one wire.ClientMsg off a freshly attached

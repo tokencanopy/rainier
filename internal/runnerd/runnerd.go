@@ -385,16 +385,38 @@ func (s *Server) OpSnapshot(ctx context.Context, id, ref string) (string, error)
 	return snap.Ref, nil
 }
 
-// setupEnvKeys are the driver-injected variables that carry the setup channel
-// itself. They are stripped from EVERY snapshot, unconditionally: an image
-// that keeps RAINIER_SETUP_B64 makes every session booted from it re-run the
-// setup script its cache exists to skip, and RAINIER_SETUP_TIMEOUT is that
-// script's bound, meaningless without it.
-var setupEnvKeys = []string{"RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT"}
+// driverEnvKeys are the variables the DRIVER injects into every session
+// container, all of which are stripped from every snapshot unconditionally.
+// Two kinds, both per-session and neither meaningful in an image:
+//
+//   - the setup channel. An image that keeps RAINIER_SETUP_B64 makes every
+//     session booted from it re-run the setup script its cache exists to
+//     skip; RAINIER_SETUP_TIMEOUT is that script's bound, meaningless without
+//     it.
+//   - the session's own identity and egress wiring. RAINIER_SESSION and
+//     RAINIER_DIAL name the container that happened to build the image, and
+//     the proxy URLs are worse than stale: the driver embeds the session id in
+//     them as URL userinfo, so egressd reads it as that session's identity on
+//     every CONNECT (internal/driver.withSessionUserinfo). Left in the image
+//     config, the BUILD session's id outlives the build inside a cache every
+//     later session boots — a credential-shaped value with no business
+//     surviving its session. Both cases of each proxy var, because the driver
+//     injects both.
+//
+// Stripping is safe for the same reason it is for secrets: the driver injects
+// all of these fresh on every `docker run`, and a later -e wins over the
+// image's empty value.
+var driverEnvKeys = []string{
+	"RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT",
+	"RAINIER_DIAL", "RAINIER_SESSION",
+	"HTTP_PROXY", "http_proxy",
+	"HTTPS_PROXY", "https_proxy",
+	"NO_PROXY", "no_proxy",
+}
 
 // stripEnvFor is the list of environment keys a snapshot of id must not leave
 // in the committed image: everything the create injected (an environment's
-// decrypted secrets) plus the setup channel.
+// decrypted secrets) plus everything the driver injects (driverEnvKeys).
 //
 // Always both, and never conditional on what this particular session looks
 // like now. A snapshot is taken minutes after the create, of a container whose
@@ -403,7 +425,7 @@ var setupEnvKeys = []string{"RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT"}
 // key that was not there is nothing — the commit sets it empty, which is what
 // it already was.
 func (s *Server) stripEnvFor(id string) []string {
-	return append(s.reg.envKeys(id), setupEnvKeys...)
+	return append(s.reg.envKeys(id), driverEnvKeys...)
 }
 
 // envKeys returns env's keys, sorted. Values are deliberately not returned,

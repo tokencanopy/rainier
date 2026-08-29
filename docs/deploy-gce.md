@@ -283,10 +283,50 @@ what must stay out of reach, and it does.
 
 **Secrets and the setup channel never reach the cached image.** The commit
 strips every variable the create injected — an environment's resolved
-`secret_ref` values — along with the setup script itself, so `docker image
-inspect rainier-env:…` shows neither. A session booted from the cache gets its
-secrets injected fresh at create (they are resolved per session, not baked per
-image) and runs no setup script, which is the entire point of the cache.
+`secret_ref` values — along with the setup script, the session's own identity,
+and the egress proxy URLs (which embed that session id), so `docker image
+inspect rainier-env:…` shows none of them. A session booted from the cache gets
+all of it injected fresh at create (secrets are resolved per session, not baked
+per image) and runs no setup script, which is the entire point of the cache.
+
+**Where a secret is in plaintext.** Encrypted at rest in Postgres, decrypted by
+controld at dispatch, and then sent to the runner **in the clear over the
+controld→runnerd websocket** — that hop is not separately encrypted, and the
+value lands as an ordinary environment variable inside the container, readable
+by the agent (the spec's honest v0). The **tailnet (or VPC) is the transport
+boundary that makes that acceptable**: nothing in this deployment listens on a
+public address, and controld's own `--listen` is reachable only over it. A
+deployment that exposes controld beyond a private network needs TLS on that hop
+before it needs anything else here.
+
+**Debugging a setup that failed.** A failed setup leaves the session `failed`
+with the last 2KB the script printed in its `error` — enough to see, not always
+enough to diagnose. The container is still there and sessiond is still serving
+viewers, so **attach to it and read the whole log**:
+
+```bash
+./bin/rainier ls --all            # the failed session, with its runner
+./bin/rainier attach <id>         # replays everything the setup printed
+./bin/rainier rm <id>             # frees the slot
+```
+
+Attach works on a `failed` session for exactly as long as its runner holds its
+current control connection; `--since 0` (the default) replays the full setup
+output, not the tail. **A failed session keeps its slot until you remove it** —
+deliberate, so the evidence outlives the failure, but a forgotten one costs the
+fleet a slot. **Read the log before restarting runnerd:** a restart re-announces
+the container, reconciliation sees a session the store has already finished, and
+collects it as an orphan (§4.8) — the row stays, the log is gone.
+
+**Pre-pull failures on other runners are expected.** When an environment caches
+a snapshot, controld tells every other connected runner to pull it. v0 has no
+registry, so that ref names an image only the runner that built it has, and
+those pulls fail by construction — you will see one informative line per runner
+in `/tmp/runnerd.log`. Nothing is broken: a session placed on a non-holder
+runner is dispatched with the setup script and rebuilds the environment there,
+exactly as it would have with no pre-pull at all. The scheduler prefers the
+holder anyway, so this is rare in practice, and it goes away with the
+registry-backed distribution the design defers to §6.
 
 **Setup scripts must be idempotent.** A cold-parked session that is resumed
 starts its container again, and sessiond re-runs the setup wrapper on that

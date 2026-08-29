@@ -1187,14 +1187,21 @@ func TestSnapshotStripsTheCreateEnvAndSetupChannel(t *testing.T) {
 	if len(strips) != 1 {
 		t.Fatalf("Strips() = %v, want exactly one snapshot's list", strips)
 	}
-	// Env keys sorted, then the setup channel: a stable list, so a snapshot of
-	// the same session always issues the same command.
-	want := []string{"API_KEY", "GH_TOKEN", "RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT"}
+	// Env keys sorted, then everything the DRIVER injects: the setup channel,
+	// the session's own identity, and the egress proxy vars (whose URLs embed
+	// that session id as userinfo). A stable list, so a snapshot of the same
+	// session always issues the same command.
+	want := []string{
+		"API_KEY", "GH_TOKEN",
+		"RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT",
+		"RAINIER_DIAL", "RAINIER_SESSION",
+		"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy",
+	}
 	if !reflect.DeepEqual(strips[0], want) {
 		t.Fatalf("strip list = %v, want %v", strips[0], want)
 	}
 
-	// A session that injected nothing still strips the setup channel —
+	// A session that injected nothing still strips the driver's own set —
 	// unconditionally, because "this one looked harmless" is exactly the
 	// reasoning that lets one image through carrying a credential.
 	if err := rd.CreateWithID(ctx, "sess-bare", driver.Spec{Image: "img"}, nil); err != nil {
@@ -1204,8 +1211,8 @@ func TestSnapshotStripsTheCreateEnvAndSetupChannel(t *testing.T) {
 		t.Fatal(err)
 	}
 	strips = fd.Strips()
-	if got, want := strips[1], []string{"RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("strip list for a session with no injected env = %v, want %v", got, want)
+	if got := strips[1]; !reflect.DeepEqual(got, driverEnvKeys) {
+		t.Fatalf("strip list for a session with no injected env = %v, want %v", got, driverEnvKeys)
 	}
 }
 

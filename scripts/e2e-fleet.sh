@@ -572,7 +572,14 @@ SNAP_ENV=$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "
   || fail "the cached image's config carries $SECRET_NAME's decrypted VALUE — readable by anyone with docker on this runner"
 ! printf '%s\n' "$SNAP_ENV" | grep -q '^RAINIER_SETUP_B64=.' \
   || fail "the cached image's config carries RAINIER_SETUP_B64, which makes every session booted from it re-run setup"
-ok "the cached image's config carries neither the secret's value nor the setup script"
+# The build session's own identity is per-session too, and the proxy vars are
+# worse than stale: the driver embeds the session id in them as userinfo, which
+# is how egressd identifies the caller.
+! printf '%s\n' "$SNAP_ENV" | grep -q '^RAINIER_DIAL=.' \
+  || fail "the cached image's config carries RAINIER_DIAL from the build session"
+! printf '%s\n' "$SNAP_ENV" | grep -qE "^(RAINIER_SESSION|HTTPS?_PROXY|https?_proxy)=." \
+  || fail "the cached image's config carries the build session's identity or its egress proxy URLs (which embed that session's id)"
+ok "the cached image's config carries no secret value, no setup script, and nothing naming the build session"
 
 # --- teardown, which is also the env-delete guard (design §5).
 if ./bin/rainier env rm "$ENV_NAME" >/tmp/rainier-e2e-envrm.txt 2>&1; then

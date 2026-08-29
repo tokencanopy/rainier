@@ -246,6 +246,16 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 		detail := m.Ref
 		if err != nil {
 			detail = err.Error()
+			// One informative line, not an error: on a multi-VM fleet this
+			// failure is the NORMAL outcome and not a fault to chase. v0 has
+			// no registry (design §6), so a rainier-env: ref names an image
+			// that exists only in the local store of the runner that
+			// committed it — every other runner's `docker pull` of it must
+			// fail, by construction, until the registry upgrade lands. Nothing
+			// breaks: a session placed on a non-holder runner is dispatched
+			// with the setup script and rebuilds the environment itself, which
+			// is exactly what would have happened with no prepull at all.
+			log.Printf("agent: prepull %s did not land (expected without a registry; sessions here rebuild from setup): %v", m.Ref, err)
 		}
 		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: detail})
 	case "destroy":

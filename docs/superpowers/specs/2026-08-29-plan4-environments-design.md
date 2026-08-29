@@ -92,8 +92,10 @@ interactions the design missed, all fixed and test-pinned:
 2. `docker commit` bakes the container's env block into the image config —
    which would re-trigger setup on cache boots and, far worse, publish
    **decrypted secret values** in the cached image. The driver's Snapshot now
-   strips a per-session key list (secret env keys + the setup vars) via
-   `--change 'ENV K='`; runners record env KEYS (never values) for this.
+   strips a per-session key list via `--change 'ENV K='`: the secret env
+   keys, the setup vars, and the driver-injected identity (RAINIER_SESSION,
+   RAINIER_DIAL, and both cases of the proxy vars, whose URLs carry the
+   session id as userinfo). Runners record env KEYS (never values) for this.
 3. Cacheable install paths are `$HOME` and the stock image's dedicated
    writable prefix `/opt/rainier-env` (on PATH). `/usr/local/bin` stays
    root-owned even during writable builds so a prompt-injected agent in a
