@@ -702,6 +702,29 @@ func TestEventUpdatesStore(t *testing.T) {
 			t.Fatalf("row = %s on %q, want running on vm2 (untouched)", got.State, got.Runner)
 		}
 	})
+
+	// "running" tolerates an unplaced row (it can outrun the create's own
+	// queued->creating transition), but "dead" must not: an unplaced row is
+	// one a requeue cleared, and the scheduler may already be re-placing it.
+	// A stale holder reporting its copy dead would otherwise kill a session
+	// that is alive — terminally, since dead is not recoverable.
+	t.Run("dead event for an unplaced (requeued) row is ignored", func(t *testing.T) {
+		requeued := "sess_requeued"
+		seedSession(t, st, Session{ID: requeued, State: StateQueued})
+		sync := "sess_sync2"
+		seedSession(t, st, Session{ID: sync, State: StateCreating, Runner: "vm1"})
+
+		f.event(t, requeued, "dead")
+		f.event(t, sync, "running")
+		// In-order handling again: the second event landing proves the first
+		// has already been handled (and ignored).
+		wantState(t, st, sync, StateRunning)
+
+		got := getSession(t, st, requeued)
+		if got.State != StateQueued || got.Runner != "" {
+			t.Fatalf("row = %s on %q, want queued and unplaced (untouched)", got.State, got.Runner)
+		}
+	})
 }
 
 // TestCapacityRidesEveryMessage pins the piggyback rule: Used/Total on a

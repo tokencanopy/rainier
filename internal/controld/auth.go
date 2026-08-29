@@ -93,14 +93,21 @@ type meResponse struct {
 // appears in both. A login in neither list cannot log in at all — ok is
 // false — which also means an empty Admins and Members together fail
 // closed: nobody can log in.
+//
+// Matching is case-insensitive (EqualFold), because GitHub logins are: the
+// same account answers to "Alice" and "alice", and GitHub returns whatever
+// casing the account was registered with, not whatever the operator typed
+// into RAINIER_ADMINS. A case-only mismatch would otherwise lock out exactly
+// the person the allowlist was written for, with a 403 that looks like a
+// policy decision rather than a typo.
 func (s *Server) roleFor(login string) (role string, ok bool) {
 	for _, a := range s.cfg.Admins {
-		if a == login {
+		if strings.EqualFold(a, login) {
 			return "admin", true
 		}
 	}
 	for _, m := range s.cfg.Members {
-		if m == login {
+		if strings.EqualFold(m, login) {
 			return "member", true
 		}
 	}

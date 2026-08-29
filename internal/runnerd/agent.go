@@ -187,6 +187,16 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 		err := s.CreateWithID(ctx, m.Session, spec, allow)
 		ok := err == nil || errors.Is(err, errSessionExists)
 		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: ok, Detail: errTextUnless(err, errSessionExists)})
+		if errors.Is(err, errSessionExists) {
+			// The result alone says "it exists", not what it is doing — and a
+			// controld that requeued a create it never heard back on, then
+			// re-placed it here, has a row that only leaves `creating` on an
+			// event or the next announce. Re-fire the session's current state
+			// now so it converges immediately instead of waiting for a
+			// reconnect that may be minutes away. Sent after the result, so
+			// controld settles the dispatch before it sees the state.
+			s.reannounce(m.Session, send)
+		}
 	case "suspend", "resume", "snapshot":
 		ref, err := s.Op(ctx, m.Session, m.Type, m.Warm)
 		detail := ref
@@ -210,6 +220,27 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 	default:
 		log.Printf("agent: unknown command type %q", m.Type)
 	}
+}
+
+// reannounce fires one session's current state as an event, using the same
+// rendering the announce uses (announceState, off a locked registry
+// snapshot). It reports nothing for a session that vanished in the meantime,
+// or one still "starting" — that one's own create result speaks for it, and
+// announceState omits it for the same reason.
+//
+// controld acts on "running" today and merely logs the suspended states as
+// unrecognized; the mapping is shared with Announce anyway so the two can't
+// drift as that vocabulary grows.
+func (s *Server) reannounce(id string, send func(rwire.FromRunner)) {
+	e, ok := s.reg.snapshot(id)
+	if !ok {
+		return
+	}
+	state, ok := announceState(e)
+	if !ok {
+		return
+	}
+	send(rwire.FromRunner{Type: "event", Session: id, State: state})
 }
 
 // dialAttachBack completes controld's attach pairing from the runner side

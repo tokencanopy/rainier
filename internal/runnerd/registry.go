@@ -52,6 +52,21 @@ func (r *registry) get(id string) (*sessionEntry, bool) {
 }
 func (r *registry) remove(id string) { r.mu.Lock(); delete(r.items, id); r.mu.Unlock() }
 
+// snapshot returns a value copy of one entry, taken under the lock, for
+// callers that need to read the two mutable fields (state, hub) together and
+// consistently — exactly what list() gives, for a single id. get() returns
+// the live pointer, so reading those fields off it races setHub/setState; see
+// list()'s doc comment for why that is a real race and not a hypothetical.
+func (r *registry) snapshot(id string) (sessionEntry, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.items[id]
+	if !ok {
+		return sessionEntry{}, false
+	}
+	return *e, true
+}
+
 // list snapshots every entry (value copies, not the live pointers) under a
 // single critical section. That matters because id/handle/allow are set once
 // at put() and never mutated again, but hub and state are: a caller ranging
@@ -151,6 +166,11 @@ func (r *registry) opTarget(id string) (handle, state string, ok bool) {
 // suspended" so a later resume's re-register can setHub a fresh hub onto the
 // same entry, rather than falling into the caller's Inspect-then-destroy
 // path.
+//
+// Delete's "destroying" marker is deliberately NOT normalized here: it is
+// returned verbatim so the caller can stand down entirely (no Inspect, no
+// destroy, no "dead" event) and leave the teardown to the Delete that is
+// already running. See Delete and register's hub-death tail.
 //
 // deadHub guards against a redial that already installed a fresh hub before
 // this call runs (this goroutine is for the OLD conn, running after a newer

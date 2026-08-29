@@ -293,13 +293,14 @@ func TestGitHubAuthRejectsUnknownFields(t *testing.T) {
 // extra coverage beyond the mandated seven
 // ---------------------------------------------------------------------------
 
-// roleFor: admin beats member, and a login in neither list is rejected.
+// roleFor: admin beats member, matching is case-insensitive (GitHub logins
+// are), and a login in neither list is rejected.
 func TestRoleForPrecedenceAndFailClosed(t *testing.T) {
 	s, err := New(NewMemStore(), Config{
 		RunnerToken: "tok",
 		ExternalURL: "http://controld.test",
 		Admins:      []string{"alice"},
-		Members:     []string{"alice", "bob"},
+		Members:     []string{"alice", "Bob"},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -308,11 +309,21 @@ func TestRoleForPrecedenceAndFailClosed(t *testing.T) {
 	if role, ok := s.roleFor("alice"); !ok || role != "admin" {
 		t.Errorf("roleFor(alice) = (%q, %v), want (admin, true) — admin must win over member", role, ok)
 	}
-	if role, ok := s.roleFor("bob"); !ok || role != "member" {
-		t.Errorf("roleFor(bob) = (%q, %v), want (member, true)", role, ok)
+	if role, ok := s.roleFor("Bob"); !ok || role != "member" {
+		t.Errorf("roleFor(Bob) = (%q, %v), want (member, true)", role, ok)
 	}
 	if role, ok := s.roleFor("eve"); ok {
 		t.Errorf("roleFor(eve) = (%q, %v), want ok=false — not listed", role, ok)
+	}
+
+	// GitHub returns the account's own casing, not whatever the operator
+	// typed into --admins/--members, and the two are the same account. A
+	// case-only mismatch must not read as "not authorized".
+	if role, ok := s.roleFor("ALICE"); !ok || role != "admin" {
+		t.Errorf("roleFor(ALICE) = (%q, %v), want (admin, true) — GitHub logins are case-insensitive", role, ok)
+	}
+	if role, ok := s.roleFor("bob"); !ok || role != "member" {
+		t.Errorf("roleFor(bob) = (%q, %v), want (member, true) — allowlisted as %q", role, ok, "Bob")
 	}
 }
 

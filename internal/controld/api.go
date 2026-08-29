@@ -372,6 +372,13 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request, u U
 	if row.Runner != "" && s.runnerConnected(row.Runner) {
 		res, err := s.dispatch(r.Context(), row.Runner, rwire.ToRunner{Type: "destroy", Session: id})
 		switch {
+		// ErrDispatchTimeout wraps ErrRunnerUnreachable, so it lands here
+		// too — deliberately, here and at the three sibling ops
+		// (suspend/resume/snapshot). Whether the runner never got the
+		// command or got it and didn't answer in time, controld cannot
+		// confirm the op and leaves the row untouched, so `runner_unreachable`
+		// is the honest answer and the caller's retry runs against the same
+		// state it just read.
 		case errors.Is(err, ErrRunnerUnreachable):
 			writeErr(w, http.StatusBadGateway, "runner_unreachable", "runner did not respond")
 			return
