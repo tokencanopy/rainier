@@ -176,31 +176,53 @@ func TestMissingAuthHeaderDenied(t *testing.T) {
 // ..." string verbatim (that would never match any real allow entry and
 // every such request would silently default-deny).
 func TestBasicAuthSessionIdentity(t *testing.T) {
-	origin, stop := startOrigin(t)
-	defer stop()
-	var audit bytes.Buffer
-	p := New(&audit)
-	srv := httptest.NewServer(p.Handler())
-	defer srv.Close()
-
-	host, _, _ := net.SplitHostPort(origin)
-	p.SetAllow("sess-42", []string{host})
-
-	// Matches exactly what curl sends for https_proxy="http://sess-42:@host:port"
-	// (verified against real curl during the Task 13 spike): username
-	// "sess-42", empty password, still colon-terminated.
-	creds := base64.StdEncoding.EncodeToString([]byte("sess-42:"))
-	resp, conn := connectWithAuth(t, srv.URL, origin, "Basic "+creds)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 for allowlisted session via Basic auth, got %d", resp.StatusCode)
+	cases := []struct {
+		name  string
+		creds string // "<username>:<password>" before base64 encoding
+	}{
+		{
+			// Matches exactly what curl sends for
+			// https_proxy="http://sess-42:@host:port" (verified against real
+			// curl during the Task 13 spike): username "sess-42", empty
+			// password, still colon-terminated.
+			"empty password (the driver's actual form)", "sess-42:",
+		},
+		{
+			// Review round 1, finding 3: a non-empty password must not
+			// leak into or corrupt the extracted session id — only the
+			// username half (before the first colon) is the identity,
+			// regardless of what follows it. Guards against a future
+			// change accidentally using the whole decoded string as the
+			// session id instead of cutting on the colon.
+			"non-empty password must still yield just the username", "sess-42:somepassword",
+		},
 	}
-	conn.Close()
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			origin, stop := startOrigin(t)
+			defer stop()
+			var audit bytes.Buffer
+			p := New(&audit)
+			srv := httptest.NewServer(p.Handler())
+			defer srv.Close()
 
-	if !strings.Contains(audit.String(), `"session":"sess-42"`) {
-		t.Fatalf("audit does not show the decoded session id sess-42: %s", audit.String())
-	}
-	if strings.Contains(audit.String(), "Basic ") {
-		t.Fatalf("audit leaked the raw Basic header instead of the decoded session id: %s", audit.String())
+			host, _, _ := net.SplitHostPort(origin)
+			p.SetAllow("sess-42", []string{host})
+
+			creds := base64.StdEncoding.EncodeToString([]byte(c.creds))
+			resp, conn := connectWithAuth(t, srv.URL, origin, "Basic "+creds)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("expected 200 for allowlisted session via Basic auth, got %d", resp.StatusCode)
+			}
+			conn.Close()
+
+			if !strings.Contains(audit.String(), `"session":"sess-42"`) {
+				t.Fatalf("audit does not show the decoded session id sess-42: %s", audit.String())
+			}
+			if strings.Contains(audit.String(), "Basic ") {
+				t.Fatalf("audit leaked the raw Basic header instead of the decoded session id: %s", audit.String())
+			}
+		})
 	}
 }
 

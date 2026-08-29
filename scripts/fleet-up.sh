@@ -15,7 +15,27 @@ go build -o bin/runnerctl ./cmd/runnerctl
 # throwaway listener needed).
 ./bin/egressd --listen 0.0.0.0:3128 --admin 127.0.0.1:3129 >/tmp/egressd.log 2>&1 &
 echo $! > /tmp/rainier-egressd.pid
-sleep 0.3
+
+# Review round 1, finding 2: don't guess egressd is up after a fixed sleep —
+# poll it from the HOST until it actually accepts a connection (bounded,
+# ~5s), so a slow box can never be misread as "no route" by the container
+# probe below. Bash's /dev/tcp avoids a dependency on nc/curl being present
+# on the host for this one check. If egressd never comes up at all, that's
+# an egressd startup problem, not a platform limitation — hard-fail rather
+# than silently falling through to "enforcement off".
+EGRESSD_UP=0
+for _ in $(seq 1 50); do
+  if (exec 3<>/dev/tcp/127.0.0.1/3128) 2>/dev/null; then
+    exec 3>&- 3<&-
+    EGRESSD_UP=1
+    break
+  fi
+  sleep 0.1
+done
+if [ "$EGRESSD_UP" != "1" ]; then
+  echo "FATAL: egressd did not start listening on :3128 within 5s — check /tmp/egressd.log. This is an egressd startup problem, not a platform limitation; refusing to guess at the platform probe below with a listener that isn't even up yet." >&2
+  exit 1
+fi
 
 # --- R4 platform probe (Task 13 spike; see docker-compose.fleet.yml's
 # comment and docs/superpowers/specs/2026-08-28-plan3-controld-design.md §3
@@ -71,8 +91,36 @@ if docker network inspect rainier-internal >/dev/null 2>&1; then
   HAVE_BOOL=$(docker network inspect rainier-internal -f '{{.Internal}}')
   if [ "$HAVE_BOOL" != "$WANT_BOOL" ]; then
     echo "rainier-internal exists with Internal=$HAVE_BOOL, want $WANT_BOOL — recreating"
-    docker network rm rainier-internal >/dev/null 2>&1 || \
-      echo "could not recreate rainier-internal (containers still attached?) — leaving it as-is" >&2
+    if ! docker network rm rainier-internal >/dev/null 2>&1; then
+      if [ "$WANT_BOOL" = "true" ]; then
+        # Review round 1, finding 1: this is the one direction that must
+        # never be allowed to fall through. This platform CAN enforce R4
+        # (the probe above found the route), but the existing network is
+        # stuck at internal:false — almost certainly because rainier-labeled
+        # containers are still attached, so `docker network rm` refused.
+        # Falling through here would let fleet-up.sh "succeed" while
+        # silently leaving enforcement off on a box that should have it —
+        # exactly the failure direction we must never take. Stop instead.
+        cat >&2 <<EOF
+FATAL: rainier-internal exists with Internal=false, but this platform can
+enforce R4 (internal:true) and the network could not be recreated —
+almost certainly because containers are still attached to it. Refusing to
+continue with enforcement silently off.
+Fix: stop and remove the attached containers (e.g. run
+'./scripts/fleet-down.sh', or manually 'docker rm -f' anything still
+attached to rainier-internal), then re-run fleet-up.sh.
+EOF
+        kill "$(cat /tmp/rainier-egressd.pid)" 2>/dev/null || true
+        exit 1
+      fi
+      # WANT_BOOL=false here: the existing network is internal:true, i.e.
+      # MORE restrictive than this platform's probe determined it needs to
+      # be (or can even route through). That's not the dangerous direction
+      # — it fails toward more isolation, never less — so a stuck rm just
+      # means fleet-up proceeds with the existing (stricter) network rather
+      # than loosening it automatically. Note it and move on.
+      echo "NOTE: could not recreate rainier-internal (containers still attached?) — leaving the existing internal:true network as-is. If sessions can't reach runnerd/egressd, remove it (e.g. './scripts/fleet-down.sh') and re-run." >&2
+    fi
   fi
 fi
 docker network inspect rainier-internal >/dev/null 2>&1 || \
