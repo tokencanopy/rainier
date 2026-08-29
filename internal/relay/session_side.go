@@ -36,10 +36,12 @@ func (w *connWriter) write(f Frame) error {
 	return w.conn.Write(w.ctx, b)
 }
 
-// ControlSender emits sessiond-originated control events upstream over the
-// conn its ServeSessionWithControl call is serving. It is safe for concurrent
-// use with that relay — and only with that one, since sharing the conn safely
-// means sharing its writer, not just its Conn value.
+// ControlSender emits sessiond-originated control frames upstream over the
+// conn its ServeSessionWithControl call is serving: setup outcomes, the
+// session-RPC requests this end originates, and the responses to requests
+// that arrived on onControl. It is safe for concurrent use with that relay —
+// and only with that one, since sharing the conn safely means sharing its
+// writer, not just its Conn value.
 type ControlSender struct{ w *connWriter }
 
 // Send wraps payload in a FrameControl on AttachID 0 (no attachment owns a
@@ -62,25 +64,45 @@ func (c *ControlSender) Send(payload []byte) error {
 // raw wire.ClientMsg into s.Stdin/s.SetSize; FrameClose calls s.Detach.
 // Returns when conn.Read errors (conn closed).
 func ServeSession(ctx context.Context, conn Conn, s *session.Session) error {
-	return serveSession(ctx, conn, s, newConnWriter(ctx, conn))
+	return serveSession(ctx, conn, s, newConnWriter(ctx, conn), nil)
 }
 
-// ServeSessionWithControl is ServeSession plus an upstream control channel:
-// it runs the relay on its own goroutine and hands back a ControlSender
-// sharing the relay's writer, so control events and terminal frames cannot
-// interleave on the conn. The returned channel is buffered and receives
-// exactly one value — whatever ServeSession returned when the conn died. It
-// is deliberately not closed afterwards: a nil second receive would read as
-// "the relay is fine", so callers take the value once and treat that as the
-// end of this conn's life.
-func ServeSessionWithControl(ctx context.Context, conn Conn, s *session.Session) (*ControlSender, <-chan error) {
+// ServeSessionWithControl is ServeSession plus a control channel in both
+// directions: it runs the relay on its own goroutine and hands back a
+// ControlSender sharing the relay's writer, so outbound control events and
+// terminal frames cannot interleave on the conn, while onControl receives the
+// control frames arriving the other way — the session-RPC requests runnerd
+// sends down, and the responses to requests this end originated.
+//
+// onControl is wired here, in the constructor, for the same two reasons the
+// Hub's is (see NewHubWithControl): assigning it to a field afterwards would
+// race the relay goroutine this call starts, and a request arriving on the
+// conn's first frame would find no handler installed yet. nil means inbound
+// control frames are read and dropped, which is exactly the Plan 4 behaviour
+// for a session that never expects to be asked anything.
+//
+// Each inbound frame is dispatched on its OWN goroutine, so onControl may
+// take as long as its method needs — an RPC that shells out to git is the
+// point of this channel — without stalling the demux that every attachment on
+// this conn shares. Two consequences the handler must live with: frames are
+// not ordered against each other once dispatched (correlate by ControlEvent.ID,
+// never by arrival), and a handler that never returns leaks its goroutine for
+// the life of the process, so anything unbounded inside it needs its own
+// timeout. Replies go back through the returned ControlSender, whose Send is
+// safe to call from those goroutines.
+//
+// The returned channel is buffered and receives exactly one value — whatever
+// ServeSession returned when the conn died. It is deliberately not closed
+// afterwards: a nil second receive would read as "the relay is fine", so
+// callers take the value once and treat that as the end of this conn's life.
+func ServeSessionWithControl(ctx context.Context, conn Conn, s *session.Session, onControl func(payload []byte)) (*ControlSender, <-chan error) {
 	w := newConnWriter(ctx, conn)
 	errc := make(chan error, 1)
-	go func() { errc <- serveSession(ctx, conn, s, w) }()
+	go func() { errc <- serveSession(ctx, conn, s, w, onControl) }()
 	return &ControlSender{w: w}, errc
 }
 
-func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWriter) error {
+func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWriter, onControl func(payload []byte)) error {
 	var mu sync.Mutex
 	atts := map[uint64]*session.Attachment{}
 	// Every frame this loop and its per-attachment forwarder goroutines emit
@@ -137,6 +159,16 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 		case FrameClose:
 			mu.Lock(); att := atts[f.AttachID]; delete(atts, f.AttachID); mu.Unlock()
 			if att != nil { s.Detach(att.ID) }
+		case FrameControl:
+			// Its own case, never the attachment demux: a control frame
+			// carries AttachID 0, which no attachment ever has. The payload is
+			// a fresh slice per frame (Decode unmarshals into one), so handing
+			// it to a goroutine aliases nothing the next read will overwrite.
+			// Dispatched on that goroutine so a handler doing real work
+			// (running a diff, reading files) cannot stall the terminal
+			// traffic multiplexed over this same conn — see
+			// ServeSessionWithControl for what that costs the handler.
+			if onControl != nil { go onControl(f.Payload) }
 		}
 	}
 }

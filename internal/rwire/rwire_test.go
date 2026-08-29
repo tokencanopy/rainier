@@ -54,8 +54,69 @@ func TestEnvironmentSpecRoundTrip(t *testing.T) {
 	// a plain scratch create byte-identical to what Plan 1-3 peers expect.
 	eb, err := json.Marshal(ToRunner{Type: "create", Spec: &Spec{Image: "img"}})
 	if err != nil { t.Fatal(err) }
-	for _, tag := range []string{"setup", "setup_timeout_sec", "env", "ref"} {
+	for _, tag := range []string{"setup", "setup_timeout_sec", "env", "ref", "rpc"} {
 		if strings.Contains(string(eb), `"`+tag+`"`) { t.Fatalf("empty spec leaked %q: %s", tag, eb) }
+	}
+}
+
+// TestSessionRPCRoundTrip pins the session-RPC vocabulary runnerd forwards in
+// both directions: a controld-initiated "session_rpc" going down, a
+// sessiond-initiated "session_req" coming up, and the response to that one
+// going back down as another "session_rpc" whose Method is "resp". The
+// literal JSON assertions are the point — runnerd is a pure forwarder here, so
+// a renamed tag would not fail any forwarding test, it would just quietly
+// deliver an RPC with no method to the far end.
+func TestSessionRPCRoundTrip(t *testing.T) {
+	down := ToRunner{Type: "session_rpc", Session: "sess_ab12",
+		RPC: &RPCEnvelope{ID: 42, Method: "diff", Payload: json.RawMessage(`{"repo":"api"}`)}}
+	db, err := json.Marshal(down)
+	if err != nil { t.Fatal(err) }
+	if got := string(db); !strings.Contains(got, `"type":"session_rpc"`) ||
+		!strings.Contains(got, `"rpc":{"id":42,"method":"diff","payload":{"repo":"api"}}`) {
+		t.Fatalf("session_rpc wrong on the wire: %s", got)
+	}
+	var dout ToRunner
+	if err := json.Unmarshal(db, &dout); err != nil { t.Fatal(err) }
+	if dout.Type != "session_rpc" || dout.Session != "sess_ab12" || dout.RPC == nil ||
+		dout.RPC.ID != 42 || dout.RPC.Method != "diff" || string(dout.RPC.Payload) != `{"repo":"api"}` {
+		t.Fatalf("round trip mangled: %+v", dout.RPC)
+	}
+
+	// Upward: the sandbox asks for a credential. No payload — a method whose
+	// arguments are all implied by the session it came from must still put an
+	// id and a method on the wire, since the id is what the response is
+	// correlated against.
+	up := FromRunner{Type: "session_req", Session: "sess_ab12",
+		RPC: &RPCEnvelope{ID: 7, Method: "mint_git_credential"}}
+	ub, err := json.Marshal(up)
+	if err != nil { t.Fatal(err) }
+	if got := string(ub); !strings.Contains(got, `"type":"session_req"`) ||
+		!strings.Contains(got, `"rpc":{"id":7,"method":"mint_git_credential"}`) {
+		t.Fatalf("session_req wrong on the wire: %s", got)
+	}
+	var uout FromRunner
+	if err := json.Unmarshal(ub, &uout); err != nil { t.Fatal(err) }
+	if uout.Type != "session_req" || uout.RPC == nil || uout.RPC.ID != 7 ||
+		uout.RPC.Method != "mint_git_credential" || uout.RPC.Payload != nil {
+		t.Fatalf("round trip mangled: %+v", uout.RPC)
+	}
+
+	// The answer to that request travels back as a session_rpc whose Method is
+	// "resp", echoing the request's id.
+	answer := ToRunner{Type: "session_rpc", Session: "sess_ab12",
+		RPC: &RPCEnvelope{ID: 7, Method: "resp", Payload: json.RawMessage(`{"ok":true}`)}}
+	ab, err := json.Marshal(answer)
+	if err != nil { t.Fatal(err) }
+	if !strings.Contains(string(ab), `"rpc":{"id":7,"method":"resp","payload":{"ok":true}}`) {
+		t.Fatalf("session_rpc response wrong on the wire: %s", ab)
+	}
+
+	// A message with no RPC must not start carrying an empty envelope: every
+	// Plan 1-4 message type keeps its exact bytes.
+	for _, m := range []any{ToRunner{Type: "destroy", Session: "s"}, FromRunner{Type: "event", Session: "s", State: "running"}} {
+		b, err := json.Marshal(m)
+		if err != nil { t.Fatal(err) }
+		if strings.Contains(string(b), `"rpc"`) { t.Fatalf("non-RPC message leaked rpc: %s", b) }
 	}
 }
 

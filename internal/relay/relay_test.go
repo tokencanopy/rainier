@@ -159,7 +159,9 @@ func TestControlFramesReachHub(t *testing.T) {
 	sessConn, runConn := newPipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	sender, errc := ServeSessionWithControl(ctx, sessConn, s)
+	// nil inbound handler: the Plan 4 behaviour — a session that never expects
+	// a request from runnerd still relays and still sends control events.
+	sender, errc := ServeSessionWithControl(ctx, sessConn, s, nil)
 
 	// Wired through the constructor, which is the only way to install a
 	// handler: NewHubWithControl sets it before starting readLoop, so there
@@ -223,6 +225,150 @@ func TestControlFramesReachHub(t *testing.T) {
 		if !ok { t.Fatal("error channel closed after a delay; the contract is one value and no close") }
 		t.Fatalf("error channel yielded a late second value %v, want exactly one", v)
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// recvControl takes one control payload off a handler's hand-off channel and
+// decodes it as a ControlEvent. Decoding happens HERE, on the test goroutine,
+// and not inside the handler, because t.Fatalf from a handler goroutine is
+// not allowed — and because a handler that unmarshals is a handler that does
+// work, which is precisely what the hand-off contract on both ends forbids.
+func recvControl(t *testing.T, ch <-chan []byte, what string) ControlEvent {
+	t.Helper()
+	select {
+	case p := <-ch:
+		var ev ControlEvent
+		if err := json.Unmarshal(p, &ev); err != nil {
+			t.Fatalf("decode %s: %v (raw %s)", what, err, p)
+		}
+		return ev
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s never arrived", what)
+	}
+	return ControlEvent{}
+}
+
+func encodeControl(t *testing.T, ev ControlEvent) []byte {
+	t.Helper()
+	b, err := json.Marshal(ev)
+	if err != nil { t.Fatalf("marshal control event: %v", err) }
+	return b
+}
+
+// TestControlRPCRoundTripBothDirections pins the control channel as a
+// BIDIRECTIONAL request/response transport, which is the one primitive the
+// GitHub connector and the credential vault are both built on: a mint request
+// travels sandbox→controld, while diff and push/pull travel controld→sandbox.
+// Plan 4 only ever pushed events upward, so both new halves are asserted here
+// — the hub originating a request (Hub.SendControl) and the session side
+// receiving one (the handler ServeSessionWithControl now takes) — in both
+// orders, because a transport that only works when the first request happened
+// to come from one particular end is not bidirectional.
+//
+// The third act re-asserts the terminal mux after all that control traffic,
+// mirroring TestControlFramesReachHub: control frames and terminal frames
+// share one conn in each direction, so a botched write discipline shows up as
+// a stalled or corrupted attachment rather than as a failed control round
+// trip.
+func TestControlRPCRoundTripBothDirections(t *testing.T) {
+	s, err := session.New(
+		session.Config{Argv: []string{"sh", "-i"}, Cols: 80, Rows: 24, LogPath: filepath.Join(t.TempDir(), "s.log")},
+		session.StartProc,
+	)
+	if err != nil { t.Fatal(err) }
+	defer s.Stop()
+
+	sessConn, runConn := newPipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Both handlers do nothing but hand the payload off to a buffered channel:
+	// that is the documented contract on both ends, and modelling it here
+	// keeps the test from passing only because its handler was fast.
+	sessIn := make(chan []byte, 8)
+	sender, _ := ServeSessionWithControl(ctx, sessConn, s, func(p []byte) { sessIn <- append([]byte(nil), p...) })
+	hubIn := make(chan []byte, 8)
+	hub := NewHubWithControl(ctx, runConn, func(p []byte) { hubIn <- append([]byte(nil), p...) })
+	defer hub.Close()
+
+	// Act 1 — runnerd → sessiond request, sessiond responds.
+	if err := hub.SendControl(encodeControl(t, ControlEvent{
+		Kind: "req:ping", ID: 1, Payload: json.RawMessage(`{"n":1}`),
+	})); err != nil {
+		t.Fatalf("hub SendControl: %v", err)
+	}
+	req := recvControl(t, sessIn, "req:ping at the session")
+	if req.Kind != "req:ping" || req.ID != 1 || string(req.Payload) != `{"n":1}` {
+		t.Fatalf("request reached the session mangled: %+v", req)
+	}
+	if err := sender.Send(encodeControl(t, ControlEvent{
+		Kind: "resp", ID: req.ID, OK: true, Payload: json.RawMessage(`{"pong":1}`),
+	})); err != nil {
+		t.Fatalf("session Send resp: %v", err)
+	}
+	resp := recvControl(t, hubIn, "resp at the hub")
+	if resp.Kind != "resp" || resp.ID != 1 || !resp.OK || string(resp.Payload) != `{"pong":1}` {
+		t.Fatalf("response reached the hub mangled: %+v", resp)
+	}
+
+	// Act 2 — the REVERSE: sessiond → runnerd request, runnerd responds. The
+	// ID space is per-direction, so 1 is a legitimate id here too and reusing
+	// it would hide a reply routed back to the wrong side's table; 2 keeps the
+	// two halves of this test distinguishable.
+	if err := sender.Send(encodeControl(t, ControlEvent{
+		Kind: "req:pong", ID: 2, Payload: json.RawMessage(`{"n":2}`),
+	})); err != nil {
+		t.Fatalf("session Send req: %v", err)
+	}
+	up := recvControl(t, hubIn, "req:pong at the hub")
+	if up.Kind != "req:pong" || up.ID != 2 || string(up.Payload) != `{"n":2}` {
+		t.Fatalf("request reached the hub mangled: %+v", up)
+	}
+	if err := hub.SendControl(encodeControl(t, ControlEvent{
+		Kind: "resp", ID: up.ID, OK: false, Payload: json.RawMessage(`{"err":"nope"}`),
+	})); err != nil {
+		t.Fatalf("hub SendControl resp: %v", err)
+	}
+	down := recvControl(t, sessIn, "resp at the session")
+	// OK false is the interesting case for a bool with omitempty: it is absent
+	// from the wire, so a decoder that guessed a default of true would pass
+	// every happy-path assertion and silently turn failures into successes.
+	if down.Kind != "resp" || down.ID != 2 || down.OK || string(down.Payload) != `{"err":"nope"}` {
+		t.Fatalf("response reached the session mangled: %+v", down)
+	}
+
+	// Act 3 — the terminal mux still works, in both directions, after control
+	// traffic has crossed the conn both ways.
+	client, hubClient := newPipe()
+	go hub.AttachClient(ctx, hubClient, 0, 80, 24)
+	first := readServerMsg(t, client)
+	if first.Type != "snapshot" { t.Fatalf("first msg = %s, want snapshot", first.Type) }
+	writeClientMsg(t, client, wire.ClientMsg{Type: "stdin", Data: []byte("echo rpc-marker\n")})
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("never saw rpc-marker echoed through the relay after RPC traffic both ways")
+		default:
+		}
+		m := readServerMsg(t, client)
+		if m.Type == "output" && contains(m.Data, "rpc-marker") { return }
+	}
+}
+
+// TestHubSendControlSurfacesWriteError is Hub.SendControl's half of what
+// TestControlSenderSurfacesWriteError pins for the session side: an
+// undelivered control frame must be reported, never swallowed. On this end it
+// matters more, not less — a dropped request leaves the caller's pending-RPC
+// entry waiting for a response that nothing will ever send, so the error is
+// the only thing that lets it fail fast instead of at a timeout.
+func TestHubSendControlSurfacesWriteError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hub := NewHub(ctx, deadConn{})
+	defer hub.Close()
+	if err := hub.SendControl([]byte(`{"kind":"req:ping","id":1}`)); err == nil {
+		t.Fatal("SendControl on a dead conn returned nil, want the write error")
 	}
 }
 

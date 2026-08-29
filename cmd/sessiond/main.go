@@ -167,7 +167,15 @@ func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, s
 			// frame can never interleave on the conn. With no setup running
 			// the sender is simply never used, and the relay behaves exactly
 			// as ServeSession did.
-			sender, errc := relay.ServeSessionWithControl(ctx, relay.WSConn(c), s)
+			//
+			// The inbound handler is nil until sessiond has RPC methods to
+			// serve (the git and file operations controld drives from the
+			// other end): a nil handler reads inbound control frames and drops
+			// them, which is the right behaviour for a session that cannot
+			// answer anything yet — the alternative, refusing to decode them,
+			// would only be a way for a newer controld to kill an older
+			// sandbox's relay.
+			sender, errc := relay.ServeSessionWithControl(ctx, relay.WSConn(c), s, nil)
 			var relayErr error
 			pending, setup, relayErr = serveConn(sender, errc, setup, pending)
 			log.Printf("relay ended: %v; redialing", relayErr)
