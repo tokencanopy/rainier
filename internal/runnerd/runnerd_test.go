@@ -951,6 +951,122 @@ func TestSessionOpGetUnknownSessionReturns404(t *testing.T) {
 	}
 }
 
+// blockingDestroyFake parks the first Destroy call after it has actually
+// removed the container but before it returns, holding Delete in the one
+// window that matters: past its hub.Close(), short of its reg.remove(). Later
+// calls (the double-destroy this test exists to forbid) sail through the
+// closed release channel and are still recorded.
+type blockingDestroyFake struct {
+	*destroyTrackingFake
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingDestroyFake(total int) *blockingDestroyFake {
+	return &blockingDestroyFake{
+		destroyTrackingFake: newDestroyTrackingFake(total),
+		entered:             make(chan struct{}),
+		release:             make(chan struct{}),
+	}
+}
+
+func (f *blockingDestroyFake) Destroy(ctx context.Context, id string) error {
+	err := f.destroyTrackingFake.Destroy(ctx, id)
+	f.once.Do(func() { close(f.entered) })
+	<-f.release
+	return err
+}
+
+// TestDeleteRacingHubDeathFiresNoDeadEvent pins the rm-vs-spurious-dead race:
+// Delete's own hub.Close() causes a hub death that is socket-level identical
+// to a crash, so register()'s hub-death tail wakes up, Inspects the container
+// Delete has just removed, finds it gone — and, before the "destroying"
+// marker, would both destroy it a second time and fire a "dead" event while
+// the Delete was still in flight. controld applies that event terminally, so
+// the session lands on `dead` and the deliberate teardown's `destroyed` never
+// sticks (e2e-fleet.sh asserts exactly that). With the marker set before
+// hub.Close(), the register tail stands down: no dead event, one destroy, and
+// Delete alone removes the entry.
+func TestDeleteRacingHubDeathFiresNoDeadEvent(t *testing.T) {
+	fd := newBlockingDestroyFake(4)
+	rd := New(fd, "", "", "")
+
+	var mu sync.Mutex
+	var events []string
+	rd.SetOnEvent(func(id, state string) {
+		mu.Lock()
+		events = append(events, id+":"+state)
+		mu.Unlock()
+	})
+	seen := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), events...)
+	}
+
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+	base := strings.Replace(srv.URL, "http", "ws", 1)
+	ctx := context.Background()
+
+	id := createSession(t, srv.URL)
+	dialRegisterAndServe(t, ctx, base, id)
+	waitForHub(t, rd, id)
+	handle, _, ok := rd.reg.opTarget(id)
+	if !ok || handle == "" {
+		t.Fatal("session has no handle after register")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- rd.Delete(ctx, id) }()
+
+	select {
+	case <-fd.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Delete never reached drv.Destroy")
+	}
+
+	// Delete is parked mid-Destroy. Wait for the hub death it caused to be
+	// processed (hubDied clears the hub), then give register's tail the room
+	// to run the Inspect-and-destroy path it must decline — the same
+	// settle-and-check shape as the other hub-death tests here.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, hubOK := rd.reg.hub(id); !hubOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("hub never cleared after Delete closed it")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	close(fd.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Delete did not return after the destroy was released")
+	}
+	// A dead event fired by the losing path would be queued by now, but let
+	// it land before asserting its absence.
+	time.Sleep(200 * time.Millisecond)
+
+	if _, ok := rd.reg.get(id); ok {
+		t.Fatal("registry entry survived Delete")
+	}
+	if calls := fd.destroyCalls(); len(calls) != 1 || calls[0] != handle {
+		t.Fatalf("Destroy calls = %v, want exactly one for %q", calls, handle)
+	}
+	if got := seen(); len(got) != 1 || got[0] != id+":running" {
+		t.Fatalf("events = %v, want only the register's %s:running — a deliberate rm must fire no \"dead\"", got, id)
+	}
+}
+
 func TestDeleteSessionRemovesRegistryEntryAndClosesHub(t *testing.T) {
 	rd := New(driver.NewFake(4), "", "", "")
 	srv := httptest.NewServer(rd.Handler())

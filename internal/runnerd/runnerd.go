@@ -392,6 +392,16 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) (snapshotRef 
 // synchronously with this deliberate teardown instead of being left to find
 // out later. register() also calls reg.remove/hub.Close on its own unblock —
 // both are safe, idempotent no-ops the second time.
+//
+// The entry is marked "destroying" BEFORE hub.Close(), exactly as Op's cold
+// suspend marks "suspending" before `docker stop` and for the same reason:
+// the hub death this is about to cause is indistinguishable at the socket
+// level from a crash, so the register goroutine it unblocks would otherwise
+// run its crash path — Inspect the (already destroyed) container, find it
+// gone, and both destroy it a second time and fire a spurious "dead" event
+// while this Delete is still between its hub.Close() and its reg.remove().
+// controld would then mark the session dead instead of destroyed. The marker
+// makes that goroutine stand down (see register's hub-death tail).
 func (s *Server) Delete(ctx context.Context, id string) error {
 	handle, state, ok := s.reg.opTarget(id)
 	if !ok {
@@ -400,6 +410,7 @@ func (s *Server) Delete(ctx context.Context, id string) error {
 	if state == "starting" {
 		return errSessionStarting
 	}
+	s.reg.setState(id, "destroying")
 	if h, ok := s.reg.hub(id); ok {
 		h.Close()
 	}
@@ -436,21 +447,49 @@ func (s *Server) Delete(ctx context.Context, id string) error {
 func (s *Server) Announce() []rwire.SessionInfo {
 	var out []rwire.SessionInfo
 	for _, e := range s.reg.list() {
-		var state string
-		switch {
-		case e.state == "running":
-			state = "running"
-		case e.state == "suspended" && e.hub != nil:
-			// Warm pause keeps sessiond's conn (and the hub) alive.
-			state = "suspended_warm"
-		case e.state == "suspended", e.state == "suspending":
-			state = "suspended_cold"
-		default:
-			continue // "starting" only — see doc comment above
+		state, ok := announceState(e)
+		if !ok {
+			continue
 		}
 		out = append(out, rwire.SessionInfo{ID: e.id, State: state})
 	}
 	return out
+}
+
+// announceState renders one registry entry in rwire's session-state
+// vocabulary, reporting false for an entry that must not be announced at all
+// ("starting" — see Announce's doc comment). It takes a value copy, never a
+// live *sessionEntry, because it reads both mutable fields (state, hub); the
+// caller is responsible for having snapshotted it under the registry lock
+// (reg.list or reg.snapshot).
+//
+// Announce and the agent's idempotent-create re-announce (execute's create
+// case) share this so the two renderings can never drift apart.
+func announceState(e sessionEntry) (string, bool) {
+	var state string
+	switch {
+	case e.state == "running":
+		state = "running"
+	case e.state == "suspended" && e.hub != nil:
+		// Warm pause keeps sessiond's conn (and the hub) alive.
+		state = "suspended_warm"
+	case e.state == "suspended", e.state == "suspending":
+		state = "suspended_cold"
+	case e.state == "destroying":
+		// Mid-Delete (drv.Destroy in flight). Reported, not omitted, for
+		// the same reason "suspending" is: omission is the one direction
+		// controld cannot heal from — it marks the row dead, terminally,
+		// and a client retrying the rm then gets a session that reads
+		// "dead" rather than "destroyed". Reporting it live keeps the row
+		// non-terminal, so the retry (which runnerd answers as an
+		// already-gone session, i.e. ok) lands it on destroyed. "running"
+		// is the vocabulary's closest live state; the entry disappears
+		// moments later either way.
+		state = "running"
+	default:
+		return "", false // "starting" only — see Announce's doc comment
+	}
+	return state, true
 }
 
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
@@ -499,6 +538,9 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	if state == "suspending" || state == "suspended" {
 		return
 	} // deliberate cold suspend: keep
+	if state == "destroying" {
+		return
+	} // deliberate teardown: Delete owns the destroy and the entry removal
 	// The conn died but that no longer proves the container did: sessiond
 	// now survives conn loss and redials (see cmd/sessiond). Ask the driver
 	// — bounded, so a hung docker daemon can't strand this goroutine (and

@@ -239,11 +239,37 @@ func TestSchedulerFIFOPlacementAndCapacityFrees(t *testing.T) {
 		}
 		return nil
 	})
+
+	// A running event frees no slot, but it does clear freeCapacity's
+	// double-count: while a row is `creating` AND its container is already in
+	// the runner's reported Used, one slot of real headroom is invisible.
+	// vm1 now reports used 0/2 with sess_q2 and sess_q3 both `creating`, so
+	// free reads 0 and a fourth session waits — until sess_q2 goes running,
+	// which drops the creating count to 1 and must WAKE the scheduler. The
+	// 2s bound is the assertion: the 10s safety tick would also get there
+	// eventually (the burst e2e measured 20s of exactly that), so anything
+	// inside this bound is the wake doing its job.
+	seedQueued(t, st, "sess_q4", 3)
+	time.Sleep(150 * time.Millisecond)
+	if got := getSession(t, st, "sess_q4"); got.State != StateQueued {
+		t.Fatalf("sess_q4 state = %q, want queued (no headroom until a creating row clears)", got.State)
+	}
+
+	f.event(t, "sess_q2", "running")
+	eventually(t, 2*time.Second, func() error {
+		got := getSession(t, st, "sess_q4")
+		if got.State != StateCreating || got.Runner != "vm1" {
+			return fmt.Errorf("sess_q4 = %q on %q, want creating on vm1 promptly after the running event", got.State, got.Runner)
+		}
+		return nil
+	})
 }
 
-// TestCreateDispatchFailureRequeues covers the two dispatch-failure paths:
-// an explicit ok:false fails the session outright, while a runner that
-// never answers requeues it (with placement cleared) once OpTimeout elapses.
+// TestCreateDispatchFailureRequeues covers the dispatch-failure paths, which
+// differ in exactly one thing — whether the create was ever delivered:
+// ok:false fails the session outright; a connection that dies requeues it
+// (with placement cleared); and a timeout on a still-live connection does
+// NEITHER, because the runner has the command and may be executing it.
 func TestCreateDispatchFailureRequeues(t *testing.T) {
 	t.Run("ok false fails the session with the runner's detail", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
@@ -269,20 +295,60 @@ func TestCreateDispatchFailureRequeues(t *testing.T) {
 		}
 	})
 
-	// This one calls dispatchCreate directly rather than driving it through
+	// These two call dispatchCreate directly rather than driving it through
 	// Run/schedulerLoop: a requeue also fires wakeScheduler, and since vm1
 	// is the only (still-connected, still-not-answering) runner, the full
 	// loop would immediately re-place and re-dispatch the same row —
 	// correct behavior, but it means the row only sits `queued` for a
 	// flicker between one OpTimeout and the next re-dispatch, which races
 	// any poll trying to observe it. Calling dispatchCreate once, in
-	// isolation, pins the requeue itself without that race.
-	t.Run("no result before OpTimeout requeues with runner cleared", func(t *testing.T) {
-		s, st, ts := newTestControld(t, func(c *Config) { c.OpTimeout = 150 * time.Millisecond })
+	// isolation, pins the outcome itself without that race.
+	t.Run("connection death requeues with runner cleared", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 2,
 			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f) // reconcile must finish before we seed, or it can requeue our row itself
+
+		id := "sess_conn_death"
+		row := seedSession(t, st, Session{ID: id, State: StateCreating, Runner: "vm1", Name: id, Image: "img:latest"})
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.dispatchCreate(context.Background(), row, "vm1")
+		}()
+
+		cmd := f.nextCmd(t)
+		if cmd.Type != "create" || cmd.Session != id {
+			t.Fatalf("got %+v, want create of %s", cmd, id)
+		}
+		// The runner drops off mid-create: nothing on the other end can
+		// finish it, and nothing will re-announce it either, so this row must
+		// go back on the queue for another runner.
+		f.close()
+
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("dispatchCreate did not return after the connection died")
+		}
+		got := getSession(t, st, id)
+		if got.State != StateQueued || got.Runner != "" {
+			t.Fatalf("session = %+v, want queued with runner cleared", got)
+		}
+	})
+
+	// The Important finding this wave closes: a create that times out on a
+	// LIVE connection was delivered (a cold image pull routinely outlasts
+	// OpTimeout), so requeuing it would place a second copy elsewhere. The
+	// row must stay `creating` and be settled by the runner's own news.
+	t.Run("timeout on a live connection leaves the row creating", func(t *testing.T) {
+		s, st, ts := newTestControld(t, func(c *Config) { c.OpTimeout = 150 * time.Millisecond })
+		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 2,
+			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+		waitConnected(t, s, "vm1")
+		awaitReconciled(t, f)
 
 		id := "sess_timeout"
 		row := seedSession(t, st, Session{ID: id, State: StateCreating, Runner: "vm1", Name: id, Image: "img:latest"})
@@ -297,7 +363,7 @@ func TestCreateDispatchFailureRequeues(t *testing.T) {
 		if cmd.Type != "create" || cmd.Session != id {
 			t.Fatalf("got %+v, want create of %s", cmd, id)
 		}
-		// Never answer: the dispatch must time out on its own.
+		// Never answer the dispatch: it must time out with the conn still up.
 
 		select {
 		case <-done:
@@ -305,9 +371,14 @@ func TestCreateDispatchFailureRequeues(t *testing.T) {
 			t.Fatal("dispatchCreate did not return after OpTimeout elapsed")
 		}
 		got := getSession(t, st, id)
-		if got.State != StateQueued || got.Runner != "" {
-			t.Fatalf("session = %+v, want queued with runner cleared", got)
+		if got.State != StateCreating || got.Runner != "vm1" {
+			t.Fatalf("session = %+v, want still creating on vm1 (the create was delivered)", got)
 		}
+
+		// ...and the slow create eventually lands: the runner's own "running"
+		// event settles the row without controld ever having requeued it.
+		f.event(t, id, "running")
+		wantState(t, st, id, StateRunning)
 	})
 }
 

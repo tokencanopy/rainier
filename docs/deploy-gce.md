@@ -130,7 +130,9 @@ curl -sf http://rainier-1:9090/healthz && echo   # → ok
 `--listen 0.0.0.0:9090` with no firewall rule opened is deliberate: GCE's
 default ingress denies 9090 from the internet, and the tailnet interface is
 where the traffic actually arrives. Add `--members` for teammates who should
-get the non-admin role.
+get the non-admin role. Allowlist entries are matched case-insensitively, as
+GitHub logins are — `Alice` in `--admins` admits the account GitHub reports as
+`alice`.
 
 Every flag also reads a `RAINIER_*` environment variable
 (`RAINIER_LISTEN`, `RAINIER_DB`, `RAINIER_RUNNER_TOKEN`, `RAINIER_ADMINS`,

@@ -27,6 +27,27 @@ import (
 // answer", and the message text carries which one it was.
 var ErrRunnerUnreachable = errors.New("runner unreachable")
 
+// ErrDispatchTimeout is the one no-answer outcome that is NOT evidence the
+// command went undelivered: OpTimeout elapsed while the control connection
+// was still live, so the runner has the command and may well have executed
+// it — controld just didn't hear back in time (a cold image pull routinely
+// outlasts a 60s OpTimeout).
+//
+// It wraps ErrRunnerUnreachable rather than standing alone, deliberately, so
+// that every existing errors.Is(err, ErrRunnerUnreachable) call site keeps
+// its behavior and only callers that ask specifically see the distinction:
+//
+//   - api.go's destroy/suspend/resume/snapshot handlers (4 sites) keep
+//     answering 502 `runner_unreachable`. That is the honest answer for a
+//     timeout too — controld cannot confirm the op either way, and the row
+//     is left exactly as the store had it, so the client's retry is against
+//     unchanged state. Splitting a second client-visible code here would
+//     tell the caller nothing it could act on differently.
+//   - sched.go's dispatchCreate is the one caller that must branch: a
+//     requeue on a delivered-but-unconfirmed create is what births a
+//     duplicate container. See its doc comment.
+var ErrDispatchTimeout = fmt.Errorf("timed out with the connection still live: %w", ErrRunnerUnreachable)
+
 const (
 	// runnerReadLimit matches runnerd's own read limit; announces of a full
 	// fleet member are the largest message either side sends.
@@ -308,11 +329,11 @@ func (s *Server) touchRunner(ctx context.Context, rc *runnerConn, m rwire.FromRu
 //
 // A runner may only report on sessions the store places on it, or on ones it
 // places nowhere yet (a "running" event can outrun the create's own
-// queued→creating transition). Without that guard the fleet-wide runner
-// token would let any runner drive any session to a terminal state, and the
-// stale holder of a duplicate — the case reconcileUnplaced destroys — could
-// mark a session dead that has since been re-placed and is running fine
-// somewhere else.
+// queued→creating transition; "dead" tightens that to an exact match — see
+// its arm below). Without that guard the fleet-wide runner token would let
+// any runner drive any session to a terminal state, and the stale holder of
+// a duplicate — the case reconcileUnplaced destroys — could mark a session
+// dead that has since been re-placed and is running fine somewhere else.
 func (s *Server) applyEvent(ctx context.Context, runner string, m rwire.FromRunner) {
 	if m.Session == "" {
 		log.Printf("controld: runner %s: event with no session", runner)
@@ -335,7 +356,26 @@ func (s *Server) applyEvent(ctx context.Context, runner string, m rwire.FromRunn
 	switch m.State {
 	case "running":
 		s.transitionQuiet(ctx, m.Session, liveOnRunner, StateRunning, TransitionOpts{})
+		// A session reaching running frees no slot, but it does change
+		// freeCapacity's math: the row leaves the `creating` count while the
+		// runner's reported Used already includes its container, so the
+		// double-count that was hiding one slot of headroom clears here.
+		// Without this wake that headroom stays invisible until the 10s
+		// safety tick — the burst e2e measured 20s of a queue sitting on
+		// capacity that already existed.
+		s.wakeScheduler()
 	case "dead":
+		// Unlike "running", dead demands an exact placement match. The guard
+		// above deliberately accepts row.Runner == "" (a running event can
+		// outrun the create's own queued->creating transition), but dead is
+		// terminal and unhealable: an unplaced row is one a requeue cleared
+		// and the scheduler may have re-placed elsewhere, so a stale holder
+		// reporting its own copy dead must not kill the live one.
+		if row.Runner != runner {
+			log.Printf("controld: runner %s reported %s dead, but the store places it on %q; ignoring",
+				runner, row.ID, row.Runner)
+			return
+		}
 		reason := deadByRunner
 		s.transitionQuiet(ctx, m.Session, NonTerminal, StateDead, TransitionOpts{Error: &reason})
 		s.wakeScheduler() // a dead session frees its slot
@@ -494,10 +534,14 @@ func announcedState(s string) (SessionState, bool) {
 // dispatch sends m to a runner and waits for the matching result. It assigns
 // the ReqID (per-connection, so ids never collide across runners) and
 // returns an error wrapping ErrRunnerUnreachable whenever no answer arrives:
-// no connection, a connection that died, or OpTimeout. The one exception is
-// the caller's own ctx being canceled, which returns a bare ctx.Err() — the
-// runner is not implicated, and callers that map ErrRunnerUnreachable to a
-// 502 should let that one surface as the client disconnect it is.
+// no connection, a connection that died, or OpTimeout. That last one — and
+// only that one — also wraps ErrDispatchTimeout, because it alone leaves the
+// command delivered and possibly executed (see that error's doc comment).
+//
+// The one exception is the caller's own ctx being canceled, which returns a
+// bare ctx.Err() — the runner is not implicated, and callers that map
+// ErrRunnerUnreachable to a 502 should let that one surface as the client
+// disconnect it is.
 func (s *Server) dispatch(ctx context.Context, runner string, m rwire.ToRunner) (rwire.FromRunner, error) {
 	rc := s.conn(runner)
 	if rc == nil {
@@ -537,8 +581,19 @@ func (s *Server) dispatch(ctx context.Context, runner string, m rwire.ToRunner) 
 		if res, ok := drain(ch); ok {
 			return res, nil
 		}
+		// select is random among ready cases, so a connection that died at
+		// the same instant the timer fired could surface here as a timeout.
+		// Re-check explicitly: conn death is the stronger fact (the command
+		// is definitively unanswerable now), and ErrDispatchTimeout's whole
+		// contract is "the connection was still live", which callers act on.
+		select {
+		case <-rc.done:
+			return rwire.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: connection closed before the result: %w",
+				m.Type, runner, ErrRunnerUnreachable)
+		default:
+		}
 		return rwire.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: no result within %s: %w",
-			m.Type, runner, s.cfg.OpTimeout, ErrRunnerUnreachable)
+			m.Type, runner, s.cfg.OpTimeout, ErrDispatchTimeout)
 	case <-ctx.Done():
 		if res, ok := drain(ch); ok {
 			return res, nil

@@ -126,13 +126,26 @@ func (s *Server) freeCapacity(ctx context.Context) ([]runnerView, error) {
 }
 
 // dispatchCreate sends row's create to runner and settles the outcome:
-// ok:false fails the session with the runner's own detail text; a transport
-// failure or OpTimeout (ErrRunnerUnreachable) puts the row back on the
-// queue with its placement cleared and wakes the scheduler so it — or, once
-// it's back, another runner — gets another chance. The caller's own ctx
-// being canceled (process shutdown) is left alone: the row stays `creating`
-// and the runner's next announce reconciles it (requeue if the create never
-// landed, adopt if it did).
+// ok:false fails the session with the runner's own detail text, and a
+// transport failure — no connection, a dead one, a full send queue
+// (ErrRunnerUnreachable) — puts the row back on the queue with its placement
+// cleared and wakes the scheduler so it, or once it's back another runner,
+// gets another chance.
+//
+// A timeout on a LIVE connection (ErrDispatchTimeout) is deliberately not
+// requeued. The command was delivered, and a create that outlasts OpTimeout
+// is usually one still pulling a cold image: requeuing it would place a
+// second copy of the same session on another runner, and the first copy
+// would survive — invisible to the store — until that runner's next announce
+// reconciled it away, or, if it landed back on the same runner, leave a row
+// stuck `creating` against a container that already exists. So the row is
+// left `creating` and settled by whichever arrives first: the runner's
+// "running" event, its next announce (adopt if the create landed, requeue if
+// it didn't), or a later reconcile.
+//
+// The caller's own ctx being canceled (process shutdown) is left alone for
+// the same reason — the row stays `creating` and the next announce
+// reconciles it.
 func (s *Server) dispatchCreate(ctx context.Context, row Session, runner string) {
 	res, err := s.dispatch(ctx, runner, rwire.ToRunner{
 		Type:    "create",
@@ -145,14 +158,15 @@ func (s *Server) dispatchCreate(ctx context.Context, row Session, runner string)
 		},
 	})
 	switch {
-	case err != nil:
-		if !errors.Is(err, ErrRunnerUnreachable) {
-			log.Printf("controld: dispatch create %s to %s: %v", row.ID, runner, err)
-			return
-		}
+	case errors.Is(err, ErrDispatchTimeout):
+		log.Printf("controld: create %s on %s: no result before the op timeout; leaving it creating for the runner's event or next announce to settle: %v",
+			row.ID, runner, err)
+	case errors.Is(err, ErrRunnerUnreachable):
 		none := ""
 		s.transitionQuiet(ctx, row.ID, []SessionState{StateCreating}, StateQueued, TransitionOpts{Runner: &none})
 		s.wakeScheduler()
+	case err != nil:
+		log.Printf("controld: dispatch create %s to %s: %v", row.ID, runner, err)
 	case !res.OK:
 		detail := res.Detail
 		s.transitionQuiet(ctx, row.ID, []SessionState{StateCreating}, StateFailed, TransitionOpts{Error: &detail})

@@ -245,6 +245,18 @@ func TestAgentIdempotentCreate(t *testing.T) {
 	if calls := fd.createCalls(); len(calls) != 1 {
 		t.Fatalf("Create called %d times, want 1 (idempotent)", len(calls))
 	}
+
+	// The ok result says the session exists; it does not say what state it is
+	// in — and the controld that retried this create has a row sitting in
+	// `creating` waiting to hear exactly that. So the re-create re-fires the
+	// session's current state as an event, right after the result, and the
+	// row converges now instead of at the next reconnect's announce. (That
+	// the first create did NOT emit one is already pinned above: an event
+	// queued after res1 would have been read in res2's place.)
+	evt := conn.readMsg(t)
+	if evt.Type != "event" || evt.Session != "sess_x" || evt.State != "running" {
+		t.Fatalf("after the idempotent create: got %+v, want event{sess_x running}", evt)
+	}
 }
 
 // TestCreateWithIDConcurrentSameIDCallsDriverOnce is the regression test for
