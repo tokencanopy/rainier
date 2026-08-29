@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 650" role="img" aria-labelledby="title desc">
+  <title id="title">Project Rainier</title>
+  <desc id="desc">A geometric snowcapped mountain with evergreen trees and the words Project Rainier, Coding Agents, Anywhere.</desc>
+
+  <style>
+    .wordmark { fill: #123C69; }
+    .tagline { fill: #456579; }
+
+    @media (prefers-color-scheme: dark) {
+      .wordmark { fill: #DCEBFA; }
+      .tagline { fill: #B7C9D5; }
+    }
+  </style>
+
+  <defs>
+    <linearGradient id="mountain" x1="0" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#268DD1" />
+      <stop offset="1" stop-color="#123C69" />
+    </linearGradient>
+    <linearGradient id="evergreen" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#123C69" />
+      <stop offset="1" stop-color="#14704F" />
+    </linearGradient>
+    <path id="pine" d="M0 58 18 30h-8L25 8h-8L32-18 55 8h-8l15 22h-8l18 28z" />
+  </defs>
+
+  <g transform="translate(0 -45)">
+    <!-- Mountain foundation. -->
+    <path fill="url(#mountain)" d="m177 414 66-89 53-49 42-48 42-39c18-17 38-23 59-12l33 25 31 36 45 48 55 71v57z" />
+    <path fill="#F8F6EE" d="m247 322 47-38 43-48 42-39c18-17 38-23 59-12l30 24 14 23-19-10-17-14-15 30-14-10-20 37-20-12-19 23-23-12-23 34-20-8-29 34-21-3z" />
+    <path fill="#A9DEF0" d="m247 322 43-23 31-30 22 8-25 31-31 29-23 14z" />
+    <path fill="#A9DEF0" d="m387 234 19-24 20 12 18-37 14 10 15-30 16 14 19 10-16 16-24-4-20 37-23-11-18 24z" />
+
+    <!-- A compact pine silhouette grounds the mark. -->
+    <path fill="#123C69" d="M177 414h426v43H177z" />
+    <g fill="url(#evergreen)">
+      <use href="#pine" transform="translate(183 394) scale(.92)" />
+      <use href="#pine" transform="translate(237 378) scale(1.08)" />
+      <use href="#pine" transform="translate(297 397) scale(.84)" />
+      <use href="#pine" transform="translate(338 372) scale(1.16)" />
+      <use href="#pine" transform="translate(404 389) scale(.94)" />
+      <use href="#pine" transform="translate(456 369) scale(1.18)" />
+      <use href="#pine" transform="translate(522 393) scale(.9)" />
+      <use href="#pine" transform="translate(566 377) scale(1.05)" />
+    </g>
+  </g>
+
+  <text class="wordmark" x="460" y="525" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="38" font-weight="700" letter-spacing="7">PROJECT RAINIER</text>
+  <text class="tagline" x="460" y="570" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="600" letter-spacing="3">CODING AGENTS, ANYWHERE.</text>
+</svg>
