@@ -1,42 +1,17 @@
-// Command rattach is the dev attach client: it dials sessiond's /attach
-// websocket, puts the local terminal in raw mode, and pipes stdin/stdout
-// through. Ctrl-] detaches without touching the remote session.
+// Command rattach is the dev attach client: it dials sessiond's (or
+// runnerd's/controld's) /attach websocket, puts the local terminal in raw
+// mode, and pipes stdin/stdout through. Ctrl-] detaches without touching the
+// remote session. The loop itself lives in internal/attachio; this file is
+// just flag parsing.
 package main
 
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
-	"net/url"
-	"os"
-	"os/signal"
-	"strconv"
-	"syscall"
 
-	"github.com/coder/websocket"
-	"github.com/coder/websocket/wsjson"
-	"golang.org/x/term"
-
-	"rainier/internal/wire"
+	"rainier/internal/attachio"
 )
-
-const detachKey = 0x1d // Ctrl-]
-
-// attachURL builds the /attach URL from a base (sessiond directly, or
-// runnerd's relay — same contract either way). session is appended as an
-// extra query param only when non-empty: direct sessiond has no use for it
-// and ignores unknown params, while runnerd's /attach handler reads it to
-// find the right hub. Factored out so the URL contract (base is just
-// "scheme://host[:port]", never anything with a path already on it) has one
-// place to get right and one place to unit test.
-func attachURL(base string, since uint64, session string) string {
-	u := base + "/attach?since=" + strconv.FormatUint(since, 10)
-	if session != "" {
-		u += "&session=" + url.QueryEscape(session)
-	}
-	return u
-}
 
 func main() {
 	baseURL := flag.String("url", "ws://127.0.0.1:7070", "sessiond/runnerd base URL (no path)")
@@ -45,109 +20,7 @@ func main() {
 	flag.Parse()
 
 	ctx := context.Background()
-	c, _, err := websocket.Dial(ctx, attachURL(*baseURL, *since, *session), nil)
-	if err != nil {
+	if err := attachio.Run(ctx, attachio.AttachURL(*baseURL, *since, *session), nil, *since); err != nil {
 		log.Fatal(err)
-	}
-	defer c.CloseNow()
-	// See internal/server/server.go: match the server's raised read limit so
-	// a single oversized PTY-output frame (live or replayed from the event
-	// log) doesn't close the connection with StatusMessageTooBig. 16MiB
-	// explicit cap, not unlimited (-1); a real protocol-level max-frame size
-	// is deferred to Plan 2.
-	c.SetReadLimit(16 << 20)
-
-	fd := int(os.Stdin.Fd())
-	isTTY := term.IsTerminal(fd)
-
-	// restore is a no-op unless stdin is a real tty. Raw mode, and the
-	// SIGWINCH-driven size reporting that depends on term.GetSize working,
-	// are both skipped for non-tty stdin (e.g. a script piping input in) —
-	// there is no terminal state to save or restore in that case.
-	restore := func() {}
-	if isTTY {
-		oldState, err := term.MakeRaw(fd)
-		if err != nil {
-			log.Fatal(err)
-		}
-		restore = func() { term.Restore(fd, oldState) }
-	}
-	defer restore()
-
-	if isTTY {
-		sendSize := func() {
-			w, h, err := term.GetSize(fd)
-			if err == nil {
-				wsjson.Write(ctx, c, wire.ClientMsg{Type: "resize", Cols: w, Rows: h})
-			}
-		}
-		sendSize() // required first message
-
-		winch := make(chan os.Signal, 1)
-		signal.Notify(winch, syscall.SIGWINCH)
-		go func() {
-			for range winch {
-				sendSize()
-			}
-		}()
-	} else {
-		// No tty to size from: announce a fixed default so the server's
-		// resize-first contract is still satisfied.
-		wsjson.Write(ctx, c, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24})
-	}
-
-	var lastSeq uint64
-	go func() {
-		for {
-			var m wire.ServerMsg
-			if err := wsjson.Read(ctx, c, &m); err != nil {
-				restore()
-				fmt.Printf("\r\n[disconnected at seq %d; rattach --since %d to resume]\r\n", lastSeq, lastSeq)
-				os.Exit(0)
-			}
-			switch m.Type {
-			case "snapshot", "output":
-				os.Stdout.Write(m.Data)
-				if m.Seq > 0 {
-					lastSeq = m.Seq
-				}
-			case "exit":
-				restore()
-				fmt.Printf("\r\n[session process exited: %d]\r\n", m.ExitCode)
-				os.Exit(0)
-			}
-		}
-	}()
-
-	buf := make([]byte, 1024)
-	for {
-		n, err := os.Stdin.Read(buf)
-		if err != nil {
-			// Stdin closed (EOF on a pipe, or a read error on a real tty).
-			// There's nothing left to forward, but the session may still
-			// have output in flight, so block here instead of returning:
-			// the goroutine above is what ends the process, on disconnect
-			// or session exit — or the process gets killed externally.
-			select {}
-		}
-		detach := -1
-		for i := 0; i < n; i++ {
-			if buf[i] == detachKey {
-				detach = i
-				break
-			}
-		}
-		if detach < 0 {
-			wsjson.Write(ctx, c, wire.ClientMsg{Type: "stdin", Data: append([]byte(nil), buf[:n]...)})
-			continue
-		}
-		// Forward whatever preceded the detach key in this chunk before
-		// detaching; anything after it in the same chunk is discarded.
-		if detach > 0 {
-			wsjson.Write(ctx, c, wire.ClientMsg{Type: "stdin", Data: append([]byte(nil), buf[:detach]...)})
-		}
-		restore()
-		fmt.Printf("\r\n[detached at seq %d; session still running]\r\n", lastSeq)
-		return
 	}
 }
