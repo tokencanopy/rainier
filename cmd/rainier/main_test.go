@@ -543,3 +543,67 @@ func TestDevcontainerDir(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// env create / env update: the init hook reaches the wire
+// ---------------------------------------------------------------------------
+
+// TestEnvInitFlagsReachTheWire pins the two ends of the `--init-file` /
+// `--init-timeout-sec` plumbing: create sends the script's CONTENTS (not its
+// path) as `init`, and update sends only the fields the operator actually
+// passed — an absent flag means "leave it alone", which for an environment's
+// boot hook is the difference between editing it and erasing it.
+func TestEnvInitFlagsReachTheWire(t *testing.T) {
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody = nil
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusCreated)
+		}
+		if _, err := w.Write([]byte(`{"environment":{"id":"env_test"}}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	t.Setenv("RAINIER_CONFIG", filepath.Join(dir, "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_test"}); err != nil {
+		t.Fatal(err)
+	}
+	initPath := filepath.Join(dir, "init.sh")
+	if err := os.WriteFile(initPath, []byte("make dev-server &\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runEnvCreate([]string{"dev", "--image", "img:1", "--init-file", initPath, "--init-timeout-sec", "120"}); err != nil {
+		t.Fatalf("env create: %v", err)
+	}
+	if gotBody["init"] != "make dev-server &\n" {
+		t.Errorf("create init = %#v, want the script's contents", gotBody["init"])
+	}
+	if gotBody["init_timeout_sec"] != float64(120) {
+		t.Errorf("create init_timeout_sec = %#v, want 120", gotBody["init_timeout_sec"])
+	}
+
+	if err := runEnvUpdate([]string{"dev", "--init-file", initPath}); err != nil {
+		t.Fatalf("env update: %v", err)
+	}
+	if gotBody["init"] != "make dev-server &\n" {
+		t.Errorf("update init = %#v, want the script's contents", gotBody["init"])
+	}
+	if len(gotBody) != 1 {
+		t.Errorf("patch = %#v, want it to carry only the field that was passed", gotBody)
+	}
+
+	if err := runEnvUpdate([]string{"dev", "--init-timeout-sec", "300"}); err != nil {
+		t.Fatalf("env update: %v", err)
+	}
+	if gotBody["init_timeout_sec"] != float64(300) || len(gotBody) != 1 {
+		t.Errorf("patch = %#v, want only init_timeout_sec", gotBody)
+	}
+}

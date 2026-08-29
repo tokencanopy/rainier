@@ -117,7 +117,7 @@ func (s *Store) UserByToken(ctx context.Context, tokenHash string) (controld.Use
 
 // --- sessions -----------------------------------------------------------
 
-const selectSessionCols = `id, owner_id, name, image, cmd, egress_allow, state, runner, idempotency_key, error, environment_id, resolved_image, setup_hash, created_at, updated_at, last_event_at`
+const selectSessionCols = `id, owner_id, name, image, cmd, egress_allow, state, runner, idempotency_key, error, environment_id, resolved_image, setup_hash, child_exit_code, created_at, updated_at, last_event_at`
 
 // rowScanner is satisfied by both pgx.Row and pgx.Rows.
 type rowScanner interface {
@@ -141,7 +141,7 @@ func scanSession(row rowScanner) (controld.Session, error) {
 
 	if err := row.Scan(&sess.ID, &sess.OwnerID, &sess.Name, &sess.Image, &cmdBytes, &egressBytes,
 		&state, &sess.Runner, &idem, &sess.Error, &sess.EnvironmentID, &sess.ResolvedImage, &sess.SetupHash,
-		&sess.CreatedAt, &sess.UpdatedAt, &sess.LastEventAt); err != nil {
+		&sess.ChildExitCode, &sess.CreatedAt, &sess.UpdatedAt, &sess.LastEventAt); err != nil {
 		return controld.Session{}, err
 	}
 	sess.State = controld.SessionState(state)
@@ -420,6 +420,22 @@ func (s *Store) SetSessionSetupHash(ctx context.Context, id, hash string) error 
 	return nil
 }
 
+func (s *Store) SetChildExitCode(ctx context.Context, id string, code int) error {
+	// Unguarded and state-agnostic, like SetSessionSetupHash: the child
+	// exiting is an observation about the process inside the container, not a
+	// transition of the session itself, and the session stays attachable
+	// afterwards. last_event_at is deliberately left alone for the same
+	// reason SetSessionSetupHash leaves it alone.
+	ct, err := s.pool.Exec(ctx, `UPDATE sessions SET child_exit_code = $1, updated_at = now() WHERE id = $2`, code, id)
+	if err != nil {
+		return fmt.Errorf("pgstore: set child exit code: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return controld.ErrNotFound
+	}
+	return nil
+}
+
 // --- runners --------------------------------------------------------------
 
 func (s *Store) UpsertRunner(ctx context.Context, r controld.Runner) error {
@@ -477,7 +493,7 @@ func (s *Store) ListRunners(ctx context.Context) ([]controld.Runner, error) {
 
 // --- environments ---------------------------------------------------------
 
-const selectEnvironmentCols = `id, name, image, setup, setup_hash, egress_allow, secret_refs, connectors, placement, setup_timeout_sec, snapshot_ref, snapshot_runner, snapshot_hash, created_at, updated_at`
+const selectEnvironmentCols = `id, name, image, setup, setup_hash, init, init_timeout_sec, egress_allow, secret_refs, connectors, placement, setup_timeout_sec, snapshot_ref, snapshot_runner, snapshot_hash, created_at, updated_at`
 
 // encodeConnectors renders cs as the JSON array the connectors column holds:
 // each element is that connector's own object, passed through untouched, so
@@ -534,8 +550,9 @@ func scanEnvironment(row rowScanner) (controld.Environment, error) {
 	var e controld.Environment
 	var egressBytes, refsBytes, connectorBytes []byte
 
-	if err := row.Scan(&e.ID, &e.Name, &e.Image, &e.Setup, &e.SetupHash, &egressBytes, &refsBytes,
-		&connectorBytes, &e.Placement, &e.SetupTimeoutSec, &e.SnapshotRef, &e.SnapshotRunner, &e.SnapshotHash,
+	if err := row.Scan(&e.ID, &e.Name, &e.Image, &e.Setup, &e.SetupHash, &e.Init, &e.InitTimeoutSec,
+		&egressBytes, &refsBytes, &connectorBytes, &e.Placement, &e.SetupTimeoutSec,
+		&e.SnapshotRef, &e.SnapshotRunner, &e.SnapshotHash,
 		&e.CreatedAt, &e.UpdatedAt); err != nil {
 		return controld.Environment{}, err
 	}
@@ -588,10 +605,10 @@ func (s *Store) CreateEnvironment(ctx context.Context, e controld.Environment) (
 	// The snapshot columns are left at their '' defaults: a new environment
 	// has no cache, and only SetEnvironmentSnapshot ever writes one.
 	row := s.pool.QueryRow(ctx, `
-		INSERT INTO environments (id, name, image, setup, setup_hash, egress_allow, secret_refs, connectors, placement, setup_timeout_sec, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		INSERT INTO environments (id, name, image, setup, setup_hash, init, init_timeout_sec, egress_allow, secret_refs, connectors, placement, setup_timeout_sec, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING `+selectEnvironmentCols,
-		e.ID, e.Name, e.Image, e.Setup, controld.SetupHash(e.Image, e.Setup),
+		e.ID, e.Name, e.Image, e.Setup, controld.SetupHash(e.Image, e.Setup), e.Init, e.InitTimeoutSec,
 		egress, refs, connectors, e.Placement, e.SetupTimeoutSec, createdAt, updatedAt)
 
 	out, err := scanEnvironment(row)
@@ -661,11 +678,12 @@ func (s *Store) UpdateEnvironment(ctx context.Context, e controld.Environment) (
 	// standing for the caching path to rebuild.
 	row := s.pool.QueryRow(ctx, `
 		UPDATE environments SET
-			name = $2, image = $3, setup = $4, setup_hash = $5, egress_allow = $6, secret_refs = $7,
-			connectors = $8, placement = $9, setup_timeout_sec = $10, updated_at = now()
+			name = $2, image = $3, setup = $4, setup_hash = $5, init = $6, init_timeout_sec = $7,
+			egress_allow = $8, secret_refs = $9,
+			connectors = $10, placement = $11, setup_timeout_sec = $12, updated_at = now()
 		WHERE id = $1
 		RETURNING `+selectEnvironmentCols,
-		e.ID, e.Name, e.Image, e.Setup, controld.SetupHash(e.Image, e.Setup),
+		e.ID, e.Name, e.Image, e.Setup, controld.SetupHash(e.Image, e.Setup), e.Init, e.InitTimeoutSec,
 		egress, refs, connectors, e.Placement, e.SetupTimeoutSec)
 
 	out, err := scanEnvironment(row)
@@ -782,6 +800,131 @@ func (s *Store) DeleteSecret(ctx context.Context, name string) error {
 		return controld.ErrNotFound
 	}
 	return nil
+}
+
+// --- credentials ----------------------------------------------------------
+
+const selectCredentialCols = `user_id, provider, ciphertext, nonce, refresh_ciphertext, refresh_nonce, status, scopes, obtained_at, expires_at, last_verified_at, last_used_at, updated_at`
+
+func scanCredential(row rowScanner) (controld.Credential, error) {
+	var c controld.Credential
+	if err := row.Scan(&c.UserID, &c.Provider, &c.Ciphertext, &c.Nonce,
+		&c.RefreshCiphertext, &c.RefreshNonce, &c.Status, &c.Scopes,
+		&c.ObtainedAt, &c.ExpiresAt, &c.LastVerifiedAt, &c.LastUsedAt, &c.UpdatedAt); err != nil {
+		return controld.Credential{}, err
+	}
+	return c, nil
+}
+
+// nilIfZero renders a zero time as SQL NULL, so the statement's COALESCE can
+// stamp the server's own now() in its place. Every credential clock is set by
+// the database, never by this process: SetCredentialStatus and
+// TouchCredentialUsed can only use now(), and a row whose obtained_at came
+// from a client whose clock runs fast would then look edited before it was
+// created.
+func nilIfZero(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+
+func (s *Store) UpsertCredential(ctx context.Context, c controld.Credential) error {
+	status := c.Status
+	if status == "" {
+		status = controld.CredentialValid
+	}
+	// A whole-row replace: an upsert is a fresh login, so every column moves,
+	// including obtained_at — the row now describes a different token.
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO credentials (user_id, provider, ciphertext, nonce, refresh_ciphertext, refresh_nonce,
+			status, scopes, obtained_at, expires_at, last_verified_at, last_used_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+			COALESCE($9::timestamptz, now()), $10::timestamptz,
+			COALESCE($11::timestamptz, now()), COALESCE($12::timestamptz, now()), COALESCE($13::timestamptz, now()))
+		ON CONFLICT (user_id, provider) DO UPDATE SET
+			ciphertext = EXCLUDED.ciphertext,
+			nonce = EXCLUDED.nonce,
+			refresh_ciphertext = EXCLUDED.refresh_ciphertext,
+			refresh_nonce = EXCLUDED.refresh_nonce,
+			status = EXCLUDED.status,
+			scopes = EXCLUDED.scopes,
+			obtained_at = EXCLUDED.obtained_at,
+			expires_at = EXCLUDED.expires_at,
+			last_verified_at = EXCLUDED.last_verified_at,
+			last_used_at = EXCLUDED.last_used_at,
+			updated_at = EXCLUDED.updated_at`,
+		c.UserID, c.Provider, c.Ciphertext, c.Nonce, c.RefreshCiphertext, c.RefreshNonce,
+		status, c.Scopes, nilIfZero(c.ObtainedAt), c.ExpiresAt,
+		nilIfZero(c.LastVerifiedAt), nilIfZero(c.LastUsedAt), nilIfZero(c.UpdatedAt))
+	if err != nil {
+		// Deliberately no value in the message: this error is logged, and a
+		// credential's bytes must never reach a log line. The identity is
+		// enough to find the row.
+		return fmt.Errorf("pgstore: upsert credential for provider %q: %w", c.Provider, err)
+	}
+	return nil
+}
+
+func (s *Store) GetCredential(ctx context.Context, userID, provider string) (controld.Credential, error) {
+	row := s.pool.QueryRow(ctx, `SELECT `+selectCredentialCols+` FROM credentials WHERE user_id = $1 AND provider = $2`, userID, provider)
+	c, err := scanCredential(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controld.Credential{}, controld.ErrNotFound
+		}
+		return controld.Credential{}, fmt.Errorf("pgstore: get credential for provider %q: %w", provider, err)
+	}
+	return c, nil
+}
+
+func (s *Store) SetCredentialStatus(ctx context.Context, userID, provider, status string) error {
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE credentials SET status = $3, updated_at = now()
+		WHERE user_id = $1 AND provider = $2`, userID, provider, status)
+	if err != nil {
+		return fmt.Errorf("pgstore: set credential status for provider %q: %w", provider, err)
+	}
+	if ct.RowsAffected() == 0 {
+		return controld.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) TouchCredentialUsed(ctx context.Context, userID, provider string) error {
+	// last_used_at only. updated_at is the row's edit clock, and a mint is a
+	// read: a session using a credential must not make it look freshly
+	// changed to whoever is watching the status.
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE credentials SET last_used_at = now()
+		WHERE user_id = $1 AND provider = $2`, userID, provider)
+	if err != nil {
+		return fmt.Errorf("pgstore: touch credential for provider %q: %w", provider, err)
+	}
+	if ct.RowsAffected() == 0 {
+		return controld.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) ListCredentials(ctx context.Context, userID string) ([]controld.Credential, error) {
+	// Scoped to one user by the query itself, not by a filter above it: there
+	// is no code path here that could hand back another user's row.
+	rows, err := s.pool.Query(ctx, `SELECT `+selectCredentialCols+` FROM credentials WHERE user_id = $1 ORDER BY provider ASC`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("pgstore: list credentials: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]controld.Credential, 0)
+	for rows.Next() {
+		c, err := scanCredential(rows)
+		if err != nil {
+			return nil, fmt.Errorf("pgstore: list credentials: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // --- cursor ---------------------------------------------------------------

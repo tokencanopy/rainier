@@ -199,6 +199,8 @@ type environment struct {
 	Image           string            `json:"image"`
 	Setup           string            `json:"setup"`
 	SetupHash       string            `json:"setup_hash"`
+	Init            string            `json:"init"`
+	InitTimeoutSec  int               `json:"init_timeout_sec"`
 	EgressAllow     []string          `json:"egress_allow"`
 	SecretRefs      []string          `json:"secret_refs"`
 	Connectors      []json.RawMessage `json:"connectors"`
@@ -223,6 +225,8 @@ type createEnvironmentRequest struct {
 	Name            string          `json:"name"`
 	Image           string          `json:"image"`
 	Setup           string          `json:"setup,omitempty"`
+	Init            string          `json:"init,omitempty"`
+	InitTimeoutSec  int             `json:"init_timeout_sec,omitempty"`
 	EgressAllow     []string        `json:"egress_allow,omitempty"`
 	SecretRefs      []string        `json:"secret_refs,omitempty"`
 	Connectors      json.RawMessage `json:"connectors,omitempty"`
@@ -882,9 +886,11 @@ func runEnv(args []string) error {
 type envFlags struct {
 	image        *string
 	setupFile    *string
+	initFile     *string
 	egress       *string
 	placement    *string
 	timeout      *int
+	initTimeout  *int
 	name         *string
 	secretRefs   stringsFlag
 	connectors   stringsFlag
@@ -893,11 +899,13 @@ type envFlags struct {
 
 func registerEnvFlags(fs *flag.FlagSet, forUpdate bool) *envFlags {
 	f := &envFlags{
-		image:     fs.String("image", "", "base container image"),
-		setupFile: fs.String("setup-file", "", "path to a shell script run once when a session is first built"),
-		egress:    fs.String("egress", "", "comma-separated egress allowlist"),
-		placement: fs.String("placement", "", "pin this environment's sessions to one runner"),
-		timeout:   fs.Int("setup-timeout-sec", 0, "how long the setup script may run (0 = server default)"),
+		image:       fs.String("image", "", "base container image"),
+		setupFile:   fs.String("setup-file", "", "path to a shell script run once when a session is first built"),
+		initFile:    fs.String("init-file", "", "path to a shell script run on every session boot, after the code is in place"),
+		egress:      fs.String("egress", "", "comma-separated egress allowlist"),
+		placement:   fs.String("placement", "", "pin this environment's sessions to one runner"),
+		timeout:     fs.Int("setup-timeout-sec", 0, "how long the setup script may run (0 = server default)"),
+		initTimeout: fs.Int("init-timeout-sec", 0, "how long the init script may run (0 = server default)"),
 	}
 	fs.Var(&f.secretRefs, "secret-ref", "name of a team secret to inject; repeatable")
 	fs.Var(&f.connectors, "connector-json", "a connector object, or an array of them, as raw JSON; repeatable")
@@ -938,7 +946,11 @@ func runEnvCreate(args []string) error {
 		return fmt.Errorf("an image is required: pass --image (a devcontainer that builds from a Dockerfile has no image for rainier to take)")
 	}
 
-	setup, err := readSetupFile(*f.setupFile)
+	setup, err := readScriptFile(*f.setupFile, "setup")
+	if err != nil {
+		return err
+	}
+	init, err := readScriptFile(*f.initFile, "init")
 	if err != nil {
 		return err
 	}
@@ -957,6 +969,8 @@ func runEnvCreate(args []string) error {
 		Name:            name,
 		Image:           image,
 		Setup:           setup,
+		Init:            init,
+		InitTimeoutSec:  *f.initTimeout,
 		EgressAllow:     splitList(*f.egress),
 		SecretRefs:      nonEmpty(f.secretRefs),
 		Connectors:      connectors,
@@ -1051,11 +1065,18 @@ func runEnvUpdate(args []string) error {
 		patch["image"] = *f.image
 	}
 	if passed["setup-file"] {
-		setup, err := readSetupFile(*f.setupFile)
+		setup, err := readScriptFile(*f.setupFile, "setup")
 		if err != nil {
 			return err
 		}
 		patch["setup"] = setup
+	}
+	if passed["init-file"] {
+		init, err := readScriptFile(*f.initFile, "init")
+		if err != nil {
+			return err
+		}
+		patch["init"] = init
 	}
 	if passed["egress"] {
 		patch["egress_allow"] = splitList(*f.egress)
@@ -1076,8 +1097,11 @@ func runEnvUpdate(args []string) error {
 	if passed["setup-timeout-sec"] {
 		patch["setup_timeout_sec"] = *f.timeout
 	}
+	if passed["init-timeout-sec"] {
+		patch["init_timeout_sec"] = *f.initTimeout
+	}
 	if len(patch) == 0 {
-		return fmt.Errorf("nothing to update: pass at least one of --name, --image, --setup-file, --egress, --secret-ref, --connector-json, --placement, --setup-timeout-sec")
+		return fmt.Errorf("nothing to update: pass at least one of --name, --image, --setup-file, --init-file, --egress, --secret-ref, --connector-json, --placement, --setup-timeout-sec, --init-timeout-sec")
 	}
 
 	cfg, err := requireLogin()
@@ -1209,14 +1233,16 @@ func nonEmpty(values []string) []string {
 	return out
 }
 
-// readSetupFile reads a --setup-file path, or returns "" when none was given.
-func readSetupFile(path string) (string, error) {
+// readScriptFile reads a --setup-file or --init-file path, or returns "" when
+// none was given. what names the script in the error, so an operator who
+// passes two of these and fatfingers one knows which.
+func readScriptFile(path, what string) (string, error) {
 	if path == "" {
 		return "", nil
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("reading the setup script: %w", err)
+		return "", fmt.Errorf("reading the %s script: %w", what, err)
 	}
 	return string(data), nil
 }
