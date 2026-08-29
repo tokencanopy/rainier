@@ -1,6 +1,6 @@
 # Deploying Rainier on GCE (the v0 dogfood target)
 
-One `e2-medium` in GCP project `rainier`, reached over Tailscale. No load
+One `e2-medium` in GCP project `rainier-cloud`, reached over Tailscale. No load
 balancer, no domain, no certificates, no systemd units — v0 is honest about
 being one box you can rebuild in twenty minutes. Everything here is the
 Plan 3 design's §4.10 deployment story, written out as commands.
@@ -25,7 +25,7 @@ register listener on the docker bridge gateway.
 
 ## 1. Provision the VM
 
-From your laptop, with `gcloud` authenticated and project `rainier` created
+From your laptop, with `gcloud` authenticated and project `rainier-cloud` created
 and billed:
 
 ```bash
@@ -44,10 +44,10 @@ Debian bookworm's `golang-go` is 1.19 and this repo's `go.mod` requires
 Then join the tailnet, on the VM:
 
 ```bash
-gcloud compute ssh rainier-1 --project rainier --zone us-west1-b
+gcloud compute ssh rainier-1 --project rainier-cloud --zone us-west1-b
 sudo tailscale up                   # authenticate in the browser it prints
 tailscale status                    # note the MagicDNS name — "rainier-1" below
-exit && gcloud compute ssh rainier-1 --project rainier --zone us-west1-b
+exit && gcloud compute ssh rainier-1 --project rainier-cloud --zone us-west1-b
 go version                          # → go1.25.0 (from ~/.profile's PATH)
 ```
 

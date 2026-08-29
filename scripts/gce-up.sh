@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # scripts/gce-up.sh — provision the Rainier dogfood VM: one e2-medium in GCP
-# project "rainier", with Docker and Tailscale installed. Run once; safe to
+# project "rainier-cloud", with Docker and Tailscale installed. Run once; safe to
 # re-run (every step is a create-if-absent).
 #
 # This script stops at "the VM exists and has the two things it needs".
@@ -11,14 +11,14 @@
 #
 # Prereqs:
 #   - gcloud installed and authenticated (`gcloud auth login`)
-#   - project "rainier" exists with billing enabled
+#   - project "rainier-cloud" exists with billing enabled
 #   - a Tailscale account (the auth step is interactive, at the end)
 #
 # Env: PROJECT, ZONE, VM, MACHINE_TYPE, DISK_SIZE, GO_VERSION override the
 # defaults.
 set -euo pipefail
 
-PROJECT=${PROJECT:-rainier}
+PROJECT=${PROJECT:-rainier-cloud}
 ZONE=${ZONE:-us-west1-b}
 VM=${VM:-rainier-1}
 MACHINE_TYPE=${MACHINE_TYPE:-e2-medium}
