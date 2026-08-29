@@ -813,8 +813,9 @@ func TestDockerSnapshotStripsSecretsAndSetupChannel(t *testing.T) {
 	defer dockerRun(ctx, "image", "rm", "-f", ref)
 
 	h, err := d.Create(ctx, Spec{
-		Name: "tstrip", SessionID: "sstrip", DialURL: "ws://x",
-		Setup: "echo hi", SetupTimeoutSec: 900,
+		Name: "tstrip", SessionID: "sstrip", DialURL: "ws://runnerd:8080/register",
+		ProxyURL: "http://egressd:3128",
+		Setup:    "echo hi", SetupTimeoutSec: 900,
 		Env: map[string]string{"SECRET_A": secretValue},
 	})
 	if err != nil {
@@ -822,19 +823,38 @@ func TestDockerSnapshotStripsSecretsAndSetupChannel(t *testing.T) {
 	}
 	defer d.Destroy(ctx, h.ID)
 
-	// The container really does carry both — otherwise the assertions below
-	// would pass against a create that never injected anything.
+	// The container really does carry all of it — otherwise the assertions
+	// below would pass against a create that never injected anything. The
+	// proxy URLs matter as much as the secret: the driver embeds the session
+	// id in them as userinfo, which is how egressd identifies the caller, so
+	// they are per-session credential-shaped values with no business outliving
+	// the build inside an image every later session boots.
 	before, err := dockerRun(ctx, "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", h.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"SECRET_A=" + secretValue, "RAINIER_SETUP_B64="} {
+	for _, want := range []string{
+		"SECRET_A=" + secretValue, "RAINIER_SETUP_B64=",
+		"RAINIER_SESSION=sstrip", "RAINIER_DIAL=", "HTTP_PROXY=", "http_proxy=", "NO_PROXY=",
+	} {
 		if !strings.Contains(before, want) {
 			t.Fatalf("the container's own env does not contain %q, so this test proves nothing:\n%s", want, before)
 		}
 	}
+	if !strings.Contains(before, "sstrip:@egressd") {
+		t.Fatalf("the proxy URL carries no session-id userinfo, so stripping it would prove nothing:\n%s", before)
+	}
 
-	strip := []string{"SECRET_A", "RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT"}
+	// The whole always-stripped set, spelled out here rather than imported
+	// from runnerd: this is the DRIVER's contract, and a list that could only
+	// ever agree with itself would prove nothing about the caller composing
+	// it. runnerd's own test asserts it composes exactly this.
+	strip := []string{
+		"SECRET_A",
+		"RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT",
+		"RAINIER_DIAL", "RAINIER_SESSION",
+		"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy",
+	}
 	if _, err := d.Snapshot(ctx, h.ID, ref, strip); err != nil {
 		t.Fatal(err)
 	}
@@ -844,6 +864,9 @@ func TestDockerSnapshotStripsSecretsAndSetupChannel(t *testing.T) {
 	}
 	if strings.Contains(after, secretValue) {
 		t.Fatalf("the committed image's config carries the secret's VALUE:\n%s", after)
+	}
+	if strings.Contains(after, "sstrip") {
+		t.Fatalf("the committed image's config still names the build session (id or proxy userinfo):\n%s", after)
 	}
 	for _, line := range strings.Split(after, "\n") {
 		for _, k := range strip {

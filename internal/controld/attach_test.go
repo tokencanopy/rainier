@@ -558,6 +558,121 @@ func TestAttachWrongState(t *testing.T) {
 		}
 		assertErrCode(t, resp, "runner_unreachable")
 	})
+
+	t.Run("failed on a disconnected runner is still 503", func(t *testing.T) {
+		// The failed-session exemption is not a blanket one: with no control
+		// connection there is nothing to send a dial_attach down, so this is
+		// the ordinary not-ready answer rather than a socket that upgrades and
+		// then dies.
+		seedSession(t, st, Session{ID: "sess_failed_gone", OwnerID: u.ID, State: StateFailed, Runner: "vm-gone"})
+		_, resp, err := dialAttach(t, ts, "sess_failed_gone", "", tok)
+		if err == nil {
+			t.Fatal("dial succeeded, want rejection before upgrade")
+		}
+		if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("resp = %+v (%v), want 503", resp, err)
+		}
+		assertErrCode(t, resp, "session_not_ready")
+	})
+
+	t.Run("failed with no runner at all is 503", func(t *testing.T) {
+		seedSession(t, st, Session{ID: "sess_failed_unplaced", OwnerID: u.ID, State: StateFailed})
+		_, resp, err := dialAttach(t, ts, "sess_failed_unplaced", "", tok)
+		if err == nil {
+			t.Fatal("dial succeeded, want rejection before upgrade")
+		}
+		if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("resp = %+v (%v), want 503", resp, err)
+		}
+		assertErrCode(t, resp, "session_not_ready")
+	})
+}
+
+// TestAttachToFailedSession is the debugging path a failed setup exists to
+// leave behind (design §4.3): the session's error column carries only the last
+// 2KB the script printed, while the whole log is still inside the container,
+// where sessiond is running and serving viewers. Attach has to reach it — with
+// the row terminal, which every other terminal state is refused for.
+//
+// The session is failed AFTER the runner has announced, which is the order
+// production produces (a setup_failed event arrives on a live control conn) and
+// the only order that works: an announce carrying a session the store already
+// has terminal is an orphan, and reconciliation destroys it (§4.8).
+func TestAttachToFailedSession(t *testing.T) {
+	fx := newAttachFixture(t)
+	ts, sd := fx.ts, fx.sd
+
+	reason := "setup failed: rc 7: E: unable to locate package foo"
+	err := fx.st.Transition(context.Background(), fx.id, NonTerminal, StateFailed, TransitionOpts{Error: &reason})
+	if err != nil {
+		t.Fatalf("failing the session: %v", err)
+	}
+
+	// No wait budget is consumed: failed-with-a-connected-runner is as settled
+	// an answer as running, and the diagnosis is on the other side of it.
+	start := time.Now()
+	cli, resp, err := dialAttach(t, ts, fx.id, "?since=0", fx.tok)
+	if err != nil {
+		t.Fatalf("attach to a failed session: %v", err)
+	}
+	defer cli.CloseNow()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("attach status = %d, want 101", resp.StatusCode)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("attach to a failed session took %s; it must not sit out the wait budget", elapsed)
+	}
+	cli.SetReadLimit(16 << 20)
+	writeClient(t, cli, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24})
+
+	// The dial_attach went out and the splice is live: the session's own
+	// FrameOpen arrived, and its reply reaches the client. That reply is the
+	// scrollback a user attaches to a failed session to read.
+	if open := sd.nextOpen(t); open.Since != 0 {
+		t.Fatalf("FrameOpen since = %d, want 0 (the full replay a failure needs)", open.Since)
+	}
+	if m := readServer(t, cli); m.Type != "snapshot" || string(m.Data) != snapshotText {
+		t.Fatalf("first server msg = %+v, want the session's snapshot %q", m, snapshotText)
+	}
+
+	// The row is untouched by the attach: reading a failure must not resurrect
+	// it, and the slot is still held until an explicit rm.
+	after, err := fx.st.GetSession(context.Background(), fx.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.State != StateFailed || after.Error != reason {
+		t.Fatalf("session after the attach = %s / %q, want it still failed with its error intact", after.State, after.Error)
+	}
+}
+
+// TestAttachToDeadSessionIsRefused pins the NARROWNESS of the exemption above,
+// which TestAttachWrongState cannot: its terminal case has no runner at all, so
+// it would pass just as well against a handler that admitted every terminal
+// state on a connected runner.
+//
+// Here the runner is connected and the container is real, and the answer is
+// still 503. `dead` is the runner reporting the container gone, and canceled and
+// destroyed never had one — only `failed` leaves a container up with a log
+// worth reading, so only `failed` is let through.
+func TestAttachToDeadSessionIsRefused(t *testing.T) {
+	fx := newAttachFixture(t)
+
+	reason := "runner reported dead"
+	err := fx.st.Transition(context.Background(), fx.id, NonTerminal, StateDead, TransitionOpts{Error: &reason})
+	if err != nil {
+		t.Fatalf("killing the session: %v", err)
+	}
+
+	c, resp, err := dialAttach(t, fx.ts, fx.id, "", fx.tok)
+	if err == nil {
+		c.CloseNow()
+		t.Fatal("attach to a dead session succeeded; only `failed` is exempt from the terminal rule")
+	}
+	if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("resp = %+v (%v), want 503", resp, err)
+	}
+	assertErrCode(t, resp, "session_not_ready")
 }
 
 // TestAttachBackBogusID pins the dial-back's own guards: an unknown (expired,

@@ -238,6 +238,13 @@ type Store interface {
 	DeleteEnvironment(ctx context.Context, id string) error // ErrNotFound
 	// CountSessionsByEnvironment counts sessions on envID whose state is in
 	// states; an empty states counts every session on the environment.
+	//
+	// envID must be a REAL environment id. A scratch session carries
+	// environment_id "", so passing "" counts every scratch session in the
+	// fleet — a number that means nothing here and, used as a delete guard,
+	// would refuse a deletion because of sessions that belong to no
+	// environment at all. Callers resolve their ref to an id first (see
+	// handleDeleteEnvironment).
 	CountSessionsByEnvironment(ctx context.Context, envID string, states []SessionState) (int, error)
 	// SetEnvironmentSnapshot records a built snapshot against the
 	// environment, but only while its SetupHash is still expectHash. A

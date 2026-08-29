@@ -1422,16 +1422,24 @@ func TestEnvSetupStreamsAndCaches(t *testing.T) {
 	}
 
 	// The snapshot command carried the strip list: everything the create
-	// injected (this environment's decrypted secret) plus the setup channel.
-	// Without it the committed image would hand every later session that
-	// secret in its config, and re-run the very setup the cache exists to
-	// skip. runnerd composes the list from what it recorded at create; this is
-	// the scene where that survives a real dispatch and a real websocket.
+	// injected (this environment's decrypted secret) plus everything the
+	// driver injects — the setup channel, the build session's own identity,
+	// and the egress proxy vars, whose URLs embed that session id. Without it
+	// the committed image would hand every later session that secret in its
+	// config, re-run the very setup the cache exists to skip, and carry the
+	// build session's id forward forever. runnerd composes the list from what
+	// it recorded at create; this is the scene where that survives a real
+	// dispatch over a real websocket.
 	strips := f.runners[holder].drv.Strips()
 	if len(strips) != 1 {
 		t.Fatalf("driver saw %d snapshot(s) on %s, want exactly one: %v", len(strips), holder, strips)
 	}
-	wantStrip := []string{"ENV_TOKEN", "RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT"}
+	wantStrip := []string{
+		"ENV_TOKEN",
+		"RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT",
+		"RAINIER_DIAL", "RAINIER_SESSION",
+		"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy",
+	}
 	if !slices.Equal(strips[0], wantStrip) {
 		t.Fatalf("snapshot strip list = %v, want %v", strips[0], wantStrip)
 	}
@@ -1577,6 +1585,19 @@ func TestSetupFailureLandsFailed(t *testing.T) {
 	// that didn't work.
 	if e := f.getEnv(env.ID); e.SnapshotRef != "" {
 		t.Fatalf("environment cached %q from a session whose setup failed", e.SnapshotRef)
+	}
+
+	// And the session is still attachable, which is the whole point of leaving
+	// the container up: the error column holds 2KB of tail, and everything
+	// else the script printed is in the scrollback on the other side of this
+	// attach (design §4.3). Terminal, and still reachable through the full
+	// plane — controld's pairing, the runner's dial-back, the session's hub.
+	f.echoes(created.ID, "reading the log")
+
+	// Reading it changed nothing: the row is still failed, still carrying its
+	// diagnosis, and still holding its slot until an explicit rm.
+	if row := f.list()[created.ID]; row.State != "failed" || row.Error != got {
+		t.Fatalf("session after attaching to it = %s / %q, want it unchanged", row.State, row.Error)
 	}
 }
 
