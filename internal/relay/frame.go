@@ -12,6 +12,13 @@ const (
 	FrameClose
 	FrameClient
 	FrameServer
+	// FrameControl carries a sessiond-originated control event — a setup
+	// outcome today, a credential request later — over the same conn as the
+	// terminal mux, tagged with AttachID 0 because no attachment owns it.
+	// Its value is spelled out instead of left to iota because it is
+	// wire-visible: the two ends of a live conn can be different builds, so
+	// the numbers above must never renumber underneath it.
+	FrameControl FrameType = 4
 )
 
 type Frame struct {

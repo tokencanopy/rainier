@@ -139,6 +139,115 @@ func TestRelayAttachStreamsOutput(t *testing.T) {
 	}
 }
 
+// TestControlFramesReachHub pins the CONTROL channel that rides the same
+// outbound conn as the terminal mux: a sessiond-originated payload sent
+// through a ControlSender must arrive verbatim at the Hub's control handler,
+// and — because control writes and ServeSession's own frame writes now go
+// through one shared writer — an attachment opened afterwards must still
+// stream normally. A broken sharing (interleaved/corrupted frames, or a
+// deadlocked write mutex) fails in the second half of this test, which is
+// exactly why the terminal round trip is asserted here and not left to
+// TestRelayAttachStreamsOutput alone.
+func TestControlFramesReachHub(t *testing.T) {
+	s, err := session.New(
+		session.Config{Argv: []string{"sh", "-i"}, Cols: 80, Rows: 24, LogPath: filepath.Join(t.TempDir(), "s.log")},
+		session.StartProc,
+	)
+	if err != nil { t.Fatal(err) }
+	defer s.Stop()
+
+	sessConn, runConn := newPipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sender, errc := ServeSessionWithControl(ctx, sessConn, s)
+
+	// Wired through the constructor, which is the only way to install a
+	// handler: NewHubWithControl sets it before starting readLoop, so there
+	// is neither a race with that goroutine nor a window in which an early
+	// control frame arrives unhandled.
+	got := make(chan []byte, 4)
+	hub := NewHubWithControl(ctx, runConn, func(p []byte) { got <- append([]byte(nil), p...) })
+	defer hub.Close()
+
+	want := []byte(`{"kind":"setup_done"}`)
+	if err := sender.Send(want); err != nil { t.Fatalf("send control: %v", err) }
+	select {
+	case p := <-got:
+		if !bytes.Equal(p, want) { t.Fatalf("control payload = %q, want %q", p, want) }
+	case <-time.After(5 * time.Second):
+		t.Fatal("control frame never reached the hub's control handler")
+	}
+
+	// Terminal mux still works over the same conn after a control write.
+	client, hubClient := newPipe()
+	go hub.AttachClient(ctx, hubClient, 0, 80, 24)
+	first := readServerMsg(t, client)
+	if first.Type != "snapshot" { t.Fatalf("first msg = %s, want snapshot", first.Type) }
+	writeClientMsg(t, client, wire.ClientMsg{Type: "stdin", Data: []byte("echo control-marker\n")})
+	deadline := time.After(5 * time.Second)
+	for done := false; !done; {
+		select {
+		case <-deadline:
+			t.Fatal("never saw control-marker echoed through the relay after a control frame")
+		default:
+		}
+		m := readServerMsg(t, client)
+		if m.Type == "output" && contains(m.Data, "control-marker") { done = true }
+	}
+
+	// The error channel yields the relay's exit EXACTLY once: one value, and
+	// then nothing — neither a second value nor a close. The close half
+	// matters because a closed channel hands out an endless supply of nil
+	// errors, which a caller selecting on it would read as "the relay is
+	// alive and well" forever; the documented contract is one value, take it
+	// once, and treat it as the end of this conn's life.
+	sessConn.Close()
+	select {
+	case err := <-errc:
+		if err == nil { t.Fatal("error channel yielded nil after session conn death, want the read error") }
+	case <-time.After(5 * time.Second):
+		t.Fatal("error channel never yielded after session conn death")
+	}
+	select {
+	case v, ok := <-errc:
+		if !ok { t.Fatal("error channel was closed after its one value; the contract is one value and no close") }
+		t.Fatalf("error channel yielded a second value %v, want exactly one", v)
+	default:
+	}
+	// A closed channel is always ready, so had ServeSessionWithControl closed
+	// it the receive above would have fired instantly rather than falling to
+	// default. Give it a moment to close late, too — the relay goroutine has
+	// already returned by now, so anything it was going to do, it has done.
+	select {
+	case v, ok := <-errc:
+		if !ok { t.Fatal("error channel closed after a delay; the contract is one value and no close") }
+		t.Fatalf("error channel yielded a late second value %v, want exactly one", v)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// deadConn stands in for an outbound conn that has died: every write fails,
+// and a read parks until its context is cancelled. Deliberately not a closed
+// pipeConn — a pipeConn's Write races its own buffered channel against the
+// closed signal and can still succeed after Close, which makes it useless for
+// asserting a *guaranteed* write failure.
+type deadConn struct{}
+
+func (deadConn) Read(ctx context.Context) ([]byte, error)  { <-ctx.Done(); return nil, ctx.Err() }
+func (deadConn) Write(ctx context.Context, b []byte) error { return io.ErrClosedPipe }
+func (deadConn) Close() error                              { return nil }
+
+// TestControlSenderSurfacesWriteError: an undelivered control event must be
+// reported back to its caller, not swallowed. sessiond's setup watcher is the
+// only thing that knows a setup outcome exists at all, so a Send that
+// silently returned nil on a dead conn would lose the event entirely.
+func TestControlSenderSurfacesWriteError(t *testing.T) {
+	sender := &ControlSender{w: newConnWriter(context.Background(), deadConn{})}
+	if err := sender.Send([]byte(`{"kind":"setup_done"}`)); err == nil {
+		t.Fatal("Send on a dead conn returned nil, want the write error")
+	}
+}
+
 // TestSessionConnDeathClosesClient is the regression test for cascading
 // cleanup: when the outbound conn a session opened to runnerd dies,
 // ServeSession's read loop must detach every live attachment (so its
