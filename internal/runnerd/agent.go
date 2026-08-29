@@ -14,6 +14,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"rainier/internal/driver"
+	"rainier/internal/relay"
 	"rainier/internal/rwire"
 )
 
@@ -199,13 +200,56 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 		ok := err == nil || errors.Is(err, errNoSuchSession)
 		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: ok, Detail: errTextUnless(err, errNoSuchSession)})
 	case "dial_attach":
-		// Implemented in a later task; log-and-ignore rather than a silent
-		// drop that would look identical to lost network to someone
-		// debugging a stuck attach.
-		log.Printf("agent: dial_attach not yet implemented (session %s); ignoring", m.Session)
+		// Deliberately not in a goroutine of its own: agentSession's read
+		// loop already runs one execute per inbound command precisely so a
+		// long-running one can't block the next command from being read —
+		// and this one runs for the whole life of the viewer's attach.
+		s.dialAttachBack(ctx, m, cfg)
 	default:
 		log.Printf("agent: unknown command type %q", m.Type)
 	}
+}
+
+// dialAttachBack completes controld's attach pairing from the runner side
+// (design §4.2): dial the target URL controld parked the client's socket
+// under, then feed that socket into the session's hub as an ordinary client
+// attachment. The dial is outbound, like every other connection a runner
+// makes (spec rule 3) — controld never dials in.
+//
+// It dials BEFORE waiting for the hub: the pairing controld is holding has a
+// TTL, and claiming it promptly is what keeps a client attaching to a
+// still-booting container from being dropped while this end waits. If the hub
+// never shows, closing the dialed socket is what tells controld's splice to
+// tear the client down too.
+//
+// ctx is the agent's lifetime, not one control connection's: an attach must
+// survive the control conn flapping and redialing underneath it.
+func (s *Server) dialAttachBack(ctx context.Context, m rwire.ToRunner, cfg AgentConfig) {
+	at := m.Attach
+	if at == nil {
+		log.Printf("agent: dial_attach for %s carried no attach block; ignoring", m.Session)
+		return
+	}
+	hdr := http.Header{"Authorization": {"Bearer " + cfg.Token}}
+	c, _, err := websocket.Dial(ctx, at.TargetURL, &websocket.DialOptions{HTTPHeader: hdr})
+	if err != nil {
+		// Nothing to report back: dial_attach is fire-and-forget, and
+		// controld's pairing TTL closes the client that was waiting.
+		log.Printf("agent: attach-back dial for %s: %v", m.Session, err)
+		return
+	}
+	c.SetReadLimit(16 << 20)
+
+	hub, ok := s.waitHub(m.Session)
+	if !ok {
+		log.Printf("agent: attach-back for %s: session never registered a hub", m.Session)
+		c.CloseNow()
+		return
+	}
+	// Blocks for the life of the attach; the hub owns the conn's teardown on
+	// either side dying (its readLoop closes clients when the session conn
+	// dies, AttachClient closes the attachment when the client does).
+	hub.AttachClient(ctx, relay.WSConn(c), at.Since, at.Cols, at.Rows)
 }
 
 // errTextUnless returns err's message, or "" if err is nil or matches

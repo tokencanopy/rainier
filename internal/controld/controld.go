@@ -20,6 +20,13 @@ const (
 	// defaultGitHubAPIBase is the real GitHub API; tests point Config at a
 	// fake instead (Task 9).
 	defaultGitHubAPIBase = "https://api.github.com"
+	// defaultAttachWait bounds how long an attach holds its request open
+	// waiting for the session to reach `running` — 10s, mirroring runnerd's
+	// own hub wait (design §5).
+	defaultAttachWait = 10 * time.Second
+	// defaultAttachPairTTL bounds how long a parked client socket waits for
+	// its runner to dial back before controld closes it (design §5).
+	defaultAttachPairTTL = 15 * time.Second
 )
 
 // Config is controld's startup configuration. RunnerToken and ExternalURL
@@ -41,6 +48,14 @@ type Config struct {
 	ExternalURL string
 	// OpTimeout is the budget for one dispatch round-trip to a runner.
 	OpTimeout time.Duration
+	// AttachWait bounds how long WS /v1/sessions/{id}/attach waits for the
+	// session to reach `running` before answering 503 session_not_ready.
+	// Zero means defaultAttachWait; tests shorten it.
+	AttachWait time.Duration
+	// AttachPairTTL bounds how long a parked client socket waits for its
+	// runner's dial-back before controld closes it. Zero means
+	// defaultAttachPairTTL; tests shorten it.
+	AttachPairTTL time.Duration
 }
 
 // Server is controld: the HTTP/WebSocket surface, the runner plane, and (as
@@ -59,6 +74,13 @@ type Server struct {
 	// (connected flag and capacity) — see nameLock. Keyed by runner name,
 	// never held while mu is.
 	runnerLocks map[string]*sync.Mutex
+
+	// attaches holds the attach pairings this replica is waiting on, keyed
+	// by attach_id — client sockets parked between the dial_attach sent to
+	// their runner and the dial-back that claims them (see attach.go). It
+	// has its own lock: pairing is per-socket and must never contend with
+	// the fleet-wide runner map.
+	attaches *attachTable
 
 	// schedWake carries capacity news to the scheduler loop (Task 8). It is
 	// buffered by one and written non-blockingly: the loop only needs to
@@ -86,6 +108,12 @@ func New(st Store, cfg Config) (*Server, error) {
 	if cfg.OpTimeout <= 0 {
 		cfg.OpTimeout = defaultOpTimeout
 	}
+	if cfg.AttachWait <= 0 {
+		cfg.AttachWait = defaultAttachWait
+	}
+	if cfg.AttachPairTTL <= 0 {
+		cfg.AttachPairTTL = defaultAttachPairTTL
+	}
 	if cfg.GitHubAPIBase == "" {
 		cfg.GitHubAPIBase = defaultGitHubAPIBase
 	}
@@ -94,18 +122,20 @@ func New(st Store, cfg Config) (*Server, error) {
 		cfg:         cfg,
 		runners:     map[string]*runnerConn{},
 		runnerLocks: map[string]*sync.Mutex{},
+		attaches:    newAttachTable(),
 		schedWake:   make(chan struct{}, 1),
 	}, nil
 }
 
-// Handler returns controld's full HTTP surface: the runner control
-// endpoint, the auth exchange, and the sessions/runners client API, all
-// wrapped in the shared middleware chain (request id, nosniff, no-store on
-// GET — see withMiddleware). Paths no task has claimed yet 404. The attach
-// plane is the one piece a later task still adds.
+// Handler returns controld's full HTTP surface: the runner control endpoint
+// and attach dial-back, the auth exchange, the sessions/runners client API,
+// and the client attach plane, all wrapped in the shared middleware chain
+// (request id, nosniff, no-store on GET — see withMiddleware). Paths no route
+// claims 404.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/runners/connect", s.handleRunnerConnect)
+	mux.HandleFunc("GET /v1/runners/attach-back", s.handleAttachBack)
 	mux.HandleFunc("POST /v1/auth/github", s.handleGitHubAuth)
 	mux.HandleFunc("GET /v1/me", s.requireUser(s.handleMe))
 
@@ -116,6 +146,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{id}/suspend", s.requireUser(s.handleSuspendSession))
 	mux.HandleFunc("POST /v1/sessions/{id}/resume", s.requireUser(s.handleResumeSession))
 	mux.HandleFunc("POST /v1/sessions/{id}/snapshot", s.requireUser(s.handleSnapshotSession))
+	mux.HandleFunc("GET /v1/sessions/{id}/attach", s.requireUser(s.handleClientAttach))
 	mux.HandleFunc("GET /v1/runners", s.requireUser(s.handleListRunners))
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
