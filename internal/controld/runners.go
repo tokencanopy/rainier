@@ -71,12 +71,29 @@ const (
 	// deadByRunner is the error recorded when a runner reports a session
 	// dead.
 	deadByRunner = "runner reported dead"
+	// setupFailedPrefix is what a failed setup script reads as in a session's
+	// error column. runnerd's Detail is already a composed sentence — "rc N:
+	// <tail of the script's output>", with rc -1 for the timeout kill — so
+	// controld prefixes it and never parses the rc back out; how a setup
+	// failure is described is the runner's half of the contract.
+	setupFailedPrefix = "setup failed: "
+	// snapshotRefHashLen is how much of an environment's setup hash goes into
+	// its snapshot ref: 12 hex characters, enough that no fleet collides and
+	// short enough to read in a `docker images` listing (design §4.3).
+	snapshotRefHashLen = 12
 )
 
 // liveOnRunner is the set of states in which a session is placed on a runner
 // and expected to exist there: the from-list for adopting an announced
 // state, and the filter for "what should this runner be holding".
 var liveOnRunner = []SessionState{StateCreating, StateRunning, StateSuspendedWarm, StateSuspendedCold}
+
+// setupFailedFrom is the from-list of a setup failure. The wrapper only execs
+// the agent on rc 0, so in practice the row is still `creating` when a setup
+// failure lands — but the registration `running` event can outrun the rc
+// write, so both states must be accepted or a failure would silently not
+// apply to exactly the sessions that got furthest.
+var setupFailedFrom = []SessionState{StateCreating, StateRunning}
 
 // runnerConn is one runnerd control connection. Exactly one goroutine reads
 // it (the HTTP handler) and exactly one writes it (the writer goroutine
@@ -329,11 +346,12 @@ func (s *Server) touchRunner(ctx context.Context, rc *runnerConn, m rwire.FromRu
 //
 // A runner may only report on sessions the store places on it, or on ones it
 // places nowhere yet (a "running" event can outrun the create's own
-// queued→creating transition; "dead" tightens that to an exact match — see
-// its arm below). Without that guard the fleet-wide runner token would let
-// any runner drive any session to a terminal state, and the stale holder of
-// a duplicate — the case reconcileUnplaced destroys — could mark a session
-// dead that has since been re-placed and is running fine somewhere else.
+// queued→creating transition; "dead" and the two setup outcomes tighten that
+// to an exact match — see placedExactlyOn). Without that guard the fleet-wide
+// runner token would let any runner drive any session to a terminal state,
+// and the stale holder of a duplicate — the case reconcileUnplaced destroys —
+// could mark a session dead that has since been re-placed and is running fine
+// somewhere else.
 func (s *Server) applyEvent(ctx context.Context, runner string, m rwire.FromRunner) {
 	if m.Session == "" {
 		log.Printf("controld: runner %s: event with no session", runner)
@@ -365,23 +383,192 @@ func (s *Server) applyEvent(ctx context.Context, runner string, m rwire.FromRunn
 		// capacity that already existed.
 		s.wakeScheduler()
 	case "dead":
-		// Unlike "running", dead demands an exact placement match. The guard
-		// above deliberately accepts row.Runner == "" (a running event can
-		// outrun the create's own queued->creating transition), but dead is
-		// terminal and unhealable: an unplaced row is one a requeue cleared
-		// and the scheduler may have re-placed elsewhere, so a stale holder
-		// reporting its own copy dead must not kill the live one.
-		if row.Runner != runner {
-			log.Printf("controld: runner %s reported %s dead, but the store places it on %q; ignoring",
-				runner, row.ID, row.Runner)
+		if !placedExactlyOn(row, runner, m.State) {
 			return
 		}
 		reason := deadByRunner
 		s.transitionQuiet(ctx, m.Session, NonTerminal, StateDead, TransitionOpts{Error: &reason})
 		s.wakeScheduler() // a dead session frees its slot
+	case "setup_failed":
+		if !placedExactlyOn(row, runner, m.State) {
+			return
+		}
+		// m.Detail is runnerd's composed sentence, prefixed and never parsed
+		// (see setupFailedPrefix). It lands in the row's error column, which
+		// the API hands straight back to the caller.
+		reason := setupFailedPrefix + m.Detail
+		s.transitionQuiet(ctx, m.Session, setupFailedFrom, StateFailed, TransitionOpts{Error: &reason})
+		s.wakeScheduler() // a failed session gives its slot back
+	case "setup_done":
+		if !placedExactlyOn(row, runner, m.State) {
+			return
+		}
+		// Deliberately no transition: a finished setup is news about the
+		// ENVIRONMENT, not about the session, whose state the registration
+		// "running" event governs exactly as it does for a scratch session.
+		s.cacheEnvironment(ctx, runner, row)
 	default:
 		log.Printf("controld: runner %s: unknown event state %q for %s", runner, clip(m.State), clip(m.Session))
 	}
+}
+
+// placedExactlyOn reports whether the store places row on the runner now
+// reporting about it, logging the mismatch when it doesn't.
+//
+// applyEvent's own guard is deliberately looser — it accepts a row the store
+// places nowhere, because a "running" event can outrun the create's own
+// queued→creating transition. The events that END a session (dead,
+// setup_failed) or publish a fleet-wide fact (setup_done) need the exact
+// match instead: an unplaced row is one a requeue cleared and the scheduler
+// may have re-placed elsewhere, so a stale holder must not be able to kill
+// the live copy, nor to have its own container's image published as an
+// environment's cache.
+func placedExactlyOn(row Session, runner, state string) bool {
+	if row.Runner == runner {
+		return true
+	}
+	log.Printf("controld: runner %s reported %s for %s, but the store places it on %q; ignoring",
+		runner, clip(state), row.ID, row.Runner)
+	return false
+}
+
+// snapshotRef mints an environment snapshot's image ref:
+// rainier-env:<envID>-<first 12 hex of the setup hash> (design §4.3). It is
+// content-addressed, so every replica derives the same name from the same
+// build inputs and stale refs stay prunable by prefix.
+func snapshotRef(envID, setupHash string) string {
+	if len(setupHash) > snapshotRefHashLen {
+		setupHash = setupHash[:snapshotRefHashLen]
+	}
+	return "rainier-env:" + envID + "-" + setupHash
+}
+
+// cacheEnvironment turns one session's finished setup script into its
+// environment's cached snapshot (design §4.3): the runner that ran the script
+// is asked to commit the container, the resulting ref is recorded against the
+// environment under a guarded write, and the rest of the fleet is told to
+// warm it.
+//
+// The decision to snapshot at all is made HERE, in the connection's reader,
+// so that a no-op is complete by the time the event is handled. The work that
+// follows must not be: dispatch waits for a result THIS reader is the one to
+// deliver, so running it inline would deadlock the connection until OpTimeout
+// and stall every other event and result the runner sends meanwhile.
+func (s *Server) cacheEnvironment(ctx context.Context, runner string, row Session) {
+	env, hash, ok := s.snapshotWanted(ctx, runner, row)
+	if !ok {
+		return
+	}
+	go s.buildSnapshot(ctx, runner, row, env, hash)
+}
+
+// snapshotWanted decides whether row's finished setup is worth snapshotting,
+// returning the environment it belongs to and the setup hash to cache it
+// under. Everything is read fresh at event time: the environment may have
+// been edited, deleted, or cached by a sibling session since this one was
+// created.
+//
+// Four answers are "no", each an ordinary outcome rather than a failure:
+//
+//   - a scratch session has no environment to cache;
+//   - the environment is gone;
+//   - it is already cached at exactly this hash — a sibling session won the
+//     race, or a cold resume re-ran an idempotent script;
+//   - the container is not built from the environment's own image, so the
+//     image it would produce is not this environment's cache at all. A
+//     session that overrode `image` still runs the setup script, and an
+//     environment whose image moved after this session was created is in the
+//     same position: publishing either under the environment's hash would
+//     hand every later session an image nobody asked for.
+func (s *Server) snapshotWanted(ctx context.Context, runner string, row Session) (Environment, string, bool) {
+	if row.EnvironmentID == "" {
+		log.Printf("controld: runner %s: setup finished for scratch session %s; nothing to cache", runner, row.ID)
+		return Environment{}, "", false
+	}
+	env, err := s.st.GetEnvironment(ctx, row.EnvironmentID)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		log.Printf("controld: runner %s: setup finished for %s, whose environment %s is gone; nothing to cache",
+			runner, row.ID, clip(row.EnvironmentID))
+		return Environment{}, "", false
+	case err != nil:
+		log.Printf("controld: runner %s: setup finished for %s: reading environment %s: %v",
+			runner, row.ID, clip(row.EnvironmentID), err)
+		return Environment{}, "", false
+	}
+
+	// Recomputed rather than read out of env.SetupHash: this hash is both the
+	// cache key and the value the guarded store write is checked against, so
+	// deriving it from the very two fields the snapshot's content comes from
+	// is what keeps the pair honest.
+	hash := SetupHash(env.Image, env.Setup)
+	switch {
+	case env.SnapshotHash == hash:
+		log.Printf("controld: environment %s is already cached as %s; %s needs no snapshot",
+			env.ID, env.SnapshotRef, row.ID)
+		return Environment{}, "", false
+	case row.ResolvedImage != env.Image:
+		log.Printf("controld: environment %s: not caching %s — it ran the setup over %q, not the environment's %q",
+			env.ID, row.ID, clip(row.ResolvedImage), clip(env.Image))
+		return Environment{}, "", false
+	}
+	return env, hash, true
+}
+
+// buildSnapshot asks runner to commit row's container under the environment's
+// content-addressed ref, records it, and warms the rest of the fleet. It runs
+// in its own goroutine (see cacheEnvironment).
+//
+// Nothing here needs undoing when a step fails: an environment with no
+// snapshot recorded is exactly an environment whose next session runs the
+// setup script again — slower, never wrong.
+func (s *Server) buildSnapshot(ctx context.Context, runner string, row Session, env Environment, hash string) {
+	ref := snapshotRef(env.ID, hash)
+	res, err := s.dispatch(ctx, runner, rwire.ToRunner{Type: "snapshot", Session: row.ID, Ref: ref})
+	switch {
+	case err != nil:
+		log.Printf("controld: snapshotting %s for environment %s on %s: %v", row.ID, env.ID, runner, err)
+		return
+	case !res.OK:
+		log.Printf("controld: snapshotting %s for environment %s on %s: runner reported failure: %s",
+			row.ID, env.ID, runner, clip(res.Detail))
+		return
+	case res.Detail != "" && res.Detail != ref:
+		// A runner echoes the ref it was given (the driver contract returns an
+		// explicit ref verbatim). One that doesn't is a runner bug worth
+		// saying out loud — and the ref recorded stays OURS, because the
+		// content-addressed name is what every other replica derives
+		// independently and what a later create looks the image up by.
+		log.Printf("controld: runner %s answered the snapshot of environment %s with ref %q, not the %q it was given; recording ours",
+			runner, env.ID, clip(res.Detail), ref)
+	}
+
+	// Deliberately not under the connection's context: the image exists on the
+	// runner now, and a connection dying in this instant must not cost the
+	// fleet a rebuild. Bounded so a wedged store cannot leak this goroutine.
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storeCleanupTimeout)
+	defer cancel()
+
+	switch err := s.st.SetEnvironmentSnapshot(wctx, env.ID, hash, ref, runner); {
+	case errors.Is(err, ErrConflict):
+		// The environment was edited or deleted while the snapshot was
+		// building, so this image is of a setup nobody asked for any more.
+		// The guarded write is precisely what keeps it from becoming the
+		// cache (design §4.3); the next session rebuilds from the new script.
+		log.Printf("controld: environment %s changed while %s was being snapshotted; dropping %s",
+			env.ID, row.ID, ref)
+		return
+	case err != nil:
+		log.Printf("controld: recording snapshot %s for environment %s: %v", ref, env.ID, err)
+		return
+	}
+	log.Printf("controld: environment %s cached as %s on %s", env.ID, ref, runner)
+
+	// Warm every OTHER connected runner. The holder is excluded: it just built
+	// the image, and with no registry in v0 that ref names something only it
+	// has, so a prepull there could only fail. Fire-and-forget by design — a
+	// prepull is a head start, never a precondition for a create (design §4.3).
+	s.broadcastToRunners(rwire.ToRunner{Type: "prepull", Ref: ref}, runner)
 }
 
 // reconcile makes the store agree with the reality a runner just announced

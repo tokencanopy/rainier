@@ -194,6 +194,13 @@ func (f *fakeRunner) event(t *testing.T, session, state string) {
 	f.write(t, rwire.FromRunner{Type: "event", Session: session, State: state})
 }
 
+// eventDetail is event with the Detail the setup events carry: runnerd's
+// pre-composed "rc N: <tail>" sentence on a failure, empty on success.
+func (f *fakeRunner) eventDetail(t *testing.T, session, state, detail string) {
+	t.Helper()
+	f.write(t, rwire.FromRunner{Type: "event", Session: session, State: state, Detail: detail})
+}
+
 // waitClosed returns the error that ended the fake's read loop — how a test
 // observes controld hanging up (and, for a protocol rejection, why).
 func (f *fakeRunner) waitClosed(t *testing.T) error {
@@ -244,15 +251,45 @@ func joinRunner(t *testing.T, s *Server, ts *httptest.Server, sc runnerScript) *
 	return f
 }
 
-// nextCreate returns the next "create" command f receives, skipping anything
-// else controld happens to send in the meantime.
-func nextCreate(t *testing.T, f *fakeRunner) rwire.ToRunner {
+// nextOfType returns the next command of type typ f receives, skipping
+// anything else controld happens to send in the meantime.
+func nextOfType(t *testing.T, f *fakeRunner, typ string) rwire.ToRunner {
 	t.Helper()
 	for {
-		if cmd := f.nextCmd(t); cmd.Type == "create" {
+		if cmd := f.nextCmd(t); cmd.Type == typ {
 			return cmd
 		}
 	}
+}
+
+func nextCreate(t *testing.T, f *fakeRunner) rwire.ToRunner {
+	t.Helper()
+	return nextOfType(t, f, "create")
+}
+
+// wantNothingQueued proves controld sent f nothing: a destroy for a probe
+// session is queued now, and a connection delivers in order, so that destroy
+// arriving first means nothing else was ever enqueued ahead of it.
+func wantNothingQueued(t *testing.T, s *Server, f *fakeRunner) {
+	t.Helper()
+	probe := "sess_quiet_probe_" + f.name
+	if err := s.sendToRunner(f.name, rwire.ToRunner{Type: "destroy", Session: probe}); err != nil {
+		t.Fatalf("sendToRunner(%s): %v", f.name, err)
+	}
+	if cmd := f.nextCmd(t); cmd.Type != "destroy" || cmd.Session != probe {
+		t.Fatalf("%s got %+v, want only the probe destroy — controld sent it something it shouldn't have", f.name, cmd)
+	}
+}
+
+// wantEventHandled seeds a fresh session, sends a `running` event for it, and
+// waits for that to land. One connection's messages are handled in order and
+// in the reader, so this proves every event sent before it has already been
+// applied — the synchronization the "and nothing happened" assertions need.
+func wantEventHandled(t *testing.T, st Store, f *fakeRunner, id string) {
+	t.Helper()
+	seedSession(t, st, Session{ID: id, State: StateCreating, Runner: f.name})
+	f.event(t, id, "running")
+	wantState(t, st, id, StateRunning)
 }
 
 // eventually polls fn until it returns nil or d elapses — controld processes
@@ -293,6 +330,15 @@ func seedSession(t *testing.T, st Store, s Session) Session {
 		t.Fatalf("seed session %s: %v", s.ID, err)
 	}
 	return out
+}
+
+func envRow(t *testing.T, st Store, id string) Environment {
+	t.Helper()
+	e, err := st.GetEnvironment(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get environment %s: %v", id, err)
+	}
+	return e
 }
 
 func getSession(t *testing.T, st Store, id string) Session {
@@ -965,6 +1011,349 @@ func TestSendToRunnerUnreachable(t *testing.T) {
 	if !errors.Is(err, ErrRunnerUnreachable) {
 		t.Fatalf("err = %v, want ErrRunnerUnreachable", err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// setup orchestration (design §4.3): the four clauses of the setup pipeline's
+// controld half — the failure arm, the caching arm, its no-ops, and the
+// session state the setup events deliberately do NOT touch.
+// ---------------------------------------------------------------------------
+
+// TestSetupDoneCachesTheSnapshot drives the whole happy path through the real
+// scheduler and the real connections: a queued session on an environment with
+// a setup script is placed, its create carries the script, and the runner's
+// setup_done turns into a snapshot at the content-addressed ref, a guarded
+// store write, and a prepull for the rest of the fleet.
+//
+// It also pins the one structural fact the orchestration turns on: the
+// snapshot's result is delivered by the SAME reader that handled the
+// setup_done, so an orchestration that ran inline in that reader could never
+// see this reply — the environment would simply never get cached.
+func TestSetupDoneCachesTheSnapshot(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	// vm1 has strictly more free capacity, so the session places there; vm2 is
+	// the fleet member the prepull must reach.
+	f1 := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+	f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 1})
+
+	env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "apt-get install -y jq"})
+	seedSession(t, st, Session{ID: "sess_setup", State: StateQueued, Name: "setup1",
+		EnvironmentID: env.ID, ResolvedImage: env.Image, CreatedAt: time.Now().Add(-time.Hour)})
+	startRun(t, s)
+
+	create := nextCreate(t, f1)
+	if create.Spec == nil || create.Spec.Setup != env.Setup {
+		t.Fatalf("create spec = %+v, want one carrying the environment's setup script", create.Spec)
+	}
+	f1.reply(t, create, true, "")
+	f1.event(t, "sess_setup", "running")
+	wantState(t, st, "sess_setup", StateRunning)
+
+	f1.eventDetail(t, "sess_setup", "setup_done", "")
+
+	wantRef := "rainier-env:" + env.ID + "-" + env.SetupHash[:12]
+	snap := nextOfType(t, f1, "snapshot")
+	if snap.Session != "sess_setup" || snap.Ref != wantRef {
+		t.Fatalf("snapshot command = %+v, want sess_setup at ref %s", snap, wantRef)
+	}
+	f1.reply(t, snap, true, snap.Ref)
+
+	eventually(t, 3*time.Second, func() error {
+		got := envRow(t, st, env.ID)
+		if got.SnapshotRef != wantRef || got.SnapshotRunner != "vm1" || got.SnapshotHash != env.SetupHash {
+			return fmt.Errorf("environment cache = %q/%q/%q, want %q/vm1/%s",
+				got.SnapshotRef, got.SnapshotRunner, got.SnapshotHash, wantRef, env.SetupHash)
+		}
+		return nil
+	})
+
+	// Clause 4: a setup event says nothing about the session's own state. The
+	// `running` event governs, and it already did.
+	if got := getSession(t, st, "sess_setup"); got.State != StateRunning {
+		t.Fatalf("session = %q after setup_done, want running (untouched)", got.State)
+	}
+
+	// Every OTHER connected runner gets the head start...
+	if cmd := f2.nextCmd(t); cmd.Type != "prepull" || cmd.Ref != wantRef {
+		t.Fatalf("vm2 got %+v, want the prepull of %s", cmd, wantRef)
+	}
+	// ...and the runner that built it does not: it already holds the image,
+	// and with no registry in v0 the ref names something only it has, so a
+	// prepull there could only fail.
+	wantNothingQueued(t, s, f1)
+}
+
+// TestSetupDoneNoOps covers clause 3: the setup finished, but there is
+// nothing to cache. Each case must be a log line and nothing else — no
+// snapshot command, no store write, no session change.
+func TestSetupDoneNoOps(t *testing.T) {
+	t.Run("scratch session", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		seedSession(t, st, Session{ID: "sess_scratch", State: StateRunning, Runner: "vm1", Image: "img:1"})
+
+		f.eventDetail(t, "sess_scratch", "setup_done", "")
+		wantEventHandled(t, st, f, "sess_sync_scratch")
+		wantNothingQueued(t, s, f)
+
+		if got := getSession(t, st, "sess_scratch"); got.State != StateRunning {
+			t.Fatalf("session = %q, want running (untouched)", got.State)
+		}
+	})
+
+	t.Run("environment already cached at the current hash", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "echo hi"})
+		const ref = "rainier-env:already-cached"
+		env = cacheEnvSnapshot(t, st, env, ref, "vm2")
+		seedSession(t, st, Session{ID: "sess_cached", State: StateRunning, Runner: "vm1",
+			EnvironmentID: env.ID, ResolvedImage: env.Image})
+
+		f.eventDetail(t, "sess_cached", "setup_done", "")
+		wantEventHandled(t, st, f, "sess_sync_cached")
+		wantNothingQueued(t, s, f)
+
+		got := envRow(t, st, env.ID)
+		if got.SnapshotRef != ref || got.SnapshotRunner != "vm2" {
+			t.Fatalf("environment cache = %q on %q, want %q on vm2 (untouched)", got.SnapshotRef, got.SnapshotRunner, ref)
+		}
+	})
+
+	t.Run("environment deleted while the setup ran", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		env := seedEnv(t, st, Environment{Name: "doomed", Image: "img:1", Setup: "echo hi"})
+		seedSession(t, st, Session{ID: "sess_orphan", State: StateRunning, Runner: "vm1",
+			EnvironmentID: env.ID, ResolvedImage: env.Image})
+		if err := st.DeleteEnvironment(context.Background(), env.ID); err != nil {
+			t.Fatalf("DeleteEnvironment: %v", err)
+		}
+
+		f.eventDetail(t, "sess_orphan", "setup_done", "")
+		wantEventHandled(t, st, f, "sess_sync_orphan")
+		wantNothingQueued(t, s, f)
+	})
+
+	t.Run("session that ran the setup over an image of its own", func(t *testing.T) {
+		// An `image` override still gets the environment's setup script, so
+		// setup_done arrives — but what that container holds is the script
+		// applied to somebody else's base. Publishing it under the
+		// environment's hash would hand every later session an image nobody
+		// asked for.
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "echo hi"})
+		seedSession(t, st, Session{ID: "sess_override", State: StateRunning, Runner: "vm1",
+			Image: "myfork:latest", EnvironmentID: env.ID, ResolvedImage: "myfork:latest"})
+
+		f.eventDetail(t, "sess_override", "setup_done", "")
+		wantEventHandled(t, st, f, "sess_sync_override")
+		wantNothingQueued(t, s, f)
+
+		if got := envRow(t, st, env.ID); got.SnapshotRef != "" {
+			t.Fatalf("environment cached as %q from an overridden image; want no cache", got.SnapshotRef)
+		}
+	})
+}
+
+// TestSetupFailedFailsTheSession covers clause 1. The Detail runnerd sends is
+// already a composed sentence ("rc N: <tail>", rc -1 for the timeout kill);
+// controld prefixes it and never parses the rc back out.
+func TestSetupFailedFailsTheSession(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		from   SessionState
+		detail string
+		want   string
+	}{
+		{
+			name:   "from creating",
+			from:   StateCreating,
+			detail: "rc 7: boom",
+			want:   "setup failed: rc 7: boom",
+		},
+		{
+			// The wrapper only execs the agent on rc 0, so in practice the row
+			// is still creating — but the registration `running` event can
+			// outrun the rc write, so that from-state must be accepted too.
+			name:   "from running",
+			from:   StateRunning,
+			detail: "rc -1: setup timed out after 900s",
+			want:   "setup failed: rc -1: setup timed out after 900s",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, st, ts := newTestControld(t)
+			f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+			seedSession(t, st, Session{ID: "sess_failed", State: tc.from, Runner: "vm1"})
+
+			f.eventDetail(t, "sess_failed", "setup_failed", tc.detail)
+
+			got := wantState(t, st, "sess_failed", StateFailed)
+			if got.Error != tc.want {
+				t.Fatalf("error = %q, want %q", got.Error, tc.want)
+			}
+		})
+	}
+}
+
+// TestSetupEventsFromANonPlacedRunnerAreIgnored pins the placement guard on
+// both setup arms. The fleet token is one token: without this, any runner
+// could fail any session, or publish its own container's image as any
+// environment's cache.
+func TestSetupEventsFromANonPlacedRunnerAreIgnored(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+	env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "echo hi"})
+
+	t.Run("setup_failed for a session placed elsewhere", func(t *testing.T) {
+		seedSession(t, st, Session{ID: "sess_elsewhere_failed", State: StateRunning, Runner: "vm2",
+			EnvironmentID: env.ID, ResolvedImage: env.Image})
+
+		f.eventDetail(t, "sess_elsewhere_failed", "setup_failed", "rc 1: boom")
+		wantEventHandled(t, st, f, "sess_sync_ef")
+
+		got := getSession(t, st, "sess_elsewhere_failed")
+		if got.State != StateRunning || got.Runner != "vm2" {
+			t.Fatalf("row = %s on %q, want running on vm2 (untouched)", got.State, got.Runner)
+		}
+	})
+
+	t.Run("setup_failed for an unplaced (requeued) row", func(t *testing.T) {
+		seedSession(t, st, Session{ID: "sess_requeued_failed", State: StateQueued,
+			EnvironmentID: env.ID, ResolvedImage: env.Image})
+
+		f.eventDetail(t, "sess_requeued_failed", "setup_failed", "rc 1: boom")
+		wantEventHandled(t, st, f, "sess_sync_rf")
+
+		got := getSession(t, st, "sess_requeued_failed")
+		if got.State != StateQueued || got.Runner != "" {
+			t.Fatalf("row = %s on %q, want queued and unplaced (untouched)", got.State, got.Runner)
+		}
+	})
+
+	t.Run("setup_done for a session placed elsewhere", func(t *testing.T) {
+		seedSession(t, st, Session{ID: "sess_elsewhere_done", State: StateRunning, Runner: "vm2",
+			EnvironmentID: env.ID, ResolvedImage: env.Image})
+
+		f.eventDetail(t, "sess_elsewhere_done", "setup_done", "")
+		wantEventHandled(t, st, f, "sess_sync_ed")
+		wantNothingQueued(t, s, f)
+
+		if got := envRow(t, st, env.ID); got.SnapshotRef != "" {
+			t.Fatalf("environment cached as %q on a report from a runner it isn't placed on", got.SnapshotRef)
+		}
+	})
+
+	t.Run("setup_done for an unplaced (requeued) row", func(t *testing.T) {
+		seedSession(t, st, Session{ID: "sess_requeued_done", State: StateQueued,
+			EnvironmentID: env.ID, ResolvedImage: env.Image})
+
+		f.eventDetail(t, "sess_requeued_done", "setup_done", "")
+		wantEventHandled(t, st, f, "sess_sync_rd")
+		wantNothingQueued(t, s, f)
+
+		if got := envRow(t, st, env.ID); got.SnapshotRef != "" {
+			t.Fatalf("environment cached as %q from an unplaced row", got.SnapshotRef)
+		}
+	})
+}
+
+// envSnapshotSpy records the outcome of every SetEnvironmentSnapshot the
+// orchestration attempts, so a test can wait for the guarded write — and its
+// verdict — instead of polling for the absence of one.
+type envSnapshotSpy struct {
+	Store
+	calls chan error
+}
+
+func newEnvSnapshotSpy() *envSnapshotSpy {
+	return &envSnapshotSpy{Store: NewMemStore(), calls: make(chan error, 8)}
+}
+
+func (e *envSnapshotSpy) SetEnvironmentSnapshot(ctx context.Context, envID, expectHash, ref, runner string) error {
+	err := e.Store.SetEnvironmentSnapshot(ctx, envID, expectHash, ref, runner)
+	select {
+	case e.calls <- err:
+	default:
+	}
+	return err
+}
+
+// TestSetupDoneStaleEnvironmentIsDropped is the race the guarded store write
+// exists for: the environment is edited while its snapshot is being built, so
+// the image that comes back is of a setup nobody asked for any more. It must
+// be dropped, not recorded, and nothing may be broadcast for it.
+func TestSetupDoneStaleEnvironmentIsDropped(t *testing.T) {
+	spy := newEnvSnapshotSpy()
+	s, ts := newTestControldOver(t, spy)
+	f1 := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+	f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 4})
+
+	env := seedEnv(t, spy, Environment{Name: "dev", Image: "img:1", Setup: "echo one"})
+	seedSession(t, spy, Session{ID: "sess_stale", State: StateRunning, Runner: "vm1",
+		EnvironmentID: env.ID, ResolvedImage: env.Image})
+
+	f1.eventDetail(t, "sess_stale", "setup_done", "")
+	snap := nextOfType(t, f1, "snapshot")
+	if want := "rainier-env:" + env.ID + "-" + env.SetupHash[:12]; snap.Ref != want {
+		t.Fatalf("snapshot ref = %q, want %q", snap.Ref, want)
+	}
+
+	// The edit lands while the runner is still building: the ref in flight now
+	// names an image of the OLD script.
+	edited := env
+	edited.Setup = "echo two"
+	if _, err := spy.UpdateEnvironment(context.Background(), edited); err != nil {
+		t.Fatalf("UpdateEnvironment: %v", err)
+	}
+	f1.reply(t, snap, true, snap.Ref)
+
+	select {
+	case err := <-spy.calls:
+		if !errors.Is(err, ErrConflict) {
+			t.Fatalf("guarded write returned %v, want ErrConflict — the stale snapshot must not land", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the orchestration never attempted the guarded write")
+	}
+
+	got := envRow(t, spy, env.ID)
+	if got.SnapshotRef != "" || got.SnapshotRunner != "" || got.SnapshotHash != "" {
+		t.Fatalf("environment cache = %q/%q/%q, want all empty", got.SnapshotRef, got.SnapshotRunner, got.SnapshotHash)
+	}
+	// Nothing was cached, so there is nothing to warm.
+	wantNothingQueued(t, s, f2)
+}
+
+// TestSetupDoneSnapshotFailureRecordsNothing: a snapshot the runner could not
+// build leaves the environment exactly as it was. The next session on it
+// simply runs setup again — which is why nothing here needs undoing.
+func TestSetupDoneSnapshotFailureRecordsNothing(t *testing.T) {
+	spy := newEnvSnapshotSpy()
+	s, ts := newTestControldOver(t, spy)
+	f1 := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+	f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 4})
+
+	env := seedEnv(t, spy, Environment{Name: "dev", Image: "img:1", Setup: "echo one"})
+	seedSession(t, spy, Session{ID: "sess_snapfail", State: StateRunning, Runner: "vm1",
+		EnvironmentID: env.ID, ResolvedImage: env.Image})
+
+	f1.eventDetail(t, "sess_snapfail", "setup_done", "")
+	snap := nextOfType(t, f1, "snapshot")
+	f1.reply(t, snap, false, "no space left on device")
+
+	select {
+	case err := <-spy.calls:
+		t.Fatalf("recorded a snapshot the runner never built (err %v)", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	if got := envRow(t, spy, env.ID); got.SnapshotRef != "" {
+		t.Fatalf("environment cached as %q after a failed snapshot", got.SnapshotRef)
+	}
+	wantNothingQueued(t, s, f2)
 }
 
 // TestUnroutedPathIs404 pins Handler()'s shape: a path no route claims 404s
