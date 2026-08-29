@@ -183,29 +183,17 @@ func (s *Server) handleRunnerConnect(w http.ResponseWriter, r *http.Request) {
 	name := ann.Runner
 
 	rc := newRunnerConn(name, c)
-	// Registering before the UpsertRunner below is deliberate: it closes any
-	// previous conn for this name, and the pointer guard in retireRunner
-	// then keeps that conn's teardown from marking this live one
-	// disconnected. Doing it the other way round leaves a window where the
-	// old conn's SetRunnerConnected(false) lands after our
-	// UpsertRunner(connected: true) and the fleet loses a runner that is
-	// sitting right here.
-	s.registerRunner(rc)
+	connErr := s.connectRunner(connCtx, rc, ann.Used, ann.Total)
 
 	var writerDone sync.WaitGroup
 	defer func() {
 		s.retireRunner(rc) // closes done, which is what lets the writer exit
 		writerDone.Wait()
 	}()
-
-	if err := s.st.UpsertRunner(connCtx, Runner{
-		Name:          name,
-		CapacityUsed:  ann.Used,
-		CapacityTotal: ann.Total,
-		Connected:     true,
-		LastSeenAt:    time.Now(),
-	}); err != nil {
-		log.Printf("controld: upsert runner %s: %v", name, err)
+	if connErr != nil {
+		// connectRunner registers before it writes, so rc is in the map even
+		// now; the deferred retire above is what takes it back out.
+		log.Printf("controld: upsert runner %s: %v", name, connErr)
 		closeRunner(c, websocket.StatusInternalError, "store unavailable")
 		return
 	}
@@ -263,15 +251,14 @@ func (s *Server) readLoop(ctx context.Context, rc *runnerConn) {
 			log.Printf("controld: runner %s connection ended: %v", rc.name, err)
 			return
 		}
-		if !s.isCurrentConn(rc) {
-			// A reconnect replaced us while this frame was in flight. The
-			// new conn owns the runner now; anything we did here would
-			// write yesterday's news over today's.
+		// Capacity rides every message, not just announces, so the fleet
+		// view is current without a separate capacity message. touchRunner
+		// reports false when a reconnect has replaced us: the new conn owns
+		// the runner now, and anything we did here would write yesterday's
+		// news over today's.
+		if !s.touchRunner(ctx, rc, m) {
 			return
 		}
-		// Capacity rides every message, not just announces, so the fleet
-		// view is current without a separate capacity message.
-		s.touchRunner(ctx, rc.name, m)
 
 		switch m.Type {
 		case "result":
@@ -290,28 +277,61 @@ func (s *Server) readLoop(ctx context.Context, rc *runnerConn) {
 }
 
 // touchRunner refreshes the runner row from any message's piggybacked
-// capacity.
-func (s *Server) touchRunner(ctx context.Context, name string, m rwire.FromRunner) {
+// capacity, reporting whether rc is still the registered connection — the
+// caller stops reading when it isn't. The identity check and the write both
+// happen under the runner's name lock, so a reconnect can neither slip
+// between them nor have its own row write overtaken by this one.
+func (s *Server) touchRunner(ctx context.Context, rc *runnerConn, m rwire.FromRunner) bool {
+	nl := s.nameLock(rc.name)
+	nl.Lock()
+	defer nl.Unlock()
+
+	if !s.isCurrentConn(rc) {
+		return false
+	}
 	err := s.st.UpsertRunner(ctx, Runner{
-		Name:          name,
+		Name:          rc.name,
 		CapacityUsed:  m.Used,
 		CapacityTotal: m.Total,
 		Connected:     true,
 		LastSeenAt:    time.Now(),
 	})
 	if err != nil {
-		log.Printf("controld: upsert runner %s: %v", name, err)
+		log.Printf("controld: upsert runner %s: %v", rc.name, err)
 	}
+	return true
 }
 
 // applyEvent applies a runner's unsolicited state report. Events race
 // reconciliation by nature — the announce is truth, an event is news — so a
 // guarded transition that doesn't apply is expected, not an error.
+//
+// A runner may only report on sessions the store places on it, or on ones it
+// places nowhere yet (a "running" event can outrun the create's own
+// queued→creating transition). Without that guard the fleet-wide runner
+// token would let any runner drive any session to a terminal state, and the
+// stale holder of a duplicate — the case reconcileUnplaced destroys — could
+// mark a session dead that has since been re-placed and is running fine
+// somewhere else.
 func (s *Server) applyEvent(ctx context.Context, runner string, m rwire.FromRunner) {
 	if m.Session == "" {
 		log.Printf("controld: runner %s: event with no session", runner)
 		return
 	}
+	row, err := s.st.GetSession(ctx, m.Session)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		log.Printf("controld: runner %s: event for unknown session %s; ignoring", runner, clip(m.Session))
+		return
+	case err != nil:
+		log.Printf("controld: runner %s: event for %s: %v", runner, clip(m.Session), err)
+		return
+	case row.Runner != "" && row.Runner != runner:
+		log.Printf("controld: runner %s reported %s for %s, which the store places on %s; ignoring",
+			runner, clip(m.State), row.ID, row.Runner)
+		return
+	}
+
 	switch m.State {
 	case "running":
 		s.transitionQuiet(ctx, m.Session, liveOnRunner, StateRunning, TransitionOpts{})
@@ -409,11 +429,23 @@ func (s *Server) reconcileUnplaced(ctx context.Context, name string, ann rwire.S
 		log.Printf("controld: runner %s announced %s, which the store already finished as %s; destroying orphan",
 			name, row.ID, row.State)
 		s.destroyOrphan(name, row.ID)
+	case row.Runner != "" && row.Runner != name:
+		// The store has this session placed on a different runner, so this
+		// one is holding a duplicate — the losing half of a requeue that
+		// re-placed elsewhere while this runner was away. Postgres owns
+		// placement (§4.8), so the copy here is an orphan. Adopting it
+		// instead would leave both copies alive and make Runner ping-pong
+		// between the two on every reconnect, with the loser's container
+		// holding a slot for the life of the runner.
+		log.Printf("controld: runner %s announced %s, which the store places on %s; destroying the duplicate",
+			name, row.ID, row.Runner)
+		s.destroyOrphan(name, row.ID)
 	default:
-		// The store wants this session alive but has it elsewhere (or
-		// nowhere — e.g. requeued while the runner was away). runnerd is
-		// truth for liveness: adopt it onto the runner that actually holds
-		// it rather than destroying something the store still wants.
+		// The store wants this session alive and has it either here or
+		// nowhere (e.g. requeued while the runner was away, never
+		// re-placed). runnerd is truth for liveness: adopt it onto the
+		// runner that actually holds it rather than destroying something
+		// the store still wants.
 		want, ok := announcedState(ann.State)
 		if !ok {
 			log.Printf("controld: runner %s announced %s in unknown state %q; leaving it alone",
@@ -462,7 +494,10 @@ func announcedState(s string) (SessionState, bool) {
 // dispatch sends m to a runner and waits for the matching result. It assigns
 // the ReqID (per-connection, so ids never collide across runners) and
 // returns an error wrapping ErrRunnerUnreachable whenever no answer arrives:
-// no connection, a connection that died, or OpTimeout.
+// no connection, a connection that died, or OpTimeout. The one exception is
+// the caller's own ctx being canceled, which returns a bare ctx.Err() — the
+// runner is not implicated, and callers that map ErrRunnerUnreachable to a
+// 502 should let that one surface as the client disconnect it is.
 func (s *Server) dispatch(ctx context.Context, runner string, m rwire.ToRunner) (rwire.FromRunner, error) {
 	rc := s.conn(runner)
 	if rc == nil {
@@ -551,10 +586,55 @@ func (s *Server) isCurrentConn(rc *runnerConn) bool {
 	return s.runners[rc.name] == rc
 }
 
+// nameLock returns the mutex serializing the store writes that describe one
+// runner. The pointer guard alone cannot order those writes: between a
+// dying connection's identity check and its SetRunnerConnected(false) sits a
+// whole store round-trip, and a redial that registers and writes
+// connected:true inside that gap loses to the stale disconnect that lands
+// after it. The protocol is announce-once, so an idle runner sends nothing
+// further to correct the row — the fleet member most likely to have free
+// slots would stay invisible to the scheduler until its next redial. Every
+// path that writes a runner row therefore takes this lock, re-checks the
+// registered conn under it, and only then writes.
+//
+// Entries are never removed: the key set is runner names, one small mutex
+// per fleet member, and removing one safely would need refcounting for no
+// practical gain. s.mu is released before the lock is taken, so the two
+// never nest the wrong way round.
+func (s *Server) nameLock(name string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	mu, ok := s.runnerLocks[name]
+	if !ok {
+		mu = &sync.Mutex{}
+		s.runnerLocks[name] = mu
+	}
+	return mu
+}
+
+// connectRunner installs rc as the live connection for its runner and
+// records the capacity it announced, both under the runner's name lock so
+// that a connection being retired at this same instant either writes its
+// disconnect before us or (seeing itself replaced) not at all.
+func (s *Server) connectRunner(ctx context.Context, rc *runnerConn, used, total int) error {
+	nl := s.nameLock(rc.name)
+	nl.Lock()
+	defer nl.Unlock()
+
+	s.registerRunner(rc)
+	return s.st.UpsertRunner(ctx, Runner{
+		Name:          rc.name,
+		CapacityUsed:  used,
+		CapacityTotal: total,
+		Connected:     true,
+		LastSeenAt:    time.Now(),
+	})
+}
+
 // registerRunner installs rc as the live connection for its runner and
 // closes whatever it replaces. A redial that arrives before the old
 // connection's teardown must win, so the swap happens under the lock and the
-// old conn is closed after it.
+// old conn is closed after it. Callers hold the runner's name lock.
 func (s *Server) registerRunner(rc *runnerConn) {
 	s.mu.Lock()
 	old := s.runners[rc.name]
@@ -571,9 +651,15 @@ func (s *Server) registerRunner(rc *runnerConn) {
 // on it with ErrRunnerUnreachable) and, only if rc is still the registered
 // connection for its name, deregisters it and records the runner as
 // disconnected. The pointer guard is what keeps a replaced connection's
-// teardown from marking the connection that replaced it dead.
+// teardown from marking the connection that replaced it dead; holding the
+// name lock across the check and the write is what keeps a redial from
+// slipping into the gap between them (see nameLock).
 func (s *Server) retireRunner(rc *runnerConn) {
 	rc.shutdown()
+
+	nl := s.nameLock(rc.name)
+	nl.Lock()
+	defer nl.Unlock()
 
 	s.mu.Lock()
 	current := s.runners[rc.name] == rc

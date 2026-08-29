@@ -50,11 +50,15 @@ type Server struct {
 	st  Store
 	cfg Config
 
-	// mu guards runners. It is held only for map reads and writes, never
-	// across a store call or a socket write, so a slow runner can't stall
-	// registration for the rest of the fleet.
+	// mu guards runners and runnerLocks. It is held only for map reads and
+	// writes, never across a store call or a socket write, so a slow runner
+	// can't stall registration for the rest of the fleet.
 	mu      sync.Mutex
 	runners map[string]*runnerConn
+	// runnerLocks serializes the store writes that describe one runner
+	// (connected flag and capacity) — see nameLock. Keyed by runner name,
+	// never held while mu is.
+	runnerLocks map[string]*sync.Mutex
 
 	// schedWake carries capacity news to the scheduler loop (Task 8). It is
 	// buffered by one and written non-blockingly: the loop only needs to
@@ -86,10 +90,11 @@ func New(st Store, cfg Config) (*Server, error) {
 		cfg.GitHubAPIBase = defaultGitHubAPIBase
 	}
 	return &Server{
-		st:        st,
-		cfg:       cfg,
-		runners:   map[string]*runnerConn{},
-		schedWake: make(chan struct{}, 1),
+		st:          st,
+		cfg:         cfg,
+		runners:     map[string]*runnerConn{},
+		runnerLocks: map[string]*sync.Mutex{},
+		schedWake:   make(chan struct{}, 1),
 	}, nil
 }
 
