@@ -98,15 +98,28 @@ func New(st Store, cfg Config) (*Server, error) {
 	}, nil
 }
 
-// Handler returns controld's full HTTP surface: the runner control endpoint
-// today, plus the client API and attach plane as later tasks register them.
-// Paths no task has claimed yet 404.
+// Handler returns controld's full HTTP surface: the runner control
+// endpoint, the auth exchange, and the sessions/runners client API, all
+// wrapped in the shared middleware chain (request id, nosniff, no-store on
+// GET — see withMiddleware). Paths no task has claimed yet 404. The attach
+// plane is the one piece a later task still adds.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/runners/connect", s.handleRunnerConnect)
 	mux.HandleFunc("POST /v1/auth/github", s.handleGitHubAuth)
 	mux.HandleFunc("GET /v1/me", s.requireUser(s.handleMe))
-	return mux
+
+	mux.HandleFunc("POST /v1/sessions", s.requireUser(s.handleCreateSession))
+	mux.HandleFunc("GET /v1/sessions", s.requireUser(s.handleListSessions))
+	mux.HandleFunc("GET /v1/sessions/{id}", s.requireUser(s.handleGetSession))
+	mux.HandleFunc("DELETE /v1/sessions/{id}", s.requireUser(s.handleDeleteSession))
+	mux.HandleFunc("POST /v1/sessions/{id}/suspend", s.requireUser(s.handleSuspendSession))
+	mux.HandleFunc("POST /v1/sessions/{id}/resume", s.requireUser(s.handleResumeSession))
+	mux.HandleFunc("POST /v1/sessions/{id}/snapshot", s.requireUser(s.handleSnapshotSession))
+	mux.HandleFunc("GET /v1/runners", s.requireUser(s.handleListRunners))
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+
+	return withMiddleware(mux)
 }
 
 // Run hosts controld's background loops and blocks until ctx is done.
