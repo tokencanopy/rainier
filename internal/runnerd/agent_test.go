@@ -481,3 +481,160 @@ func TestAgentReconnectDoesNotLeakWriterGoroutine(t *testing.T) {
 	cancel() // shut the agent down entirely
 	waitForAgentWriterCount(t, rd, 0)
 }
+
+// blockingPrepullFake wraps driver.Fake with a Prepull that parks until the
+// test releases it, so a test can hold one command mid-flight and prove the
+// next one is still served. Same shadowing pattern as slowFake in
+// runnerd_test.go: every other driver method goes straight through.
+type blockingPrepullFake struct {
+	*driver.Fake
+	entered chan string
+	release chan struct{}
+}
+
+func newBlockingPrepullFake(total int) *blockingPrepullFake {
+	return &blockingPrepullFake{Fake: driver.NewFake(total), entered: make(chan string, 1), release: make(chan struct{})}
+}
+
+func (f *blockingPrepullFake) Prepull(ctx context.Context, ref string) error {
+	f.entered <- ref
+	<-f.release
+	return f.Fake.Prepull(ctx, ref)
+}
+
+// TestAgentSnapshotUsesTheCommandRef: controld content-addresses an
+// environment's cached image and sends the runner that exact tag, so a
+// snapshot command's ref must reach the driver and come back as the result's
+// detail verbatim. Before Task 6 the agent had no way to pass one — every
+// snapshot got a driver-minted rainier-snap: tag, which controld could not
+// have addressed a later create against.
+func TestAgentSnapshotUsesTheCommandRef(t *testing.T) {
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "", "")
+	if err := rd.CreateWithID(context.Background(), "sess_env", driver.Spec{Image: "img"}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1"})
+
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+
+	const ref = "rainier-env:e-1"
+	conn.send(t, rwire.ToRunner{Type: "snapshot", ReqID: 9, Session: "sess_env", Ref: ref})
+	res := conn.readMsg(t)
+	if res.Type != "result" || res.ReqID != 9 || !res.OK {
+		t.Fatalf("result = %+v, want an ok result for req_id 9", res)
+	}
+	if res.Detail != ref {
+		t.Fatalf("result detail = %q, want the commanded ref %q", res.Detail, ref)
+	}
+}
+
+// TestAgentPrepullPullsAndReports: prepull is advisory — controld dispatches
+// it with no pending entry to correlate against, so the command carries
+// neither a session nor a req_id, and the agent must handle both absences.
+// The result is informational: ok plus the ref it pulled.
+func TestAgentPrepullPullsAndReports(t *testing.T) {
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "", "")
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1"})
+
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+
+	const ref = "rainier-env:e-2"
+	conn.send(t, rwire.ToRunner{Type: "prepull", Ref: ref})
+	res := conn.readMsg(t)
+	if res.Type != "result" || !res.OK {
+		t.Fatalf("result = %+v, want an ok result", res)
+	}
+	if res.ReqID != 0 {
+		t.Fatalf("result req_id = %d, want 0 echoed back from the ref-only command", res.ReqID)
+	}
+	if res.Detail != ref {
+		t.Fatalf("result detail = %q, want the pulled ref %q", res.Detail, ref)
+	}
+	// The result is sent only after Prepull returns, so by now the driver has
+	// certainly recorded it.
+	if got := fd.Pulls(); len(got) != 1 || got[0] != ref {
+		t.Fatalf("driver pulls = %v, want exactly [%s]", got, ref)
+	}
+}
+
+// TestAgentPrepullFailureReportsTheError: a prepull for an image that cannot
+// be fetched must come back as a failed result carrying the reason, not a
+// silent drop — controld logs it, and a runner that answered nothing would
+// look indistinguishable from one that pulled fine.
+func TestAgentPrepullFailureReportsTheError(t *testing.T) {
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "", "")
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1"})
+
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+
+	// An empty ref is the one failure every driver rejects identically (see
+	// driver.Fake.Prepull / Docker.Prepull), so it needs no fake of its own.
+	conn.send(t, rwire.ToRunner{Type: "prepull", ReqID: 4})
+	res := conn.readMsg(t)
+	if res.Type != "result" || res.ReqID != 4 || res.OK {
+		t.Fatalf("result = %+v, want a failed result for req_id 4", res)
+	}
+	if res.Detail == "" {
+		t.Fatal("failed prepull result carried no detail; want the error text")
+	}
+}
+
+// TestAgentPrepullDoesNotBlockTheReader: `docker pull` of a cold image runs
+// for minutes, and a prepull is exactly the command a runner receives while
+// real work is in flight. If it were served inline on the read loop, every
+// other command — the create the prepull was warming up FOR, included — would
+// queue behind it. This parks a prepull mid-pull and proves a later snapshot
+// is served and answered while it is still running.
+func TestAgentPrepullDoesNotBlockTheReader(t *testing.T) {
+	fd := newBlockingPrepullFake(4)
+	rd := New(fd, "", "", "")
+	if err := rd.CreateWithID(context.Background(), "sess_par", driver.Spec{Image: "img"}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1"})
+
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+
+	conn.send(t, rwire.ToRunner{Type: "prepull", ReqID: 1, Ref: "rainier-env:slow"})
+	select {
+	case <-fd.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("prepull never reached the driver")
+	}
+
+	// Sent while the prepull is parked inside the driver.
+	conn.send(t, rwire.ToRunner{Type: "snapshot", ReqID: 2, Session: "sess_par", Ref: "rainier-env:fast"})
+	res := conn.readMsg(t)
+	if res.ReqID != 2 || !res.OK || res.Detail != "rainier-env:fast" {
+		t.Fatalf("first result = %+v, want the snapshot's (req_id 2) — the prepull is blocking the reader", res)
+	}
+
+	close(fd.release)
+	res = conn.readMsg(t)
+	if res.ReqID != 1 || !res.OK {
+		t.Fatalf("second result = %+v, want the released prepull's (req_id 1)", res)
+	}
+}

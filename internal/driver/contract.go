@@ -6,6 +6,23 @@ import (
 	"testing"
 )
 
+// cleanupSnapshotRef best-effort removes an image a snapshot subtest just
+// committed. Only the docker driver puts a real image on the host — every
+// other driver's ref is bookkeeping it drops with the driver itself — so this
+// is a no-op for them, and its failure is never worth failing a test over:
+// leaving a stray tag behind is untidy, not incorrect.
+//
+// It lives here rather than in each driver's own tests because the refs it has
+// to clean up are the ones the shared subtests above name, and the alternative
+// (the docker contract run silently accumulating one `rainier-*` image per
+// invocation on the developer's machine) is what the pre-Task-6 suite did.
+func cleanupSnapshotRef(d Driver, ref string) {
+	if _, ok := d.(*Docker); !ok || ref == "" {
+		return
+	}
+	dockerRun(context.Background(), "image", "rm", "-f", ref)
+}
+
 func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 	t.Run("create-inspect-destroy", func(t *testing.T) {
 		d, cleanup := newDriver(t)
@@ -56,27 +73,58 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 		}
 	})
 
-	t.Run("snapshot", func(t *testing.T) {
+	t.Run("snapshot with an empty ref generates unique refs", func(t *testing.T) {
+		// An empty ref is the dev surface's case (POST
+		// /sessions/{id}/snapshot has no environment to name), and the driver
+		// mints the tag itself. The Plan 2 behavior, re-pinned through the
+		// two-argument signature.
 		d, cleanup := newDriver(t)
 		defer cleanup()
 		ctx := context.Background()
 		h, _ := d.Create(ctx, Spec{Name: "t3", Image: "", SessionID: "s3", DialURL: "ws://x"})
 		defer d.Destroy(ctx, h.ID)
-		snap, err := d.Snapshot(ctx, h.ID)
+		snap, err := d.Snapshot(ctx, h.ID, "")
 		if err != nil || snap.Ref == "" {
 			t.Fatalf("snapshot = %+v, %v", snap, err)
 		}
+		defer cleanupSnapshotRef(d, snap.Ref)
 		// Two snapshots of the SAME handle must get distinct refs: a fixed
 		// per-container suffix (e.g. derived only from the container id's
 		// length) makes every snapshot of that container collide on the same
 		// ref, so a second `docker commit` silently overwrites the first
 		// snapshot under the same tag instead of producing a new one.
-		snap2, err := d.Snapshot(ctx, h.ID)
+		snap2, err := d.Snapshot(ctx, h.ID, "")
 		if err != nil || snap2.Ref == "" {
 			t.Fatalf("second snapshot = %+v, %v", snap2, err)
 		}
+		defer cleanupSnapshotRef(d, snap2.Ref)
 		if snap2.Ref == snap.Ref {
 			t.Fatalf("two snapshots of the same handle got the same ref: %q", snap.Ref)
+		}
+	})
+
+	t.Run("snapshot honors an explicit ref", func(t *testing.T) {
+		// Plan 4 content-addresses an environment's cached image in CONTROLD
+		// (rainier-env:<envID>-<setupHash>) and hands the runner that exact
+		// tag, so the same environment resolves to the same ref on every
+		// runner in the fleet. The driver treats it as opaque and must return
+		// it verbatim — a driver that minted its own name here, or decorated
+		// the caller's, would break that addressing outright: controld would
+		// record one ref and later creates would look for an image nobody
+		// ever tagged.
+		d, cleanup := newDriver(t)
+		defer cleanup()
+		ctx := context.Background()
+		h, _ := d.Create(ctx, Spec{Name: "t8", Image: "", SessionID: "s8", DialURL: "ws://x"})
+		defer d.Destroy(ctx, h.ID)
+		const ref = "rainier-env:contract-abc123"
+		defer cleanupSnapshotRef(d, ref)
+		snap, err := d.Snapshot(ctx, h.ID, ref)
+		if err != nil {
+			t.Fatalf("snapshot to %q: %v", ref, err)
+		}
+		if snap.Ref != ref {
+			t.Fatalf("snapshot ref = %q, want %q verbatim", snap.Ref, ref)
 		}
 	})
 

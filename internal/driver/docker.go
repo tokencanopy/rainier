@@ -495,23 +495,49 @@ func (d *Docker) Resume(ctx context.Context, id string) error {
 	return err
 }
 
-func (d *Docker) Snapshot(ctx context.Context, id string) (Snapshot, error) {
+// Snapshot commits the container as an image under ref, or under a
+// driver-generated one when ref is empty (see the Driver interface for which
+// caller is which, and why the given ref is honored exactly).
+func (d *Docker) Snapshot(ctx context.Context, id, ref string) (Snapshot, error) {
 	if _, err := dockerRun(ctx, "inspect", "-f", "{{.Id}}", id); err != nil {
 		return Snapshot{}, fmt.Errorf("snapshot: no such container %s: %w", id, err)
 	}
-	short := id
-	if len(short) > 12 {
-		short = short[:12]
+	if ref == "" {
+		ref = d.generatedSnapshotRef(id)
 	}
-	// The suffix must make each call's ref unique, not just each container's:
-	// snapshotting the same container twice used to reuse len(short) (always
-	// 12 for a real container id) as the suffix, so both calls produced the
-	// identical ref and the second `docker commit` silently overwrote the
-	// first snapshot under the same tag. A per-call atomic counter fixes that
-	// regardless of how many times Snapshot is called on the same handle.
-	ref := "rainier-snap:" + short + "-" + strconv.FormatInt(d.snapSeq.Add(1), 10)
 	if _, err := dockerRun(ctx, "commit", id, ref); err != nil {
 		return Snapshot{}, err
 	}
 	return Snapshot{Ref: ref}, nil
+}
+
+// generatedSnapshotRef mints the driver's own tag for a snapshot nobody named
+// — the dev surface's case.
+//
+// The suffix must make each CALL's ref unique, not just each container's:
+// snapshotting the same container twice used to reuse len(short) (always 12
+// for a real container id) as the suffix, so both calls produced the identical
+// ref and the second `docker commit` silently overwrote the first snapshot
+// under the same tag. A per-call atomic counter fixes that regardless of how
+// many times Snapshot is called on the same handle.
+func (d *Docker) generatedSnapshotRef(id string) string {
+	short := id
+	if len(short) > 12 {
+		short = short[:12]
+	}
+	return "rainier-snap:" + short + "-" + strconv.FormatInt(d.snapSeq.Add(1), 10)
+}
+
+// Prepull fetches ref so a create that names it doesn't pay for the pull.
+//
+// An empty ref is rejected before the exec: it means the command upstream
+// carried no ref at all, and `docker pull ""` reports that as a CLI usage
+// error whose text reads like a defect in this driver rather than in its
+// caller.
+func (d *Docker) Prepull(ctx context.Context, ref string) error {
+	if ref == "" {
+		return errors.New("prepull: empty image ref")
+	}
+	_, err := dockerRun(ctx, "pull", ref)
+	return err
 }

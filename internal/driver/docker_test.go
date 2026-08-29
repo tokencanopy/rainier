@@ -600,3 +600,64 @@ func TestWorkspaceInitArgs(t *testing.T) {
 		t.Errorf("image at %d, script at %d: the script must follow the image: %v", img, script, args)
 	}
 }
+
+// TestDockerSnapshotToExplicitRefCreatesThatImage is the docker half of the
+// contract's "snapshot honors an explicit ref" subtest: the contract can only
+// assert the ref comes back verbatim, but what actually matters to Plan 4 is
+// that `docker image inspect` finds a real image under the tag controld
+// content-addressed. A driver that returned the ref while committing under a
+// name of its own would pass the contract and still leave every later create
+// pulling an image nobody tagged.
+func TestDockerSnapshotToExplicitRefCreatesThatImage(t *testing.T) {
+	dockerAvailable(t)
+	d := NewDocker(DockerOpts{Image: "alpine:3.20", Network: "bridge", TotalSlots: 8, Label: "rainier.test"})
+	d.defaultCmd = []string{"sleep", "3600"}
+	defer d.destroyAllLabeled(context.Background())
+	ctx := context.Background()
+
+	h, err := d.Create(ctx, Spec{Name: "tsnapref", SessionID: "ssnapref", DialURL: "ws://x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Destroy(ctx, h.ID)
+
+	const ref = "rainier-env:dockertest-abc123"
+	defer dockerRun(ctx, "image", "rm", "-f", ref)
+	snap, err := d.Snapshot(ctx, h.ID, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.Ref != ref {
+		t.Fatalf("snapshot ref = %q, want %q verbatim", snap.Ref, ref)
+	}
+	if _, err := dockerRun(ctx, "image", "inspect", "-f", "{{.Id}}", ref); err != nil {
+		t.Fatalf("docker image inspect %s: %v (the commit did not land under the ref the driver reported)", ref, err)
+	}
+}
+
+// TestDockerPrepullPullsTheImage exercises the real `docker pull`. alpine:3.20
+// is the same image the rest of this file's docker-gated tests already require
+// present, so this adds no dependency the suite didn't already have.
+func TestDockerPrepullPullsTheImage(t *testing.T) {
+	dockerAvailable(t)
+	d := NewDocker(DockerOpts{Image: "alpine:3.20", TotalSlots: 8, Label: "rainier.test"})
+	ctx := context.Background()
+	if err := d.Prepull(ctx, "alpine:3.20"); err != nil {
+		t.Fatalf("Prepull(alpine:3.20) = %v", err)
+	}
+	if _, err := dockerRun(ctx, "image", "inspect", "-f", "{{.Id}}", "alpine:3.20"); err != nil {
+		t.Fatalf("after Prepull, docker image inspect alpine:3.20: %v", err)
+	}
+}
+
+// TestDockerPrepullRejectsEmptyRef: an empty ref is an upstream bug (a
+// prepull command that carried no ref at all), and `docker pull ""` reports it
+// as a CLI usage error that reads like a driver defect. Rejecting before the
+// exec keeps the message legible — and needs no docker daemon, so it runs
+// everywhere.
+func TestDockerPrepullRejectsEmptyRef(t *testing.T) {
+	d := NewDocker(DockerOpts{Image: "alpine:3.20", TotalSlots: 8, Label: "rainier.test"})
+	if err := d.Prepull(context.Background(), ""); err == nil {
+		t.Fatal("Prepull with an empty ref = nil, want an error")
+	}
+}

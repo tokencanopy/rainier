@@ -1116,3 +1116,40 @@ func TestDeleteSessionRemovesRegistryEntryAndClosesHub(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// TestSnapshotOverHTTPGeneratesARef pins the local dev surface (runnerctl
+// snapshot). Task 6 moved this path off Op onto OpSnapshot(id, ""), because
+// only the agent has an environment ref to commit to; a plain
+// POST /sessions/{id}/snapshot names none, so the driver still mints one and
+// it still comes back as {"ref": ...}. The observable behavior must not have
+// moved with the plumbing.
+func TestSnapshotOverHTTPGeneratesARef(t *testing.T) {
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "", "")
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+	if err := rd.CreateWithID(context.Background(), "sess-snap", driver.Spec{Image: "img"}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := http.Post(srv.URL+"/sessions/sess-snap/snapshot", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("snapshot status = %d, want 200", resp.StatusCode)
+	}
+	var body struct {
+		Ref string `json:"ref"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	// The fake's generated shape. Asserting the prefix (rather than merely
+	// "not empty") is what proves the empty ref actually reached the driver
+	// and it minted one, instead of the handler echoing back a blank.
+	if !strings.HasPrefix(body.Ref, "fake-image:") {
+		t.Fatalf("snapshot ref = %q, want a driver-generated fake-image: ref", body.Ref)
+	}
+}

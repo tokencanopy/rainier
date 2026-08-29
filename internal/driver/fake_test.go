@@ -90,3 +90,46 @@ func TestFakeNoSessionIDNoVolume(t *testing.T) {
 		t.Errorf("id-less create recorded volumes %v, want none", names)
 	}
 }
+
+// TestFakeRecordsPrepulls pins the bookkeeping runnerd's agent tests depend
+// on: Prepull is otherwise invisible (nothing about the fake's state changes),
+// so recording the refs is the only way a caller can prove the command reached
+// the driver at all.
+func TestFakeRecordsPrepulls(t *testing.T) {
+	f := NewFake(2)
+	ctx := context.Background()
+	if err := f.Prepull(ctx, "rainier-env:e1-aaa"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Prepull(ctx, "rainier-env:e2-bbb"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"rainier-env:e1-aaa", "rainier-env:e2-bbb"}
+	if got := f.Pulls(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Pulls() = %v, want %v (in call order)", got, want)
+	}
+
+	// Same guard as the docker driver's: a ref-less prepull is an upstream
+	// bug, and a fake that accepted it would let a runnerd test pass against
+	// a call production rejects.
+	if err := f.Prepull(ctx, ""); err == nil {
+		t.Error("Prepull with an empty ref = nil, want an error")
+	}
+	if got := f.Pulls(); len(got) != 2 {
+		t.Errorf("a rejected prepull was recorded: %v", got)
+	}
+}
+
+// TestFakePullsIsACopy: the accessor must not hand out the fake's own slice,
+// or a caller appending to what it got would rewrite the driver's record.
+func TestFakePullsIsACopy(t *testing.T) {
+	f := NewFake(2)
+	if err := f.Prepull(context.Background(), "img:1"); err != nil {
+		t.Fatal(err)
+	}
+	got := f.Pulls()
+	got[0] = "mutated"
+	if again := f.Pulls(); again[0] != "img:1" {
+		t.Errorf("Pulls()[0] = %q after the caller mutated its copy; want %q", again[0], "img:1")
+	}
+}

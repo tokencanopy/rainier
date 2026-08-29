@@ -197,9 +197,43 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 			// controld settles the dispatch before it sees the state.
 			s.reannounce(m.Session, send)
 		}
-	case "suspend", "resume", "snapshot":
-		ref, err := s.Op(ctx, m.Session, m.Type, m.Warm)
+	case "suspend", "resume":
+		err := s.Op(ctx, m.Session, m.Type, m.Warm)
+		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: errText(err)})
+	case "snapshot":
+		// m.Ref is controld's content-addressed environment ref
+		// (rainier-env:<envID>-<setupHash>), passed through untouched — see
+		// driver.Driver.Snapshot for why the runner must not rename it. An
+		// empty one still means "driver, mint a tag", which is what the local
+		// HTTP surface sends; controld always names one.
+		//
+		// The detail carries the FINAL ref, which is the whole point on this
+		// path: controld records what came back, so a driver-generated ref
+		// reaches it just as an echoed one does.
+		ref, err := s.OpSnapshot(ctx, m.Session, m.Ref)
 		detail := ref
+		if err != nil {
+			detail = err.Error()
+		}
+		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: detail})
+	case "prepull":
+		// Advisory and session-less: controld dispatches a prepull without a
+		// pending entry to correlate against (design §4.3 — it is warming an
+		// image, not driving a session's state machine), so this case must not
+		// depend on m.Session or m.ReqID being set. The result is sent for the
+		// same reason any other one is — it goes out over the writer's `out`
+		// channel, which needs nothing on controld's side to be waiting for it
+		// — and is informational: the ref on success, the reason on failure.
+		//
+		// `docker pull` of a cold image runs for minutes, and this deliberately
+		// does NOT get a goroutine of its own: execute ALREADY runs one per
+		// inbound command (agentSession's read loop does `go s.execute(...)`)
+		// precisely so a slow docker op can't stall the next command. Nesting a
+		// second goroutine here would buy nothing and cost the honest
+		// "one command, one goroutine" accounting. Pinned by
+		// TestAgentPrepullDoesNotBlockTheReader.
+		err := s.drv.Prepull(ctx, m.Ref)
+		detail := m.Ref
 		if err != nil {
 			detail = err.Error()
 		}
@@ -352,13 +386,24 @@ func wsOrigin(raw string) (string, bool) {
 	return scheme + "://" + host + ":" + port, true
 }
 
+// errText returns err's message, or "" if err is nil — the Detail a result
+// carries for an op whose success has nothing else to report (suspend,
+// resume). Snapshot and prepull don't use it: their success detail is the
+// image ref, not silence.
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
 // errTextUnless returns err's message, or "" if err is nil or matches
 // sentinel — used by destroy (errNoSuchSession) and create
 // (errSessionExists), where that particular error is a success case, not a
 // failure detail worth surfacing.
 func errTextUnless(err, sentinel error) string {
-	if err == nil || errors.Is(err, sentinel) {
+	if errors.Is(err, sentinel) {
 		return ""
 	}
-	return err.Error()
+	return errText(err)
 }
