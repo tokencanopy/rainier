@@ -64,7 +64,13 @@ say "installing docker + tailscale + go $GO_VERSION on $VM (idempotent)"
 # Single-quoted heredoc: this whole block is remote shell, so $USER, $(…) and
 # friends must reach the VM unexpanded. GO_VERSION is the one local value it
 # needs, so it is passed in as an env assignment on the remote command line.
-gcloud compute ssh "$VM" --project "$PROJECT" --zone "$ZONE" --command "GO_VERSION=$GO_VERSION bash -s" <<'REMOTE'
+# The first ssh to a freshly created VM can lose the key-propagation race
+# even after gcloud's own internal wait (seen live on 2026-08-29: exit 255,
+# install phase never ran). Bounded retry: 5 attempts, 15s apart, then fail
+# loudly. Re-running the whole script is always safe, but it shouldn't be
+# necessary for a race this common.
+ssh_install() {
+  gcloud compute ssh "$VM" --project "$PROJECT" --zone "$ZONE" --command "GO_VERSION=$GO_VERSION bash -s" <<'REMOTE'
   set -e
   if ! command -v docker >/dev/null; then
     echo "--- installing docker"
@@ -114,6 +120,13 @@ gcloud compute ssh "$VM" --project "$PROJECT" --zone "$ZONE" --command "GO_VERSI
     echo "NEXT, on the VM: sudo tailscale up    (authenticate in the browser it prints)"
   fi
 REMOTE
+}
+for attempt in 1 2 3 4 5; do
+  if ssh_install; then INSTALL_OK=1; break; fi
+  echo "ssh attempt $attempt failed (key propagation?) — retrying in 15s" >&2
+  sleep 15
+done
+[ "${INSTALL_OK:-0}" = "1" ] || { echo "FATAL: could not ssh into $VM after 5 attempts — run this script again once ssh works" >&2; exit 1; }
 
 cat <<EOF
 
