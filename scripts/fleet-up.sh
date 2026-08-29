@@ -162,14 +162,45 @@ echo "internal network bridge gateway: $BRIDGE_GW; host reachable via: $GW"
 # each session's own id as URL userinfo per container (Task 13, egress R4),
 # so every session gets a distinct, correctly-scoped Proxy-Authorization
 # identity from this one shared flag value.
-./bin/runnerd --listen 0.0.0.0:8080 --dial-base "ws://$GW:8080" \
-  --image rainier-session:latest --network rainier-internal \
-  --egress-admin http://127.0.0.1:3129 --proxy-url "http://$GW:3128" \
-  >/tmp/runnerd.log 2>&1 &
+RUNNERD_ARGS=(--listen 0.0.0.0:8080 --dial-base "ws://$GW:8080"
+  --image rainier-session:latest --network rainier-internal
+  --egress-admin http://127.0.0.1:3129 --proxy-url "http://$GW:3128")
+
+# Dial (agent) mode, opt-in via CONTROLD_URL: this runnerd also dials a
+# control plane and takes its placements from there (Plan 3). Unset — the
+# default, and what scripts/demo.sh and runnerctl still drive — is exactly
+# the behavior this script has always had: local HTTP surface only.
+# scripts/e2e-fleet.sh sets it after starting controld; docs/deploy-gce.md
+# does the same on the VM.
+#
+# The local HTTP surface stays up in BOTH modes and is unaffected by this:
+# it is what session containers register against, what egress-check.sh
+# drives, and the documented dev/debug path (cmd/runnerd keeps serving it in
+# a goroutine when --controld is set).
+RUNNER_NAME="${RUNNER_NAME:-$(hostname -s 2>/dev/null || hostname)}"
+if [ -n "${CONTROLD_URL:-}" ]; then
+  if [ -z "${RAINIER_RUNNER_TOKEN:-}" ]; then
+    # Fail closed and loudly rather than starting a runner that will
+    # log.Fatal on its own the moment it tries to dial: the token is the
+    # only thing authenticating this runner to the fleet.
+    echo "FATAL: CONTROLD_URL is set but RAINIER_RUNNER_TOKEN is empty — a runnerd cannot dial controld without the fleet token." >&2
+    kill "$(cat /tmp/rainier-egressd.pid)" 2>/dev/null || true
+    exit 1
+  fi
+  RUNNERD_ARGS+=(--controld "$CONTROLD_URL" --runner-token "$RAINIER_RUNNER_TOKEN" --runner-name "$RUNNER_NAME")
+  echo "runnerd mode: dial — controld $CONTROLD_URL, announcing as \"$RUNNER_NAME\""
+else
+  echo "runnerd mode: local HTTP only (set CONTROLD_URL=ws://host:9090 + RAINIER_RUNNER_TOKEN to join a control plane)"
+fi
+
+./bin/runnerd "${RUNNERD_ARGS[@]}" >/tmp/runnerd.log 2>&1 &
 echo $! > /tmp/rainier-runnerd.pid
 sleep 1
 echo "runnerd on :8080, egressd on :3128. Try:"
-echo "  ./bin/runnerctl create            # → {\"session_id\":\"sess-1\"}"
+echo "  ./bin/runnerctl create            # → {\"session_id\":\"sess-1\"}   (dev tool; local surface)"
 echo "  ./bin/runnerctl ls"
 echo "  ./bin/runnerctl attach sess-1      # live terminal through the relay"
 echo "  ./scripts/egress-check.sh          # R4 acceptance (enforcement asserted only where ON)"
+if [ -n "${CONTROLD_URL:-}" ]; then
+  echo "  ./bin/rainier ls                   # the same fleet through the control plane"
+fi

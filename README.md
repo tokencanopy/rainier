@@ -6,7 +6,68 @@ terminal sessions. Sessions survive laptop sleep and network changes; attach
 shows the agent's real TUI from any machine; your subscriptions and your GitHub
 identity stay yours.
 
-Status: v0 design phase. See
-[`docs/superpowers/specs/2026-08-27-rainier-design.md`](docs/superpowers/specs/2026-08-27-rainier-design.md).
+Status: **v0 Plan 3 — control plane + CLI.** One `controld` (Postgres-backed
+REST + WebSocket API, GitHub identity, least-loaded placement) fronts N
+`runnerd` VMs that dial it outbound, and the `rainier` CLI drives the whole
+fleet. Deploying it: [`docs/deploy-gce.md`](docs/deploy-gce.md). Design:
+[`docs/superpowers/specs/2026-08-27-rainier-design.md`](docs/superpowers/specs/2026-08-27-rainier-design.md)
+and
+[`docs/superpowers/specs/2026-08-28-plan3-controld-design.md`](docs/superpowers/specs/2026-08-28-plan3-controld-design.md).
+
+## Quickstart
+
+```bash
+make build
+
+# Point the CLI at your controld and log in with your GitHub identity.
+# --from-gh borrows the token from the `gh` CLI; --token <t> and
+# --client-id <id> (device flow) are the alternatives.
+bin/rainier login --from-gh --server http://rainier-1:9090
+
+bin/rainier new --name box1 --image rainier-session:latest   # creates, then attaches
+bin/rainier ls                                               # id, name, state, runner, reachable, age
+bin/rainier attach box1                                      # Ctrl-] detaches; the session keeps running
+bin/rainier suspend box1 && bin/rainier resume box1
+bin/rainier rm box1
+```
+
+`rainier new` attaches immediately by default so you watch the agent boot;
+`--detach` opts out. Names are per-owner, so `<id|name>` takes either.
+
+Locally, `make e2e` brings the whole stack up on your own machine (Postgres +
+controld + a dial-mode runnerd in docker) and drives that same CLI flow end to
+end — the dress rehearsal for a real deploy.
+
+## What runs where
+
+| Component | Where | Talks to |
+|---|---|---|
+| `rainier` | your laptop | controld (HTTPS/WSS) |
+| `controld` | one VM | Postgres; accepts runner and client connections |
+| `runnerd` | each runner VM | dials controld outbound; drives docker |
+| `egressd` | each runner VM | the session allowlist proxy (egress R4) |
+| `sessiond` | inside each session container | dials its runnerd outbound |
+
+Reachability is outbound-only in one direction (spec rule 3): sessiond →
+runnerd → controld, and clients talk only to controld. Nothing dials into a
+runner.
+
+`runnerctl` and `rattach` are **dev tools**, not the product surface: they
+drive one runnerd's local HTTP API directly, bypassing the control plane
+(no identity, no placement, no durable state). They stay in-tree for
+debugging a single box — `rainier` is the CLI to use.
+
+## Tests
+
+```bash
+go test ./...                    # unit + contract suites (no services needed)
+go test ./internal/e2e/ -race    # in-process end-to-end chaos scenes (fake driver)
+make e2e                         # full stack on docker, driven by the real CLI
+./scripts/egress-check.sh        # egress R4 acceptance (exit 3 = skipped on VM-backed docker)
+```
+
+The store contract suite runs against memstore by default and against
+Postgres when docker is available; the e2e scenes take
+`RAINIER_TEST_PG_DSN=postgres://…` to run the same scenarios against pgstore.
 
 License: [Apache-2.0](LICENSE)
