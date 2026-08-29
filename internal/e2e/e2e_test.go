@@ -6,12 +6,17 @@
 // runtime (driver.Fake) and GitHub's /user.
 //
 // The scenes are the design's chaos list (§7.4) and map 1:1 onto its success
-// criteria (§1):
+// criteria (§1) — Plan 3's first, then Plan 4's environments:
 //
-//	TestBurstQueuesAndDrains     criterion 5 (burst over capacity queues, drains)
-//	TestControldRestartMidSession criterion 2 (controld dies mid-attach; nothing else moves)
-//	TestRunnerRestartReRegisters  criterion 3 (runnerd dies; no container destroyed)
-//	TestDeleteDisconnectedRunner  §4.8's terminal-row-orphan rule
+//	TestBurstQueuesAndDrains      P3 criterion 5 (burst over capacity queues, drains)
+//	TestControldRestartMidSession P3 criterion 2 (controld dies mid-attach; nothing else moves)
+//	TestRunnerRestartReRegisters  P3 criterion 3 (runnerd dies; no container destroyed)
+//	TestDeleteDisconnectedRunner  P3 §4.8's terminal-row-orphan rule
+//	TestEnvSetupStreamsAndCaches  P4 criterion 2 (first session runs setup, second boots the cache)
+//	TestEnvEditInvalidatesCache   P4 criterion 2's other half (an edited script rebuilds)
+//	TestSetupFailureLandsFailed   P4 §4.3's failure path (rc + tail reach the session's error)
+//	TestSecretsReachSpec          P4 criterion 4 (a secret is decrypted into the dispatched Spec)
+//	TestPlacementPinQueuesWithReason P4 criterion 5 (a pin queues visibly, then places)
 //
 // Every scene builds its OWN stack from public surfaces only (controld.New/
 // Handler/Run/NewMemStore, runnerd.New/Handler/Recover/RunAgent,
@@ -31,6 +36,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -531,6 +537,33 @@ func (ss *scriptedSessiond) send(ctx context.Context, attachID uint64, m wire.Se
 	ss.conn.Write(ctx, raw)
 }
 
+// control sends one FrameControl — sessiond reporting on the session as a
+// whole rather than on any one viewer, which is how the setup pipeline's two
+// outcomes travel (design §4.3). A real sessiond sends exactly this frame
+// when its setup wrapper writes an exit code; runnerd's hub hands the payload
+// to routeControl, which turns it into the rwire event controld's snapshot
+// orchestration is waiting on. Playing it from here is what lets these scenes
+// exercise the whole pipeline without a container.
+//
+// AttachID is deliberately left zero: no attachment owns a control frame, and
+// relay.Conn's own Send does the same.
+func (ss *scriptedSessiond) control(t *testing.T, ev relay.ControlEvent) {
+	t.Helper()
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshaling control event %+v: %v", ev, err)
+	}
+	raw, err := relay.Encode(relay.Frame{Type: relay.FrameControl, Payload: payload})
+	if err != nil {
+		t.Fatalf("encoding control frame for %s: %v", ss.id, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := ss.conn.Write(ctx, raw); err != nil {
+		t.Fatalf("session %s: sending %s: %v", ss.id, ev.Kind, err)
+	}
+}
+
 func (ss *scriptedSessiond) close() { ss.conn.Close() }
 
 // boot starts a scripted sessiond for every placed session that doesn't have
@@ -559,6 +592,20 @@ func (f *fleet) boot(rows map[string]apiSession) {
 	}
 }
 
+// sessiond returns the scripted sessiond standing in for id's container,
+// waiting (and booting, on every poll pass) until there is one. It is how a
+// scene reaches inside "the container" to play a control event — the session
+// has to be placed and registered first, which is exactly the state its real
+// sessiond would be in when its setup script finishes.
+func (f *fleet) sessiond(id string) *scriptedSessiond {
+	f.t.Helper()
+	f.waitSessions(60*time.Second, "session "+id+" to register a sessiond", func(map[string]apiSession) bool {
+		_, ok := f.sessionds[id]
+		return ok
+	})
+	return f.sessionds[id]
+}
+
 // dropSessiond closes a session's scripted sessiond and forgets it, so the
 // next boot pass dials a fresh one — what a real sessiond's redial loop does
 // after its runnerd dies underneath it (design §4.8, carried hardening).
@@ -578,10 +625,16 @@ func (f *fleet) dropSessiond(id string) {
 type apiSession struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
+	Image     string `json:"image"`
 	State     string `json:"state"`
 	Runner    string `json:"runner"`
 	Reachable bool   `json:"reachable"`
 	Error     string `json:"error"`
+	// Environment is the environment's NAME, and QueueReason explains a
+	// queued session its environment's placement pin is holding back — both
+	// derived by controld per request, never stored on the row.
+	Environment string `json:"environment"`
+	QueueReason string `json:"queue_reason"`
 }
 
 type sessionEnvelope struct {
@@ -634,6 +687,24 @@ func (f *fleet) list() map[string]apiSession {
 		}
 		cursor = page.NextCursor
 	}
+}
+
+// createFrom posts a session that starts FROM an environment, exactly as
+// `rainier new --env <ref>` does: no image of its own, so everything the
+// session runs — the resolved image, the setup script, the egress list, the
+// decrypted secrets — is the environment's to decide.
+func (f *fleet) createFrom(name, envRef string) apiSession {
+	f.t.Helper()
+	var resp sessionEnvelope
+	body := map[string]any{"name": name, "environment": envRef}
+	err := f.client().Do(http.MethodPost, "/v1/sessions", body, &resp, cli.IdempotencyKey(cli.RandHex(8)))
+	if err != nil {
+		f.t.Fatalf("POST /v1/sessions (%s from environment %s): %v", name, envRef, err)
+	}
+	if resp.Session.State != "queued" {
+		f.t.Fatalf("created session %s state = %q, want queued", name, resp.Session.State)
+	}
+	return resp.Session
 }
 
 // delete removes a session exactly as `rainier rm` does.
@@ -749,6 +820,110 @@ func liveOn(rows map[string]apiSession, runner string) []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// ---------------------------------------------------------------------------
+// environments and secrets (Plan 4)
+// ---------------------------------------------------------------------------
+
+// apiEnvironment mirrors the fields of controld's client-facing environment
+// view (api.go's environmentView) these scenes assert on. The three snapshot
+// fields are the whole cache: a ref, the runner that holds it, and the setup
+// hash it was built from — which is stale exactly when it stops matching
+// SetupHash.
+type apiEnvironment struct {
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	Image           string `json:"image"`
+	Setup           string `json:"setup"`
+	SetupHash       string `json:"setup_hash"`
+	Placement       string `json:"placement"`
+	SetupTimeoutSec int    `json:"setup_timeout_sec"`
+	SnapshotRef     string `json:"snapshot_ref"`
+	SnapshotRunner  string `json:"snapshot_runner"`
+	SnapshotHash    string `json:"snapshot_hash"`
+}
+
+type environmentEnvelope struct {
+	Environment apiEnvironment `json:"environment"`
+}
+
+// snapshotRefHashLen is how much of an environment's setup hash goes into its
+// snapshot ref (design §4.3).
+const snapshotRefHashLen = 12
+
+// snapshotRefFor builds the ref controld content-addresses env's cached image
+// under: rainier-env:<env id>-<first 12 hex of its setup hash>.
+//
+// It spells the format out rather than asking controld what name it picked —
+// controld's own helper is unexported, and a scene that read the answer back
+// off the same code that produced it could not tell a correct ref from a
+// silently changed format. This is the wire-visible contract: every replica
+// derives this name independently, and a runner's `docker images` shows it.
+func snapshotRefFor(t *testing.T, env apiEnvironment) string {
+	t.Helper()
+	if len(env.SetupHash) < snapshotRefHashLen {
+		t.Fatalf("environment %s has setup_hash %q, too short to build a snapshot ref from", env.ID, env.SetupHash)
+	}
+	return "rainier-env:" + env.ID + "-" + env.SetupHash[:snapshotRefHashLen]
+}
+
+// createEnv posts an environment as `rainier env create` does. body is a raw
+// map so a scene can send exactly the fields it means to — the API rejects
+// unknown ones, so a typo here fails loudly rather than silently defaulting.
+func (f *fleet) createEnv(body map[string]any) apiEnvironment {
+	f.t.Helper()
+	var resp environmentEnvelope
+	if err := f.client().Do(http.MethodPost, "/v1/environments", body, &resp); err != nil {
+		f.t.Fatalf("POST /v1/environments (%v): %v", body["name"], err)
+	}
+	return resp.Environment
+}
+
+// getEnv reads one environment by id or name.
+func (f *fleet) getEnv(ref string) apiEnvironment {
+	f.t.Helper()
+	var resp environmentEnvelope
+	if err := f.client().Do(http.MethodGet, "/v1/environments/"+ref, nil, &resp); err != nil {
+		f.t.Fatalf("GET /v1/environments/%s: %v", ref, err)
+	}
+	return resp.Environment
+}
+
+// patchEnv edits an environment as `rainier env update` does.
+func (f *fleet) patchEnv(ref string, patch map[string]any) apiEnvironment {
+	f.t.Helper()
+	var resp environmentEnvelope
+	if err := f.client().Do(http.MethodPatch, "/v1/environments/"+ref, patch, &resp); err != nil {
+		f.t.Fatalf("PATCH /v1/environments/%s (%v): %v", ref, patch, err)
+	}
+	return resp.Environment
+}
+
+// waitEnv polls one environment until cond holds — the bounded wait for work
+// controld does off the request path, namely the snapshot it commits after a
+// setup script reports success.
+func (f *fleet) waitEnv(ref string, timeout time.Duration, what string, cond func(apiEnvironment) bool) apiEnvironment {
+	f.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		env := f.getEnv(ref)
+		if cond(env) {
+			return env
+		}
+		if !time.Now().Before(deadline) {
+			f.t.Fatalf("timed out after %s waiting for %s; environment: %+v", timeout, what, env)
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
+// putSecret stores a team secret as `rainier secret set` does.
+func (f *fleet) putSecret(name, value string) {
+	f.t.Helper()
+	if err := f.client().Do(http.MethodPut, "/v1/secrets/"+name, map[string]string{"value": value}, nil); err != nil {
+		f.t.Fatalf("PUT /v1/secrets/%s: %v", name, err)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,5 +1336,335 @@ func TestDeleteDisconnectedRunner(t *testing.T) {
 
 	if row := f.list()[created.ID]; row.State != "destroyed" {
 		t.Fatalf("session after the orphan was collected = %+v, want it still destroyed", row)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scene 5 — Plan 4 criterion 2: setup runs once, then the cache boots
+// ---------------------------------------------------------------------------
+
+// buildEnvCache drives one environment from "never built" to "cached", and
+// returns the runner holding the cache together with the environment row as
+// the store has it afterwards. It is the shared opening of the two caching
+// scenes: create a session on the environment, let it come up, play the setup
+// script's success from inside the container, and wait for controld's
+// orchestration to commit the image and record the ref.
+//
+// The two assertions on the way through belong here rather than in a caller
+// because they are the precondition both scenes rest on: if the FIRST create
+// didn't carry the environment's own image and script, "the second one
+// didn't" would prove nothing at all.
+func (f *fleet) buildEnvCache(env apiEnvironment, sessionName string) (runner string, cached apiEnvironment) {
+	f.t.Helper()
+
+	first := f.createFrom(sessionName, env.Name)
+	rows := f.waitSessions(90*time.Second, "the first session on "+env.Name+" to come up", func(rows map[string]apiSession) bool {
+		return rows[first.ID].State == "running"
+	})
+	runner = rows[first.ID].Runner
+
+	spec := f.runners[runner].drv.LastSpec()
+	if spec.Image != env.Image || spec.Setup != env.Setup {
+		f.t.Fatalf("first create on %s dispatched image=%q setup=%q; want the environment's own image %q and its script %q — nothing has run it yet, so there is no cache to boot from",
+			runner, spec.Image, spec.Setup, env.Image, env.Setup)
+	}
+
+	// The container reports the script finished; that is the news controld
+	// snapshots on (design §4.3), and the session's own state is unaffected.
+	f.sessiond(first.ID).control(f.t, relay.ControlEvent{Kind: "setup_done"})
+	cached = f.waitEnv(env.ID, 90*time.Second, "environment "+env.Name+" to cache a snapshot", func(e apiEnvironment) bool {
+		return e.SnapshotRef != ""
+	})
+	if row := f.list()[first.ID]; row.State != "running" {
+		f.t.Fatalf("session %s is %q after its setup finished; a setup outcome is news about the ENVIRONMENT, not about the session", first.ID, row.State)
+	}
+	return runner, cached
+}
+
+// TestEnvSetupStreamsAndCaches is Plan 4 success criterion 2, mechanized:
+// "The FIRST session on an environment runs setup live [...]; a snapshot is
+// cached; the SECOND session boots from cache with no setup run."
+//
+// The timing half of that criterion belongs on real hardware — a fake driver
+// costs nothing to "build" — so what this scene pins is the part timings can
+// only hint at: WHAT was dispatched each time. The first create carries the
+// environment's image and its script; the snapshot lands under the
+// content-addressed ref every replica derives independently; the second create
+// carries that ref and no script at all, and lands on the runner that holds it
+// (v0 has no registry, so the image exists nowhere else).
+func TestEnvSetupStreamsAndCaches(t *testing.T) {
+	f := newFleet(t)
+	f.addRunner("vm-a", 2)
+	f.addRunner("vm-b", 2)
+	f.waitRunner("vm-a", true, 30*time.Second)
+	f.waitRunner("vm-b", true, 30*time.Second)
+
+	env := f.createEnv(map[string]any{
+		"name":              "toolchain",
+		"image":             "e2e-image",
+		"setup":             "install-toolchain v1",
+		"setup_timeout_sec": 120,
+	})
+
+	holder, cached := f.buildEnvCache(env, "first-on-toolchain")
+
+	wantRef := snapshotRefFor(t, env)
+	if cached.SnapshotRef != wantRef || cached.SnapshotRunner != holder || cached.SnapshotHash != env.SetupHash {
+		t.Fatalf("cached environment = ref %q on runner %q built from hash %q; want ref %q on %q from %q",
+			cached.SnapshotRef, cached.SnapshotRunner, cached.SnapshotHash, wantRef, holder, env.SetupHash)
+	}
+	// The environment's own timeout travels with the script — controld's
+	// default only fills in for an environment that declares none.
+	if got := f.runners[holder].drv.LastSpec().SetupTimeoutSec; got != 120 {
+		t.Fatalf("first create dispatched setup_timeout_sec = %d, want the environment's 120", got)
+	}
+
+	// The rest of the fleet is warmed with that very ref. This is the only
+	// independent look at what actually went over the wire: the ref controld
+	// recorded and the one it dispatched to the holder are one variable, but
+	// the prepull is a separate message to a separate runner.
+	other := "vm-b"
+	if holder == "vm-b" {
+		other = "vm-a"
+	}
+	waitUntil(t, 60*time.Second, "the prepull broadcast to reach "+other, func() bool {
+		return slices.Contains(f.runners[other].drv.Pulls(), wantRef)
+	})
+	if pulled := f.runners[holder].drv.Pulls(); slices.Contains(pulled, wantRef) {
+		t.Fatalf("the snapshot holder %s was told to prepull %q, an image only it has: %v", holder, wantRef, pulled)
+	}
+
+	// --- the second session: cache hit, no setup, and on the holder.
+	second := f.createFrom("second-on-toolchain", env.Name)
+	rows := f.waitSessions(90*time.Second, "the second session to boot from the cache", func(rows map[string]apiSession) bool {
+		return rows[second.ID].State == "running"
+	})
+	if got := rows[second.ID].Runner; got != holder {
+		t.Fatalf("second session placed on %q, want the snapshot holder %q — with no registry in v0 the cached image exists nowhere else\n%s",
+			got, holder, describe(rows))
+	}
+	spec := f.runners[holder].drv.LastSpec()
+	if spec.Setup != "" {
+		t.Fatalf("second create dispatched setup %q; the cached image IS the finished setup", spec.Setup)
+	}
+	if spec.Image != wantRef {
+		t.Fatalf("second create dispatched image %q, want the cached snapshot %q", spec.Image, wantRef)
+	}
+	if got := rows[second.ID].Image; got != wantRef {
+		t.Fatalf("second session's view reports image %q, want the resolved %q — the API must show what the session actually runs", got, wantRef)
+	}
+	if got := rows[second.ID].Environment; got != env.Name {
+		t.Fatalf("second session's view reports environment %q, want %q", got, env.Name)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scene 6 — Plan 4 criterion 2's other half: an edit invalidates the cache
+// ---------------------------------------------------------------------------
+
+// TestEnvEditInvalidatesCache pins the cache's invalidation rule (design
+// §4.3): the snapshot is a cache keyed by the content hash of (image, setup),
+// so editing either makes the stored snapshot stale — visibly, not silently.
+// The edited environment keeps its old ref and old hash on the row, and the
+// next session is dispatched with the NEW script over the plain image.
+//
+// The middle create is what makes the last one mean anything: without it,
+// "the third session ran setup" would be equally consistent with a cache that
+// never worked.
+func TestEnvEditInvalidatesCache(t *testing.T) {
+	f := newFleet(t)
+	f.addRunner("vm-a", 3)
+	f.waitRunner("vm-a", true, 30*time.Second)
+
+	env := f.createEnv(map[string]any{
+		"name":  "toolchain",
+		"image": "e2e-image",
+		"setup": "install-toolchain v1",
+	})
+
+	holder, cached := f.buildEnvCache(env, "before-edit")
+	wantRef := snapshotRefFor(t, env)
+	if cached.SnapshotRef != wantRef {
+		t.Fatalf("cached environment ref = %q, want %q", cached.SnapshotRef, wantRef)
+	}
+
+	// The cache is live: a session created now boots from it, no script.
+	hit := f.createFrom("cache-hit", env.Name)
+	f.waitSessions(90*time.Second, "the cache-hit session to come up", func(rows map[string]apiSession) bool {
+		return rows[hit.ID].State == "running"
+	})
+	if spec := f.runners[holder].drv.LastSpec(); spec.Setup != "" || spec.Image != wantRef {
+		t.Fatalf("the cache-hit create dispatched image=%q setup=%q, want image=%q and no setup", spec.Image, spec.Setup, wantRef)
+	}
+
+	// --- the edit.
+	edited := f.patchEnv(env.ID, map[string]any{"setup": "install-toolchain v2"})
+	if edited.SetupHash == env.SetupHash {
+		t.Fatalf("editing the setup script left setup_hash at %q; the hash is the cache key", edited.SetupHash)
+	}
+	if edited.SnapshotRef != wantRef || edited.SnapshotHash != env.SetupHash {
+		t.Fatalf("the edit moved the snapshot columns to ref %q / hash %q; they belong to the store and must stay put, reading stale (%q from %q)",
+			edited.SnapshotRef, edited.SnapshotHash, wantRef, env.SetupHash)
+	}
+
+	third := f.createFrom("after-edit", env.Name)
+	f.waitSessions(90*time.Second, "the post-edit session to come up", func(rows map[string]apiSession) bool {
+		return rows[third.ID].State == "running"
+	})
+	spec := f.runners[holder].drv.LastSpec()
+	if spec.Setup != "install-toolchain v2" {
+		t.Fatalf("post-edit create dispatched setup %q, want the edited script", spec.Setup)
+	}
+	if spec.Image != env.Image {
+		t.Fatalf("post-edit create dispatched image %q, want the environment's plain image %q — the stale snapshot must not be booted", spec.Image, env.Image)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scene 7 — design §4.3's failure path: a setup that fails fails the session
+// ---------------------------------------------------------------------------
+
+// TestSetupFailureLandsFailed pins the seam three components share when a
+// setup script exits non-zero: sessiond reports the rc and the tail of what
+// the script printed, runnerd composes them into one sentence ("rc 7: boom"),
+// and controld prefixes its own words and lands the whole thing in the
+// session's error column, which the API hands straight back.
+//
+// All three pieces are asserted at once, from the outside, because that is the
+// only place they are ever seen together — each component's own tests can only
+// prove its half of the sentence.
+func TestSetupFailureLandsFailed(t *testing.T) {
+	f := newFleet(t)
+	f.addRunner("vm-a", 2)
+	f.waitRunner("vm-a", true, 30*time.Second)
+
+	env := f.createEnv(map[string]any{
+		"name":  "broken",
+		"image": "e2e-image",
+		"setup": "exit 7",
+	})
+	created := f.createFrom("setup-fails", env.Name)
+	f.sessiond(created.ID).control(t, relay.ControlEvent{Kind: "setup_failed", RC: 7, Tail: "boom"})
+
+	rows := f.waitSessions(90*time.Second, "the session to land failed", func(rows map[string]apiSession) bool {
+		return rows[created.ID].State == "failed"
+	})
+	got := rows[created.ID].Error
+	for _, want := range []string{"setup failed", "rc 7", "boom"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("failed session's error = %q, want it to carry %q — a user whose session never came up has nothing else to go on", got, want)
+		}
+	}
+
+	// A failed setup caches nothing: the image it would publish is of a build
+	// that didn't work.
+	if e := f.getEnv(env.ID); e.SnapshotRef != "" {
+		t.Fatalf("environment cached %q from a session whose setup failed", e.SnapshotRef)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scene 8 — Plan 4 criterion 4: a secret reaches the container, and only it
+// ---------------------------------------------------------------------------
+
+// TestSecretsReachSpec is criterion 4: "Env-declared secrets are injected as
+// env vars into sessions of that env, stored encrypted in Postgres, never
+// readable via the API after write."
+//
+// The value makes one round trip through the whole system in this scene —
+// sealed by controld's PUT, stored as ciphertext, decrypted at dispatch, and
+// asserted where the container would read it (the driver's Spec.Env). The
+// second half is the "never readable" clause, checked the blunt way: the raw
+// listing body must name the secret and must not contain its value anywhere.
+func TestSecretsReachSpec(t *testing.T) {
+	const secretName = "E2E_TOKEN"
+	const secretValue = "s3cr3t-e2e-value"
+
+	f := newFleet(t)
+	f.addRunner("vm-a", 1)
+	f.waitRunner("vm-a", true, 30*time.Second)
+
+	f.putSecret(secretName, secretValue)
+	env := f.createEnv(map[string]any{
+		"name":        "with-secrets",
+		"image":       "e2e-image",
+		"secret_refs": []string{secretName},
+	})
+
+	created := f.createFrom("needs-token", env.Name)
+	f.waitSessions(90*time.Second, "the session to come up", func(rows map[string]apiSession) bool {
+		return rows[created.ID].State == "running"
+	})
+
+	spec := f.runners["vm-a"].drv.LastSpec()
+	if got := spec.Env[secretName]; got != secretValue {
+		t.Fatalf("dispatched Spec.Env[%q] = %q, want the decrypted secret value", secretName, got)
+	}
+
+	var body json.RawMessage
+	if err := f.client().Do(http.MethodGet, "/v1/secrets", nil, &body); err != nil {
+		t.Fatalf("GET /v1/secrets: %v", err)
+	}
+	if !strings.Contains(string(body), secretName) {
+		t.Fatalf("the secret listing does not name %s: %s", secretName, body)
+	}
+	if strings.Contains(string(body), secretValue) {
+		t.Fatal("the secret listing carries the secret's VALUE; it is write-only at this API")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scene 9 — Plan 4 criterion 5: a placement pin queues visibly, then places
+// ---------------------------------------------------------------------------
+
+// TestPlacementPinQueuesWithReason is criterion 5: "An environment with
+// placement: rainier-1 always places there; placement to a non-existent runner
+// queues with a visible reason."
+//
+// Both halves are one scene deliberately. The queue half alone is satisfiable
+// by a fleet with no capacity at all; what makes the pin a pin is that a
+// runner with room sits right there and is passed over — and that the session
+// places the moment the runner it actually named turns up, with no create
+// retried and nothing else touched.
+func TestPlacementPinQueuesWithReason(t *testing.T) {
+	f := newFleet(t)
+	f.addRunner("vm-a", 2)
+	f.waitRunner("vm-a", true, 30*time.Second)
+
+	env := f.createEnv(map[string]any{
+		"name":      "gpu-box",
+		"image":     "e2e-image",
+		"placement": "vm-gpu", // a runner that has not joined the fleet
+	})
+	created := f.createFrom("pinned", env.Name)
+
+	rows := f.waitSessions(60*time.Second, "the pinned session to explain itself", func(rows map[string]apiSession) bool {
+		return rows[created.ID].QueueReason != ""
+	})
+	row := rows[created.ID]
+	if row.State != "queued" || row.Runner != "" {
+		t.Fatalf("pinned session = %+v, want it queued and unplaced: vm-a has two free slots, but the pin is not for it\n%s", row, describe(rows))
+	}
+	if !strings.Contains(row.QueueReason, "vm-gpu") {
+		t.Fatalf("queue_reason = %q, want it to name the runner the session is waiting for (vm-gpu)", row.QueueReason)
+	}
+
+	// The pinned runner joins. Nothing else changes — no controld config, no
+	// re-create, no nudge.
+	f.addRunner("vm-gpu", 1)
+	f.waitRunner("vm-gpu", true, 30*time.Second)
+
+	rows = f.waitSessions(90*time.Second, "the pinned session to place once its runner joins", func(rows map[string]apiSession) bool {
+		return rows[created.ID].State == "running"
+	})
+	row = rows[created.ID]
+	if row.Runner != "vm-gpu" {
+		t.Fatalf("pinned session placed on %q, want vm-gpu\n%s", row.Runner, describe(rows))
+	}
+	if row.QueueReason != "" {
+		t.Fatalf("a placed session still carries queue_reason %q", row.QueueReason)
+	}
+	if held := f.runners["vm-a"].containers(t); len(held) != 0 {
+		t.Fatalf("vm-a holds %v; a pinned session must wait for its runner, never fall back to the fleet", held)
 	}
 }
