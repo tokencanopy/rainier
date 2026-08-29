@@ -3,6 +3,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -47,6 +48,8 @@ type Fake struct {
 	// driver: a cold-parked session's container is stopped but its volume is
 	// untouched, which is the entire reason the volume is named per session.
 	volumes map[string]bool
+	// pulls records every ref handed to Prepull, in order — see Pulls.
+	pulls []string
 }
 
 func NewFake(total int) *Fake {
@@ -146,14 +149,47 @@ func (f *Fake) Resume(_ context.Context, id string) error {
 	it.cold = false
 	return nil
 }
-func (f *Fake) Snapshot(_ context.Context, id string) (Snapshot, error) {
+func (f *Fake) Snapshot(_ context.Context, id, ref string) (Snapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.items[id]; !ok {
 		return Snapshot{}, fmt.Errorf("no such id %s", id)
 	}
+	// A named ref comes back verbatim, exactly as `docker commit <id> <ref>`
+	// would — see the Driver interface for why the driver must never rename
+	// what controld content-addressed. Only an unnamed snapshot gets a
+	// generated tag.
+	if ref != "" {
+		return Snapshot{Ref: ref}, nil
+	}
 	f.snapSeq++
 	return Snapshot{Ref: "fake-image:" + id + "-" + fmt.Sprint(f.snapSeq)}, nil
+}
+
+// Prepull records ref instead of fetching anything. Prepull changes nothing
+// else about a driver's state, so the record is the only evidence a caller has
+// that the command arrived at all — see Pulls.
+//
+// The empty-ref rejection mirrors Docker.Prepull's: a fake that accepted one
+// would let a runnerd test pass against a call production refuses.
+func (f *Fake) Prepull(_ context.Context, ref string) error {
+	if ref == "" {
+		return errors.New("prepull: empty image ref")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pulls = append(f.pulls, ref)
+	return nil
+}
+
+// Pulls returns every ref passed to Prepull, in call order. Exported — unlike
+// this fake's other accessors, which are package-internal — because runnerd's
+// agent tests live in another package and this record is their whole
+// assertion.
+func (f *Fake) Pulls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.pulls)
 }
 func (f *Fake) Destroy(_ context.Context, id string) error {
 	f.mu.Lock()

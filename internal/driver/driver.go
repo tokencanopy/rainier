@@ -50,7 +50,28 @@ type Driver interface {
 	Create(ctx context.Context, spec Spec) (Handle, error)
 	Suspend(ctx context.Context, id string, warm bool) error // warm=pause, cold=stop
 	Resume(ctx context.Context, id string) error
-	Snapshot(ctx context.Context, id string) (Snapshot, error)
+	// Snapshot commits a session's current filesystem as an image.
+	//
+	// ref, when non-empty, is the exact tag to commit to, and comes back in
+	// the returned Snapshot verbatim. It is opaque here on purpose: the
+	// content-addressed environment refs Plan 4 caches
+	// (rainier-env:<envID>-<setupHash>) are minted by CONTROLD, which is the
+	// only component that knows an environment's setup hash and the only one
+	// that can make the same environment resolve to the same ref on every
+	// runner. A driver that decorated or re-derived the name would break that
+	// addressing: controld would record one ref while the image lived under
+	// another.
+	//
+	// An empty ref asks the driver to mint one of its own. That is the local
+	// dev surface's case (POST /sessions/{id}/snapshot names no environment),
+	// and the only caller that has no ref to give.
+	Snapshot(ctx context.Context, id, ref string) (Snapshot, error)
+	// Prepull fetches ref into this runner's local image store ahead of a
+	// create that will need it, so the create isn't the thing paying for the
+	// pull. Advisory by design — controld dispatches it without waiting on
+	// the answer, and a failure costs nothing worse than the slow create the
+	// prepull was trying to avoid.
+	Prepull(ctx context.Context, ref string) error
 	Destroy(ctx context.Context, id string) error
 	Inspect(ctx context.Context, id string) (Handle, error)
 	Capacity(ctx context.Context) (used, total int, err error)

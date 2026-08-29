@@ -289,19 +289,20 @@ func (s *Server) sessionOp(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 2 {
 		op = parts[1]
 	}
+	if op == "snapshot" {
+		// "" ref: this surface is the local dev/runnerctl one and has no
+		// environment to name, so the driver mints the tag. Only the agent —
+		// where controld supplies a content-addressed ref — passes one.
+		ref, err := s.OpSnapshot(ctx, id, "")
+		mapOpErr(w, err, func() { json.NewEncoder(w).Encode(map[string]string{"ref": ref}) })
+		return
+	}
 	warm := op == "suspend" && r.URL.Query().Get("warm") != "false"
-	ref, err := s.Op(ctx, id, op, warm)
-	mapOpErr(w, err, func() {
-		if op == "snapshot" {
-			json.NewEncoder(w).Encode(map[string]string{"ref": ref})
-		} else {
-			w.WriteHeader(http.StatusNoContent)
-		}
-	})
+	mapOpErr(w, s.Op(ctx, id, op, warm), func() { w.WriteHeader(http.StatusNoContent) })
 }
 
-// mapOpErr maps Op/Delete's sentinel errors to the status codes the HTTP
-// surface has always returned, or calls onOK to write the success response
+// mapOpErr maps Op/OpSnapshot/Delete's sentinel errors to the status codes the
+// HTTP surface has always returned, or calls onOK to write the success response
 // (which varies: 204 for delete/suspend/resume, a JSON ref for snapshot).
 func mapOpErr(w http.ResponseWriter, err error, onOK func()) {
 	switch {
@@ -318,29 +319,63 @@ func mapOpErr(w http.ResponseWriter, err error, onOK func()) {
 	}
 }
 
-// Op runs suspend/resume/snapshot against a session's current driver handle,
-// returning the snapshot ref (snapshot only; empty otherwise). Both fronts
-// (sessionOp's HTTP handler and the agent's execute) drive this same
-// sequence; warm is pre-parsed by the caller (HTTP's `?warm=` query, or the
-// agent's rwire.ToRunner.Warm) since query-string parsing is an HTTP concern
-// this function has no business knowing about.
-func (s *Server) Op(ctx context.Context, id, op string, warm bool) (snapshotRef string, err error) {
-	// opTarget, not get()+e.handle: handle is a post-put field (set by
-	// CreateWithID's setHandle once drv.Create returns), so reading it off an
-	// unlocked pointer returned by get() would race that write. See
-	// registry.opTarget's doc comment.
+// opHandle resolves a session id to the driver handle an op should act on,
+// rejecting the two states that have none. Shared by Op, OpSnapshot and
+// Delete so the guard can't drift between them.
+//
+// It reads through registry.opTarget rather than get()+e.handle: handle is a
+// post-put field (set by CreateWithID's setHandle once drv.Create returns), so
+// reading it off an unlocked pointer returned by get() would race that write.
+// See registry.opTarget's doc comment.
+//
+// A "starting" entry (handle == "") means CreateWithID is still inside
+// drv.Create — there is no driver handle yet for any op to act on. Ids can be
+// predictable (POST /sessions' sequential newID) or externally chosen (the
+// agent's controld-supplied id), so an op can land in exactly that window;
+// reject rather than either no-op on an empty handle or block the caller until
+// Create finishes.
+func (s *Server) opHandle(id string) (string, error) {
 	handle, state, ok := s.reg.opTarget(id)
 	if !ok {
 		return "", errNoSuchSession
 	}
-	// A "starting" entry (handle == "") means CreateWithID is still inside
-	// drv.Create — there is no driver handle yet for any of these ops to act
-	// on. Ids can be predictable (POST /sessions' sequential newID) or
-	// externally chosen (the agent's controld-supplied id), so an op can land
-	// in exactly that window; reject rather than either no-op on an empty
-	// handle or block the request until Create finishes.
 	if state == "starting" {
 		return "", errSessionStarting
+	}
+	return handle, nil
+}
+
+// OpSnapshot commits a session's current filesystem as an image and returns
+// the resulting ref.
+//
+// It is separate from Op rather than another case inside it because ref is a
+// snapshot-only concern: threading it through Op would put an image tag in
+// suspend's and resume's signature, where it means nothing and every caller
+// would pass "". Both fronts drive this one function — the HTTP dev surface
+// with an empty ref (it has no environment to name, so the driver mints the
+// tag) and the agent with controld's content-addressed rainier-env: ref.
+func (s *Server) OpSnapshot(ctx context.Context, id, ref string) (string, error) {
+	handle, err := s.opHandle(id)
+	if err != nil {
+		return "", err
+	}
+	snap, err := s.drv.Snapshot(ctx, handle, ref)
+	if err != nil {
+		return "", err
+	}
+	return snap.Ref, nil
+}
+
+// Op runs suspend/resume against a session's current driver handle. Both
+// fronts (sessionOp's HTTP handler and the agent's execute) drive this same
+// sequence; warm is pre-parsed by the caller (HTTP's `?warm=` query, or the
+// agent's rwire.ToRunner.Warm) since query-string parsing is an HTTP concern
+// this function has no business knowing about. Snapshot has its own entry
+// point — see OpSnapshot.
+func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
+	handle, err := s.opHandle(id)
+	if err != nil {
+		return err
 	}
 	switch op {
 	case "suspend":
@@ -359,7 +394,7 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) (snapshotRef 
 			if !warm {
 				s.reg.setState(id, "running") // stop failed: we're still running
 			}
-			return "", err
+			return err
 		}
 		// e.state is mutated here from a concurrent request goroutine, so it
 		// goes through the registry lock rather than a direct field write —
@@ -367,21 +402,15 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) (snapshotRef 
 		// sessiond, so its conn — and the hub — stay alive; the state still
 		// lands on "suspended" either way for a consistent GET /sessions view.
 		s.reg.setState(id, "suspended")
-		return "", nil
+		return nil
 	case "resume":
 		if err := s.drv.Resume(ctx, handle); err != nil {
-			return "", err
+			return err
 		}
 		s.reg.setState(id, "running")
-		return "", nil
-	case "snapshot":
-		snap, err := s.drv.Snapshot(ctx, handle)
-		if err != nil {
-			return "", err
-		}
-		return snap.Ref, nil
+		return nil
 	default:
-		return "", errUnknownOp
+		return errUnknownOp
 	}
 }
 
@@ -403,12 +432,9 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) (snapshotRef 
 // controld would then mark the session dead instead of destroyed. The marker
 // makes that goroutine stand down (see register's hub-death tail).
 func (s *Server) Delete(ctx context.Context, id string) error {
-	handle, state, ok := s.reg.opTarget(id)
-	if !ok {
-		return errNoSuchSession
-	}
-	if state == "starting" {
-		return errSessionStarting
+	handle, err := s.opHandle(id)
+	if err != nil {
+		return err
 	}
 	s.reg.setState(id, "destroying")
 	if h, ok := s.reg.hub(id); ok {
