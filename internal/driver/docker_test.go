@@ -3,6 +3,7 @@ package driver
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"net/url"
@@ -379,6 +380,45 @@ func TestDockerRunArgs(t *testing.T) {
 		}
 	})
 
+	t.Run("Spec.Setup becomes RAINIER_SETUP_B64 and RAINIER_SETUP_TIMEOUT", func(t *testing.T) {
+		// base64 because a setup script is arbitrary text — newlines above
+		// all — and `docker run -e K=V` carries one line per var. The
+		// container's sessiond decodes it back to /workspace/.rainier/setup.sh.
+		const script = "#!/bin/sh\nset -e\napt-get install -y 'a b'\n"
+		args := d.runArgs(Spec{SessionID: "sess-5", Setup: script, SetupTimeoutSec: 900}, "img:1")
+		env := flagValues(args, "-e")
+		wantB64 := "RAINIER_SETUP_B64=" + base64.StdEncoding.EncodeToString([]byte(script))
+		if !slicesContains(env, wantB64) {
+			t.Errorf("-e values %v missing %s", env, wantB64)
+		}
+		if !slicesContains(env, "RAINIER_SETUP_TIMEOUT=900") {
+			t.Errorf("-e values %v missing RAINIER_SETUP_TIMEOUT=900", env)
+		}
+	})
+
+	t.Run("no Spec.Setup means no setup vars", func(t *testing.T) {
+		// A session whose environment was already snapshot-cached carries no
+		// setup: the image IS the finished setup, and sessiond must run the
+		// agent directly rather than wrap it.
+		env := flagValues(d.runArgs(Spec{SessionID: "sess-6", SetupTimeoutSec: 900}, "img:1"), "-e")
+		for _, e := range env {
+			if strings.HasPrefix(e, "RAINIER_SETUP") {
+				t.Errorf("setup var %q injected for a spec with no Setup: %v", e, env)
+			}
+		}
+	})
+
+	t.Run("Spec.Env still comes last, after the setup vars", func(t *testing.T) {
+		args := d.runArgs(Spec{
+			SessionID: "sess-7", Setup: "true", SetupTimeoutSec: 5,
+			Env: map[string]string{"AAA": "1"},
+		}, "img:1")
+		env := flagValues(args, "-e")
+		if len(env) == 0 || env[len(env)-1] != "AAA=1" {
+			t.Errorf("-e values = %v, want Spec.Env last", env)
+		}
+	})
+
 	t.Run("Spec.Env can override a proxy var", func(t *testing.T) {
 		// `docker run` takes the LAST -e for a repeated key (verified against
 		// docker 29), so putting Spec.Env after the proxy block is what makes
@@ -659,5 +699,43 @@ func TestDockerPrepullRejectsEmptyRef(t *testing.T) {
 	d := NewDocker(DockerOpts{Image: "alpine:3.20", TotalSlots: 8, Label: "rainier.test"})
 	if err := d.Prepull(context.Background(), ""); err == nil {
 		t.Fatal("Prepull with an empty ref = nil, want an error")
+	}
+}
+
+// TestCreateRejectsAnOversizedSetup: the setup script rides to the container
+// as an environment variable, and an environment block is not an unbounded
+// place to put a file — a runaway setup (a paste of a tarball, a generated
+// script) would fail deep inside `docker run` with an errno, or worse, be
+// truncated silently. Both drivers reject it up front, before anything with a
+// side effect runs, so the message names the limit and the caller learns which
+// of its inputs is wrong. Needs no daemon: the check precedes every exec.
+func TestCreateRejectsAnOversizedSetup(t *testing.T) {
+	spec := Spec{SessionID: "sess-big", Setup: strings.Repeat("x", MaxSetupBytes+1)}
+	ctx := context.Background()
+
+	for name, create := range map[string]func() error{
+		"docker": func() error {
+			_, err := NewDocker(DockerOpts{Image: "img", TotalSlots: 8, Label: "rainier.test"}).Create(ctx, spec)
+			return err
+		},
+		"fake": func() error {
+			_, err := NewFake(4).Create(ctx, spec)
+			return err
+		},
+	} {
+		err := create()
+		if err == nil {
+			t.Errorf("%s driver accepted a %d-byte setup script, want an error", name, len(spec.Setup))
+			continue
+		}
+		if !strings.Contains(err.Error(), "524288") {
+			t.Errorf("%s driver error %q does not name the %d-byte limit", name, err, MaxSetupBytes)
+		}
+	}
+
+	// Exactly at the limit is fine — the fake proves the boundary without a
+	// daemon (the docker driver's next step would be a real `docker run`).
+	if _, err := NewFake(4).Create(ctx, Spec{SessionID: "sess-ok", Setup: strings.Repeat("x", MaxSetupBytes)}); err != nil {
+		t.Errorf("a setup script exactly at the limit was rejected: %v", err)
 	}
 }

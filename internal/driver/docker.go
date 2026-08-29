@@ -3,6 +3,7 @@ package driver
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"maps"
@@ -83,6 +84,12 @@ func NewDocker(opts DockerOpts) *Docker {
 }
 
 func (d *Docker) Create(ctx context.Context, spec Spec) (Handle, error) {
+	// First, before the capacity probe and every side effect after it: an
+	// oversized setup script is a caller error, and it costs nothing to say
+	// so without touching the daemon.
+	if err := checkSetupSize(spec); err != nil {
+		return Handle{}, err
+	}
 	used, total, err := d.Capacity(ctx)
 	if err != nil {
 		return Handle{}, err
@@ -219,6 +226,17 @@ func (d *Docker) runArgs(spec Spec, image string) []string {
 			"-e", "https_proxy="+proxyURL,
 			"-e", "NO_PROXY="+noProxy,
 			"-e", "no_proxy="+noProxy,
+		)
+	}
+	if spec.Setup != "" {
+		// Base64, because `docker run -e K=V` carries one line per var and a
+		// setup script is multi-line by nature. The timeout rides along only
+		// when there is a script to bound — a container with no setup has
+		// nothing to time out, and an orphan RAINIER_SETUP_TIMEOUT would
+		// read like one was expected.
+		args = append(args,
+			"-e", "RAINIER_SETUP_B64="+base64.StdEncoding.EncodeToString([]byte(spec.Setup)),
+			"-e", "RAINIER_SETUP_TIMEOUT="+strconv.Itoa(spec.SetupTimeoutSec),
 		)
 	}
 	// Spec.Env goes in LAST, after everything the driver injects itself.

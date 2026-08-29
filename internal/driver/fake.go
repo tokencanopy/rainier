@@ -102,6 +102,13 @@ func (f *Fake) usedLocked() int {
 }
 
 func (f *Fake) Create(_ context.Context, spec Spec) (Handle, error) {
+	// Mirrors Docker.Create's own first check, and for the same reason the
+	// empty-ref rejection in Prepull mirrors its counterpart: a fake that
+	// accepted a spec production refuses would let a runnerd test pass
+	// against a create that can never happen.
+	if err := checkSetupSize(spec); err != nil {
+		return Handle{}, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	used := f.usedLocked()

@@ -117,7 +117,9 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 	// or a dead conn's closure keeps receiving events (and writing to an out
 	// channel nothing drains any more). SetOnEvent/fireEvent are the
 	// synchronized accessors — see the Server.onEvent field's doc comment.
-	s.SetOnEvent(func(id, state string) { send(rwire.FromRunner{Type: "event", Session: id, State: state}) })
+	s.SetOnEvent(func(id, state, detail string) {
+		send(rwire.FromRunner{Type: "event", Session: id, State: state, Detail: detail})
+	})
 	defer s.SetOnEvent(nil)
 
 	used, total, _ := s.drv.Capacity(ctx)
@@ -172,7 +174,15 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 		var spec driver.Spec
 		var allow []string
 		if m.Spec != nil {
-			spec = driver.Spec{Name: m.Spec.Name, Image: m.Spec.Image, Cmd: m.Spec.Cmd, EgressAllow: m.Spec.EgressAllow}
+			// Setup/SetupTimeoutSec/Env are carried straight through to the
+			// driver: controld resolved them (the environment's script, its
+			// timeout, and its declared vars plus decrypted secret values)
+			// and this runner's only job is to hand them to the container.
+			// Nothing here logs Env — its values are secrets as often as not.
+			spec = driver.Spec{
+				Name: m.Spec.Name, Image: m.Spec.Image, Cmd: m.Spec.Cmd, EgressAllow: m.Spec.EgressAllow,
+				Setup: m.Spec.Setup, SetupTimeoutSec: m.Spec.SetupTimeoutSec, Env: m.Spec.Env,
+			}
 			allow = m.Spec.EgressAllow
 		}
 		// Idempotency lives inside CreateWithID's own putIfAbsent now, not a

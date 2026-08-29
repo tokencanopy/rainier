@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -636,5 +637,81 @@ func TestAgentPrepullDoesNotBlockTheReader(t *testing.T) {
 	res = conn.readMsg(t)
 	if res.ReqID != 1 || !res.OK {
 		t.Fatalf("second result = %+v, want the released prepull's (req_id 1)", res)
+	}
+}
+
+// TestAgentCreateCarriesSetupAndEnvToTheDriver pins the mapping controld's
+// environment resolution depends on: the setup script, its timeout, and the
+// resolved environment (declared vars plus decrypted secret values) all have
+// to reach driver.Spec, or a session boots with none of its environment and
+// no setup ever runs. The rwire→driver hop is the only place that can drop
+// them silently, since both sides have a field of the same name.
+func TestAgentCreateCarriesSetupAndEnvToTheDriver(t *testing.T) {
+	fd := newCreateTrackingFake(4)
+	rd := New(fd, "", "", "")
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1"})
+
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+
+	const setup = "#!/bin/sh\nnpm ci\n"
+	conn.send(t, rwire.ToRunner{Type: "create", ReqID: 1, Session: "sess_env", Spec: &rwire.Spec{
+		Image:           "img",
+		Setup:           setup,
+		SetupTimeoutSec: 900,
+		Env:             map[string]string{"NODE_ENV": "test", "TOKEN": "s3cret"},
+	}})
+	if res := conn.readMsg(t); !res.OK {
+		t.Fatalf("create result = %+v, want ok", res)
+	}
+
+	calls := fd.createCalls()
+	if len(calls) != 1 {
+		t.Fatalf("Create called %d times, want 1", len(calls))
+	}
+	got := calls[0]
+	if got.Setup != setup {
+		t.Errorf("Spec.Setup = %q, want %q", got.Setup, setup)
+	}
+	if got.SetupTimeoutSec != 900 {
+		t.Errorf("Spec.SetupTimeoutSec = %d, want 900", got.SetupTimeoutSec)
+	}
+	want := map[string]string{"NODE_ENV": "test", "TOKEN": "s3cret"}
+	if !reflect.DeepEqual(got.Env, want) {
+		t.Errorf("Spec.Env = %v, want %v", got.Env, want)
+	}
+}
+
+// TestAgentCreateWithoutSetupLeavesTheSpecEmpty: a session whose environment
+// was already snapshot-cached carries no setup at all (the image IS the
+// finished setup), and a spec that invented one would make every cached
+// create re-run it.
+func TestAgentCreateWithoutSetupLeavesTheSpecEmpty(t *testing.T) {
+	fd := newCreateTrackingFake(4)
+	rd := New(fd, "", "", "")
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1"})
+
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+	conn.send(t, rwire.ToRunner{Type: "create", ReqID: 1, Session: "sess_cached",
+		Spec: &rwire.Spec{Image: "rainier-env:e1-abc123"}})
+	if res := conn.readMsg(t); !res.OK {
+		t.Fatalf("create result = %+v, want ok", res)
+	}
+
+	calls := fd.createCalls()
+	if len(calls) != 1 {
+		t.Fatalf("Create called %d times, want 1", len(calls))
+	}
+	if calls[0].Setup != "" || calls[0].SetupTimeoutSec != 0 || calls[0].Env != nil {
+		t.Fatalf("Spec = %+v, want no setup and no env for a cached-image create", calls[0])
 	}
 }
