@@ -139,6 +139,55 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 		}
 	})
 
+	t.Run("workspace survives cold park", func(t *testing.T) {
+		// Cold park is stop, not destroy: the container AND the /workspace
+		// volume behind it have to still be there afterwards, or a resumed
+		// session comes back to a blank workspace — which is the whole reason
+		// the volume is named per session instead of anonymous.
+		//
+		// What every driver owes here is the surface: after a cold
+		// suspend/resume round trip the session is running again, still
+		// listed under the same session id, and still on the same handle.
+		// Proving the FILES themselves survived needs to look inside the
+		// container, which only the docker driver can do — that half lives in
+		// docker_test.go's TestDockerWorkspaceSurvivesColdPark.
+		d, cleanup := newDriver(t)
+		defer cleanup()
+		ctx := context.Background()
+		h, err := d.Create(ctx, Spec{Name: "t7", Image: "", SessionID: "s7", DialURL: "ws://x"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Destroy(ctx, h.ID)
+
+		if err := d.Suspend(ctx, h.ID, false); err != nil {
+			t.Fatal(err)
+		} // cold
+		if err := d.Resume(ctx, h.ID); err != nil {
+			t.Fatal(err)
+		}
+		if g, err := d.Inspect(ctx, h.ID); err != nil || g.State != StateRunning {
+			t.Fatalf("inspect after cold park + resume = %+v, %v; want %s", g, err, StateRunning)
+		}
+
+		listed, err := d.List(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var found *Listed
+		for i := range listed {
+			if listed[i].SessionID == "s7" {
+				found = &listed[i]
+			}
+		}
+		if found == nil {
+			t.Fatalf("List after cold park + resume dropped session s7: %+v", listed)
+		}
+		if found.Handle.ID != h.ID {
+			t.Fatalf("handle id after cold park + resume = %q, want %q (a new handle means the session was recreated, not resumed)", found.Handle.ID, h.ID)
+		}
+	})
+
 	t.Run("capacity ignores cold-parked", func(t *testing.T) {
 		d, cleanup := newDriver(t)
 		defer cleanup()

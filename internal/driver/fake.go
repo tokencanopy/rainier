@@ -4,6 +4,8 @@ package driver
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 )
 
@@ -16,6 +18,16 @@ type fakeItem struct {
 	sessionID string
 	state     State
 	cold      bool
+	// volume is the workspace volume name this item holds, "" for a spec with
+	// no session id (the docker driver mounts none in that case either).
+	// Recorded so Destroy can release it — the fake's stand-in for `docker
+	// volume rm`.
+	volume string
+	// env is a copy of Spec.Env as passed to Create, so tests can assert what
+	// was injected without a docker daemon. A copy, not the caller's map: a
+	// test that mutates its own Spec.Env afterwards must not be able to
+	// rewrite what the driver "received".
+	env map[string]string
 }
 
 type Fake struct {
@@ -29,9 +41,43 @@ type Fake struct {
 	// per-container, since Fake otherwise only models the lifecycle states
 	// the contract suite exercises, not every Spec field.
 	lastSpec Spec
+	// volumes is the set of workspace volumes that currently exist, the
+	// fake's model of `docker volume ls`. Kept beside items rather than
+	// derived from them because the two have different lifetimes in the real
+	// driver: a cold-parked session's container is stopped but its volume is
+	// untouched, which is the entire reason the volume is named per session.
+	volumes map[string]bool
 }
 
-func NewFake(total int) *Fake { return &Fake{total: total, items: map[string]*fakeItem{}} }
+func NewFake(total int) *Fake {
+	return &Fake{total: total, items: map[string]*fakeItem{}, volumes: map[string]bool{}}
+}
+
+// hasVolume reports whether name is currently a live workspace volume.
+func (f *Fake) hasVolume(name string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.volumes[name]
+}
+
+// volumeNames returns every live workspace volume name, sorted.
+func (f *Fake) volumeNames() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Sorted(maps.Keys(f.volumes))
+}
+
+// envFor returns the Spec.Env recorded for the handle id, or nil if that id
+// has no item (or was created with no env).
+func (f *Fake) envFor(id string) map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	it, ok := f.items[id]
+	if !ok {
+		return nil
+	}
+	return maps.Clone(it.env)
+}
 
 // LastSpec returns the Spec passed to the most recent Create call.
 func (f *Fake) LastSpec() Spec {
@@ -62,7 +108,20 @@ func (f *Fake) Create(_ context.Context, spec Spec) (Handle, error) {
 	f.lastSpec = spec
 	f.seq++
 	id := fmt.Sprintf("fake-%d", f.seq)
-	f.items[id] = &fakeItem{sessionID: spec.SessionID, state: StateRunning}
+	// Same name the docker driver would use, and the same "no session id, no
+	// volume" rule — a fake that named them differently would let a test pass
+	// against a string production never produces.
+	volume := ""
+	if spec.SessionID != "" {
+		volume = workspaceVolume(spec.SessionID)
+		f.volumes[volume] = true
+	}
+	f.items[id] = &fakeItem{
+		sessionID: spec.SessionID,
+		state:     StateRunning,
+		volume:    volume,
+		env:       maps.Clone(spec.Env),
+	}
 	return Handle{ID: id, State: StateRunning}, nil
 }
 func (f *Fake) Suspend(_ context.Context, id string, warm bool) error {
@@ -99,6 +158,12 @@ func (f *Fake) Snapshot(_ context.Context, id string) (Snapshot, error) {
 func (f *Fake) Destroy(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// The session's volume goes with the session, exactly as in the docker
+	// driver — Suspend/Resume deliberately don't touch it, so this is the only
+	// place a workspace disappears.
+	if it, ok := f.items[id]; ok && it.volume != "" {
+		delete(f.volumes, it.volume)
+	}
 	delete(f.items, id)
 	return nil
 }
