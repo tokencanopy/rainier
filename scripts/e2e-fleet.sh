@@ -3,8 +3,11 @@
 # (docs/deploy-gce.md). It brings up the whole Plan 3 stack on this machine —
 # Postgres in docker, controld on the host, egressd + a DIAL-MODE runnerd via
 # fleet-up.sh — and then drives the REAL `rainier` CLI against it end to end:
-# login, new, ls, attach (non-tty, piped stdin), suspend, resume, rm. It
-# finishes with scripts/egress-check.sh, the R4 acceptance.
+# login, new, ls, attach (non-tty, piped stdin), suspend, resume, rm, and
+# Plan 4's environments (secret set from stdin → env create with a setup
+# script → a first session that runs it → the snapshot controld commits → a
+# second session that boots the cache). It finishes with
+# scripts/egress-check.sh, the R4 acceptance.
 #
 # Where internal/e2e's Go suite fakes the container runtime to make the chaos
 # scenes deterministic, this one fakes nothing: real docker containers, real
@@ -12,7 +15,9 @@
 #
 # Exit codes: 0 = every executed check passed, 1 = a check failed,
 # 2 = setup/usage error, 3 = the CLI half was skipped (no GitHub auth) but
-# everything that did run passed.
+# everything that did run passed. A 0 can still carry FINDINGs — defects this
+# run PROVED in the product, recorded rather than aborted on; the summary line
+# names them (see `finding`).
 #
 # Env:
 #   GITHUB_USER   GitHub login to allowlist as admin (default: `gh api user`)
@@ -68,6 +73,16 @@ ok()    { printf 'PASS: %s\n' "$*"; }
 fail()  { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 setup_error() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
 
+# finding TEXT — a defect this rehearsal PROVED in the system under test,
+# recorded with its evidence instead of aborting. `fail` means the rehearsal
+# is broken and nothing after it can be trusted; a finding means the product
+# is broken in a way that is already known and written down (see the
+# acceptance table in docs/deploy-gce.md), and the rest of the run is still
+# worth having. The summary repeats them, so a green run with findings can
+# never be mistaken for a clean one.
+FINDINGS=0
+finding() { FINDINGS=$((FINDINGS + 1)); printf 'FINDING: %s\n' "$*"; }
+
 # Ownership flags. Teardown destroys state, and this script must only ever
 # destroy state IT created: an abort before we own anything — the preflight
 # finding another fleet on these ports, a build failure, a missing binary —
@@ -109,6 +124,28 @@ waitfor() {
     sleep 0.2
   done
   return 1
+}
+
+# cell ROW_PREFIX HEADER NEXT_HEADER — read one cell out of a `rainier` table
+# on stdin, addressed by the CHARACTER OFFSET of its column header rather than
+# by awk field number.
+#
+# The tables are tabwriter-aligned and a cell can be legitimately empty — ENV
+# is, on every scratch session — which collapses under awk's whitespace
+# splitting and shifts every field after it. `$3` in this script meant STATE
+# until sessions grew an env column, and then meant STATE on scratch rows and
+# the env name on rows that had one: a silent, row-dependent wrong answer.
+# Header offsets don't shift, because tabwriter pads every row of a block to
+# the same widths. An empty NEXT_HEADER means "to the end of the line", for
+# the last column.
+cell() {
+  awk -v id="$1" -v h="$2" -v n="$3" '
+    NR == 1 { s = index($0, h); e = (n == "" ? 0 : index($0, n)); next }
+    index($0, id) == 1 {
+      v = (e > 0 ? substr($0, s, e - s) : substr($0, s))
+      gsub(/^[ \t]+|[ \t]+$/, "", v)
+      print v
+    }'
 }
 
 # port_busy PORT — true when something on this host already listens there.
@@ -262,8 +299,10 @@ case "$SID" in
   *) fail "new printed \"$SID\", want a sess_ id" ;;
 esac
 
-# state column of `rainier ls`: ID NAME STATE RUNNER REACHABLE AGE
-session_state() { ./bin/rainier ls | awk -v id="$SID" '$1 == id { print $3 }'; }
+# `rainier ls`: ID NAME ENV STATE RUNNER REACHABLE AGE — read by header
+# offset, since ENV is empty on a scratch session (see `cell`).
+state_of()      { ./bin/rainier ls | cell "$1" STATE RUNNER; }
+session_state() { state_of "$SID"; }
 waitfor '[ "$(session_state)" = running ]' 90 "session running" \
   || fail "$SID never reached running (state: $(session_state)); see /tmp/runnerd.log"
 ok "session is running: $(./bin/rainier ls | awk -v id="$SID" '$1 == id')"
@@ -332,10 +371,207 @@ waitfor '[ -z "$(session_state)" ]' 30 "session gone from ls" \
 # Scoped to THIS session's row: a bare `grep -q destroyed` over the whole
 # --all listing passes on any leftover destroyed session from an earlier run
 # — including one this run's rm never touched.
-session_state_all() { ./bin/rainier ls --all | awk -v id="$SID" '$1 == id { print $3 }'; }
+session_state_all() { ./bin/rainier ls --all | cell "$SID" STATE RUNNER; }
 [ "$(session_state_all)" = "destroyed" ] \
   || fail "ls --all shows $SID as \"$(session_state_all)\", want destroyed"
 ok "removed; $SID's terminal row is still visible under ls --all"
+
+# ---------------------------------------------------------------------------
+step "environments (secret → setup → snapshot cache)"
+# ---------------------------------------------------------------------------
+# Plan 4's whole pipeline against real containers: a team secret stored from
+# stdin, an environment whose setup script proves it can see that secret, a
+# first session that runs the script live, the snapshot controld commits from
+# it, and a second session that boots the cached image instead.
+ENV_NAME="e2e-env-$$"
+SECRET_NAME=E2E_TOKEN
+SECRET_VALUE="e2e-token-value-$$"
+SECRET_LEN=${#SECRET_VALUE}
+SETUP_FILE=/tmp/rainier-e2e-setup.sh
+SECRET_OUT=/tmp/rainier-e2e-secret.txt
+
+# attach_probe SID COMMAND OUTFILE ERE SECONDS — attach with piped stdin, run
+# one command in the session's shell, and wait until ERE shows up in the
+# session's output; the output file is left behind for the caller to grep
+# further. Same FIFO shape as the attach step above, and for the same reason:
+# the detach key goes out when the answer has actually arrived, not after a
+# fixed sleep.
+#
+# The PTY echoes the typed line, so ERE must be something the COMMAND TEXT
+# does not itself contain — otherwise the echo satisfies the wait and the
+# probe proves nothing. Every caller below picks a pattern that only the
+# command's OUTPUT can produce.
+attach_probe() {
+  local sid=$1 cmd=$2 out=$3 ere=$4 secs=$5 rc=0
+  local fifo=/tmp/rainier-e2e-probe.fifo
+  rm -f "$fifo"; mkfifo "$fifo"
+  : > "$out"
+  ./bin/rainier attach "$sid" <"$fifo" >"$out" 2>&1 &
+  local job=$!
+  exec 8>"$fifo"
+  printf '%s\r' "$cmd" >&8
+  waitfor "grep -qE '$ere' '$out'" "$secs" "$ere" || rc=1
+  printf '\035' >&8
+  exec 8>&-
+  wait "$job" 2>/dev/null || true
+  rm -f "$fifo"
+  return $rc
+}
+
+# --- the secret. Piped on stdin, which is the documented way: it keeps the
+# value out of the shell history and out of the process table.
+printf '%s' "$SECRET_VALUE" | ./bin/rainier secret set "$SECRET_NAME" >"$SECRET_OUT" 2>&1 \
+  || { cat "$SECRET_OUT" >&2; fail "secret set $SECRET_NAME"; }
+grep -qx "set $SECRET_NAME" "$SECRET_OUT" \
+  || fail "secret set printed \"$(cat "$SECRET_OUT")\", want \"set $SECRET_NAME\""
+! grep -q "$SECRET_VALUE" "$SECRET_OUT" || fail "secret set echoed the value back"
+./bin/rainier secret ls > /tmp/rainier-e2e-secrets.txt
+grep -q "$SECRET_NAME" /tmp/rainier-e2e-secrets.txt || fail "secret ls does not list $SECRET_NAME"
+! grep -q "$SECRET_VALUE" /tmp/rainier-e2e-secrets.txt || fail "secret ls printed the secret's VALUE"
+ok "secret $SECRET_NAME stored from stdin; neither set nor ls echoed its value"
+
+# --- the environment. The setup script writes only under /workspace, because
+# that is the only path a session container can write at all (v0 runs them
+# --read-only) — and the last block is what MEASURES that rather than assuming
+# it, since whether a setup script can install anything durable decides
+# whether the snapshot cache can hold anything.
+cat > "$SETUP_FILE" <<'EOF'
+#!/bin/sh
+echo setup-ran > /workspace/setup-marker
+if [ -z "${E2E_TOKEN:-}" ]; then
+  echo "E2E_TOKEN is not set in this container" >&2
+  exit 17
+fi
+printf 'secret-len=%s\n' "$(printf %s "$E2E_TOKEN" | wc -c | tr -d ' ')" > /workspace/secret-check
+if mkdir -p /usr/local/rainier-e2e 2>/dev/null; then
+  echo rootfs=writable > /workspace/rootfs-check
+else
+  echo rootfs=read-only > /workspace/rootfs-check
+fi
+echo "e2e setup complete"
+EOF
+
+ENV_ID=$(./bin/rainier env create "$ENV_NAME" \
+  --image rainier-session:latest --setup-file "$SETUP_FILE" \
+  --secret-ref "$SECRET_NAME" --egress example.com)
+case "$ENV_ID" in
+  env_*) ok "created environment $ENV_NAME ($ENV_ID)" ;;
+  *) fail "env create printed \"$ENV_ID\", want an env_ id" ;;
+esac
+env_cached() { ./bin/rainier env ls | cell "$ENV_NAME" CACHED ""; }
+[ "$(env_cached)" = "no" ] || fail "a brand-new environment reads CACHED=$(env_cached), want no"
+
+# --- the FIRST session: runs the setup script, then becomes the snapshot.
+FIRST_START=$(date +%s)
+SID1=$(./bin/rainier new --detach --name "$ENV_NAME-first" --env "$ENV_NAME")
+case "$SID1" in sess_*) ;; *) fail "new --env printed \"$SID1\", want a sess_ id" ;; esac
+waitfor '[ "$(state_of "$SID1")" = running ]' 120 "the first env session" \
+  || fail "$SID1 never reached running (state: $(state_of "$SID1")); see /tmp/runnerd.log"
+# "running" arrives when sessiond registers, which is BEFORE the setup script
+# finishes — the cache landing is what says the first session is actually
+# usable, and it is the number criterion 2 compares the second create against.
+waitfor '[ "$(env_cached)" = yes ]' 300 "the environment to cache its snapshot" \
+  || fail "$ENV_NAME never cached a snapshot; see $CONTROLD_LOG"
+FIRST_SECS=$(( $(date +%s) - FIRST_START ))
+
+grep -q "controld: environment $ENV_ID cached as " "$CONTROLD_LOG" \
+  || fail "controld never logged a cache for $ENV_ID; see $CONTROLD_LOG"
+SNAP_REF=$(grep -m1 "controld: environment $ENV_ID cached as " "$CONTROLD_LOG" | sed 's/.* cached as \([^ ]*\) on .*/\1/')
+case "$SNAP_REF" in
+  "rainier-env:$ENV_ID-"*) ok "snapshot is content-addressed: $SNAP_REF (cached in ${FIRST_SECS}s)" ;;
+  *) fail "snapshot ref \"$SNAP_REF\" is not rainier-env:$ENV_ID-<hash>" ;;
+esac
+SHOW_REF=$(./bin/rainier env show "$ENV_NAME" | sed -n 's/.*"snapshot_ref": "\([^"]*\)".*/\1/p')
+[ "$SHOW_REF" = "$SNAP_REF" ] || fail "env show reports snapshot_ref \"$SHOW_REF\"; the log says \"$SNAP_REF\""
+
+CID1=$(docker ps -q --filter "label=rainier.session=$SID1")
+[ -n "$CID1" ] || fail "no container is labeled rainier.session=$SID1"
+IMAGE1=$(docker inspect -f '{{.Config.Image}}' "$CID1")
+[ "$IMAGE1" = "rainier-session:latest" ] \
+  || fail "the first session runs image \"$IMAGE1\", want the environment's own rainier-session:latest"
+docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CID1" | grep -q '^RAINIER_SETUP_B64=' \
+  || fail "the first create carried no setup script"
+ok "first create dispatched the environment's own image plus its setup script"
+
+ATTACH1_OUT=/tmp/rainier-e2e-env-attach1.txt
+attach_probe "$SID1" 'cat /workspace/setup-marker /workspace/secret-check /workspace/rootfs-check' \
+  "$ATTACH1_OUT" 'rootfs=' 60 \
+  || { echo "--- attach output ---"; cat -v "$ATTACH1_OUT"; echo "---------------------"; \
+       fail "the first session never answered the setup-marker probe"; }
+grep -q 'setup-ran' "$ATTACH1_OUT" || fail "/workspace/setup-marker is missing: the setup script did not run"
+grep -q "secret-len=$SECRET_LEN" "$ATTACH1_OUT" \
+  || fail "the setup script saw $SECRET_NAME as \"$(grep -o 'secret-len=[0-9]*' "$ATTACH1_OUT" | head -1)\", want secret-len=$SECRET_LEN"
+ok "the setup script ran in the session and read the environment's secret ($SECRET_LEN bytes)"
+grep -q 'e2e setup complete' "$ATTACH1_OUT" \
+  && ok "the setup script's own output is in the session's scrollback — an attached viewer watches provisioning" \
+  || finding "the setup script's output is not in the session's scrollback; design §4.3 says setup is streamed to the attached terminal like any other output"
+
+if grep -q 'rootfs=read-only' "$ATTACH1_OUT"; then
+  finding "a setup script can write NOTHING outside /workspace: session containers run --read-only (internal/driver/docker.go runArgs), and \`docker commit\` excludes the /workspace volume. The cached image is therefore the base image under a new tag — an environment's setup installs do not survive into it (design §1 criteria 1 and 2)."
+else
+  ok "the session rootfs is writable during setup, so installs can be cached"
+fi
+
+# --- the SECOND session: must boot the cache, with no setup dispatched.
+SECOND_START=$(date +%s)
+SID2=$(./bin/rainier new --detach --name "$ENV_NAME-second" --env "$ENV_NAME")
+case "$SID2" in sess_*) ;; *) fail "the second new --env printed \"$SID2\"" ;; esac
+waitfor '[ "$(state_of "$SID2")" = running ]' 120 "the second env session" \
+  || fail "$SID2 never reached running (state: $(state_of "$SID2")); see /tmp/runnerd.log"
+SECOND_SECS=$(( $(date +%s) - SECOND_START ))
+
+CID2=$(docker ps -q --filter "label=rainier.session=$SID2")
+[ -n "$CID2" ] || fail "no container is labeled rainier.session=$SID2"
+IMAGE2=$(docker inspect -f '{{.Config.Image}}' "$CID2")
+# The image IS the proof that no setup was dispatched: controld resolves a
+# session to the snapshot ref only when the cache is usable, and createSpec
+# sends `setup` only when it did NOT resolve to the snapshot (internal/controld
+# — resolveImage and createSpec are the same branch, read the other way). The
+# container's own RAINIER_SETUP_B64 cannot answer this, for the reason the
+# finding below spells out.
+[ "$IMAGE2" = "$SNAP_REF" ] \
+  || fail "the second session runs image \"$IMAGE2\", want the cached snapshot \"$SNAP_REF\" — it was dispatched with setup, not from the cache"
+ok "second create dispatched NO setup: it booted $SNAP_REF (${SECOND_SECS}s vs ${FIRST_SECS}s for the first)"
+
+ATTACH2_OUT=/tmp/rainier-e2e-env-attach2.txt
+attach_probe "$SID2" 'test -f /workspace/setup-marker; echo "rerun-check:$?"' \
+  "$ATTACH2_OUT" 'rerun-check:[01]' 60 \
+  || { echo "--- attach output ---"; cat -v "$ATTACH2_OUT"; echo "---------------------"; \
+       fail "the second session never answered the setup-rerun probe"; }
+if grep -q 'rerun-check:0' "$ATTACH2_OUT"; then
+  finding "the cache-booted session RE-RAN its setup script: \`docker commit\` bakes the container's environment block into the image, so RAINIER_SETUP_B64 rides along in $SNAP_REF and sessiond runs setup again even though controld dispatched none. The cache saves nothing."
+else
+  ok "the cache-booted session did not re-run setup (/workspace is fresh and empty)"
+fi
+
+# Read into a variable first: `docker image inspect | grep -q` in an `if`
+# condition turns an inspect FAILURE into the same exit status as "no match"
+# under pipefail, which would report the reassuring answer for the wrong
+# reason.
+SNAP_ENV=$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$SNAP_REF") \
+  || fail "docker image inspect $SNAP_REF: the cached image is not on this runner"
+if printf '%s\n' "$SNAP_ENV" | grep -q "^$SECRET_NAME=$SECRET_VALUE\$"; then
+  finding "the cached image carries the environment's DECRYPTED secrets in its config: \`docker image inspect $SNAP_REF\` prints $SECRET_NAME's value. Values are write-only at the API but readable by anyone with docker on the runner — and any registry-backed distribution (design §6) would publish them."
+else
+  ok "the cached image's config carries no secret value"
+fi
+
+# --- teardown, which is also the env-delete guard (design §5).
+if ./bin/rainier env rm "$ENV_NAME" >/tmp/rainier-e2e-envrm.txt 2>&1; then
+  fail "env rm removed $ENV_NAME while $SID1 and $SID2 still reference it"
+fi
+grep -q conflict /tmp/rainier-e2e-envrm.txt \
+  || fail "env rm while referenced said \"$(cat /tmp/rainier-e2e-envrm.txt)\", want a conflict"
+ok "env rm is refused while live sessions reference the environment"
+
+./bin/rainier rm "$SID1" >/dev/null
+./bin/rainier rm "$SID2" >/dev/null
+waitfor '[ -z "$(state_of "$SID1")" ] && [ -z "$(state_of "$SID2")" ]' 60 "both env sessions to go" \
+  || fail "the environment's sessions are still listed after rm"
+./bin/rainier env rm "$ENV_NAME" | grep -q removed || fail "env rm did not report removal"
+./bin/rainier secret rm "$SECRET_NAME" >/dev/null || fail "secret rm"
+rm -f "$SETUP_FILE"
+ok "environment and secret deleted once nothing referenced them"
 
 # ---------------------------------------------------------------------------
 step "egress R4 acceptance"
@@ -348,4 +584,7 @@ case "$EGRESS_RC" in
 esac
 
 echo
-echo "e2e-fleet: ALL CHECKS PASSED (login, new, ls, attach, suspend, resume, rm$([ "$EGRESS_RC" = 0 ] && echo ", egress R4"))"
+echo "e2e-fleet: ALL CHECKS PASSED (login, new, ls, attach, suspend, resume, rm, environments$([ "$EGRESS_RC" = 0 ] && echo ", egress R4"))"
+if [ "$FINDINGS" -gt 0 ]; then
+  echo "e2e-fleet: $FINDINGS FINDING(S) recorded above — the flow works, the product has defects; see the acceptance table in docs/deploy-gce.md"
+fi
