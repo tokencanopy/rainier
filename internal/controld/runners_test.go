@@ -883,13 +883,14 @@ func TestSendToRunnerUnreachable(t *testing.T) {
 	}
 }
 
-// TestUnroutedPathIs404 pins Handler()'s shape before later tasks add the
-// client API: only the runner endpoint exists today.
+// TestUnroutedPathIs404 pins Handler()'s shape: a path no route claims 404s
+// even once every task's routes are registered. (Task 10 claimed
+// /v1/sessions itself, so this now probes a path nothing will ever claim.)
 func TestUnroutedPathIs404(t *testing.T) {
 	_, _, ts := newTestControld(t)
-	resp, err := http.Get(ts.URL + "/v1/sessions")
+	resp, err := http.Get(ts.URL + "/v1/bogus")
 	if err != nil {
-		t.Fatalf("GET /v1/sessions: %v", err)
+		t.Fatalf("GET /v1/bogus: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
