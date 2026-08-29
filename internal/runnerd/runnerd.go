@@ -51,7 +51,14 @@ type Server struct {
 	// correct zero value: HTTP-only mode never calls SetOnEvent, and
 	// fireEvent's nil check is then a no-op, matching the old field's
 	// nil-safety.
-	onEvent atomic.Pointer[func(sessionID, state string)]
+	//
+	// detail is the event's one free-text field: empty for the lifecycle
+	// states ("running", "dead" — the state IS the whole message), and the
+	// rc plus output tail for a "setup_failed", which has more to say than a
+	// state name can carry. It rides in the same callback rather than a
+	// parallel hook so there is exactly one path an event can take out of
+	// this server.
+	onEvent atomic.Pointer[func(sessionID, state, detail string)]
 	// agentWriterCount tracks currently-running agentSession writer
 	// goroutines. It exists solely so agent_test.go can assert the
 	// writer-goroutine-leak fix (review round 1, finding 3)
@@ -67,7 +74,7 @@ type Server struct {
 // hub-death path's request goroutines can call fireEvent concurrently with
 // agentSession swapping the callback in on every (re)connect and clearing it
 // via defer on exit — see the onEvent field's doc comment.
-func (s *Server) SetOnEvent(f func(sessionID, state string)) {
+func (s *Server) SetOnEvent(f func(sessionID, state, detail string)) {
 	if f == nil {
 		s.onEvent.Store(nil)
 		return
@@ -75,10 +82,15 @@ func (s *Server) SetOnEvent(f func(sessionID, state string)) {
 	s.onEvent.Store(&f)
 }
 
-// fireEvent calls the current OnEvent callback, if any is installed.
-func (s *Server) fireEvent(sessionID, state string) {
+// fireEvent reports a state that speaks for itself — the container lifecycle
+// events, where there is nothing to add beyond the state name.
+func (s *Server) fireEvent(sessionID, state string) { s.fireEventDetail(sessionID, state, "") }
+
+// fireEventDetail calls the current OnEvent callback, if any is installed,
+// with a state and the free-text detail that goes with it.
+func (s *Server) fireEventDetail(sessionID, state, detail string) {
 	if p := s.onEvent.Load(); p != nil {
-		(*p)(sessionID, state)
+		(*p)(sessionID, state, detail)
 	}
 }
 
@@ -529,7 +541,22 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.SetReadLimit(16 << 20)
-	hub := relay.NewHub(r.Context(), relay.WSConn(c))
+	hub := relay.NewHubWithControl(r.Context(), relay.WSConn(c), func(payload []byte) {
+		// On its own goroutine, deliberately: this runs on the hub's read
+		// loop, the single goroutine demultiplexing every attachment
+		// multiplexed over this session's conn, and routeControl ends in the
+		// agent's send() — which piggybacks a driver capacity call (a real
+		// `docker ps`) onto every message. Running that inline would stall
+		// every viewer's output for its duration. See NewHubWithControl's
+		// contract.
+		//
+		// One goroutine per control frame means two frames could in
+		// principle be reported out of order. That is fine for the only
+		// vocabulary there is: a session has exactly one setup outcome, and
+		// after it there is nothing left to race with. A control channel
+		// that grows ordered events needs a queue here instead.
+		go s.routeControl(id, payload)
+	})
 	if !s.reg.setHub(id, hub) {
 		// The entry vanished between our existence check above and now — a
 		// concurrent DELETE raced this dial-in (session torn down while its
@@ -592,6 +619,49 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		s.drv.Destroy(context.Background(), handle)
 		s.fireEvent(id, "dead")
 	}
+}
+
+// routeControl turns one FrameControl payload from session id into an event
+// for controld. This is the runner's half of the setup pipeline: sessiond
+// watches the setup script's exit code inside the container and reports the
+// outcome here, and controld's orchestration (snapshot the image on success,
+// fail the session on failure) is waiting on the resulting event.
+//
+// An undecodable payload or an unknown kind is logged and dropped, never
+// escalated: this arrives from inside a container over a conn that also
+// carries every viewer's terminal traffic, and the one thing that must not
+// happen is a malformed frame taking the session down with it.
+func (s *Server) routeControl(id string, payload []byte) {
+	var ev relay.ControlEvent
+	if err := json.Unmarshal(payload, &ev); err != nil {
+		log.Printf("session %s: undecodable control payload (%d bytes): %v", id, len(payload), err)
+		return
+	}
+	switch ev.Kind {
+	case "setup_done":
+		s.fireEventDetail(id, "setup_done", "")
+	case "setup_failed":
+		log.Printf("session %s: setup failed (rc %d)", id, ev.RC)
+		s.fireEventDetail(id, "setup_failed", setupFailedDetail(ev.RC, ev.Tail))
+	default:
+		log.Printf("session %s: unknown control kind %q", id, ev.Kind)
+	}
+}
+
+// setupFailedDetail composes the one string an rwire event has room for out
+// of the two things a setup failure has to say: the script's exit code (-1
+// when it was killed at its timeout) and the tail of what it printed.
+//
+// Front-loading the rc keeps it legible when controld prefixes its own words
+// ("setup failed: rc 7: E: unable to locate package foo"), and this side
+// deliberately does not spell out "setup failed" itself — that is controld's
+// sentence to write, and repeating it here would double it.
+func setupFailedDetail(rc int, tail string) string {
+	d := "rc " + strconv.Itoa(rc)
+	if tail == "" {
+		return d
+	}
+	return d + ": " + tail
 }
 
 // hubWait bounds how long an attach waits for a session's sessiond to

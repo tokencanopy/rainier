@@ -30,6 +30,30 @@ type Frame struct {
 	Payload  []byte    `json:"p,omitempty"`
 }
 
+// ControlEvent is the JSON payload a FrameControl carries: sessiond
+// reporting on something that belongs to the session as a whole rather than
+// to any one viewer. Today the only kinds are the two setup outcomes —
+// "setup_done" and "setup_failed" — which runnerd turns into rwire events
+// for controld's setup orchestration.
+//
+// It lives here, beside the frame that carries it, so the two ends of that
+// hop cannot drift: cmd/sessiond marshals this type and internal/runnerd
+// unmarshals it. relay does not interpret it — a payload is opaque bytes to
+// Send and to the hub's control handler alike — but owning the shape is what
+// keeps a field rename from silently becoming a dropped event.
+type ControlEvent struct {
+	Kind string `json:"kind"`
+	// RC is the setup script's exit status on a "setup_failed", or -1 when
+	// the script was still running at its timeout and was terminated.
+	RC int `json:"rc,omitempty"`
+	// Tail is the last few KB of the session's own output on a
+	// "setup_failed" — what the script printed before it gave up — or the
+	// timeout message for RC -1. It is the only diagnostic that reaches a
+	// user whose session never came up, so it travels with the event rather
+	// than being left in a log inside a container that is about to go away.
+	Tail string `json:"tail,omitempty"`
+}
+
 func Encode(f Frame) ([]byte, error) { return json.Marshal(f) }
 
 func Decode(b []byte) (Frame, error) {

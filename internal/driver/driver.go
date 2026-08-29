@@ -1,6 +1,9 @@
 package driver
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 type Spec struct {
 	Name        string   // human label
@@ -20,6 +23,42 @@ type Spec struct {
 	// declared env plus its resolved secret refs, Plan 4) — the driver only
 	// carries it through, in sorted-key order, after the proxy vars.
 	Env map[string]string
+	// Setup is the environment's setup script, run once inside the fresh
+	// container before the agent starts. It reaches the container as
+	// RAINIER_SETUP_B64 (base64 of these bytes): a setup script is
+	// multi-line by nature and `docker run -e K=V` carries one line per var,
+	// so the encoding is what makes an env var a viable channel for a file
+	// at all. sessiond decodes it back to /workspace/.rainier/setup.sh and
+	// wraps the agent behind it; see cmd/sessiond.
+	//
+	// Empty means "no setup" — which is the normal case for a session whose
+	// environment was already snapshot-cached, since that image IS the
+	// finished setup. Capped at MaxSetupBytes.
+	Setup string
+	// SetupTimeoutSec bounds that run, injected as RAINIER_SETUP_TIMEOUT
+	// alongside the script. It is carried, not policed, here: controld owns
+	// the default (design §4.3 — it sends 900 when an environment declares
+	// none) and sessiond treats anything non-positive as an unbounded run.
+	SetupTimeoutSec int
+}
+
+// MaxSetupBytes caps Spec.Setup before encoding. The script rides to the
+// container in its environment block, which is not an unbounded place to put
+// a file: an oversized one fails deep inside `docker run` with an errno that
+// names nothing useful, or is silently truncated into a script that does
+// something other than what the environment declared. Rejecting it in Create,
+// before anything with a side effect runs, is what turns that into an error
+// naming the limit and the input that broke it.
+const MaxSetupBytes = 512 << 10
+
+// checkSetupSize enforces MaxSetupBytes. Shared by both drivers so the fake
+// can never accept a spec the real one refuses — a test that passed against
+// one and not the other would be worse than no test.
+func checkSetupSize(spec Spec) error {
+	if len(spec.Setup) > MaxSetupBytes {
+		return fmt.Errorf("setup script is %d bytes, over the %d-byte limit", len(spec.Setup), MaxSetupBytes)
+	}
+	return nil
 }
 
 type State string

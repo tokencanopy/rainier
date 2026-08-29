@@ -889,7 +889,7 @@ func TestOnEventFiresRunningAndDead(t *testing.T) {
 	type event struct{ sessionID, state string }
 	var mu sync.Mutex
 	var events []event
-	rd.SetOnEvent(func(sessionID, state string) {
+	rd.SetOnEvent(func(sessionID, state, _ string) {
 		mu.Lock()
 		events = append(events, event{sessionID, state})
 		mu.Unlock()
@@ -994,7 +994,7 @@ func TestDeleteRacingHubDeathFiresNoDeadEvent(t *testing.T) {
 
 	var mu sync.Mutex
 	var events []string
-	rd.SetOnEvent(func(id, state string) {
+	rd.SetOnEvent(func(id, state, _ string) {
 		mu.Lock()
 		events = append(events, id+":"+state)
 		mu.Unlock()
@@ -1151,5 +1151,166 @@ func TestSnapshotOverHTTPGeneratesARef(t *testing.T) {
 	// and it minted one, instead of the handler echoing back a blank.
 	if !strings.HasPrefix(body.Ref, "fake-image:") {
 		t.Fatalf("snapshot ref = %q, want a driver-generated fake-image: ref", body.Ref)
+	}
+}
+
+// TestControlFramesBecomeEvents pins the setup half of the control channel:
+// a FrameControl arriving on a session's register conn is not an attachment's
+// frame at all — it belongs to the session — and runnerd turns it into the
+// event controld's setup orchestration waits on. A setup_failed has two
+// things to say (the exit code and what the script printed) and one string to
+// say them in, so the composition is pinned here too: controld renders this
+// detail into the session's error text.
+func TestControlFramesBecomeEvents(t *testing.T) {
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "", "")
+
+	type event struct{ session, state, detail string }
+	events := make(chan event, 8)
+	rd.SetOnEvent(func(session, state, detail string) {
+		events <- event{session, state, detail}
+	})
+
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+	base := strings.Replace(srv.URL, "http", "ws", 1)
+	ctx := context.Background()
+
+	id := createSession(t, srv.URL)
+	c, _, err := websocket.Dial(ctx, base+"/register?session="+id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.CloseNow()
+	waitForHub(t, rd, id)
+
+	// register()'s own "running" event fires first; drain it.
+	if got := nextEvent(t, events); got.state != "running" {
+		t.Fatalf("first event = %+v, want running", got)
+	}
+
+	sendControl := func(payload string) {
+		t.Helper()
+		f, err := relay.Encode(relay.Frame{Type: relay.FrameControl, Payload: []byte(payload)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Write(ctx, websocket.MessageText, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Garbage and unknown kinds are logged and dropped, never turned into an
+	// event — and, crucially, never kill the hub's read loop: the setup_done
+	// after them still lands.
+	sendControl(`not json at all`)
+	sendControl(`{"kind":"who knows"}`)
+	sendControl(`{"kind":"setup_done"}`)
+	if got, want := nextEvent(t, events), (event{id, "setup_done", ""}); got != want {
+		t.Fatalf("event = %+v, want %+v", got, want)
+	}
+
+	sendControl(`{"kind":"setup_failed","rc":7,"tail":"E: unable to locate package foo"}`)
+	got := nextEvent(t, events)
+	if got.session != id || got.state != "setup_failed" {
+		t.Fatalf("event = %+v, want a setup_failed for %s", got, id)
+	}
+	if !strings.Contains(got.detail, "7") || !strings.Contains(got.detail, "unable to locate package foo") {
+		t.Fatalf("detail = %q, want it to carry both the rc and the tail", got.detail)
+	}
+}
+
+// nextEvent takes one event off the channel or fails the test — the bound
+// keeps a routing regression from hanging the suite.
+func nextEvent[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case e := <-ch:
+		return e
+	case <-time.After(3 * time.Second):
+		var zero T
+		t.Fatal("no event within 3s")
+		return zero
+	}
+}
+
+// TestControlHandlerDoesNotBlockTheHubReadLoop: OnControl runs on the hub's
+// read loop, the one goroutine demultiplexing every attachment on the
+// session's conn. The agent's event path ends in a capacity call against the
+// driver (a real `docker ps` in production), so a handler that fired it
+// inline would stall every viewer's output for the duration. The handler must
+// hand off — proven here by making the event callback block and asserting the
+// session's terminal frames keep flowing anyway.
+func TestControlHandlerDoesNotBlockTheHubReadLoop(t *testing.T) {
+	rd := New(driver.NewFake(4), "", "", "")
+	release := make(chan struct{})
+	fired := make(chan struct{}, 1)
+	rd.SetOnEvent(func(session, state, detail string) {
+		if state != "setup_done" {
+			return
+		}
+		fired <- struct{}{}
+		<-release // a wedged consumer
+	})
+	defer close(release)
+
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+	base := strings.Replace(srv.URL, "http", "ws", 1)
+	ctx := context.Background()
+
+	id := createSession(t, srv.URL)
+	sessConn, _, err := websocket.Dial(ctx, base+"/register?session="+id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessConn.CloseNow()
+	waitForHub(t, rd, id)
+
+	// A client attaches; the "session" side answers its FrameOpen with one
+	// FrameServer. Nothing here needs a real session.Session — the hub only
+	// moves frames.
+	cli, _, err := websocket.Dial(ctx, base+"/attach?session="+id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.CloseNow()
+	if err := wsjson.Write(ctx, cli, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24}); err != nil {
+		t.Fatal(err)
+	}
+	// Read the FrameOpen the hub sends us, so we know the attach id.
+	_, raw, err := sessConn.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	open, err := relay.Decode(raw)
+	if err != nil || open.Type != relay.FrameOpen {
+		t.Fatalf("first frame = %+v (%v), want a FrameOpen", open, err)
+	}
+
+	// Wedge the control handler, then prove terminal output still arrives.
+	ctrl, _ := relay.Encode(relay.Frame{Type: relay.FrameControl, Payload: []byte(`{"kind":"setup_done"}`)})
+	if err := sessConn.Write(ctx, websocket.MessageText, ctrl); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fired:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the control event never reached the callback")
+	}
+
+	msg, _ := json.Marshal(wire.ServerMsg{Type: "output", Seq: 1, Data: []byte("still alive")})
+	out, _ := relay.Encode(relay.Frame{Type: relay.FrameServer, AttachID: open.AttachID, Payload: msg})
+	if err := sessConn.Write(ctx, websocket.MessageText, out); err != nil {
+		t.Fatal(err)
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	var got wire.ServerMsg
+	if err := wsjson.Read(readCtx, cli, &got); err != nil {
+		t.Fatalf("client read while a control handler is wedged: %v (the hub read loop is blocked)", err)
+	}
+	if string(got.Data) != "still alive" {
+		t.Fatalf("client got %q, want the frame sent after the wedged control event", got.Data)
 	}
 }
