@@ -117,7 +117,7 @@ func (s *Store) UserByToken(ctx context.Context, tokenHash string) (controld.Use
 
 // --- sessions -----------------------------------------------------------
 
-const selectSessionCols = `id, owner_id, name, image, cmd, egress_allow, state, runner, idempotency_key, error, environment_id, resolved_image, created_at, updated_at, last_event_at`
+const selectSessionCols = `id, owner_id, name, image, cmd, egress_allow, state, runner, idempotency_key, error, environment_id, resolved_image, setup_hash, created_at, updated_at, last_event_at`
 
 // rowScanner is satisfied by both pgx.Row and pgx.Rows.
 type rowScanner interface {
@@ -140,7 +140,7 @@ func scanSession(row rowScanner) (controld.Session, error) {
 	var cmdBytes, egressBytes []byte
 
 	if err := row.Scan(&sess.ID, &sess.OwnerID, &sess.Name, &sess.Image, &cmdBytes, &egressBytes,
-		&state, &sess.Runner, &idem, &sess.Error, &sess.EnvironmentID, &sess.ResolvedImage,
+		&state, &sess.Runner, &idem, &sess.Error, &sess.EnvironmentID, &sess.ResolvedImage, &sess.SetupHash,
 		&sess.CreatedAt, &sess.UpdatedAt, &sess.LastEventAt); err != nil {
 		return controld.Session{}, err
 	}
@@ -195,11 +195,11 @@ func (s *Store) CreateSession(ctx context.Context, sess controld.Session) (contr
 	}
 
 	row := s.pool.QueryRow(ctx, `
-		INSERT INTO sessions (id, owner_id, name, image, cmd, egress_allow, state, runner, idempotency_key, error, environment_id, resolved_image, created_at, updated_at, last_event_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		INSERT INTO sessions (id, owner_id, name, image, cmd, egress_allow, state, runner, idempotency_key, error, environment_id, resolved_image, setup_hash, created_at, updated_at, last_event_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		RETURNING `+selectSessionCols,
 		sess.ID, sess.OwnerID, sess.Name, sess.Image, cmd, egress, string(sess.State), sess.Runner, idem, sess.Error,
-		sess.EnvironmentID, sess.ResolvedImage, createdAt, updatedAt, lastEventAt)
+		sess.EnvironmentID, sess.ResolvedImage, sess.SetupHash, createdAt, updatedAt, lastEventAt)
 
 	out, err := scanSession(row)
 	if err != nil {
@@ -402,6 +402,22 @@ func (s *Store) Transition(ctx context.Context, id string, from []controld.Sessi
 		return err
 	}
 	return controld.ErrConflict
+}
+
+func (s *Store) SetSessionSetupHash(ctx context.Context, id, hash string) error {
+	// Unguarded and state-agnostic: the create dispatch writes this once,
+	// before the command goes out, and nothing else ever writes it. It is
+	// provenance, not lifecycle, so it deliberately leaves last_event_at
+	// alone — a session's liveness clock must not tick for a bookkeeping
+	// write.
+	ct, err := s.pool.Exec(ctx, `UPDATE sessions SET setup_hash = $1, updated_at = now() WHERE id = $2`, hash, id)
+	if err != nil {
+		return fmt.Errorf("pgstore: set session setup hash: %w", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return controld.ErrNotFound
+	}
+	return nil
 }
 
 // --- runners --------------------------------------------------------------

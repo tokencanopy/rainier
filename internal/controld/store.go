@@ -79,9 +79,18 @@ type Session struct {
 	Error          string
 	EnvironmentID  string // environment this session came from; "" for scratch
 	ResolvedImage  string // image actually dispatched (snapshot or env image); "" for scratch
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	LastEventAt    time.Time
+	// SetupHash identifies the build inputs of the setup script this session
+	// was actually dispatched with: SetupHash(resolved image, script), pinned
+	// by the create dispatch and "" when no script was sent. It is the
+	// session's provenance, and the only way controld can tell, when the setup
+	// finishes, whether the container it is about to snapshot was built from
+	// the environment as it stands NOW — the environment may have been edited
+	// while the script ran, and the row carries no other trace of which script
+	// that was.
+	SetupHash   string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	LastEventAt time.Time
 }
 
 // effectiveImage is the image this session actually runs: the one resolution
@@ -202,6 +211,11 @@ type Store interface {
 	// in from, ErrNotFound if id doesn't exist. On success it also bumps
 	// updated_at and last_event_at.
 	Transition(ctx context.Context, id string, from []SessionState, to SessionState, opts TransitionOpts) error
+	// SetSessionSetupHash records the identity of the setup script a session
+	// was dispatched with (see Session.SetupHash). It is unguarded — the
+	// create dispatch writes it once, before the command goes out — and
+	// returns ErrNotFound if id doesn't exist.
+	SetSessionSetupHash(ctx context.Context, id, hash string) error
 
 	UpsertRunner(ctx context.Context, r Runner) error // by Name; sets connected/capacity/last_seen
 	SetRunnerConnected(ctx context.Context, name string, connected bool) error

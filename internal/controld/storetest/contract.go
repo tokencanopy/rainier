@@ -570,4 +570,61 @@ func RunContract(t *testing.T, open func(t *testing.T) controld.Store) {
 			t.Fatalf("scratch session after get: %+v", gotScratch)
 		}
 	})
+
+	// A session's setup_hash is the provenance of the script it was dispatched
+	// with: written once by the create dispatch, read when that setup finishes
+	// to decide whether the container may become the environment's cache.
+	t.Run("session setup hash persists and is settable", func(t *testing.T) {
+		st := open(t)
+		u := mkUser(t, st)
+		e := mkEnv(t, st, "dev")
+
+		// It round-trips through create like any other column...
+		const atCreate = "aaaa1111"
+		s, err := st.CreateSession(ctx, controld.Session{
+			ID: controld.NewSessionID(), OwnerID: u.ID, Name: "work",
+			EnvironmentID: e.ID, ResolvedImage: e.Image, SetupHash: atCreate,
+			Image: "img", State: controld.StateQueued})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.SetupHash != atCreate {
+			t.Fatalf("create must return setup_hash: %+v", s)
+		}
+
+		// ...and the dispatch-time write replaces it, visible through every
+		// read path.
+		const atDispatch = "bbbb2222"
+		if err := st.SetSessionSetupHash(ctx, s.ID, atDispatch); err != nil {
+			t.Fatalf("SetSessionSetupHash: %v", err)
+		}
+		got, err := st.GetSession(ctx, s.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.SetupHash != atDispatch {
+			t.Fatalf("get setup_hash = %q, want %q", got.SetupHash, atDispatch)
+		}
+		rows, _, err := st.ListSessions(ctx, controld.SessionQuery{Limit: 10})
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("list: %v %+v", err, rows)
+		}
+		if rows[0].SetupHash != atDispatch {
+			t.Fatalf("list setup_hash = %q, want %q", rows[0].SetupHash, atDispatch)
+		}
+		onRunner, err := st.SessionsOnRunner(ctx, "", []controld.SessionState{controld.StateQueued})
+		if err != nil || len(onRunner) != 1 || onRunner[0].SetupHash != atDispatch {
+			t.Fatalf("sessions-on-runner setup_hash: %v %+v", err, onRunner)
+		}
+
+		// A session dispatched without a script keeps the column empty.
+		scratch := mkSess(t, st, u.ID, "scratch")
+		if scratch.SetupHash != "" {
+			t.Fatalf("scratch session setup_hash = %q, want empty", scratch.SetupHash)
+		}
+
+		if err := st.SetSessionSetupHash(ctx, "sess_nosuch", atDispatch); !errors.Is(err, controld.ErrNotFound) {
+			t.Fatalf("SetSessionSetupHash on an unknown id = %v, want ErrNotFound", err)
+		}
+	})
 }

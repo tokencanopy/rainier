@@ -468,7 +468,7 @@ func (s *Server) cacheEnvironment(ctx context.Context, runner string, row Sessio
 // been edited, deleted, or cached by a sibling session since this one was
 // created.
 //
-// Four answers are "no", each an ordinary outcome rather than a failure:
+// Five answers are "no", each an ordinary outcome rather than a failure:
 //
 //   - a scratch session has no environment to cache;
 //   - the environment is gone;
@@ -479,7 +479,18 @@ func (s *Server) cacheEnvironment(ctx context.Context, runner string, row Sessio
 //     session that overrode `image` still runs the setup script, and an
 //     environment whose image moved after this session was created is in the
 //     same position: publishing either under the environment's hash would
-//     hand every later session an image nobody asked for.
+//     hand every later session an image nobody asked for;
+//   - the setup this session actually ran is not the setup the environment
+//     describes now — its pinned SetupHash says so. This is the edit that
+//     lands WHILE the script runs: nothing about the row changes, the image
+//     still matches, and only the pin can tell that the container holds the
+//     old script. A row with no pin at all (dispatched before the column
+//     existed) fails the same way, which is the safe direction.
+//
+// The last two divide the work between them: the image check catches an
+// environment whose image moved (and a session that overrode it), the pin
+// catches a script edit — and since the hash is f(image, setup), together
+// they leave no edit uncovered.
 func (s *Server) snapshotWanted(ctx context.Context, runner string, row Session) (Environment, string, bool) {
 	if row.EnvironmentID == "" {
 		log.Printf("controld: runner %s: setup finished for scratch session %s; nothing to cache", runner, row.ID)
@@ -510,6 +521,10 @@ func (s *Server) snapshotWanted(ctx context.Context, runner string, row Session)
 	case row.ResolvedImage != env.Image:
 		log.Printf("controld: environment %s: not caching %s — it ran the setup over %q, not the environment's %q",
 			env.ID, row.ID, clip(row.ResolvedImage), clip(env.Image))
+		return Environment{}, "", false
+	case row.SetupHash != hash:
+		log.Printf("controld: environment %s: not caching %s — the setup it ran predates an edit to the environment",
+			env.ID, row.ID)
 		return Environment{}, "", false
 	}
 	return env, hash, true

@@ -249,6 +249,9 @@ func (s *Server) dispatchCreate(ctx context.Context, row Session, runner string,
 		s.failCreate(ctx, row.ID, fail)
 		return
 	}
+	if !s.pinSetupHash(ctx, row, spec) {
+		return
+	}
 	res, err := s.dispatch(ctx, runner, rwire.ToRunner{
 		Type:    "create",
 		Session: row.ID,
@@ -267,6 +270,35 @@ func (s *Server) dispatchCreate(ctx context.Context, row Session, runner string,
 	case !res.OK:
 		s.failCreate(ctx, row.ID, res.Detail)
 	}
+}
+
+// pinSetupHash records WHICH setup script this create is dispatching, and
+// reports whether the dispatch may proceed.
+//
+// The pin has to happen here rather than at create time because createSpec
+// deliberately derives the script from the environment as it stands at
+// DISPATCH: a create-time copy could name a script the container never ran.
+// Once the command goes out, this hash is the only trace of what was actually
+// executed inside it — the environment can be edited a millisecond later, and
+// the session row otherwise remembers only the image. Without it, a setup_done
+// for a session that ran script v1 would be cached under the hash of v2 and
+// hand every later session the wrong toolchain, silently.
+//
+// A create with no script pins nothing (there is no provenance to record and
+// no snapshot to gate). A write that fails FAILS the session rather than
+// dispatching anyway: a container whose provenance cannot be recorded must not
+// be allowed to run a cacheable setup, and failing loudly costs one session
+// where guessing would cost the environment.
+func (s *Server) pinSetupHash(ctx context.Context, row Session, spec *rwire.Spec) bool {
+	if spec.Setup == "" {
+		return true
+	}
+	if err := s.st.SetSessionSetupHash(ctx, row.ID, SetupHash(spec.Image, spec.Setup)); err != nil {
+		log.Printf("controld: create %s: recording the setup it runs: %v", row.ID, err)
+		s.failCreate(ctx, row.ID, "could not record the setup this session runs")
+		return false
+	}
+	return true
 }
 
 // failCreate settles a create that will never happen: the row goes terminal

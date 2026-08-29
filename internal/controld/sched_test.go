@@ -3,6 +3,7 @@ package controld
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -589,6 +590,75 @@ func TestCreateDispatchFailureRequeues(t *testing.T) {
 		// event settles the row without controld ever having requeued it.
 		f.event(t, id, "running")
 		wantState(t, st, id, StateRunning)
+	})
+}
+
+// pinFailStore fails every SetSessionSetupHash, so a create whose setup
+// provenance cannot be recorded can be observed end to end.
+type pinFailStore struct {
+	Store
+	err error
+}
+
+func (p *pinFailStore) SetSessionSetupHash(ctx context.Context, id, hash string) error {
+	return p.err
+}
+
+// TestSetupPinIsWrittenBeforeTheCreate pins both halves of the provenance
+// write: a create carrying a setup script records the hash of exactly that
+// script BEFORE the command goes out, and a create that cannot record it
+// fails the session instead of running an unattributable setup.
+func TestSetupPinIsWrittenBeforeTheCreate(t *testing.T) {
+	t.Run("recorded before the command is sent", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+
+		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "make deps"})
+		row := seedSession(t, st, Session{ID: "sess_pin", State: StateCreating, Runner: "vm1",
+			Name: "pin", EnvironmentID: env.ID, ResolvedImage: env.Image})
+
+		go s.dispatchCreate(context.Background(), row, "vm1", &env)
+
+		cmd := nextCreate(t, f)
+		// The command is out, so the pin — written first — is already there.
+		got := getSession(t, st, "sess_pin")
+		if want := SetupHash(env.Image, env.Setup); got.SetupHash != want {
+			t.Fatalf("setup hash = %q, want %q recorded before the create went out", got.SetupHash, want)
+		}
+		f.reply(t, cmd, true, "")
+	})
+
+	t.Run("a scratch create pins nothing", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		row := seedSession(t, st, Session{ID: "sess_nopin", State: StateCreating, Runner: "vm1",
+			Name: "nopin", Image: "img:latest"})
+
+		go s.dispatchCreate(context.Background(), row, "vm1", nil)
+
+		cmd := nextCreate(t, f)
+		f.reply(t, cmd, true, "")
+		if got := getSession(t, st, "sess_nopin"); got.SetupHash != "" {
+			t.Fatalf("setup hash = %q, want empty — no script was dispatched", got.SetupHash)
+		}
+	})
+
+	t.Run("a pin that cannot be written fails the session and sends nothing", func(t *testing.T) {
+		store := &pinFailStore{Store: NewMemStore(), err: errors.New("store down")}
+		s, ts := newTestControldOver(t, store)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+
+		env := seedEnv(t, store, Environment{Name: "dev", Image: "img:1", Setup: "make deps"})
+		row := seedSession(t, store, Session{ID: "sess_pinfail", State: StateCreating, Runner: "vm1",
+			Name: "pinfail", EnvironmentID: env.ID, ResolvedImage: env.Image})
+
+		s.dispatchCreate(context.Background(), row, "vm1", &env)
+
+		got := wantState(t, store, "sess_pinfail", StateFailed)
+		if got.Error != "could not record the setup this session runs" {
+			t.Fatalf("error = %q, want the provenance failure", got.Error)
+		}
+		wantNothingQueued(t, s, f) // no create was ever sent
 	})
 }
 
