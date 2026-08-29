@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -342,6 +343,74 @@ func TestAgentReconnects(t *testing.T) {
 
 	conn2 := fc.nextConn(t)
 	conn2.readAnnounce(t)
+}
+
+// TestDialAttachBackChecksTargetOrigin pins the dial-back's origin guard: the
+// dial carries the fleet runner token, so a dial_attach naming any host other
+// than this runner's own controld must be refused BEFORE the dial — otherwise
+// a compromised or misrouted control conn turns into token exfiltration. The
+// probe server 404s every request, so a permitted dial fails immediately
+// (nothing to wait for) while still proving it was attempted.
+func TestDialAttachBackChecksTargetOrigin(t *testing.T) {
+	var hits atomic.Int64
+	probe := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Error(w, "no", http.StatusNotFound)
+	}))
+	defer probe.Close()
+	probeWS := strings.Replace(probe.URL, "http", "ws", 1)
+
+	dial := func(t *testing.T, controldURL string) int64 {
+		t.Helper()
+		hits.Store(0)
+		rd := New(driver.NewFake(4), "", "")
+		msg := rwire.ToRunner{Type: "dial_attach", Session: "sess_x", Attach: &rwire.Attach{
+			AttachID: "0123456789abcdef", Cols: 80, Rows: 24,
+			TargetURL: probeWS + "/v1/runners/attach-back?attach_id=0123456789abcdef",
+		}}
+		rd.dialAttachBack(context.Background(), msg, AgentConfig{ControldURL: controldURL, Token: testToken})
+		return hits.Load()
+	}
+
+	t.Run("foreign host is never dialed", func(t *testing.T) {
+		if n := dial(t, "ws://controld.invalid:9090"); n != 0 {
+			t.Fatalf("dialed a target that is not this runner's controld (%d requests)", n)
+		}
+	})
+
+	t.Run("own controld is dialed", func(t *testing.T) {
+		if n := dial(t, probeWS); n != 1 {
+			t.Fatalf("attach-back requests to this runner's own controld = %d, want 1", n)
+		}
+	})
+}
+
+// TestSameControld pins the origin comparison itself, including the two cases
+// the e2e can't reach: controld deriving a ws(s) target_url from its own
+// http(s) ExternalURL, and a wss→ws downgrade (which would put the fleet
+// token on the wire in the clear).
+func TestSameControld(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		controld, target string
+		want             bool
+	}{
+		{"identical", "ws://c:9090", "ws://c:9090/v1/runners/attach-back?attach_id=a", true},
+		{"http external url", "wss://c.example", "wss://c.example/v1/runners/attach-back", true},
+		{"default port implied", "wss://c.example:443", "wss://c.example/x", true},
+		{"http vs ws scheme alias", "ws://c:80", "http://c/x", true},
+		{"foreign host", "ws://c:9090", "ws://evil.example:9090/x", false},
+		{"foreign port", "ws://c:9090", "ws://c:9091/x", false},
+		{"tls downgrade", "wss://c.example", "ws://c.example/x", false},
+		{"unknown scheme", "ws://c:9090", "file:///etc/passwd", false},
+		{"empty target", "ws://c:9090", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sameControld(tc.controld, tc.target); got != tc.want {
+				t.Fatalf("sameControld(%q, %q) = %v, want %v", tc.controld, tc.target, got, tc.want)
+			}
+		})
+	}
 }
 
 // waitForAgentWriterCount polls rd's agentWriterCount until it equals want,

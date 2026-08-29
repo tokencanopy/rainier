@@ -7,6 +7,8 @@ import (
 	"log"
 	mrand "math/rand"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -216,11 +218,17 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 // attachment. The dial is outbound, like every other connection a runner
 // makes (spec rule 3) — controld never dials in.
 //
+// The target URL is checked against this runner's own controld before it is
+// dialed: the dial carries the fleet runner token, so an attacker who could
+// get a dial_attach onto this connection (a compromised or misconfigured
+// controld, a misrouted command) would otherwise have the runner post that
+// token to a host of their choosing. Same origin or no dial.
+//
 // It dials BEFORE waiting for the hub: the pairing controld is holding has a
 // TTL, and claiming it promptly is what keeps a client attaching to a
-// still-booting container from being dropped while this end waits. If the hub
-// never shows, closing the dialed socket is what tells controld's splice to
-// tear the client down too.
+// still-booting container from being dropped while this end waits. The trade
+// is one socket held for up to hubWait when the session never registers —
+// cheap, and closing it is what tells controld's splice to drop the client.
 //
 // ctx is the agent's lifetime, not one control connection's: an attach must
 // survive the control conn flapping and redialing underneath it.
@@ -230,8 +238,21 @@ func (s *Server) dialAttachBack(ctx context.Context, m rwire.ToRunner, cfg Agent
 		log.Printf("agent: dial_attach for %s carried no attach block; ignoring", m.Session)
 		return
 	}
+	if !sameControld(cfg.ControldURL, at.TargetURL) {
+		log.Printf("agent: refusing dial_attach for %s: target %q is not this runner's controld (%q)",
+			m.Session, at.TargetURL, cfg.ControldURL)
+		return
+	}
+
 	hdr := http.Header{"Authorization": {"Bearer " + cfg.Token}}
-	c, _, err := websocket.Dial(ctx, at.TargetURL, &websocket.DialOptions{HTTPHeader: hdr})
+	// The timeout covers the handshake only, and deliberately sits under
+	// controld's pairing TTL: a blackholed target must not park this
+	// goroutine (and its socket) until the agent shuts down. Canceling after
+	// a successful handshake is safe — net/http hands the upgraded
+	// connection to the caller and stops watching the request context.
+	dialCtx, cancel := context.WithTimeout(ctx, attachDialTimeout)
+	c, _, err := websocket.Dial(dialCtx, at.TargetURL, &websocket.DialOptions{HTTPHeader: hdr})
+	cancel()
 	if err != nil {
 		// Nothing to report back: dial_attach is fire-and-forget, and
 		// controld's pairing TTL closes the client that was waiting.
@@ -250,6 +271,54 @@ func (s *Server) dialAttachBack(ctx context.Context, m rwire.ToRunner, cfg Agent
 	// either side dying (its readLoop closes clients when the session conn
 	// dies, AttachClient closes the attachment when the client does).
 	hub.AttachClient(ctx, relay.WSConn(c), at.Since, at.Cols, at.Rows)
+}
+
+// attachDialTimeout bounds one attach-back handshake. It sits below
+// controld's 15s pairing TTL: past that the client is already gone, so a
+// dial still in flight has nothing left to connect to.
+const attachDialTimeout = 5 * time.Second
+
+// sameControld reports whether target names the same ws(s) origin as this
+// runner's configured controld — scheme, host, and port, with the default
+// port filled in and http(s) read as its ws(s) equivalent (controld derives
+// target_url from its own http(s) ExternalURL). A ws target for a wss
+// controld is a downgrade, not a match: it would put the fleet token on the
+// wire in the clear.
+func sameControld(controldURL, target string) bool {
+	want, ok := wsOrigin(controldURL)
+	if !ok {
+		return false
+	}
+	got, ok := wsOrigin(target)
+	return ok && got == want
+}
+
+// wsOrigin renders raw as a comparable "scheme://host:port", normalizing
+// http→ws and https→wss. Anything else — another scheme, an unparseable URL,
+// a missing host — is not an origin this runner will dial.
+func wsOrigin(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	var scheme, defaultPort string
+	switch strings.ToLower(u.Scheme) {
+	case "ws", "http":
+		scheme, defaultPort = "ws", "80"
+	case "wss", "https":
+		scheme, defaultPort = "wss", "443"
+	default:
+		return "", false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return "", false
+	}
+	port := u.Port()
+	if port == "" {
+		port = defaultPort
+	}
+	return scheme + "://" + host + ":" + port, true
 }
 
 // errTextUnless returns err's message, or "" if err is nil or matches
