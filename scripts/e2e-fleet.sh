@@ -431,8 +431,8 @@ grep -q "$SECRET_NAME" /tmp/rainier-e2e-secrets.txt || fail "secret ls does not 
 ok "secret $SECRET_NAME stored from stdin; neither set nor ls echoed its value"
 
 # --- the environment. The setup script writes to BOTH kinds of path, because
-# the difference between them is the whole cache story: /usr/local is on the
-# container's own filesystem and `docker commit` keeps it, so the SECOND
+# the difference between them is the whole cache story: /opt/rainier-env is on
+# the container's own filesystem and `docker commit` keeps it, so the SECOND
 # session must still see that marker; /workspace is a volume the commit
 # excludes, so the second session must NOT see that one (and its absence is
 # also how we prove the setup did not simply run again).
@@ -441,8 +441,10 @@ ok "secret $SECRET_NAME stored from stdin; neither set nor ls echoed its value"
 # died here would only produce "the environment never cached a snapshot".
 cat > "$SETUP_FILE" <<'EOF'
 #!/bin/sh
-# Image-visible: this is what the snapshot is supposed to carry forward.
-echo installed > /usr/local/rainier-setup-marker
+# Image-visible: this is what the snapshot is supposed to carry forward. The
+# stock session image gives the session user this prefix (and puts its bin/ on
+# PATH); /usr/local stays root-owned, because sessiond lives there.
+echo installed > /opt/rainier-env/rainier-setup-marker
 # Volume-backed: per-session by construction, never in the cache.
 echo setup-ran > /workspace/setup-marker
 if [ -z "${E2E_TOKEN:-}" ]; then
@@ -496,15 +498,27 @@ docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CID1" | grep -q 
 ok "first create dispatched the environment's own image plus its setup script"
 
 ATTACH1_OUT=/tmp/rainier-e2e-env-attach1.txt
-attach_probe "$SID1" 'cat /usr/local/rainier-setup-marker /workspace/setup-marker /workspace/secret-check' \
+attach_probe "$SID1" 'cat /opt/rainier-env/rainier-setup-marker /workspace/setup-marker /workspace/secret-check' \
   "$ATTACH1_OUT" 'secret-len=' 60 \
   || { echo "--- attach output ---"; cat -v "$ATTACH1_OUT"; echo "---------------------"; \
        fail "the first session never answered the setup-marker probe"; }
-grep -q 'installed' "$ATTACH1_OUT" || fail "/usr/local/rainier-setup-marker is missing: the setup script could not write outside /workspace"
+grep -q 'installed' "$ATTACH1_OUT" || fail "/opt/rainier-env/rainier-setup-marker is missing: the setup script could not write outside /workspace"
 grep -q 'setup-ran' "$ATTACH1_OUT" || fail "/workspace/setup-marker is missing: the setup script did not run"
 grep -q "secret-len=$SECRET_LEN" "$ATTACH1_OUT" \
   || fail "the setup script saw $SECRET_NAME as \"$(grep -o 'secret-len=[0-9]*' "$ATTACH1_OUT" | head -1)\", want secret-len=$SECRET_LEN"
-ok "the setup script ran in the session, installed to /usr/local, and read the environment's secret ($SECRET_LEN bytes)"
+ok "the setup script ran in the session, installed to /opt/rainier-env, and read the environment's secret ($SECRET_LEN bytes)"
+
+# The boundary that makes the writable build acceptable, against the REAL
+# session image: the session user owns its install prefix and cannot touch
+# /usr/local/bin, where sessiond — this session's PID 1 — lives. An agent that
+# could rewrite PID 1 during a build would have it baked into the cached image
+# every later session of the environment boots (design §10).
+docker exec -u 1000:1000 "$CID1" sh -c 'touch /opt/rainier-env/writable-probe' >/dev/null 2>&1 \
+  || fail "the session user cannot write /opt/rainier-env in a setup build; nothing an environment installs can be cached"
+if docker exec -u 1000:1000 "$CID1" sh -c 'touch /usr/local/bin/probe' >/dev/null 2>&1; then
+  fail "the session user can write /usr/local/bin during a setup build — sessiond (PID 1) must stay root-owned even while the rootfs is writable"
+fi
+ok "during a setup build the session user owns /opt/rainier-env and still cannot touch sessiond in /usr/local/bin"
 grep -q 'e2e setup complete' "$ATTACH1_OUT" \
   && ok "the setup script's own output is in the session's scrollback — an attached viewer watches provisioning" \
   || finding "the setup script's output is not in the session's scrollback; design §4.3 says setup is streamed to the attached terminal like any other output"
@@ -531,19 +545,19 @@ IMAGE2=$(docker inspect -f '{{.Config.Image}}' "$CID2")
 ok "second create dispatched NO setup: it booted $SNAP_REF (${SECOND_SECS}s vs ${FIRST_SECS}s for the first)"
 
 # The strong form of the cache proof, from inside the second session: the
-# /usr/local marker the setup script installed must be there (the commit
+# /opt/rainier-env marker the setup script installed must be there (the commit
 # carried it forward — this is what "cached" has to MEAN), and the /workspace
 # marker must not (the volume is per-session, and its absence is also how a
 # silent setup re-run would show itself).
 ATTACH2_OUT=/tmp/rainier-e2e-env-attach2.txt
 attach_probe "$SID2" \
-  'cat /usr/local/rainier-setup-marker; test -f /workspace/setup-marker; echo "rerun-check:$?"' \
+  'cat /opt/rainier-env/rainier-setup-marker; test -f /workspace/setup-marker; echo "rerun-check:$?"' \
   "$ATTACH2_OUT" 'rerun-check:[01]' 60 \
   || { echo "--- attach output ---"; cat -v "$ATTACH2_OUT"; echo "---------------------"; \
        fail "the second session never answered the cache probe"; }
 grep -q 'installed' "$ATTACH2_OUT" \
   || { echo "--- attach output ---"; cat -v "$ATTACH2_OUT"; echo "---------------------"; \
-       fail "the cache-booted session has no /usr/local/rainier-setup-marker: the snapshot did not carry the setup's installs, so the cache holds nothing"; }
+       fail "the cache-booted session has no /opt/rainier-env/rainier-setup-marker: the snapshot did not carry the setup's installs, so the cache holds nothing"; }
 grep -q 'rerun-check:1' "$ATTACH2_OUT" \
   || fail "the cache-booted session found /workspace/setup-marker — it re-ran its setup script, which the cached image exists to skip"
 ok "the cached image carries the setup's install, and the session did not re-run setup"

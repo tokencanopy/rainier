@@ -22,13 +22,25 @@ RUN apk add --no-cache bash curl
 # language images (node, python) already ship such a user; this is that same
 # contract, made explicit for rainier's own.
 #
-# /usr/local goes with it: it is the conventional install prefix a setup script
-# reaches for, and it is root-owned by default. Handing it to the session user
-# is what makes `--setup-file` able to put a toolchain somewhere the snapshot
-# keeps. The window is narrow — only a container that carries a setup script
-# has a writable rootfs at all (see runArgs), and that script is the
-# environment admin's own, running in an image the same admin chose.
-RUN adduser -D -u 1000 rainier && chown -R 1000:1000 /usr/local
+# /opt/rainier-env is the install prefix that goes with it: a setup script
+# needs somewhere outside /workspace it can write, since the snapshot keeps the
+# rootfs and excludes the volume. It is a DEDICATED prefix, not /usr/local,
+# and that distinction is the security boundary. /usr/local/bin holds sessiond
+# — the session's PID 1 — and stays root-owned, so even during the one
+# writable-rootfs window (a container carrying a setup script; see runArgs) the
+# session user cannot rewrite it. A setup script is untrusted in exactly the
+# way design §10 means: an agent, possibly prompt-injected, runs inside these
+# containers, and a PID 1 it could replace would be baked into the cached image
+# every later session of that environment boots.
+#
+# Cache poisoning of USER-level binaries under this prefix remains possible and
+# is inherent to any shared build cache — it is the same class of trust a
+# malicious npm package already has. What must not be reachable is the
+# platform's own agent, and it isn't.
+RUN adduser -D -u 1000 rainier \
+ && mkdir -p /opt/rainier-env/bin \
+ && chown -R 1000:1000 /opt/rainier-env
+ENV PATH="/opt/rainier-env/bin:${PATH}"
 COPY --from=build /out/sessiond /usr/local/bin/sessiond
 # sessiond as PID 1; RAINIER_DIAL/RAINIER_SESSION injected by the driver select
 # dial (relay) mode. With no env, it falls back to listen mode (dev).
