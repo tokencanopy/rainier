@@ -127,12 +127,14 @@ step "preflight"
 # script fails, and it fails LATE and cryptically (runnerd log.Fatals on
 # "address already in use" seconds after fleet-up.sh reports success). Catch
 # it here, where the fix is one line.
-for port in "$CONTROLD_PORT" 8080 3128 3129; do
+RUNNERD_PORT="${RUNNERD_PORT:-8080}"
+export RUNNERD_PORT  # fleet-up.sh reads it; egress-check.sh gets RUNNERD below
+for port in "$CONTROLD_PORT" "$RUNNERD_PORT" 3128 3129; do
   if port_busy "$port"; then
     setup_error "127.0.0.1:$port is already in use — a previous fleet is probably still running. Try ./scripts/fleet-down.sh (it kills the pid files), or 'lsof -nP -iTCP:$port -sTCP:LISTEN' to find the process."
   fi
 done
-echo "ports $CONTROLD_PORT, 8080, 3128, 3129 are free"
+echo "ports $CONTROLD_PORT, $RUNNERD_PORT, 3128, 3129 are free"
 
 # ---------------------------------------------------------------------------
 step "build"
@@ -221,7 +223,7 @@ ok "runner joined: $(grep -m1 'runner .* connected' "$CONTROLD_LOG" | sed 's/.*c
 
 if [ "$RUN_CLI" = "0" ]; then
   step "egress R4 acceptance"
-  set +e; ./scripts/egress-check.sh; EGRESS_RC=$?; set -e
+  set +e; RUNNERD="http://127.0.0.1:$RUNNERD_PORT" ./scripts/egress-check.sh; EGRESS_RC=$?; set -e
   case "$EGRESS_RC" in
     0) ok "egress R4 enforced and verified" ;;
     3) echo "SKIPPED: egress enforcement is not verifiable on this platform (see the message above)" ;;
@@ -333,7 +335,7 @@ ok "removed; $SID's terminal row is still visible under ls --all"
 # ---------------------------------------------------------------------------
 step "egress R4 acceptance"
 # ---------------------------------------------------------------------------
-set +e; ./scripts/egress-check.sh; EGRESS_RC=$?; set -e
+set +e; RUNNERD="http://127.0.0.1:$RUNNERD_PORT" ./scripts/egress-check.sh; EGRESS_RC=$?; set -e
 case "$EGRESS_RC" in
   0) ok "egress R4 enforced and verified" ;;
   3) echo "SKIPPED: egress enforcement is not verifiable on this platform (see the message above)" ;;
