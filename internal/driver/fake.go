@@ -50,6 +50,12 @@ type Fake struct {
 	volumes map[string]bool
 	// pulls records every ref handed to Prepull, in order — see Pulls.
 	pulls []string
+	// strips records the stripEnv list handed to each Snapshot call, in order.
+	// The real driver's stripping is invisible to anything but `docker image
+	// inspect`, so for every caller above the driver this record IS the
+	// observable: it is how a runnerd or e2e test proves the keys that must
+	// never reach a committed image were actually named on the command.
+	strips [][]string
 }
 
 func NewFake(total int) *Fake {
@@ -156,12 +162,15 @@ func (f *Fake) Resume(_ context.Context, id string) error {
 	it.cold = false
 	return nil
 }
-func (f *Fake) Snapshot(_ context.Context, id, ref string) (Snapshot, error) {
+func (f *Fake) Snapshot(_ context.Context, id, ref string, stripEnv []string) (Snapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.items[id]; !ok {
 		return Snapshot{}, fmt.Errorf("no such id %s", id)
 	}
+	// Recorded even on the generated-ref path: what a caller asked to be
+	// stripped is worth knowing whoever named the tag.
+	f.strips = append(f.strips, slices.Clone(stripEnv))
 	// A named ref comes back verbatim, exactly as `docker commit <id> <ref>`
 	// would — see the Driver interface for why the driver must never rename
 	// what controld content-addressed. Only an unnamed snapshot gets a
@@ -197,6 +206,21 @@ func (f *Fake) Pulls() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.pulls)
+}
+
+// Strips returns the stripEnv list of every Snapshot call, in call order.
+// Exported for the same reason Pulls is: runnerd's and the e2e suite's tests
+// live in other packages, and this record is the only place above the driver
+// where "the secrets and the setup channel were named for stripping" is
+// observable at all.
+func (f *Fake) Strips() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([][]string, len(f.strips))
+	for i, s := range f.strips {
+		out[i] = slices.Clone(s)
+	}
+	return out
 }
 func (f *Fake) Destroy(_ context.Context, id string) error {
 	f.mu.Lock()

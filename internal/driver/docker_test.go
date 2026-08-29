@@ -324,6 +324,39 @@ func TestDockerRunArgs(t *testing.T) {
 		}
 	})
 
+	t.Run("a setup script drops read-only and nothing else", func(t *testing.T) {
+		// The one conditional flag in runArgs, and the reason Plan 4's cache
+		// can hold anything: an environment's build has to be able to install
+		// into /usr/local and $HOME, which a read-only rootfs forbids and
+		// `docker commit` is the only thing that can keep (it excludes
+		// volumes, so /workspace is per-session by construction).
+		args := d.runArgs(Spec{SessionID: "sess-3", DialURL: "ws://x", Setup: "apt-get install -y make"}, "img:1")
+		if slicesContains(args, "--read-only") {
+			t.Errorf("a create with a setup script kept --read-only, so its installs cannot be committed: %v", args)
+		}
+		// Every OTHER hardening flag is untouched. The trade is one flag on
+		// one container per environment edit, not a relaxed session.
+		for _, pair := range [][2]string{
+			{"--user", "1000:1000"},
+			{"--security-opt", "no-new-privileges"},
+			{"--tmpfs", "/tmp"},
+			{"--network", "rainier-int"},
+			{"--label", "rainier.session=sess-3"},
+			{"-v", "rainier-ws-sess-3:/workspace"},
+			{"-w", "/workspace"},
+		} {
+			if !hasFlag(args, pair[0], pair[1]) {
+				t.Errorf("a setup create lost %s %s: %v", pair[0], pair[1], args)
+			}
+		}
+		// And the very next session — the cache-booted one, which carries no
+		// script — is hardened again. This is the population that matters.
+		cached := d.runArgs(Spec{SessionID: "sess-4", DialURL: "ws://x", Image: "rainier-env:e-abc"}, "rainier-env:e-abc")
+		if !slicesContains(cached, "--read-only") {
+			t.Errorf("a create with no setup script lost --read-only: %v", cached)
+		}
+	})
+
 	t.Run("no session id means no volume and no workdir", func(t *testing.T) {
 		// A volume literally named "rainier-ws-" would be SHARED by every
 		// id-less session, and -w on a path no volume backs would leave the
@@ -663,7 +696,7 @@ func TestDockerSnapshotToExplicitRefCreatesThatImage(t *testing.T) {
 
 	const ref = "rainier-env:dockertest-abc123"
 	defer dockerRun(ctx, "image", "rm", "-f", ref)
-	snap, err := d.Snapshot(ctx, h.ID, ref)
+	snap, err := d.Snapshot(ctx, h.ID, ref, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -672,6 +705,160 @@ func TestDockerSnapshotToExplicitRefCreatesThatImage(t *testing.T) {
 	}
 	if _, err := dockerRun(ctx, "image", "inspect", "-f", "{{.Id}}", ref); err != nil {
 		t.Fatalf("docker image inspect %s: %v (the commit did not land under the ref the driver reported)", ref, err)
+	}
+}
+
+// TestDockerSetupCreateCommitsRootfsWrites is THE regression pin for Plan 4's
+// first acceptance defect: an environment's setup script installed a toolchain
+// and the cached image did not have it, because every session ran with a
+// read-only rootfs and `docker commit` excludes the /workspace volume — so
+// there was no path a build could write that the commit could keep.
+//
+// A create carrying Spec.Setup now drops that one flag, and this proves the
+// consequence end to end at the driver's level: write outside the volume,
+// commit, and the file is in the image a later create would boot.
+//
+// The write is exec'd as root deliberately. What is under test here is the
+// DRIVER's property — the rootfs is writable and the commit captures it —
+// which is separate from which uid the session image lets write where; that
+// second half is the session image's own contract (see the Dockerfile's
+// session user) and is covered end to end by scripts/e2e-fleet.sh. Mixing them
+// would leave this test failing for a reason that has nothing to do with the
+// flag it exists to pin.
+func TestDockerSetupCreateCommitsRootfsWrites(t *testing.T) {
+	dockerAvailable(t)
+	d := NewDocker(DockerOpts{Image: "alpine:3.20", Network: "bridge", TotalSlots: 8, Label: "rainier.test"})
+	d.defaultCmd = []string{"sleep", "3600"}
+	defer d.destroyAllLabeled(context.Background())
+	ctx := context.Background()
+
+	const marker = "/usr/local/rainier-setup-marker"
+	const ref = "rainier-env:dockertest-setupcache"
+	defer dockerRun(ctx, "image", "rm", "-f", ref)
+
+	h, err := d.Create(ctx, Spec{Name: "tsetup", SessionID: "ssetup", DialURL: "ws://x", Setup: "true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Destroy(ctx, h.ID)
+
+	if _, err := dockerRun(ctx, "exec", "-u", "0:0", h.ID, "sh", "-c", "echo baked > "+marker); err != nil {
+		t.Fatalf("a create with a setup script could not write %s: %v — the rootfs is still read-only, so nothing a setup installs can ever be cached", marker, err)
+	}
+	if _, err := d.Snapshot(ctx, h.ID, ref, nil); err != nil {
+		t.Fatal(err)
+	}
+	out, err := dockerRun(ctx, "run", "--rm", "--entrypoint", "sh", ref, "-c", "cat "+marker)
+	if err != nil {
+		t.Fatalf("the cached image has no %s: %v — the commit did not keep the setup's work", marker, err)
+	}
+	if strings.TrimSpace(out) != "baked" {
+		t.Fatalf("cached %s = %q, want %q", marker, strings.TrimSpace(out), "baked")
+	}
+
+	// Negative control: a create with NO setup script is still hardened, and
+	// the same write is refused. Without this the test above would pass just as
+	// well against a driver that dropped --read-only for every session.
+	cached, err := d.Create(ctx, Spec{Name: "tcached", SessionID: "scached", DialURL: "ws://x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Destroy(ctx, cached.ID)
+	if _, err := dockerRun(ctx, "exec", "-u", "0:0", cached.ID, "sh", "-c", "echo nope > "+marker); err == nil {
+		t.Fatalf("a create with no setup script accepted a write to %s; its rootfs must stay read-only", marker)
+	}
+}
+
+// TestDockerSnapshotStripsSecretsAndSetupChannel is the regression pin for the
+// other two acceptance defects, which share one cause: `docker commit`
+// captures the container's whole config, environment block included.
+//
+// Left alone, that block put an environment's DECRYPTED secrets inside an
+// image anyone with a docker socket could read, and carried RAINIER_SETUP_B64
+// along so every session booted from the cache re-ran the setup script the
+// cache exists to skip. Both are asserted here against the real committed
+// config, because a fake cannot have one.
+func TestDockerSnapshotStripsSecretsAndSetupChannel(t *testing.T) {
+	dockerAvailable(t)
+	d := NewDocker(DockerOpts{Image: "alpine:3.20", Network: "bridge", TotalSlots: 8, Label: "rainier.test"})
+	d.defaultCmd = []string{"sleep", "3600"}
+	defer d.destroyAllLabeled(context.Background())
+	ctx := context.Background()
+
+	const secretValue = "s3cr3t-must-not-survive"
+	const ref = "rainier-env:dockertest-strip"
+	defer dockerRun(ctx, "image", "rm", "-f", ref)
+
+	h, err := d.Create(ctx, Spec{
+		Name: "tstrip", SessionID: "sstrip", DialURL: "ws://x",
+		Setup: "echo hi", SetupTimeoutSec: 900,
+		Env: map[string]string{"SECRET_A": secretValue},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Destroy(ctx, h.ID)
+
+	// The container really does carry both — otherwise the assertions below
+	// would pass against a create that never injected anything.
+	before, err := dockerRun(ctx, "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"SECRET_A=" + secretValue, "RAINIER_SETUP_B64="} {
+		if !strings.Contains(before, want) {
+			t.Fatalf("the container's own env does not contain %q, so this test proves nothing:\n%s", want, before)
+		}
+	}
+
+	strip := []string{"SECRET_A", "RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT"}
+	if _, err := d.Snapshot(ctx, h.ID, ref, strip); err != nil {
+		t.Fatal(err)
+	}
+	after, err := dockerRun(ctx, "image", "inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(after, secretValue) {
+		t.Fatalf("the committed image's config carries the secret's VALUE:\n%s", after)
+	}
+	for _, line := range strings.Split(after, "\n") {
+		for _, k := range strip {
+			if v, ok := strings.CutPrefix(line, k+"="); ok && v != "" {
+				t.Fatalf("stripped key %s carries %q in the committed image:\n%s", k, v, after)
+			}
+		}
+	}
+
+	// And a container booted from that image sees the setup channel as absent,
+	// which is what sessiond's `RAINIER_SETUP_B64 != ""` gate reads — the
+	// empty-equals-absent contract the strip relies on.
+	out, err := dockerRun(ctx, "run", "--rm", "--entrypoint", "sh", ref, "-c", `[ -z "$RAINIER_SETUP_B64" ] && echo no-setup`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out) != "no-setup" {
+		t.Fatalf("a container from the cached image still sees a setup script: %q", out)
+	}
+}
+
+// TestDockerCommitArgsRejectsAMalformedStripKey: a key carrying '=' or
+// whitespace would corrupt the `--change "ENV K="` it becomes, silently
+// leaving a secret in the image. Aborting the snapshot is the safe direction —
+// no cache just means the next session runs setup again. No daemon needed.
+func TestDockerCommitArgsRejectsAMalformedStripKey(t *testing.T) {
+	for _, bad := range []string{"", "K=V", "HAS SPACE"} {
+		if _, err := commitArgs("cid", "ref", []string{"FINE", bad}); err == nil {
+			t.Errorf("commitArgs accepted strip key %q; want an error", bad)
+		}
+	}
+	args, err := commitArgs("cid", "ref", []string{"A", "B"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"commit", "--change", "ENV A=", "--change", "ENV B=", "cid", "ref"}
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("commitArgs = %v, want %v", args, want)
 	}
 }
 

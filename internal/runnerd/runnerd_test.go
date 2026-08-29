@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -1151,6 +1152,60 @@ func TestSnapshotOverHTTPGeneratesARef(t *testing.T) {
 	// and it minted one, instead of the handler echoing back a blank.
 	if !strings.HasPrefix(body.Ref, "fake-image:") {
 		t.Fatalf("snapshot ref = %q, want a driver-generated fake-image: ref", body.Ref)
+	}
+}
+
+// TestSnapshotStripsTheCreateEnvAndSetupChannel pins runnerd's half of the
+// cached-image safety rule: a commit captures the container's whole config, so
+// the snapshot command must NAME everything that must not survive into the
+// image — every variable the create injected (an environment's decrypted
+// secrets) plus the setup channel that would otherwise make the cache re-run
+// its own setup script.
+//
+// The driver is where the stripping happens; what this asserts is that runnerd
+// remembered the right names from a create it handled minutes earlier, since
+// the Spec is long gone by snapshot time and nothing else in the process knows
+// them.
+func TestSnapshotStripsTheCreateEnvAndSetupChannel(t *testing.T) {
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "", "")
+	ctx := context.Background()
+
+	err := rd.CreateWithID(ctx, "sess-strip", driver.Spec{
+		Image: "img",
+		Setup: "install things",
+		Env:   map[string]string{"GH_TOKEN": "secret-value", "API_KEY": "another"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rd.OpSnapshot(ctx, "sess-strip", "rainier-env:e1-abc"); err != nil {
+		t.Fatal(err)
+	}
+
+	strips := fd.Strips()
+	if len(strips) != 1 {
+		t.Fatalf("Strips() = %v, want exactly one snapshot's list", strips)
+	}
+	// Env keys sorted, then the setup channel: a stable list, so a snapshot of
+	// the same session always issues the same command.
+	want := []string{"API_KEY", "GH_TOKEN", "RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT"}
+	if !reflect.DeepEqual(strips[0], want) {
+		t.Fatalf("strip list = %v, want %v", strips[0], want)
+	}
+
+	// A session that injected nothing still strips the setup channel —
+	// unconditionally, because "this one looked harmless" is exactly the
+	// reasoning that lets one image through carrying a credential.
+	if err := rd.CreateWithID(ctx, "sess-bare", driver.Spec{Image: "img"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rd.OpSnapshot(ctx, "sess-bare", ""); err != nil {
+		t.Fatal(err)
+	}
+	strips = fd.Strips()
+	if got, want := strips[1], []string{"RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("strip list for a session with no injected env = %v, want %v", got, want)
 	}
 }
 

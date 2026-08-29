@@ -236,16 +236,39 @@ step. Editing the image or the script moves the hash, `CACHED` drops back to
 `no`, and the next session rebuilds; sessions already running are never
 touched, because each pinned its resolved image at create.
 
-**What a setup script may write — and what survives it.** A session container
-has exactly two writable paths: `/workspace` (its own docker volume) and
-`/tmp` (tmpfs). Everything else is a read-only rootfs. `docker commit`
-excludes volumes, so nothing a setup script writes under `/workspace` reaches
-the cached image, and today nothing it writes anywhere else can succeed at
-all — which means **the snapshot cache does not yet carry installed
-software**. Put toolchains in `--image` (that is what `node:22` above is for)
-and use `--setup-file` for per-session preparation. See the criterion-2 row of
-the Plan 4 acceptance table below: this is a known v0 defect, not a
-configuration mistake.
+**Install into image-visible paths, not `/workspace`.** `docker commit`
+excludes volumes, so anything a setup script writes under `/workspace` is
+per-session: the session that ran the script has it, and every session booted
+from the cache starts with an empty workspace. Only writes to the container's
+own filesystem — `$HOME`, `/usr/local`, anywhere on the rootfs — end up in the
+snapshot. So `npm ci --prefix /workspace` gives you a fresh install every time,
+while `npm install -g` or a `$HOME`-based toolchain installer is cached once
+and reused. Use `/workspace` for the per-session preparation you actually want
+repeated.
+
+Those paths have to be writable by the **session user (uid 1000)**, which the
+image decides. Rainier's own `rainier-session:latest` creates that user and
+gives it `/usr/local`; mainstream language images (`node:22`, and friends)
+ship a uid-1000 user with a real `$HOME`. An image with no uid-1000 user gives
+it `HOME=/` on a root-owned rootfs, and a setup script there can write nothing
+the cache could keep.
+
+**The first build per environment edit runs with a writable rootfs.** That is
+the one hardening flag rainier trades away, and only on the container that has
+a setup script to run: it has to be able to install, and a read-only rootfs
+makes that impossible. The trade is narrow on purpose — the build executes the
+environment admin's own script, in an image the same admin chose, once per
+edit. Every session afterwards boots the cached image with `--read-only` back
+on, which is the population that matters. Nothing else differs between the two:
+same unprivileged user, same `no-new-privileges`, same tmpfs, same workspace
+volume, same egress wiring.
+
+**Secrets and the setup channel never reach the cached image.** The commit
+strips every variable the create injected — an environment's resolved
+`secret_ref` values — along with the setup script itself, so `docker image
+inspect rainier-env:…` shows neither. A session booted from the cache gets its
+secrets injected fresh at create (they are resolved per session, not baked per
+image) and runs no setup script, which is the entire point of the cache.
 
 **Setup scripts must be idempotent.** A cold-parked session that is resumed
 starts its container again, and sessiond re-runs the setup wrapper on that
@@ -259,7 +282,8 @@ one-shot `sh -c` container built from that same image (a new named volume's
 root is `root:root`, and the session runs as uid 1000). A distroless or
 `FROM scratch` image therefore fails `Create` loudly — `initialize workspace
 volume rainier-ws-…: the image must provide sh and chown` — rather than
-producing a session with an unwritable workspace.
+producing a session with an unwritable workspace. It should also carry a
+uid-1000 user, for the reason above.
 
 **`--from-devcontainer` reads plain JSON only.** It is a one-field hint: it
 takes `image` and prints every key it ignored. devcontainer.json is officially
@@ -360,42 +384,45 @@ containers on a laptop. Record what actually happened in the Result column.
 
 | # | Criterion | How to run it | Status | Result |
 |---|---|---|---|---|
-| 1 | `rainier env create myapp --image node:22 --setup ./setup.sh --egress registry.npmjs.org,github.com` then `rainier new --env myapp` boots a session with the toolchain present. | Step 7 above, on the VM. | ◐ | 2026-08-29 local rehearsal: `env create` → `new --env` → attach works; the toolchain that is present is the **base image's**. A setup script cannot add one — see criterion 2. GCE run pending. |
-| 2 | The FIRST session on an environment runs setup live, streamed to the attached terminal; a snapshot is cached; the SECOND session boots from cache with no setup run — measurably faster (record both times on rainier-1). | Step 7 above: `rainier new --env web` twice, timing each, with `rainier env ls` in between. | ✗ | 2026-08-29 local rehearsal. What works: setup runs live and its output is in the session's scrollback; the snapshot is committed and recorded content-addressed (`rainier-env:<env id>-<hash12>`); the second create dispatches no setup and boots that ref (2s vs 1s, trivial script). What does not: **the cache carries nothing** — three defects below. |
+| 1 | `rainier env create myapp --image node:22 --setup ./setup.sh --egress registry.npmjs.org,github.com` then `rainier new --env myapp` boots a session with the toolchain present. | Step 7 above, on the VM. | ◐ | 2026-08-29 local rehearsal: `env create` → `new --env` → attach works, and the setup script's install into `/usr/local` is present in the session AND in every session booted from the cache after it. GCE run pending. |
+| 2 | The FIRST session on an environment runs setup live, streamed to the attached terminal; a snapshot is cached; the SECOND session boots from cache with no setup run — measurably faster (record both times on rainier-1). | Step 7 above: `rainier new --env web` twice, timing each, with `rainier env ls` in between. | ◐ | 2026-08-29 local rehearsal, after the fix round below: setup runs live with its output in the scrollback; the snapshot is committed content-addressed (`rainier-env:<env id>-<hash12>`); the second create dispatches no setup, boots that ref, still has the setup's `/usr/local` install, and did NOT re-run the script. Timings on this laptop are meaningless (trivial script, warm image) — **record real ones on rainier-1**, which is what the ◐ is for. |
 | 3 | Session work in `/workspace` survives warm suspend AND cold park (stop + resume) — the session volume exists and persists. | Covered by the driver contract suite (`go test ./internal/driver/`), which runs the docker driver whenever a daemon is available: write → cold suspend → resume → file present; destroy → volume gone. | ☑ | Automated: green, docker and fake drivers. |
-| 4 | Env-declared secrets are injected as env vars into sessions of that env, stored encrypted in Postgres, never readable via the API after write. | `go test ./internal/e2e/ -run TestSecretsReachSpec`; on the VM, an environment whose setup script echoes the secret's LENGTH. | ◐ | Injection and encryption: ☑ (automated, plus the local rehearsal's setup script read the value). "Never readable": true of the API, **false of the fleet** — see the third finding below. |
+| 4 | Env-declared secrets are injected as env vars into sessions of that env, stored encrypted in Postgres, never readable via the API after write. | `go test ./internal/e2e/ -run TestSecretsReachSpec`; on the VM, an environment whose setup script echoes the secret's LENGTH. | ☑ | Injection and encryption: automated, plus the local rehearsal's setup script read the value. "Never readable": the API is write-only, and after the fix round below the cached image's config carries no value either (`docker image inspect rainier-env:…`, asserted by the rehearsal). |
 | 5 | An environment with `placement: rainier-1` always places there; placement to a non-existent runner queues with a visible reason. | Covered by `go test ./internal/e2e/ -run TestPlacementPinQueuesWithReason` (a pinned session is passed over while a runner with two free slots sits there, then places the moment its own runner joins). | ☑ | Automated: green under `-race -count=5`. |
 | 6 | Editing an environment never mutates a running session (sessions pin their resolved image at create). | Covered by `go test ./internal/e2e/ -run TestEnvEditInvalidatesCache` and controld's `SetSessionSetupHash` tests. | ☑ | Automated: the edit moves `setup_hash`, leaves the running session and the stale snapshot columns untouched, and only the NEXT create rebuilds. |
 | 7 | Everything green in CI; acceptance run on the GCE fleet recorded in the runbook. | `go test ./... -race`, then this table filled in from the VM. | ◐ | CI green 2026-08-29. Local rehearsal recorded here; the GCE run is what remains. |
 
 **Notes / follow-ups from the 2026-08-29 environments rehearsal**
-(`RUNNERD_PORT=8081 PG_PORT=5434 ./scripts/e2e-fleet.sh`, exit 0 with three
-findings):
+(`RUNNERD_PORT=8081 PG_PORT=5434 ./scripts/e2e-fleet.sh`)
 
-- **The snapshot cache is empty, by construction.** Session containers run
-  `--read-only` with only `/workspace` (a volume) and `/tmp` (tmpfs)
-  writable, and `docker commit` excludes volumes. A setup script's writes
-  therefore reach nothing the snapshot can keep: `mkdir /usr/local/...`
-  inside a session fails with `Read-only file system`, and the committed
-  image is the base image under a new tag. Design §4.4 ("root stays
-  read-only") and §4.3 (setup provisions a cacheable image) contradict each
-  other, and §4.4 won.
-- **A cache-booted session re-runs its setup script.** `docker commit`
+The first rehearsal exited 0 on the flow and recorded three findings — the
+environment plumbing (API, CLI, resolution, placement, secrets-at-rest,
+invalidation, events) was doing exactly what it should, and everything the
+cache is *for* was broken. All three were one root cause, what `docker commit`
+captures, and all three are fixed; the rehearsal now asserts each of them
+rather than reporting it.
+
+- **The snapshot cache was empty by construction.** Every session ran with
+  `--read-only`, so a setup script could write only `/workspace` (a volume
+  `docker commit` excludes) and `/tmp` — `mkdir /usr/local/...` failed with
+  `Read-only file system`, and the committed image was the base image under a
+  new tag. Design §4.4 ("root stays read-only") and §4.3 (setup provisions a
+  cacheable image) contradicted each other, and §4.4 won. **Fixed:** a create
+  carrying a setup script drops that one flag; cache-booted and scratch
+  sessions keep it. The session image also needed a uid-1000 user to own the
+  paths a script installs into — a writable rootfs it has no permission to
+  write is no better than a read-only one.
+- **A cache-booted session re-ran its setup script.** `docker commit`
   snapshots the container's *config*, environment block included, so
-  `RAINIER_SETUP_B64` rides along inside `rainier-env:…`. controld correctly
-  dispatches no `setup` for a cache hit — and sessiond runs it anyway,
-  because the variable is in the image. The second session's `/workspace`
-  had the setup marker in it.
-- **The cached image carries the environment's decrypted secrets.** Same
-  cause: every `-e` the driver passed, including each resolved `secret_ref`
-  value, is in the committed image's config. `docker image inspect
-  rainier-env:…` prints them. Values stay write-only at the API, but anyone
-  with docker on that runner can read them, and a registry-backed
-  distribution (design §6) would publish them.
-- All three land in the driver's `Snapshot` and in the container's hardening
-  flags, not in the environment plumbing above them: the API, CLI, resolution,
-  placement, secrets-at-rest, invalidation and event paths are all doing what
-  they should, which is why the phase's other twelve checks pass.
+  `RAINIER_SETUP_B64` rode along inside `rainier-env:…` and sessiond ran the
+  script even though controld correctly dispatched none. **Fixed:** the
+  snapshot names the setup channel for stripping, always.
+- **The cached image carried the environment's decrypted secrets.** Same
+  cause: every `-e` the driver passed, each resolved `secret_ref` value
+  included, was in the committed config for anyone with a docker socket to
+  read — and a registry-backed distribution (design §6) would have published
+  them. **Fixed:** runnerd records each create's env KEYS (never values) and
+  names them for stripping at snapshot time, alongside the setup channel.
 - Unrelated repair found by the same run: `e2e-fleet.sh` read `rainier ls`
   columns by awk field number, and the ENV column that sessions grew in Plan 4
   shifted every field after it — `session_state` returned `-` forever, so the
