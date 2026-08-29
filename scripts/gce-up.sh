@@ -14,7 +14,8 @@
 #   - project "rainier" exists with billing enabled
 #   - a Tailscale account (the auth step is interactive, at the end)
 #
-# Env: PROJECT, ZONE, VM, MACHINE_TYPE, DISK_SIZE all override the defaults.
+# Env: PROJECT, ZONE, VM, MACHINE_TYPE, DISK_SIZE, GO_VERSION override the
+# defaults.
 set -euo pipefail
 
 PROJECT=${PROJECT:-rainier}
@@ -22,6 +23,11 @@ ZONE=${ZONE:-us-west1-b}
 VM=${VM:-rainier-1}
 MACHINE_TYPE=${MACHINE_TYPE:-e2-medium}
 DISK_SIZE=${DISK_SIZE:-50GB}
+# go.mod says `go 1.25.0`, and Debian bookworm's golang-go is 1.19 — apt's Go
+# cannot build this repo at all ("go.mod requires go >= 1.25.0"). Install the
+# official tarball instead, which is also how you upgrade later: bump this and
+# re-run.
+GO_VERSION=${GO_VERSION:-1.25.0}
 
 command -v gcloud >/dev/null || { echo "gcloud not found — install the Google Cloud CLI first" >&2; exit 2; }
 
@@ -49,12 +55,16 @@ else
     --boot-disk-size "$DISK_SIZE"
 fi
 
-say "installing docker + tailscale on $VM (idempotent)"
-# Each install is guarded by a command -v check, so re-running costs one ssh
-# round trip and changes nothing. The docker group membership only takes
+say "installing docker + tailscale + go $GO_VERSION on $VM (idempotent)"
+# Each install is guarded by a version/command check, so re-running costs one
+# ssh round trip and changes nothing. The docker group membership only takes
 # effect on the next login — hence the note at the end rather than a `newgrp`
 # dance inside a non-interactive shell.
-gcloud compute ssh "$VM" --project "$PROJECT" --zone "$ZONE" --command '
+#
+# Single-quoted heredoc: this whole block is remote shell, so $USER, $(…) and
+# friends must reach the VM unexpanded. GO_VERSION is the one local value it
+# needs, so it is passed in as an env assignment on the remote command line.
+gcloud compute ssh "$VM" --project "$PROJECT" --zone "$ZONE" --command "GO_VERSION=$GO_VERSION bash -s" <<'REMOTE'
   set -e
   if ! command -v docker >/dev/null; then
     echo "--- installing docker"
@@ -69,24 +79,49 @@ gcloud compute ssh "$VM" --project "$PROJECT" --zone "$ZONE" --command '
   else
     echo "--- tailscale already installed: $(tailscale version | head -1)"
   fi
-  if ! command -v git >/dev/null || ! command -v go >/dev/null; then
-    echo "--- installing git + go toolchain"
+  if ! command -v git >/dev/null; then
+    echo "--- installing git"
     sudo apt-get update -qq
-    sudo apt-get install -y -qq git golang-go
+    sudo apt-get install -y -qq git
   fi
+
+  # Go from the official tarball, NOT apt: Debian bookworm ships golang-go
+  # 1.19 and go.mod requires 1.25.0, so `make build` would hard-fail at
+  # runbook step 2 with "go.mod requires go >= 1.25.0". /usr/local/go is
+  # exactly where go.dev/doc/install puts it, so PATH advice everywhere else
+  # applies unchanged.
+  if [ "$(/usr/local/go/bin/go version 2>/dev/null | awk '{print $3}')" = "go${GO_VERSION}" ]; then
+    echo "--- go already installed: $(/usr/local/go/bin/go version)"
+  else
+    ARCH=$(dpkg --print-architecture)   # amd64 on e2-medium, arm64 on t2a
+    echo "--- installing go ${GO_VERSION} (linux-${ARCH}) into /usr/local/go"
+    curl -fsSL -o /tmp/go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz"
+    sudo rm -rf /usr/local/go
+    sudo tar -C /usr/local -xzf /tmp/go.tgz
+    rm -f /tmp/go.tgz
+    echo "$(/usr/local/go/bin/go version) installed"
+  fi
+  # On PATH for every future login shell (and idempotent: one grep guard).
+  if ! grep -qs '/usr/local/go/bin' ~/.profile; then
+    echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.profile
+    echo "--- added /usr/local/go/bin to ~/.profile (takes effect next login)"
+  fi
+
   echo
   if tailscale status >/dev/null 2>&1; then
     echo "tailscale is already up: $(tailscale status --json | grep -m1 DNSName || true)"
   else
     echo "NEXT, on the VM: sudo tailscale up    (authenticate in the browser it prints)"
   fi
-'
+REMOTE
 
 cat <<EOF
 
 === provisioned
 Next steps are in docs/deploy-gce.md:
   1. gcloud compute ssh $VM --project $PROJECT --zone $ZONE
+     (a FRESH login: the docker group and /usr/local/go/bin in PATH both
+      only take effect on the next one — 'go version' should print go$GO_VERSION)
   2. sudo tailscale up            # if it isn't already
   3. clone the repo, make build, start postgres + controld + the fleet
   4. from this laptop: rainier login --from-gh --server http://$VM:9090

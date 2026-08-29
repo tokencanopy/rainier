@@ -65,6 +65,10 @@ const (
 	pollInterval = 20 * time.Millisecond
 	// wsReadLimit matches controld's, runnerd's, and sessiond's own limits.
 	wsReadLimit = 16 << 20
+	// pgAdminTimeout bounds the RAINIER_TEST_PG_DSN admin round trips (create
+	// and drop the scene's own database), so an unreachable server fails the
+	// scene rather than hanging it.
+	pgAdminTimeout = 30 * time.Second
 )
 
 // ---------------------------------------------------------------------------
@@ -91,7 +95,11 @@ func newStore(t *testing.T) controld.Store {
 // throwaway container either way.
 func newPGStore(t *testing.T, dsn string) controld.Store {
 	t.Helper()
-	ctx := context.Background()
+	// Bounded: a DSN pointing at an unreachable or wedged server must fail
+	// this scene with a legible error, not park it until `go test`'s own
+	// panic-after-10-minutes.
+	ctx, cancel := context.WithTimeout(context.Background(), pgAdminTimeout)
+	defer cancel()
 
 	name := "e2e_" + cli.RandHex(8)
 	admin, err := pgx.Connect(ctx, dsn)
@@ -115,9 +123,15 @@ func newPGStore(t *testing.T, dsn string) controld.Store {
 	}
 	t.Cleanup(func() {
 		st.Close()
-		if c, err := pgx.Connect(ctx, dsn); err == nil {
-			c.Exec(ctx, "DROP DATABASE IF EXISTS "+name)
-			c.Close(ctx)
+		// A fresh bounded context: ctx above is already canceled by the time
+		// cleanup runs (its defer fired when newPGStore returned), and a
+		// canceled context would turn this best-effort tidy-up into a
+		// guaranteed no-op that silently leaks a database per scene.
+		dropCtx, dropCancel := context.WithTimeout(context.Background(), pgAdminTimeout)
+		defer dropCancel()
+		if c, err := pgx.Connect(dropCtx, dsn); err == nil {
+			c.Exec(dropCtx, "DROP DATABASE IF EXISTS "+name)
+			c.Close(dropCtx)
 		}
 	})
 	return st
@@ -840,9 +854,13 @@ func (f *fleet) echoes(id, keys string) {
 // creates against a fleet with 4 free slots: 4 run, 6 sit visibly queued, and
 // the queue drains as capacity frees — no failed creates, no lost sessions."
 //
-// Two runners of two slots each also make the placement assertion meaningful:
-// least-loaded with a name tie-break (§4.7) has to spread the four across both
-// runners, not stack them on whichever answered first.
+// Phases 1 and 2 are that criterion. Their 2-and-2 spread proves capacity is
+// respected and never overcommitted — but at saturation it does NOT
+// discriminate least-loaded from any other capacity-respecting policy: with
+// four slots and ten creates, every policy fills both runners. Phase 3 is
+// what actually tests §4.7's placement rule, by building the one situation
+// where policies disagree — two runners with free capacity, in different
+// amounts, and an empty queue.
 func TestBurstQueuesAndDrains(t *testing.T) {
 	f := newFleet(t)
 	f.addRunner("vm-a", 2)
@@ -855,7 +873,7 @@ func TestBurstQueuesAndDrains(t *testing.T) {
 		f.create(fmt.Sprintf("burst-%02d", i))
 	}
 
-	// 4 slots, 10 creates: four reach running, six wait. Nothing fails.
+	// --- phase 1: 4 slots, 10 creates → four run, six wait, nothing fails.
 	rows := f.waitSessions(90*time.Second, "4 running and 6 queued", func(rows map[string]apiSession) bool {
 		c := counts(rows)
 		return len(rows) == total && c["running"] == 4 && c["queued"] == 6
@@ -863,10 +881,11 @@ func TestBurstQueuesAndDrains(t *testing.T) {
 	assertNoCasualties(t, rows)
 
 	if a, b := liveOn(rows, "vm-a"), liveOn(rows, "vm-b"); len(a) != 2 || len(b) != 2 {
-		t.Fatalf("placement spread = vm-a:%d vm-b:%d, want 2 and 2 (least-loaded)\n%s", len(a), len(b), describe(rows))
+		t.Fatalf("placement spread = vm-a:%d vm-b:%d, want 2 and 2 — capacity is respected and evenly filled\n%s",
+			len(a), len(b), describe(rows))
 	}
 
-	// Free two slots on vm-a. The queue must drain into exactly those.
+	// --- phase 2: free two slots on vm-a; the queue drains into exactly those.
 	destroyed := liveOn(rows, "vm-a")
 	for _, id := range destroyed {
 		f.delete(id)
@@ -891,6 +910,61 @@ func TestBurstQueuesAndDrains(t *testing.T) {
 			}
 		}
 	}
+
+	// --- phase 3: least-loaded, actually discriminating.
+	//
+	// The queue has to be empty first: while anything is queued, free capacity
+	// is consumed the instant it appears, so there is no way to hold two
+	// runners at different free counts long enough to place against them.
+	// Cancelling queued rows is the cheap way there (queued → canceled needs
+	// no runner at all) and exercises that path besides.
+	for id, row := range rows {
+		if row.State == "queued" {
+			f.delete(id)
+		}
+	}
+	rows = f.waitSessions(60*time.Second, "the queue to empty out", func(rows map[string]apiSession) bool {
+		return counts(rows)["queued"] == 0 && counts(rows)["canceled"] == 4
+	})
+
+	// A third runner joins with 2 free slots (criterion 6's join path, and the
+	// only runner that will have the most free capacity in a moment), while
+	// vm-a is left holding exactly one free slot.
+	f.addRunner("vm-c", 2)
+	f.waitRunner("vm-c", true, 30*time.Second)
+	freed := liveOn(rows, "vm-a")[0]
+	f.delete(freed)
+	rows = f.waitSessions(60*time.Second, "vm-a to drop to one live session", func(rows map[string]apiSession) bool {
+		return rows[freed].State == "destroyed" && len(liveOn(rows, "vm-a")) == 1
+	})
+	if got := len(liveOn(rows, "vm-c")); got != 0 {
+		t.Fatalf("vm-c holds %d sessions before phase 3's first create; the queue was not empty\n%s", got, describe(rows))
+	}
+
+	// vm-a: 1 free. vm-b: 0 free. vm-c: 2 free. Least-loaded must pick vm-c —
+	// first-fit, round-robin, or "whoever announced first" would all pick
+	// vm-a, so this is the assertion that tells them apart.
+	mostFree := f.create("least-loaded-most-free")
+	rows = f.waitSessions(60*time.Second, "the most-free placement to land", func(rows map[string]apiSession) bool {
+		return rows[mostFree.ID].Runner != ""
+	})
+	if got := rows[mostFree.ID].Runner; got != "vm-c" {
+		t.Fatalf("placed on %q with vm-a at 1 free and vm-c at 2 free; least-loaded must pick vm-c\n%s",
+			got, describe(rows))
+	}
+
+	// Now vm-a and vm-c are both at exactly 1 free, so the tie-break decides:
+	// lexicographically smaller name (§4.7, deterministic for exactly this
+	// reason). vm-a, not vm-c.
+	tieBreak := f.create("least-loaded-tie-break")
+	rows = f.waitSessions(60*time.Second, "the tie-broken placement to land", func(rows map[string]apiSession) bool {
+		return rows[tieBreak.ID].Runner != ""
+	})
+	if got := rows[tieBreak.ID].Runner; got != "vm-a" {
+		t.Fatalf("placed on %q with vm-a and vm-c both at 1 free; the name tie-break must pick vm-a\n%s",
+			got, describe(rows))
+	}
+	assertNoCasualties(t, rows)
 }
 
 // assertNoCasualties pins criterion 5's "no failed creates, no lost sessions":

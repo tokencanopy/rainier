@@ -162,9 +162,14 @@ echo "internal network bridge gateway: $BRIDGE_GW; host reachable via: $GW"
 # each session's own id as URL userinfo per container (Task 13, egress R4),
 # so every session gets a distinct, correctly-scoped Proxy-Authorization
 # identity from this one shared flag value.
+# SLOTS is this runner's capacity — runnerd's own default is 16. It is
+# passed through because a capacity you can set from the outside is what makes
+# the burst/queue behavior (design success criterion 5) reproducible on a real
+# fleet: SLOTS=4 gives you the four-free-slot fleet that criterion describes.
 RUNNERD_ARGS=(--listen 0.0.0.0:8080 --dial-base "ws://$GW:8080"
   --image rainier-session:latest --network rainier-internal
-  --egress-admin http://127.0.0.1:3129 --proxy-url "http://$GW:3128")
+  --egress-admin http://127.0.0.1:3129 --proxy-url "http://$GW:3128"
+  --slots "${SLOTS:-16}")
 
 # Dial (agent) mode, opt-in via CONTROLD_URL: this runnerd also dials a
 # control plane and takes its placements from there (Plan 3). Unset — the
