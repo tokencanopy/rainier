@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -20,6 +21,12 @@ import (
 	"rainier/internal/attachio"
 	"rainier/internal/cli"
 )
+
+// devicePollTimeout bounds a single poll request to GitHub's device-flow
+// token endpoint — without it, a stalled or blackholed request could park
+// the whole `login --client-id` flow indefinitely instead of just failing
+// that one poll and trying again on the next interval tick.
+const devicePollTimeout = 15 * time.Second
 
 func main() {
 	if len(os.Args) < 2 {
@@ -71,7 +78,15 @@ commands:
   suspend  <id|name> [--cold]
   resume   <id|name>
   snapshot <id|name>
-  rm       <id|name>`)
+  rm       <id|name>
+
+<id|name>: a "sess_" prefix is used as a session id directly. Anything else
+is resolved by name against your team's non-terminal sessions — names are
+unique only per owner, so two teammates can share one. If the name matches
+more than one session, a session this CLI has seen you create (cached from
+a prior "new") is preferred when it's the only one of the matches that's
+yours; otherwise the name is rejected as ambiguous and every matching
+session's id and owner are listed so you can pass the id explicitly.`)
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +96,7 @@ commands:
 
 type session struct {
 	ID          string   `json:"id"`
+	OwnerID     string   `json:"owner_id"`
 	Name        string   `json:"name"`
 	Image       string   `json:"image"`
 	Cmd         []string `json:"cmd"`
@@ -244,8 +260,10 @@ func githubDeviceFlow(clientID string) (string, error) {
 }
 
 func requestDeviceCode(clientID string) (deviceCodeResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), devicePollTimeout)
+	defer cancel()
 	form := url.Values{"client_id": {clientID}, "scope": {"read:user"}}
-	req, err := http.NewRequest(http.MethodPost, "https://github.com/login/device/code", strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://github.com/login/device/code", strings.NewReader(form.Encode()))
 	if err != nil {
 		return deviceCodeResponse{}, err
 	}
@@ -263,13 +281,19 @@ func requestDeviceCode(clientID string) (deviceCodeResponse, error) {
 	return dc, nil
 }
 
+// pollAccessToken makes one poll of GitHub's device-flow token endpoint,
+// bounded by devicePollTimeout so a single stalled request can't park the
+// whole login flow — githubDeviceFlow's own loop is what retries on the
+// next interval tick.
 func pollAccessToken(clientID, deviceCode string) (accessTokenResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), devicePollTimeout)
+	defer cancel()
 	form := url.Values{
 		"client_id":   {clientID},
 		"device_code": {deviceCode},
 		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
 	}
-	req, err := http.NewRequest(http.MethodPost, "https://github.com/login/oauth/access_token", strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://github.com/login/oauth/access_token", strings.NewReader(form.Encode()))
 	if err != nil {
 		return accessTokenResponse{}, err
 	}
@@ -320,6 +344,21 @@ func runNew(args []string) error {
 	}
 	fmt.Println(resp.Session.ID)
 
+	// Best-effort cache of the caller's own owner_id: controld's
+	// client-facing API (POST /v1/auth/github, GET /v1/me) never exposes a
+	// user's own id, only their login and role, so a session this CLI just
+	// created — unambiguously the caller's own — is the only place it's
+	// ever learned. resolveSessionID uses it to break a name that matches
+	// more than one session (see its doc comment). A failure to persist it
+	// isn't fatal to `new` itself; it only means owner-preference isn't
+	// available yet on some future ambiguous lookup.
+	if resp.Session.OwnerID != "" && resp.Session.OwnerID != cfg.OwnerID {
+		cfg.OwnerID = resp.Session.OwnerID
+		if err := cli.Save(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "rainier: warning: could not cache owner id: %v\n", err)
+		}
+	}
+
 	if *detach {
 		return nil
 	}
@@ -329,10 +368,13 @@ func runNew(args []string) error {
 // attachWithRetry is `new`'s "attach immediately and stream everything"
 // (design §4.10): a session that was just created is legitimately a few
 // seconds from `running`, so a first attach that fails because it isn't
-// ready yet (controld answers 503 session_not_ready before the websocket
-// upgrade — attachio.Run's dial then fails with that status in its error
-// text) is retried, with a waiting line, for up to 60s rather than treated
-// as fatal.
+// ready yet is retried, with a waiting line, for up to 60s rather than
+// treated as fatal. attachio.Run's dial wraps that specific failure —
+// controld's 503 session_not_ready before the websocket upgrade — as a
+// *attachio.DialError matching errors.Is(err, attachio.ErrSessionNotReady);
+// any other error (including a *DialError for some other status) is
+// treated as fatal immediately rather than burning the retry budget on a
+// failure that will never resolve itself.
 func attachWithRetry(c *cli.Client, cfg cli.Config, id string, since uint64) error {
 	wsURL := wsURLFor(cfg.ServerURL, id)
 	header := http.Header{"Authorization": {"Bearer " + cfg.Token}}
@@ -343,7 +385,7 @@ func attachWithRetry(c *cli.Client, cfg cli.Config, id string, since uint64) err
 		if err == nil {
 			return nil
 		}
-		if !strings.Contains(err.Error(), "503") || !time.Now().Before(deadline) {
+		if !errors.Is(err, attachio.ErrSessionNotReady) || !time.Now().Before(deadline) {
 			return err
 		}
 		fmt.Println("waiting for session…")
@@ -422,12 +464,7 @@ func runAttach(args []string) error {
 	fs.Parse(reorderArgs(fs, args))
 	ref := requireRef(fs, "attach")
 
-	cfg, err := requireLogin()
-	if err != nil {
-		return err
-	}
-	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
-	id, err := resolveSessionID(c, ref)
+	cfg, _, id, err := resolveClientAndID(ref)
 	if err != nil {
 		return err
 	}
@@ -447,7 +484,7 @@ func runSuspend(args []string) error {
 	fs.Parse(reorderArgs(fs, args))
 	ref := requireRef(fs, "suspend")
 
-	c, id, err := resolveClientAndID(ref)
+	_, c, id, err := resolveClientAndID(ref)
 	if err != nil {
 		return err
 	}
@@ -470,7 +507,7 @@ func runResume(args []string) error {
 	fs.Parse(args)
 	ref := requireRef(fs, "resume")
 
-	c, id, err := resolveClientAndID(ref)
+	_, c, id, err := resolveClientAndID(ref)
 	if err != nil {
 		return err
 	}
@@ -487,7 +524,7 @@ func runSnapshot(args []string) error {
 	fs.Parse(args)
 	ref := requireRef(fs, "snapshot")
 
-	c, id, err := resolveClientAndID(ref)
+	_, c, id, err := resolveClientAndID(ref)
 	if err != nil {
 		return err
 	}
@@ -504,7 +541,7 @@ func runRm(args []string) error {
 	fs.Parse(args)
 	ref := requireRef(fs, "rm")
 
-	c, id, err := resolveClientAndID(ref)
+	_, c, id, err := resolveClientAndID(ref)
 	if err != nil {
 		return err
 	}
@@ -533,18 +570,20 @@ func requireLogin() (cli.Config, error) {
 }
 
 // resolveClientAndID is the requireLogin+resolveSessionID pair every
-// lifecycle command (suspend/resume/snapshot/rm) needs.
-func resolveClientAndID(ref string) (*cli.Client, string, error) {
+// lifecycle command (suspend/resume/snapshot/rm/attach) needs. It returns
+// cfg too — runAttach needs ServerURL/Token beyond just the resolved id;
+// the other callers discard it.
+func resolveClientAndID(ref string) (cli.Config, *cli.Client, string, error) {
 	cfg, err := requireLogin()
 	if err != nil {
-		return nil, "", err
+		return cli.Config{}, nil, "", err
 	}
 	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
-	id, err := resolveSessionID(c, ref)
+	id, err := resolveSessionID(c, cfg.OwnerID, ref)
 	if err != nil {
-		return nil, "", err
+		return cli.Config{}, nil, "", err
 	}
-	return c, id, nil
+	return cfg, c, id, nil
 }
 
 // resolveSessionID resolves ref to a session id: a "sess_" prefix is
@@ -555,10 +594,36 @@ func resolveClientAndID(ref string) (*cli.Client, string, error) {
 // (the default GET /v1/sessions view), which matches every command that
 // uses it: you attach, suspend, resume, or snapshot a live session, not a
 // dead one.
-func resolveSessionID(c *cli.Client, ref string) (string, error) {
+//
+// Session names are unique only per owner (design), while GET /v1/sessions
+// is team-visible — two teammates can each have a session named e.g.
+// "dev-box". Every non-terminal match is collected across every page
+// before deciding anything (a match on page 1 does not short-circuit the
+// search): acting on "whichever paginated first" risks silently suspending
+// or deleting a teammate's session by mistake.
+//
+//   - Exactly one match: use it.
+//   - No match: "no session named %q found".
+//   - More than one match: if myOwnerID is non-empty and exactly one match
+//     belongs to it (owner-preference — see myOwnerID below), use that one;
+//     otherwise refuse and list every match's id and owner so the caller
+//     can pass the id explicitly.
+//
+// myOwnerID is this CLI's best-effort cache of the caller's own owner_id
+// (cli.Config.OwnerID, populated by `rainier new` from its own create
+// response — see runNew). controld's client-facing API never exposes a
+// user's own id any other way (POST /v1/auth/github and GET /v1/me return
+// only login and role), so an empty myOwnerID (a fresh login that has
+// never created a session with this CLI) means owner-preference simply
+// isn't available yet: an ambiguous name always errors in that case.
+func resolveSessionID(c *cli.Client, myOwnerID, ref string) (string, error) {
 	if strings.HasPrefix(ref, "sess_") {
 		return ref, nil
 	}
+
+	type match struct{ id, owner string }
+	var matches []match
+
 	cursor := ""
 	for {
 		path := "/v1/sessions"
@@ -571,7 +636,7 @@ func resolveSessionID(c *cli.Client, ref string) (string, error) {
 		}
 		for _, s := range page.Sessions {
 			if s.Name == ref {
-				return s.ID, nil
+				matches = append(matches, match{id: s.ID, owner: s.OwnerID})
 			}
 		}
 		if page.NextCursor == "" {
@@ -579,7 +644,32 @@ func resolveSessionID(c *cli.Client, ref string) (string, error) {
 		}
 		cursor = page.NextCursor
 	}
-	return "", fmt.Errorf("no session named %q found", ref)
+
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("no session named %q found", ref)
+	case 1:
+		return matches[0].id, nil
+	}
+
+	if myOwnerID != "" {
+		mine, count := -1, 0
+		for i, m := range matches {
+			if m.owner == myOwnerID {
+				mine, count = i, count+1
+			}
+		}
+		if count == 1 {
+			return matches[mine].id, nil
+		}
+	}
+
+	listed := make([]string, len(matches))
+	for i, m := range matches {
+		listed[i] = fmt.Sprintf("%s (owner %s)", m.id, m.owner)
+	}
+	return "", fmt.Errorf("ambiguous name %q matches %d sessions: %s — use the session id",
+		ref, len(matches), strings.Join(listed, ", "))
 }
 
 // wsURLFor renders id's attach URL against serverURL's http(s) base,
