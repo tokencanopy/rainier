@@ -117,13 +117,17 @@ func TestDockerCreateInjectsProxyEnv(t *testing.T) {
 		}
 	}
 	const wantProxy = "http://sproxy:@proxy.internal:3128"
+	// NO_PROXY carries the dial URL's host ("x", from DialURL above) on top
+	// of the base list: sessiond's register dial must never be sent through
+	// the proxy. See noProxyFor.
+	const wantNoProxy = "localhost,127.0.0.1,host.docker.internal,x"
 	want := map[string]string{
 		"HTTP_PROXY":  wantProxy,
 		"http_proxy":  wantProxy,
 		"HTTPS_PROXY": wantProxy,
 		"https_proxy": wantProxy,
-		"NO_PROXY":    "localhost,127.0.0.1,host.docker.internal",
-		"no_proxy":    "localhost,127.0.0.1,host.docker.internal",
+		"NO_PROXY":    wantNoProxy,
+		"no_proxy":    wantNoProxy,
 	}
 	for k, wantV := range want {
 		if got := env[k]; got != wantV {
@@ -158,6 +162,36 @@ func TestWithSessionUserinfo(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := withSessionUserinfo(c.base, c.sessionID); got != c.want {
 				t.Errorf("withSessionUserinfo(%q, %q) = %q, want %q", c.base, c.sessionID, got, c.want)
+			}
+		})
+	}
+}
+
+// TestNoProxyForExcludesTheDialHost is the regression test for the bug
+// scripts/e2e-fleet.sh's first run surfaced: with HTTP_PROXY set and the
+// runnerd host missing from NO_PROXY, sessiond's ws:// register dial goes
+// through egressd (Go proxies ws/wss from the same env vars as http/https),
+// which answers 405 — the container comes up and is permanently mute. The
+// dial URL's host has to be in NO_PROXY, and it cannot come from the literal
+// "host.docker.internal" in the base list because fleet-up.sh resolves that
+// name to an IP before handing it over as --dial-base.
+func TestNoProxyForExcludesTheDialHost(t *testing.T) {
+	cases := []struct {
+		name    string
+		dialURL string
+		want    string
+	}{
+		{"ip dial base", "ws://192.168.5.2:8080/register", noProxyBase + ",192.168.5.2"},
+		{"bridge gateway", "ws://172.17.0.1:8080/register", noProxyBase + ",172.17.0.1"},
+		{"named host", "ws://runnerd:8080/register", noProxyBase + ",runnerd"},
+		{"already in the base list", "ws://host.docker.internal:8080/register", noProxyBase},
+		{"no dial url", "", noProxyBase},
+		{"unparseable", "ws://[::1", noProxyBase},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := noProxyFor(tc.dialURL); got != tc.want {
+				t.Fatalf("noProxyFor(%q) = %q, want %q", tc.dialURL, got, tc.want)
 			}
 		})
 	}
