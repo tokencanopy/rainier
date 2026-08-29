@@ -3,6 +3,7 @@ package driver
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -21,6 +22,38 @@ func cleanupSnapshotRef(d Driver, ref string) {
 		return
 	}
 	dockerRun(context.Background(), "image", "rm", "-f", ref)
+}
+
+// assertStrippedFromImage checks a committed image's own configuration for the
+// values a snapshot was told to strip. Only the docker driver has one to read
+// — every other driver's snapshot is bookkeeping with no config behind it — so
+// this is a no-op for them, and the fake's half of the same guarantee is
+// asserted through Fake.Strips instead.
+//
+// It asserts on the whole rendered env block: `value` must not appear anywhere
+// in it (a stripped key whose value merely moved to another key is still a
+// leak), and each stripped key must be present-but-empty rather than carrying
+// anything at all.
+func assertStrippedFromImage(t *testing.T, d Driver, ref, value string, stripped []string) {
+	t.Helper()
+	if _, ok := d.(*Docker); !ok {
+		return
+	}
+	out, err := dockerRun(context.Background(), "image", "inspect",
+		"-f", "{{range .Config.Env}}{{println .}}{{end}}", ref)
+	if err != nil {
+		t.Fatalf("docker image inspect %s: %v", ref, err)
+	}
+	if strings.Contains(out, value) {
+		t.Fatalf("the committed image's config still carries a stripped value:\n%s", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		for _, k := range stripped {
+			if v, ok := strings.CutPrefix(line, k+"="); ok && v != "" {
+				t.Fatalf("stripped key %s carries %q in the committed image's config:\n%s", k, v, out)
+			}
+		}
+	}
 }
 
 func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
@@ -83,7 +116,7 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 		ctx := context.Background()
 		h, _ := d.Create(ctx, Spec{Name: "t3", Image: "", SessionID: "s3", DialURL: "ws://x"})
 		defer d.Destroy(ctx, h.ID)
-		snap, err := d.Snapshot(ctx, h.ID, "")
+		snap, err := d.Snapshot(ctx, h.ID, "", nil)
 		if err != nil || snap.Ref == "" {
 			t.Fatalf("snapshot = %+v, %v", snap, err)
 		}
@@ -93,7 +126,7 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 		// length) makes every snapshot of that container collide on the same
 		// ref, so a second `docker commit` silently overwrites the first
 		// snapshot under the same tag instead of producing a new one.
-		snap2, err := d.Snapshot(ctx, h.ID, "")
+		snap2, err := d.Snapshot(ctx, h.ID, "", nil)
 		if err != nil || snap2.Ref == "" {
 			t.Fatalf("second snapshot = %+v, %v", snap2, err)
 		}
@@ -119,13 +152,52 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 		defer d.Destroy(ctx, h.ID)
 		const ref = "rainier-env:contract-abc123"
 		defer cleanupSnapshotRef(d, ref)
-		snap, err := d.Snapshot(ctx, h.ID, ref)
+		snap, err := d.Snapshot(ctx, h.ID, ref, nil)
 		if err != nil {
 			t.Fatalf("snapshot to %q: %v", ref, err)
 		}
 		if snap.Ref != ref {
 			t.Fatalf("snapshot ref = %q, want %q verbatim", snap.Ref, ref)
 		}
+	})
+
+	t.Run("snapshot strips the named environment keys", func(t *testing.T) {
+		// The security half of Plan 4's cache. A commit captures the
+		// container's config, environment block and all, so an environment's
+		// decrypted secrets and the setup channel that triggers a re-run would
+		// otherwise be baked into an image every later session boots. Every
+		// driver owes the same guarantee: what a caller names in stripEnv is
+		// not in the committed image.
+		//
+		// Only the docker driver has a config to inspect; the fake's contract
+		// is that it accepts and records the list (asserted in fake_test.go),
+		// so this subtest asserts the shared surface — the call succeeds and
+		// still returns the caller's ref verbatim — and then the real config
+		// where there is one.
+		d, cleanup := newDriver(t)
+		defer cleanup()
+		ctx := context.Background()
+		h, err := d.Create(ctx, Spec{
+			Name: "t9", Image: "", SessionID: "s9", DialURL: "ws://x",
+			Setup: "true",
+			Env:   map[string]string{"CONTRACT_SECRET": "must-not-survive"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Destroy(ctx, h.ID)
+
+		const ref = "rainier-env:contract-strip"
+		defer cleanupSnapshotRef(d, ref)
+		strip := []string{"CONTRACT_SECRET", "RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT"}
+		snap, err := d.Snapshot(ctx, h.ID, ref, strip)
+		if err != nil {
+			t.Fatalf("snapshot with a strip list: %v", err)
+		}
+		if snap.Ref != ref {
+			t.Fatalf("snapshot ref = %q, want %q verbatim", snap.Ref, ref)
+		}
+		assertStrippedFromImage(t, d, ref, "must-not-survive", strip)
 	})
 
 	t.Run("capacity", func(t *testing.T) {

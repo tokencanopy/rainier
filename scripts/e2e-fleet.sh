@@ -430,24 +430,26 @@ grep -q "$SECRET_NAME" /tmp/rainier-e2e-secrets.txt || fail "secret ls does not 
 ! grep -q "$SECRET_VALUE" /tmp/rainier-e2e-secrets.txt || fail "secret ls printed the secret's VALUE"
 ok "secret $SECRET_NAME stored from stdin; neither set nor ls echoed its value"
 
-# --- the environment. The setup script writes only under /workspace, because
-# that is the only path a session container can write at all (v0 runs them
-# --read-only) — and the last block is what MEASURES that rather than assuming
-# it, since whether a setup script can install anything durable decides
-# whether the snapshot cache can hold anything.
+# --- the environment. The setup script writes to BOTH kinds of path, because
+# the difference between them is the whole cache story: /usr/local is on the
+# container's own filesystem and `docker commit` keeps it, so the SECOND
+# session must still see that marker; /workspace is a volume the commit
+# excludes, so the second session must NOT see that one (and its absence is
+# also how we prove the setup did not simply run again).
+# No `set -e`: a write that fails should let the session come up anyway, so the
+# attach probes below can say exactly WHICH marker is missing. A script that
+# died here would only produce "the environment never cached a snapshot".
 cat > "$SETUP_FILE" <<'EOF'
 #!/bin/sh
+# Image-visible: this is what the snapshot is supposed to carry forward.
+echo installed > /usr/local/rainier-setup-marker
+# Volume-backed: per-session by construction, never in the cache.
 echo setup-ran > /workspace/setup-marker
 if [ -z "${E2E_TOKEN:-}" ]; then
   echo "E2E_TOKEN is not set in this container" >&2
   exit 17
 fi
 printf 'secret-len=%s\n' "$(printf %s "$E2E_TOKEN" | wc -c | tr -d ' ')" > /workspace/secret-check
-if mkdir -p /usr/local/rainier-e2e 2>/dev/null; then
-  echo rootfs=writable > /workspace/rootfs-check
-else
-  echo rootfs=read-only > /workspace/rootfs-check
-fi
 echo "e2e setup complete"
 EOF
 
@@ -494,23 +496,18 @@ docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CID1" | grep -q 
 ok "first create dispatched the environment's own image plus its setup script"
 
 ATTACH1_OUT=/tmp/rainier-e2e-env-attach1.txt
-attach_probe "$SID1" 'cat /workspace/setup-marker /workspace/secret-check /workspace/rootfs-check' \
-  "$ATTACH1_OUT" 'rootfs=' 60 \
+attach_probe "$SID1" 'cat /usr/local/rainier-setup-marker /workspace/setup-marker /workspace/secret-check' \
+  "$ATTACH1_OUT" 'secret-len=' 60 \
   || { echo "--- attach output ---"; cat -v "$ATTACH1_OUT"; echo "---------------------"; \
        fail "the first session never answered the setup-marker probe"; }
+grep -q 'installed' "$ATTACH1_OUT" || fail "/usr/local/rainier-setup-marker is missing: the setup script could not write outside /workspace"
 grep -q 'setup-ran' "$ATTACH1_OUT" || fail "/workspace/setup-marker is missing: the setup script did not run"
 grep -q "secret-len=$SECRET_LEN" "$ATTACH1_OUT" \
   || fail "the setup script saw $SECRET_NAME as \"$(grep -o 'secret-len=[0-9]*' "$ATTACH1_OUT" | head -1)\", want secret-len=$SECRET_LEN"
-ok "the setup script ran in the session and read the environment's secret ($SECRET_LEN bytes)"
+ok "the setup script ran in the session, installed to /usr/local, and read the environment's secret ($SECRET_LEN bytes)"
 grep -q 'e2e setup complete' "$ATTACH1_OUT" \
   && ok "the setup script's own output is in the session's scrollback — an attached viewer watches provisioning" \
   || finding "the setup script's output is not in the session's scrollback; design §4.3 says setup is streamed to the attached terminal like any other output"
-
-if grep -q 'rootfs=read-only' "$ATTACH1_OUT"; then
-  finding "a setup script can write NOTHING outside /workspace: session containers run --read-only (internal/driver/docker.go runArgs), and \`docker commit\` excludes the /workspace volume. The cached image is therefore the base image under a new tag — an environment's setup installs do not survive into it (design §1 criteria 1 and 2)."
-else
-  ok "the session rootfs is writable during setup, so installs can be cached"
-fi
 
 # --- the SECOND session: must boot the cache, with no setup dispatched.
 SECOND_START=$(date +%s)
@@ -533,16 +530,23 @@ IMAGE2=$(docker inspect -f '{{.Config.Image}}' "$CID2")
   || fail "the second session runs image \"$IMAGE2\", want the cached snapshot \"$SNAP_REF\" — it was dispatched with setup, not from the cache"
 ok "second create dispatched NO setup: it booted $SNAP_REF (${SECOND_SECS}s vs ${FIRST_SECS}s for the first)"
 
+# The strong form of the cache proof, from inside the second session: the
+# /usr/local marker the setup script installed must be there (the commit
+# carried it forward — this is what "cached" has to MEAN), and the /workspace
+# marker must not (the volume is per-session, and its absence is also how a
+# silent setup re-run would show itself).
 ATTACH2_OUT=/tmp/rainier-e2e-env-attach2.txt
-attach_probe "$SID2" 'test -f /workspace/setup-marker; echo "rerun-check:$?"' \
+attach_probe "$SID2" \
+  'cat /usr/local/rainier-setup-marker; test -f /workspace/setup-marker; echo "rerun-check:$?"' \
   "$ATTACH2_OUT" 'rerun-check:[01]' 60 \
   || { echo "--- attach output ---"; cat -v "$ATTACH2_OUT"; echo "---------------------"; \
-       fail "the second session never answered the setup-rerun probe"; }
-if grep -q 'rerun-check:0' "$ATTACH2_OUT"; then
-  finding "the cache-booted session RE-RAN its setup script: \`docker commit\` bakes the container's environment block into the image, so RAINIER_SETUP_B64 rides along in $SNAP_REF and sessiond runs setup again even though controld dispatched none. The cache saves nothing."
-else
-  ok "the cache-booted session did not re-run setup (/workspace is fresh and empty)"
-fi
+       fail "the second session never answered the cache probe"; }
+grep -q 'installed' "$ATTACH2_OUT" \
+  || { echo "--- attach output ---"; cat -v "$ATTACH2_OUT"; echo "---------------------"; \
+       fail "the cache-booted session has no /usr/local/rainier-setup-marker: the snapshot did not carry the setup's installs, so the cache holds nothing"; }
+grep -q 'rerun-check:1' "$ATTACH2_OUT" \
+  || fail "the cache-booted session found /workspace/setup-marker — it re-ran its setup script, which the cached image exists to skip"
+ok "the cached image carries the setup's install, and the session did not re-run setup"
 
 # Read into a variable first: `docker image inspect | grep -q` in an `if`
 # condition turns an inspect FAILURE into the same exit status as "no match"
@@ -550,11 +554,11 @@ fi
 # reason.
 SNAP_ENV=$(docker image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$SNAP_REF") \
   || fail "docker image inspect $SNAP_REF: the cached image is not on this runner"
-if printf '%s\n' "$SNAP_ENV" | grep -q "^$SECRET_NAME=$SECRET_VALUE\$"; then
-  finding "the cached image carries the environment's DECRYPTED secrets in its config: \`docker image inspect $SNAP_REF\` prints $SECRET_NAME's value. Values are write-only at the API but readable by anyone with docker on the runner — and any registry-backed distribution (design §6) would publish them."
-else
-  ok "the cached image's config carries no secret value"
-fi
+! printf '%s\n' "$SNAP_ENV" | grep -q "^$SECRET_NAME=$SECRET_VALUE\$" \
+  || fail "the cached image's config carries $SECRET_NAME's decrypted VALUE — readable by anyone with docker on this runner"
+! printf '%s\n' "$SNAP_ENV" | grep -q '^RAINIER_SETUP_B64=.' \
+  || fail "the cached image's config carries RAINIER_SETUP_B64, which makes every session booted from it re-run setup"
+ok "the cached image's config carries neither the secret's value nor the setup script"
 
 # --- teardown, which is also the env-delete guard (design §5).
 if ./bin/rainier env rm "$ENV_NAME" >/tmp/rainier-e2e-envrm.txt 2>&1; then

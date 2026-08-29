@@ -1399,11 +1399,13 @@ func TestEnvSetupStreamsAndCaches(t *testing.T) {
 	f.waitRunner("vm-a", true, 30*time.Second)
 	f.waitRunner("vm-b", true, 30*time.Second)
 
+	f.putSecret("ENV_TOKEN", "toolchain-secret")
 	env := f.createEnv(map[string]any{
 		"name":              "toolchain",
 		"image":             "e2e-image",
 		"setup":             "install-toolchain v1",
 		"setup_timeout_sec": 120,
+		"secret_refs":       []string{"ENV_TOKEN"},
 	})
 
 	holder, cached := f.buildEnvCache(env, "first-on-toolchain")
@@ -1417,6 +1419,21 @@ func TestEnvSetupStreamsAndCaches(t *testing.T) {
 	// default only fills in for an environment that declares none.
 	if got := f.runners[holder].drv.LastSpec().SetupTimeoutSec; got != 120 {
 		t.Fatalf("first create dispatched setup_timeout_sec = %d, want the environment's 120", got)
+	}
+
+	// The snapshot command carried the strip list: everything the create
+	// injected (this environment's decrypted secret) plus the setup channel.
+	// Without it the committed image would hand every later session that
+	// secret in its config, and re-run the very setup the cache exists to
+	// skip. runnerd composes the list from what it recorded at create; this is
+	// the scene where that survives a real dispatch and a real websocket.
+	strips := f.runners[holder].drv.Strips()
+	if len(strips) != 1 {
+		t.Fatalf("driver saw %d snapshot(s) on %s, want exactly one: %v", len(strips), holder, strips)
+	}
+	wantStrip := []string{"ENV_TOKEN", "RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT"}
+	if !slices.Equal(strips[0], wantStrip) {
+		t.Fatalf("snapshot strip list = %v, want %v", strips[0], wantStrip)
 	}
 
 	// The rest of the fleet is warmed with that very ref. This is the only

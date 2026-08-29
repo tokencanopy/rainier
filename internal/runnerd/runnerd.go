@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -245,7 +247,12 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 // this server's own concerns (the id parameter, s.dialBase, s.proxyURL), not
 // anything a caller — HTTP body or rwire.Spec — should be trusted to supply.
 func (s *Server) CreateWithID(ctx context.Context, id string, spec driver.Spec, allow []string) error {
-	if !s.reg.putIfAbsent(id, &sessionEntry{id: id, state: "starting", allow: allow}) {
+	// The env KEYS are captured here, at the claim, because this is the last
+	// moment the Spec exists: a snapshot minutes later has to name them so the
+	// commit doesn't bake their values into the environment's cached image,
+	// and nothing else in this process remembers what was injected. Keys only
+	// — see sessionEntry.envKeys.
+	if !s.reg.putIfAbsent(id, &sessionEntry{id: id, state: "starting", allow: allow, envKeys: envKeys(spec.Env)}) {
 		return errSessionExists
 	}
 	if err := s.pushEgress(id, allow); err != nil {
@@ -371,11 +378,41 @@ func (s *Server) OpSnapshot(ctx context.Context, id, ref string) (string, error)
 	if err != nil {
 		return "", err
 	}
-	snap, err := s.drv.Snapshot(ctx, handle, ref)
+	snap, err := s.drv.Snapshot(ctx, handle, ref, s.stripEnvFor(id))
 	if err != nil {
 		return "", err
 	}
 	return snap.Ref, nil
+}
+
+// setupEnvKeys are the driver-injected variables that carry the setup channel
+// itself. They are stripped from EVERY snapshot, unconditionally: an image
+// that keeps RAINIER_SETUP_B64 makes every session booted from it re-run the
+// setup script its cache exists to skip, and RAINIER_SETUP_TIMEOUT is that
+// script's bound, meaningless without it.
+var setupEnvKeys = []string{"RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT"}
+
+// stripEnvFor is the list of environment keys a snapshot of id must not leave
+// in the committed image: everything the create injected (an environment's
+// decrypted secrets) plus the setup channel.
+//
+// Always both, and never conditional on what this particular session looks
+// like now. A snapshot is taken minutes after the create, of a container whose
+// state has moved on; "this one had no setup script" is exactly the reasoning
+// that would let one image through carrying a credential. The cost of naming a
+// key that was not there is nothing — the commit sets it empty, which is what
+// it already was.
+func (s *Server) stripEnvFor(id string) []string {
+	return append(s.reg.envKeys(id), setupEnvKeys...)
+}
+
+// envKeys returns env's keys, sorted. Values are deliberately not returned,
+// copied, or logged anywhere on this path.
+func envKeys(env map[string]string) []string {
+	if len(env) == 0 {
+		return nil
+	}
+	return slices.Sorted(maps.Keys(env))
 }
 
 // Op runs suspend/resume against a session's current driver handle. Both

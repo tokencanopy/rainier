@@ -2,6 +2,7 @@
 package runnerd
 
 import (
+	"slices"
 	"sync"
 
 	"rainier/internal/relay"
@@ -12,7 +13,15 @@ type sessionEntry struct {
 	handle string // driver handle id
 	state  string
 	allow  []string
-	hub    *relay.Hub // set when sessiond registers; nil until then
+	// envKeys are the NAMES of the variables this session's create injected
+	// (Spec.Env) — never their values, which are an environment's decrypted
+	// secrets and have no business being held anywhere but the container.
+	// Recorded because a snapshot has to name them to keep the commit from
+	// baking them into an image (see OpSnapshot and driver.Driver.Snapshot),
+	// and by then the Spec is long gone. Sorted at capture, so a snapshot's
+	// strip list is the same on every call.
+	envKeys []string
+	hub     *relay.Hub // set when sessiond registers; nil until then
 }
 
 type registry struct {
@@ -147,6 +156,27 @@ func (r *registry) opTarget(id string) (handle, state string, ok bool) {
 		return "", "", false
 	}
 	return e.handle, e.state, true
+}
+
+// envKeys returns the names of the variables a session's create injected, or
+// nil for a session that had none (and for one that no longer exists — a
+// snapshot of a session that just vanished has nothing to strip, and its
+// commit is about to fail on the missing container anyway).
+//
+// Read under the lock like every other entry field, even though envKeys is set
+// once at putIfAbsent and never mutated: the whole registry's rule is that no
+// caller dereferences a live *sessionEntry, and one field quietly exempting
+// itself is how the next field to become mutable acquires a silent race. The
+// clone is for the same reason — a caller must not be able to alias, or sort,
+// the registry's own slice.
+func (r *registry) envKeys(id string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.items[id]
+	if !ok {
+		return nil
+	}
+	return slices.Clone(e.envKeys)
 }
 
 // hubDied is called when a session's relay hub dies (its conn closed). It

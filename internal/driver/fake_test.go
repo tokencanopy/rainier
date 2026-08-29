@@ -120,6 +120,58 @@ func TestFakeRecordsPrepulls(t *testing.T) {
 	}
 }
 
+// TestFakeRecordsSnapshotStrips is the fake's half of the strip guarantee.
+// The docker driver's stripping is only visible in a committed image's config;
+// above the driver there is nothing to look at, so the fake's record IS the
+// observable that runnerd's and the e2e suite's tests assert on — that the
+// keys which must never reach a committed image were named on the call.
+func TestFakeRecordsSnapshotStrips(t *testing.T) {
+	f := NewFake(2)
+	ctx := context.Background()
+	h, err := f.Create(ctx, Spec{SessionID: "sess-s", Env: map[string]string{"TOKEN": "v"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Snapshot(ctx, h.ID, "rainier-env:e1-aaa", []string{"TOKEN", "RAINIER_SETUP_B64"}); err != nil {
+		t.Fatal(err)
+	}
+	// Recorded on the generated-ref path too: what a caller asked to be
+	// stripped matters whoever named the tag.
+	if _, err := f.Snapshot(ctx, h.ID, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"TOKEN", "RAINIER_SETUP_B64"}, nil}
+	if got := f.Strips(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Strips() = %v, want %v (in call order)", got, want)
+	}
+
+	// A snapshot that never happened must not be recorded — otherwise a
+	// caller could read the record as proof of a commit that failed.
+	if _, err := f.Snapshot(ctx, "no-such-handle", "ref", []string{"TOKEN"}); err == nil {
+		t.Error("Snapshot of an unknown handle = nil, want an error")
+	}
+	if got := f.Strips(); len(got) != 2 {
+		t.Errorf("a failed snapshot was recorded: %v", got)
+	}
+}
+
+// TestFakeStripsIsACopy: like Pulls, the accessor must not hand out the fake's
+// own slices — a caller sorting or appending to what it got would rewrite the
+// driver's record.
+func TestFakeStripsIsACopy(t *testing.T) {
+	f := NewFake(2)
+	ctx := context.Background()
+	h, _ := f.Create(ctx, Spec{SessionID: "sess-t"})
+	if _, err := f.Snapshot(ctx, h.ID, "ref", []string{"A", "B"}); err != nil {
+		t.Fatal(err)
+	}
+	got := f.Strips()
+	got[0][0] = "mutated"
+	if again := f.Strips(); again[0][0] != "A" {
+		t.Errorf("Strips()[0][0] = %q after the caller mutated its copy; want %q", again[0][0], "A")
+	}
+}
+
 // TestFakePullsIsACopy: the accessor must not hand out the fake's own slice,
 // or a caller appending to what it got would rewrite the driver's record.
 func TestFakePullsIsACopy(t *testing.T) {

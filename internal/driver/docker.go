@@ -183,7 +183,30 @@ func (d *Docker) runArgs(spec Spec, image string) []string {
 		"--label", d.opts.Label + "=" + spec.SessionID,
 		"--user", sessionUser,
 		"--security-opt", "no-new-privileges",
-		"--read-only", "--tmpfs", "/tmp",
+		"--tmpfs", "/tmp",
+	}
+	// The read-only rootfs is conditional on exactly one thing: whether this
+	// container has a setup script to run.
+	//
+	// A session WITH a script is an environment's build. Its whole job is to
+	// install things — a toolchain into /usr/local, a package manager's cache
+	// into $HOME — and `docker commit` excludes volumes, so anything it puts in
+	// /workspace is per-session and cannot be cached. A read-only rootfs makes
+	// that build impossible: the script cannot write, the commit captures no
+	// filesystem change, and the environment's "cache" is its base image under
+	// a new tag. That is the whole feature, so the flag comes off for that one
+	// container.
+	//
+	// The trade is narrow and it is the right way round. The build runs at the
+	// same trust level as the script it was given — an admin wrote it, and it
+	// is about to be executed inside the container regardless — and it happens
+	// once per environment edit. EVERY session after it boots the cached image
+	// with the full hardening back on, which is the population that matters:
+	// the agent-facing sessions people actually work in. Nothing else is
+	// relaxed here — the unprivileged user, no-new-privileges, the tmpfs, the
+	// workspace volume and the egress wiring are identical either way.
+	if spec.Setup == "" {
+		args = append(args, "--read-only")
 	}
 	if spec.SessionID != "" {
 		// The session's own persistent workspace, and the directory it starts
@@ -516,17 +539,42 @@ func (d *Docker) Resume(ctx context.Context, id string) error {
 // Snapshot commits the container as an image under ref, or under a
 // driver-generated one when ref is empty (see the Driver interface for which
 // caller is which, and why the given ref is honored exactly).
-func (d *Docker) Snapshot(ctx context.Context, id, ref string) (Snapshot, error) {
+func (d *Docker) Snapshot(ctx context.Context, id, ref string, stripEnv []string) (Snapshot, error) {
 	if _, err := dockerRun(ctx, "inspect", "-f", "{{.Id}}", id); err != nil {
 		return Snapshot{}, fmt.Errorf("snapshot: no such container %s: %w", id, err)
 	}
 	if ref == "" {
 		ref = d.generatedSnapshotRef(id)
 	}
-	if _, err := dockerRun(ctx, "commit", id, ref); err != nil {
+	args, err := commitArgs(id, ref, stripEnv)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if _, err := dockerRun(ctx, args...); err != nil {
 		return Snapshot{}, err
 	}
 	return Snapshot{Ref: ref}, nil
+}
+
+// commitArgs builds the `docker commit` argv, one `--change "ENV K="` per key
+// to be stripped (see Driver.Snapshot for what and why).
+//
+// A malformed key ABORTS the snapshot rather than being skipped. Skipping is
+// the tempting move and it is exactly wrong: the keys that arrive here are an
+// environment's secret names, so quietly dropping one from the strip list
+// publishes that secret inside the cached image — the failure this whole
+// parameter exists to prevent. No snapshot at all just means the next session
+// runs the setup script again: slow, never unsafe.
+func commitArgs(id, ref string, stripEnv []string) ([]string, error) {
+	args := make([]string, 0, 3+2*len(stripEnv))
+	args = append(args, "commit")
+	for _, k := range stripEnv {
+		if k == "" || strings.ContainsAny(k, "= \t\n") {
+			return nil, fmt.Errorf("snapshot %s: cannot strip environment key %q: a key may not be empty or contain '=' or whitespace", ref, k)
+		}
+		args = append(args, "--change", "ENV "+k+"=")
+	}
+	return append(args, id, ref), nil
 }
 
 // generatedSnapshotRef mints the driver's own tag for a snapshot nobody named

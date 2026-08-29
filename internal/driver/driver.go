@@ -104,7 +104,31 @@ type Driver interface {
 	// An empty ref asks the driver to mint one of its own. That is the local
 	// dev surface's case (POST /sessions/{id}/snapshot names no environment),
 	// and the only caller that has no ref to give.
-	Snapshot(ctx context.Context, id, ref string) (Snapshot, error)
+	//
+	// stripEnv names environment variables that must NOT survive into the
+	// committed image's configuration. A commit captures the container's whole
+	// config, environment block included, and two classes of variable in there
+	// are actively harmful once they are baked into an image every later
+	// session boots:
+	//
+	//   - the setup channel (RAINIER_SETUP_B64 and its timeout). sessiond runs
+	//     a setup script whenever that variable is present, so an image
+	//     carrying it makes every cache-booted session re-run the setup its
+	//     cache exists to skip — the control plane deliberately dispatches no
+	//     script, and the container runs one anyway.
+	//   - every value the layer above injected as Spec.Env, which is where an
+	//     environment's DECRYPTED secrets live. Baked into an image they are
+	//     readable by anyone with a docker socket on that runner, and would be
+	//     published outright by any registry-backed distribution of the cache.
+	//
+	// The keys are stripped, not deleted: a driver sets each to the empty
+	// string, which every consumer treats as absent (sessiond gates on
+	// `RAINIER_SETUP_B64 != ""`; a credential read as "" fails closed rather
+	// than silently wrong). A later `docker run -e K=V` still overrides it, so
+	// a session booted from the cache is handed its secrets fresh, as it must
+	// be — the environment's secret_refs are resolved per create, not per
+	// image.
+	Snapshot(ctx context.Context, id, ref string, stripEnv []string) (Snapshot, error)
 	// Prepull fetches ref into this runner's local image store ahead of a
 	// create that will need it, so the create isn't the thing paying for the
 	// pull. Advisory by design — controld dispatches it without waiting on
