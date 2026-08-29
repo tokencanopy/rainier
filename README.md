@@ -29,7 +29,8 @@ make build
 bin/rainier login --from-gh --server http://rainier-1:9090
 
 bin/rainier new --name box1 --image rainier-session:latest   # creates, then attaches
-bin/rainier ls                                               # id, name, state, runner, reachable, age
+bin/rainier new --name box2 --env dev                        # ...or from an environment
+bin/rainier ls                                               # id, name, env, state, runner, reachable, age
 bin/rainier attach box1                                      # Ctrl-] detaches; the session keeps running
 bin/rainier suspend box1 && bin/rainier resume box1
 bin/rainier rm box1
@@ -37,6 +38,9 @@ bin/rainier rm box1
 
 `rainier new` attaches immediately by default so you watch the agent boot;
 `--detach` opts out. Names are per-owner, so `<id|name>` takes either.
+`--env <name>` starts the session from an environment — its image, setup
+script, egress and secrets — with `--image`/`--egress` overriding that one
+session's copy of them.
 
 Locally, `make e2e` brings the whole stack up on your own machine (Postgres in
 docker; controld, egressd and a dial-mode runnerd on the host, with runnerd

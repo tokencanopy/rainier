@@ -203,6 +203,47 @@ func TestResolveSessionIDNotFound(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// ls columns
+// ---------------------------------------------------------------------------
+
+// TestSessionStateCell pins the STATE column. A bare "queued" invites the
+// wrong question — is it stuck, is it broken? — so when controld says which
+// runner a queued session is waiting on, `ls` says it too, in place.
+func TestSessionStateCell(t *testing.T) {
+	cases := []struct {
+		name string
+		in   session
+		want string
+	}{
+		{"running", session{State: "running"}, "running"},
+		{"queued with nothing to explain", session{State: "queued"}, "queued"},
+		{
+			"queued behind a placement pin",
+			session{State: "queued", QueueReason: "waiting for runner rainier-gpu"},
+			"queued (waiting for runner rainier-gpu)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sessionStateCell(tc.in); got != tc.want {
+				t.Fatalf("sessionStateCell = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDashIfEmpty pins the ENV column's empty rendering: a scratch session has
+// no environment, and a blank cell reads as a bug rather than as an answer.
+func TestDashIfEmpty(t *testing.T) {
+	if got := dashIfEmpty(""); got != "-" {
+		t.Errorf("dashIfEmpty(\"\") = %q, want -", got)
+	}
+	if got := dashIfEmpty("dev"); got != "dev" {
+		t.Errorf("dashIfEmpty(dev) = %q, want dev", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // env: the pure helpers behind `rainier env create|update|ls`
 // ---------------------------------------------------------------------------
 

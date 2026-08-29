@@ -174,6 +174,216 @@ func TestPickRunner(t *testing.T) {
 	}
 }
 
+// TestPickForSession walks the two rules layered on top of pickRunner's
+// most-free choice: an environment's placement pin narrows the candidate set
+// to exactly one runner, and a session whose resolved image IS its
+// environment's cached snapshot prefers the runner holding that snapshot.
+func TestPickForSession(t *testing.T) {
+	const snapRef = "rainier-env:env_x-0123456789ab"
+	fleet := []runnerView{{Name: "vm1", Free: 3}, {Name: "vm2", Free: 1}, {Name: "vm3", Free: 0}}
+
+	for _, tc := range []struct {
+		name string
+		rs   []runnerView
+		row  Session
+		env  *Environment
+		want string
+		ok   bool
+	}{
+		{
+			name: "no environment is pickRunner's most-free choice",
+			rs:   fleet, row: Session{}, env: nil,
+			want: "vm1", ok: true,
+		},
+		{
+			name: "an environment with no pin and no cache is unchanged",
+			rs:   fleet, row: Session{EnvironmentID: "env_x"}, env: &Environment{ID: "env_x"},
+			want: "vm1", ok: true,
+		},
+		{
+			name: "a pin wins over more free capacity elsewhere",
+			rs:   fleet, row: Session{EnvironmentID: "env_x"}, env: &Environment{ID: "env_x", Placement: "vm2"},
+			want: "vm2", ok: true,
+		},
+		{
+			name: "a pin to a full runner places nothing",
+			rs:   fleet, row: Session{EnvironmentID: "env_x"}, env: &Environment{ID: "env_x", Placement: "vm3"},
+			want: "", ok: false,
+		},
+		{
+			name: "a pin to a runner that is not connected places nothing",
+			rs:   fleet, row: Session{EnvironmentID: "env_x"}, env: &Environment{ID: "env_x", Placement: "vm9"},
+			want: "", ok: false,
+		},
+		{
+			// The whole point of the tiebreak: the snapshot exists only in
+			// vm2's local image store, so vm2 is worth more than vm1's extra
+			// headroom.
+			name: "the snapshot holder wins over a runner with more free capacity",
+			rs:   fleet,
+			row:  Session{EnvironmentID: "env_x", ResolvedImage: snapRef},
+			env:  &Environment{ID: "env_x", SnapshotRef: snapRef, SnapshotRunner: "vm2"},
+			want: "vm2", ok: true,
+		},
+		{
+			name: "the snapshot holder wins a tie it would lose lexicographically",
+			rs:   []runnerView{{Name: "vm1", Free: 2}, {Name: "vm2", Free: 2}},
+			row:  Session{EnvironmentID: "env_x", ResolvedImage: snapRef},
+			env:  &Environment{ID: "env_x", SnapshotRef: snapRef, SnapshotRunner: "vm2"},
+			want: "vm2", ok: true,
+		},
+		{
+			name: "a full snapshot holder falls back to the normal pick",
+			rs:   fleet,
+			row:  Session{EnvironmentID: "env_x", ResolvedImage: snapRef},
+			env:  &Environment{ID: "env_x", SnapshotRef: snapRef, SnapshotRunner: "vm3"},
+			want: "vm1", ok: true,
+		},
+		{
+			name: "a disconnected snapshot holder falls back to the normal pick",
+			rs:   fleet,
+			row:  Session{EnvironmentID: "env_x", ResolvedImage: snapRef},
+			env:  &Environment{ID: "env_x", SnapshotRef: snapRef, SnapshotRunner: "vm9"},
+			want: "vm1", ok: true,
+		},
+		{
+			// The session resolved to the plain image (the cache was stale, or
+			// the holder was full at create): it has no affinity at all.
+			name: "a session not running the snapshot ignores the holder",
+			rs:   fleet,
+			row:  Session{EnvironmentID: "env_x", ResolvedImage: "plain:1"},
+			env:  &Environment{ID: "env_x", SnapshotRef: snapRef, SnapshotRunner: "vm2"},
+			want: "vm1", ok: true,
+		},
+		{
+			name: "the pin outranks the snapshot holder",
+			rs:   fleet,
+			row:  Session{EnvironmentID: "env_x", ResolvedImage: snapRef},
+			env:  &Environment{ID: "env_x", Placement: "vm1", SnapshotRef: snapRef, SnapshotRunner: "vm2"},
+			want: "vm1", ok: true,
+		},
+		{
+			name: "nothing free anywhere places nothing",
+			rs:   []runnerView{{Name: "vm1", Free: 0}},
+			row:  Session{}, env: nil,
+			want: "", ok: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := pickForSession(tc.rs, tc.row, tc.env)
+			if got != tc.want || ok != tc.ok {
+				t.Fatalf("pickForSession = (%q, %v), want (%q, %v)", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
+// TestPlacementPinPlacesOnThePinnedRunner drives the pin through the real
+// scheduler: vm1 has strictly more free capacity, so the session landing on
+// vm2 can only be the environment's placement.
+func TestPlacementPinPlacesOnThePinnedRunner(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	f1 := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+	f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 1})
+	autoAckCreates(t, f1)
+	autoAckCreates(t, f2)
+
+	env := seedEnv(t, st, Environment{Name: "pinned", Image: "img:1", Placement: "vm2"})
+	seedSession(t, st, Session{ID: "sess_pinned", State: StateQueued, Name: "pinned1",
+		EnvironmentID: env.ID, ResolvedImage: env.Image, CreatedAt: time.Now().Add(-time.Hour)})
+
+	startRun(t, s)
+
+	eventually(t, 3*time.Second, func() error {
+		got := getSession(t, st, "sess_pinned")
+		if got.State != StateCreating || got.Runner != "vm2" {
+			return fmt.Errorf("session = %q on %q, want creating on vm2 (the pin)", got.State, got.Runner)
+		}
+		return nil
+	})
+}
+
+// TestPlacementPinQueuesWhenTheRunnerHasNoRoom pins both halves of the
+// blocked-pin rule: the pinned session waits (it is never placed elsewhere),
+// and — the part a naive "stop the pass" scheduler gets wrong — a younger
+// unpinned session behind it is still placed.
+func TestPlacementPinQueuesWhenTheRunnerHasNoRoom(t *testing.T) {
+	t.Run("pinned to a runner with no free slot", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f1 := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		// vm2 announces itself full, so the pin has nowhere to land.
+		joinRunner(t, s, ts, runnerScript{Name: "vm2", Used: 1, Total: 1})
+		rec := autoAckCreates(t, f1)
+
+		env := seedEnv(t, st, Environment{Name: "pinned", Image: "img:1", Placement: "vm2"})
+		seedSession(t, st, Session{ID: "sess_blocked", State: StateQueued, Name: "blocked",
+			EnvironmentID: env.ID, ResolvedImage: env.Image, CreatedAt: time.Now().Add(-time.Hour)})
+		seedQueued(t, st, "sess_behind", 1)
+
+		startRun(t, s)
+
+		// The unpinned session behind it places on vm1...
+		wantState(t, st, "sess_behind", StateCreating)
+		if got := rec.snapshot(); !sameSet(got, []string{"sess_behind"}) {
+			t.Fatalf("vm1 received creates for %v, want only sess_behind", got)
+		}
+		// ...while the pinned one stays queued and unplaced.
+		got := getSession(t, st, "sess_blocked")
+		if got.State != StateQueued || got.Runner != "" {
+			t.Fatalf("pinned session = %q on %q, want still queued and unplaced", got.State, got.Runner)
+		}
+	})
+
+	t.Run("pinned to a runner that never connected", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		rec := autoAckCreates(t, f)
+
+		env := seedEnv(t, st, Environment{Name: "hardware", Image: "img:1", Placement: "rainier-gpu"})
+		seedSession(t, st, Session{ID: "sess_hw", State: StateQueued, Name: "hw",
+			EnvironmentID: env.ID, ResolvedImage: env.Image, CreatedAt: time.Now().Add(-time.Hour)})
+		seedQueued(t, st, "sess_any", 1)
+
+		startRun(t, s)
+
+		wantState(t, st, "sess_any", StateCreating)
+		if got := rec.snapshot(); !sameSet(got, []string{"sess_any"}) {
+			t.Fatalf("vm1 received creates for %v, want only sess_any", got)
+		}
+		if got := getSession(t, st, "sess_hw"); got.State != StateQueued || got.Runner != "" {
+			t.Fatalf("pinned session = %q on %q, want still queued and unplaced", got.State, got.Runner)
+		}
+	})
+}
+
+// TestCacheTiebreakPrefersTheSnapshotHolder drives rule 6 through the real
+// scheduler: vm1 has more free capacity, but the session's resolved image is
+// a snapshot that exists only in vm2's local image store.
+func TestCacheTiebreakPrefersTheSnapshotHolder(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	f1 := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+	f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 1})
+	autoAckCreates(t, f1)
+	autoAckCreates(t, f2)
+
+	env := seedEnv(t, st, Environment{Name: "cached", Image: "img:1", Setup: "echo hi"})
+	const ref = "rainier-env:cached-0123456789ab"
+	env = cacheEnvSnapshot(t, st, env, ref, "vm2")
+
+	seedSession(t, st, Session{ID: "sess_cached", State: StateQueued, Name: "cached1",
+		EnvironmentID: env.ID, ResolvedImage: ref, CreatedAt: time.Now().Add(-time.Hour)})
+
+	startRun(t, s)
+
+	eventually(t, 3*time.Second, func() error {
+		got := getSession(t, st, "sess_cached")
+		if got.State != StateCreating || got.Runner != "vm2" {
+			return fmt.Errorf("session = %q on %q, want creating on vm2 (the snapshot holder)", got.State, got.Runner)
+		}
+		return nil
+	})
+}
+
 // TestSchedulerFIFOPlacementAndCapacityFrees is the mandated scheduler flow
 // test: a 2-slot runner, 3 queued rows, exactly the oldest 2 dispatched and
 // left `creating`, the third staying queued until a slot actually frees —
@@ -316,7 +526,7 @@ func TestCreateDispatchFailureRequeues(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			s.dispatchCreate(context.Background(), row, "vm1")
+			s.dispatchCreate(context.Background(), row, "vm1", nil)
 		}()
 
 		cmd := f.nextCmd(t)
@@ -356,7 +566,7 @@ func TestCreateDispatchFailureRequeues(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			s.dispatchCreate(context.Background(), row, "vm1")
+			s.dispatchCreate(context.Background(), row, "vm1", nil)
 		}()
 
 		cmd := f.nextCmd(t)

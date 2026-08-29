@@ -84,6 +84,19 @@ type Session struct {
 	LastEventAt    time.Time
 }
 
+// effectiveImage is the image this session actually runs: the one resolution
+// settled on for a session started from an environment (its image, or the
+// environment's cached snapshot), and the caller's own Image for a scratch
+// session, which has no ResolvedImage at all. Every place that needs "which
+// image is this" — the dispatched Spec, the client-facing view — asks here,
+// so the two can never disagree.
+func (s Session) effectiveImage() string {
+	if s.ResolvedImage != "" {
+		return s.ResolvedImage
+	}
+	return s.Image
+}
+
 // Connector is one entry of an Environment's connectors array: the "type"
 // member decoded out, plus the whole original object kept verbatim in Raw.
 // The store treats a connector as opaque — it persists Raw as-is and decodes

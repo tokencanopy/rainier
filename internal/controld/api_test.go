@@ -301,7 +301,465 @@ func TestCreateSession(t *testing.T) {
 		}
 		assertKeySet(t, string(outer["session"]),
 			"id", "owner_id", "name", "image", "cmd", "egress_allow", "state", "runner",
-			"reachable", "error", "created_at", "updated_at", "last_event_at")
+			"reachable", "error", "environment", "queue_reason",
+			"created_at", "updated_at", "last_event_at")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/sessions with "environment" — the resolution rules (design §4.3,
+// §4.5). The evidence for every rule is the rwire.Spec controld actually
+// dispatches, captured off a fake runner: that message IS the contract, and a
+// resolution that only looks right in the store would still start the wrong
+// container.
+// ---------------------------------------------------------------------------
+
+// createWithEnv POSTs a create body and returns the decoded session, failing
+// the test unless it was accepted.
+func createWithEnv(t *testing.T, ts *httptest.Server, tok string, body map[string]any) sessionView {
+	t.Helper()
+	resp := doJSON(t, ts, http.MethodPost, "/v1/sessions", tok, body, nil)
+	raw := readBody(t, resp)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST /v1/sessions status = %d, want 202; body=%s", resp.StatusCode, raw)
+	}
+	var env sessionEnvelope
+	if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, raw)
+	}
+	return env.Session
+}
+
+// countSessions returns how many session rows st holds, terminal included —
+// the "nothing was written" assertion the pre-insert rejection paths need.
+func countSessions(t *testing.T, st Store) int {
+	t.Helper()
+	rows, _, err := st.ListSessions(context.Background(), SessionQuery{IncludeTerminal: true, Limit: maxListLimit})
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	return len(rows)
+}
+
+func TestCreateSessionResolvesEnvironment(t *testing.T) {
+	// oneRunnerFleet is the common fixture: a controld with its scheduler
+	// running and a single connected runner to receive the create.
+	oneRunnerFleet := func(t *testing.T) (Store, *httptest.Server, *fakeRunner, string) {
+		t.Helper()
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		startRun(t, s)
+		_, tok := loginUser(t, st, "alice", "member")
+		return st, ts, f, tok
+	}
+
+	t.Run("cache miss dispatches the environment's image, setup and secrets", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
+		putSecretValue(t, st, "GH_TOKEN", "ghp_resolved_value")
+		env := seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", Setup: "apt-get install -y jq",
+			EgressAllow: []string{"api.github.com"}, SecretRefs: []string{"GH_TOKEN"}})
+
+		got := createWithEnv(t, ts, tok, map[string]any{"name": "e1", "environment": "dev"})
+		if got.Environment != "dev" {
+			t.Errorf("environment = %q, want dev", got.Environment)
+		}
+
+		row := getSession(t, st, got.ID)
+		if row.EnvironmentID != env.ID {
+			t.Errorf("stored environment_id = %q, want %q", row.EnvironmentID, env.ID)
+		}
+		if row.ResolvedImage != "env-img:1" {
+			t.Errorf("stored resolved_image = %q, want env-img:1", row.ResolvedImage)
+		}
+		if !slices.Equal(row.EgressAllow, []string{"api.github.com"}) {
+			t.Errorf("stored egress_allow = %v, want the environment's", row.EgressAllow)
+		}
+
+		cmd := nextCreate(t, f)
+		if cmd.Session != got.ID || cmd.Spec == nil {
+			t.Fatalf("dispatched %+v, want a create of %s with a spec", cmd, got.ID)
+		}
+		spec := cmd.Spec
+		if spec.Image != "env-img:1" {
+			t.Errorf("spec.Image = %q, want env-img:1", spec.Image)
+		}
+		if spec.Setup != "apt-get install -y jq" {
+			t.Errorf("spec.Setup = %q, want the environment's setup", spec.Setup)
+		}
+		if spec.SetupTimeoutSec != defaultSetupTimeoutSec {
+			t.Errorf("spec.SetupTimeoutSec = %d, want the %d default", spec.SetupTimeoutSec, defaultSetupTimeoutSec)
+		}
+		if spec.Env["GH_TOKEN"] != "ghp_resolved_value" {
+			t.Errorf("spec.Env = %v, want GH_TOKEN decrypted", spec.Env)
+		}
+		if !slices.Equal(spec.EgressAllow, []string{"api.github.com"}) {
+			t.Errorf("spec.EgressAllow = %v, want the environment's", spec.EgressAllow)
+		}
+	})
+
+	t.Run("an explicit setup_timeout_sec is dispatched verbatim", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
+		seedEnv(t, st, Environment{Name: "slow", Image: "env-img:1", Setup: "sleep 1", SetupTimeoutSec: 120})
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "e2", "environment": "slow"})
+		if got := nextCreate(t, f).Spec.SetupTimeoutSec; got != 120 {
+			t.Fatalf("spec.SetupTimeoutSec = %d, want 120", got)
+		}
+	})
+
+	t.Run("an environment with no setup dispatches neither setup nor a timeout", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
+		seedEnv(t, st, Environment{Name: "bare", Image: "env-img:1"})
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "e3", "environment": "bare"})
+		spec := nextCreate(t, f).Spec
+		if spec.Setup != "" || spec.SetupTimeoutSec != 0 {
+			t.Fatalf("spec setup = %q/%d, want both zero", spec.Setup, spec.SetupTimeoutSec)
+		}
+	})
+
+	t.Run("a current cache dispatches the snapshot with no setup", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
+		env := seedEnv(t, st, Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
+		const ref = "rainier-env:cached-0123456789ab"
+		cacheEnvSnapshot(t, st, env, ref, "vm1")
+
+		got := createWithEnv(t, ts, tok, map[string]any{"name": "e4", "environment": "cached"})
+		if row := getSession(t, st, got.ID); row.ResolvedImage != ref {
+			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.ResolvedImage, ref)
+		}
+		spec := nextCreate(t, f).Spec
+		if spec.Image != ref {
+			t.Errorf("spec.Image = %q, want the snapshot %q", spec.Image, ref)
+		}
+		if spec.Setup != "" || spec.SetupTimeoutSec != 0 {
+			t.Errorf("spec setup = %q/%d, want none — the cached image IS the finished setup",
+				spec.Setup, spec.SetupTimeoutSec)
+		}
+	})
+
+	// The cache is a per-runner local image, not a registry: dispatching a
+	// cache-hit ref to any other runner would `docker pull` a ref no daemon can
+	// resolve. So a cache whose holder cannot take the session right now is not
+	// a cache hit at all.
+	t.Run("a cache whose holder has no free slot falls back to image and setup", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		joinRunner(t, s, ts, runnerScript{Name: "vm1", Used: 1, Total: 1}) // the holder, full
+		f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 2})
+		startRun(t, s)
+		_, tok := loginUser(t, st, "alice", "member")
+
+		env := seedEnv(t, st, Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
+		cacheEnvSnapshot(t, st, env, "rainier-env:cached-0123456789ab", "vm1")
+
+		got := createWithEnv(t, ts, tok, map[string]any{"name": "e5", "environment": "cached"})
+		if row := getSession(t, st, got.ID); row.ResolvedImage != "env-img:1" {
+			t.Errorf("stored resolved_image = %q, want the plain image", row.ResolvedImage)
+		}
+		cmd := nextCreate(t, f2)
+		if cmd.Spec.Image != "env-img:1" || cmd.Spec.Setup != "echo hi" {
+			t.Fatalf("spec = %+v, want the plain image rebuilt with its setup on vm2", cmd.Spec)
+		}
+	})
+
+	t.Run("a cache whose holder is disconnected falls back to image and setup", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
+		env := seedEnv(t, st, Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
+		cacheEnvSnapshot(t, st, env, "rainier-env:cached-0123456789ab", "vm-gone")
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "e6", "environment": "cached"})
+		spec := nextCreate(t, f).Spec
+		if spec.Image != "env-img:1" || spec.Setup != "echo hi" {
+			t.Fatalf("spec = %+v, want the plain image rebuilt with its setup", spec)
+		}
+	})
+
+	t.Run("a snapshot built from superseded setup is not used", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
+		env := seedEnv(t, st, Environment{Name: "stale", Image: "env-img:1", Setup: "echo old"})
+		cacheEnvSnapshot(t, st, env, "rainier-env:stale-0123456789ab", "vm1")
+
+		env.Setup = "echo new"
+		if _, err := st.UpdateEnvironment(context.Background(), env); err != nil {
+			t.Fatalf("UpdateEnvironment: %v", err)
+		}
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "e7", "environment": "stale"})
+		spec := nextCreate(t, f).Spec
+		if spec.Image != "env-img:1" || spec.Setup != "echo new" {
+			t.Fatalf("spec = %+v, want the plain image rebuilt with the new setup", spec)
+		}
+	})
+
+	t.Run("a session image overrides even a current cache", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
+		env := seedEnv(t, st, Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
+		cacheEnvSnapshot(t, st, env, "rainier-env:cached-0123456789ab", "vm1")
+
+		got := createWithEnv(t, ts, tok, map[string]any{"name": "e8", "environment": "cached", "image": "custom:9"})
+		if row := getSession(t, st, got.ID); row.ResolvedImage != "custom:9" {
+			t.Errorf("stored resolved_image = %q, want custom:9", row.ResolvedImage)
+		}
+		spec := nextCreate(t, f).Spec
+		if spec.Image != "custom:9" {
+			t.Errorf("spec.Image = %q, want custom:9", spec.Image)
+		}
+		// The override is not the snapshot, so the environment's setup has not
+		// been baked into it — it has to run.
+		if spec.Setup != "echo hi" {
+			t.Errorf("spec.Setup = %q, want the environment's setup", spec.Setup)
+		}
+	})
+
+	t.Run("a session egress_allow overrides the environment's", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", EgressAllow: []string{"api.github.com"}})
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "e9", "environment": "dev", "egress_allow": []string{"pypi.org"}})
+		if got := nextCreate(t, f).Spec.EgressAllow; !slices.Equal(got, []string{"pypi.org"}) {
+			t.Fatalf("spec.EgressAllow = %v, want the session's own [pypi.org]", got)
+		}
+	})
+
+	t.Run("the environment may be named by id", func(t *testing.T) {
+		st, ts, _, tok := oneRunnerFleet(t)
+		env := seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1"})
+
+		got := createWithEnv(t, ts, tok, map[string]any{"name": "e10", "environment": env.ID})
+		if got.Environment != "dev" {
+			t.Fatalf("environment = %q, want the name dev", got.Environment)
+		}
+		if row := getSession(t, st, got.ID); row.EnvironmentID != env.ID {
+			t.Fatalf("stored environment_id = %q, want %q", row.EnvironmentID, env.ID)
+		}
+	})
+
+	t.Run("an unknown environment is 400 naming it, and nothing is stored", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, tok := loginUser(t, st, "alice", "member")
+
+		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions", tok,
+			map[string]any{"name": "nope", "environment": "ghost"}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+		}
+		e := decodeErrBody(t, raw)
+		if e.Error.Code != "invalid_request" {
+			t.Errorf("code = %q, want invalid_request", e.Error.Code)
+		}
+		if !strings.Contains(e.Error.Message, "ghost") {
+			t.Errorf("message = %q, want it to name the environment", e.Error.Message)
+		}
+		if n := countSessions(t, st); n != 0 {
+			t.Fatalf("stored %d sessions, want none", n)
+		}
+	})
+
+	// An environment may reference a secret that has since been deleted. The
+	// create fails loudly, naming the secret — and it fails BEFORE the row
+	// exists, so there is no half-built session to explain afterwards.
+	t.Run("a deleted secret_ref is 409 before the row is created", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, tok := loginUser(t, st, "alice", "member")
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", SecretRefs: []string{"GH_TOKEN"}})
+
+		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions", tok,
+			map[string]any{"name": "orphan", "environment": "dev"}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
+		}
+		e := decodeErrBody(t, raw)
+		if e.Error.Code != "conflict" {
+			t.Errorf("code = %q, want conflict", e.Error.Code)
+		}
+		if !strings.Contains(e.Error.Message, "GH_TOKEN") {
+			t.Errorf("message = %q, want it to name the missing secret", e.Error.Message)
+		}
+		if n := countSessions(t, st); n != 0 {
+			t.Fatalf("stored %d sessions, want none — the create must fail before the insert", n)
+		}
+	})
+
+	t.Run("a scratch create is untouched by any of it", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
+
+		got := createWithEnv(t, ts, tok, map[string]any{"name": "scratch", "image": "ubuntu:latest"})
+		if got.Environment != "" || got.QueueReason != "" {
+			t.Errorf("scratch session = %+v, want no environment and no queue reason", got)
+		}
+		if row := getSession(t, st, got.ID); row.EnvironmentID != "" || row.ResolvedImage != "" {
+			t.Errorf("stored row = %+v, want no environment_id and no resolved_image", row)
+		}
+		spec := nextCreate(t, f).Spec
+		if spec.Image != "ubuntu:latest" || spec.Setup != "" || spec.SetupTimeoutSec != 0 || spec.Env != nil {
+			t.Fatalf("spec = %+v, want exactly the pre-environments create", spec)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// sessionJSON's two derived fields: "environment" and "queue_reason"
+// ---------------------------------------------------------------------------
+
+// envReadCountingStore counts GetEnvironment calls, so the list handler's
+// per-request cache can be pinned as a fact rather than a comment.
+type envReadCountingStore struct {
+	Store
+	mu sync.Mutex
+	n  int
+}
+
+func (e *envReadCountingStore) GetEnvironment(ctx context.Context, id string) (Environment, error) {
+	e.mu.Lock()
+	e.n++
+	e.mu.Unlock()
+	return e.Store.GetEnvironment(ctx, id)
+}
+
+func (e *envReadCountingStore) reads() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.n
+}
+
+func TestSessionEnvironmentAndQueueReason(t *testing.T) {
+	t.Run("an environment-backed session renders the environment's name", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		u, tok := loginUser(t, st, "alice", "member")
+		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1"})
+		seedSession(t, st, Session{ID: "sess_env1", OwnerID: u.ID, State: StateRunning, Runner: "vm1",
+			EnvironmentID: env.ID, ResolvedImage: "img:1"})
+
+		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_env1", tok, nil, nil)
+		raw := readBody(t, resp)
+		var body sessionEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		if body.Session.Environment != "dev" {
+			t.Errorf("environment = %q, want dev", body.Session.Environment)
+		}
+		if body.Session.QueueReason != "" {
+			t.Errorf("queue_reason = %q, want empty (the session is running)", body.Session.QueueReason)
+		}
+	})
+
+	t.Run("a session whose environment was deleted renders an empty name", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		u, tok := loginUser(t, st, "alice", "member")
+		seedSession(t, st, Session{ID: "sess_orphan", OwnerID: u.ID, State: StateRunning,
+			EnvironmentID: "env_deadbeef", ResolvedImage: "img:1"})
+
+		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_orphan", tok, nil, nil)
+		raw := readBody(t, resp)
+		var body sessionEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		if body.Session.Environment != "" {
+			t.Fatalf("environment = %q, want empty for an environment that no longer exists", body.Session.Environment)
+		}
+	})
+
+	t.Run("a queued session pinned to a runner that is not here says so", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		u, tok := loginUser(t, st, "alice", "member")
+		env := seedEnv(t, st, Environment{Name: "hardware", Image: "img:1", Placement: "rainier-gpu"})
+		seedSession(t, st, Session{ID: "sess_wait", OwnerID: u.ID, State: StateQueued,
+			EnvironmentID: env.ID, ResolvedImage: "img:1"})
+
+		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_wait", tok, nil, nil)
+		raw := readBody(t, resp)
+		var body sessionEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		if body.Session.State != string(StateQueued) {
+			t.Errorf("state = %q, want queued", body.Session.State)
+		}
+		if want := "waiting for runner rainier-gpu"; body.Session.QueueReason != want {
+			t.Fatalf("queue_reason = %q, want %q", body.Session.QueueReason, want)
+		}
+	})
+
+	t.Run("a queued session pinned to a runner with room has no reason", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		u, tok := loginUser(t, st, "alice", "member")
+		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Placement: "vm1"})
+		seedSession(t, st, Session{ID: "sess_soon", OwnerID: u.ID, State: StateQueued,
+			EnvironmentID: env.ID, ResolvedImage: "img:1"})
+
+		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_soon", tok, nil, nil)
+		raw := readBody(t, resp)
+		var body sessionEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		if body.Session.QueueReason != "" {
+			t.Fatalf("queue_reason = %q, want empty — vm1 is connected with room", body.Session.QueueReason)
+		}
+	})
+
+	t.Run("a queued session pinned to a full runner says so", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		joinRunner(t, s, ts, runnerScript{Name: "vm1", Used: 2, Total: 2})
+		u, tok := loginUser(t, st, "alice", "member")
+		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Placement: "vm1"})
+		seedSession(t, st, Session{ID: "sess_full", OwnerID: u.ID, State: StateQueued,
+			EnvironmentID: env.ID, ResolvedImage: "img:1"})
+
+		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_full", tok, nil, nil)
+		raw := readBody(t, resp)
+		var body sessionEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		if want := "waiting for runner vm1"; body.Session.QueueReason != want {
+			t.Fatalf("queue_reason = %q, want %q", body.Session.QueueReason, want)
+		}
+	})
+
+	t.Run("the list renders both fields, reading each environment once", func(t *testing.T) {
+		cst := &envReadCountingStore{Store: NewMemStore()}
+		_, ts := newTestControldOver(t, cst)
+		u, tok := loginUser(t, cst, "alice", "member")
+		env := seedEnv(t, cst, Environment{Name: "hardware", Image: "img:1", Placement: "rainier-gpu"})
+		for _, id := range []string{"sess_a", "sess_b", "sess_c"} {
+			seedSession(t, cst, Session{ID: id, OwnerID: u.ID, Name: id, State: StateQueued,
+				EnvironmentID: env.ID, ResolvedImage: "img:1"})
+		}
+		seedSession(t, cst, Session{ID: "sess_scratch", OwnerID: u.ID, Name: "scratch", State: StateQueued})
+
+		before := cst.reads()
+		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions", tok, nil, nil)
+		raw := readBody(t, resp)
+		var body sessionsEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		if len(body.Sessions) != 4 {
+			t.Fatalf("listed %d sessions, want 4", len(body.Sessions))
+		}
+		for _, got := range body.Sessions {
+			if got.ID == "sess_scratch" {
+				if got.Environment != "" || got.QueueReason != "" {
+					t.Errorf("scratch row = %+v, want neither field set", got)
+				}
+				continue
+			}
+			if got.Environment != "hardware" {
+				t.Errorf("%s environment = %q, want hardware", got.ID, got.Environment)
+			}
+			if want := "waiting for runner rainier-gpu"; got.QueueReason != want {
+				t.Errorf("%s queue_reason = %q, want %q", got.ID, got.QueueReason, want)
+			}
+		}
+		if n := cst.reads() - before; n != 1 {
+			t.Fatalf("the list read the environment %d times, want 1 (per-request cache)", n)
+		}
 	})
 }
 
@@ -1826,13 +2284,51 @@ func getEnv(t *testing.T, ts *httptest.Server, tok, ref string) environmentView 
 // admin PUT route.
 func putSecretDirect(t *testing.T, st Store, name string) {
 	t.Helper()
-	ct, nonce, err := Seal(testSecretsKey, []byte("v"))
+	putSecretValue(t, st, name, "v")
+}
+
+// putSecretValue is putSecretDirect with the plaintext spelled out, for the
+// resolution tests — they assert the exact value that came back out of the
+// envelope and into the dispatched Spec.Env.
+func putSecretValue(t *testing.T, st Store, name, value string) {
+	t.Helper()
+	ct, nonce, err := Seal(testSecretsKey, []byte(value))
 	if err != nil {
 		t.Fatalf("Seal(%s): %v", name, err)
 	}
 	if err := st.PutSecret(context.Background(), name, ct, nonce); err != nil {
 		t.Fatalf("PutSecret(%s): %v", name, err)
 	}
+}
+
+// seedEnv stores e straight into st (minting an id when it has none) and
+// returns the row the store actually holds — SetupHash included, since the
+// resolution rules compare against it.
+func seedEnv(t *testing.T, st Store, e Environment) Environment {
+	t.Helper()
+	if e.ID == "" {
+		e.ID = NewEnvironmentID()
+	}
+	out, err := st.CreateEnvironment(context.Background(), e)
+	if err != nil {
+		t.Fatalf("seed environment %q: %v", e.Name, err)
+	}
+	return out
+}
+
+// cacheEnvSnapshot records a built snapshot against env — what Task 9's setup
+// orchestration does once a session's setup script finishes — and returns the
+// refreshed row.
+func cacheEnvSnapshot(t *testing.T, st Store, env Environment, ref, runner string) Environment {
+	t.Helper()
+	if err := st.SetEnvironmentSnapshot(context.Background(), env.ID, env.SetupHash, ref, runner); err != nil {
+		t.Fatalf("SetEnvironmentSnapshot(%s): %v", env.ID, err)
+	}
+	out, err := st.GetEnvironment(context.Background(), env.ID)
+	if err != nil {
+		t.Fatalf("GetEnvironment(%s): %v", env.ID, err)
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
