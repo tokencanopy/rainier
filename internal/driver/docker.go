@@ -5,13 +5,59 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
 )
 
 var errNotImpl = errors.New("not implemented yet")
+
+const (
+	// workspaceMount is the one writable, persistent path a session gets, and
+	// its working directory. Everything else in the container is either
+	// read-only rootfs or the throwaway tmpfs on /tmp.
+	workspaceMount = "/workspace"
+	// sessionUser is the uid:gid session containers run as. Named rather than
+	// repeated because the workspace volume has to be chowned to exactly this
+	// (see initWorkspaceScript) — the two drifting apart gives every session
+	// a workspace it cannot write to.
+	sessionUser = "1000:1000"
+	// workspaceVolumePrefix + the session id names the volume. The prefix is
+	// also a safety rail: Destroy only ever removes volumes under it, so a
+	// mangled session id can't turn into `docker volume rm` of something a
+	// human made.
+	workspaceVolumePrefix = "rainier-ws-"
+)
+
+// workspaceVolume is the docker volume backing sessionID's /workspace. One per
+// session, derived from the session id alone so Destroy can reconstruct it
+// from the container's label without any state of its own.
+func workspaceVolume(sessionID string) string { return workspaceVolumePrefix + sessionID }
+
+// initWorkspaceScript prepares a freshly created workspace volume so the
+// unprivileged session user can actually write to it. Both halves are load
+// bearing, and both were established empirically against docker 29:
+//
+//   - chown: a new named volume's root is root:root 0755, so a container
+//     running as --user 1000:1000 gets a workspace it can only read. Nothing
+//     in `docker run` sets volume ownership, so it takes a container to do it.
+//
+//   - mkdir: docker only "initializes" a volume that is EMPTY at mount time,
+//     and part of that initialization is copying the ownership of the image's
+//     directory at the mount point. `-w /workspace` makes docker create that
+//     directory in the image's rootfs (root:root 0755) when the image has none
+//     — which then lands back on the volume and silently undoes the chown.
+//     Seeding one directory makes the volume non-empty, so the initialization
+//     never fires again and the ownership sticks. (Verified both ways: without
+//     the seed and with -w, the session container sees root:root 0755 and
+//     cannot write; with it, 1000:1000 and it can.)
+//
+// The seeded directory is /workspace/.rainier, which Plan 4's setup pipeline
+// wants anyway for its script and exit-code files.
+const initWorkspaceScript = "mkdir -p " + workspaceMount + "/.rainier && chown -R " + sessionUser + " " + workspaceMount
 
 type Docker struct {
 	opts       DockerOpts
@@ -52,11 +98,93 @@ func (d *Docker) Create(ctx context.Context, spec Spec) (Handle, error) {
 	if image == "" {
 		image = d.opts.Image
 	}
+	// The workspace volume has to exist before the container that mounts it:
+	// `docker run -v` would create one implicitly, but an implicitly created
+	// one is never initialized, and an uninitialized workspace is unwritable
+	// by the session user (see initWorkspaceScript).
+	createdVolume := false
+	if spec.SessionID != "" {
+		created, err := d.ensureWorkspaceVolume(ctx, spec.SessionID, image)
+		if err != nil {
+			return Handle{}, err
+		}
+		createdVolume = created
+	}
+
+	id, err := dockerRun(ctx, d.runArgs(spec, image)...)
+	if err != nil {
+		if createdVolume {
+			// Don't leave a volume behind for a container that never started:
+			// nothing would ever name it again. Only one this call created —
+			// a volume that was already there holds an earlier session's work,
+			// and a failed create is no reason to throw that away.
+			dockerRun(ctx, "volume", "rm", "-f", workspaceVolume(spec.SessionID))
+		}
+		return Handle{}, err
+	}
+	return Handle{ID: id, State: StateRunning}, nil
+}
+
+// ensureWorkspaceVolume makes sessionID's workspace volume exist and be
+// writable by the session user, reporting whether this call created it.
+//
+// An existing volume is left strictly alone — that is the cold-park and
+// restart path, where the volume holds the session's files and re-running the
+// init would be at best a no-op and at worst a recursive chown over the user's
+// work. image is used only as the vehicle for the one-shot init container: it
+// is the one image guaranteed to be present (the session is about to run it),
+// so initialization adds no new image dependency to the fleet.
+func (d *Docker) ensureWorkspaceVolume(ctx context.Context, sessionID, image string) (created bool, err error) {
+	name := workspaceVolume(sessionID)
+	if _, err := dockerRun(ctx, "volume", "inspect", "-f", "{{.Name}}", name); err == nil {
+		return false, nil
+	}
+	if _, err := dockerRun(ctx, "volume", "create", name); err != nil {
+		return false, fmt.Errorf("create workspace volume %s: %w", name, err)
+	}
+	if _, err := dockerRun(ctx, workspaceInitArgs(name, image)...); err != nil {
+		dockerRun(ctx, "volume", "rm", "-f", name)
+		return false, fmt.Errorf("initialize workspace volume %s (the image must provide sh and chown): %w", name, err)
+	}
+	return true, nil
+}
+
+// workspaceInitArgs is the one-shot `docker run` that prepares a freshly
+// created workspace volume (see initWorkspaceScript for what and why).
+//
+// Root — chowning a volume takes it — but root with nothing else: no network,
+// read-only rootfs, no privilege escalation, and every Linux capability
+// dropped except the single CAP_CHOWN the job needs. The image's own
+// entrypoint never runs; `sh -c` with a fixed script does. Session images are
+// user-supplied, so this is the one uid-0 window in the driver and it is worth
+// keeping as narrow as it can be made.
+func workspaceInitArgs(volume, image string) []string {
+	return []string{"run", "--rm",
+		"--network", "none",
+		"--user", "0:0",
+		"--security-opt", "no-new-privileges",
+		"--cap-drop", "ALL", "--cap-add", "CHOWN",
+		"--read-only",
+		"-v", volume + ":" + workspaceMount,
+		"--entrypoint", "sh", image,
+		"-c", initWorkspaceScript,
+	}
+}
+
+func (d *Docker) runArgs(spec Spec, image string) []string {
 	args := []string{"run", "-d",
 		"--label", d.opts.Label + "=" + spec.SessionID,
-		"--user", "1000:1000",
+		"--user", sessionUser,
 		"--security-opt", "no-new-privileges",
 		"--read-only", "--tmpfs", "/tmp",
+	}
+	if spec.SessionID != "" {
+		// The session's own persistent workspace, and the directory it starts
+		// in. Gated on the session id because the volume is named from it: an
+		// id-less spec would otherwise mount one volume literally named
+		// "rainier-ws-" into every such container, and point -w at a path
+		// nothing backs.
+		args = append(args, "-v", workspaceVolume(spec.SessionID)+":"+workspaceMount, "-w", workspaceMount)
 	}
 	if d.opts.Network != "" {
 		args = append(args, "--network", d.opts.Network)
@@ -93,18 +221,25 @@ func (d *Docker) Create(ctx context.Context, spec Spec) (Handle, error) {
 			"-e", "no_proxy="+noProxy,
 		)
 	}
+	// Spec.Env goes in LAST, after everything the driver injects itself.
+	// `docker run` honors the last -e for a repeated key (verified against
+	// docker 29), so this ordering is what lets a caller deliberately override
+	// an injected var — a session that has to reach a different proxy, say.
+	// Nothing does that today; the point is that the ordering makes it
+	// possible rather than accidental.
+	//
+	// Sorted by key because Go randomizes map iteration: an unsorted loop
+	// would emit a different argv on essentially every call, which is
+	// untestable and makes two containers' configs pointlessly hard to diff.
+	for _, k := range slices.Sorted(maps.Keys(spec.Env)) {
+		args = append(args, "-e", k+"="+spec.Env[k])
+	}
 	args = append(args, image)
 	cmd := spec.Cmd
 	if len(cmd) == 0 {
 		cmd = d.defaultCmd
 	}
-	args = append(args, cmd...)
-
-	id, err := dockerRun(ctx, args...)
-	if err != nil {
-		return Handle{}, err
-	}
-	return Handle{ID: id, State: StateRunning}, nil
+	return append(args, cmd...)
 }
 
 // noProxyBase is the host list every session excludes from its proxy
@@ -185,9 +320,40 @@ func withSessionUserinfo(base, sessionID string) string {
 	return u.String()
 }
 
+// Destroy removes the container and the session's workspace volume with it. A
+// session's volume is the session's: leaving it behind would grow the host's
+// disk by one workspace per session ever created, with nothing left that names
+// it — the container that did is exactly what Destroy just removed.
+//
+// Order matters. The session id is read off the container's label BEFORE the
+// container goes, because afterwards there is nothing left to ask; and the
+// volume is removed AFTER, because docker refuses to remove a volume any
+// container still references, stopped ones included.
 func (d *Docker) Destroy(ctx context.Context, id string) error {
-	_, err := dockerRun(ctx, "rm", "-f", id)
-	return err
+	// `with` rather than a bare `index`: a container without the label (not
+	// one of ours, or one from before the label existed) yields "" instead of
+	// Go's "<no value>", which would build a nonsense volume name.
+	sessionID, err := dockerRun(ctx, "inspect",
+		"-f", `{{ with index .Config.Labels "`+d.opts.Label+`" }}{{ . }}{{ end }}`, id)
+	if err != nil {
+		// Either the container is already gone or docker is unhappy; both
+		// leave us with no session id to derive a volume name from. Removal of
+		// the container below is the operation that gets to report the error.
+		sessionID = ""
+	}
+	if _, err := dockerRun(ctx, "rm", "-f", id); err != nil {
+		return err
+	}
+	if sessionID == "" {
+		return nil
+	}
+	// -f here means "don't fail if it's already gone", not "remove it even if
+	// something is using it" — docker still refuses an in-use volume, which is
+	// a real error worth surfacing rather than swallowing.
+	if _, err := dockerRun(ctx, "volume", "rm", "-f", workspaceVolume(sessionID)); err != nil {
+		return fmt.Errorf("remove workspace volume for session %s: %w", sessionID, err)
+	}
+	return nil
 }
 
 // isNotFoundErr reports whether a dockerRun error indicates the object
@@ -294,7 +460,10 @@ func (d *Docker) destroyAllLabeled(ctx context.Context) {
 		return
 	}
 	for _, id := range strings.Split(strings.TrimSpace(out), "\n") {
-		dockerRun(ctx, "rm", "-f", id)
+		// Through Destroy, not a bare `rm -f`: otherwise every test run that
+		// uses this for cleanup leaves one workspace volume per container
+		// behind on the developer's machine.
+		d.Destroy(ctx, id)
 	}
 }
 

@@ -15,6 +15,11 @@ type Spec struct {
 	// read lowercase, many Go/Node tools read uppercase) plus NO_PROXY/
 	// no_proxy for loopback and the docker-desktop host alias.
 	ProxyURL string
+	// Env is extra environment for the session container, injected as
+	// `docker run -e K=V`. Resolved by the layer above (an environment's
+	// declared env plus its resolved secret refs, Plan 4) — the driver only
+	// carries it through, in sorted-key order, after the proxy vars.
+	Env map[string]string
 }
 
 type State string
