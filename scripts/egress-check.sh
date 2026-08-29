@@ -21,14 +21,29 @@ command -v docker >/dev/null || { echo "docker CLI not found" >&2; exit 2; }
 
 BASE=${RUNNERD:-http://127.0.0.1:8080}
 
-INTERNAL=$(docker network inspect rainier-internal -f '{{.Internal}}' 2>/dev/null || echo "")
+# Minor fix (review round 1): distinguish "the fleet was never started" from
+# the VM-backed SKIP — a missing network is a setup error (exit 2), not a
+# platform-capability finding (exit 3), and the two messages point at
+# different fixes.
+if ! docker network inspect rainier-internal >/dev/null 2>&1; then
+  echo "ERROR: rainier-internal network not found — is the fleet running? Try ./scripts/fleet-up.sh first." >&2
+  exit 2
+fi
+INTERNAL=$(docker network inspect rainier-internal -f '{{.Internal}}')
 if [ "$INTERNAL" != "true" ]; then
   echo "SKIPPED: enforcement not verifiable on VM-backed docker — run on Linux (CI or the GCE VM)"
   exit 3
 fi
 
-sid=$(curl -sf -X POST "$BASE/sessions" -d '{"image":"rainier-session:latest","egress_allow":["example.com"],"cmd":["--","sleep","600"]}' | sed 's/.*"session_id":"\([^"]*\)".*/\1/')
-[ -n "$sid" ] || { echo "FAIL: no session_id in create response"; exit 1; }
+# Minor fix (review round 1): sed's s/// leaves non-matching input
+# UNCHANGED (and default-prints it), so without `-n ... p` a malformed
+# create response would make $sid the entire raw JSON body instead of
+# empty — silently passing the `[ -n "$sid" ]` guard with garbage. `-n`
+# suppresses that auto-print; `p` only fires on an actual match, so a
+# non-matching body correctly yields an empty $sid here.
+create_resp=$(curl -sf -X POST "$BASE/sessions" -d '{"image":"rainier-session:latest","egress_allow":["example.com"],"cmd":["--","sleep","600"]}')
+sid=$(printf '%s' "$create_resp" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
+[ -n "$sid" ] || { echo "FAIL: create failed — response: $create_resp"; exit 1; }
 cleanup() { curl -sf -X DELETE "$BASE/sessions/$sid" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
