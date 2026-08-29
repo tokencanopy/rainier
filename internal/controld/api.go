@@ -219,6 +219,27 @@ func (s *Server) writeSessionCreated(w http.ResponseWriter, row Session) {
 	writeJSON(w, http.StatusAccepted, sessionEnvelope{Session: sessionJSON(row, s.reachable(row))})
 }
 
+// writeCurrentSession re-fetches id and writes it as a 200 session response
+// (404 if it no longer exists). Used when a guarded Transition lost a race
+// against a concurrent mutation after a runner op had already executed: the
+// runner op is real, so the response is still success — it just has to
+// report what the store actually holds now, not the state the handler
+// merely hoped to reach. Never let a caller of this function then serialize
+// its own guessed state instead.
+func (s *Server) writeCurrentSession(w http.ResponseWriter, r *http.Request, id string) {
+	row, err := s.st.GetSession(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "session not found")
+			return
+		}
+		log.Printf("controld: get session %s: %v", id, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not get session")
+		return
+	}
+	writeJSON(w, http.StatusOK, sessionEnvelope{Session: sessionJSON(row, s.reachable(row))})
+}
+
 // ---------------------------------------------------------------------------
 // GET /v1/sessions
 // ---------------------------------------------------------------------------
@@ -423,7 +444,20 @@ func (s *Server) handleSuspendSession(w http.ResponseWriter, r *http.Request, u 
 	if !warm {
 		to = StateSuspendedCold
 	}
-	s.transitionQuiet(r.Context(), id, []SessionState{StateRunning}, to, TransitionOpts{})
+	if err := s.st.Transition(r.Context(), id, []SessionState{StateRunning}, to, TransitionOpts{}); err != nil {
+		if !errors.Is(err, ErrConflict) && !errors.Is(err, ErrNotFound) {
+			log.Printf("controld: suspend %s: transition: %v", id, err)
+			writeErr(w, http.StatusInternalServerError, "internal", "could not suspend session")
+			return
+		}
+		// The runner op already executed, but the row moved out from under
+		// us before we could record it (e.g. a concurrent DELETE won the
+		// race). The response must tell the truth about persisted state,
+		// not the state we hoped to reach — never fabricate row.State here.
+		s.wakeScheduler()
+		s.writeCurrentSession(w, r, id)
+		return
+	}
 	s.wakeScheduler()
 
 	row.State = to
@@ -498,7 +532,19 @@ func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request, u U
 		return
 	}
 
-	s.transitionQuiet(r.Context(), id, []SessionState{row.State}, StateRunning, TransitionOpts{})
+	if err := s.st.Transition(r.Context(), id, []SessionState{row.State}, StateRunning, TransitionOpts{}); err != nil {
+		if !errors.Is(err, ErrConflict) && !errors.Is(err, ErrNotFound) {
+			log.Printf("controld: resume %s: transition: %v", id, err)
+			writeErr(w, http.StatusInternalServerError, "internal", "could not resume session")
+			return
+		}
+		// The runner op already executed, but the row moved out from under
+		// us before we could record it. Report what the store actually
+		// holds now, not the state we hoped to reach.
+		s.wakeScheduler()
+		s.writeCurrentSession(w, r, id)
+		return
+	}
 	s.wakeScheduler()
 
 	row.State = StateRunning

@@ -687,6 +687,31 @@ func TestDeleteSession(t *testing.T) {
 	})
 }
 
+// raceTransitionStore deterministically forces the race a concurrent
+// mutation (e.g. a DELETE landing during a suspend/resume's OpTimeout
+// dispatch window) can win: the first time Transition is called for
+// triggerID, it first moves the row to raceToState directly — exactly as an
+// independent, already-guarded request would have, out from under the
+// handler under test — and only then lets the real (now losing) Transition
+// call proceed, so it observes the row already moved and returns
+// ErrConflict.
+type raceTransitionStore struct {
+	Store
+	triggerID   string
+	raceToState SessionState
+	triggered   bool
+}
+
+func (r *raceTransitionStore) Transition(ctx context.Context, id string, from []SessionState, to SessionState, opts TransitionOpts) error {
+	if !r.triggered && id == r.triggerID {
+		r.triggered = true
+		if err := r.Store.Transition(ctx, id, NonTerminal, r.raceToState, TransitionOpts{}); err != nil {
+			panic(fmt.Sprintf("raceTransitionStore: forcing the race: %v", err))
+		}
+	}
+	return r.Store.Transition(ctx, id, from, to, opts)
+}
+
 // ---------------------------------------------------------------------------
 // POST /v1/sessions/{id}/suspend
 // ---------------------------------------------------------------------------
@@ -842,6 +867,49 @@ func TestSuspendSession(t *testing.T) {
 		raw := readBody(t, resp)
 		assertKeySet(t, raw, "session")
 	})
+
+	// The runner op executes (ok:true), but a concurrent DELETE moves the
+	// row to destroyed between the handler's initial GetSession and its
+	// guarded post-dispatch Transition. The 200 response must report the
+	// store's real state (destroyed), never the suspended_warm the handler
+	// was trying to reach.
+	t.Run("concurrent mutation racing the runner round-trip: response reflects real persisted state", func(t *testing.T) {
+		const id = "sess_susp_race"
+		race := &raceTransitionStore{Store: NewMemStore(), triggerID: id, raceToState: StateDestroyed}
+		s, ts := newTestControldOver(t, race)
+		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
+			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+		waitConnected(t, s, "vm1")
+		awaitReconciled(t, f)
+
+		owner, tok := loginUser(t, race, "alice", "member")
+		seedSession(t, race, Session{ID: id, OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+
+		type result struct{ resp *http.Response }
+		resc := make(chan result, 1)
+		go func() {
+			resc <- result{doRequest(t, ts, http.MethodPost, "/v1/sessions/"+id+"/suspend", tok, nil, nil)}
+		}()
+		cmd := f.nextCmd(t)
+		f.reply(t, cmd, true, "")
+
+		resp := (<-resc).resp
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (the runner op did execute); body=%s", resp.StatusCode, raw)
+		}
+		var body sessionEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		if body.Session.State != string(StateDestroyed) {
+			t.Fatalf("response state = %q, want destroyed (the real persisted state) — got a fabricated state instead", body.Session.State)
+		}
+		got := getSession(t, race, id)
+		if got.State != StateDestroyed {
+			t.Fatalf("stored state = %q, want destroyed", got.State)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -974,6 +1042,48 @@ func TestResumeSession(t *testing.T) {
 		resp := (<-resc).resp
 		raw := readBody(t, resp)
 		assertKeySet(t, raw, "session")
+	})
+
+	// Same race as suspend's, forced against resume: the runner op executes
+	// (ok:true), but a concurrent DELETE moves the row to destroyed before
+	// resume's guarded Transition lands. The response must report the real
+	// persisted state, not a fabricated "running".
+	t.Run("concurrent mutation racing the runner round-trip: response reflects real persisted state", func(t *testing.T) {
+		const id = "sess_res_race"
+		race := &raceTransitionStore{Store: NewMemStore(), triggerID: id, raceToState: StateDestroyed}
+		s, ts := newTestControldOver(t, race)
+		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
+			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+		waitConnected(t, s, "vm1")
+		awaitReconciled(t, f)
+
+		owner, tok := loginUser(t, race, "alice", "member")
+		seedSession(t, race, Session{ID: id, OwnerID: owner.ID, State: StateSuspendedWarm, Runner: "vm1"})
+
+		type result struct{ resp *http.Response }
+		resc := make(chan result, 1)
+		go func() {
+			resc <- result{doRequest(t, ts, http.MethodPost, "/v1/sessions/"+id+"/resume", tok, nil, nil)}
+		}()
+		cmd := f.nextCmd(t)
+		f.reply(t, cmd, true, "")
+
+		resp := (<-resc).resp
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (the runner op did execute); body=%s", resp.StatusCode, raw)
+		}
+		var body sessionEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		if body.Session.State != string(StateDestroyed) {
+			t.Fatalf("response state = %q, want destroyed (the real persisted state) — got a fabricated state instead", body.Session.State)
+		}
+		got := getSession(t, race, id)
+		if got.State != StateDestroyed {
+			t.Fatalf("stored state = %q, want destroyed", got.State)
+		}
 	})
 }
 
