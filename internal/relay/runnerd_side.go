@@ -26,20 +26,47 @@ type Hub struct {
 	mu      sync.Mutex
 	next    uint64
 	clients map[uint64]Conn // attachID → client conn
+	// onControl is wired by the constructor and never written again — see
+	// NewHubWithControl for why it isn't a settable field.
+	onControl func(payload []byte)
 }
 
 func NewHub(ctx context.Context, sessionConn Conn) *Hub {
+	return NewHubWithControl(ctx, sessionConn, nil)
+}
+
+// NewHubWithControl is NewHub plus a handler for the session's control
+// events — the FrameControls that belong to the session itself (setup
+// outcomes today) rather than to any attachment, which is why they carry no
+// meaningful AttachID and bypass the client demux in readLoop.
+//
+// The handler is wired here, in the constructor, rather than assigned to a
+// field afterwards, and that is deliberate on two counts. Correctness: the
+// constructor starts readLoop, so a later assignment would be a plain write
+// racing that goroutine's read under the Go memory model — the same shape
+// runnerd's OnEvent had to fix in Plan 3. Delivery: wiring it before the
+// goroutine starts means the handler exists from the hub's very first frame,
+// so a control event that arrives the instant a session registers cannot land
+// in the window before a caller got around to installing a handler.
+//
+// onControl runs ON readLoop's goroutine, so it must hand off and return —
+// the same contract as runnerd's OnEvent — because blocking in it stalls
+// every attachment multiplexed over this conn, not just the control channel.
+// nil means control frames are read and dropped.
+func NewHubWithControl(ctx context.Context, sessionConn Conn, onControl func(payload []byte)) *Hub {
 	hctx, cancel := context.WithCancel(ctx)
-	h := &Hub{conn: sessionConn, ctx: hctx, cancel: cancel, clients: map[uint64]Conn{}}
+	h := &Hub{conn: sessionConn, ctx: hctx, cancel: cancel, clients: map[uint64]Conn{}, onControl: onControl}
 	go h.readLoop()
 	return h
 }
 
 // readLoop demultiplexes FrameServer/FrameClose from the session to the right
-// client. Its deferred cleanup is what makes session-conn death cascade to
-// every attached client: once h.conn.Read errors for good (conn dead), close
-// every remaining client conn rather than leaving each one parked forever
-// with no one left to ever write it another byte or a close.
+// client, and hands FrameControl to onControl instead (it belongs to the
+// session, not to an attachment). Its deferred cleanup is what makes
+// session-conn death cascade to every attached client: once h.conn.Read
+// errors for good (conn dead), close every remaining client conn rather than
+// leaving each one parked forever with no one left to ever write it another
+// byte or a close.
 func (h *Hub) readLoop() {
 	defer func() {
 		h.mu.Lock()
@@ -51,6 +78,13 @@ func (h *Hub) readLoop() {
 		if err != nil { h.cancel(); return }
 		f, err := Decode(raw)
 		if err != nil { continue }
+		if f.Type == FrameControl {
+			// Handled before the client lookup: a control frame carries
+			// AttachID 0, which is never a client id (ids start at 1), so
+			// the demux below would drop it as "unknown attachment".
+			if h.onControl != nil { h.onControl(f.Payload) }
+			continue
+		}
 		h.mu.Lock(); client := h.clients[f.AttachID]; h.mu.Unlock()
 		if client == nil { continue }
 		switch f.Type {
