@@ -32,6 +32,14 @@ const testRunnerToken = "rnr_test_runner_token"
 func newTestControld(t *testing.T, opts ...func(*Config)) (*Server, Store, *httptest.Server) {
 	t.Helper()
 	st := NewMemStore()
+	s, ts := newTestControldOver(t, st, opts...)
+	return s, st, ts
+}
+
+// newTestControldOver is newTestControld over a caller-supplied store — for
+// tests that wrap the store to force an interleaving.
+func newTestControldOver(t *testing.T, st Store, opts ...func(*Config)) (*Server, *httptest.Server) {
+	t.Helper()
 	cfg := Config{
 		RunnerToken: testRunnerToken,
 		ExternalURL: "http://controld.test:9090",
@@ -50,7 +58,7 @@ func newTestControld(t *testing.T, opts ...func(*Config)) (*Server, Store, *http
 	// in-flight handlers, and the runner handler lives as long as its
 	// (hijacked) websocket does.
 	t.Cleanup(ts.Close)
-	return s, st, ts
+	return s, ts
 }
 
 func runnerWSURL(ts *httptest.Server) string {
@@ -510,11 +518,32 @@ func TestReconcileTable(t *testing.T) {
 		}
 	})
 
+	// A live row the store places on ANOTHER runner: this runner is holding
+	// a duplicate, so the copy here is an orphan. Adopting it would leave
+	// both alive and ping-pong Runner between them on every reconnect.
+	t.Run("live row placed on another runner is destroyed as a duplicate", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		id := "sess_dupe"
+		seedSession(t, st, Session{ID: id, State: StateRunning, Runner: "vm2"})
+		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
+			Sessions: []rwire.SessionInfo{{ID: id, State: "running"}}})
+
+		cmd := f.nextCmd(t)
+		if cmd.Type != "destroy" || cmd.Session != id {
+			t.Fatalf("got %+v, want destroy of %s", cmd, id)
+		}
+		got := getSession(t, st, id)
+		if got.State != StateRunning || got.Runner != "vm2" {
+			t.Fatalf("row = %s on %q, want running on vm2 (untouched)", got.State, got.Runner)
+		}
+	})
+
 	// Not a table row, but the case the table's edges leave open: a live row
-	// this runner isn't (or is no longer) the placement of. Postgres wants it
-	// alive and the runner has it, so it's adopted onto this runner — never
-	// destroyed. The ghost announced after it pins the ordering: its destroy
-	// arriving first proves no destroy was sent for the adopted session.
+	// with no placement at all (requeued while the runner was away, never
+	// re-placed). Postgres wants it alive and this runner has it, so it's
+	// adopted — never destroyed. The ghost announced after it pins the
+	// ordering: its destroy arriving first proves no destroy was sent for
+	// the adopted session.
 	t.Run("live row announced by a runner it is not placed on is adopted", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		id := "sess_unplaced"
@@ -652,6 +681,27 @@ func TestEventUpdatesStore(t *testing.T) {
 	if got.Error != "runner reported dead" {
 		t.Fatalf("error = %q, want %q", got.Error, "runner reported dead")
 	}
+
+	// A runner may only speak for sessions the store places on it (or on
+	// nobody yet): otherwise a stale holder of a duplicate could drive a
+	// session that has since been re-placed to a terminal state.
+	t.Run("event from a runner the session is not placed on is ignored", func(t *testing.T) {
+		elsewhere := "sess_elsewhere"
+		seedSession(t, st, Session{ID: elsewhere, State: StateRunning, Runner: "vm2"})
+		sync := "sess_sync"
+		seedSession(t, st, Session{ID: sync, State: StateCreating, Runner: "vm1"})
+
+		f.event(t, elsewhere, "dead")
+		f.event(t, sync, "running")
+		// The reader handles messages in order, so the second event landing
+		// proves the first has already been fully handled (and ignored).
+		wantState(t, st, sync, StateRunning)
+
+		got := getSession(t, st, elsewhere)
+		if got.State != StateRunning || got.Runner != "vm2" {
+			t.Fatalf("row = %s on %q, want running on vm2 (untouched)", got.State, got.Runner)
+		}
+	})
 }
 
 // TestCapacityRidesEveryMessage pins the piggyback rule: Used/Total on a
@@ -721,6 +771,105 @@ func TestReconnectReplacesConn(t *testing.T) {
 
 	if !s.runnerConnected("vm1") {
 		t.Fatal("runnerConnected(vm1) = false after reconnect")
+	}
+}
+
+// raceStore forces the one interleaving the runner row's connected flag can
+// lose to: it holds a connection teardown's SetRunnerConnected(false) until
+// a redial's UpsertRunner(connected: true) has landed, so the stale
+// disconnect is guaranteed to write last. The wait has a grace period
+// because a correctly serialized controld makes that upsert wait on *us* —
+// without the fallback the test would wedge instead of passing.
+type raceStore struct {
+	Store
+	entered  chan struct{} // the first disconnect write has begun
+	upserted chan struct{} // some connected:true upsert has completed
+	wrote    chan struct{} // the first disconnect write has returned
+
+	enteredOnce  sync.Once
+	upsertedOnce sync.Once
+	wroteOnce    sync.Once
+}
+
+func newRaceStore() *raceStore {
+	return &raceStore{
+		Store:    NewMemStore(),
+		entered:  make(chan struct{}),
+		upserted: make(chan struct{}),
+		wrote:    make(chan struct{}),
+	}
+}
+
+func (r *raceStore) SetRunnerConnected(ctx context.Context, name string, connected bool) error {
+	if connected {
+		return r.Store.SetRunnerConnected(ctx, name, connected)
+	}
+	r.enteredOnce.Do(func() { close(r.entered) })
+	select {
+	case <-r.upserted:
+	case <-time.After(500 * time.Millisecond):
+	}
+	err := r.Store.SetRunnerConnected(ctx, name, connected)
+	r.wroteOnce.Do(func() { close(r.wrote) })
+	return err
+}
+
+func (r *raceStore) UpsertRunner(ctx context.Context, run Runner) error {
+	err := r.Store.UpsertRunner(ctx, run)
+	// Only a connect that happens *after* the teardown began is the one this
+	// test is racing; the first runner's own announce must not release it.
+	select {
+	case <-r.entered:
+		if run.Connected {
+			r.upsertedOnce.Do(func() { close(r.upserted) })
+		}
+	default:
+	}
+	return err
+}
+
+func awaitChan(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s did not happen within 5s", what)
+	}
+}
+
+// TestRedialSurvivesStaleDisconnect pins the ordering a pointer guard alone
+// can't hold: a dying connection's disconnect write must never land on top
+// of a redial's connect. The protocol is announce-once, so a runner that
+// loses this race sends nothing further to correct the row — it would stay
+// invisible to the scheduler until its next redial.
+func TestRedialSurvivesStaleDisconnect(t *testing.T) {
+	rs := newRaceStore()
+	s, ts := newTestControldOver(t, rs)
+
+	first := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4})
+	waitConnected(t, s, "vm1")
+	first.close()
+
+	// The teardown is now inside its disconnect write; redial into that gap.
+	awaitChan(t, rs.entered, "teardown's disconnect write")
+	startFakeRunner(t, ts, runnerScript{Name: "vm1", Used: 1, Total: 4})
+	awaitChan(t, rs.wrote, "teardown's disconnect write returning")
+
+	eventually(t, 3*time.Second, func() error {
+		runners, err := rs.ListRunners(context.Background())
+		if err != nil {
+			return err
+		}
+		if len(runners) != 1 {
+			return fmt.Errorf("runners = %+v, want 1", runners)
+		}
+		if !runners[0].Connected {
+			return fmt.Errorf("runner marked disconnected while its redial is live: %+v", runners[0])
+		}
+		return nil
+	})
+	if !s.runnerConnected("vm1") {
+		t.Fatal("runnerConnected(vm1) = false after the redial")
 	}
 }
 
