@@ -82,6 +82,26 @@ v0 (they capture setup-installed toolchains; `/workspace` volume content is
 deliberately NOT in the snapshot). Setup scripts are trusted team content
 (they run as the session user inside the sandbox, egress-limited).
 
+**Amendment (acceptance-run outcomes, 2026-08-29):** the build measured three
+interactions the design missed, all fixed and test-pinned:
+
+1. A `--read-only` rootfs (Plan 2 hardening) means `docker commit` captures
+   NOTHING — so sessions dispatched **with** a setup script run with a
+   writable rootfs (the first build per env edit runs at the script's own
+   trust level); cache-booted and scratch sessions keep full hardening.
+2. `docker commit` bakes the container's env block into the image config —
+   which would re-trigger setup on cache boots and, far worse, publish
+   **decrypted secret values** in the cached image. The driver's Snapshot now
+   strips a per-session key list (secret env keys + the setup vars) via
+   `--change 'ENV K='`; runners record env KEYS (never values) for this.
+3. Cacheable install paths are `$HOME` and the stock image's dedicated
+   writable prefix `/opt/rainier-env` (on PATH). `/usr/local/bin` stays
+   root-owned even during writable builds so a prompt-injected agent in a
+   first-build session cannot tamper the sessiond binary into the team's
+   cache (threat model §10) — pinned by a test proving uid 1000 cannot write
+   it. User-level cache poisoning remains inherent to any shared build cache,
+   the same class as a malicious package.
+
 ## 4. Proposed design
 
 ### 4.1 The environment object
