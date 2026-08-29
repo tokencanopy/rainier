@@ -43,6 +43,11 @@ const (
 // nil-vs-empty-slice difference. No field is omitempty — the key set is
 // meant to be identical on every session, which is what the response-shape
 // regression tests pin.
+//
+// Image is the image the session ACTUALLY runs: for a session started from an
+// environment that is the resolved one (the environment's image, or its
+// cached snapshot), not the empty override the client sent. Environment and
+// QueueReason are derived, never stored — see sessionDerived.
 type sessionView struct {
 	ID          string   `json:"id"`
 	OwnerID     string   `json:"owner_id"`
@@ -54,31 +59,145 @@ type sessionView struct {
 	Runner      string   `json:"runner"`
 	Reachable   bool     `json:"reachable"`
 	Error       string   `json:"error"`
+	Environment string   `json:"environment"`
+	QueueReason string   `json:"queue_reason"`
 	CreatedAt   string   `json:"created_at"`
 	UpdatedAt   string   `json:"updated_at"`
 	LastEventAt string   `json:"last_event_at"`
 }
 
-// sessionJSON renders s as its client-facing view. reachable is computed by
-// the caller — it depends on live connection state (runnerConnected), which
-// is not part of the row itself — per the rule: s.Runner != "" &&
-// runnerConnected(s.Runner) && !s.State.Terminal().
-func sessionJSON(s Session, reachable bool) sessionView {
+// sessionDerived carries the three view fields that cannot be read off the
+// session row: each depends on live connection state or on another table, and
+// none is stored. Reachable follows the rule s.Runner != "" &&
+// runnerConnected(s.Runner) && !s.State.Terminal(); Environment is the
+// environment's NAME ("" for a scratch session, or one whose environment has
+// since been deleted); QueueReason explains a queued session that is waiting
+// on a specific runner. sessionRenderer computes all three.
+type sessionDerived struct {
+	Reachable   bool
+	Environment string
+	QueueReason string
+}
+
+// sessionJSON renders s as its client-facing view, with d supplying the
+// fields the row itself cannot answer for.
+func sessionJSON(s Session, d sessionDerived) sessionView {
 	return sessionView{
 		ID:          s.ID,
 		OwnerID:     s.OwnerID,
 		Name:        s.Name,
-		Image:       s.Image,
+		Image:       s.effectiveImage(),
 		Cmd:         emptyIfNil(s.Cmd),
 		EgressAllow: emptyIfNil(s.EgressAllow),
 		State:       string(s.State),
 		Runner:      s.Runner,
-		Reachable:   reachable,
+		Reachable:   d.Reachable,
 		Error:       s.Error,
+		Environment: d.Environment,
+		QueueReason: d.QueueReason,
 		CreatedAt:   s.CreatedAt.UTC().Format(time.RFC3339),
 		UpdatedAt:   s.UpdatedAt.UTC().Format(time.RFC3339),
 		LastEventAt: s.LastEventAt.UTC().Format(time.RFC3339),
 	}
+}
+
+// ---------------------------------------------------------------------------
+// rendering a session view
+// ---------------------------------------------------------------------------
+
+// sessionRenderer answers the derived half of a session view for every
+// session rendered by ONE request. Both answers live outside the session row
+// — the environments table, and the live fleet's free capacity — so a page of
+// N sessions would otherwise repeat the same handful of lookups N times. The
+// renderer memoizes them for the life of one request and no longer: a cached
+// environment or capacity reading that outlived its request would start
+// describing a fleet that has since moved on.
+type sessionRenderer struct {
+	srv *Server
+	ctx context.Context
+
+	// envs maps environment id to its row; a nil value records "already
+	// looked up, and there is nothing there".
+	envs map[string]*Environment
+	// free maps a connected runner's name to its free slots, computed at most
+	// once per request and only if some queued session's pin asks for it.
+	free     map[string]int
+	freeDone bool
+}
+
+// renderer returns a fresh per-request renderer.
+func (s *Server) renderer(ctx context.Context) *sessionRenderer {
+	return &sessionRenderer{srv: s, ctx: ctx, envs: map[string]*Environment{}}
+}
+
+// view renders one session.
+func (r *sessionRenderer) view(row Session) sessionView {
+	d := sessionDerived{Reachable: r.srv.reachable(row)}
+	if env := r.environment(row.EnvironmentID); env != nil {
+		d.Environment = env.Name
+		d.QueueReason = r.queueReason(row, *env)
+	}
+	return sessionJSON(row, d)
+}
+
+// environment returns the row for id, or nil for a scratch session, an
+// environment that has since been deleted, or a store that could not answer.
+// None of those is worth failing a read over: the environment name is a
+// convenience on a session view, and a session outlives its environment
+// perfectly well — it carries its own resolved image.
+func (r *sessionRenderer) environment(id string) *Environment {
+	if id == "" {
+		return nil
+	}
+	if env, seen := r.envs[id]; seen {
+		return env
+	}
+	var env *Environment
+	row, err := r.srv.st.GetEnvironment(r.ctx, id)
+	switch {
+	case errors.Is(err, ErrNotFound):
+	case err != nil:
+		log.Printf("controld: rendering a session view: get environment %s: %v", id, err)
+	default:
+		env = &row
+	}
+	r.envs[id] = env
+	return env
+}
+
+// queueReason explains a queued session its environment's placement pin is
+// holding back: the pinned runner is not connected to this replica, or has no
+// free slot, and until one of those changes the scheduler will keep passing
+// this session over (design §4.6). Everything else — a session that is not
+// queued, an unpinned environment, a pin that could be honored right now —
+// has no reason to give, and says nothing rather than guessing.
+func (r *sessionRenderer) queueReason(row Session, env Environment) string {
+	if row.State != StateQueued || env.Placement == "" || r.runnerHasRoom(env.Placement) {
+		return ""
+	}
+	return "waiting for runner " + env.Placement
+}
+
+// runnerHasRoom reports whether name is connected to this replica AND has a
+// free slot right now — the same two conditions placement itself applies.
+func (r *sessionRenderer) runnerHasRoom(name string) bool {
+	if !r.freeDone {
+		r.freeDone = true
+		r.free = map[string]int{}
+		views, err := r.srv.freeCapacity(r.ctx)
+		if err != nil {
+			// Without the fleet's capacity the honest answer is "no room known"
+			// — which renders the waiting-for-runner line. That is the safer
+			// way to be wrong: it explains a session that is in fact about to be
+			// placed, rather than silently explaining nothing about one that is
+			// genuinely stuck.
+			log.Printf("controld: rendering a session view: computing free capacity: %v", err)
+		}
+		for _, v := range views {
+			r.free[v.Name] = v.Free
+		}
+	}
+	return r.free[name] > 0 && r.srv.runnerConnected(name)
 }
 
 // emptyIfNil returns ss, or a non-nil empty slice in its place, so
@@ -124,11 +243,16 @@ type snapshotResponse struct {
 // request bodies
 // ---------------------------------------------------------------------------
 
+// createSessionRequest is POST /v1/sessions's body. Environment names the
+// environment this session starts from, by name or by id; omitting it is a
+// scratch session, exactly as before environments existed. Image and
+// EgressAllow are overrides when it is present — see resolveEnvironment.
 type createSessionRequest struct {
 	Name        string   `json:"name,omitempty"`
 	Image       string   `json:"image,omitempty"`
 	Cmd         []string `json:"cmd,omitempty"`
 	EgressAllow []string `json:"egress_allow,omitempty"`
+	Environment string   `json:"environment,omitempty"`
 }
 
 // suspendRequest's Warm is a pointer so an absent field is distinguishable
@@ -182,6 +306,11 @@ func authorizeOwnerOrAdmin(u User, row Session) bool {
 // gets a response, or a controld that crashes right after this call, always
 // has a durable row to show for it (design §4.6, "create is write-ahead
 // durable").
+//
+// Environment resolution runs BEFORE that commit, deliberately: every way it
+// can fail (an environment nobody has heard of, a secret it references that
+// has since been deleted) must leave no session behind at all, so the caller
+// fixes one thing and retries rather than cleaning up a half-built row first.
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u User) {
 	var req createSessionRequest
 	if !decodeJSONBody(w, r, &req) {
@@ -199,6 +328,9 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 		State:          StateQueued,
 		IdempotencyKey: idemKey,
 	}
+	if req.Environment != "" && !s.resolveEnvironment(w, r, req.Environment, &row) {
+		return
+	}
 
 	created, err := s.st.CreateSession(r.Context(), row)
 	switch {
@@ -209,7 +341,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 			writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
 			return
 		}
-		s.writeSessionCreated(w, existing)
+		s.writeSessionCreated(w, r, existing)
 		return
 	case errors.Is(err, ErrConflict):
 		writeErr(w, http.StatusConflict, "conflict", "a non-terminal session with that name already exists")
@@ -223,12 +355,144 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 	// The row is durably committed at this point; only now may the
 	// scheduler learn about it or the client learn it exists.
 	s.wakeScheduler()
-	s.writeSessionCreated(w, created)
+	s.writeSessionCreated(w, r, created)
 }
 
-func (s *Server) writeSessionCreated(w http.ResponseWriter, row Session) {
+// resolveEnvironment applies the environment named by ref to row: the id it
+// came from, the image it will actually run, and the egress it inherits when
+// the caller named none. It writes the client's response and reports false on
+// every failure, so a rejected create never reaches the store.
+//
+// The environment's secrets are resolved here too, and then thrown away: the
+// values belong in exactly one place, the dispatched Spec (see createSpec),
+// and resolving them now is what turns a dangling reference into a refused
+// create instead of a session that starts without the credential its
+// environment promised.
+func (s *Server) resolveEnvironment(w http.ResponseWriter, r *http.Request, ref string, row *Session) bool {
+	env, err := s.environmentByRef(r.Context(), ref)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeErr(w, http.StatusBadRequest, "invalid_request",
+				fmt.Sprintf("environment %q does not exist", ref))
+			return false
+		}
+		log.Printf("controld: create session: get environment %q: %v", ref, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
+		return false
+	}
+
+	_, missing, err := s.secretEnv(r.Context(), env)
+	switch {
+	case err != nil:
+		log.Printf("controld: create session: resolving secrets of environment %s: %v", env.ID, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
+		return false
+	case missing != "":
+		writeErr(w, http.StatusConflict, "conflict", missingSecretMessage(env, missing))
+		return false
+	}
+
+	row.EnvironmentID = env.ID
+	row.ResolvedImage = s.resolveImage(r.Context(), row.Image, env)
+	// A caller who sent egress_allow at all — including an explicit empty
+	// array, which means "no egress" — has answered the question; only its
+	// absence inherits the environment's list.
+	if row.EgressAllow == nil {
+		row.EgressAllow = env.EgressAllow
+	}
+	return true
+}
+
+// resolveImage decides the image a session from env actually runs (design
+// §4.3): the caller's own image wins outright, then env's cached snapshot
+// while it is usable, then env's plain image — which is also the case where
+// the setup script still has to run, since nothing has run it yet.
+func (s *Server) resolveImage(ctx context.Context, override string, env Environment) string {
+	switch {
+	case override != "":
+		return override
+	case s.cacheUsable(ctx, env):
+		return env.SnapshotRef
+	default:
+		return env.Image
+	}
+}
+
+// cacheUsable reports whether env's cached snapshot may be dispatched right
+// now. Two conditions, both necessary:
+//
+//   - The cache is current: it was built from the image+setup the environment
+//     still has (SnapshotHash == SetupHash). An edited environment leaves its
+//     old snapshot in place and visibly stale rather than silently adopted.
+//   - The runner that built it is connected to this replica with a free slot.
+//     v0 has no registry: the snapshot exists ONLY in that runner's local
+//     image store, so a create carrying the ref anywhere else would `docker
+//     pull` a tag no daemon can resolve and fail. The scheduler's cache
+//     tiebreak then steers the session to that same runner; this check is what
+//     keeps the two agreeing, and what makes a busy holder mean "rebuild from
+//     the plain image" rather than "fail".
+func (s *Server) cacheUsable(ctx context.Context, env Environment) bool {
+	if env.SnapshotRef == "" || env.SnapshotRunner == "" || env.SnapshotHash != env.SetupHash {
+		return false
+	}
+	if !s.runnerConnected(env.SnapshotRunner) {
+		return false
+	}
+	views, err := s.freeCapacity(ctx)
+	if err != nil {
+		// Without the capacity picture the safe answer is "don't use the
+		// cache": rebuilding from the plain image is slow but always works,
+		// while a misplaced snapshot ref fails the create outright.
+		log.Printf("controld: resolving environment %s: computing free capacity: %v", env.ID, err)
+		return false
+	}
+	for _, v := range views {
+		if v.Name == env.SnapshotRunner {
+			return v.Free > 0
+		}
+	}
+	return false
+}
+
+// secretEnv decrypts every secret env references into the environment map its
+// sessions' containers get. A reference no stored secret answers to comes back
+// as its name rather than as an error — a dangling reference is the caller's
+// to report (409 at create, a failed session at dispatch), not a store
+// failure. No return value and no error text here ever carries a secret VALUE.
+// The three results are, in order: the variables, the name of the first
+// reference that had no secret behind it, and a genuine failure.
+func (s *Server) secretEnv(ctx context.Context, env Environment) (map[string]string, string, error) {
+	if len(env.SecretRefs) == 0 {
+		return nil, "", nil
+	}
+	vars := make(map[string]string, len(env.SecretRefs))
+	for _, name := range env.SecretRefs {
+		ciphertext, nonce, err := s.st.GetSecret(ctx, name)
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return nil, name, nil
+			}
+			return nil, "", fmt.Errorf("get secret %s: %w", name, err)
+		}
+		plaintext, err := Open(s.cfg.SecretsKey, ciphertext, nonce)
+		if err != nil {
+			return nil, "", fmt.Errorf("open secret %s: %w", name, err)
+		}
+		vars[name] = string(plaintext)
+	}
+	return vars, "", nil
+}
+
+// missingSecretMessage is the one client-facing sentence for a dangling
+// secret_ref, shared by the create's 409 and the dispatch's failure text so
+// an operator meets the same words wherever the reference breaks.
+func missingSecretMessage(env Environment, name string) string {
+	return fmt.Sprintf("environment %q references secret %q, which no longer exists", env.Name, name)
+}
+
+func (s *Server) writeSessionCreated(w http.ResponseWriter, r *http.Request, row Session) {
 	w.Header().Set("Location", "/v1/sessions/"+row.ID)
-	writeJSON(w, http.StatusAccepted, sessionEnvelope{Session: sessionJSON(row, s.reachable(row))})
+	writeJSON(w, http.StatusAccepted, sessionEnvelope{Session: s.renderer(r.Context()).view(row)})
 }
 
 // writeCurrentSession re-fetches id and writes it as a 200 session response
@@ -249,7 +513,7 @@ func (s *Server) writeCurrentSession(w http.ResponseWriter, r *http.Request, id 
 		writeErr(w, http.StatusInternalServerError, "internal", "could not get session")
 		return
 	}
-	writeJSON(w, http.StatusOK, sessionEnvelope{Session: sessionJSON(row, s.reachable(row))})
+	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(r.Context()).view(row)})
 }
 
 // ---------------------------------------------------------------------------
@@ -299,9 +563,13 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request, u Us
 		return
 	}
 
+	// One renderer for the whole page: the environment name and queue reason
+	// each row needs come from outside the session table, and this is what
+	// keeps a page of N sessions from repeating those lookups N times.
+	rend := s.renderer(r.Context())
 	views := make([]sessionView, len(rows))
 	for i, row := range rows {
-		views[i] = sessionJSON(row, s.reachable(row))
+		views[i] = rend.view(row)
 	}
 	writeJSON(w, http.StatusOK, sessionsEnvelope{Sessions: views, NextCursor: next})
 }
@@ -322,7 +590,7 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request, u User
 		writeErr(w, http.StatusInternalServerError, "internal", "could not get session")
 		return
 	}
-	writeJSON(w, http.StatusOK, sessionEnvelope{Session: sessionJSON(row, s.reachable(row))})
+	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(r.Context()).view(row)})
 }
 
 // ---------------------------------------------------------------------------
@@ -480,7 +748,7 @@ func (s *Server) handleSuspendSession(w http.ResponseWriter, r *http.Request, u 
 	s.wakeScheduler()
 
 	row.State = to
-	writeJSON(w, http.StatusOK, sessionEnvelope{Session: sessionJSON(row, s.reachable(row))})
+	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(r.Context()).view(row)})
 }
 
 // ---------------------------------------------------------------------------
@@ -567,7 +835,7 @@ func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request, u U
 	s.wakeScheduler()
 
 	row.State = StateRunning
-	writeJSON(w, http.StatusOK, sessionEnvelope{Session: sessionJSON(row, s.reachable(row))})
+	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(r.Context()).view(row)})
 }
 
 // ---------------------------------------------------------------------------
@@ -780,6 +1048,12 @@ func (s *Server) handleDeleteSecret(w http.ResponseWriter, r *http.Request, u Us
 // A script that would not fit here belongs in the image, not in an
 // environment row.
 const environmentsBodyLimit = 256 << 10
+
+// defaultSetupTimeoutSec bounds an environment's setup script when the
+// environment names no timeout of its own: fifteen minutes, which covers a
+// language toolchain and a dependency install on a cold container, and is
+// short enough that a hung script gives its slot back inside the working hour.
+const defaultSetupTimeoutSec = 900
 
 // environmentIDPrefix is what NewEnvironmentID puts in front of every
 // environment id, and therefore what tells an id from a name on the

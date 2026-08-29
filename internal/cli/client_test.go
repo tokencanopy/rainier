@@ -322,11 +322,14 @@ type smokeAuthResponse struct {
 }
 
 type smokeSession struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	State     string `json:"state"`
-	Runner    string `json:"runner"`
-	Reachable bool   `json:"reachable"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Image       string `json:"image"`
+	State       string `json:"state"`
+	Runner      string `json:"runner"`
+	Reachable   bool   `json:"reachable"`
+	Environment string `json:"environment"`
+	QueueReason string `json:"queue_reason"`
 }
 
 type smokeSessionEnvelope struct {
@@ -790,9 +793,38 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 		t.Fatalf("shown environment = %+v, want %s pinned to vm1", shown.Environment, createdEnv.Environment.ID)
 	}
 
+	// --- `rainier new --env smoke-env`: the create resolves the environment
+	// server-side. The response is the evidence a client actually gets — the
+	// environment's name, and the image resolution settled on (the environment
+	// has no snapshot yet, so its plain image) rather than the empty override
+	// this body carries. The environment pins placement to vm1, so reaching
+	// `creating` there is the placement hint honored end to end ---
+	var envSession smokeSessionEnvelope
+	if err := c.Do(http.MethodPost, "/v1/sessions", map[string]any{"name": "smoke-env-session", "environment": "smoke-env"},
+		&envSession, IdempotencyKey(RandHex(8))); err != nil {
+		t.Fatalf("POST /v1/sessions with an environment: %v", err)
+	}
+	if envSession.Session.Environment != "smoke-env" {
+		t.Fatalf("created session environment = %q, want smoke-env", envSession.Session.Environment)
+	}
+	if envSession.Session.Image != "smoke-image" {
+		t.Fatalf("created session image = %q, want the environment's smoke-image", envSession.Session.Image)
+	}
+	placed := waitSessionState(t, c, envSession.Session.ID, "creating", 5*time.Second)
+	if placed.Runner != "vm1" {
+		t.Fatalf("environment session placed on %q, want vm1 (the environment's placement)", placed.Runner)
+	}
+
+	// An environment nobody has heard of is refused, and names itself in the
+	// error the CLI would print.
+	unknownEnvErr := c.Do(http.MethodPost, "/v1/sessions", map[string]any{"name": "nope", "environment": "no-such-env"}, nil)
+	if unknownEnvErr == nil || !strings.Contains(unknownEnvErr.Error(), "no-such-env") {
+		t.Fatalf("POST /v1/sessions with an unknown environment = %v, want an error naming it", unknownEnvErr)
+	}
+
 	// The secret delete runs last of the secrets calls: the environment above
 	// had to reference a secret that still existed (the API refuses a
-	// dangling secret_ref at create).
+	// dangling secret_ref at create), and so did the session started from it.
 	if err := admin.Do(http.MethodDelete, "/v1/secrets/SMOKE_TOKEN", nil, nil); err != nil {
 		t.Fatalf("DELETE /v1/secrets/SMOKE_TOKEN as admin: %v", err)
 	}

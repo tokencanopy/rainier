@@ -80,7 +80,8 @@ func printUsage() {
 
 commands:
   login    [--from-gh] [--token GH_TOKEN] [--client-id ID] [--server URL]
-  new      [--name N] [--image IMG] [--egress host,host] [--detach] [-- CMD ARGS...]
+  new      [--name N] [--env ENV] [--image IMG] [--egress host,host] [--detach]
+           [-- CMD ARGS...]
   ls       [--all]
   attach   <id|name> [--since N]
   suspend  <id|name> [--cold]
@@ -89,6 +90,10 @@ commands:
   rm       <id|name>
   secret   set <NAME> [--value V] | ls | rm <NAME>
   env      create <name> [flags] | ls | show <ref> | update <ref> [flags] | rm <ref>
+
+new --env starts the session from an environment (by name or id): its image,
+setup script, egress and secrets. --image and --egress override the
+environment's own for that one session; everything else comes from it.
 
 secret set reads the value from stdin when --value is omitted, so it never
 lands in your shell history:  cat token.txt | rainier secret set GH_TOKEN
@@ -121,8 +126,13 @@ type session struct {
 	Runner      string   `json:"runner"`
 	Reachable   bool     `json:"reachable"`
 	Error       string   `json:"error"`
-	CreatedAt   string   `json:"created_at"`
-	UpdatedAt   string   `json:"updated_at"`
+	// Environment is the name of the environment this session came from, ""
+	// for a scratch session. QueueReason, when set, is why a queued session is
+	// still queued — controld derives it per request, so it is never stale.
+	Environment string `json:"environment"`
+	QueueReason string `json:"queue_reason"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
 }
 
 type sessionEnvelope struct {
@@ -153,6 +163,7 @@ type createSessionRequest struct {
 	Image       string   `json:"image,omitempty"`
 	Cmd         []string `json:"cmd,omitempty"`
 	EgressAllow []string `json:"egress_allow,omitempty"`
+	Environment string   `json:"environment,omitempty"`
 }
 
 type suspendRequest struct {
@@ -394,8 +405,9 @@ func pollAccessToken(clientID, deviceCode string) (accessTokenResponse, error) {
 func runNew(args []string) error {
 	fs := flag.NewFlagSet("new", flag.ExitOnError)
 	name := fs.String("name", "", "session name")
-	image := fs.String("image", "", "container image")
-	egress := fs.String("egress", "", "comma-separated egress allowlist")
+	env := fs.String("env", "", "environment to start from (name or id)")
+	image := fs.String("image", "", "container image (overrides the environment's)")
+	egress := fs.String("egress", "", "comma-separated egress allowlist (overrides the environment's)")
 	detach := fs.Bool("detach", false, "create without attaching")
 	fs.Parse(reorderArgs(fs, args))
 	cmdArgs := fs.Args() // whatever followed "--"
@@ -406,7 +418,9 @@ func runNew(args []string) error {
 	}
 	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
 
-	body := createSessionRequest{Name: *name, Image: *image}
+	// --env and the two override flags compose: the environment supplies
+	// everything the flags don't, and controld resolves the pair (design §4.3).
+	body := createSessionRequest{Name: *name, Image: *image, Environment: *env}
 	if len(cmdArgs) > 0 {
 		body.Cmd = cmdArgs
 	}
@@ -485,7 +499,7 @@ func runLs(args []string) error {
 	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tNAME\tSTATE\tRUNNER\tREACHABLE\tAGE")
+	fmt.Fprintln(w, "ID\tNAME\tENV\tSTATE\tRUNNER\tREACHABLE\tAGE")
 
 	cursor := ""
 	for {
@@ -505,7 +519,8 @@ func runLs(args []string) error {
 			return err
 		}
 		for _, s := range page.Sessions {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%t\t%s\n", s.ID, s.Name, s.State, s.Runner, s.Reachable, formatAge(s.CreatedAt))
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%t\t%s\n",
+				s.ID, s.Name, dashIfEmpty(s.Environment), sessionStateCell(s), s.Runner, s.Reachable, formatAge(s.CreatedAt))
 		}
 		if page.NextCursor == "" {
 			break
@@ -513,6 +528,27 @@ func runLs(args []string) error {
 		cursor = page.NextCursor
 	}
 	return w.Flush()
+}
+
+// sessionStateCell renders the STATE column: the state alone, plus the reason
+// a queued session is still queued when controld gave one. "queued" by itself
+// invites the wrong question ("is it broken?"); "queued (waiting for runner
+// rainier-gpu)" answers it in the same glance.
+func sessionStateCell(s session) string {
+	if s.QueueReason == "" {
+		return s.State
+	}
+	return s.State + " (" + s.QueueReason + ")"
+}
+
+// dashIfEmpty renders an empty column value as "-", so a scratch session's
+// blank ENV reads as "no environment" rather than as a column that failed to
+// print.
+func dashIfEmpty(v string) string {
+	if v == "" {
+		return "-"
+	}
+	return v
 }
 
 // formatAge renders a RFC3339 created_at as a short elapsed duration; a

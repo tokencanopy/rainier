@@ -625,6 +625,32 @@ func (s *Server) sendToRunner(runner string, m rwire.ToRunner) error {
 	return nil
 }
 
+// broadcastToRunners queues m for every runner connected to this replica
+// except the one named (pass "" to reach all of them) — how a fact one runner
+// just produced reaches the rest of the fleet, which in Plan 4 is the prepull
+// of a freshly built environment snapshot.
+//
+// Fire-and-forget by nature: there is no aggregate result worth waiting for,
+// and a runner that misses the message loses nothing but a head start. The
+// connection set is snapshotted under s.mu and the sends happen after it is
+// released, so one wedged runner never stalls registration for the fleet.
+func (s *Server) broadcastToRunners(m rwire.ToRunner, except string) {
+	s.mu.Lock()
+	conns := make([]*runnerConn, 0, len(s.runners))
+	for name, rc := range s.runners {
+		if name != except {
+			conns = append(conns, rc)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, rc := range conns {
+		if err := rc.enqueue(m); err != nil {
+			log.Printf("controld: broadcasting %s to runner %s: %v", m.Type, rc.name, err)
+		}
+	}
+}
+
 // runnerConnected reports whether a runner currently holds a control
 // connection to this replica.
 func (s *Server) runnerConnected(name string) bool { return s.conn(name) != nil }

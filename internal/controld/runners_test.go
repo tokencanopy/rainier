@@ -224,6 +224,37 @@ func awaitReconciled(t *testing.T, f *fakeRunner) {
 	}
 }
 
+// joinRunner starts a fake runner and returns only once it is both connected
+// and finished reconciling, so anything the test seeds afterwards is safe from
+// the announce sweep. Its probe id is per-runner, which is what lets a
+// multi-runner test wait on each one independently.
+func joinRunner(t *testing.T, s *Server, ts *httptest.Server, sc runnerScript) *fakeRunner {
+	t.Helper()
+	if sc.Name == "" {
+		sc.Name = "vm1"
+	}
+	probe := ghostSession + "-" + sc.Name
+	sc.Sessions = append(append([]rwire.SessionInfo{}, sc.Sessions...), rwire.SessionInfo{ID: probe, State: "running"})
+	f := startFakeRunner(t, ts, sc)
+	waitConnected(t, s, sc.Name)
+	cmd := f.nextCmd(t)
+	if cmd.Type != "destroy" || cmd.Session != probe {
+		t.Fatalf("reconcile probe on %s: got %+v, want destroy of %s", sc.Name, cmd, probe)
+	}
+	return f
+}
+
+// nextCreate returns the next "create" command f receives, skipping anything
+// else controld happens to send in the meantime.
+func nextCreate(t *testing.T, f *fakeRunner) rwire.ToRunner {
+	t.Helper()
+	for {
+		if cmd := f.nextCmd(t); cmd.Type == "create" {
+			return cmd
+		}
+	}
+}
+
 // eventually polls fn until it returns nil or d elapses — controld processes
 // runner messages asynchronously, so assertions on the store are polled, not
 // slept on.
@@ -894,6 +925,35 @@ func TestRedialSurvivesStaleDisconnect(t *testing.T) {
 	})
 	if !s.runnerConnected("vm1") {
 		t.Fatal("runnerConnected(vm1) = false after the redial")
+	}
+}
+
+// TestBroadcastToRunners pins the fan-out helper the setup pipeline's prepull
+// rides on: every connected runner except the one named receives the message.
+func TestBroadcastToRunners(t *testing.T) {
+	s, _, ts := newTestControld(t)
+	f1 := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+	f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 4})
+	f3 := joinRunner(t, s, ts, runnerScript{Name: "vm3", Total: 4})
+
+	const ref = "rainier-env:env_x-0123456789ab"
+	s.broadcastToRunners(rwire.ToRunner{Type: "prepull", Ref: ref}, "vm1")
+
+	for _, f := range []*fakeRunner{f2, f3} {
+		cmd := f.nextCmd(t)
+		if cmd.Type != "prepull" || cmd.Ref != ref {
+			t.Fatalf("%s got %+v, want the prepull of %s", f.name, cmd, ref)
+		}
+	}
+
+	// vm1 was excluded. Sending it something else now and seeing that arrive
+	// first proves no prepull was ever queued ahead of it — the connection
+	// delivers in order.
+	if err := s.sendToRunner("vm1", rwire.ToRunner{Type: "destroy", Session: "sess_probe"}); err != nil {
+		t.Fatalf("sendToRunner(vm1): %v", err)
+	}
+	if cmd := f1.nextCmd(t); cmd.Type != "destroy" {
+		t.Fatalf("vm1 got %+v, want the destroy (it must not have received the prepull)", cmd)
 	}
 }
 
