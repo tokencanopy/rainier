@@ -718,13 +718,17 @@ func TestDockerSnapshotToExplicitRefCreatesThatImage(t *testing.T) {
 // consequence end to end at the driver's level: write outside the volume,
 // commit, and the file is in the image a later create would boot.
 //
-// The write is exec'd as root deliberately. What is under test here is the
+// The marker write is exec'd as root deliberately. What that half tests is the
 // DRIVER's property — the rootfs is writable and the commit captures it —
 // which is separate from which uid the session image lets write where; that
 // second half is the session image's own contract (see the Dockerfile's
-// session user) and is covered end to end by scripts/e2e-fleet.sh. Mixing them
-// would leave this test failing for a reason that has nothing to do with the
-// flag it exists to pin.
+// /opt/rainier-env prefix) and is covered end to end by scripts/e2e-fleet.sh
+// against the real image. Mixing them would leave this test failing for a
+// reason that has nothing to do with the flag it exists to pin.
+//
+// The uid-1000 probe below is the exception, and belongs here rather than in
+// the rehearsal: it is the security property that makes the writable window
+// acceptable at all, and it must hold for any image, not just ours.
 func TestDockerSetupCreateCommitsRootfsWrites(t *testing.T) {
 	dockerAvailable(t)
 	d := NewDocker(DockerOpts{Image: "alpine:3.20", Network: "bridge", TotalSlots: 8, Label: "rainier.test"})
@@ -732,7 +736,7 @@ func TestDockerSetupCreateCommitsRootfsWrites(t *testing.T) {
 	defer d.destroyAllLabeled(context.Background())
 	ctx := context.Background()
 
-	const marker = "/usr/local/rainier-setup-marker"
+	const marker = "/opt/rainier-env/rainier-setup-marker"
 	const ref = "rainier-env:dockertest-setupcache"
 	defer dockerRun(ctx, "image", "rm", "-f", ref)
 
@@ -742,8 +746,27 @@ func TestDockerSetupCreateCommitsRootfsWrites(t *testing.T) {
 	}
 	defer d.Destroy(ctx, h.ID)
 
-	if _, err := dockerRun(ctx, "exec", "-u", "0:0", h.ID, "sh", "-c", "echo baked > "+marker); err != nil {
+	if _, err := dockerRun(ctx, "exec", "-u", "0:0", h.ID, "sh", "-c", "mkdir -p /opt/rainier-env && echo baked > "+marker); err != nil {
 		t.Fatalf("a create with a setup script could not write %s: %v — the rootfs is still read-only, so nothing a setup installs can ever be cached", marker, err)
+	}
+
+	// The security boundary that makes the writable window acceptable:
+	// dropping --read-only must not be mistaken for making root-owned paths
+	// writable by uid 1000, the uid a setup script actually runs as.
+	// /usr/local/bin is where sessiond — the session's PID 1 — lives, and a
+	// setup script is untrusted in exactly the way design §10 means: an agent
+	// that could rewrite PID 1 would have it baked into the cached image every
+	// later session of that environment boots.
+	//
+	// This is the general half, true of any image whose /usr/local is
+	// root-owned (alpine included). It deliberately does NOT pin that the
+	// container runs as uid 1000 — `docker exec -u` overrides that either way,
+	// and the runArgs subtest above is what pins the --user flag. The STOCK
+	// session image's half — that our own Dockerfile hands the session user
+	// /opt/rainier-env and NOT /usr/local — is asserted against the real image
+	// by scripts/e2e-fleet.sh.
+	if _, err := dockerRun(ctx, "exec", "-u", "1000:1000", h.ID, "sh", "-c", "touch /usr/local/bin/probe"); err == nil {
+		t.Fatal("uid 1000 can write /usr/local/bin during a setup build; sessiond (PID 1) must stay out of reach even while the rootfs is writable")
 	}
 	if _, err := d.Snapshot(ctx, h.ID, ref, nil); err != nil {
 		t.Fatal(err)
@@ -764,7 +787,7 @@ func TestDockerSetupCreateCommitsRootfsWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Destroy(ctx, cached.ID)
-	if _, err := dockerRun(ctx, "exec", "-u", "0:0", cached.ID, "sh", "-c", "echo nope > "+marker); err == nil {
+	if _, err := dockerRun(ctx, "exec", "-u", "0:0", cached.ID, "sh", "-c", "mkdir -p /opt/rainier-env && echo nope > "+marker); err == nil {
 		t.Fatalf("a create with no setup script accepted a write to %s; its rootfs must stay read-only", marker)
 	}
 }

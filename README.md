@@ -57,11 +57,12 @@ The first session on an environment runs the setup script live — attach and
 you watch it — and its image is then snapshot-cached for the next one;
 editing the image or the script invalidates that cache without touching any
 running session. `--image`/`--egress` on `new` override the environment for
-that one session. Setup scripts should install into image-visible paths
-(`$HOME`, `/usr/local`) — that is what the snapshot carries forward, while
-`/workspace` is a per-session volume the snapshot excludes. Details, including
-the one hardening flag a first build trades away, in
-[`docs/deploy-gce.md`](docs/deploy-gce.md) §7.
+that one session. Setup scripts should install into image-visible paths —
+`$HOME`, or `/opt/rainier-env` on the stock session image, which is already on
+`PATH` — because that is what the snapshot carries forward, while `/workspace`
+is a per-session volume the snapshot excludes. Details, including the one
+hardening flag a first build trades away and why `/usr/local` is not the
+install prefix, in [`docs/deploy-gce.md`](docs/deploy-gce.md) §7.
 
 Locally, `make e2e` brings the whole stack up on your own machine (Postgres in
 docker; controld, egressd and a dial-mode runnerd on the host, with runnerd

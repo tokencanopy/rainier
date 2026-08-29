@@ -211,8 +211,12 @@ printf %s "$GH_PAT" | ./bin/rainier secret set GH_TOKEN
 cat > setup.sh <<'EOF'
 #!/bin/sh
 set -eu
-# /workspace and /tmp are the only writable paths in a session container —
-# hence the explicit --cache, which npm would otherwise put under $HOME.
+# Cached: the snapshot keeps the container's own filesystem. $HOME is the
+# portable choice (node:22 gives uid 1000 a real one); the stock
+# rainier-session image also offers /opt/rainier-env, already on PATH.
+npm config set prefix "$HOME/.npm-global"
+npm install -g typescript
+# Per-session: /workspace is a volume, and the snapshot excludes volumes.
 npm ci --prefix /workspace --cache /workspace/.npm
 EOF
 
@@ -240,28 +244,42 @@ touched, because each pinned its resolved image at create.
 excludes volumes, so anything a setup script writes under `/workspace` is
 per-session: the session that ran the script has it, and every session booted
 from the cache starts with an empty workspace. Only writes to the container's
-own filesystem — `$HOME`, `/usr/local`, anywhere on the rootfs — end up in the
-snapshot. So `npm ci --prefix /workspace` gives you a fresh install every time,
-while `npm install -g` or a `$HOME`-based toolchain installer is cached once
-and reused. Use `/workspace` for the per-session preparation you actually want
-repeated.
+own filesystem end up in the snapshot. So `npm ci --prefix /workspace` gives
+you a fresh install every time, while a toolchain installed into an
+image-visible path is cached once and reused. Use `/workspace` for the
+per-session preparation you actually want repeated.
 
 Those paths have to be writable by the **session user (uid 1000)**, which the
-image decides. Rainier's own `rainier-session:latest` creates that user and
-gives it `/usr/local`; mainstream language images (`node:22`, and friends)
-ship a uid-1000 user with a real `$HOME`. An image with no uid-1000 user gives
-it `HOME=/` on a root-owned rootfs, and a setup script there can write nothing
-the cache could keep.
+image decides. On the stock `rainier-session:latest` they are **`$HOME` and
+`/opt/rainier-env`** — the image creates the user, gives it that prefix, and
+puts `/opt/rainier-env/bin` on `PATH`, so binaries a setup script installs
+there are simply found. `/usr/local` is deliberately NOT one of them (see
+below). Other images set their own policy: `node:22` and friends ship a
+uid-1000 user with a real `$HOME` but a root-owned `/usr/local`, so a bare
+`npm install -g` fails there; a custom image may chown whatever prefix it
+likes. Only `/opt/rainier-env/bin` is on `PATH` for free — any other prefix
+needs the image or the agent's shell init to add it. An image with no uid-1000
+user at all gives it `HOME=/` on a root-owned rootfs, and a setup script there
+can write nothing the cache could keep.
 
 **The first build per environment edit runs with a writable rootfs.** That is
 the one hardening flag rainier trades away, and only on the container that has
 a setup script to run: it has to be able to install, and a read-only rootfs
-makes that impossible. The trade is narrow on purpose — the build executes the
-environment admin's own script, in an image the same admin chose, once per
-edit. Every session afterwards boots the cached image with `--read-only` back
-on, which is the population that matters. Nothing else differs between the two:
-same unprivileged user, same `no-new-privileges`, same tmpfs, same workspace
-volume, same egress wiring.
+makes that impossible. Every session afterwards boots the cached image with
+`--read-only` back on, which is the population that matters. Nothing else
+differs between the two: same unprivileged user, same `no-new-privileges`, same
+tmpfs, same workspace volume, same egress wiring.
+
+That window is why the install prefix is `/opt/rainier-env` and not
+`/usr/local`. `/usr/local/bin` holds `sessiond` — the session's PID 1 — and
+stays root-owned, so the session user cannot rewrite it even while the rootfs
+is writable. A setup script is not trusted code: an agent runs inside these
+containers and may be prompt-injected (design §10), and a PID 1 it could
+replace would be baked into the cached image every later session of that
+environment boots. Cache poisoning of **user-level** binaries under the install
+prefix is still possible and is inherent to any shared build cache — the same
+class of trust a malicious npm package already has. The platform's own agent is
+what must stay out of reach, and it does.
 
 **Secrets and the setup channel never reach the cached image.** The commit
 strips every variable the create injected — an environment's resolved
@@ -384,8 +402,8 @@ containers on a laptop. Record what actually happened in the Result column.
 
 | # | Criterion | How to run it | Status | Result |
 |---|---|---|---|---|
-| 1 | `rainier env create myapp --image node:22 --setup ./setup.sh --egress registry.npmjs.org,github.com` then `rainier new --env myapp` boots a session with the toolchain present. | Step 7 above, on the VM. | ◐ | 2026-08-29 local rehearsal: `env create` → `new --env` → attach works, and the setup script's install into `/usr/local` is present in the session AND in every session booted from the cache after it. GCE run pending. |
-| 2 | The FIRST session on an environment runs setup live, streamed to the attached terminal; a snapshot is cached; the SECOND session boots from cache with no setup run — measurably faster (record both times on rainier-1). | Step 7 above: `rainier new --env web` twice, timing each, with `rainier env ls` in between. | ◐ | 2026-08-29 local rehearsal, after the fix round below: setup runs live with its output in the scrollback; the snapshot is committed content-addressed (`rainier-env:<env id>-<hash12>`); the second create dispatches no setup, boots that ref, still has the setup's `/usr/local` install, and did NOT re-run the script. Timings on this laptop are meaningless (trivial script, warm image) — **record real ones on rainier-1**, which is what the ◐ is for. |
+| 1 | `rainier env create myapp --image node:22 --setup ./setup.sh --egress registry.npmjs.org,github.com` then `rainier new --env myapp` boots a session with the toolchain present. | Step 7 above, on the VM. | ◐ | 2026-08-29 local rehearsal: `env create` → `new --env` → attach works, and the setup script's install into `/opt/rainier-env` is present in the session AND in every session booted from the cache after it. GCE run pending. |
+| 2 | The FIRST session on an environment runs setup live, streamed to the attached terminal; a snapshot is cached; the SECOND session boots from cache with no setup run — measurably faster (record both times on rainier-1). | Step 7 above: `rainier new --env web` twice, timing each, with `rainier env ls` in between. | ◐ | 2026-08-29 local rehearsal, after the fix round below: setup runs live with its output in the scrollback; the snapshot is committed content-addressed (`rainier-env:<env id>-<hash12>`); the second create dispatches no setup, boots that ref, still has the setup's `/opt/rainier-env` install, and did NOT re-run the script. Timings on this laptop are meaningless (trivial script, warm image) — **record real ones on rainier-1**, which is what the ◐ is for. |
 | 3 | Session work in `/workspace` survives warm suspend AND cold park (stop + resume) — the session volume exists and persists. | Covered by the driver contract suite (`go test ./internal/driver/`), which runs the docker driver whenever a daemon is available: write → cold suspend → resume → file present; destroy → volume gone. | ☑ | Automated: green, docker and fake drivers. |
 | 4 | Env-declared secrets are injected as env vars into sessions of that env, stored encrypted in Postgres, never readable via the API after write. | `go test ./internal/e2e/ -run TestSecretsReachSpec`; on the VM, an environment whose setup script echoes the secret's LENGTH. | ☑ | Injection and encryption: automated, plus the local rehearsal's setup script read the value. "Never readable": the API is write-only, and after the fix round below the cached image's config carries no value either (`docker image inspect rainier-env:…`, asserted by the rehearsal). |
 | 5 | An environment with `placement: rainier-1` always places there; placement to a non-existent runner queues with a visible reason. | Covered by `go test ./internal/e2e/ -run TestPlacementPinQueuesWithReason` (a pinned session is passed over while a runner with two free slots sits there, then places the moment its own runner joins). | ☑ | Automated: green under `-race -count=5`. |
@@ -409,9 +427,11 @@ rather than reporting it.
   new tag. Design §4.4 ("root stays read-only") and §4.3 (setup provisions a
   cacheable image) contradicted each other, and §4.4 won. **Fixed:** a create
   carrying a setup script drops that one flag; cache-booted and scratch
-  sessions keep it. The session image also needed a uid-1000 user to own the
-  paths a script installs into — a writable rootfs it has no permission to
-  write is no better than a read-only one.
+  sessions keep it. The session image also needed a uid-1000 user and an
+  install prefix it owns — a writable rootfs it has no permission to write is
+  no better than a read-only one. That prefix is `/opt/rainier-env`, not
+  `/usr/local`: sessiond is the session's PID 1, and a setup script that could
+  replace it would have that baked into the cached image (design §10).
 - **A cache-booted session re-ran its setup script.** `docker commit`
   snapshots the container's *config*, environment block included, so
   `RAINIER_SETUP_B64` rode along inside `rainier-env:…` and sessiond ran the
