@@ -167,6 +167,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/secrets", s.requireUser(s.handleListSecrets))
 	mux.HandleFunc("DELETE /v1/secrets/{name}", s.requireAdmin(s.handleDeleteSecret))
 
+	// Credentials are per-user, not per-team: the listing is the caller's
+	// own rows and nobody else's (not even an admin's view of them), and
+	// there is no write route at all — a credential is stored by logging in.
+	mux.HandleFunc("GET /v1/credentials", s.requireUser(s.handleListCredentials))
+
 	// Environments belong to the whole team, so like secrets they have no
 	// owner to fall back on: mutations are admin-only, reads team-visible
 	// (design §4.5). The {id} routes take an id or a name.

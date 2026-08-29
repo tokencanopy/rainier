@@ -317,8 +317,24 @@ type smokeUserView struct {
 }
 
 type smokeAuthResponse struct {
-	Token string        `json:"token"`
-	User  smokeUserView `json:"user"`
+	Token   string        `json:"token"`
+	User    smokeUserView `json:"user"`
+	Scopes  string        `json:"scopes"`
+	Warning string        `json:"warning"`
+}
+
+// smokeCredential mirrors one element of GET /v1/credentials. Like
+// smokeSecret it has no value field, because the response has none.
+type smokeCredential struct {
+	Provider       string `json:"provider"`
+	Status         string `json:"status"`
+	Scopes         string `json:"scopes"`
+	LastVerifiedAt string `json:"last_verified_at"`
+	LastUsedAt     string `json:"last_used_at"`
+}
+
+type smokeCredentialsEnvelope struct {
+	Credentials []smokeCredential `json:"credentials"`
 }
 
 type smokeSession struct {
@@ -374,6 +390,11 @@ type smokeEnvironmentsEnvelope struct {
 	Environments []smokeEnvironment `json:"environments"`
 }
 
+// smokeGHScopes is the X-OAuth-Scopes the fake GitHub reports, matching what
+// the device flow now asks for — controld reads it off this same /user
+// response and stores it with the credential.
+const smokeGHScopes = "repo, read:user"
+
 // newSmokeGitHub fakes GitHub's GET /user: 200 with {"id":99,"login":"alice"}
 // for the smokeGHToken bearer and {"id":1,"login":"root"} for
 // smokeAdminGHToken (the fixture's admin), 401 for anything else.
@@ -394,6 +415,7 @@ func newSmokeGitHub(t *testing.T) *httptest.Server {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-OAuth-Scopes", smokeGHScopes)
 		json.NewEncoder(w).Encode(user)
 	}))
 	t.Cleanup(ts.Close)
@@ -623,7 +645,38 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	if auth.Token == "" {
 		t.Fatal("auth response carried no token")
 	}
+	if auth.Scopes != smokeGHScopes {
+		t.Fatalf("auth response scopes = %q, want %q (read off GitHub's own /user response)", auth.Scopes, smokeGHScopes)
+	}
+	if auth.Warning != "" {
+		t.Fatalf("auth response warning = %q, want none — this token has the repo scope", auth.Warning)
+	}
 	c := &Client{Base: controldTS.URL, Token: auth.Token}
+
+	// --- creds: GET /v1/credentials, the one call cmd/rainier's `creds`
+	// makes. Logging in above sealed alice's GitHub token into the vault;
+	// this is the only view of it the API offers, and it carries metadata
+	// only — the same write-only discipline as secrets ---
+	var rawCreds json.RawMessage
+	if err := c.Do(http.MethodGet, "/v1/credentials", nil, &rawCreds); err != nil {
+		t.Fatalf("GET /v1/credentials: %v", err)
+	}
+	if strings.Contains(string(rawCreds), smokeGHToken) {
+		t.Fatalf("GET /v1/credentials leaked the GitHub token: %s", rawCreds)
+	}
+	var creds smokeCredentialsEnvelope
+	if err := json.Unmarshal(rawCreds, &creds); err != nil {
+		t.Fatalf("decode credentials: %v; body=%s", err, rawCreds)
+	}
+	if len(creds.Credentials) != 1 {
+		t.Fatalf("credentials = %+v, want exactly the github one login stored", creds.Credentials)
+	}
+	if got := creds.Credentials[0]; got.Provider != "github" || got.Status != "valid" || got.Scopes != smokeGHScopes {
+		t.Fatalf("credential = %+v, want github/valid with the reported scopes", got)
+	}
+	if creds.Credentials[0].LastVerifiedAt == "" || creds.Credentials[0].LastUsedAt == "" {
+		t.Fatalf("credential timestamps = %+v, want both populated", creds.Credentials[0])
+	}
 
 	// --- a real runnerd (fake driver) connected to controld ---
 	rd := runnerd.New(driver.NewFake(4), "", "", "")

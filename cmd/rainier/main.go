@@ -57,6 +57,8 @@ func main() {
 		err = runSnapshot(rest)
 	case "rm":
 		err = runRm(rest)
+	case "creds":
+		err = runCreds(rest)
 	case "secret":
 		err = runSecret(rest)
 	case "env":
@@ -80,6 +82,7 @@ func printUsage() {
 
 commands:
   login    [--from-gh] [--token GH_TOKEN] [--client-id ID] [--server URL]
+           [--refresh PROVIDER]
   new      [--name N] [--env ENV] [--image IMG] [--egress host,host] [--detach]
            [-- CMD ARGS...]
   ls       [--all]
@@ -88,12 +91,24 @@ commands:
   resume   <id|name>
   snapshot <id|name>
   rm       <id|name>
+  creds
   secret   set <NAME> [--value V] | ls | rm <NAME>
   env      create <name> [flags] | ls | show <ref> | update <ref> [flags] | rm <ref>
 
 new --env starts the session from an environment (by name or id): its image,
 setup script, egress and secrets. --image and --egress override the
 environment's own for that one session; everything else comes from it.
+
+login stores your GitHub token in the server's credential vault (sealed), so
+sessions can clone, pull and push as you. "creds" shows what's stored:
+provider, status, scopes and when it was last verified and used. A status of
+needs_refresh means git saw that token rejected — run
+
+  rainier login --refresh github
+
+to log in again with a fresh token and clear it. Use the same command when
+"creds" shows scopes without "repo": that token can prove who you are but
+cannot do git.
 
 secret set reads the value from stdin when --value is omitted, so it never
 lands in your shell history:  cat token.txt | rainier secret set GH_TOKEN
@@ -156,6 +171,27 @@ type userView struct {
 type authResponse struct {
 	Token string   `json:"token"`
 	User  userView `json:"user"`
+	// Scopes is what GitHub reported the token can do; Warning is set when
+	// something about it will bite later (v0: no `repo` scope). Neither
+	// carries the token itself — this API never gives one back.
+	Scopes  string `json:"scopes"`
+	Warning string `json:"warning"`
+}
+
+// credential mirrors one element of GET /v1/credentials. As with `secret`,
+// there is no value field here for the same reason there is none
+// server-side: the API never returns one.
+type credential struct {
+	Provider       string `json:"provider"`
+	Status         string `json:"status"`
+	Scopes         string `json:"scopes"`
+	ObtainedAt     string `json:"obtained_at"`
+	LastVerifiedAt string `json:"last_verified_at"`
+	LastUsedAt     string `json:"last_used_at"`
+}
+
+type credentialsEnvelope struct {
+	Credentials []credential `json:"credentials"`
 }
 
 type createSessionRequest struct {
@@ -238,13 +274,25 @@ type createEnvironmentRequest struct {
 // login
 // ---------------------------------------------------------------------------
 
+// refreshableProviders is every provider `login --refresh` knows. The vault
+// is keyed by (user, provider) and v0 stores GitHub only; naming an unknown
+// one is refused rather than quietly refreshing GitHub, since a caller who
+// typed "gitlab" did not mean "github".
+var refreshableProviders = []string{"github"}
+
 func runLogin(args []string) error {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
 	fromGH := fs.Bool("from-gh", false, "obtain a GitHub token via `gh auth token`")
 	token := fs.String("token", "", "a GitHub access token to use directly")
 	clientID := fs.String("client-id", "", "GitHub OAuth App client id — runs the device flow")
 	server := fs.String("server", "", "controld server URL")
+	refresh := fs.String("refresh", "", "replace the stored credential for this `provider` (github) — use it when `rainier creds` says needs_refresh")
 	fs.Parse(reorderArgs(fs, args))
+
+	if *refresh != "" && !slices.Contains(refreshableProviders, *refresh) {
+		return fmt.Errorf("--refresh %s: unknown provider; rainier stores credentials for: %s",
+			*refresh, strings.Join(refreshableProviders, ", "))
+	}
 
 	cfg, _ := cli.Load() // a missing/unreadable config is not fatal here: --server can still supply everything
 	serverURL := *server
@@ -280,16 +328,70 @@ func runLogin(args []string) error {
 		os.Exit(2)
 	}
 
+	// A refresh is the same exchange: the server upserts the credential on
+	// every login, so re-logging in IS how a needs_refresh row is cleared.
+	// There is no second endpoint to call and nothing extra to send.
 	c := &cli.Client{Base: serverURL}
 	var resp authResponse
 	if err := c.Do(http.MethodPost, "/v1/auth/github", map[string]string{"access_token": ghToken}, &resp); err != nil {
 		return err
 	}
-	if err := cli.Save(cli.Config{ServerURL: serverURL, Token: resp.Token}); err != nil {
+
+	// Only ServerURL and Token are replaced: OwnerID is this CLI's own cache
+	// of who the caller is (see runNew), and a refresh of a GitHub credential
+	// is no reason to forget it.
+	cfg.ServerURL, cfg.Token = serverURL, resp.Token
+	if err := cli.Save(cfg); err != nil {
 		return fmt.Errorf("saving config: %w", err)
 	}
-	fmt.Printf("logged in as %s (%s)\n", resp.User.Login, resp.User.Role)
+
+	if *refresh != "" {
+		fmt.Printf("refreshed %s credential for %s (%s)\n", *refresh, resp.User.Login, resp.User.Role)
+	} else {
+		fmt.Printf("logged in as %s (%s)\n", resp.User.Login, resp.User.Role)
+	}
+	if resp.Scopes != "" {
+		fmt.Printf("github scopes: %s\n", resp.Scopes)
+	}
+	// The server warns rather than fails when the token can't do git; print
+	// it on stdout beside the rest of the login summary, since it is about
+	// this login's outcome and not a CLI-level error.
+	if resp.Warning != "" {
+		fmt.Printf("warning: %s\n", resp.Warning)
+	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// creds
+// ---------------------------------------------------------------------------
+
+// runCreds renders GET /v1/credentials: what the server's vault holds for
+// the caller, and nothing about anyone else. There is no value in the
+// response and none in this table by construction — a credential is
+// write-only at that API exactly like a secret.
+func runCreds(args []string) error {
+	fs := flag.NewFlagSet("creds", flag.ExitOnError)
+	fs.Parse(args)
+
+	cfg, err := requireLogin()
+	if err != nil {
+		return err
+	}
+	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+
+	var resp credentialsEnvelope
+	if err := c.Do(http.MethodGet, "/v1/credentials", nil, &resp); err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "PROVIDER\tSTATUS\tSCOPES\tLAST_VERIFIED\tLAST_USED")
+	for _, cr := range resp.Credentials {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+			cr.Provider, cr.Status, dashIfEmpty(cr.Scopes), formatAge(cr.LastVerifiedAt), formatAge(cr.LastUsedAt))
+	}
+	return w.Flush()
 }
 
 // deviceCodeResponse and accessTokenResponse are GitHub's device-flow wire
@@ -353,7 +455,12 @@ func githubDeviceFlow(clientID string) (string, error) {
 func requestDeviceCode(clientID string) (deviceCodeResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), devicePollTimeout)
 	defer cancel()
-	form := url.Values{"client_id": {clientID}, "scope": {"read:user"}}
+	// `repo` is what lets a session clone, pull and push on the user's
+	// behalf; `read:user` is what the login exchange itself needs. Both are
+	// requested up front because the alternative — asking for read:user now
+	// and repo at the first clone — means a device-flow prompt in the middle
+	// of a session, which is the one moment there is nobody at the terminal.
+	form := url.Values{"client_id": {clientID}, "scope": {"repo read:user"}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://github.com/login/device/code", strings.NewReader(form.Encode()))
 	if err != nil {
 		return deviceCodeResponse{}, err

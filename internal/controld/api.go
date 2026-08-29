@@ -1039,6 +1039,58 @@ func (s *Server) handleDeleteSecret(w http.ResponseWriter, r *http.Request, u Us
 }
 
 // ---------------------------------------------------------------------------
+// credentials: GET /v1/credentials
+// ---------------------------------------------------------------------------
+
+// credentialView is the client-facing rendering of a Credential: what the
+// vault holds ABOUT a credential, never the credential. Like secretView, it
+// has nowhere to put a value on purpose — Credential itself carries four
+// sealed byte slices, and the only durable way to keep them off the wire is
+// for the wire type to have no field they could be assigned to.
+type credentialView struct {
+	Provider       string `json:"provider"`
+	Status         string `json:"status"`
+	Scopes         string `json:"scopes"`
+	ObtainedAt     string `json:"obtained_at"`
+	LastVerifiedAt string `json:"last_verified_at"`
+	LastUsedAt     string `json:"last_used_at"`
+}
+
+type credentialsEnvelope struct {
+	Credentials []credentialView `json:"credentials"`
+}
+
+// handleListCredentials serves GET /v1/credentials: the CALLER's own
+// credentials, provider ascending.
+//
+// This is the one listing on this API that is not team-visible, and the
+// asymmetry is deliberate. A team secret is the team's, and knowing its name
+// is what lets a member wire it into an environment; a credential is one
+// person's GitHub identity, and no teammate — admin included — has any use
+// for its status. So the store call is scoped to u.ID and there is no
+// "somebody else's" query parameter to add later without noticing.
+func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request, u User) {
+	rows, err := s.st.ListCredentials(r.Context(), u.ID)
+	if err != nil {
+		log.Printf("controld: list credentials for user %s: %v", u.ID, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not list credentials")
+		return
+	}
+	out := make([]credentialView, len(rows))
+	for i, row := range rows {
+		out[i] = credentialView{
+			Provider:       row.Provider,
+			Status:         row.Status,
+			Scopes:         row.Scopes,
+			ObtainedAt:     row.ObtainedAt.UTC().Format(time.RFC3339),
+			LastVerifiedAt: row.LastVerifiedAt.UTC().Format(time.RFC3339),
+			LastUsedAt:     row.LastUsedAt.UTC().Format(time.RFC3339),
+		}
+	}
+	writeJSON(w, http.StatusOK, credentialsEnvelope{Credentials: out})
+}
+
+// ---------------------------------------------------------------------------
 // environments: POST/GET /v1/environments, GET/PATCH/DELETE /v1/environments/{id}
 // ---------------------------------------------------------------------------
 

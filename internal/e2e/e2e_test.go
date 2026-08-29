@@ -246,6 +246,10 @@ func newFakeGitHub(t *testing.T) *httptest.Server {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		// The exchange reads a token's scopes off this same response and
+		// seals the credential with them (Plan 5 vault); reporting `repo`
+		// keeps the fixture's logins free of the missing-scope warning.
+		w.Header().Set("X-OAuth-Scopes", "repo, read:user")
 		json.NewEncoder(w).Encode(map[string]any{"id": 1001, "login": e2eLogin})
 	}))
 	t.Cleanup(ts.Close)

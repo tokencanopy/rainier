@@ -77,10 +77,18 @@ func userJSON(u User) userView {
 	return userView{Login: u.Login, Role: u.Role}
 }
 
-// authResponse is the body of a successful POST /v1/auth/github.
+// authResponse is the body of a successful POST /v1/auth/github. Token is
+// controld's own opaque bearer — never the GitHub token, which this API
+// takes in and never gives back.
+//
+// Scopes is what GitHub said the presented token can do, echoed so the CLI
+// can show it; Warning is present only when something about the token will
+// bite later (v0: no `repo` scope, so git operations can't work yet).
 type authResponse struct {
-	Token string   `json:"token"`
-	User  userView `json:"user"`
+	Token   string   `json:"token"`
+	User    userView `json:"user"`
+	Scopes  string   `json:"scopes"`
+	Warning string   `json:"warning,omitempty"`
 }
 
 // meResponse is the body of a successful GET /v1/me.
@@ -135,12 +143,56 @@ type githubUser struct {
 // upstream failure.
 var errGitHubUnauthorized = errors.New("controld: github rejected the access token")
 
+// githubScopesHeader is the response header GitHub puts a classic OAuth
+// token's granted scopes in, on every authenticated API response — which is
+// why the exchange can read it off the /user call it already makes instead of
+// spending a second round-trip on it.
+const githubScopesHeader = "X-OAuth-Scopes"
+
+// gitScope is the GitHub scope a token needs before rainier can clone, pull,
+// or push on the user's behalf. `public_repo` is deliberately not accepted as
+// a substitute: it cannot read a private repository, and a login that
+// silently passed with it would fail at the first private clone instead of
+// here.
+const gitScope = "repo"
+
+// githubRepoScopeWarning is the exact text POST /v1/auth/github returns (and
+// the CLI prints) when the presented token has no `repo` scope. The login
+// still succeeds and the credential is still stored: the token is a perfectly
+// good identity, it just can't do git yet, and saying so at login beats an
+// unexplainable clone failure later.
+const githubRepoScopeWarning = "token lacks repo scope; git operations will require rainier login --refresh github"
+
+// hasGitScope reports whether the X-OAuth-Scopes value scopes grants
+// gitScope. GitHub renders the header as a comma-separated list with spaces
+// ("repo, read:user"), so each entry is trimmed and compared whole — a
+// substring test would accept `repo:status` and `public_repo` alike.
+//
+// An empty header (a fine-grained token, or a provider that reports no
+// scopes) reads as "not granted", which is the fail-safe direction: it
+// produces a warning nobody has to act on rather than silence in front of a
+// git setup that won't work.
+func hasGitScope(scopes string) bool {
+	for _, s := range strings.Split(scopes, ",") {
+		if strings.TrimSpace(s) == gitScope {
+			return true
+		}
+	}
+	return false
+}
+
 // handleGitHubAuth serves POST /v1/auth/github: the one unauthenticated
 // endpoint on this API by design. It exchanges a caller-supplied GitHub
 // access token for controld's own opaque bearer token, gated by the
-// configured admin/member allowlists. The GitHub token is used for exactly
-// one upstream call and then discarded — it is never stored and never
-// logged.
+// configured admin/member allowlists.
+//
+// Since Plan 5 the GitHub token is also SEALED INTO THE VAULT rather than
+// discarded — that is what lets a session's git mint from it later (spec
+// §4.2) — but it is still never logged and never returned: the response
+// carries controld's own token, the user's login and role, and the scopes
+// GitHub reported. `rainier login --refresh github` is this same request
+// again; the upsert is a whole-row replace, so a refresh is all it takes to
+// clear a needs_refresh row.
 func (s *Server) handleGitHubAuth(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, githubExchangeBodyLimit)
 	dec := json.NewDecoder(r.Body)
@@ -160,7 +212,7 @@ func (s *Server) handleGitHubAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	gu, err := s.fetchGitHubUser(r.Context(), req.AccessToken)
+	gu, scopes, err := s.fetchGitHubUser(r.Context(), req.AccessToken)
 	switch {
 	case errors.Is(err, errGitHubUnauthorized):
 		writeErr(w, http.StatusUnauthorized, "unauthenticated", "invalid GitHub access token")
@@ -186,6 +238,21 @@ func (s *Server) handleGitHubAuth(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal", "could not complete login")
 		return
 	}
+
+	// The credential is stored BEFORE the bearer token is minted, so a login
+	// that answers 200 is always a login whose git works: the failure mode
+	// this ordering rules out is a caller holding a perfectly good token over
+	// a vault with nothing in it, which would surface much later as a clone
+	// that can't authenticate. A failure here loses nothing but this attempt
+	// — logging in again is the whole retry.
+	if err := s.storeGitHubCredential(r.Context(), u.ID, req.AccessToken, scopes); err != nil {
+		// The error is from Seal or the store; neither carries the token,
+		// and neither does this line.
+		log.Printf("controld: storing github credential for user %s: %v", u.ID, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not complete login")
+		return
+	}
+
 	tok, hash := NewToken()
 	if err := s.st.InsertToken(r.Context(), u.ID, hash); err != nil {
 		log.Printf("controld: insert token for user %s: %v", u.ID, err)
@@ -193,48 +260,60 @@ func (s *Server) handleGitHubAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, authResponse{Token: tok, User: userJSON(u)})
+	resp := authResponse{Token: tok, User: userJSON(u), Scopes: scopes}
+	if !hasGitScope(scopes) {
+		// A warning, never a failure: the login is valid and the credential
+		// is stored: only git is out of reach until the user re-logs in with
+		// a broader token.
+		resp.Warning = githubRepoScopeWarning
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // fetchGitHubUser calls {GitHubAPIBase}/user with token as a bearer and
 // validates the response shape — a third-party response is untrusted input
-// exactly like a client request. It returns errGitHubUnauthorized for
-// GitHub's own 401 and a wrapped error (detail for the log, never the
-// caller) for anything else that goes wrong: a non-200/401 status,
-// unparseable JSON, or a shape that fails validation (id <= 0 or an empty
-// login).
-func (s *Server) fetchGitHubUser(ctx context.Context, token string) (githubUser, error) {
+// exactly like a client request. It returns the user, the X-OAuth-Scopes
+// header from that SAME response (GitHub reports a classic token's scopes on
+// every authenticated response, so this costs no extra round-trip), and
+// errGitHubUnauthorized for GitHub's own 401 or a wrapped error (detail for
+// the log, never the caller) for anything else that goes wrong: a non-200/401
+// status, unparseable JSON, or a shape that fails validation (id <= 0 or an
+// empty login).
+//
+// Scopes are returned as GitHub spelled them, whitespace and all: they are
+// stored and displayed verbatim, and only hasGitScope ever parses them.
+func (s *Server) fetchGitHubUser(ctx context.Context, token string) (githubUser, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, githubCallTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.cfg.GitHubAPIBase+"/user", nil)
 	if err != nil {
-		return githubUser{}, fmt.Errorf("building github /user request: %w", err)
+		return githubUser{}, "", fmt.Errorf("building github /user request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Accept", "application/vnd.github+json")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return githubUser{}, fmt.Errorf("calling github /user: %w", err)
+		return githubUser{}, "", fmt.Errorf("calling github /user: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		return githubUser{}, errGitHubUnauthorized
+		return githubUser{}, "", errGitHubUnauthorized
 	}
 	if resp.StatusCode != http.StatusOK {
-		return githubUser{}, fmt.Errorf("github /user: unexpected status %d", resp.StatusCode)
+		return githubUser{}, "", fmt.Errorf("github /user: unexpected status %d", resp.StatusCode)
 	}
 
 	var gu githubUser
 	if err := json.NewDecoder(io.LimitReader(resp.Body, githubUserBodyLimit)).Decode(&gu); err != nil {
-		return githubUser{}, fmt.Errorf("decoding github /user response: %w", err)
+		return githubUser{}, "", fmt.Errorf("decoding github /user response: %w", err)
 	}
 	if gu.ID <= 0 || gu.Login == "" {
-		return githubUser{}, fmt.Errorf("github /user: invalid shape (id=%d, login=%q)", gu.ID, gu.Login)
+		return githubUser{}, "", fmt.Errorf("github /user: invalid shape (id=%d, login=%q)", gu.ID, gu.Login)
 	}
-	return gu, nil
+	return gu, resp.Header.Get(githubScopesHeader), nil
 }
 
 // ---------------------------------------------------------------------------
