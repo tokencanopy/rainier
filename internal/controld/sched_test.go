@@ -387,7 +387,7 @@ func TestCreateDispatchFailureRequeues(t *testing.T) {
 // connected runner at all means nothing is even attempted.
 func TestDrainQueueStopsWhenNoRunnerHasCapacity(t *testing.T) {
 	st := NewMemStore()
-	s, err := New(st, Config{RunnerToken: "t", ExternalURL: "http://x:9090"})
+	s, err := New(st, Config{RunnerToken: "t", ExternalURL: "http://x:9090", SecretsKey: testSecretsKey})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

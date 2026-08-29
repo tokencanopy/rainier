@@ -39,6 +39,7 @@ func newAttachControld(t *testing.T, opts ...func(*Config)) (*Server, Store, *ht
 	cfg := Config{
 		RunnerToken: testRunnerToken,
 		ExternalURL: "http://" + ts.Listener.Addr().String(),
+		SecretsKey:  testSecretsKey,
 		OpTimeout:   2 * time.Second,
 	}
 	for _, o := range opts {

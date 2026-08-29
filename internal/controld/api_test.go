@@ -5,10 +5,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -1193,6 +1195,447 @@ func TestSnapshotSession(t *testing.T) {
 		resp := (<-resc).resp
 		raw := readBody(t, resp)
 		assertKeySet(t, raw, "ref")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// secrets: the key is a required, fail-closed config
+// ---------------------------------------------------------------------------
+
+// TestNewRequiresSecretsKey pins the fail-closed rule: a controld with no
+// secrets key must refuse to start rather than come up with a secrets API
+// that would seal everything under a key of zeros.
+func TestNewRequiresSecretsKey(t *testing.T) {
+	t.Run("a zero SecretsKey is refused, naming the env var", func(t *testing.T) {
+		_, err := New(NewMemStore(), Config{RunnerToken: "t", ExternalURL: "http://x:9090"})
+		if err == nil {
+			t.Fatal("New with no SecretsKey: want error, got nil")
+		}
+		if !strings.Contains(err.Error(), "RAINIER_SECRETS_KEY") {
+			t.Errorf("error = %q, want it to name RAINIER_SECRETS_KEY", err)
+		}
+	})
+
+	t.Run("a configured key is accepted", func(t *testing.T) {
+		if _, err := New(NewMemStore(), Config{
+			RunnerToken: "t",
+			ExternalURL: "http://x:9090",
+			SecretsKey:  testSecretsKey,
+		}); err != nil {
+			t.Fatalf("New with a SecretsKey: %v", err)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// PUT /v1/secrets/{name}
+// ---------------------------------------------------------------------------
+
+// getSecretValue decrypts what the store actually holds for name, so a test
+// can assert the round trip through the real sealing path rather than
+// trusting the handler's own 204.
+func getSecretValue(t *testing.T, st Store, name string) string {
+	t.Helper()
+	ct, nonce, err := st.GetSecret(context.Background(), name)
+	if err != nil {
+		t.Fatalf("GetSecret(%s): %v", name, err)
+	}
+	pt, err := Open(testSecretsKey, ct, nonce)
+	if err != nil {
+		t.Fatalf("Open(%s): %v", name, err)
+	}
+	return string(pt)
+}
+
+func TestPutSecret(t *testing.T) {
+	t.Run("happy path stores the value sealed and answers 204", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+
+		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/GH_TOKEN", adminTok, map[string]any{"value": "ghp_supersecret"}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, raw)
+		}
+		if raw != "" {
+			t.Errorf("204 carried a body: %q", raw)
+		}
+
+		ct, nonce, err := st.GetSecret(context.Background(), "GH_TOKEN")
+		if err != nil {
+			t.Fatalf("GetSecret: %v", err)
+		}
+		if strings.Contains(string(ct), "ghp_supersecret") {
+			t.Fatalf("stored ciphertext contains the plaintext: %q", ct)
+		}
+		if len(nonce) != 12 {
+			t.Errorf("stored nonce is %d bytes, want 12", len(nonce))
+		}
+		if got := getSecretValue(t, st, "GH_TOKEN"); got != "ghp_supersecret" {
+			t.Errorf("stored value = %q, want ghp_supersecret", got)
+		}
+	})
+
+	t.Run("a second PUT replaces the value", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+
+		readBody(t, doJSON(t, ts, http.MethodPut, "/v1/secrets/API_KEY", adminTok, map[string]any{"value": "first"}, nil))
+		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/API_KEY", adminTok, map[string]any{"value": "second"}, nil)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, readBody(t, resp))
+		}
+		readBody(t, resp)
+		if got := getSecretValue(t, st, "API_KEY"); got != "second" {
+			t.Fatalf("stored value = %q, want second (the replacement)", got)
+		}
+	})
+
+	t.Run("invalid names are 400 invalid_request", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+
+		for _, name := range []string{
+			"lowercase",
+			"HAS-DASH",
+			"HAS.DOT",
+			"HAS SPACE",
+			"HÉLLO",
+			strings.Repeat("A", 65),
+		} {
+			resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/"+url.PathEscape(name), adminTok, map[string]any{"value": "v"}, nil)
+			raw := readBody(t, resp)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("PUT name=%q status = %d, want 400; body=%s", name, resp.StatusCode, raw)
+				continue
+			}
+			if e := decodeErrBody(t, raw); e.Error.Code != "invalid_request" {
+				t.Errorf("PUT name=%q code = %q, want invalid_request", name, e.Error.Code)
+			}
+		}
+	})
+
+	t.Run("a 64-character name is accepted (the boundary)", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		name := strings.Repeat("A", 64)
+		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/"+name, adminTok, map[string]any{"value": "v"}, nil)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, readBody(t, resp))
+		}
+		readBody(t, resp)
+	})
+
+	t.Run("an empty value is 400 invalid_request", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/EMPTY", adminTok, map[string]any{"value": ""}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "invalid_request" {
+			t.Errorf("code = %q, want invalid_request", e.Error.Code)
+		}
+	})
+
+	t.Run("a value over 64KB is 400 invalid_request", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/BIG", adminTok,
+			map[string]any{"value": strings.Repeat("x", (64<<10)+1)}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "invalid_request" {
+			t.Errorf("code = %q, want invalid_request", e.Error.Code)
+		}
+		if _, _, err := st.GetSecret(context.Background(), "BIG"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("an over-cap value was stored anyway (GetSecret err = %v)", err)
+		}
+	})
+
+	t.Run("a value at exactly 64KB is accepted (the boundary)", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		value := strings.Repeat("x", 64<<10)
+		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/ATCAP", adminTok, map[string]any{"value": value}, nil)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, readBody(t, resp))
+		}
+		readBody(t, resp)
+		if got := getSecretValue(t, st, "ATCAP"); got != value {
+			t.Errorf("stored value length = %d, want %d", len(got), len(value))
+		}
+	})
+
+	t.Run("an unbounded body is 400 invalid_request", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		huge := `{"value":"` + strings.Repeat("x", secretsBodyLimit+1) + `"}`
+		resp := doRaw(t, ts, http.MethodPut, "/v1/secrets/HUGE", adminTok, huge)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "invalid_request" {
+			t.Errorf("code = %q, want invalid_request", e.Error.Code)
+		}
+	})
+
+	t.Run("unknown field is 400 invalid_request", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doRaw(t, ts, http.MethodPut, "/v1/secrets/UNKNOWN", adminTok, `{"value":"v","bogus":true}`)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "invalid_request" {
+			t.Errorf("code = %q, want invalid_request", e.Error.Code)
+		}
+	})
+
+	t.Run("a member is 403 forbidden and stores nothing", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, memberTok := loginUser(t, st, "alice", "member")
+
+		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/MEMBER_TRY", memberTok, map[string]any{"value": "nope"}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "forbidden" {
+			t.Errorf("code = %q, want forbidden", e.Error.Code)
+		}
+		if _, _, err := st.GetSecret(context.Background(), "MEMBER_TRY"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("a member's rejected PUT stored the secret anyway (err = %v)", err)
+		}
+	})
+
+	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
+		_, _, ts := newTestControld(t)
+		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/ANON", "", map[string]any{"value": "nope"}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "unauthenticated" {
+			t.Errorf("code = %q, want unauthenticated", e.Error.Code)
+		}
+	})
+
+	// The value is the one thing this API accepts and never gives back: not
+	// in the 204, not in an error, not anywhere.
+	t.Run("no response on any path echoes the value", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		_, memberTok := loginUser(t, st, "alice", "member")
+		const value = "ghp_never_echo_me"
+
+		bodies := []string{
+			readBody(t, doJSON(t, ts, http.MethodPut, "/v1/secrets/ECHO", adminTok, map[string]any{"value": value}, nil)),
+			readBody(t, doJSON(t, ts, http.MethodPut, "/v1/secrets/bad-name", adminTok, map[string]any{"value": value}, nil)),
+			readBody(t, doJSON(t, ts, http.MethodPut, "/v1/secrets/ECHO", memberTok, map[string]any{"value": value}, nil)),
+			readBody(t, doRequest(t, ts, http.MethodGet, "/v1/secrets", adminTok, nil, nil)),
+		}
+		for i, b := range bodies {
+			if strings.Contains(b, value) {
+				t.Errorf("response %d echoed the secret value: %s", i, b)
+			}
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/secrets
+// ---------------------------------------------------------------------------
+
+func TestListSecrets(t *testing.T) {
+	// putSecret seals and stores a secret directly, so list/delete tests
+	// don't have to go through the admin PUT route to have data.
+	putSecret := func(t *testing.T, st Store, name, value string) {
+		t.Helper()
+		ct, nonce, err := Seal(testSecretsKey, []byte(value))
+		if err != nil {
+			t.Fatalf("Seal(%s): %v", name, err)
+		}
+		if err := st.PutSecret(context.Background(), name, ct, nonce); err != nil {
+			t.Fatalf("PutSecret(%s): %v", name, err)
+		}
+	}
+
+	t.Run("happy path lists names and timestamps, name ascending", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, tok := loginUser(t, st, "alice", "member")
+		putSecret(t, st, "ZULU", "z")
+		putSecret(t, st, "ALPHA", "a")
+
+		resp := doRequest(t, ts, http.MethodGet, "/v1/secrets", tok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
+		}
+		var body secretsEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		if len(body.Secrets) != 2 {
+			t.Fatalf("secrets = %+v, want 2", body.Secrets)
+		}
+		if body.Secrets[0].Name != "ALPHA" || body.Secrets[1].Name != "ZULU" {
+			t.Errorf("order = %q, %q, want ALPHA, ZULU", body.Secrets[0].Name, body.Secrets[1].Name)
+		}
+		for _, sv := range body.Secrets {
+			if _, err := time.Parse(time.RFC3339, sv.CreatedAt); err != nil {
+				t.Errorf("created_at = %q, want RFC3339: %v", sv.CreatedAt, err)
+			}
+			if _, err := time.Parse(time.RFC3339, sv.UpdatedAt); err != nil {
+				t.Errorf("updated_at = %q, want RFC3339: %v", sv.UpdatedAt, err)
+			}
+		}
+	})
+
+	t.Run("no secrets renders an empty array, not null", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, tok := loginUser(t, st, "alice", "member")
+		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v1/secrets", tok, nil, nil))
+		if strings.Contains(raw, `"secrets":null`) {
+			t.Fatalf("empty list rendered as JSON null: %s", raw)
+		}
+	})
+
+	// The mandated raw-JSON assertion: a listing must never grow a value
+	// field, whatever a future refactor does to the view struct.
+	t.Run("the raw JSON never contains a value key or any value", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, tok := loginUser(t, st, "alice", "member")
+		putSecret(t, st, "GH_TOKEN", "ghp_never_listed")
+
+		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v1/secrets", tok, nil, nil))
+		if strings.Contains(raw, "value") {
+			t.Fatalf("list body mentions \"value\": %s", raw)
+		}
+		if strings.Contains(raw, "ghp_never_listed") {
+			t.Fatalf("list body leaked the secret value: %s", raw)
+		}
+		if strings.Contains(raw, "ciphertext") || strings.Contains(raw, "nonce") {
+			t.Fatalf("list body leaked the sealed representation: %s", raw)
+		}
+	})
+
+	t.Run("a member may list (reads are team-visible)", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, tok := loginUser(t, st, "alice", "member")
+		putSecret(t, st, "SHARED", "v")
+		resp := doRequest(t, ts, http.MethodGet, "/v1/secrets", tok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
+		}
+	})
+
+	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
+		_, _, ts := newTestControld(t)
+		resp := doRequest(t, ts, http.MethodGet, "/v1/secrets", "", nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401; body=%s", resp.StatusCode, raw)
+		}
+	})
+
+	t.Run("response shape is pinned", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, tok := loginUser(t, st, "alice", "member")
+		putSecret(t, st, "PINNED", "v")
+
+		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v1/secrets", tok, nil, nil))
+		assertKeySet(t, raw, "secrets")
+		var outer map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &outer); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		var arr []json.RawMessage
+		if err := json.Unmarshal(outer["secrets"], &arr); err != nil {
+			t.Fatalf("decode secrets array: %v", err)
+		}
+		assertKeySet(t, string(arr[0]), "name", "created_at", "updated_at")
+	})
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /v1/secrets/{name}
+// ---------------------------------------------------------------------------
+
+func TestDeleteSecret(t *testing.T) {
+	t.Run("happy path is 204 and the secret is gone", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		readBody(t, doJSON(t, ts, http.MethodPut, "/v1/secrets/DOOMED", adminTok, map[string]any{"value": "v"}, nil))
+
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/secrets/DOOMED", adminTok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, raw)
+		}
+		if _, _, err := st.GetSecret(context.Background(), "DOOMED"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("GetSecret after delete: err = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("unknown name is 404 not_found", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/secrets/NEVER_EXISTED", adminTok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "not_found" {
+			t.Errorf("code = %q, want not_found", e.Error.Code)
+		}
+	})
+
+	t.Run("invalid name is 400 invalid_request", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/secrets/bad-name", adminTok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "invalid_request" {
+			t.Errorf("code = %q, want invalid_request", e.Error.Code)
+		}
+	})
+
+	t.Run("a member is 403 forbidden and the secret survives", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		_, memberTok := loginUser(t, st, "alice", "member")
+		readBody(t, doJSON(t, ts, http.MethodPut, "/v1/secrets/SURVIVOR", adminTok, map[string]any{"value": "v"}, nil))
+
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/secrets/SURVIVOR", memberTok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, raw)
+		}
+		if e := decodeErrBody(t, raw); e.Error.Code != "forbidden" {
+			t.Errorf("code = %q, want forbidden", e.Error.Code)
+		}
+		if got := getSecretValue(t, st, "SURVIVOR"); got != "v" {
+			t.Fatalf("secret value after a rejected delete = %q, want v", got)
+		}
+	})
+
+	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
+		_, _, ts := newTestControld(t)
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/secrets/ANON", "", nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401; body=%s", resp.StatusCode, raw)
+		}
 	})
 }
 

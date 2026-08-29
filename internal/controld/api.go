@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -140,7 +141,15 @@ type suspendRequest struct {
 // It writes a 400 invalid_request response and returns false on any
 // failure; callers should return immediately when it does.
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, v any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, sessionsBodyLimit)
+	return decodeJSONBodyLimit(w, r, v, sessionsBodyLimit)
+}
+
+// decodeJSONBodyLimit is decodeJSONBody with an explicit byte cap, for the
+// one body that isn't a small fixed-shape object: PUT /v1/secrets/{name}
+// carries a value up to maxSecretValueBytes, which JSON escaping can inflate
+// well past the sessions limit.
+func decodeJSONBodyLimit(w http.ResponseWriter, r *http.Request, v any, limit int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
@@ -626,6 +635,136 @@ func (s *Server) handleListRunners(w http.ResponseWriter, r *http.Request, u Use
 		}
 	}
 	writeJSON(w, http.StatusOK, runnersEnvelope{Runners: out})
+}
+
+// ---------------------------------------------------------------------------
+// secrets: PUT/GET/DELETE /v1/secrets
+// ---------------------------------------------------------------------------
+
+const (
+	// maxSecretValueBytes caps one secret's plaintext at 64KB. Secrets are
+	// environment variables injected into a session (design §4.1) — API
+	// tokens, keys, the occasional PEM — not file storage.
+	maxSecretValueBytes = 64 << 10
+	// secretsBodyLimit caps the whole PUT body. It is deliberately far above
+	// maxSecretValueBytes: JSON escaping can inflate a value up to six-fold
+	// (every byte of a control character becomes \u00xx), and a request that
+	// carries a legal 64KB value must fail the value check with a message
+	// about the value, not get cut off mid-body and reported as malformed.
+	secretsBodyLimit = 8 * maxSecretValueBytes
+)
+
+// secretNamePattern is the whole vocabulary of a secret name: the shell
+// environment-variable spelling, since that is exactly what a secret becomes
+// inside a session. Anything outside it is rejected at the API rather than
+// producing a variable no setup script can reference.
+var secretNamePattern = regexp.MustCompile(`^[A-Z0-9_]{1,64}$`)
+
+// secretView is the client-facing rendering of a SecretMeta. There is
+// deliberately no value field anywhere in this file's response types: a
+// secret's value is write-only at this API, and the only way to keep that
+// true under future edits is for the wire type to have nowhere to put one.
+type secretView struct {
+	Name      string `json:"name"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+type secretsEnvelope struct {
+	Secrets []secretView `json:"secrets"`
+}
+
+// putSecretRequest is the decoded body of PUT /v1/secrets/{name}. Value is
+// never logged and never echoed — not in a success response, not in an
+// error.
+type putSecretRequest struct {
+	Value string `json:"value"`
+}
+
+// handlePutSecret serves PUT /v1/secrets/{name} (admin): seal the value
+// under the fleet's secrets key and upsert it. The response is a bare 204 —
+// there is nothing to return that the caller doesn't already have, and a
+// body echoing the name is one refactor away from echoing the value.
+func (s *Server) handlePutSecret(w http.ResponseWriter, r *http.Request, u User) {
+	name := r.PathValue("name")
+	if !secretNamePattern.MatchString(name) {
+		writeErr(w, http.StatusBadRequest, "invalid_request", "secret name must match [A-Z0-9_]{1,64}")
+		return
+	}
+
+	var req putSecretRequest
+	if !decodeJSONBodyLimit(w, r, &req, secretsBodyLimit) {
+		return
+	}
+	if req.Value == "" {
+		writeErr(w, http.StatusBadRequest, "invalid_request", "value is required")
+		return
+	}
+	if len(req.Value) > maxSecretValueBytes {
+		writeErr(w, http.StatusBadRequest, "invalid_request",
+			fmt.Sprintf("value must be at most %d bytes", maxSecretValueBytes))
+		return
+	}
+
+	ciphertext, nonce, err := Seal(s.cfg.SecretsKey, []byte(req.Value))
+	if err != nil {
+		// Seal only fails if the OS entropy source is broken; the detail is
+		// for the log, and carries nothing about the value either way.
+		log.Printf("controld: sealing secret %s: %v", name, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not store secret")
+		return
+	}
+	if err := s.st.PutSecret(r.Context(), name, ciphertext, nonce); err != nil {
+		log.Printf("controld: put secret %s: %v", name, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not store secret")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleListSecrets serves GET /v1/secrets: every secret's name and
+// timestamps, name ascending. Team-visible like every other read on this
+// API — knowing which names exist is what lets a member write an
+// environment that references them; the values stay unreadable.
+func (s *Server) handleListSecrets(w http.ResponseWriter, r *http.Request, u User) {
+	rows, err := s.st.ListSecrets(r.Context())
+	if err != nil {
+		log.Printf("controld: list secrets: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not list secrets")
+		return
+	}
+	out := make([]secretView, len(rows))
+	for i, row := range rows {
+		out[i] = secretView{
+			Name:      row.Name,
+			CreatedAt: row.CreatedAt.UTC().Format(time.RFC3339),
+			UpdatedAt: row.UpdatedAt.UTC().Format(time.RFC3339),
+		}
+	}
+	writeJSON(w, http.StatusOK, secretsEnvelope{Secrets: out})
+}
+
+// handleDeleteSecret serves DELETE /v1/secrets/{name} (admin). Unlike
+// DELETE /v1/sessions/{id}, this one is not idempotent: an unknown name is
+// 404, because deleting the wrong secret and deleting a nonexistent one look
+// identical to the caller otherwise, and there is no "already gone" state to
+// report the way a terminal session has.
+func (s *Server) handleDeleteSecret(w http.ResponseWriter, r *http.Request, u User) {
+	name := r.PathValue("name")
+	if !secretNamePattern.MatchString(name) {
+		writeErr(w, http.StatusBadRequest, "invalid_request", "secret name must match [A-Z0-9_]{1,64}")
+		return
+	}
+	if err := s.st.DeleteSecret(r.Context(), name); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "secret not found")
+			return
+		}
+		log.Printf("controld: delete secret %s: %v", name, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not delete secret")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ---------------------------------------------------------------------------

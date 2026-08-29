@@ -108,6 +108,16 @@ export RAINIER_RUNNER_TOKEN="rnr-$(openssl rand -hex 24)"
 echo "$RAINIER_RUNNER_TOKEN" > ~/.rainier-runner-token && chmod 600 ~/.rainier-runner-token
 ```
 
+controld also requires a secrets key: 32 bytes of hex that team secrets are
+AES-256-GCM-encrypted with at rest. Generate it once and keep it — losing it
+loses the stored secret **values** (and nothing else in the database); the
+recovery is an admin re-running `rainier secret set` for each name.
+
+```bash
+export RAINIER_SECRETS_KEY="$(openssl rand -hex 32)"
+echo "$RAINIER_SECRETS_KEY" > ~/.rainier-secrets-key && chmod 600 ~/.rainier-secrets-key
+```
+
 `--external-url` must be the **tailnet MagicDNS name**, not `localhost`: it is
 what controld hands runners as the attach dial-back target, and a runner
 refuses a dial-back whose origin isn't its own controld. On this single-VM
@@ -121,6 +131,7 @@ nohup ./bin/controld \
   --listen :9090 \
   --db "$RAINIER_DB" \
   --runner-token "$RAINIER_RUNNER_TOKEN" \
+  --secrets-key "$RAINIER_SECRETS_KEY" \
   --external-url http://rainier-1:9090 \
   --admins "$RAINIER_ADMINS" \
   > /tmp/controld.log 2>&1 &
@@ -137,8 +148,8 @@ GitHub logins are — `Alice` in `--admins` admits the account GitHub reports as
 `alice`.
 
 Every flag also reads a `RAINIER_*` environment variable
-(`RAINIER_LISTEN`, `RAINIER_DB`, `RAINIER_RUNNER_TOKEN`, `RAINIER_ADMINS`,
-`RAINIER_MEMBERS`, `RAINIER_EXTERNAL_URL`, `RAINIER_GITHUB_API`), so the
+(`RAINIER_LISTEN`, `RAINIER_DB`, `RAINIER_RUNNER_TOKEN`, `RAINIER_SECRETS_KEY`,
+`RAINIER_ADMINS`, `RAINIER_MEMBERS`, `RAINIER_EXTERNAL_URL`, `RAINIER_GITHUB_API`), so the
 command above shrinks to `./bin/controld` once those are exported — an
 explicit flag always wins over the environment.
 

@@ -287,10 +287,26 @@ func TestDoSuccessNoOutDoesNotDecode(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 const (
-	smokeGHToken     = "gho_smoke_good"
-	smokeRunnerToken = "rnr_smoke_token"
-	smokeSnapshot    = "smoke-snapshot"
+	smokeGHToken = "gho_smoke_good"
+	// smokeAdminGHToken logs in as "root", the fixture's admin — secrets
+	// (and, from Task 4, environments) are admin-only mutations, so the
+	// smoke needs both roles to exercise the real authZ.
+	smokeAdminGHToken = "gho_smoke_admin"
+	smokeRunnerToken  = "rnr_smoke_token"
+	smokeSnapshot     = "smoke-snapshot"
+	// smokeSecretsKeyHex is the AES-256 key this fixture's controld seals
+	// team secrets under; controld.New requires one (fail closed).
+	smokeSecretsKeyHex = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
 )
+
+// smokeSecretsKey is smokeSecretsKeyHex parsed once, for newSmokeControld.
+var smokeSecretsKey = func() [32]byte {
+	k, err := controld.ParseSecretsKey(smokeSecretsKeyHex)
+	if err != nil {
+		panic("cli smoke: bad secrets key: " + err.Error())
+	}
+	return k
+}()
 
 // smoke*Response/Envelope mirror controld's client-facing JSON shapes
 // (internal/controld/api.go, auth.go) — this file decodes only the fields
@@ -322,21 +338,37 @@ type smokeSessionsEnvelope struct {
 	NextCursor string         `json:"next_cursor"`
 }
 
+type smokeSecret struct {
+	Name      string `json:"name"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+type smokeSecretsEnvelope struct {
+	Secrets []smokeSecret `json:"secrets"`
+}
+
 // newSmokeGitHub fakes GitHub's GET /user: 200 with {"id":99,"login":"alice"}
-// for the fixed smokeGHToken bearer, 401 otherwise.
+// for the smokeGHToken bearer and {"id":1,"login":"root"} for
+// smokeAdminGHToken (the fixture's admin), 401 for anything else.
 func newSmokeGitHub(t *testing.T) *httptest.Server {
 	t.Helper()
+	users := map[string]map[string]any{
+		"Bearer " + smokeGHToken:      {"id": 99, "login": "alice"},
+		"Bearer " + smokeAdminGHToken: {"id": 1, "login": "root"},
+	}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/user" {
 			http.NotFound(w, r)
 			return
 		}
-		if r.Header.Get("Authorization") != "Bearer "+smokeGHToken {
+		user, ok := users[r.Header.Get("Authorization")]
+		if !ok {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"id": 99, "login": "alice"})
+		json.NewEncoder(w).Encode(user)
 	}))
 	t.Cleanup(ts.Close)
 	return ts
@@ -356,6 +388,8 @@ func newSmokeControld(t *testing.T, gh *httptest.Server) *httptest.Server {
 	ts := httptest.NewUnstartedServer(nil)
 	cfg := controld.Config{
 		RunnerToken:   smokeRunnerToken,
+		SecretsKey:    smokeSecretsKey,
+		Admins:        []string{"root"},
 		Members:       []string{"alice"},
 		GitHubAPIBase: gh.URL,
 		ExternalURL:   "http://" + ts.Listener.Addr().String(),
@@ -629,6 +663,65 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	}
 	if one.Session.State != "running" {
 		t.Fatalf("GET /v1/sessions/%s state = %q, want running", id, one.Session.State)
+	}
+
+	// --- secrets: exactly the three calls cmd/rainier's `secret set|ls|rm`
+	// make. Writes are admin-only, the listing is team-visible, and no
+	// response on any path carries a value ---
+	var adminAuth smokeAuthResponse
+	if err := anon.Do(http.MethodPost, "/v1/auth/github", map[string]string{"access_token": smokeAdminGHToken}, &adminAuth); err != nil {
+		t.Fatalf("POST /v1/auth/github (admin): %v", err)
+	}
+	if adminAuth.User.Login != "root" || adminAuth.User.Role != "admin" {
+		t.Fatalf("admin auth user = %+v, want login=root role=admin", adminAuth.User)
+	}
+	admin := &Client{Base: controldTS.URL, Token: adminAuth.Token}
+
+	const smokeSecretValue = "ghp_smoke_secret_value"
+	if err := admin.Do(http.MethodPut, "/v1/secrets/SMOKE_TOKEN", map[string]string{"value": smokeSecretValue}, nil); err != nil {
+		t.Fatalf("PUT /v1/secrets/SMOKE_TOKEN as admin: %v", err)
+	}
+
+	// The member (alice) may not write one; the error must be the envelope's
+	// forbidden code, surfaced by Client.Do as "forbidden: ...".
+	memberPutErr := c.Do(http.MethodPut, "/v1/secrets/MEMBER_TRY", map[string]string{"value": "nope"}, nil)
+	if memberPutErr == nil {
+		t.Fatal("PUT /v1/secrets as a member: want a forbidden error, got nil")
+	}
+	if !strings.Contains(memberPutErr.Error(), "forbidden") {
+		t.Fatalf("member PUT error = %q, want a forbidden error", memberPutErr)
+	}
+
+	// The listing is decoded twice: once as raw JSON, so this asserts on the
+	// bytes on the wire (no value key, no value), and once as the shape the
+	// CLI renders.
+	var rawSecrets json.RawMessage
+	if err := c.Do(http.MethodGet, "/v1/secrets", nil, &rawSecrets); err != nil {
+		t.Fatalf("GET /v1/secrets as a member: %v", err)
+	}
+	if strings.Contains(string(rawSecrets), "value") || strings.Contains(string(rawSecrets), smokeSecretValue) {
+		t.Fatalf("GET /v1/secrets leaked a value: %s", rawSecrets)
+	}
+	var secrets smokeSecretsEnvelope
+	if err := json.Unmarshal(rawSecrets, &secrets); err != nil {
+		t.Fatalf("decode secrets: %v; body=%s", err, rawSecrets)
+	}
+	if len(secrets.Secrets) != 1 || secrets.Secrets[0].Name != "SMOKE_TOKEN" {
+		t.Fatalf("secrets = %+v, want exactly SMOKE_TOKEN (the member's rejected PUT stored nothing)", secrets.Secrets)
+	}
+	if secrets.Secrets[0].CreatedAt == "" || secrets.Secrets[0].UpdatedAt == "" {
+		t.Fatalf("secret timestamps = %+v, want both populated", secrets.Secrets[0])
+	}
+
+	if err := admin.Do(http.MethodDelete, "/v1/secrets/SMOKE_TOKEN", nil, nil); err != nil {
+		t.Fatalf("DELETE /v1/secrets/SMOKE_TOKEN as admin: %v", err)
+	}
+	var afterRm smokeSecretsEnvelope
+	if err := c.Do(http.MethodGet, "/v1/secrets", nil, &afterRm); err != nil {
+		t.Fatalf("GET /v1/secrets after delete: %v", err)
+	}
+	if len(afterRm.Secrets) != 0 {
+		t.Fatalf("secrets after delete = %+v, want none", afterRm.Secrets)
 	}
 
 	// --- attach: attachio.Run's non-tty path, exactly like cmd/rainier's

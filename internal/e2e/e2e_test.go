@@ -60,6 +60,9 @@ const (
 	// e2eRunnerToken is the fleet-wide bearer every runnerd in these scenes
 	// presents on /v1/runners/connect.
 	e2eRunnerToken = "rnr_e2e_fleet_token"
+	// e2eSecretsKeyHex is the AES-256 key these scenes' controld seals team
+	// secrets under; controld.New requires one (fail closed).
+	e2eSecretsKeyHex = "e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0e2e0"
 
 	// pollInterval is how often every bounded wait re-checks its condition.
 	pollInterval = 20 * time.Millisecond
@@ -70,6 +73,15 @@ const (
 	// scene rather than hanging it.
 	pgAdminTimeout = 30 * time.Second
 )
+
+// e2eSecretsKey is e2eSecretsKeyHex parsed once, for every scene's controld.
+var e2eSecretsKey = func() [32]byte {
+	k, err := controld.ParseSecretsKey(e2eSecretsKeyHex)
+	if err != nil {
+		panic("e2e: bad secrets key: " + err.Error())
+	}
+	return k
+}()
 
 // ---------------------------------------------------------------------------
 // store: memstore by default, pgstore when RAINIER_TEST_PG_DSN is set
@@ -266,6 +278,7 @@ func startControld(t *testing.T, st controld.Store, githubAPI, addr string) *con
 
 	srv, err := controld.New(st, controld.Config{
 		RunnerToken:   e2eRunnerToken,
+		SecretsKey:    e2eSecretsKey,
 		Admins:        []string{e2eLogin},
 		GitHubAPIBase: githubAPI,
 		ExternalURL:   "http://" + actual,

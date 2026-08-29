@@ -22,6 +22,8 @@ func main() {
 	members := flag.String("members", envDefault("RAINIER_MEMBERS", ""), "comma-separated GitHub logins allowed to log in as member")
 	externalURL := flag.String("external-url", envDefault("RAINIER_EXTERNAL_URL", ""),
 		"http(s) base URL clients and runners reach this replica at (required)")
+	secretsKey := flag.String("secrets-key", envDefault("RAINIER_SECRETS_KEY", ""),
+		"64 hex characters (32 bytes) team secrets are encrypted with at rest (required; or set RAINIER_SECRETS_KEY; generate with: openssl rand -hex 32)")
 	githubAPI := flag.String("github-api", envDefault("RAINIER_GITHUB_API", "https://api.github.com"), "GitHub API base URL")
 	flag.Parse()
 
@@ -38,6 +40,16 @@ func main() {
 	if *externalURL == "" {
 		log.Fatal("controld: --external-url is required")
 	}
+	if *secretsKey == "" {
+		log.Fatal("controld: --secrets-key is required (or set RAINIER_SECRETS_KEY; generate one with: openssl rand -hex 32)")
+	}
+	// ParseSecretsKey's errors describe the shape that was wrong and never
+	// echo the key itself — this is a log line, and the key is the one value
+	// in this process that must never reach one.
+	key, err := controld.ParseSecretsKey(*secretsKey)
+	if err != nil {
+		log.Fatalf("controld: %v", err)
+	}
 
 	adminLogins := splitLogins(*admins)
 	memberLogins := splitLogins(*members)
@@ -52,6 +64,7 @@ func main() {
 
 	srv, err := controld.New(st, controld.Config{
 		RunnerToken:   *runnerToken,
+		SecretsKey:    key,
 		Admins:        adminLogins,
 		Members:       memberLogins,
 		GitHubAPIBase: *githubAPI,
@@ -62,6 +75,9 @@ func main() {
 	}
 
 	log.Printf("controld: external url %s", *externalURL)
+	// Says that a key was accepted, never anything derived from it — no
+	// prefix, no length, no fingerprint.
+	log.Printf("controld: secrets: enabled")
 	log.Printf("controld: %d admin(s), %d member(s) allowlisted", len(adminLogins), len(memberLogins))
 	if len(adminLogins) == 0 && len(memberLogins) == 0 {
 		// Fail closed is the right default (no magic first-login promotion),

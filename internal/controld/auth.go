@@ -273,6 +273,24 @@ func (s *Server) requireUser(next func(http.ResponseWriter, *http.Request, User)
 	}
 }
 
+// requireAdmin is requireUser plus the role check every fleet-wide mutation
+// needs: team secrets and environments belong to the whole team, so unlike a
+// session (owner-or-admin, authorizeOwnerOrAdmin) they have no owner to fall
+// back on — only an admin may write them (design §4.5).
+//
+// The order matters and matches requireUser's own contract: an
+// unauthenticated caller is 401 and learns nothing about what the route
+// would have required; an authenticated non-admin is 403 forbidden.
+func (s *Server) requireAdmin(next func(http.ResponseWriter, *http.Request, User)) http.HandlerFunc {
+	return s.requireUser(func(w http.ResponseWriter, r *http.Request, u User) {
+		if u.Role != "admin" {
+			writeErr(w, http.StatusForbidden, "forbidden", "admin role required")
+			return
+		}
+		next(w, r, u)
+	})
+}
+
 // handleMe serves GET /v1/me: the caller's own identity and role.
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, u User) {
 	writeJSON(w, http.StatusOK, meResponse{User: userJSON(u)})
