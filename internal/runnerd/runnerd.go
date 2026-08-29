@@ -521,25 +521,43 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// hubWait bounds how long an attach waits for a session's sessiond to
+// register, and hubPollInterval is how often it re-checks. A container that
+// was just created is legitimately a second or two from dialing in, so both
+// attach fronts wait rather than failing a client that arrived early.
+const (
+	hubWait         = 10 * time.Second
+	hubPollInterval = 100 * time.Millisecond
+)
+
+// waitHub returns the session's hub, waiting up to hubWait for it to appear.
+// Both attach fronts use it: the local HTTP /attach handler and the agent's
+// dial-back for controld's attach plane.
+//
+// It reads the hub through the registry lock (registry.hub) rather than
+// dereferencing a get()-returned pointer's .hub field, which would race
+// register's setHub call on the connection's own goroutine.
+func (s *Server) waitHub(id string) (*relay.Hub, bool) {
+	deadline := time.Now().Add(hubWait)
+	for {
+		if h, ok := s.reg.hub(id); ok {
+			return h, true
+		}
+		if !time.Now().Before(deadline) {
+			return nil, false
+		}
+		time.Sleep(hubPollInterval)
+	}
+}
+
 func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("session")
 	since, _ := strconv.ParseUint(r.URL.Query().Get("since"), 10, 64)
 
 	// Wait briefly for the session to register (container may still be
-	// booting). Reads hub through the registry lock (registry.hub), not by
-	// dereferencing a get()-returned pointer's .hub field directly — the
-	// latter would race against register's setHub call on the connection's
-	// own goroutine.
-	var hub *relay.Hub
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if h, ok := s.reg.hub(id); ok {
-			hub = h
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if hub == nil {
+	// booting).
+	hub, ok := s.waitHub(id)
+	if !ok {
 		http.Error(w, "session not registered", http.StatusServiceUnavailable)
 		return
 	}
