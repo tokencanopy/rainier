@@ -166,7 +166,10 @@ echo "internal network bridge gateway: $BRIDGE_GW; host reachable via: $GW"
 # passed through because a capacity you can set from the outside is what makes
 # the burst/queue behavior (design success criterion 5) reproducible on a real
 # fleet: SLOTS=4 gives you the four-free-slot fleet that criterion describes.
-RUNNERD_ARGS=(--listen 0.0.0.0:8080 --dial-base "ws://$GW:8080"
+# RUNNERD_PORT: parameterized for hosts where 8080 is taken by something
+# unrelated (a dev box running another server). Default unchanged.
+RUNNERD_PORT="${RUNNERD_PORT:-8080}"
+RUNNERD_ARGS=(--listen "0.0.0.0:$RUNNERD_PORT" --dial-base "ws://$GW:$RUNNERD_PORT"
   --image rainier-session:latest --network rainier-internal
   --egress-admin http://127.0.0.1:3129 --proxy-url "http://$GW:3128"
   --slots "${SLOTS:-16}")
@@ -201,7 +204,7 @@ fi
 ./bin/runnerd "${RUNNERD_ARGS[@]}" >/tmp/runnerd.log 2>&1 &
 echo $! > /tmp/rainier-runnerd.pid
 sleep 1
-echo "runnerd on :8080, egressd on :3128. Try:"
+echo "runnerd on :$RUNNERD_PORT, egressd on :3128. Try:"
 echo "  ./bin/runnerctl create            # → {\"session_id\":\"sess-1\"}   (dev tool; local surface)"
 echo "  ./bin/runnerctl ls"
 echo "  ./bin/runnerctl attach sess-1      # live terminal through the relay"
