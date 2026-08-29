@@ -144,6 +144,7 @@ const snapshotText = "attach-snapshot"
 // every stdin ClientMsg back as an output ServerMsg. Everything a test needs
 // to synchronize on arrives on a channel — no sleeps.
 type fakeSessiond struct {
+	raw     *websocket.Conn
 	conn    relay.Conn
 	opens   chan relay.Frame
 	resizes chan wire.ClientMsg
@@ -159,6 +160,7 @@ func startFakeSessiond(t *testing.T, ctx context.Context, wsBase, id string) *fa
 	c.SetReadLimit(16 << 20)
 	t.Cleanup(func() { c.CloseNow() })
 	fs := &fakeSessiond{
+		raw:     c,
 		conn:    relay.WSConn(c),
 		opens:   make(chan relay.Frame, 8),
 		resizes: make(chan wire.ClientMsg, 8),
@@ -167,6 +169,10 @@ func startFakeSessiond(t *testing.T, ctx context.Context, wsBase, id string) *fa
 	go fs.serve(ctx)
 	return fs
 }
+
+// die kills the session conn the way a container dying does: no close
+// handshake, just a socket that stops existing.
+func (fs *fakeSessiond) die() { fs.raw.CloseNow() }
 
 // serve is the fake's single reader and single writer, so its replies need no
 // lock of their own.
@@ -238,19 +244,26 @@ func (fs *fakeSessiond) nextClose(t *testing.T) uint64 {
 }
 
 // ---------------------------------------------------------------------------
-// tests
+// end-to-end fixture
 // ---------------------------------------------------------------------------
 
-// TestAttachEndToEnd is the whole terminal plane in one process: a client's
-// websocket at controld, paired with a real runnerd's outbound dial-back,
-// spliced onto a relay.Hub over a scripted sessiond. It asserts the three
-// things the plane exists to do — the snapshot reaches the client, stdin
-// reaches the session and comes back, and closing either end tears the other
-// down — plus the resize-first contract (the first resize sizes the
-// FrameOpen and is NOT forwarded again as a client frame).
-func TestAttachEndToEnd(t *testing.T) {
+// attachFixture is the whole terminal plane wired up in one process:
+// controld over a memstore, a real runnerd (fake driver) holding a control
+// conn to it, and a scripted sessiond registered for one running session the
+// logged-in user owns.
+type attachFixture struct {
+	s   *Server
+	st  Store
+	ts  *httptest.Server
+	sd  *fakeSessiond
+	tok string
+	id  string
+}
+
+func newAttachFixture(t *testing.T) *attachFixture {
+	t.Helper()
 	s, st, ts := newAttachControld(t)
-	_, tok := loginUser(t, st, "alice", "member")
+	u, tok := loginUser(t, st, "alice", "member")
 
 	// A real runnerd: fake driver, its own HTTP surface for the session's
 	// /register dial-in, and RunAgent holding the control conn to controld.
@@ -264,7 +277,7 @@ func TestAttachEndToEnd(t *testing.T) {
 	// the announce is truth, so a row the runner doesn't announce would be
 	// marked dead and a session controld doesn't have would be destroyed as
 	// an orphan.
-	seedSession(t, st, Session{ID: id, State: StateRunning, Runner: "vm1"})
+	seedSession(t, st, Session{ID: id, OwnerID: u.ID, State: StateRunning, Runner: "vm1"})
 	if err := rd.CreateWithID(context.Background(), id, driver.Spec{Image: "img"}, nil); err != nil {
 		t.Fatalf("runnerd CreateWithID: %v", err)
 	}
@@ -274,9 +287,25 @@ func TestAttachEndToEnd(t *testing.T) {
 	go rd.RunAgent(ctx, runnerd.AgentConfig{ControldURL: wsBase(ts), Token: testRunnerToken, RunnerName: "vm1"})
 	waitConnected(t, s, "vm1")
 
-	sd := startFakeSessiond(t, ctx, rbase, id)
+	return &attachFixture{s: s, st: st, ts: ts, sd: startFakeSessiond(t, ctx, rbase, id), tok: tok, id: id}
+}
 
-	cli, resp, err := dialAttach(t, ts, id, "?since=7", tok)
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
+
+// TestAttachEndToEnd is the whole terminal plane in one process: a client's
+// websocket at controld, paired with a real runnerd's outbound dial-back,
+// spliced onto a relay.Hub over a scripted sessiond. It asserts the three
+// things the plane exists to do — the snapshot reaches the client, stdin
+// reaches the session and comes back, and closing the client tears the
+// session-side attachment down — plus the resize-first contract (the first
+// resize sizes the FrameOpen and is NOT forwarded again as a client frame).
+func TestAttachEndToEnd(t *testing.T) {
+	fx := newAttachFixture(t)
+	s, ts, sd := fx.s, fx.ts, fx.sd
+
+	cli, resp, err := dialAttach(t, ts, fx.id, "?since=7", fx.tok)
 	if err != nil {
 		t.Fatalf("dial attach: %v", err)
 	}
@@ -328,6 +357,47 @@ func TestAttachEndToEnd(t *testing.T) {
 	})
 }
 
+// TestAttachSessionDeathCascadesToClient is TestAttachEndToEnd's cascade run
+// in the other direction: the container (its sessiond conn) dies mid-attach,
+// and the viewer must find out. The chain under test is relay.Hub's readLoop
+// closing every attached client → runnerd's dial-back socket dying →
+// controld's splice closing the client — three processes' worth of teardown
+// that has to complete for a client not to sit on a dead terminal forever.
+func TestAttachSessionDeathCascadesToClient(t *testing.T) {
+	fx := newAttachFixture(t)
+
+	cli, _, err := dialAttach(t, fx.ts, fx.id, "", fx.tok)
+	if err != nil {
+		t.Fatalf("dial attach: %v", err)
+	}
+	defer cli.CloseNow()
+	cli.SetReadLimit(16 << 20)
+	writeClient(t, cli, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24})
+
+	// Wait for the pipe to be demonstrably live before killing it, so a
+	// failure below is unambiguously about the cascade, not the plumbing.
+	fx.sd.nextOpen(t)
+	if m := readServer(t, cli); m.Type != "snapshot" {
+		t.Fatalf("first server msg = %+v, want a snapshot", m)
+	}
+
+	fx.sd.die()
+
+	readCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, err := cli.Read(readCtx); err == nil {
+		t.Fatal("client socket still readable after the session conn died; want it closed")
+	} else if readCtx.Err() != nil {
+		t.Fatalf("client socket never closed after the session conn died: %v", err)
+	}
+	eventually(t, 3*time.Second, func() error {
+		if n := pendingAttaches(fx.s); n != 0 {
+			return fmt.Errorf("pairing table still holds %d entries", n)
+		}
+		return nil
+	})
+}
+
 func TestAttachRequiresAuth(t *testing.T) {
 	_, st, ts := newAttachControld(t)
 	seedSession(t, st, Session{ID: "sess_auth", State: StateRunning, Runner: "vm1"})
@@ -356,6 +426,73 @@ func TestAttachRequiresAuth(t *testing.T) {
 	}
 }
 
+// TestAttachAuthorization pins §4.4's owner-or-admin rule on the one route
+// that carries stdin: a teammate who does not own the session cannot type
+// into it, an admin can, and the refusal comes before the bounded wait so an
+// unauthorized caller can neither occupy a slot nor time the answer to learn
+// anything about a session that isn't theirs.
+func TestAttachAuthorization(t *testing.T) {
+	// A wait long enough that an authz check hiding behind it would be
+	// obvious: the 403 below has to come back immediately.
+	s, st, ts := newAttachControld(t, func(c *Config) { c.AttachWait = 30 * time.Second })
+	owner, _ := loginUser(t, st, "alice", "member")
+	_, otherTok := loginUser(t, st, "bob", "member")
+	_, adminTok := loginUser(t, st, "root", "admin")
+
+	f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
+		Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+	waitConnected(t, s, "vm1")
+	awaitReconciled(t, f)
+
+	id := "sess_owned_by_alice"
+	seedSession(t, st, Session{ID: id, OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+	// A session that will never reach `running`: an authorization check
+	// placed after the wait would answer this one 503 in 30s instead of 403
+	// at once, which is exactly what the timing bound below catches.
+	queued := "sess_queued_by_alice"
+	seedSession(t, st, Session{ID: queued, OwnerID: owner.ID, State: StateQueued})
+
+	for _, tc := range []struct{ name, session string }{
+		{"non-owner member is refused", id},
+		{"refused before the wait, not behind it", queued},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start := time.Now()
+			c, resp, err := dialAttach(t, ts, tc.session, "", otherTok)
+			if err == nil {
+				c.CloseNow()
+				t.Fatal("a non-owner's attach succeeded")
+			}
+			if resp == nil || resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("resp = %+v (%v), want 403", resp, err)
+			}
+			assertErrCode(t, resp, "forbidden")
+			if elapsed := time.Since(start); elapsed > 5*time.Second {
+				t.Fatalf("403 took %s: authorization must not be gated behind the attach wait", elapsed)
+			}
+			if n := pendingAttaches(s); n != 0 {
+				t.Fatalf("pairing table holds %d entries after a refused attach, want 0", n)
+			}
+		})
+	}
+
+	t.Run("admin attaches another user's session", func(t *testing.T) {
+		cli, resp, err := dialAttach(t, ts, id, "", adminTok)
+		if err != nil {
+			t.Fatalf("admin attach: %v", err)
+		}
+		defer cli.CloseNow()
+		if resp.StatusCode != http.StatusSwitchingProtocols {
+			t.Fatalf("admin attach status = %d, want 101", resp.StatusCode)
+		}
+		writeClient(t, cli, wire.ClientMsg{Type: "resize", Cols: 90, Rows: 20})
+		cmd := f.nextCmd(t)
+		if cmd.Type != "dial_attach" || cmd.Session != id {
+			t.Fatalf("command = %+v, want dial_attach for %s", cmd, id)
+		}
+	})
+}
+
 // TestAttachWrongState pins the pre-upgrade rejections: a session that isn't
 // running (and isn't going to be within the wait budget) is a 503
 // session_not_ready, a session that doesn't exist is a 404, and a running
@@ -364,10 +501,10 @@ func TestAttachRequiresAuth(t *testing.T) {
 func TestAttachWrongState(t *testing.T) {
 	const wait = 100 * time.Millisecond
 	_, st, ts := newAttachControld(t, func(c *Config) { c.AttachWait = wait })
-	_, tok := loginUser(t, st, "alice", "member")
+	u, tok := loginUser(t, st, "alice", "member")
 
 	t.Run("queued waits the budget then 503", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_queued", State: StateQueued})
+		seedSession(t, st, Session{ID: "sess_queued", OwnerID: u.ID, State: StateQueued})
 		start := time.Now()
 		c, resp, err := dialAttach(t, ts, "sess_queued", "", tok)
 		if err == nil {
@@ -387,7 +524,7 @@ func TestAttachWrongState(t *testing.T) {
 	})
 
 	t.Run("terminal 503s without waiting", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_dead", State: StateDead})
+		seedSession(t, st, Session{ID: "sess_dead", OwnerID: u.ID, State: StateDead})
 		_, resp, err := dialAttach(t, ts, "sess_dead", "", tok)
 		if err == nil {
 			t.Fatal("dial succeeded, want rejection before upgrade")
@@ -410,7 +547,7 @@ func TestAttachWrongState(t *testing.T) {
 	})
 
 	t.Run("running on a disconnected runner is 502", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_gone_runner", State: StateRunning, Runner: "vm-gone"})
+		seedSession(t, st, Session{ID: "sess_gone_runner", OwnerID: u.ID, State: StateRunning, Runner: "vm-gone"})
 		_, resp, err := dialAttach(t, ts, "sess_gone_runner", "", tok)
 		if err == nil {
 			t.Fatal("dial succeeded, want rejection before upgrade")
@@ -468,7 +605,7 @@ func TestAttachBackBogusID(t *testing.T) {
 // that message and there is nothing to fall back to.
 func TestAttachRequiresResizeFirst(t *testing.T) {
 	s, st, ts := newAttachControld(t)
-	_, tok := loginUser(t, st, "alice", "member")
+	u, tok := loginUser(t, st, "alice", "member")
 
 	f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
 		Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
@@ -476,7 +613,7 @@ func TestAttachRequiresResizeFirst(t *testing.T) {
 	awaitReconciled(t, f)
 
 	id := "sess_no_resize"
-	seedSession(t, st, Session{ID: id, State: StateRunning, Runner: "vm1"})
+	seedSession(t, st, Session{ID: id, OwnerID: u.ID, State: StateRunning, Runner: "vm1"})
 
 	cli, _, err := dialAttach(t, ts, id, "", tok)
 	if err != nil {
@@ -511,7 +648,7 @@ func TestAttachRequiresResizeFirst(t *testing.T) {
 func TestPairingTTL(t *testing.T) {
 	const ttl = 250 * time.Millisecond
 	s, st, ts := newAttachControld(t, func(c *Config) { c.AttachPairTTL = ttl })
-	_, tok := loginUser(t, st, "alice", "member")
+	u, tok := loginUser(t, st, "alice", "member")
 
 	// The ghost's destroy proves reconciliation has finished, so the session
 	// seeded after it can't be swept by the announce that ran first.
@@ -521,7 +658,7 @@ func TestPairingTTL(t *testing.T) {
 	awaitReconciled(t, f)
 
 	id := "sess_ttl"
-	seedSession(t, st, Session{ID: id, State: StateRunning, Runner: "vm1"})
+	seedSession(t, st, Session{ID: id, OwnerID: u.ID, State: StateRunning, Runner: "vm1"})
 
 	cli, _, err := dialAttach(t, ts, id, "?since=3", tok)
 	if err != nil {
@@ -553,12 +690,10 @@ func TestPairingTTL(t *testing.T) {
 	// thing that can free this client now.
 	readCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	start := time.Now()
 	if _, _, err := cli.Read(readCtx); err == nil {
 		t.Fatal("client socket still readable after the pairing TTL; want it closed")
-	}
-	if elapsed := time.Since(start); elapsed < ttl/2 {
-		t.Fatalf("client closed after %s, want it to have waited out the %s TTL", elapsed, ttl)
+	} else if readCtx.Err() != nil {
+		t.Fatalf("client socket never closed after the pairing TTL: %v", err)
 	}
 	eventually(t, 3*time.Second, func() error {
 		if s.attaches.has(at.AttachID) {

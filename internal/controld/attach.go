@@ -68,10 +68,21 @@ type attachTable struct {
 
 func newAttachTable() *attachTable { return &attachTable{m: map[string]*pendingAttach{}} }
 
-func (t *attachTable) park(id string, pa *pendingAttach) {
+// park registers pa under id, reporting false if that id is already parked
+// rather than overwriting it. An overwrite would orphan the previous client
+// on a `done` nobody holds any more — it would hang until its own handler's
+// TTL fired, and the TTL would then close a socket the table no longer knows
+// about. Ids are 8 random bytes, so a genuine collision is not a thing that
+// happens; a duplicate means something is wrong and the caller says so
+// loudly rather than papering over it.
+func (t *attachTable) park(id string, pa *pendingAttach) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if _, exists := t.m[id]; exists {
+		return false
+	}
 	t.m[id] = pa
+	return true
 }
 
 // claim removes and returns id's entry. The lookup and the removal are one
@@ -117,16 +128,37 @@ func (t *attachTable) has(id string) bool {
 // once the socket is a websocket, a status code has nowhere to go and the
 // only thing left is a close reason.
 //
-// Sessions are team-visible by design (spec: trust-your-team; §4.4 restricts
-// only mutations to owner-or-admin), and the route table lists attach as
-// bearer-authenticated with no further object check — so no owner check here.
+// Attach carries stdin, so it is a mutation in every sense that matters and
+// takes §4.4's owner-or-admin rule, not the team-wide read rule — and that
+// check runs BEFORE the bounded wait: a caller who may not touch this
+// session learns so at once instead of after holding a request open for ten
+// seconds (an unauthorized caller must never get to occupy a slot, nor to
+// probe another team member's session state by timing the answer).
 func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u User) {
 	id := r.PathValue("id")
 	// A malformed since is read as 0, exactly like runnerd's own /attach: it
 	// costs a full replay, never an error the client can do anything about.
 	since, _ := strconv.ParseUint(r.URL.Query().Get("since"), 10, 64)
 
-	row, err := s.waitRunning(r.Context(), id)
+	row, err := s.st.GetSession(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "session not found")
+			return
+		}
+		log.Printf("controld: attach %s: %v", id, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not attach to session")
+		return
+	}
+	if !authorizeOwnerOrAdmin(u, row) {
+		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to attach to this session")
+		return
+	}
+
+	// Re-read through the bounded wait: authorization is settled above, and
+	// what this needs now is the state (and placement) as of the moment the
+	// session actually becomes attachable.
+	row, err = s.waitRunning(r.Context(), id)
 	switch {
 	case errors.Is(err, ErrNotFound):
 		writeErr(w, http.StatusNotFound, "not_found", "session not found")
@@ -167,7 +199,12 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 	pa := &pendingAttach{client: relay.WSConn(c), done: make(chan struct{})}
 	// Park before sending: the runner can dial back the instant it reads the
 	// command, and an entry that isn't there yet would be refused.
-	s.attaches.park(attachID, pa)
+	if !s.attaches.park(attachID, pa) {
+		log.Printf("controld: attach %s: attach id %s is already parked; refusing rather than "+
+			"overwriting another client's pairing", id, attachID)
+		closeAttach(c, websocket.StatusInternalError, "attach id collision")
+		return
+	}
 
 	dial := rwire.ToRunner{Type: "dial_attach", Session: id, Attach: &rwire.Attach{
 		AttachID:  attachID,
@@ -313,8 +350,10 @@ func (s *Server) handleAttachBack(w http.ResponseWriter, r *http.Request) {
 	pa, ok := s.attaches.claim(attachID)
 	if !ok {
 		// The TTL fired between the check above and here: the client socket
-		// is already closed and gone.
-		closeAttach(c, websocket.StatusPolicyViolation, "unknown attach id")
+		// is already closed and gone. Not a protocol violation on the
+		// runner's part — it did exactly what it was told, just too late —
+		// so it gets "try again later", the same code the expired client got.
+		closeAttach(c, websocket.StatusTryAgainLater, "attach pairing expired")
 		return
 	}
 	// Release the client handler once the splice is over, whatever ends it.
