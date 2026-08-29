@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -67,14 +68,26 @@ func (d *Docker) Create(ctx context.Context, spec Spec) (Handle, error) {
 		args = append(args, "-e", "RAINIER_SESSION="+spec.SessionID)
 	}
 	if spec.ProxyURL != "" {
+		// Embed the session id as the proxy URL's userinfo so egressd's
+		// allowlist lookup has an identity to check at all (egress R4, Task
+		// 13). A plain HTTP_PROXY/HTTPS_PROXY env var is the only channel a
+		// non-agent-aware tool (curl, wget) reads, and it has no way to set
+		// an arbitrary header from an env var — URL userinfo
+		// (http://<session-id>:@host:port) is the one thing curl-family
+		// tools do send automatically, as `Proxy-Authorization: Basic
+		// base64(session-id:)` on every CONNECT. See
+		// internal/egress.sessionFromProxyAuth, which decodes this form
+		// (alongside a literal Bearer header, for any client that can set
+		// one directly).
+		proxyURL := withSessionUserinfo(spec.ProxyURL, spec.SessionID)
 		// Inject both cases of each var: tools disagree on which they read —
 		// BusyBox wget and curl read lowercase, many Go/Node tools read
 		// uppercase — so set both rather than guess what's inside the image.
 		args = append(args,
-			"-e", "HTTP_PROXY="+spec.ProxyURL,
-			"-e", "http_proxy="+spec.ProxyURL,
-			"-e", "HTTPS_PROXY="+spec.ProxyURL,
-			"-e", "https_proxy="+spec.ProxyURL,
+			"-e", "HTTP_PROXY="+proxyURL,
+			"-e", "http_proxy="+proxyURL,
+			"-e", "HTTPS_PROXY="+proxyURL,
+			"-e", "https_proxy="+proxyURL,
 			"-e", "NO_PROXY=localhost,127.0.0.1,host.docker.internal",
 			"-e", "no_proxy=localhost,127.0.0.1,host.docker.internal",
 		)
@@ -91,6 +104,28 @@ func (d *Docker) Create(ctx context.Context, spec Spec) (Handle, error) {
 		return Handle{}, err
 	}
 	return Handle{ID: id, State: StateRunning}, nil
+}
+
+// withSessionUserinfo embeds sessionID as base's URL userinfo
+// (http://<session-id>:@host:port), so curl-family tools reading it from a
+// plain HTTP_PROXY/HTTPS_PROXY env var send it automatically as HTTP Basic
+// auth on the CONNECT request — the only channel such tools have for
+// carrying identity at all. Falls back to base unchanged if sessionID is
+// empty or base fails to parse, rather than panicking or emitting a mangled
+// URL to `docker run -e`: an unmodified base URL with no userinfo still
+// egresses through the proxy, it just won't carry an identity egressd's
+// allowlist can match — a safe (default-deny) direction to fail in, not a
+// silent bypass.
+func withSessionUserinfo(base, sessionID string) string {
+	if sessionID == "" {
+		return base
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return base
+	}
+	u.User = url.UserPassword(sessionID, "")
+	return u.String()
 }
 
 func (d *Docker) Destroy(ctx context.Context, id string) error {

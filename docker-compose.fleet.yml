@@ -1,7 +1,43 @@
 # docker-compose.fleet.yml — v0 fleet: an internal network for sessions.
 # runnerd and egressd run on the HOST (see scripts/fleet-up.sh), driving the
 # docker CLI and bound to this network's gateway. This avoids docker-in-docker.
+#
+# R4 egress enforcement (canonical shape): internal: true — sessions have NO
+# direct route to the internet; egressd's CONNECT proxy (allowlist pushed
+# per-session by runnerd) is the only way out. Verified end-to-end by
+# scripts/egress-check.sh, wired by scripts/fleet-up.sh.
+#
+# Platform-split posture (Task 13 spike, 2026-08-28 — see
+# docs/superpowers/specs/2026-08-28-plan3-controld-design.md §3 Amendment):
+# this internal:true shape holds on native Linux dockerd (the GCE production
+# target) — a container on an --internal network still has a local-link
+# route to the bridge gateway, which on Linux dockerd IS the host itself, so
+# runnerd's register listener and egressd both stay reachable.
+#
+# It does NOT hold on VM-backed docker (Docker Desktop, colima, OrbStack —
+# the common macOS dev setup): dockerd runs inside a VM there, so the real
+# host is only reachable via host.docker.internal's off-subnet NAT address,
+# and `internal:true` removes the default route that requires — confirmed
+# against the container's own routing table (only a local-link route to its
+# own subnet, no default route at all) and a raw-IP connection attempt to
+# host.docker.internal's address ("Network unreachable", vs "Connection
+# refused" for the always-local bridge gateway). This breaks sessiond's
+# register/attach dial-back too, not just egress, since both ride the same
+# single network attachment.
+#
+# So on VM-backed docker, fleet-up.sh auto-detects this (it proves
+# reachability directly — a real host listener probed from a throwaway
+# --internal network — rather than guessing from the docker context name)
+# and creates the real network WITHOUT --internal instead, printing a loud
+# warning that egress enforcement is OFF. scripts/egress-check.sh detects the
+# same condition and exits 3 (SKIPPED, distinct from pass/fail) rather than
+# asserting enforcement that cannot hold on this platform. The GCE deploy
+# doc's acceptance run is what proves enforcement for real (Linux dockerd).
+#
+# Dual-homed egressd / containerized runnerd (dev/prod parity on VM-backed
+# docker too) is a validated-but-unbuilt option, explicitly ledgered for v1
+# — out of scope here.
 networks:
   rainier-internal:
     name: rainier-internal
-    internal: false   # v0: egress enforcement NOT active — sessions have direct egress until the network is internal AND proxy env is injected (R4, Plan 3+). egressd is exercised only by its unit tests today.
+    internal: true

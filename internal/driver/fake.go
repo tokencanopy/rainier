@@ -24,9 +24,21 @@ type Fake struct {
 	seq     int
 	snapSeq int // per-call uniqueness for Snapshot refs — mirrors Docker's snapSeq
 	items   map[string]*fakeItem
+	// lastSpec is the most recent Spec passed to Create, verbatim — for
+	// tests asserting fields (e.g. ProxyURL) that fakeItem doesn't track
+	// per-container, since Fake otherwise only models the lifecycle states
+	// the contract suite exercises, not every Spec field.
+	lastSpec Spec
 }
 
 func NewFake(total int) *Fake { return &Fake{total: total, items: map[string]*fakeItem{}} }
+
+// LastSpec returns the Spec passed to the most recent Create call.
+func (f *Fake) LastSpec() Spec {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastSpec
+}
 
 // usedLocked counts slot-occupying items — running or warm-suspended — the
 // same semantic Capacity reports. Callers must hold f.mu.
@@ -47,6 +59,7 @@ func (f *Fake) Create(_ context.Context, spec Spec) (Handle, error) {
 	if used >= f.total {
 		return Handle{}, fmt.Errorf("no capacity: %d/%d", used, f.total)
 	}
+	f.lastSpec = spec
 	f.seq++
 	id := fmt.Sprintf("fake-%d", f.seq)
 	f.items[id] = &fakeItem{sessionID: spec.SessionID, state: StateRunning}
