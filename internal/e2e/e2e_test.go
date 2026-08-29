@@ -24,6 +24,7 @@ package e2e
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -937,9 +938,15 @@ func TestControldRestartMidSession(t *testing.T) {
 
 	f.cd.stop()
 
-	// The attach dies with controld — accepted downtime, not a silent hang.
+	// The attach dies with controld — accepted downtime, but an actual
+	// teardown, not a socket that quietly stops answering. Our own read
+	// deadline expiring would be the latter, so it is called out separately:
+	// a client left holding a half-open terminal has no way to know it should
+	// re-attach.
 	if _, err := live.readErr(15 * time.Second); err == nil {
 		t.Fatal("the attach outlived controld; it should have been torn down with it")
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("the attach socket went quiet instead of being closed when controld died")
 	}
 	live.close()
 
