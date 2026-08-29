@@ -386,7 +386,7 @@ ticking the box.
 | 1 | `rainier login && rainier new && rainier attach` works from Josh's laptop against a GCE e2-medium over Tailscale, from a cold VM in under an hour of ops. | Steps 1–6 above, timed from `gce-up.sh` to a live shell. | ☑ | 2026-08-29: cold VM → live shell ≈25 min including Tailscale install on the laptop; session running+reachable 3s after `new`; 167ms RTT. |
 | 2 | Kill controld mid-attach; restart it; `rainier attach` reconnects to the same session with full scrollback. The agent process never noticed. | Attach, type something, `kill $(pgrep controld)` on the VM, restart it with the step-4 command, `rainier attach <id>` again. | ☑ | 2026-08-29: mid-kill viewer disconnected at seq 19 (accepted); runner auto-reconnected; `--since 0` replay carried the pre-kill scrollback; state `running`, same runner, empty error. |
 | 3 | Kill runnerd on a VM with live sessions; restart it; sessions re-register and are attachable. No container is destroyed. | `docker ps` before, `pkill -x runnerd` (NOT `fleet-down.sh` — that is the teardown and removes session containers by design), re-run step 5, `docker ps` after, then attach. | ☑ | 2026-08-29: container id identical before/after; re-announce `used 1/16, 1 announced sessions`; sessiond re-registered; attach echoed live. |
-| 4 | A session survives the laptop sleeping overnight; reattach next morning shows the live TUI. | Attach, start something long-running, close the laptop. Reattach in the morning. **Spans a day — start it the evening before and note the start time.** | ◐ | Started 2026-08-29 07:10Z: minute-ticker loop live in `gce-1`; verify next morning. |
+| 4 | A session survives the laptop sleeping overnight; reattach next morning shows the live TUI. | Attach, start something long-running, close the laptop. Reattach in the morning. **Spans a day — start it the evening before and note the start time.** | ☑ | 2026-08-29 19:05Z, 12h after start: container never restarted (StartedAt 07:05:36Z), PID-1 sessiond and the original shell both at 12h00 elapsed, event log contiguous seq 1→756 spanning the whole day, live ticks on attach. Survived 3 runnerd restarts and a full-stack Plan 4 redeploy along the way. Finding: the CLI's `--since 0` full replay does not reach the viewer (server log intact; client forwarding bug, follow-up). |
 | 5 | Burst 10 creates against a fleet with 4 free slots: 4 run, 6 sit visibly `queued`, and the queue drains as capacity frees — no failed creates, no lost sessions. | Covered by `go test ./internal/e2e/ -run TestBurstQueuesAndDrains` (two 2-slot runners, real HTTP, real websockets). To re-run it here: `./scripts/fleet-down.sh`, bring the fleet back with `SLOTS=4` added to the step-5 environment, then `for i in $(seq 10); do rainier new --detach --name burst-$i; done` and watch `rainier ls`. | ☑ | Automated: green under `-race -count=5` (memstore and pgstore). |
 | 6 | A fresh VM running runnerd with the join token appears in the fleet and receives placements with zero controld config changes or restarts. | Provision a second VM (step 1), build (step 2), run step 5 with `RUNNER_NAME=rainier-2`. Watch `rainier ls` place new sessions on it. | ☑ | 2026-08-29: throwaway e2-small joined over the VPC (`/etc/hosts` alias to rainier-1's internal IP keeps the dial-back origin check exact) with zero controld changes; placement landed on it once rainier-1 was capped full; cross-VM attach round-tripped; VM deleted after. Surfaced the first-ssh key-propagation race, now retried in `gce-up.sh`. |
 | 7 | Egress R4 closed: a session reaches an allowlisted host through egressd and cannot reach anything else (verified by an acceptance script). | `./scripts/egress-check.sh` on the VM. On Linux dockerd it must exit **0** — exit 3 (SKIPPED) means the network came up non-internal and something is wrong with the platform probe. | ☑ | 2026-08-29: exit 0 — direct egress blocked, allowlisted allowed, non-allowlisted denied, both audit lines present. First live run of the enforced path; probe said `R4 egress enforcement: ON`. |
@@ -417,6 +417,24 @@ ticking the box.
   allowlisted host and a `deny` for the other, both carrying this session's id.
 
 **Notes / follow-ups from the run:**
+
+- 2026-08-29 (evening) Plan 4 acceptance on rainier-1, redeployed from merged
+  main (PR #9; migrations 0002/0003 applied on controld start; `gce-1`
+  survived the full-stack upgrade):
+  - C1 ✓ `secret set` + `env create acc-env` (+placement rainier-1) +
+    `new --env` → running in **3s** including the streamed setup build.
+  - C2 ✓ snapshot content-addressed (`rainier-env:<id>-a8c79ba91acd`),
+    cached; second create → running in **2s**, zero setup output in its full
+    history, toolchain (`acc-tool`) present from the cached image.
+  - C3 ✓ `/workspace` marker survived warm suspend AND cold park + resume.
+  - C4 ✓ secret injected (len 21 read in-session); raw `/v1/secrets` listing
+    carries names+timestamps only — no value anywhere.
+  - C5 ✓ env pinned to a nonexistent runner → `queued (waiting for runner
+    ghost-runner)` visible in ls and `queue_reason` in the API.
+  - C6 ✓ env setup edited while acc-2 ran → its `image` stayed the original
+    cached ref (resolved_image pinned at create).
+  - C7 ✓ `egress-check.sh` exit 0 on the Linux fleet post-Plan-4 driver
+    changes (allow+deny audit lines present).
 
 - 2026-08-29 acceptance run (criteria 1,2,3,7 passed; 5 automated; 4 in
   progress; 6 pending a second VM):
