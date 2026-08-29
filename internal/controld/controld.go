@@ -104,6 +104,8 @@ func New(st Store, cfg Config) (*Server, error) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/runners/connect", s.handleRunnerConnect)
+	mux.HandleFunc("POST /v1/auth/github", s.handleGitHubAuth)
+	mux.HandleFunc("GET /v1/me", s.requireUser(s.handleMe))
 	return mux
 }
 
