@@ -36,9 +36,10 @@ func NewHub(ctx context.Context, sessionConn Conn) *Hub {
 }
 
 // NewHubWithControl is NewHub plus a handler for the session's control
-// events — the FrameControls that belong to the session itself (setup
-// outcomes today) rather than to any attachment, which is why they carry no
-// meaningful AttachID and bypass the client demux in readLoop.
+// events — the FrameControls that belong to the session itself (a setup
+// outcome, a session-RPC request the sandbox originated, the response to one
+// this hub sent with SendControl) rather than to any attachment, which is why
+// they carry no meaningful AttachID and bypass the client demux in readLoop.
 //
 // The handler is wired here, in the constructor, rather than assigned to a
 // field afterwards, and that is deliberate on two counts. Correctness: the
@@ -99,6 +100,35 @@ func (h *Hub) readLoop() {
 			h.mu.Lock(); delete(h.clients, f.AttachID); h.mu.Unlock()
 		}
 	}
+}
+
+// SendControl writes payload to the session as a FrameControl on AttachID 0:
+// the runnerd → sessiond direction of the control channel, the mirror of
+// ControlSender.Send on the other end. It is what carries a session-RPC
+// request down into a sandbox (a diff, a push) and a response back to one the
+// sandbox originated. Like Send, it returns the conn's write error rather
+// than dropping the frame silently — a caller with a pending request needs to
+// know its request never left, or it waits for a response no one will send.
+//
+// Concurrency: this writes h.conn directly, with no mutex, unlike the
+// sessiond side's connWriter. That is not an oversight — the hub already
+// writes this conn from every concurrent AttachClient goroutine, and this
+// write is sound for the same reason those are: coder/websocket serializes
+// writers itself. Conn.Write takes the conn's message-writer lock before the
+// first byte and holds it until the message is on the wire (v1.8.15,
+// write.go: c.write → msgWriter.reset → mu.lock, released by the deferred
+// unlock), so a second writer waits its turn instead of interleaving its
+// frame's bytes into another's. A mutex here would re-serialize what the
+// transport already serializes, and would not cover the AttachClient writes
+// anyway.
+//
+// It takes h.ctx, so a write on a dead hub fails at once rather than parking
+// on that lock: readLoop cancels that context when the session conn dies, and
+// coder/websocket's lock is context-aware.
+func (h *Hub) SendControl(payload []byte) error {
+	b, err := Encode(Frame{Type: FrameControl, AttachID: 0, Payload: payload})
+	if err != nil { return err }
+	return h.conn.Write(h.ctx, b)
 }
 
 // AttachClient bridges a client conn to a new attachment over the session
