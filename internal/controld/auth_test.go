@@ -3,6 +3,7 @@ package controld
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -26,8 +27,18 @@ func newFakeGitHub(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 
 // fakeGitHubOK serves GET /user -> {"id":42,"login":"alice"} when the
 // bearer is "gho_good", 401 otherwise — the exact fixture the brief
-// mandates.
+// mandates, with the scopes a `repo read:user` login gets back.
 func fakeGitHubOK(t *testing.T) *httptest.Server {
+	t.Helper()
+	return fakeGitHubWithScopes(t, "repo, read:user")
+}
+
+// fakeGitHubWithScopes is fakeGitHubOK with a caller-chosen X-OAuth-Scopes
+// header on the /user response — the same response the exchange reads the
+// user out of, which is exactly where GitHub reports what the token can
+// actually do. Passing "" omits the header entirely, the way a token type
+// that reports no scopes at all would.
+func fakeGitHubWithScopes(t *testing.T, scopes string) *httptest.Server {
 	t.Helper()
 	return newFakeGitHub(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/user" {
@@ -37,6 +48,9 @@ func fakeGitHubOK(t *testing.T) *httptest.Server {
 		if r.Header.Get("Authorization") != "Bearer gho_good" {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
+		}
+		if scopes != "" {
+			w.Header().Set("X-OAuth-Scopes", scopes)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"id": 42, "login": "alice"})
 	})
@@ -418,6 +432,121 @@ func TestGitHubAuthRejectsMalformedUpstreamShape(t *testing.T) {
 			}
 			if e := decodeErrBody(t, raw); e.Error.Code != "internal" {
 				t.Errorf("code = %q, want internal", e.Error.Code)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the exchange stores the credential (Plan 5 vault)
+// ---------------------------------------------------------------------------
+
+// Login no longer discards the GitHub token: it seals it into the vault so a
+// session's git can mint from it later. What lands at rest must be sealed
+// bytes, not the token, and must come back out through the fleet key.
+func TestGitHubAuthStoresCredential(t *testing.T) {
+	gh := fakeGitHubOK(t)
+	s, st, ts := newTestControld(t, func(c *Config) {
+		c.GitHubAPIBase = gh.URL
+		c.Admins = []string{"alice"}
+	})
+
+	resp := postJSON(t, ts, "/v1/auth/github", map[string]any{"access_token": "gho_good"})
+	raw := readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, raw)
+	}
+	if strings.Contains(raw, "gho_good") {
+		t.Fatalf("the login response echoed the GitHub token: %s", raw)
+	}
+
+	var body authResponse
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatalf("decode response: %v; body = %s", err, raw)
+	}
+	u, err := st.UserByToken(context.Background(), HashToken(body.Token))
+	if err != nil {
+		t.Fatalf("UserByToken: %v", err)
+	}
+	c, err := st.GetCredential(context.Background(), u.ID, "github")
+	if err != nil {
+		t.Fatalf("GetCredential after login: %v", err)
+	}
+	if c.Status != CredentialValid {
+		t.Errorf("stored status = %q, want %q", c.Status, CredentialValid)
+	}
+	if c.Scopes != "repo, read:user" {
+		t.Errorf("stored scopes = %q, want the X-OAuth-Scopes header verbatim", c.Scopes)
+	}
+	if strings.Contains(string(c.Ciphertext), "gho_good") {
+		t.Fatal("the stored ciphertext contains the token in the clear")
+	}
+	plain, err := Open(s.cfg.SecretsKey, c.Ciphertext, c.Nonce)
+	if err != nil {
+		t.Fatalf("Open the stored credential: %v", err)
+	}
+	if string(plain) != "gho_good" {
+		t.Errorf("Open round-trip = %q, want the token GitHub accepted", plain)
+	}
+
+	// And the whole point: it is mintable straight away.
+	tok, err := s.mintGitCredential(context.Background(), u.ID)
+	if err != nil {
+		t.Fatalf("mintGitCredential after login: %v", err)
+	}
+	if tok != "gho_good" {
+		t.Errorf("minted token = %q, want the one login stored", tok)
+	}
+}
+
+// The scopes GitHub reports ride back in the response, and a token without
+// `repo` gets a warning — never a failure: the login is legitimate, it just
+// cannot do git yet, and saying so at login beats a mystifying clone failure
+// twenty minutes later.
+func TestGitHubAuthScopeWarning(t *testing.T) {
+	cases := []struct {
+		name        string
+		scopes      string
+		wantScopes  string
+		wantWarning bool
+	}{
+		{"repo present", "repo, read:user", "repo, read:user", false},
+		{"repo only", "repo", "repo", false},
+		{"repo missing", "read:user", "read:user", true},
+		{"public_repo is not repo", "public_repo, read:user", "public_repo, read:user", true},
+		{"no header at all", "", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gh := fakeGitHubWithScopes(t, tc.scopes)
+			_, _, ts := newTestControld(t, func(c *Config) {
+				c.GitHubAPIBase = gh.URL
+				c.Admins = []string{"alice"}
+			})
+
+			resp := postJSON(t, ts, "/v1/auth/github", map[string]any{"access_token": "gho_good"})
+			raw := readBody(t, resp)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, raw)
+			}
+
+			var body authResponse
+			if err := json.Unmarshal([]byte(raw), &body); err != nil {
+				t.Fatalf("decode response: %v; body = %s", err, raw)
+			}
+			if body.Scopes != tc.wantScopes {
+				t.Errorf("scopes = %q, want %q", body.Scopes, tc.wantScopes)
+			}
+			if tc.wantWarning {
+				if body.Warning != githubRepoScopeWarning {
+					t.Errorf("warning = %q, want %q", body.Warning, githubRepoScopeWarning)
+				}
+				assertKeySet(t, raw, "token", "user", "scopes", "warning")
+			} else {
+				if body.Warning != "" {
+					t.Errorf("warning = %q, want none when repo is granted", body.Warning)
+				}
+				assertKeySet(t, raw, "token", "user", "scopes")
 			}
 		})
 	}

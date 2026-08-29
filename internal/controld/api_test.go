@@ -2098,6 +2098,144 @@ func TestDeleteSecret(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// GET /v1/credentials
+// ---------------------------------------------------------------------------
+
+// credentialsListToken is the fake access token every credentials-route test
+// seals, so "the wire does not contain it" is a claim about this exact
+// string.
+const credentialsListToken = "gho_list_route_token"
+
+// TestListCredentials covers the four kinds this house tests every route
+// with — the happy read, authZ, the response-shape pin, and the secrets
+// discipline (here: no token material on the wire, at all, ever).
+func TestListCredentials(t *testing.T) {
+	t.Run("lists the caller's own credential", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		u, tok := loginUser(t, st, "alice", "member")
+		if err := s.storeGitHubCredential(context.Background(), u.ID, credentialsListToken, "repo, read:user"); err != nil {
+			t.Fatalf("storeGitHubCredential: %v", err)
+		}
+
+		resp := doJSON(t, ts, http.MethodGet, "/v1/credentials", tok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, raw)
+		}
+		assertKeySet(t, raw, "credentials")
+
+		var body credentialsEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body = %s", err, raw)
+		}
+		if len(body.Credentials) != 1 {
+			t.Fatalf("credentials = %+v, want exactly one", body.Credentials)
+		}
+		got := body.Credentials[0]
+		if got.Provider != "github" || got.Status != CredentialValid || got.Scopes != "repo, read:user" {
+			t.Errorf("credential = %+v, want github/valid with the stored scopes", got)
+		}
+		if got.ObtainedAt == "" || got.LastVerifiedAt == "" || got.LastUsedAt == "" {
+			t.Errorf("credential timestamps = %+v, want all three populated", got)
+		}
+
+		// Shape pin on the row: a value field must have nowhere to live.
+		var rows struct {
+			Credentials []map[string]json.RawMessage `json:"credentials"`
+		}
+		if err := json.Unmarshal([]byte(raw), &rows); err != nil {
+			t.Fatalf("decode rows: %v; body = %s", err, raw)
+		}
+		rowRaw, err := json.Marshal(rows.Credentials[0])
+		if err != nil {
+			t.Fatalf("re-marshal row: %v", err)
+		}
+		assertKeySet(t, string(rowRaw), "provider", "status", "scopes", "obtained_at", "last_verified_at", "last_used_at")
+	})
+
+	t.Run("no credentials is an empty array, not null", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, tok := loginUser(t, st, "alice", "member")
+
+		resp := doJSON(t, ts, http.MethodGet, "/v1/credentials", tok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, raw)
+		}
+		if !strings.Contains(raw, `"credentials":[]`) {
+			t.Errorf("body = %s, want an empty array (a null breaks every client's range)", raw)
+		}
+	})
+
+	t.Run("a teammate's credentials are invisible", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		alice, aliceTok := loginUser(t, st, "alice", "member")
+		_, bobTok := loginUser(t, st, "bob", "admin")
+		if err := s.storeGitHubCredential(context.Background(), alice.ID, credentialsListToken, "repo"); err != nil {
+			t.Fatalf("storeGitHubCredential: %v", err)
+		}
+
+		// Even an admin sees only their own: a credential is not a team
+		// resource the way a secret or an environment is.
+		for _, tc := range []struct{ name, token string }{{"bob (admin)", bobTok}} {
+			resp := doJSON(t, ts, http.MethodGet, "/v1/credentials", tc.token, nil, nil)
+			raw := readBody(t, resp)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("%s: status = %d, want 200; body = %s", tc.name, resp.StatusCode, raw)
+			}
+			if !strings.Contains(raw, `"credentials":[]`) {
+				t.Errorf("%s saw someone else's credentials: %s", tc.name, raw)
+			}
+		}
+
+		resp := doJSON(t, ts, http.MethodGet, "/v1/credentials", aliceTok, nil, nil)
+		if raw := readBody(t, resp); !strings.Contains(raw, `"provider":"github"`) {
+			t.Errorf("alice's own listing = %s, want her github credential", raw)
+		}
+	})
+
+	t.Run("unauthenticated", func(t *testing.T) {
+		_, _, ts := newTestControld(t)
+		for _, tok := range []string{"", "rnr_" + strings.Repeat("0", 64)} {
+			resp := doJSON(t, ts, http.MethodGet, "/v1/credentials", tok, nil, nil)
+			raw := readBody(t, resp)
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401; body = %s", resp.StatusCode, raw)
+			}
+			if e := decodeErrBody(t, raw); e.Error.Code != "unauthenticated" {
+				t.Errorf("code = %q, want unauthenticated", e.Error.Code)
+			}
+		}
+	})
+
+	t.Run("the wire never carries token material", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		u, tok := loginUser(t, st, "alice", "member")
+		if err := s.storeGitHubCredential(context.Background(), u.ID, credentialsListToken, "repo"); err != nil {
+			t.Fatalf("storeGitHubCredential: %v", err)
+		}
+		// A needs_refresh row is rendered by the same path; check both.
+		if err := st.SetCredentialStatus(context.Background(), u.ID, "github", CredentialNeedsRefresh); err != nil {
+			t.Fatalf("SetCredentialStatus: %v", err)
+		}
+
+		resp := doJSON(t, ts, http.MethodGet, "/v1/credentials", tok, nil, nil)
+		raw := readBody(t, resp)
+		if strings.Contains(raw, credentialsListToken) {
+			t.Fatalf("the listing leaked the token: %s", raw)
+		}
+		for _, forbidden := range []string{"ciphertext", "nonce", "value", "token"} {
+			if strings.Contains(raw, forbidden) {
+				t.Errorf("the listing carries a %q key: %s", forbidden, raw)
+			}
+		}
+		if !strings.Contains(raw, CredentialNeedsRefresh) {
+			t.Errorf("body = %s, want the needs_refresh status surfaced", raw)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // connector vocabulary (unit): validateConnectors
 // ---------------------------------------------------------------------------
 

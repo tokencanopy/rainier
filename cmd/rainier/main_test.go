@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -605,5 +607,163 @@ func TestEnvInitFlagsReachTheWire(t *testing.T) {
 	}
 	if gotBody["init_timeout_sec"] != float64(300) || len(gotBody) != 1 {
 		t.Errorf("patch = %#v, want only init_timeout_sec", gotBody)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// creds / login --refresh (the credential vault's client surface)
+// ---------------------------------------------------------------------------
+
+// captureStdout runs fn with os.Stdout replaced by a pipe and returns what it
+// printed. The CLI's rendering IS its contract for `creds` — the columns, and
+// just as importantly the absence of anything token-shaped — so the test has
+// to read the actual bytes a terminal would.
+func captureStdout(t *testing.T, fn func() error) (string, error) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	saved := os.Stdout
+	os.Stdout = w
+
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+
+	runErr := fn()
+	os.Stdout = saved
+	w.Close()
+	out := <-done
+	r.Close()
+	return out, runErr
+}
+
+// credsServer serves GET /v1/credentials with the given body and records the
+// path it was asked for.
+func credsServer(t *testing.T, body string) (*httptest.Server, *string) {
+	t.Helper()
+	var gotPath string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	return ts, &gotPath
+}
+
+func TestCredsRendersTable(t *testing.T) {
+	const body = `{"credentials":[{"provider":"github","status":"needs_refresh","scopes":"repo, read:user",` +
+		`"obtained_at":"2026-08-01T00:00:00Z","last_verified_at":"2026-08-01T00:00:00Z","last_used_at":"2026-08-02T00:00:00Z"}]}`
+	ts, gotPath := credsServer(t, body)
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_test"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := captureStdout(t, func() error { return runCreds(nil) })
+	if err != nil {
+		t.Fatalf("creds: %v", err)
+	}
+	if *gotPath != "/v1/credentials" {
+		t.Errorf("requested %q, want /v1/credentials", *gotPath)
+	}
+	for _, want := range []string{"PROVIDER", "STATUS", "SCOPES", "LAST_VERIFIED", "LAST_USED", "github", "needs_refresh", "repo, read:user"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("creds output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// An empty vault renders the header and nothing else — a bare table, not an
+// error and not a crash on a nil slice.
+func TestCredsEmpty(t *testing.T) {
+	ts, _ := credsServer(t, `{"credentials":[]}`)
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_test"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := captureStdout(t, func() error { return runCreds(nil) })
+	if err != nil {
+		t.Fatalf("creds: %v", err)
+	}
+	if !strings.Contains(out, "PROVIDER") {
+		t.Errorf("creds output = %q, want the header row", out)
+	}
+	if strings.Contains(out, "github") {
+		t.Errorf("creds output = %q, want no rows", out)
+	}
+}
+
+// `login --refresh github` re-runs an acquisition path and posts it to the
+// same exchange — the server upserts, so there is no second endpoint — and
+// the CLI prints the server's scope warning when one comes back.
+func TestLoginRefreshPostsTheExchangeAndPrintsTheWarning(t *testing.T) {
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody = nil
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, `{"token":"rnr_new","user":{"login":"alice","role":"member"},`+
+			`"scopes":"read:user","warning":"token lacks repo scope; git operations will require rainier login --refresh github"}`); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	defer ts.Close()
+
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("RAINIER_CONFIG", cfgPath)
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_old", OwnerID: "usr_alice"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := captureStdout(t, func() error {
+		return runLogin([]string{"--refresh", "github", "--token", "gho_refreshed"})
+	})
+	if err != nil {
+		t.Fatalf("login --refresh: %v", err)
+	}
+	if gotBody["access_token"] != "gho_refreshed" {
+		t.Errorf("exchange body = %#v, want the refreshed GitHub token", gotBody)
+	}
+	if !strings.Contains(out, "warning: token lacks repo scope") {
+		t.Errorf("login output = %q, want the server's scope warning printed", out)
+	}
+	if strings.Contains(out, "gho_refreshed") {
+		t.Errorf("login output echoed the GitHub token: %q", out)
+	}
+
+	saved, err := cli.Load()
+	if err != nil {
+		t.Fatalf("cli.Load: %v", err)
+	}
+	if saved.Token != "rnr_new" {
+		t.Errorf("saved token = %q, want the refreshed one", saved.Token)
+	}
+	if saved.OwnerID != "usr_alice" {
+		t.Errorf("saved owner id = %q, want the cached one preserved across a refresh", saved.OwnerID)
+	}
+}
+
+// --refresh names a provider, and github is the only one the vault knows in
+// v0: a typo must be refused by name rather than silently refreshing github.
+func TestLoginRefreshRejectsUnknownProvider(t *testing.T) {
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: "http://controld.test", Token: "rnr_old"}); err != nil {
+		t.Fatal(err)
+	}
+	err := runLogin([]string{"--refresh", "gitlab", "--token", "gho_x"})
+	if err == nil || !strings.Contains(err.Error(), "gitlab") {
+		t.Fatalf("login --refresh gitlab err = %v, want a refusal naming the provider", err)
 	}
 }
