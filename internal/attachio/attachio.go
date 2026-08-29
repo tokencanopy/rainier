@@ -18,12 +18,14 @@ package attachio
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 
@@ -41,6 +43,33 @@ const detachKey = 0x1d
 // (see internal/server/server.go): a snapshot replaying a large scrollback
 // is the biggest frame this splice ever carries in either direction.
 const attachReadLimit = 16 << 20
+
+// ErrSessionNotReady is Run's answer, via errors.Is, when the dial's HTTP
+// response carried a 503 — controld's session_not_ready (the session
+// hasn't reached "running" yet, see internal/controld/attach.go's
+// waitRunning). It is never returned directly: it's what a *DialError
+// wrapping a 503 response matches against, so callers write
+// `errors.Is(err, attachio.ErrSessionNotReady)` rather than parsing error
+// text (the old — and fragile — strings.Contains(err.Error(), "503")).
+var ErrSessionNotReady = errors.New("attachio: session not ready")
+
+// DialError wraps a websocket dial failure that received an HTTP response —
+// as opposed to a pure transport failure (DNS, connection refused), which
+// Run returns unwrapped so callers can still match on the underlying
+// net/url error type. Status is that response's status code.
+type DialError struct {
+	Status int
+	err    error
+}
+
+func (e *DialError) Error() string { return e.err.Error() }
+func (e *DialError) Unwrap() error { return e.err }
+
+// Is reports whether target is ErrSessionNotReady and e wraps exactly the
+// 503 controld answers a not-yet-running attach with.
+func (e *DialError) Is(target error) bool {
+	return target == ErrSessionNotReady && e.Status == http.StatusServiceUnavailable
+}
 
 // AttachURL builds the /attach URL from a base (sessiond directly, or
 // runnerd's/controld's relay — same contract either way). session is
@@ -87,14 +116,26 @@ func ScanDetach(buf []byte) int {
 // Run returns nil for all three status lines above (detach, disconnect,
 // session exit — rattach's old os.Exit(0) cases) and a non-nil error for
 // anything that keeps the loop from ever starting (the dial, or putting the
-// terminal in raw mode).
+// terminal in raw mode). A dial failure that received an HTTP response
+// (rather than a pure transport failure) comes back as a *DialError;
+// errors.Is(err, ErrSessionNotReady) matches specifically controld's 503
+// session_not_ready — callers (cmd/rainier's `new`, retrying an attach
+// immediately after create) should match on that sentinel rather than
+// inspecting error text.
 func Run(ctx context.Context, wsURL string, header http.Header, since uint64) error {
 	var opts *websocket.DialOptions
 	if header != nil {
 		opts = &websocket.DialOptions{HTTPHeader: header}
 	}
-	c, _, err := websocket.Dial(ctx, wsURL, opts)
+	c, resp, err := websocket.Dial(ctx, wsURL, opts)
 	if err != nil {
+		if resp != nil {
+			// A response came back but didn't upgrade (a plain HTTP error
+			// status, e.g. controld's 503 session_not_ready before the
+			// handshake) — as opposed to a transport failure, where resp is
+			// nil and err is returned unwrapped below.
+			return &DialError{Status: resp.StatusCode, err: err}
+		}
 		return err
 	}
 	defer c.CloseNow()
@@ -176,7 +217,28 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) er
 	// finish only once restore()+fmt.Printf() have both already run is what
 	// makes "Run has returned" a true happens-after for "this goroutine is
 	// done touching the terminal".
+	//
+	// That earlier fix was still incomplete on its own: it only gated the
+	// three DECISION paths (disconnect/exit/detach), not the reader's
+	// ordinary os.Stdout.Write(m.Data) for plain "snapshot"/"output"
+	// messages. With output still streaming at the instant of detach, the
+	// reader can be mid-write to os.Stdout the moment the stdin goroutine
+	// claims and Run returns — a caller that reassigns os.Stdout right
+	// after Run returns (a test capturing output, e.g.) races that
+	// in-flight write. A bare `if !decided.Load() { write }` check doesn't
+	// close this: decided can flip to true, and the deciding goroutine's
+	// finish() can unblock Run and hand control back to the caller, all
+	// while a write that passed the check a moment earlier is still in
+	// progress. stdoutMu is what actually serializes "touching stdout" —
+	// every write (the reader's ordinary writes AND each decision path's
+	// restore()+fmt.Printf()) holds it, and a decision path only calls
+	// finish() after releasing it, so by the time Run returns, no goroutine
+	// can still be mid-write: any reader write already in flight has
+	// necessarily completed (it holds the mutex the decision path is
+	// waiting on), and any reader write that hasn't started yet will see
+	// decided already true once it acquires the mutex and skip.
 	var decided atomic.Bool
+	var stdoutMu sync.Mutex
 	result := make(chan error, 1)
 	claim := func() bool { return decided.CompareAndSwap(false, true) }
 	finish := func(err error) { result <- err }
@@ -188,23 +250,34 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) er
 				if !claim() {
 					return
 				}
+				stdoutMu.Lock()
 				restore()
 				fmt.Printf("\r\n[disconnected at seq %d; rattach --since %d to resume]\r\n", lastSeq.Load(), lastSeq.Load())
+				stdoutMu.Unlock()
 				finish(nil)
 				return
 			}
 			switch m.Type {
 			case "snapshot", "output":
-				os.Stdout.Write(m.Data)
-				if m.Seq > 0 {
-					lastSeq.Store(m.Seq)
+				stdoutMu.Lock()
+				if !decided.Load() {
+					os.Stdout.Write(m.Data)
+					if m.Seq > 0 {
+						lastSeq.Store(m.Seq)
+					}
 				}
+				// else: a decision already claimed Run's outcome — drop this
+				// (and any later) output rather than risk racing the caller,
+				// who is free to touch os.Stdout the instant Run returns.
+				stdoutMu.Unlock()
 			case "exit":
 				if !claim() {
 					return
 				}
+				stdoutMu.Lock()
 				restore()
 				fmt.Printf("\r\n[session process exited: %d]\r\n", m.ExitCode)
+				stdoutMu.Unlock()
 				finish(nil)
 				return
 			}
@@ -238,8 +311,10 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) er
 			if !claim() {
 				return
 			}
+			stdoutMu.Lock()
 			restore()
 			fmt.Printf("\r\n[detached at seq %d; session still running]\r\n", lastSeq.Load())
+			stdoutMu.Unlock()
 			finish(nil)
 			return
 		}

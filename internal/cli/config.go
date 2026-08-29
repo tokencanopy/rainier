@@ -12,9 +12,17 @@ import (
 
 // Config is what `rainier login` writes and every other command reads: the
 // controld server to talk to, and the bearer token to talk to it with.
+//
+// OwnerID is a best-effort cache of the caller's own owner_id — controld's
+// client-facing API never exposes a user's own id (POST /v1/auth/github and
+// GET /v1/me return only login and role), so `rainier new` is the only
+// place the CLI ever learns it (from its own create response). It's used
+// to break ties when a session name resolves to more than one session; see
+// cmd/rainier's resolveSessionID. Empty until `new` has run at least once.
 type Config struct {
 	ServerURL string `json:"server_url"`
 	Token     string `json:"token"`
+	OwnerID   string `json:"owner_id,omitempty"`
 }
 
 // configPath returns the path Load/Save read and write:

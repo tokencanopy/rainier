@@ -61,6 +61,26 @@ func TestConfigRoundTrip(t *testing.T) {
 	}
 }
 
+// TestConfigOwnerIDRoundTrips pins the field `rainier new` caches the
+// caller's own owner_id into (see cmd/rainier's resolveSessionID) — added
+// alongside review round 1, finding 3's ambiguity handling.
+func TestConfigOwnerIDRoundTrips(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("RAINIER_CONFIG", filepath.Join(dir, "config.json"))
+
+	want := Config{ServerURL: "https://controld.example", Token: "rnr_abc123", OwnerID: "usr_alice"}
+	if err := Save(want); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got != want {
+		t.Fatalf("Load() = %+v, want %+v", got, want)
+	}
+}
+
 func TestSaveCreatesConfigDirMode0700(t *testing.T) {
 	dir := t.TempDir()
 	nested := filepath.Join(dir, "nested", "config.json")
