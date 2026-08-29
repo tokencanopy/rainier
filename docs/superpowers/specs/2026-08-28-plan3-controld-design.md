@@ -86,6 +86,20 @@ store); single-team install (no tenant column).
   internal networks behave (no masquerade/default route; the bridge itself
   remains) — **verified by an early spike task in the plan before anything is
   built on it.**
+
+  **Amendment (spike outcome, 2026-08-28):** holds on native Linux dockerd (the
+  GCE production target — the bridge gateway is on-subnet) and FAILS on
+  VM-backed docker (Docker Desktop/colima: the host is reachable only via
+  off-subnet NAT, which `internal: true` removes — breaking the register dial
+  too). Ruling: **platform-split posture** — `internal: true` is the canonical
+  compose shape, enforced and verified on Linux (CI + the GCE acceptance);
+  VM-backed-docker dev machines get an explicit, auto-detected `internal: false`
+  override — the same posture v0 already had, now loud instead of silent.
+  Dev/prod enforcement parity (dual-homed egressd + containerized runnerd) is
+  ledgered for v1. Secondary findings adopted: the session image carries curl
+  (BusyBox wget ignores `https_proxy`); egressd accepts
+  `Proxy-Authorization: Basic` (URL-userinfo `http://<session-id>:@…`)
+  alongside Bearer — how env-var proxy flows carry session identity.
 - A shared GitHub OAuth app (device flow enabled) will exist with its client ID
   baked into the OSS binary, gh-style. Creating it is Josh's action (§8).
 
