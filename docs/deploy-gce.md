@@ -118,7 +118,7 @@ for this replica.
 ```bash
 export RAINIER_ADMINS="<your-github-login>"      # fail-closed: empty means nobody can log in
 nohup ./bin/controld \
-  --listen 0.0.0.0:9090 \
+  --listen :9090 \
   --db "$RAINIER_DB" \
   --runner-token "$RAINIER_RUNNER_TOKEN" \
   --external-url http://rainier-1:9090 \
@@ -127,9 +127,11 @@ nohup ./bin/controld \
 curl -sf http://rainier-1:9090/healthz && echo   # → ok
 ```
 
-`--listen 0.0.0.0:9090` with no firewall rule opened is deliberate: GCE's
-default ingress denies 9090 from the internet, and the tailnet interface is
-where the traffic actually arrives. Add `--members` for teammates who should
+`--listen :9090` (dual-stack, not `0.0.0.0:9090`) matters: MagicDNS resolves
+`rainier-1` to the tailnet IPv6 address first on the VM itself, and an
+IPv4-only bind fails its own health check. No firewall rule is opened,
+deliberately: GCE's default ingress denies 9090 from the internet, and the
+tailnet interface is where the traffic actually arrives. Add `--members` for teammates who should
 get the non-admin role. Allowlist entries are matched case-insensitively, as
 GitHub logins are — `Alice` in `--admins` admits the account GitHub reports as
 `alice`.
@@ -200,13 +202,13 @@ ticking the box.
 
 | # | Criterion | How to run it | Status | Result |
 |---|---|---|---|---|
-| 1 | `rainier login && rainier new && rainier attach` works from Josh's laptop against a GCE e2-medium over Tailscale, from a cold VM in under an hour of ops. | Steps 1–6 above, timed from `gce-up.sh` to a live shell. | ☐ | _not yet run_ |
-| 2 | Kill controld mid-attach; restart it; `rainier attach` reconnects to the same session with full scrollback. The agent process never noticed. | Attach, type something, `kill $(pgrep controld)` on the VM, restart it with the step-4 command, `rainier attach <id>` again. | ☐ | _not yet run_ |
-| 3 | Kill runnerd on a VM with live sessions; restart it; sessions re-register and are attachable. No container is destroyed. | `docker ps` before, `./scripts/fleet-down.sh`, re-run step 5, `docker ps` after, then attach. | ☐ | _not yet run_ |
-| 4 | A session survives the laptop sleeping overnight; reattach next morning shows the live TUI. | Attach, start something long-running, close the laptop. Reattach in the morning. **Spans a day — start it the evening before and note the start time.** | ☐ | _not yet run_ |
+| 1 | `rainier login && rainier new && rainier attach` works from Josh's laptop against a GCE e2-medium over Tailscale, from a cold VM in under an hour of ops. | Steps 1–6 above, timed from `gce-up.sh` to a live shell. | ☑ | 2026-08-29: cold VM → live shell ≈25 min including Tailscale install on the laptop; session running+reachable 3s after `new`; 167ms RTT. |
+| 2 | Kill controld mid-attach; restart it; `rainier attach` reconnects to the same session with full scrollback. The agent process never noticed. | Attach, type something, `kill $(pgrep controld)` on the VM, restart it with the step-4 command, `rainier attach <id>` again. | ☑ | 2026-08-29: mid-kill viewer disconnected at seq 19 (accepted); runner auto-reconnected; `--since 0` replay carried the pre-kill scrollback; state `running`, same runner, empty error. |
+| 3 | Kill runnerd on a VM with live sessions; restart it; sessions re-register and are attachable. No container is destroyed. | `docker ps` before, `pkill -x runnerd` (NOT `fleet-down.sh` — that is the teardown and removes session containers by design), re-run step 5, `docker ps` after, then attach. | ☑ | 2026-08-29: container id identical before/after; re-announce `used 1/16, 1 announced sessions`; sessiond re-registered; attach echoed live. |
+| 4 | A session survives the laptop sleeping overnight; reattach next morning shows the live TUI. | Attach, start something long-running, close the laptop. Reattach in the morning. **Spans a day — start it the evening before and note the start time.** | ◐ | Started 2026-08-29 07:10Z: minute-ticker loop live in `gce-1`; verify next morning. |
 | 5 | Burst 10 creates against a fleet with 4 free slots: 4 run, 6 sit visibly `queued`, and the queue drains as capacity frees — no failed creates, no lost sessions. | Covered by `go test ./internal/e2e/ -run TestBurstQueuesAndDrains` (two 2-slot runners, real HTTP, real websockets). To re-run it here: `./scripts/fleet-down.sh`, bring the fleet back with `SLOTS=4` added to the step-5 environment, then `for i in $(seq 10); do rainier new --detach --name burst-$i; done` and watch `rainier ls`. | ☑ | Automated: green under `-race -count=5` (memstore and pgstore). |
 | 6 | A fresh VM running runnerd with the join token appears in the fleet and receives placements with zero controld config changes or restarts. | Provision a second VM (step 1), build (step 2), run step 5 with `RUNNER_NAME=rainier-2`. Watch `rainier ls` place new sessions on it. | ☐ | _not yet run_ |
-| 7 | Egress R4 closed: a session reaches an allowlisted host through egressd and cannot reach anything else (verified by an acceptance script). | `./scripts/egress-check.sh` on the VM. On Linux dockerd it must exit **0** — exit 3 (SKIPPED) means the network came up non-internal and something is wrong with the platform probe. | ☐ | _not yet run_ |
+| 7 | Egress R4 closed: a session reaches an allowlisted host through egressd and cannot reach anything else (verified by an acceptance script). | `./scripts/egress-check.sh` on the VM. On Linux dockerd it must exit **0** — exit 3 (SKIPPED) means the network came up non-internal and something is wrong with the platform probe. | ☑ | 2026-08-29: exit 0 — direct egress blocked, allowlisted allowed, non-allowlisted denied, both audit lines present. First live run of the enforced path; probe said `R4 egress enforcement: ON`. |
 
 **Where each criterion can go wrong, so you know what you're looking at:**
 
@@ -235,5 +237,13 @@ ticking the box.
 
 **Notes / follow-ups from the run:**
 
-- _(record anything the run surfaced here — this section is the deliverable
-  of the milestone, not the checkboxes)_
+- 2026-08-29 acceptance run (criteria 1,2,3,7 passed; 5 automated; 4 in
+  progress; 6 pending a second VM):
+  - `--listen 0.0.0.0:9090` failed its own `curl http://rainier-1:9090/healthz`
+    because MagicDNS resolves the VM's own name to tailnet IPv6 first — fixed
+    to dual-stack `:9090` in step 4 above.
+  - Criterion 3's original recipe used `fleet-down.sh`, which removes session
+    containers by design (it is the teardown) — recipe corrected to
+    `pkill -x runnerd`.
+  - Session create→running on the real VM: ~3s. Attach RTT over tailnet:
+    ~167ms from the laptop.
