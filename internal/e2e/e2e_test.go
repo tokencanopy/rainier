@@ -3,7 +3,11 @@
 // set), real runnerd agents dialing it over real websockets with fake
 // drivers, scripted sessionds standing in for containers, and a real HTTP
 // client driving the REST API. Nothing here is mocked except the container
-// runtime (driver.Fake) and GitHub's /user.
+// runtime (driver.Fake), GitHub's /user, and the work a real sandbox would do
+// behind the session RPC — the scripted sessionds speak that protocol for
+// themselves (they mint, they answer a diff, they assemble a push), because
+// what these scenes are qualified to prove is that the request reaches the
+// sandbox intact and the answer reaches the client.
 //
 // The scenes are the design's chaos list (§7.4) and map 1:1 onto its success
 // criteria (§1) — Plan 3's first, then Plan 4's environments:
@@ -18,6 +22,20 @@
 //	TestSecretsReachSpec          P4 criterion 4 (a secret is decrypted into the dispatched Spec)
 //	TestPlacementPinQueuesWithReason P4 criterion 5 (a pin queues visibly, then places)
 //	TestFullReplayReachesTheViewer P5 §4.7's rider (`attach --since 0` replays the whole log)
+//	TestConnectorSessionMintsAndReportsDiff P5 criteria 1, 2, 4, 7 (connector →
+//	                              RepoSpecs + attribution + egress; the mint round
+//	                              trip; the diff a sandbox answers)
+//	TestCredentialLifecycle       P5 criterion 3 (login stores → mint → rejection
+//	                              flips the row → the create gate still passes but
+//	                              the mint refuses by name → refresh restores it)
+//	TestStageFailedClone          P5 §5's revoked-mid-clone edge (a clone stage
+//	                              fails auth-shaped: failed session + flipped row)
+//	TestPushPullRoundTrip         P5 criterion 6 (a directory round-trips
+//	                              laptop↔session through the real CLI functions)
+//
+// P5 criterion 5's other half — `child_exited` reaching `rainier ls` — lives in
+// TestEnvSetupStreamsAndCaches, where the cache-hit session that reports it is
+// already standing; and criterion 8's crash rider is Scene 4b above.
 //
 // Every scene builds its OWN stack from public surfaces only (controld.New/
 // Handler/Run/NewMemStore, runnerd.New/Handler/Recover/RunAgent,
@@ -28,6 +46,7 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -37,11 +56,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -57,6 +78,7 @@ import (
 	"rainier/internal/relay"
 	"rainier/internal/runnerd"
 	"rainier/internal/wire"
+	"rainier/internal/xfer"
 )
 
 const (
@@ -65,6 +87,15 @@ const (
 	// so one identity can drive every session in a scene.
 	e2eGHToken = "gho_e2e_alice"
 	e2eLogin   = "alice"
+	// e2eGitHubID is the numeric account id the fake GitHub reports for
+	// e2eLogin, and e2eNoreplyEmail is the address every commit made inside
+	// these scenes' sessions is attributed to (design §1 criterion 2:
+	// <github id>+<login>@users.noreply.github.com). The address is spelled out
+	// rather than composed from the two constants above, so that a change to
+	// the format has to be made here as well as in controld — which is what a
+	// wire contract assertion is for.
+	e2eGitHubID     = 1001
+	e2eNoreplyEmail = "1001+alice@users.noreply.github.com"
 	// e2eRunnerToken is the fleet-wide bearer every runnerd in these scenes
 	// presents on /v1/runners/connect.
 	e2eRunnerToken = "rnr_e2e_fleet_token"
@@ -252,7 +283,7 @@ func newFakeGitHub(t *testing.T) *httptest.Server {
 		// seals the credential with them (Plan 5 vault); reporting `repo`
 		// keeps the fixture's logins free of the missing-scope warning.
 		w.Header().Set("X-OAuth-Scopes", "repo, read:user")
-		json.NewEncoder(w).Encode(map[string]any{"id": 1001, "login": e2eLogin})
+		json.NewEncoder(w).Encode(map[string]any{"id": e2eGitHubID, "login": e2eLogin})
 	}))
 	t.Cleanup(ts.Close)
 	return ts
@@ -481,13 +512,33 @@ type scriptedSessiond struct {
 	id   string
 	conn relay.Conn
 
+	// rpcSeq is this "sandbox"'s id source for the requests it originates
+	// UPWARD (the credential mint). Per-connection and independent of the ids
+	// controld assigns to the requests it sends DOWN — a response always
+	// travels opposite its request, so neither end ever has to remap one.
+	rpcSeq atomic.Uint64
+
 	// mu guards the scripted event log and the record of what every attach
 	// asked for; serve() runs on its own goroutine, and the scene reads both
-	// from the test's.
+	// from the test's. It also guards the two RPC tables below, which the
+	// same two goroutines touch for the same reason.
 	mu    sync.Mutex
 	log   [][]byte // scripted event log: entry i has sequence number i+1
 	opens []uint64 // the cursor of every FrameOpen served, in order
+	// handlers answers the methods controld drives DOWN into this sandbox
+	// (diff, push_files, pull_files); waiting holds the calls this end sent UP
+	// and has not been answered yet, keyed by the id it chose.
+	handlers map[string]rpcHandler
+	waiting  map[uint64]chan relay.ControlEvent
+	// served records every inbound method, in order — what the sandbox was
+	// actually ASKED, as opposed to what came back out of the API.
+	served []string
 }
+
+// rpcHandler serves one inbound method, in the same shape cmd/sessiond's own
+// RPCHandler has: the request's body in, the response's body out, and an error
+// that becomes an ok:false answer carrying its message.
+type rpcHandler func(payload json.RawMessage) (any, error)
 
 // script gives this sessiond an n-entry event log to replay — output events
 // the way a real session's would already be in its log by the time a viewer
@@ -553,7 +604,12 @@ func dialSessiond(ctx context.Context, wsBase, sessionID string) (*scriptedSessi
 		return nil, false
 	}
 	c.SetReadLimit(wsReadLimit)
-	ss := &scriptedSessiond{id: sessionID, conn: relay.WSConn(c)}
+	ss := &scriptedSessiond{
+		id:       sessionID,
+		conn:     relay.WSConn(c),
+		handlers: map[string]rpcHandler{},
+		waiting:  map[uint64]chan relay.ControlEvent{},
+	}
 	go ss.serve()
 	return ss, true
 }
@@ -582,6 +638,8 @@ func (ss *scriptedSessiond) serve() {
 			if m.Type == "stdin" {
 				ss.send(ctx, f.AttachID, wire.ServerMsg{Type: "output", Seq: 2, Data: m.Data})
 			}
+		case relay.FrameControl:
+			ss.onControl(f.Payload)
 		}
 	}
 }
@@ -610,22 +668,376 @@ func (ss *scriptedSessiond) send(ctx context.Context, attachID uint64, m wire.Se
 // relay.Conn's own Send does the same.
 func (ss *scriptedSessiond) control(t *testing.T, ev relay.ControlEvent) {
 	t.Helper()
-	payload, err := json.Marshal(ev)
-	if err != nil {
-		t.Fatalf("marshaling control event %+v: %v", ev, err)
-	}
-	raw, err := relay.Encode(relay.Frame{Type: relay.FrameControl, Payload: payload})
-	if err != nil {
-		t.Fatalf("encoding control frame for %s: %v", ss.id, err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := ss.conn.Write(ctx, raw); err != nil {
+	if err := ss.writeControl(ev); err != nil {
 		t.Fatalf("session %s: sending %s: %v", ss.id, ev.Kind, err)
 	}
 }
 
+// writeControl puts one control event on the wire. It is `control` without the
+// assertion, because the RPC machinery below answers requests on goroutines of
+// its own and t.Fatalf may only be called from the test's.
+func (ss *scriptedSessiond) writeControl(ev relay.ControlEvent) error {
+	payload, err := json.Marshal(ev)
+	if err != nil {
+		return fmt.Errorf("marshaling control event %+v: %w", ev, err)
+	}
+	raw, err := relay.Encode(relay.Frame{Type: relay.FrameControl, Payload: payload})
+	if err != nil {
+		return fmt.Errorf("encoding control frame for %s: %w", ss.id, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return ss.conn.Write(ctx, raw)
+}
+
 func (ss *scriptedSessiond) close() { ss.conn.Close() }
+
+// ---------------------------------------------------------------------------
+// scripted sessiond: the session RPC, both directions (Plan 5 §4.1)
+// ---------------------------------------------------------------------------
+
+// mintMethod is the method a sandbox's credential helper calls. It is spelled
+// out here rather than imported because the point of asserting it from OUTSIDE
+// all three components is that the wire word is the contract: cmd/sessiond
+// names it, internal/controld answers it, and a rename in either that the other
+// followed would be invisible to a test that borrowed the constant.
+const mintMethod = "mint_git_credential"
+
+// onControl is this sandbox's end of the control channel's RPC shapes — the
+// mirror of cmd/sessiond's rpcDispatcher.OnControl. A response is handed to
+// whoever is waiting on its id; a request runs its handler and answers exactly
+// once. Anything unroutable is dropped, never fatal: the frame crossed a
+// container boundary, and a malformed one must not take the session's whole
+// conn down with it.
+func (ss *scriptedSessiond) onControl(payload []byte) {
+	var ev relay.ControlEvent
+	if err := json.Unmarshal(payload, &ev); err != nil {
+		return
+	}
+	switch {
+	case ev.Kind == "resp":
+		if ev.ID == 0 {
+			return
+		}
+		ss.deliver(ev)
+	case strings.HasPrefix(ev.Kind, "req:"):
+		method := strings.TrimPrefix(ev.Kind, "req:")
+		if method == "" || ev.ID == 0 {
+			return
+		}
+		// On a goroutine of its own, exactly as relay hands a real sessiond its
+		// control frames: a handler that took a moment must not stall the
+		// terminal traffic multiplexed over this same conn, and one that called
+		// back UP would otherwise be waiting on the reader it is running on.
+		go ss.answer(method, ev)
+	}
+}
+
+// answer runs one inbound method and sends its response back.
+func (ss *scriptedSessiond) answer(method string, ev relay.ControlEvent) {
+	ss.mu.Lock()
+	fn := ss.handlers[method]
+	ss.served = append(ss.served, method)
+	ss.mu.Unlock()
+
+	reply := relay.ControlEvent{Kind: "resp", ID: ev.ID}
+	switch {
+	case fn == nil:
+		reply.Payload = rpcErrorPayload(fmt.Sprintf("unknown method %q", method))
+	default:
+		out, err := fn(ev.Payload)
+		if err != nil {
+			reply.Payload = rpcErrorPayload(err.Error())
+			break
+		}
+		body, err := json.Marshal(out)
+		if err != nil {
+			reply.Payload = rpcErrorPayload("the answer could not be encoded")
+			break
+		}
+		reply.OK, reply.Payload = true, body
+	}
+	// A write that fails takes the answer with it, and there is nothing useful
+	// to do here about a conn that has gone: the caller's own bounded wait is
+	// what turns that into a legible failure ("no answer within …"), and this
+	// goroutine is not the test's, so it cannot fail the scene itself.
+	_ = ss.writeControl(reply)
+}
+
+// handle registers fn as this sandbox's answer to method.
+func (ss *scriptedSessiond) handle(method string, fn rpcHandler) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.handlers[method] = fn
+}
+
+// methodsServed returns every method this sandbox was asked for, in order.
+func (ss *scriptedSessiond) methodsServed() []string {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return slices.Clone(ss.served)
+}
+
+func (ss *scriptedSessiond) deliver(ev relay.ControlEvent) {
+	ss.mu.Lock()
+	ch, ok := ss.waiting[ev.ID]
+	ss.mu.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case ch <- ev:
+	default:
+	}
+}
+
+// call is the UPWARD half: this sandbox asks controld for something and waits
+// for the answer. A refusal comes back as an error carrying controld's own
+// sentence verbatim — which for the credential mint is the named action a user
+// has to run, and the whole reason these scenes assert on the text.
+func (ss *scriptedSessiond) call(method string, payload any, timeout time.Duration) (json.RawMessage, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("%s: encoding the request: %w", method, err)
+	}
+	id := ss.rpcSeq.Add(1)
+	ch := make(chan relay.ControlEvent, 1)
+	ss.mu.Lock()
+	ss.waiting[id] = ch
+	ss.mu.Unlock()
+	defer func() {
+		ss.mu.Lock()
+		delete(ss.waiting, id)
+		ss.mu.Unlock()
+	}()
+
+	if err := ss.writeControl(relay.ControlEvent{Kind: "req:" + method, ID: id, Payload: raw}); err != nil {
+		return nil, fmt.Errorf("%s: sending the request: %w", method, err)
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case ev := <-ch:
+		if ev.OK {
+			return ev.Payload, nil
+		}
+		msg := rpcErrorText(ev.Payload)
+		if msg == "" {
+			msg = method + " was refused without a reason"
+		}
+		return nil, errors.New(msg)
+	case <-timer.C:
+		return nil, fmt.Errorf("%s: no answer within %s", method, timeout)
+	}
+}
+
+// mint plays the credential helper's entire exchange: the `{}` body helper.go
+// sends, and the `{"token": …}` answer controld's vault produces. The token is
+// returned as a value and goes nowhere else — the same rule the real path
+// holds, and the reason a scene asserts on it rather than logging it.
+func (ss *scriptedSessiond) mint() (string, error) {
+	raw, err := ss.call(mintMethod, json.RawMessage(`{}`), 30*time.Second)
+	if err != nil {
+		return "", err
+	}
+	var body struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return "", fmt.Errorf("the mint answered a shape the helper cannot read: %w", err)
+	}
+	return body.Token, nil
+}
+
+// rpcErrorPayload and rpcErrorText are the {"error": …} body every refusal
+// carries — the same shape cmd/sessiond writes and internal/controld reads.
+func rpcErrorPayload(msg string) json.RawMessage {
+	b, err := json.Marshal(struct {
+		Error string `json:"error"`
+	}{msg})
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+func rpcErrorText(payload json.RawMessage) string {
+	var body struct {
+		Error string `json:"error"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &body) != nil {
+		return ""
+	}
+	return body.Error
+}
+
+// ---------------------------------------------------------------------------
+// scripted sessiond: the push/pull methods, over a stand-in workspace
+// ---------------------------------------------------------------------------
+
+// sandboxFiles is a scripted sandbox's answer to push_files and pull_files: a
+// staging archive assembled chunk by chunk, extracted whole, and served back by
+// offset — cmd/sessiond's protocol without cmd/sessiond's transfer table.
+//
+// It is a stand-in, not a second implementation of the rules: every archive it
+// writes or reads goes through internal/xfer, the same package the real client
+// and the real sandbox both import, so what this scene proves about a directory
+// arriving intact is a fact about the shared code and the wire, not about a
+// tar written twice.
+type sandboxFiles struct {
+	root  string // stands in for the session's /workspace volume
+	stage string // where staging archives live, deliberately outside root
+
+	mu     sync.Mutex
+	pushes map[string]*sandboxPush
+	pulls  map[string][]byte
+}
+
+type sandboxPush struct {
+	dest string
+	f    *os.File
+	next int
+}
+
+// serveFiles gives ss a workspace and registers the two transfer methods
+// against it, returning the directory a scene can read the arriving files out
+// of. The staging directory is a sibling, never inside the workspace: a
+// half-assembled archive that a later pull could pick up would make a
+// round-trip comparison meaningless.
+func (ss *scriptedSessiond) serveFiles(t *testing.T) *sandboxFiles {
+	t.Helper()
+	base := t.TempDir()
+	sf := &sandboxFiles{
+		root:   filepath.Join(base, "workspace"),
+		stage:  filepath.Join(base, "staging"),
+		pushes: map[string]*sandboxPush{},
+		pulls:  map[string][]byte{},
+	}
+	for _, dir := range []string{sf.root, sf.stage} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("preparing the sandbox's stand-in workspace: %v", err)
+		}
+	}
+	ss.handle(xfer.MethodPushFiles, sf.push)
+	ss.handle(xfer.MethodPullFiles, sf.pull)
+	return sf
+}
+
+// resolve maps a transfer path onto this stand-in workspace and then applies
+// xfer's own containment rule against it.
+//
+// The prefix strip is the ONE thing here a real sandbox does not do:
+// /workspace is a mount point inside a container and a temporary directory on
+// a test machine. Everything after it — the `..` rule, the symlink rule, the
+// absolute-path rule — is xfer.Resolve, unchanged, so a path that would escape
+// still escapes nothing.
+func (sf *sandboxFiles) resolve(p string) (string, error) {
+	rel := p
+	switch {
+	case rel == xfer.WorkspaceRoot:
+		rel = "."
+	case strings.HasPrefix(rel, xfer.WorkspaceRoot+"/"):
+		rel = strings.TrimPrefix(rel, xfer.WorkspaceRoot+"/")
+	}
+	return xfer.Resolve(sf.root, rel)
+}
+
+// push appends one chunk to a transfer's staging archive and, on the last one,
+// extracts the whole thing into the destination the FIRST chunk named.
+func (sf *sandboxFiles) push(payload json.RawMessage) (any, error) {
+	var c xfer.PushChunk
+	if err := json.Unmarshal(payload, &c); err != nil {
+		return nil, fmt.Errorf("reading the push chunk: %w", err)
+	}
+	if c.Xfer == "" {
+		return nil, errors.New("the push chunk names no transfer")
+	}
+	dest, err := sf.resolve(c.Path)
+	if err != nil {
+		return nil, err
+	}
+
+	sf.mu.Lock()
+	defer sf.mu.Unlock()
+	x := sf.pushes[c.Xfer]
+	if x == nil {
+		if c.Seq != 0 {
+			return nil, fmt.Errorf("push chunk %d arrived for a transfer that has not started", c.Seq)
+		}
+		f, err := os.CreateTemp(sf.stage, "push-*.tgz")
+		if err != nil {
+			return nil, fmt.Errorf("staging the push: %w", err)
+		}
+		x = &sandboxPush{dest: dest, f: f}
+		sf.pushes[c.Xfer] = x
+	}
+	if c.Seq != x.next {
+		return nil, fmt.Errorf("push chunk %d arrived out of order; expected %d", c.Seq, x.next)
+	}
+	if _, err := x.f.Write(c.Data); err != nil {
+		return nil, fmt.Errorf("staging the push: %w", err)
+	}
+	x.next++
+	if !c.Done {
+		return xfer.PushAck{Seq: c.Seq}, nil
+	}
+
+	delete(sf.pushes, c.Xfer)
+	name := x.f.Name()
+	defer os.Remove(name)
+	if err := x.f.Close(); err != nil {
+		return nil, fmt.Errorf("staging the push: %w", err)
+	}
+	if err := xfer.UntarGz(name, x.dest, xfer.MaxExtractBytes); err != nil {
+		return nil, fmt.Errorf("unpacking into %s: %w", c.Path, err)
+	}
+	return xfer.PushAck{Seq: c.Seq, Synced: true}, nil
+}
+
+// pull tars the path on chunk 0 and serves slices of that one archive
+// afterwards, so what a client reassembles is a consistent snapshot.
+func (sf *sandboxFiles) pull(payload json.RawMessage) (any, error) {
+	var req xfer.PullRequest
+	if err := json.Unmarshal(payload, &req); err != nil {
+		return nil, fmt.Errorf("reading the pull request: %w", err)
+	}
+	if req.Xfer == "" {
+		return nil, errors.New("the pull request names no transfer")
+	}
+	src, err := sf.resolve(req.Path)
+	if err != nil {
+		return nil, err
+	}
+
+	sf.mu.Lock()
+	defer sf.mu.Unlock()
+	data, ok := sf.pulls[req.Xfer]
+	if !ok {
+		if req.Seq != 0 {
+			return nil, fmt.Errorf("pull chunk %d arrived for a transfer that has not started", req.Seq)
+		}
+		if _, err := os.Stat(src); err != nil {
+			return nil, fmt.Errorf("%s does not exist in this session's workspace", req.Path)
+		}
+		var buf bytes.Buffer
+		if _, err := xfer.TarGz(&buf, src, xfer.MaxBytes); err != nil {
+			return nil, fmt.Errorf("archiving %s: %w", req.Path, err)
+		}
+		data = buf.Bytes()
+		sf.pulls[req.Xfer] = data
+	}
+
+	off := req.Seq * xfer.ChunkBytes
+	if off > len(data) {
+		return nil, fmt.Errorf("pull chunk %d is past the end of the archive", req.Seq)
+	}
+	end := min(off+xfer.ChunkBytes, len(data))
+	done := end >= len(data)
+	if done {
+		delete(sf.pulls, req.Xfer)
+	}
+	return xfer.PullChunk{Seq: req.Seq, Data: data[off:end], Done: done}, nil
+}
 
 // boot starts a scripted sessiond for every placed session that doesn't have
 // one yet — what a real container does a second or two after `docker run`,
@@ -700,6 +1112,10 @@ type apiSession struct {
 	// null while it is still running, which is why it is a pointer: exit 0 is
 	// an answer and must not read as "no answer yet".
 	ChildExitCode *int `json:"child_exit_code"`
+	// EgressAllow is the allowlist the session actually runs with, recorded on
+	// the row at create — which is where a cloning session's github hosts have
+	// to be visible if a human is ever to see why the proxy lets them through.
+	EgressAllow []string `json:"egress_allow"`
 }
 
 type sessionEnvelope struct {
@@ -989,6 +1405,71 @@ func (f *fleet) putSecret(name, value string) {
 	if err := f.client().Do(http.MethodPut, "/v1/secrets/"+name, map[string]string{"value": value}, nil); err != nil {
 		f.t.Fatalf("PUT /v1/secrets/%s: %v", name, err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// credentials and diff (Plan 5)
+// ---------------------------------------------------------------------------
+
+// apiCredential mirrors controld's credentialView: what the vault holds ABOUT
+// a credential. There is deliberately no value field to mirror — the API has
+// none, which is half of what TestCredentialLifecycle checks.
+type apiCredential struct {
+	Provider   string `json:"provider"`
+	Status     string `json:"status"`
+	Scopes     string `json:"scopes"`
+	LastUsedAt string `json:"last_used_at"`
+}
+
+// credentials reads GET /v1/credentials — the caller's own, exactly as
+// `rainier creds` renders it — and also returns the raw body, so a scene can
+// assert on what is NOT in it.
+func (f *fleet) credentials() ([]apiCredential, string) {
+	f.t.Helper()
+	var raw json.RawMessage
+	if err := f.client().Do(http.MethodGet, "/v1/credentials", nil, &raw); err != nil {
+		f.t.Fatalf("GET /v1/credentials: %v", err)
+	}
+	var envelope struct {
+		Credentials []apiCredential `json:"credentials"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		f.t.Fatalf("GET /v1/credentials: decoding %s: %v", raw, err)
+	}
+	return envelope.Credentials, string(raw)
+}
+
+// waitCredential polls `rainier creds` until provider's row reads status. The
+// transitions it waits on happen off the request path — a rejection travels
+// from a container through runnerd to controld — so there is nothing to
+// synchronize on but the row itself.
+func (f *fleet) waitCredential(provider, status string, timeout time.Duration) apiCredential {
+	f.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		rows, _ := f.credentials()
+		for _, c := range rows {
+			if c.Provider == provider && c.Status == status {
+				return c
+			}
+		}
+		if !time.Now().Before(deadline) {
+			f.t.Fatalf("timed out after %s waiting for the %s credential to read %q; credentials: %+v",
+				timeout, provider, status, rows)
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
+// diff reads GET /v1/sessions/{id}/diff — the answer the sandbox gave, as the
+// API renders it.
+func (f *fleet) diff(id string) xfer.DiffAnswer {
+	f.t.Helper()
+	var ans xfer.DiffAnswer
+	if err := f.client().Do(http.MethodGet, "/v1/sessions/"+id+"/diff", nil, &ans); err != nil {
+		f.t.Fatalf("GET /v1/sessions/%s/diff: %v", id, err)
+	}
+	return ans
 }
 
 // ---------------------------------------------------------------------------
@@ -1956,4 +2437,425 @@ func TestPlacementPinQueuesWithReason(t *testing.T) {
 	if held := f.runners["vm-a"].containers(t); len(held) != 0 {
 		t.Fatalf("vm-a holds %v; a pinned session must wait for its runner, never fall back to the fleet", held)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Scene 10 — Plan 5 criteria 1, 2, 4 and 7: a connector becomes a clone, an
+// identity, an allowlist, a minted credential and a diff
+// ---------------------------------------------------------------------------
+
+// TestConnectorSessionMintsAndReportsDiff follows one github connector all the
+// way through the system, because every hop it takes is invisible from the one
+// before it.
+//
+// A connector is stored vocabulary. What makes it a session that can work on
+// code is four separate derivations, made in three processes: controld expands
+// it into RepoSpecs on a session branch, resolves the human's git identity from
+// their user row, and appends the hosts a clone reaches; the sandbox asks for a
+// credential and controld's vault answers it; and the sandbox answers a diff
+// that comes back out of the REST API. Each component's own tests prove its
+// hop. Only from here can the four be seen as one session.
+//
+// TWO repositories, deliberately: criterion 4's "multi-repo clones land as
+// sibling directories" is a property of the expansion that a single repo cannot
+// show, and the second one carries a non-default base branch so that the branch
+// on the wire is demonstrably the connector's and not a constant.
+func TestConnectorSessionMintsAndReportsDiff(t *testing.T) {
+	f := newFleet(t)
+	f.addRunner("vm-a", 2)
+	f.waitRunner("vm-a", true, 30*time.Second)
+
+	env := f.createEnv(map[string]any{
+		"name":         "delivers-code",
+		"image":        "e2e-image",
+		"egress_allow": []string{"registry.example.com"},
+		"connectors": []any{
+			map[string]any{"type": "github", "repo": "acme/app"},
+			map[string]any{"type": "github", "repo": "acme/tools", "base_branch": "trunk"},
+		},
+	})
+
+	created := f.createFrom("clones", env.Name)
+	rows := f.waitSessions(90*time.Second, "the cloning session to come up", func(rows map[string]apiSession) bool {
+		return rows[created.ID].State == "running"
+	})
+
+	// --- what the container was actually told to clone.
+	spec := f.runners["vm-a"].drv.LastSpec()
+	want := []driver.RepoSpec{
+		{Owner: "acme", Name: "app", BaseBranch: "main", SessionBranch: "rainier/clones", Dir: "app"},
+		{Owner: "acme", Name: "tools", BaseBranch: "trunk", SessionBranch: "rainier/clones", Dir: "tools"},
+	}
+	if !slices.Equal(spec.Repos, want) {
+		t.Fatalf("dispatched Spec.Repos = %+v, want %+v — the connector's repo and base branch, the session's own branch, and sibling directories under the workspace",
+			spec.Repos, want)
+	}
+
+	// --- who its commits will be from. Resolved from the owner's user row at
+	// dispatch, never copied onto the session at create.
+	if spec.GitAuthorName != e2eLogin || spec.GitAuthorEmail != e2eNoreplyEmail {
+		t.Fatalf("dispatched git identity = %q <%s>, want %q <%s> — a session's commits attribute to the human who asked for it",
+			spec.GitAuthorName, spec.GitAuthorEmail, e2eLogin, e2eNoreplyEmail)
+	}
+
+	// --- and what its proxy will let through. Asserted on the SESSION VIEW,
+	// not only on the dispatched spec: the row is where a human reads why a
+	// clone is allowed out, and the environment's own host has to survive the
+	// append rather than be replaced by it.
+	gotAllow := rows[created.ID].EgressAllow
+	for _, host := range []string{"registry.example.com", "github.com", "codeload.github.com", "objects.githubusercontent.com"} {
+		if !slices.Contains(gotAllow, host) {
+			t.Fatalf("session egress_allow = %v, want it to carry %q — the connector said \"acme/app\", not three CDN names, so the control plane owes the session the hosts a clone reaches",
+				gotAllow, host)
+		}
+	}
+	if got := len(gotAllow); got != 4 {
+		t.Fatalf("session egress_allow = %v (%d hosts), want exactly the environment's one plus the three git hosts, deduped", gotAllow, got)
+	}
+
+	// --- the mint. This is the credential helper's entire exchange, played
+	// from inside the "container": sessiond → runnerd → controld's vault and
+	// back, with the token appearing nowhere but the answer.
+	ss := f.sessiond(created.ID)
+	token, err := ss.mint()
+	if err != nil {
+		t.Fatalf("minting a github credential from inside the session: %v", err)
+	}
+	if token != e2eGHToken {
+		t.Fatalf("the session was minted a token that is not the one login sealed into the vault")
+	}
+
+	// --- the diff. The sandbox answers it; the REST API renders that answer.
+	stat := " README.md | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n"
+	ss.handle(xfer.MethodDiff, func(payload json.RawMessage) (any, error) {
+		// The method takes no arguments — what to diff is the session's own
+		// repository list, which controld already resolved. A payload here
+		// would mean a caller had been allowed to name a directory.
+		if len(payload) != 0 {
+			return nil, fmt.Errorf("diff carried a payload (%s); it takes no arguments", payload)
+		}
+		return xfer.DiffAnswer{Repos: []xfer.RepoDiff{{
+			Repo: "acme/app", BaseBranch: "main", SessionBranch: "rainier/clones", Stat: stat,
+		}}}, nil
+	})
+
+	ans := f.diff(created.ID)
+	if len(ans.Repos) != 1 {
+		t.Fatalf("GET /diff returned %d repositories, want the one the sandbox answered: %+v", len(ans.Repos), ans)
+	}
+	got := ans.Repos[0]
+	if got.Repo != "acme/app" || got.BaseBranch != "main" || got.SessionBranch != "rainier/clones" || got.Stat != stat {
+		t.Fatalf("GET /diff rendered %+v, want the sandbox's own answer verbatim (stat %q)", got, stat)
+	}
+	if served := ss.methodsServed(); !slices.Equal(served, []string{xfer.MethodDiff}) {
+		t.Fatalf("the sandbox was asked for %v, want exactly one %q", served, xfer.MethodDiff)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scene 11 — Plan 5 criterion 3: a credential's whole life, named at every step
+// ---------------------------------------------------------------------------
+
+// TestCredentialLifecycle is criterion 3 end to end: "A revoked/expired GitHub
+// credential surfaces as a clear, named action within one failed operation."
+//
+// The scene exists for the transition, not the states. A vault that minted a
+// stored token and a vault that refused one would both pass a test of either
+// half alone; what has to be true is that ONE observed rejection, reported by a
+// container over the control channel, moves the row — and that the move is
+// visible in three different places with three different rules:
+//
+//   - `rainier creds` shows needs_refresh immediately;
+//   - the CREATE gate still passes, because a stale credential is refreshable
+//     while the session sits there (design §4.3's any-status rule) and a create
+//     refused here would be a create the user has to make again;
+//   - the next MINT refuses, with controld's sentence reaching the sandbox
+//     verbatim — that sentence is the named action, and it is the only thing
+//     standing between a user and an opaque 403.
+//
+// And then that a refresh — the same token exchange `rainier login --refresh
+// github` performs — undoes it, because a lifecycle with no way back is a
+// dead end rather than a lifecycle.
+func TestCredentialLifecycle(t *testing.T) {
+	f := newFleet(t)
+	f.addRunner("vm-a", 3)
+	f.waitRunner("vm-a", true, 30*time.Second)
+
+	// --- login stored one. newFleet already logged in; this is what that did.
+	rows, raw := f.credentials()
+	if len(rows) != 1 || rows[0].Provider != "github" || rows[0].Status != "valid" {
+		t.Fatalf("credentials after login = %+v, want one valid github row", rows)
+	}
+	if rows[0].Scopes != "repo, read:user" {
+		t.Fatalf("stored scopes = %q, want the scopes GitHub reported for the token", rows[0].Scopes)
+	}
+	if strings.Contains(raw, e2eGHToken) {
+		t.Fatal("the credentials listing carries the token itself; the vault is write-only at every API")
+	}
+
+	env := f.createEnv(map[string]any{
+		"name":       "needs-git",
+		"image":      "e2e-image",
+		"connectors": []any{map[string]any{"type": "github", "repo": "acme/app"}},
+	})
+
+	// --- a session mints, because the credential is valid.
+	first := f.createFrom("mints", env.Name)
+	f.waitSessions(90*time.Second, "the first cloning session to come up", func(rows map[string]apiSession) bool {
+		return rows[first.ID].State == "running"
+	})
+	if token, err := f.sessiond(first.ID).mint(); err != nil || token != e2eGHToken {
+		t.Fatalf("the first mint returned (token ok: %v, err: %v), want the sealed token and no error", token == e2eGHToken, err)
+	}
+	if used := f.waitCredential("github", "valid", 30*time.Second).LastUsedAt; used == "" {
+		t.Fatal("the credential's last_used_at is empty after a mint; `rainier creds` is where a user checks whether their sessions are using it")
+	}
+
+	// --- GitHub says no. The container reports it; nothing else changes.
+	f.sessiond(first.ID).control(t, relay.ControlEvent{Kind: "credential_rejected"})
+	f.waitCredential("github", "needs_refresh", 30*time.Second)
+	if row := f.list()[first.ID]; row.State != "running" {
+		t.Fatalf("the session is %q after its credential was rejected, want running — the git operation failed, the session did not", row.State)
+	}
+
+	// --- the create gate still passes. A stale credential is refreshable
+	// mid-flight, so refusing here would cost a create for nothing.
+	second := f.createFrom("still-creates", env.Name)
+	f.waitSessions(90*time.Second, "a session created against a stale credential to come up", func(rows map[string]apiSession) bool {
+		return rows[second.ID].State == "running"
+	})
+
+	// --- but the mint refuses, in controld's own words, unrewritten.
+	_, err := f.sessiond(second.ID).mint()
+	if err == nil {
+		t.Fatal("the mint handed out a credential GitHub has already rejected")
+	}
+	if err.Error() != controld.ErrCredentialNeedsRefresh.Error() {
+		t.Fatalf("the mint refused with %q, want %q verbatim — this sentence travels out of the credential helper onto a user's terminal, and it is the only thing there that says what to run",
+			err, controld.ErrCredentialNeedsRefresh)
+	}
+
+	// --- the refresh: the same exchange `rainier login --refresh github`
+	// makes. The upsert is a whole-row replace, which is the entire mechanism
+	// by which a needs_refresh row comes back.
+	f.token = f.login()
+	f.waitCredential("github", "valid", 30*time.Second)
+	if token, err := f.sessiond(second.ID).mint(); err != nil || token != e2eGHToken {
+		t.Fatalf("the mint after a refresh returned (token ok: %v, err: %v), want the sealed token and no error", token == e2eGHToken, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scene 12 — Plan 5 §5's revoked-mid-clone edge case
+// ---------------------------------------------------------------------------
+
+// TestStageFailedClone is what a revoked token actually looks like to a user:
+// not a refused mint, but a session that will not come up.
+//
+// The clone stage is the first git operation a session ever performs, and it
+// runs before anyone is watching. When GitHub rejects the minted credential
+// there, sessiond sends TWO control events in one breath — credential_rejected
+// first, then the stage failure — and the order is load-bearing: by the time
+// the user reads why their session failed, `rainier creds` already says
+// needs_refresh, so the diagnosis and the fix are visible together rather than
+// one session apart.
+//
+// This scene plays exactly that pair and follows both halves out: the composed
+// sentence into the session's error column (three components each supply a
+// piece of it), and the flip into the vault.
+func TestStageFailedClone(t *testing.T) {
+	f := newFleet(t)
+	f.addRunner("vm-a", 2)
+	f.waitRunner("vm-a", true, 30*time.Second)
+
+	env := f.createEnv(map[string]any{
+		"name":       "clone-denied",
+		"image":      "e2e-image",
+		"connectors": []any{map[string]any{"type": "github", "repo": "acme/app"}},
+	})
+	created := f.createFrom("clone-fails", env.Name)
+	ss := f.sessiond(created.ID)
+
+	tail := "remote: Invalid username or password.\nfatal: Authentication failed for 'https://github.com/acme/app.git/'"
+	ss.control(t, relay.ControlEvent{Kind: "credential_rejected"})
+	ss.control(t, relay.ControlEvent{Kind: "stage_failed", Stage: "clone", RC: 128, Tail: tail})
+
+	rows := f.waitSessions(90*time.Second, "the session to land failed on its clone stage", func(rows map[string]apiSession) bool {
+		return rows[created.ID].State == "failed"
+	})
+	got := rows[created.ID].Error
+	for _, want := range []string{"clone failed", "rc 128", "Authentication failed"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("failed session's error = %q, want it to carry %q — the stage is controld's word, the rc and the tail are the runner's, and a user whose session never came up has nothing else to go on",
+				got, want)
+		}
+	}
+	if strings.Contains(got, "setup") {
+		t.Fatalf("failed session's error = %q, which blames setup; the clone stage is the one that failed", got)
+	}
+
+	// The credential is already flipped — same failure, same breath.
+	f.waitCredential("github", "needs_refresh", 30*time.Second)
+
+	// And the container is still there to read the rest of the log out of,
+	// exactly as a failed setup is (design §4.3).
+	f.echoes(created.ID, "reading the clone log")
+}
+
+// ---------------------------------------------------------------------------
+// Scene 13 — Plan 5 criterion 6: a directory round-trips laptop↔session
+// ---------------------------------------------------------------------------
+
+// TestPushPullRoundTrip is criterion 6: "`rainier push <dir> <session>:<path>`
+// and `pull` round-trip a directory laptop↔session."
+//
+// It drives cli.Push and cli.Pull — the very functions cmd/rainier's two
+// subcommands are argument parsing in front of — against a real controld, over
+// real websockets, into a scripted sandbox that assembles and serves the
+// archive the way cmd/sessiond does. What that buys over either end's own tests
+// is the whole path in one piece: a chunked upload whose acks are correlated
+// per chunk, a download reassembled from chunks controld counted as they
+// arrived, and the same internal/xfer rules applied by three processes.
+//
+// The tree is deliberately awkward — nested directories, an empty one, a
+// non-ASCII name, a file whose bytes are not text, an executable bit — because
+// "the directory arrived" is a claim about all of that and a flat pair of text
+// files would prove almost none of it.
+func TestPushPullRoundTrip(t *testing.T) {
+	f := newFleet(t)
+	f.addRunner("vm-a", 2)
+	f.waitRunner("vm-a", true, 30*time.Second)
+
+	created := f.create("carries-files")
+	f.waitSessions(60*time.Second, "the session to reach running", func(rows map[string]apiSession) bool {
+		return rows[created.ID].State == "running"
+	})
+	files := f.sessiond(created.ID).serveFiles(t)
+
+	// --- the directory on the "laptop".
+	src := t.TempDir()
+	writeTree(t, src, map[string]string{
+		"README.md":                "# notes\n",
+		"src/main.go":              "package main\n\nfunc main() {}\n",
+		"src/deep/nested/data.txt": strings.Repeat("payload\n", 4096),
+		"docs/ünïcode.md":          "höhe\n",
+	})
+	if err := os.WriteFile(filepath.Join(src, "run.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "src/blob.bin"), []byte{0x00, 0x01, 0xff, 0xfe, 0x00}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(src, "empty"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// --- push it in. The path is spelled the way a user spells it.
+	const remote = xfer.WorkspaceRoot + "/incoming"
+	if err := cli.Push(f.client(), created.ID, src, remote, nil); err != nil {
+		t.Fatalf("rainier push %s %s:%s: %v", src, created.ID, remote, err)
+	}
+	landed := filepath.Join(files.root, "incoming")
+	assertTreesEqual(t, src, landed, "the tree that landed in the session")
+
+	// The executable bit is the one piece of metadata a transfer carries that
+	// a byte comparison cannot see, and losing it turns a pushed script into a
+	// file the session cannot run.
+	fi, err := os.Stat(filepath.Join(landed, "run.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("run.sh landed as mode %v; a pushed script that is not executable is not the file that was pushed", fi.Mode().Perm())
+	}
+
+	// --- and pull the same directory back out.
+	dst := t.TempDir()
+	if err := cli.Pull(f.client(), created.ID, remote, dst, nil); err != nil {
+		t.Fatalf("rainier pull %s:%s %s: %v", created.ID, remote, dst, err)
+	}
+	assertTreesEqual(t, src, dst, "the tree that came back to the laptop")
+
+	// A pull of something that is not there is a refusal from inside the
+	// sandbox, and it reaches the client as the sandbox's own sentence rather
+	// than as a truncated archive.
+	err = cli.Pull(f.client(), created.ID, xfer.WorkspaceRoot+"/nothing-here", t.TempDir(), nil)
+	if err == nil {
+		t.Fatal("pulling a path the session does not have succeeded")
+	}
+	if !strings.Contains(err.Error(), "does not exist in this session's workspace") {
+		t.Fatalf("pulling a missing path failed with %v, want the sandbox's own explanation", err)
+	}
+}
+
+// writeTree writes files (relative path → contents) under root, creating
+// parents.
+func writeTree(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+	for rel, body := range files {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// assertTreesEqual fails unless want and got hold the same relative paths with
+// the same bytes. Directories count: an empty one that did not survive is a
+// directory the user will not find.
+func assertTreesEqual(t *testing.T, want, got, what string) {
+	t.Helper()
+	wantEntries := readTree(t, want)
+	gotEntries := readTree(t, got)
+	for rel, body := range wantEntries {
+		other, ok := gotEntries[rel]
+		if !ok {
+			t.Fatalf("%s is missing %q", what, rel)
+		}
+		if body != other {
+			t.Fatalf("%s has %q with %d bytes, want %d", what, rel, len(other), len(body))
+		}
+	}
+	for rel := range gotEntries {
+		if _, ok := wantEntries[rel]; !ok {
+			t.Fatalf("%s carries %q, which was never sent", what, rel)
+		}
+	}
+}
+
+// readTree reads a directory into relative path → contents, with directories
+// recorded as a marker so their presence is comparable too.
+func readTree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	err := filepath.Walk(root, func(p string, fi os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		if fi.IsDir() {
+			out[rel+"/"] = ""
+			return nil
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		out[rel] = string(b)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("reading %s: %v", root, err)
+	}
+	return out
 }
