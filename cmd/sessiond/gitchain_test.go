@@ -975,23 +975,76 @@ func TestWatchStagesWalksTheChain(t *testing.T) {
 // TestAuthRejected pins the shape of a git failure that means "GitHub said
 // no": it is what makes controld flip the vault row to needs_refresh, so the
 // NEXT operation gets a clear named action instead of another opaque 403.
+//
+// The proxy cases are the regression half. A CONNECT the egress proxy refuses
+// is reported by git with the proxy's status code in it, and reading that as
+// GitHub rejecting the credential flips a perfectly good vault row to
+// needs_refresh and tells the user to run a refresh that cannot help. It
+// happened for real on Plan 5's first live rehearsal; the first proxy case
+// below is that run's failure tail, verbatim.
 func TestAuthRejected(t *testing.T) {
 	cases := []struct {
+		name string
 		tail string
 		want bool
 	}{
-		{"fatal: Authentication failed for 'https://github.com/acme/api.git/'", true},
-		{"remote: Invalid username or password.\nfatal: authentication failed", true},
-		{"The requested URL returned error: 403", true},
-		{"error: The requested URL returned error: 401 Unauthorized", true},
-		{"fatal: repository 'https://github.com/acme/api.git/' not found", false},
-		{"fatal: Remote branch nope not found in upstream origin", false},
-		{"", false},
+		// --- genuine rejections, which must all still flip the vault.
+		{
+			"github's own words for a rejected credential",
+			"fatal: Authentication failed for 'https://github.com/acme/api.git/'", true,
+		},
+		{
+			"the remote's line plus git's",
+			"remote: Invalid username or password.\nfatal: authentication failed", true,
+		},
+		{"a 403 from github itself", "The requested URL returned error: 403", true},
+		{"a 401 from github itself", "error: The requested URL returned error: 401 Unauthorized", true},
+
+		// --- failures that are not about the credential at all.
+		{"a repository that does not exist", "fatal: repository 'https://github.com/acme/api.git/' not found", false},
+		{"a branch that does not exist", "fatal: Remote branch nope not found in upstream origin", false},
+		{"nothing at all", "", false},
+
+		// --- the proxy, which never had the credential in its hands.
+		{
+			// Verbatim from the first live GitHub rehearsal, with a public
+			// repository substituted for the run's own throwaway one. The
+			// egress proxy refused the tunnel; git never reached GitHub, so
+			// nothing here is evidence about the token.
+			"a proxy refusal carrying a 403 is not github saying no",
+			"fatal: unable to access 'https://github.com/git/git.git/': CONNECT tunnel failed, response 403",
+			false,
+		},
+		{
+			"a proxy refusal carrying a 407 is not github saying no either",
+			"fatal: unable to access 'https://github.com/acme/api.git/': CONNECT tunnel failed, response 407",
+			false,
+		},
+		{
+			// libcurl's pre-7.72 wording for the same event. The session image
+			// is not pinned to one libcurl forever, and the older phrasing
+			// carries a status code just as the current one does.
+			"the older libcurl wording for the same refusal",
+			"fatal: unable to access 'https://github.com/acme/api.git/': Received HTTP code 403 from proxy after CONNECT",
+			false,
+		},
+		{
+			// The exclusion is per line, so a multi-repo clone stage where one
+			// repo died at the proxy and another was genuinely rejected still
+			// reports the rejection. Dropping the whole tail on sight of a
+			// proxy line would trade one false positive for a false negative.
+			"a real rejection alongside a proxy refusal still counts",
+			"fatal: unable to access 'https://github.com/acme/api.git/': CONNECT tunnel failed, response 403\n" +
+				"fatal: Authentication failed for 'https://github.com/acme/web.git/'",
+			true,
+		},
 	}
 	for _, c := range cases {
-		if got := authRejected(c.tail); got != c.want {
-			t.Errorf("authRejected(%q) = %v, want %v", c.tail, got, c.want)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			if got := authRejected(c.tail); got != c.want {
+				t.Errorf("authRejected(%q) = %v, want %v", c.tail, got, c.want)
+			}
+		})
 	}
 }
 
