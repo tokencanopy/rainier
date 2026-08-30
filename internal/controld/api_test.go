@@ -1198,6 +1198,26 @@ func TestListSessions(t *testing.T) {
 		}
 	})
 
+	t.Run("name filters exactly", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		owner, tok := loginUser(t, st, "alice", "member")
+		seedSession(t, st, Session{ID: "sess_name_want", OwnerID: owner.ID, State: StateRunning, Name: "box"})
+		seedSession(t, st, Session{ID: "sess_name_other", OwnerID: owner.ID, State: StateRunning, Name: "box-extra"})
+
+		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions?name=box", tok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
+		}
+		var body sessionsEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		if len(body.Sessions) != 1 || body.Sessions[0].ID != "sess_name_want" {
+			t.Fatalf("sessions = %+v, want only exact name box", body.Sessions)
+		}
+	})
+
 	t.Run("invalid cursor is 400 invalid_request", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
@@ -1408,6 +1428,45 @@ func TestDeleteSession(t *testing.T) {
 		}
 	})
 
+	// A failed create is terminal in the database but may still be live on
+	// its runner so the user can attach and inspect the failure. Deleting it
+	// must therefore tear down the runner-side session, not merely reclaim a
+	// workspace from underneath the still-running container.
+	t.Run("a failed session still present on its runner is destroyed", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+
+		owner, tok := loginUser(t, st, "alice", "member")
+		reason := "clone failed"
+		seedSession(t, st, Session{ID: "sess_del_failed", OwnerID: owner.ID, State: StateFailed,
+			Runner: "vm1", Error: reason})
+
+		type result struct{ resp *http.Response }
+		resc := make(chan result, 1)
+		go func() {
+			resc <- result{doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_failed", tok, nil, nil)}
+		}()
+
+		cmd := f.nextCmd(t)
+		if cmd.Type != "destroy" || cmd.Session != "sess_del_failed" {
+			t.Fatalf("got %+v, want destroy of sess_del_failed", cmd)
+		}
+		f.reply(t, cmd, true, "")
+
+		resp := (<-resc).resp
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", resp.StatusCode)
+		}
+		if got := getSession(t, st, "sess_del_failed"); got.State != StateDestroyed || got.Error != reason {
+			t.Fatalf("row = %s / %q, want destroyed with the failed diagnosis preserved", got.State, got.Error)
+		}
+
+		next := f.nextCmd(t)
+		if next.Type != "remove_workspace" || next.Session != "sess_del_failed" {
+			t.Fatalf("after the destroy: got %+v, want remove_workspace of sess_del_failed", next)
+		}
+	})
+
 	// A dead session is where the durability rider's two halves meet. The
 	// crash path deliberately KEPT that session's workspace volume, and its
 	// container is long gone — so nothing on the runner will ever name that
@@ -1469,6 +1528,51 @@ func TestDeleteSession(t *testing.T) {
 		if got.State != StateDestroyed {
 			t.Fatalf("state = %q, want destroyed", got.State)
 		}
+	})
+
+	t.Run("disconnected failed delete retries orphan destroy after reconnect", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		owner, tok := loginUser(t, st, "alice", "member")
+		id := "sess_del_retry"
+		seedSession(t, st, Session{ID: id, OwnerID: owner.ID, State: StateFailed, Runner: "vm1"})
+
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/sessions/"+id, tok, nil, nil)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", resp.StatusCode)
+		}
+		wantState(t, st, id, StateDestroyed)
+
+		// The runner was offline for the DELETE and still has the attachable
+		// failed container. Its reconnect makes that container an orphan. A
+		// transient driver failure must be retried on this same connection;
+		// waiting for another reconnect would leave capacity occupied forever.
+		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Used: 1, Total: 4,
+			Sessions: []rwire.SessionInfo{{ID: id, State: "running"}}})
+		first := f.nextCmd(t)
+		if first.Type != "destroy" || first.Session != id || first.ReqID == 0 {
+			t.Fatalf("first command = %+v, want tracked destroy of %s", first, id)
+		}
+		f.reply(t, first, false, "transient driver failure")
+
+		second := f.nextCmd(t)
+		if second.Type != "destroy" || second.Session != id || second.ReqID == 0 {
+			t.Fatalf("retry command = %+v, want tracked destroy of %s", second, id)
+		}
+		if second.ReqID == first.ReqID {
+			t.Fatalf("retry req_id = %d, want a fresh id", second.ReqID)
+		}
+		f.setCapacity(0, 4)
+		f.reply(t, second, true, "")
+		eventually(t, 3*time.Second, func() error {
+			runners, err := st.ListRunners(context.Background())
+			if err != nil {
+				return err
+			}
+			if len(runners) != 1 || runners[0].CapacityUsed != 0 {
+				return fmt.Errorf("runners = %+v, want released capacity", runners)
+			}
+			return nil
+		})
 	})
 
 	t.Run("placed on a connected runner dispatches destroy", func(t *testing.T) {

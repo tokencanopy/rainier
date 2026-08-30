@@ -195,6 +195,26 @@ func RunContract(t *testing.T, open func(t *testing.T) controld.Store) {
 		}
 	})
 
+	t.Run("list filters by exact name", func(t *testing.T) {
+		st := open(t)
+		u := mkUser(t, st)
+		want := mkSess(t, st, u.ID, "box")
+		mkSess(t, st, u.ID, "box-extra")
+		if err := st.Transition(ctx, want.ID, controld.NonTerminal, controld.StateFailed, controld.TransitionOpts{}); err != nil {
+			t.Fatal(err)
+		}
+
+		rows, _, err := st.ListSessions(ctx, controld.SessionQuery{
+			Name: "box", IncludeTerminal: true, Limit: 10,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || rows[0].ID != want.ID {
+			t.Fatalf("exact-name rows = %+v, want only %s", rows, want.ID)
+		}
+	})
+
 	t.Run("runners upsert and sessions-on-runner filter", func(t *testing.T) {
 		st := open(t)
 		u := mkUser(t, st)

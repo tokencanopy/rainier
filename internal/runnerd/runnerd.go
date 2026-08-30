@@ -397,14 +397,22 @@ func mapOpErr(w http.ResponseWriter, err error, onOK func()) {
 // reject rather than either no-op on an empty handle or block the caller until
 // Create finishes.
 func (s *Server) opHandle(id string) (string, error) {
+	handle, _, err := s.opTarget(id)
+	return handle, err
+}
+
+// opTarget is opHandle's state-carrying form for Delete, which must restore
+// the prior state if driver teardown fails. Keeping the existence/starting
+// guards here prevents the two operation paths from drifting.
+func (s *Server) opTarget(id string) (handle, state string, err error) {
 	handle, state, ok := s.reg.opTarget(id)
 	if !ok {
-		return "", errNoSuchSession
+		return "", "", errNoSuchSession
 	}
 	if state == "starting" {
-		return "", errSessionStarting
+		return "", "", errSessionStarting
 	}
-	return handle, nil
+	return handle, state, nil
 }
 
 // OpSnapshot commits a session's current filesystem as an image and returns
@@ -555,7 +563,7 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 // controld would then mark the session dead instead of destroyed. The marker
 // makes that goroutine stand down (see register's hub-death tail).
 func (s *Server) Delete(ctx context.Context, id string) error {
-	handle, err := s.opHandle(id)
+	handle, previousState, err := s.opTarget(id)
 	if err != nil {
 		return err
 	}
@@ -563,7 +571,14 @@ func (s *Server) Delete(ctx context.Context, id string) error {
 	if h, ok := s.reg.hub(id); ok {
 		h.Close()
 	}
-	s.drv.Destroy(ctx, handle)
+	if err := s.drv.Destroy(ctx, handle); err != nil {
+		// The container may still be alive and consuming capacity. Keep the
+		// entry so Announce/reconciliation and an explicit retry can still
+		// find it. Restore the prior state: sessiond redials after hub.Close,
+		// and a successful redial can then install a fresh hub normally.
+		s.reg.setState(id, previousState)
+		return err
+	}
 	s.reg.remove(id)
 	return nil
 }

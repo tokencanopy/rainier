@@ -242,6 +242,7 @@ func awaitReconciled(t *testing.T, f *fakeRunner) {
 	if cmd.Type != "destroy" || cmd.Session != ghostSession {
 		t.Fatalf("reconcile probe: got %+v, want destroy of %s", cmd, ghostSession)
 	}
+	f.reply(t, cmd, true, "")
 }
 
 // joinRunner starts a fake runner and returns only once it is both connected
@@ -261,6 +262,7 @@ func joinRunner(t *testing.T, s *Server, ts *httptest.Server, sc runnerScript) *
 	if cmd.Type != "destroy" || cmd.Session != probe {
 		t.Fatalf("reconcile probe on %s: got %+v, want destroy of %s", sc.Name, cmd, probe)
 	}
+	f.reply(t, cmd, true, "")
 	return f
 }
 
@@ -604,6 +606,7 @@ func TestReconcileTable(t *testing.T) {
 		if cmd.Type != "destroy" || cmd.Session != id {
 			t.Fatalf("got %+v, want destroy of %s", cmd, id)
 		}
+		f.reply(t, cmd, true, "")
 		if got := getSession(t, st, id); got.State != StateDestroyed {
 			t.Fatalf("state = %q, want destroyed (untouched)", got.State)
 		}
@@ -618,6 +621,7 @@ func TestReconcileTable(t *testing.T) {
 		if cmd.Type != "destroy" || cmd.Session != "sess_ghost" {
 			t.Fatalf("got %+v, want destroy of sess_ghost", cmd)
 		}
+		f.reply(t, cmd, true, "")
 	})
 
 	// A live row the store places on ANOTHER runner: this runner is holding
@@ -634,6 +638,7 @@ func TestReconcileTable(t *testing.T) {
 		if cmd.Type != "destroy" || cmd.Session != id {
 			t.Fatalf("got %+v, want destroy of %s", cmd, id)
 		}
+		f.reply(t, cmd, true, "")
 		got := getSession(t, st, id)
 		if got.State != StateRunning || got.Runner != "vm2" {
 			t.Fatalf("row = %s on %q, want running on vm2 (untouched)", got.State, got.Runner)
@@ -712,6 +717,83 @@ func TestDispatchCorrelatesResults(t *testing.T) {
 			t.Fatalf("dispatch %s never returned", tc.name)
 		}
 	}
+}
+
+func TestDestroyOrphanRetriesAfterLiveQueueSaturation(t *testing.T) {
+	s, err := New(NewMemStore(), Config{
+		RunnerToken: testRunnerToken,
+		ExternalURL: "http://controld.test:9090",
+		SecretsKey:  testSecretsKey,
+		OpTimeout:   time.Second,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rc := newRunnerConn("vm1", nil)
+	s.mu.Lock()
+	s.runners[rc.name] = rc
+	s.mu.Unlock()
+
+	// Hold the writer still with a completely full live queue. The first
+	// dispatch therefore fails in enqueue, not because the connection died.
+	for i := 0; i < runnerSendQueue; i++ {
+		rc.out <- rwire.ToRunner{Type: "prepull", Ref: fmt.Sprintf("image-%d", i)}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	s.destroyOrphan(ctx, rc.name, "sess_queue_retry")
+	eventually(t, time.Second, func() error {
+		if got := rc.seq.Load(); got != 1 {
+			return fmt.Errorf("dispatch attempts = %d, want first saturated attempt", got)
+		}
+		return nil
+	})
+	// seq increments just before enqueue; let that enqueue and its deferred
+	// pending-table cleanup finish while the queue is still provably full.
+	<-time.After(50 * time.Millisecond)
+	rc.mu.Lock()
+	pendingAfterFirst := len(rc.pending)
+	rc.mu.Unlock()
+	if got := len(rc.out); got != runnerSendQueue || pendingAfterFirst != 0 {
+		t.Fatalf("after first attempt: queue=%d pending=%d, want saturated queue and completed failed dispatch",
+			got, pendingAfterFirst)
+	}
+
+	// Free one slot. The bounded retry must use it and produce a tracked
+	// destroy rather than abandoning this orphan until another reconnect.
+	<-rc.out
+	var destroy rwire.ToRunner
+	for i := 0; i < runnerSendQueue; i++ {
+		select {
+		case cmd := <-rc.out:
+			if cmd.Type == "destroy" {
+				destroy = cmd
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("no retried orphan destroy after queue capacity returned")
+		}
+	}
+	if destroy.Session != "sess_queue_retry" || destroy.ReqID == 0 {
+		t.Fatalf("retry command = %+v, want tracked destroy of sess_queue_retry", destroy)
+	}
+	if destroy.ReqID == 1 {
+		t.Fatalf("retry req_id = %d, want a fresh id after the saturated attempt", destroy.ReqID)
+	}
+	if !rc.deliver(rwire.FromRunner{Type: "result", ReqID: destroy.ReqID, OK: true}) {
+		t.Fatal("successful retry had no pending dispatcher")
+	}
+	eventually(t, time.Second, func() error {
+		rc.mu.Lock()
+		pending := len(rc.pending)
+		rc.mu.Unlock()
+		if pending != 0 {
+			return fmt.Errorf("pending dispatches = %d, want none after success", pending)
+		}
+		if got := rc.seq.Load(); got != 2 {
+			return fmt.Errorf("dispatch attempts = %d, want exactly 2", got)
+		}
+		return nil
+	})
 }
 
 func TestDispatchUnreachable(t *testing.T) {

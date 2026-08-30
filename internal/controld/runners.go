@@ -60,9 +60,15 @@ const (
 	// stops reading kills the connection rather than wedging the writer.
 	runnerWriteTimeout = 15 * time.Second
 	// runnerSendQueue is the writer's backlog. Dispatches are bounded by
-	// OpTimeout and orphan destroys are fire-and-forget, so a runner far
-	// enough behind to fill this is one whose commands are already stale.
+	// OpTimeout, so a runner far enough behind to fill this is one whose
+	// commands are already stale.
 	runnerSendQueue = 64
+	// Orphan teardown is prompted by an announce, so a failed attempt would
+	// otherwise wait for another reconnect before it ran again. Three tracked
+	// attempts cover transient driver errors without keeping a dead connection
+	// alive indefinitely; a later reconnect starts a fresh bounded series.
+	orphanDestroyAttempts   = 3
+	orphanDestroyRetryDelay = 250 * time.Millisecond
 	// storeCleanupTimeout bounds the store writes done while tearing a
 	// connection down, which must not inherit the dead request's context.
 	storeCleanupTimeout = 5 * time.Second
@@ -778,13 +784,13 @@ func (s *Server) reconcileUnplaced(ctx context.Context, name string, ann rwire.S
 	switch {
 	case errors.Is(err, ErrNotFound):
 		log.Printf("controld: runner %s announced unknown session %s; destroying orphan", name, clip(ann.ID))
-		s.destroyOrphan(name, ann.ID)
+		s.destroyOrphan(ctx, name, ann.ID)
 	case err != nil:
 		log.Printf("controld: reconcile %s: get session %s: %v", name, clip(ann.ID), err)
 	case row.State.Terminal():
 		log.Printf("controld: runner %s announced %s, which the store already finished as %s; destroying orphan",
 			name, row.ID, row.State)
-		s.destroyOrphan(name, row.ID)
+		s.destroyOrphan(ctx, name, row.ID)
 	case row.Runner != "" && row.Runner != name:
 		// The store has this session placed on a different runner, so this
 		// one is holding a duplicate — the losing half of a requeue that
@@ -795,7 +801,7 @@ func (s *Server) reconcileUnplaced(ctx context.Context, name string, ann rwire.S
 		// holding a slot for the life of the runner.
 		log.Printf("controld: runner %s announced %s, which the store places on %s; destroying the duplicate",
 			name, row.ID, row.Runner)
-		s.destroyOrphan(name, row.ID)
+		s.destroyOrphan(ctx, name, row.ID)
 	default:
 		// The store wants this session alive and has it either here or
 		// nowhere (e.g. requeued while the runner was away, never
@@ -816,12 +822,39 @@ func (s *Server) reconcileUnplaced(ctx context.Context, name string, ann rwire.S
 }
 
 // destroyOrphan tells a runner to drop a session the store has no live row
-// for. Fire-and-forget on purpose: there is no row whose state the result
-// could update, and the next announce trues it up if this one is lost.
-func (s *Server) destroyOrphan(runner, id string) {
-	if err := s.sendToRunner(runner, rwire.ToRunner{Type: "destroy", Session: id}); err != nil {
-		log.Printf("controld: destroying orphan %s on %s: %v", clip(id), runner, err)
-	}
+// for. It runs outside the connection reader because dispatch's result must
+// be delivered by that reader. A failed driver teardown remains registered
+// on runnerd, so retry it on this connection instead of waiting indefinitely
+// for another announce. The series is bounded; reconnect reconciliation
+// starts a fresh one if the orphan is still present.
+func (s *Server) destroyOrphan(ctx context.Context, runner, id string) {
+	go func() {
+		for attempt := 1; attempt <= orphanDestroyAttempts; attempt++ {
+			res, err := s.dispatch(ctx, runner, rwire.ToRunner{Type: "destroy", Session: id})
+			if err == nil && res.OK {
+				return
+			}
+
+			if err != nil {
+				log.Printf("controld: destroying orphan %s on %s (attempt %d/%d): %v",
+					clip(id), runner, attempt, orphanDestroyAttempts, err)
+			} else {
+				log.Printf("controld: runner %s failed to destroy orphan %s (attempt %d/%d): %s",
+					runner, clip(id), attempt, orphanDestroyAttempts, clip(res.Detail))
+			}
+			if attempt == orphanDestroyAttempts || ctx.Err() != nil {
+				return
+			}
+			delay := orphanDestroyRetryDelay * time.Duration(1<<(attempt-1))
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			}
+		}
+	}()
 }
 
 // transitionQuiet applies a guarded transition, swallowing exactly the two
@@ -927,9 +960,10 @@ func drain(ch chan rwire.FromRunner) (rwire.FromRunner, bool) {
 	}
 }
 
-// sendToRunner queues a command whose result nobody waits for (orphan
-// destroys, attach dial-backs). It reports only whether the command was
-// queued for delivery.
+// sendToRunner queues a command whose result nobody waits for (attach
+// dial-backs and best-effort broadcasts). It reports only whether the command
+// was queued for delivery. Orphan destroys use dispatch instead: a driver
+// failure must be visible so it can be retried without another reconnect.
 func (s *Server) sendToRunner(runner string, m rwire.ToRunner) error {
 	rc := s.conn(runner)
 	if rc == nil {

@@ -212,9 +212,9 @@ generated/returned and attached to logs. `Cache-Control: no-store` on all GETs
 | `POST /v1/auth/github` | Unauthenticated (the explicit exception). Body `{access_token}` → controld calls GitHub `/user`, checks allowlist, mints opaque bearer `rnr_…` (hash stored). Returns `{token, user}`. |
 | `GET /v1/me` | Identity + role. |
 | `POST /v1/sessions` | `{name?, image?, cmd?, egress_allow?}` → **202** `{session}` + `Location`. Accepts `Idempotency-Key` (CLI always sends one; unique index makes retries safe). 202, not 201: creation is asynchronous by design — the row is `queued`/`creating`; readiness arrives via state. |
-| `GET /v1/sessions` | Filters `state=`, `runner=`; cursor pagination (`limit` capped at 100), stable sort `created_at desc, id`. Team-visible (spec: trust-your-team). Terminal states hidden unless `all=true`. |
+| `GET /v1/sessions` | Exact filters `name=`, `state=`, `runner=`; cursor pagination (`limit` capped at 100), stable sort `created_at desc, id`. Team-visible (spec: trust-your-team). Terminal states hidden unless `all=true`. |
 | `GET /v1/sessions/{id}` | Full row incl. `state`, `runner`, `reachable`, `last_event_at`. |
-| `DELETE /v1/sessions/{id}` | Destroy; on `queued` it cancels before dispatch. 204. Owner or admin. |
+| `DELETE /v1/sessions/{id}` | Destroy; on `queued` it cancels before dispatch. A `failed` row may retain an attachable container, so DELETE destroys it and advances the row to `destroyed` while retaining the diagnostic error. 204. Owner or admin. |
 | `POST /v1/sessions/{id}/suspend` | `{warm}` (default true). 409 `conflict` while `creating`. |
 | `POST /v1/sessions/{id}/resume` | 409 `no_capacity` if the pinned runner is full (§4.7). |
 | `POST /v1/sessions/{id}/snapshot` | Synchronous, bounded timeout → `{ref}`. |
@@ -273,9 +273,15 @@ queued ──▶ creating ──▶ running ⇄ suspended_warm
    │           │           │  ⇄ suspended_cold
    ▼           ▼           ▼
 canceled    failed       dead ──(rows kept; hidden from default ls)
-                           ▲
-running/suspended ──destroy──▶ destroyed
+               │
+               └──rm (diagnostic retained)──▶ destroyed
+running/suspended ─────────rm───────────────▶ destroyed
 ```
+
+`failed` is terminal for scheduling and event application, but not immutable:
+Plan 4's attach-on-failed behavior keeps its container for diagnosis, and the
+user's explicit `rm` both tears that resource down and records `destroyed` so
+the hidden-failure hint clears. No other transition leaves a terminal state.
 
 **Reachability is not a state.** `reachable` is derived per-read from the owning
 runner's connectedness — a disconnected runner makes its sessions
@@ -340,6 +346,10 @@ On runner announce, controld reconciles Postgres against announced reality:
 | queued | — | scheduler dispatches normally |
 | — (unknown id) | present | orphan: log loudly, instruct destroy (Postgres is the source of desired state) |
 
+- **Retryable orphan teardown:** orphan destroy is a tracked dispatch outside
+  the connection reader, with three bounded attempts and backoff. A transient
+  driver failure therefore releases the container and capacity on the current
+  connection; if all attempts fail, a later announce begins a fresh series.
 - **Idempotent dispatch:** `create` carries controld's `session_id`; runnerd
   checks its registry/labels first and answers with current state instead of
   double-creating. Safe across control-conn flaps and controld restarts.
