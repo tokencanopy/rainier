@@ -144,10 +144,11 @@ After the first successful attach, `rainier` retries:
 - HTTP 429, 502, 503, and 504 responses.
 
 Other HTTP responses are permanent and return immediately. Backoff starts at
-100 ms and doubles to a 2 s cap. The CLI prints one connection-lost line, a
-short retry status, and a reconnected line. It does not replay or log terminal
-contents. The reconnect cursor is the last sequence actually written to local
-stdout, so the user sees neither a gap nor a deliberate full-log replay.
+100 ms and doubles to a 2 s cap. The CLI prints one connection-lost line and a
+short retry status; the next screen/output visibly confirms reconnection. It
+does not replay or log terminal contents. The reconnect cursor is the last
+sequence actually written to local stdout, so the user sees neither a gap nor
+a deliberate full-log replay.
 
 ### 4.4 Latency benchmark
 

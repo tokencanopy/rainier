@@ -268,6 +268,9 @@ func measureAttach(ctx context.Context, o options, sample int, ref, prefix strin
 	if err := record(prefix+"_terminal_rtt", sample, usableAt.Sub(probeStart)); err != nil {
 		return err
 	}
+	if err := record(prefix+"_terminal_usable", sample, usableAt.Sub(tp.started)); err != nil {
+		return err
+	}
 	return tp.detach(o.Timeout)
 }
 
