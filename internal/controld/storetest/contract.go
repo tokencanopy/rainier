@@ -768,6 +768,92 @@ func RunContract(t *testing.T, open func(t *testing.T) controld.Store) {
 		}
 	})
 
+	// A user is looked up by id — not just by token — because a session
+	// outlives the request that created it: the create dispatch has to turn a
+	// row's owner_id into the GitHub login and numeric id its commits are
+	// attributed to, and nothing about the dispatch carries a bearer token.
+	t.Run("user lookup by id", func(t *testing.T) {
+		st := open(t)
+		u := mkUser(t, st)
+
+		got, err := st.GetUser(ctx, u.ID)
+		if err != nil {
+			t.Fatalf("GetUser: %v", err)
+		}
+		if got.ID != u.ID || got.GitHubID != u.GitHubID || got.Login != u.Login || got.Role != u.Role {
+			t.Fatalf("GetUser = %+v, want %+v", got, u)
+		}
+		if _, err := st.GetUser(ctx, "usr_nosuch"); !errors.Is(err, controld.ErrNotFound) {
+			t.Fatalf("GetUser of an unknown id = %v, want ErrNotFound", err)
+		}
+	})
+
+	// A session's repo override is the caller's own `repos` list, recorded at
+	// create because the dispatch that needs it happens later — possibly after
+	// a restart, on another replica, off a row read back out of this store.
+	// Three states, all distinct: no override at all (use the environment's
+	// connectors), an explicit empty one (clone nothing), and a real list.
+	t.Run("session repo override round-trips, and absent differs from empty", func(t *testing.T) {
+		st := open(t)
+		u := mkUser(t, st)
+
+		refs := []controld.RepoRef{{Repo: "acme/app"}, {Repo: "acme/infra", BaseBranch: "release"}}
+		s, err := st.CreateSession(ctx, controld.Session{
+			ID: controld.NewSessionID(), OwnerID: u.ID, Name: "work",
+			Image: "img", State: controld.StateQueued, Repos: refs})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(s.Repos, refs) {
+			t.Fatalf("create must return the repo override: %+v", s.Repos)
+		}
+		got, err := st.GetSession(ctx, s.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got.Repos, refs) {
+			t.Fatalf("get repos = %+v, want %+v", got.Repos, refs)
+		}
+		queued, err := st.OldestQueued(ctx)
+		if err != nil || len(queued) != 1 {
+			t.Fatalf("oldest queued: %v %+v", err, queued)
+		}
+		if !reflect.DeepEqual(queued[0].Repos, refs) {
+			t.Fatalf("oldest-queued repos = %+v, want %+v — the dispatch reads the row from here",
+				queued[0].Repos, refs)
+		}
+
+		// An explicit empty list means "this session clones nothing", which is
+		// a different instruction from "no override given" and must survive as
+		// one: a nil here would silently re-adopt the environment's connectors.
+		none, err := st.CreateSession(ctx, controld.Session{
+			ID: controld.NewSessionID(), OwnerID: u.ID, Name: "none",
+			Image: "img", State: controld.StateQueued, Repos: []controld.RepoRef{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotNone, err := st.GetSession(ctx, none.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotNone.Repos == nil || len(gotNone.Repos) != 0 {
+			t.Fatalf("an explicit empty override read back as %#v, want a non-nil empty list", gotNone.Repos)
+		}
+
+		// And a session that named none has none.
+		scratch := mkSess(t, st, u.ID, "scratch")
+		if scratch.Repos != nil {
+			t.Fatalf("create returned repos %#v for a session that named none", scratch.Repos)
+		}
+		gotScratch, err := st.GetSession(ctx, scratch.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotScratch.Repos != nil {
+			t.Fatalf("get returned repos %#v for a session that named none", gotScratch.Repos)
+		}
+	})
+
 	// The credential vault: one row per (user, provider), holding sealed bytes
 	// the store never interprets. Every assertion here is about the row's
 	// lifecycle — the seal itself lives above the store.

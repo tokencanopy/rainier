@@ -436,6 +436,13 @@ func (s *Server) OpSnapshot(ctx context.Context, id, ref string) (string, error)
 //     session booted from it re-run the setup script its cache exists to
 //     skip; RAINIER_SETUP_TIMEOUT is that script's bound, meaningless without
 //     it.
+//   - the session's own work: the repositories it was told to clone
+//     (RAINIER_REPOS_B64), the init hook and its bound, and the git identity
+//     its commits carry. All four are per-session decisions controld makes at
+//     dispatch, and every one of them is actively wrong inside an image: a
+//     baked repo list re-clones the build's repositories into every later
+//     session, and a baked RAINIER_GIT_AUTHOR_* attributes everyone's commits
+//     to whoever happened to trigger the build.
 //   - the session's own identity and egress wiring. RAINIER_SESSION and
 //     RAINIER_DIAL name the container that happened to build the image, and
 //     the proxy URLs are worse than stale: the driver embeds the session id in
@@ -451,6 +458,8 @@ func (s *Server) OpSnapshot(ctx context.Context, id, ref string) (string, error)
 // image's empty value.
 var driverEnvKeys = []string{
 	"RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT",
+	"RAINIER_REPOS_B64", "RAINIER_INIT_B64", "RAINIER_INIT_TIMEOUT",
+	"RAINIER_GIT_AUTHOR_NAME", "RAINIER_GIT_AUTHOR_EMAIL",
 	"RAINIER_DIAL", "RAINIER_SESSION",
 	"HTTP_PROXY", "http_proxy",
 	"HTTPS_PROXY", "https_proxy",

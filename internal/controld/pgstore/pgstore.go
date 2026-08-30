@@ -115,9 +115,23 @@ func (s *Store) UserByToken(ctx context.Context, tokenHash string) (controld.Use
 	return u, nil
 }
 
+func (s *Store) GetUser(ctx context.Context, id string) (controld.User, error) {
+	var u controld.User
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, github_id, login, role, created_at FROM users WHERE id = $1`, id).
+		Scan(&u.ID, &u.GitHubID, &u.Login, &u.Role, &u.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controld.User{}, controld.ErrNotFound
+		}
+		return controld.User{}, fmt.Errorf("pgstore: get user: %w", err)
+	}
+	return u, nil
+}
+
 // --- sessions -----------------------------------------------------------
 
-const selectSessionCols = `id, owner_id, name, image, cmd, egress_allow, state, runner, idempotency_key, error, environment_id, resolved_image, setup_hash, child_exit_code, created_at, updated_at, last_event_at`
+const selectSessionCols = `id, owner_id, name, image, cmd, egress_allow, repos, state, runner, idempotency_key, error, environment_id, resolved_image, setup_hash, child_exit_code, created_at, updated_at, last_event_at`
 
 // rowScanner is satisfied by both pgx.Row and pgx.Rows.
 type rowScanner interface {
@@ -137,9 +151,9 @@ func scanSession(row rowScanner) (controld.Session, error) {
 	var sess controld.Session
 	var state string
 	var idem *string
-	var cmdBytes, egressBytes []byte
+	var cmdBytes, egressBytes, reposBytes []byte
 
-	if err := row.Scan(&sess.ID, &sess.OwnerID, &sess.Name, &sess.Image, &cmdBytes, &egressBytes,
+	if err := row.Scan(&sess.ID, &sess.OwnerID, &sess.Name, &sess.Image, &cmdBytes, &egressBytes, &reposBytes,
 		&state, &sess.Runner, &idem, &sess.Error, &sess.EnvironmentID, &sess.ResolvedImage, &sess.SetupHash,
 		&sess.ChildExitCode, &sess.CreatedAt, &sess.UpdatedAt, &sess.LastEventAt); err != nil {
 		return controld.Session{}, err
@@ -156,6 +170,15 @@ func scanSession(row rowScanner) (controld.Session, error) {
 	if len(egressBytes) > 0 {
 		if err := json.Unmarshal(egressBytes, &sess.EgressAllow); err != nil {
 			return controld.Session{}, fmt.Errorf("pgstore: decode egress_allow: %w", err)
+		}
+	}
+	// A SQL NULL scans as no bytes at all and stays a nil Repos — the session
+	// named no override. An empty JSON array decodes to a non-nil empty slice,
+	// which is the other instruction ("clone nothing") and must not collapse
+	// into the first.
+	if len(reposBytes) > 0 {
+		if err := json.Unmarshal(reposBytes, &sess.Repos); err != nil {
+			return controld.Session{}, fmt.Errorf("pgstore: decode repos: %w", err)
 		}
 	}
 	return sess, nil
@@ -186,6 +209,17 @@ func (s *Store) CreateSession(ctx context.Context, sess controld.Session) (contr
 	if err != nil {
 		return controld.Session{}, fmt.Errorf("pgstore: encode egress_allow: %w", err)
 	}
+	// repos is the one list column where nil is NOT the empty array: a session
+	// that named no override stores SQL NULL, and one that explicitly named an
+	// empty list stores '[]'. Collapsing them would make an explicit "clone
+	// nothing" silently inherit its environment's connectors at dispatch.
+	var repos []byte
+	if sess.Repos != nil {
+		repos, err = json.Marshal(sess.Repos)
+		if err != nil {
+			return controld.Session{}, fmt.Errorf("pgstore: encode repos: %w", err)
+		}
+	}
 	// idempotency_key is stored NULL for "no key" so the sessions_idem
 	// partial unique index (WHERE idempotency_key IS NOT NULL) doesn't
 	// treat every empty-key session for an owner as a collision.
@@ -195,10 +229,10 @@ func (s *Store) CreateSession(ctx context.Context, sess controld.Session) (contr
 	}
 
 	row := s.pool.QueryRow(ctx, `
-		INSERT INTO sessions (id, owner_id, name, image, cmd, egress_allow, state, runner, idempotency_key, error, environment_id, resolved_image, setup_hash, created_at, updated_at, last_event_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		INSERT INTO sessions (id, owner_id, name, image, cmd, egress_allow, repos, state, runner, idempotency_key, error, environment_id, resolved_image, setup_hash, created_at, updated_at, last_event_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		RETURNING `+selectSessionCols,
-		sess.ID, sess.OwnerID, sess.Name, sess.Image, cmd, egress, string(sess.State), sess.Runner, idem, sess.Error,
+		sess.ID, sess.OwnerID, sess.Name, sess.Image, cmd, egress, repos, string(sess.State), sess.Runner, idem, sess.Error,
 		sess.EnvironmentID, sess.ResolvedImage, sess.SetupHash, createdAt, updatedAt, lastEventAt)
 
 	out, err := scanSession(row)

@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -679,4 +681,91 @@ func TestDrainQueueStopsWhenNoRunnerHasCapacity(t *testing.T) {
 	if got.State != StateQueued {
 		t.Fatalf("state = %q, want still queued (no connected runner)", got.State)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// createSpec's repo expansion, asserted directly: the branch and directory
+// rules are pure functions of a row and its environment, and the paths below
+// (an environment edited under a queued session, an owner whose row cannot be
+// read) are hard to stage over HTTP and trivial to state here.
+// ---------------------------------------------------------------------------
+
+func TestCreateSpecExpandsRepos(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a connector added after the create still gets the git egress", func(t *testing.T) {
+		// The row's allowlist was written at create, when the environment had
+		// no repos to reach GitHub for. Editing the environment while the
+		// session sat in the queue moves the dispatch (design §4.6), so the
+		// hosts that dispatch now needs are appended here too — a clone the
+		// control plane just ordered must not be one the proxy refuses.
+		s, st := newVaultServer(t)
+		u := seedVaultUser(t, st, 42, "alice")
+		row := Session{ID: "sess_00000000000000000000000000abcdef", OwnerID: u.ID, Name: "late",
+			Image: "img:1", EgressAllow: []string{"pypi.org"}}
+		env := &Environment{ID: "env_1", Image: "img:1",
+			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}}
+
+		spec, fail := s.createSpec(ctx, row, env)
+		if fail != "" {
+			t.Fatalf("createSpec failed: %s", fail)
+		}
+		want := []string{"pypi.org", "github.com", "codeload.github.com", "objects.githubusercontent.com"}
+		if !slices.Equal(spec.EgressAllow, want) {
+			t.Fatalf("spec.EgressAllow = %v, want %v", spec.EgressAllow, want)
+		}
+	})
+
+	t.Run("the session's stored override wins over the environment", func(t *testing.T) {
+		s, st := newVaultServer(t)
+		u := seedVaultUser(t, st, 42, "alice")
+		row := Session{ID: "sess_00000000000000000000000000abcdef", OwnerID: u.ID, Name: "work",
+			Repos: []RepoRef{{Repo: "other/svc", BaseBranch: "develop"}}}
+		env := &Environment{ID: "env_1",
+			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}}
+
+		spec, fail := s.createSpec(ctx, row, env)
+		if fail != "" {
+			t.Fatalf("createSpec failed: %s", fail)
+		}
+		want := []rwire.RepoSpec{
+			{Owner: "other", Name: "svc", BaseBranch: "develop", SessionBranch: "rainier/work", Dir: "svc"},
+		}
+		if !slices.Equal(spec.Repos, want) {
+			t.Fatalf("spec.Repos = %+v, want %+v", spec.Repos, want)
+		}
+	})
+
+	t.Run("an explicit empty override clones nothing even under a connector", func(t *testing.T) {
+		s, st := newVaultServer(t)
+		u := seedVaultUser(t, st, 42, "alice")
+		row := Session{ID: "sess_00000000000000000000000000abcdef", OwnerID: u.ID, Name: "work",
+			Repos: []RepoRef{}}
+		env := &Environment{ID: "env_1",
+			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}}
+
+		spec, fail := s.createSpec(ctx, row, env)
+		if fail != "" {
+			t.Fatalf("createSpec failed: %s", fail)
+		}
+		if spec.Repos != nil || spec.GitAuthorName != "" {
+			t.Fatalf("spec = %+v, want no repos and no attribution", spec)
+		}
+	})
+
+	t.Run("an owner whose row is gone fails the create rather than cloning anonymously", func(t *testing.T) {
+		// Attribution is not decoration: a commit chain with no author is a
+		// mess to untangle after the fact, and the create is cheap to redo.
+		s, _ := newVaultServer(t)
+		row := Session{ID: "sess_00000000000000000000000000abcdef", OwnerID: "usr_gone", Name: "work",
+			Repos: []RepoRef{{Repo: "acme/app"}}}
+
+		spec, fail := s.createSpec(ctx, row, nil)
+		if fail == "" {
+			t.Fatalf("createSpec = %+v, want a failure reason", spec)
+		}
+		if strings.Contains(fail, "usr_gone") {
+			t.Fatalf("failure reason %q leaks internal identifiers", fail)
+		}
+	})
 }

@@ -116,7 +116,7 @@ func (f *Fake) Create(_ context.Context, spec Spec) (Handle, error) {
 	// empty-ref rejection in Prepull mirrors its counterpart: a fake that
 	// accepted a spec production refuses would let a runnerd test pass
 	// against a create that can never happen.
-	if err := checkSetupSize(spec); err != nil {
+	if err := checkScriptSizes(spec); err != nil {
 		return Handle{}, err
 	}
 	f.mu.Lock()

@@ -103,6 +103,25 @@ type ToRunner struct {
 	Ref string `json:"ref,omitempty"`
 }
 
+// RepoSpec is one repository a session clones at boot, fully resolved by
+// controld: the sandbox neither parses an "owner/name" string nor invents a
+// branch or a directory. Every field is a decision the control plane made
+// (from an environment's github connector or the session's own `repos`), so
+// what the session cloned is answerable from the dispatched command alone.
+//
+// SessionBranch is the branch the clone checks out after fetching BaseBranch:
+// rainier/<session-name>, or rainier/<last 12 of the session id> when the
+// session is unnamed. Dir is the directory under /workspace the repository
+// lands in — the repository's own name, unless two of them share it, in which
+// case the later ones are qualified by owner.
+type RepoSpec struct {
+	Owner         string `json:"owner"`
+	Name          string `json:"name"`
+	BaseBranch    string `json:"base_branch"`
+	SessionBranch string `json:"session_branch"`
+	Dir           string `json:"dir"`
+}
+
 type Spec struct {
 	Name        string   `json:"name,omitempty"`
 	Image       string   `json:"image,omitempty"`
@@ -115,6 +134,27 @@ type Spec struct {
 	// already snapshot-cached — the cached image IS the finished setup.
 	Setup           string `json:"setup,omitempty"`
 	SetupTimeoutSec int    `json:"setup_timeout_sec,omitempty"`
+	// Repos are the repositories this session clones at boot, in the order
+	// they are cloned. Empty is a session that clones nothing — a scratch
+	// session, or one whose `repos` was an explicit empty list.
+	Repos []RepoSpec `json:"repos,omitempty"`
+	// Init is the environment's per-boot hook, run AFTER the clones and
+	// before the agent, on every create including the ones that boot a cached
+	// snapshot. That is the whole difference between it and Setup: setup
+	// builds the image and is baked into the cache, init runs against the
+	// code that was just cloned and therefore cannot be. InitTimeoutSec
+	// bounds it (0 = the runner's default), the same carried-not-policed
+	// contract Setup's timeout has.
+	Init           string `json:"init,omitempty"`
+	InitTimeoutSec int    `json:"init_timeout_sec,omitempty"`
+	// GitAuthorName and GitAuthorEmail are the identity commits made inside
+	// the session are attributed to: the owner's GitHub login and their
+	// noreply address (<github_id>+<login>@users.noreply.github.com). Present
+	// only when the session clones something — there is nothing to attribute
+	// otherwise — and never a credential: the token stays in the vault and
+	// reaches git through the in-sandbox helper, one operation at a time.
+	GitAuthorName  string `json:"git_author_name,omitempty"`
+	GitAuthorEmail string `json:"git_author_email,omitempty"`
 	// Env is injected into the container's environment. Values are secrets
 	// as often as not, so this field is never logged verbatim.
 	Env map[string]string `json:"env,omitempty"`

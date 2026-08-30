@@ -4,6 +4,7 @@ package driver
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -441,9 +442,83 @@ func TestDockerRunArgs(t *testing.T) {
 		}
 	})
 
+	t.Run("Spec.Repos becomes RAINIER_REPOS_B64", func(t *testing.T) {
+		// The repo list is structured data, so it rides as base64'd JSON for
+		// the same reason the setup script does: `docker run -e K=V` carries
+		// one line per var, and JSON with no encoding would put quoting and
+		// (for a branch name with a newline in it) line breaks into an argv
+		// sessiond has to parse back. One decode, one json.Unmarshal.
+		repos := []RepoSpec{
+			{Owner: "acme", Name: "app", BaseBranch: "main", SessionBranch: "rainier/work", Dir: "app"},
+		}
+		args := d.runArgs(Spec{SessionID: "sess-8", Repos: repos}, "img:1")
+		blob, err := json.Marshal(repos)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "RAINIER_REPOS_B64=" + base64.StdEncoding.EncodeToString(blob)
+		if env := flagValues(args, "-e"); !slicesContains(env, want) {
+			t.Errorf("-e values %v missing %s", env, want)
+		}
+	})
+
+	t.Run("Spec.Init becomes RAINIER_INIT_B64 and RAINIER_INIT_TIMEOUT", func(t *testing.T) {
+		// Same channel as the setup script, and a separate one from it: init
+		// runs on EVERY boot, after the clones, including the cache-hit boots
+		// that deliberately carry no setup at all.
+		const script = "#!/bin/sh\nmake dev-server &\n"
+		args := d.runArgs(Spec{SessionID: "sess-9", Init: script, InitTimeoutSec: 120}, "img:1")
+		env := flagValues(args, "-e")
+		wantB64 := "RAINIER_INIT_B64=" + base64.StdEncoding.EncodeToString([]byte(script))
+		if !slicesContains(env, wantB64) {
+			t.Errorf("-e values %v missing %s", env, wantB64)
+		}
+		if !slicesContains(env, "RAINIER_INIT_TIMEOUT=120") {
+			t.Errorf("-e values %v missing RAINIER_INIT_TIMEOUT=120", env)
+		}
+		// And a cache-hit create — no setup, init still dispatched — carries
+		// the init channel without the setup one.
+		for _, e := range env {
+			if strings.HasPrefix(e, "RAINIER_SETUP") {
+				t.Errorf("setup var %q injected for a spec with only an init hook: %v", e, env)
+			}
+		}
+	})
+
+	t.Run("attribution rides as RAINIER_GIT_AUTHOR_NAME and _EMAIL", func(t *testing.T) {
+		args := d.runArgs(Spec{SessionID: "sess-10",
+			GitAuthorName: "alice", GitAuthorEmail: "42+alice@users.noreply.github.com"}, "img:1")
+		env := flagValues(args, "-e")
+		for _, want := range []string{
+			"RAINIER_GIT_AUTHOR_NAME=alice",
+			"RAINIER_GIT_AUTHOR_EMAIL=42+alice@users.noreply.github.com",
+		} {
+			if !slicesContains(env, want) {
+				t.Errorf("-e values %v missing %s", env, want)
+			}
+		}
+	})
+
+	t.Run("no repos, init or attribution means none of those vars", func(t *testing.T) {
+		// A scratch session clones nothing and commits as nobody in
+		// particular; an orphan RAINIER_REPOS_B64 or a git identity with no
+		// repository to use it would read like one was expected.
+		env := flagValues(d.runArgs(Spec{SessionID: "sess-11", InitTimeoutSec: 120}, "img:1"), "-e")
+		for _, e := range env {
+			for _, prefix := range []string{"RAINIER_REPOS", "RAINIER_INIT", "RAINIER_GIT_AUTHOR"} {
+				if strings.HasPrefix(e, prefix) {
+					t.Errorf("%s var %q injected for a spec with none: %v", prefix, e, env)
+				}
+			}
+		}
+	})
+
 	t.Run("Spec.Env still comes last, after the setup vars", func(t *testing.T) {
 		args := d.runArgs(Spec{
 			SessionID: "sess-7", Setup: "true", SetupTimeoutSec: 5,
+			Repos: []RepoSpec{{Owner: "acme", Name: "app", BaseBranch: "main", SessionBranch: "rainier/w", Dir: "app"}},
+			Init:  "make dev", InitTimeoutSec: 60,
+			GitAuthorName: "alice", GitAuthorEmail: "42+alice@users.noreply.github.com",
 			Env: map[string]string{"AAA": "1"},
 		}, "img:1")
 		env := flagValues(args, "-e")
@@ -895,6 +970,14 @@ func TestDockerSnapshotStripsSecretsAndSetupChannel(t *testing.T) {
 		Name: "tstrip", SessionID: "sstrip", DialURL: "ws://runnerd:8080/register",
 		ProxyURL: "http://egressd:3128",
 		Setup:    "echo hi", SetupTimeoutSec: 900,
+		// The Plan 5 channels belong in the same commit-time sweep. A repo
+		// list and an init hook baked into a cached image make every later
+		// session re-clone and re-init from the build's inputs, and the git
+		// identity would attribute every one of their commits to whoever
+		// happened to trigger the build.
+		Repos: []RepoSpec{{Owner: "acme", Name: "app", BaseBranch: "main", SessionBranch: "rainier/w", Dir: "app"}},
+		Init:  "echo init", InitTimeoutSec: 120,
+		GitAuthorName: "buildbot", GitAuthorEmail: "42+buildbot@users.noreply.github.com",
 		Env: map[string]string{"SECRET_A": secretValue},
 	})
 	if err != nil {
@@ -914,6 +997,8 @@ func TestDockerSnapshotStripsSecretsAndSetupChannel(t *testing.T) {
 	}
 	for _, want := range []string{
 		"SECRET_A=" + secretValue, "RAINIER_SETUP_B64=",
+		"RAINIER_REPOS_B64=", "RAINIER_INIT_B64=", "RAINIER_INIT_TIMEOUT=120",
+		"RAINIER_GIT_AUTHOR_NAME=buildbot", "RAINIER_GIT_AUTHOR_EMAIL=",
 		"RAINIER_SESSION=sstrip", "RAINIER_DIAL=", "HTTP_PROXY=", "http_proxy=", "NO_PROXY=",
 	} {
 		if !strings.Contains(before, want) {
@@ -931,6 +1016,8 @@ func TestDockerSnapshotStripsSecretsAndSetupChannel(t *testing.T) {
 	strip := []string{
 		"SECRET_A",
 		"RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT",
+		"RAINIER_REPOS_B64", "RAINIER_INIT_B64", "RAINIER_INIT_TIMEOUT",
+		"RAINIER_GIT_AUTHOR_NAME", "RAINIER_GIT_AUTHOR_EMAIL",
 		"RAINIER_DIAL", "RAINIER_SESSION",
 		"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy",
 	}

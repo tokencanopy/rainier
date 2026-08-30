@@ -277,6 +277,50 @@ type createSessionRequest struct {
 	Cmd         []string `json:"cmd,omitempty"`
 	EgressAllow []string `json:"egress_allow,omitempty"`
 	Environment string   `json:"environment,omitempty"`
+	// Repos overrides the repositories the environment's github connectors
+	// declare. Absent inherits them; an explicit empty array clones nothing,
+	// exactly the nil-vs-empty distinction egress_allow already draws — and
+	// for the same reason: "I didn't say" and "I said none" are different
+	// answers, and a session that means to be scratch under a repo-carrying
+	// environment has no other way to say so.
+	Repos []repoRequest `json:"repos,omitempty"`
+}
+
+// repoRequest is one entry of that array. BaseBranch is a pointer for the
+// same reason the github connector's is: an explicitly empty base_branch is a
+// typo, never a request for the default, and it must not reach the clone as
+// one.
+type repoRequest struct {
+	Repo       string  `json:"repo"`
+	BaseBranch *string `json:"base_branch"`
+}
+
+// repoOverrides validates a create body's `repos` and returns the refs to
+// record on the session row. It preserves nil-vs-empty: nil in, nil out
+// (inherit the environment's connectors); empty in, empty out (clone
+// nothing).
+//
+// The errors are the caller's to read — each names the offending entry by
+// index and what was wrong with it — and none carries internal detail.
+func repoOverrides(reqs []repoRequest) ([]RepoRef, error) {
+	if reqs == nil {
+		return nil, nil
+	}
+	out := make([]RepoRef, 0, len(reqs))
+	for i, req := range reqs {
+		if !repoPattern.MatchString(req.Repo) {
+			return nil, fmt.Errorf("repos[%d].repo must be \"owner/name\", got %q", i, req.Repo)
+		}
+		ref := RepoRef{Repo: req.Repo}
+		if req.BaseBranch != nil {
+			if *req.BaseBranch == "" {
+				return nil, fmt.Errorf("repos[%d].base_branch is empty; omit it for the default (%s)", i, defaultBaseBranch)
+			}
+			ref.BaseBranch = *req.BaseBranch
+		}
+		out = append(out, ref)
+	}
+	return out, nil
 }
 
 // suspendRequest's Warm is a pointer so an absent field is distinguishable
@@ -341,6 +385,12 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 		return
 	}
 
+	repos, err := repoOverrides(req.Repos)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+
 	idemKey := r.Header.Get("Idempotency-Key")
 	row := Session{
 		ID:             NewSessionID(),
@@ -349,10 +399,19 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 		Image:          req.Image,
 		Cmd:            req.Cmd,
 		EgressAllow:    req.EgressAllow,
+		Repos:          repos,
 		State:          StateQueued,
 		IdempotencyKey: idemKey,
 	}
-	if req.Environment != "" && !s.resolveEnvironment(w, r, req.Environment, &row) {
+	var env *Environment
+	if req.Environment != "" {
+		resolved, ok := s.resolveEnvironment(w, r, req.Environment, &row)
+		if !ok {
+			return
+		}
+		env = &resolved
+	}
+	if !s.resolveRepos(w, r, u, &row, env) {
 		return
 	}
 
@@ -384,25 +443,26 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 
 // resolveEnvironment applies the environment named by ref to row: the id it
 // came from, the image it will actually run, and the egress it inherits when
-// the caller named none. It writes the client's response and reports false on
-// every failure, so a rejected create never reaches the store.
+// the caller named none. It returns the environment it resolved, and writes
+// the client's response and reports false on every failure, so a rejected
+// create never reaches the store.
 //
 // The environment's secrets are resolved here too, and then thrown away: the
 // values belong in exactly one place, the dispatched Spec (see createSpec),
 // and resolving them now is what turns a dangling reference into a refused
 // create instead of a session that starts without the credential its
 // environment promised.
-func (s *Server) resolveEnvironment(w http.ResponseWriter, r *http.Request, ref string, row *Session) bool {
+func (s *Server) resolveEnvironment(w http.ResponseWriter, r *http.Request, ref string, row *Session) (Environment, bool) {
 	env, err := s.environmentByRef(r.Context(), ref)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			writeErr(w, http.StatusBadRequest, "invalid_request",
 				fmt.Sprintf("environment %q does not exist", ref))
-			return false
+			return Environment{}, false
 		}
 		log.Printf("controld: create session: get environment %q: %v", ref, err)
 		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
-		return false
+		return Environment{}, false
 	}
 
 	_, missing, err := s.secretEnv(r.Context(), env)
@@ -410,10 +470,10 @@ func (s *Server) resolveEnvironment(w http.ResponseWriter, r *http.Request, ref 
 	case err != nil:
 		log.Printf("controld: create session: resolving secrets of environment %s: %v", env.ID, err)
 		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
-		return false
+		return Environment{}, false
 	case missing != "":
 		writeErr(w, http.StatusConflict, "conflict", missingSecretMessage(env, missing))
-		return false
+		return Environment{}, false
 	}
 
 	row.EnvironmentID = env.ID
@@ -424,6 +484,55 @@ func (s *Server) resolveEnvironment(w http.ResponseWriter, r *http.Request, ref 
 	if row.EgressAllow == nil {
 		row.EgressAllow = env.EgressAllow
 	}
+	return env, true
+}
+
+// resolveRepos settles what row will clone, before the row exists: it decides
+// whether this session clones at all (its own override, else env's github
+// connectors), refuses the create when it would clone with no credential to
+// clone WITH, and adds the hosts a clone needs to the session's allowlist.
+//
+// The gate is the reason this runs at create rather than at dispatch. A
+// session that cannot authenticate to GitHub is not a session anyone wants
+// started: it would boot, fail its clone stage, and leave a dead container to
+// explain — where refusing here is one message naming one command, with no row
+// left behind (design §4.3, and the same pre-insert discipline a missing
+// secret_ref gets).
+//
+// ANY stored credential passes, valid or needs_refresh. The two differ in
+// whether they can become usable without the user creating this session again:
+// a stale credential is refreshable mid-flight — `rainier login --refresh
+// github` while the session sits there, and the clone that follows works — so
+// the clone, not the create, is the right place for it to say so, with the
+// named action the mint path already carries. A credential that is not there
+// at all never becomes present that way.
+func (s *Server) resolveRepos(w http.ResponseWriter, r *http.Request, u User, row *Session, env *Environment) bool {
+	refs, err := sessionRepoRefs(*row, env)
+	if err != nil {
+		log.Printf("controld: create session: resolving the repositories of environment %s: %v", envID(env), err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
+		return false
+	}
+	if len(refs) == 0 {
+		return true
+	}
+
+	// The row itself is never read — only its existence is — so no credential
+	// material is loaded, let alone rendered into the response.
+	if _, err := s.st.GetCredential(r.Context(), u.ID, githubProvider); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeErr(w, http.StatusConflict, "conflict", ErrCredentialMissing.Error())
+			return false
+		}
+		log.Printf("controld: create session: reading the github credential of user %s: %v", u.ID, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
+		return false
+	}
+
+	// Recorded on the row rather than added at dispatch alone, so the
+	// allowlist a session runs with is visible in the session it belongs to
+	// rather than implied by its connectors.
+	row.EgressAllow = withGitHubHosts(row.EgressAllow)
 	return true
 }
 
@@ -1184,6 +1293,14 @@ const environmentsBodyLimit = 256 << 10
 // language toolchain and a dependency install on a cold container, and is
 // short enough that a hung script gives its slot back inside the working hour.
 const defaultSetupTimeoutSec = 900
+
+// defaultInitTimeoutSec bounds an environment's init hook when it names no
+// timeout of its own. Same fifteen minutes as the setup default and for the
+// same reason, even though init is usually far shorter: it runs on EVERY boot,
+// so a hook that hangs holds a slot the operator is waiting on, and the bound
+// is what turns that into a failed stage with a tail rather than a session
+// that never finishes starting.
+const defaultInitTimeoutSec = 900
 
 // environmentIDPrefix is what NewEnvironmentID puts in front of every
 // environment id, and therefore what tells an id from a name on the
