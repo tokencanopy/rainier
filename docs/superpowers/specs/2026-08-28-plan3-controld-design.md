@@ -375,7 +375,8 @@ CLI UX (the call sites we're designing for):
 rainier login                      # device flow; prints code + URL
 rainier new --image ghcr.io/x -- claude   # 202; prints id, starts attach by default
 rainier ls [--all]                 # table: id, name, state, runner, reachable, age
-rainier attach <id|name>           # raw-mode TUI, since=0 replay then live
+rainier attach <id|name>           # raw-mode TUI, screen snapshot then live
+                                   # (--since 0 replays the whole log)
 rainier suspend|resume|rm|snapshot <id|name>
 ```
 
@@ -502,3 +503,25 @@ Jace (charter: technical design): dial-back attach transport over single-mux
 (§4.2); allowlist-config auth over first-login-admin (§4.5); reachability as
 derived fact, not state (§4.6); cold sessions pin runners, resume 409s when
 full (§4.7); sessiond redial + inspect-before-destroy semantic change (§4.8).
+
+## Amendment (2026-08-29, Plan 5 T10): a plain attach opens on a snapshot
+
+The CLI sketch above originally read `since=0 replay then live` for a plain
+`attach`, which contradicted the parent design's own rule ("deltas; scrollback
+streams lazily. Never a byte-log replay") and the behaviour internal/server's
+tests have pinned since Plan 1. Painting a fresh viewer's screen by replaying a
+long-running session's raw byte log is the thing that rule forbids — the
+overnight session it would have been measured against held 756 entries.
+
+The semantics, settled while fixing the `--since 0` defect that overnight check
+surfaced:
+
+- a plain `attach` sends cursor 0, meaning "I hold no cursor", and opens on a
+  snapshot of the current screen, then live output;
+- `--since 0` means "I have seen nothing — the whole log", and is spelled on
+  the wire as `wire.SinceAll` (a reserved maximum), because 0 was already taken
+  and `relay.Frame.Since` is `omitempty`, which erases an explicit 0 anyway;
+- `--since N` resumes after sequence N, the value a dropped attach prints.
+
+The full-log read is what the runbook's read-a-failed-setup flow needs, so it
+had to have a spelling; it is not what a fresh viewer should cost the log.
