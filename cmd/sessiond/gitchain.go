@@ -70,9 +70,19 @@ const workspaceRoot = xfer.WorkspaceRoot
 // credentialHelperCommand is what the workspace gitconfig names as
 // credential.helper. It is an absolute path, so git treats the whole string as
 // a shell command and appends the operation — which is why the subcommand can
-// ride along in it. The path is where the Dockerfile installs sessiond;
-// os.Executable() is deliberately NOT used, because the process writing this
-// config is pid 1 of the container and the agent that later reads it is not.
+// ride along in it.
+//
+// The path is a constant because it is a CONTRACT WITH THE SESSION IMAGE:
+// /usr/local/bin/sessiond is where the image is required to install it, root
+// owned, out of reach of the session user (docs/deploy-gce.md). It is not
+// os.Executable() — which would name the same file today, since a path is a
+// property of the filesystem and not of the process reading it — because this
+// string is written into a file on a PERSISTENT volume and read by a git that
+// may run under a later boot, a later image, or a resumed container. Pinning
+// the contract is more useful than recording where this particular process
+// happened to be started from; an image that installs sessiond elsewhere is
+// misconfigured, and gets told so by the first git operation (the runbook's
+// criterion-1 notes name that failure).
 const credentialHelperCommand = "/usr/local/bin/sessiond " + credentialHelperSubcommand
 
 // cloneTimeoutPerRepo bounds the clone stage, multiplied by the number of

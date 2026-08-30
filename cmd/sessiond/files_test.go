@@ -1,7 +1,9 @@
 package main
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -480,19 +482,47 @@ func TestPushRefusesEscapingDestinations(t *testing.T) {
 	}
 }
 
+// hostileArchive builds a gzipped tar by hand: an innocent file followed by a
+// symlink to an absolute path.
+//
+// It cannot go through xfer.TarGz, which refuses that symlink at PACK time —
+// which is the point of this helper. The far end is not trusted to have used
+// our packer, or any packer, so the extract-side rule has to be provable on
+// its own.
+func hostileArchive(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(zw)
+	body := []byte("x")
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "innocent.txt", Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(body); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{
+		Name: "escape", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
 // TestPushRefusesAHostileArchiveWithoutHalfExtracting: the archive is the far
 // end's, and it is validated whole before a single entry lands.
 func TestPushRefusesAHostileArchiveWithoutHalfExtracting(t *testing.T) {
 	ft, root := newTestTransfers(t, 0)
 
-	src := t.TempDir()
-	if err := os.WriteFile(filepath.Join(src, "innocent.txt"), []byte("x"), 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	if err := os.Symlink("/etc/passwd", filepath.Join(src, "escape")); err != nil {
-		t.Fatalf("symlink: %v", err)
-	}
-	blob := archiveOf(t, src)
+	blob := hostileArchive(t)
 
 	_, err := callPush(t, ft, xfer.PushChunk{Xfer: "x4", Path: "dst", Seq: 0, Data: blob, Done: true})
 	if err == nil {

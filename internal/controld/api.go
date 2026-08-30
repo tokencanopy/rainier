@@ -309,7 +309,7 @@ func repoOverrides(reqs []repoRequest) ([]RepoRef, error) {
 	}
 	out := make([]RepoRef, 0, len(reqs))
 	for i, req := range reqs {
-		if !repoPattern.MatchString(req.Repo) {
+		if !validRepoRef(req.Repo) {
 			return nil, fmt.Errorf("repos[%d].repo must be \"owner/name\", got %q", i, req.Repo)
 		}
 		ref := RepoRef{Repo: req.Repo}
@@ -1405,8 +1405,41 @@ func connectorsJSON(cs []Connector) []json.RawMessage {
 // ---------------------------------------------------------------------------
 
 // repoPattern is the "owner/name" spelling of a GitHub repository — the same
-// two-segment shape `gh repo clone` accepts, and nothing else.
+// two-segment shape `gh repo clone` accepts, and nothing else. It is the SHAPE
+// check; validRepoRef below is the whole rule.
 var repoPattern = regexp.MustCompile(`^[\w.-]+/[\w.-]+$`)
+
+// validRepoRef reports whether s names a repository this API will accept.
+//
+// The shape above is not sufficient on its own, because the name does not stay
+// a name: Plan 5's scheduler splits it (sched.go's expandRepos) and puts the
+// second segment straight into a session's repo Dir, which sessiond joins to
+// /workspace un-cleaned (cmd/sessiond/gitchain.go's repoDir) and later hands to
+// `git -C`. Validating that here is the point of a boundary — the alternative
+// is relying on git's own accidents downstream, and an accident is not a rule.
+func validRepoRef(s string) bool {
+	if !repoPattern.MatchString(s) {
+		return false
+	}
+	owner, name, _ := strings.Cut(s, "/")
+	return validRepoSegment(owner) && validRepoSegment(name)
+}
+
+// validRepoSegment refuses the two segments that are not names at all.
+//
+//   - "." and "..": path elements. `/workspace/..` is `/`, and today the only
+//     thing standing between that and a clone outside the workspace is git
+//     refusing a non-empty destination — its accident, not this boundary's
+//     rule. GitHub does not allow either as a repository name anyway.
+//   - a leading "-": an option wherever this string later sits in an argv, and
+//     neither a GitHub login nor a repository name starts with one.
+//
+// A leading "." is deliberately still ALLOWED: `.github` is a real and common
+// repository name, and refusing it would reject a legitimate connector to close
+// nothing (a dotted directory under /workspace is still under /workspace).
+func validRepoSegment(s string) bool {
+	return s != "." && s != ".." && !strings.HasPrefix(s, "-")
+}
 
 // defaultBaseBranch is the branch a github connector clones when it names
 // none.
@@ -1548,7 +1581,7 @@ func decodeGitHubConnector(elem json.RawMessage) (githubConnector, error) {
 	if err := strictDecode(elem, &c); err != nil {
 		return githubConnector{}, err
 	}
-	if !repoPattern.MatchString(c.Repo) {
+	if !validRepoRef(c.Repo) {
 		return githubConnector{}, fmt.Errorf("github connector repo must be \"owner/name\", got %q", c.Repo)
 	}
 	if c.BaseBranch == nil {

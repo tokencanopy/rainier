@@ -288,6 +288,50 @@ func TestTarGzRefusesIrregularFiles(t *testing.T) {
 	}
 }
 
+// TestTarGzRefusesEscapingSymlinksBeforeAnyBytesMove: the far end applies
+// checkLink on extraction, so a tree containing an absolute or escaping
+// symlink was always refused — but only after up to 256MiB had crossed the
+// wire, chunk by chunk, to fail on the last one. The same rule applied at pack
+// time turns that into an error about a file on the pusher's own disk, named,
+// before the first byte.
+//
+// It is the same function on purpose. A rule implemented twice is a rule that
+// is eventually implemented once.
+func TestTarGzRefusesEscapingSymlinksBeforeAnyBytesMove(t *testing.T) {
+	cases := []struct{ name, link string }{
+		{"absolute", "/usr/bin/node"},
+		{"escaping", "../../../etc/passwd"},
+		{"escaping from a subdirectory", "../../outside"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			src := t.TempDir()
+			mkdir(t, filepath.Join(src, "vendor"))
+			write(t, filepath.Join(src, "keep.txt"), "innocent\n", 0o644)
+			if err := os.Symlink(c.link, filepath.Join(src, "vendor", "node")); err != nil {
+				t.Fatalf("symlink: %v", err)
+			}
+			var buf bytes.Buffer
+			if _, err := TarGz(&buf, src, MaxBytes); err == nil {
+				t.Fatal("TarGz packed a symlink the far end is going to refuse")
+			} else if !strings.Contains(err.Error(), "vendor/node") {
+				t.Fatalf("TarGz error = %v, want it to name the offending file", err)
+			}
+		})
+	}
+
+	// The rule is containment, not a ban on symlinks: the relative ones every
+	// node_modules/.bin is full of still travel.
+	t.Run("a symlink that stays inside still travels", func(t *testing.T) {
+		src := t.TempDir()
+		writeTree(t, src)
+		var buf bytes.Buffer
+		if _, err := TarGz(&buf, src, MaxBytes); err != nil {
+			t.Fatalf("TarGz refused an ordinary relative symlink: %v", err)
+		}
+	})
+}
+
 // ---------------------------------------------------------------------------
 // hostile archives
 //
