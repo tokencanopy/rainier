@@ -10,7 +10,7 @@ terminal sessions. Sessions survive laptop sleep and network changes; attach
 shows the agent's real TUI from any machine; your subscriptions and your GitHub
 identity stay yours.
 
-Status: **v0 Plan 5 — control plane + CLI + environments + GitHub.** One
+Status: **v0 Plan 6 — terminal happy path.** One
 `controld` (Postgres-backed REST + WebSocket API, GitHub identity, least-loaded
 placement, a credential vault) fronts N `runnerd` VMs that dial it outbound, and
 the `rainier` CLI drives the whole fleet. Sessions clone your repositories at
@@ -34,13 +34,16 @@ bin/rainier login --from-gh --server http://rainier-1:9090
 
 bin/rainier new --name box1 --image rainier-session:latest   # creates, then attaches
 bin/rainier ls                                               # id, name, env, state, runner, reachable, age
-bin/rainier attach box1                                      # Ctrl-] detaches; the session keeps running
+bin/rainier attach box1                                      # resumes if needed; Ctrl-] detaches
 bin/rainier suspend box1 && bin/rainier resume box1
 bin/rainier rm box1
 ```
 
 `rainier new` attaches immediately by default so you watch the agent boot;
-`--detach` opts out. Names are per-owner, so `<id|name>` takes either.
+`--detach` opts out. `rainier attach` is state-aware: a suspended session is
+resumed first, and an established viewer reconnects after transient network or
+control-plane interruptions from the last terminal sequence it rendered.
+Names are per-owner, so `<id|name>` takes either.
 
 An **environment** is the reusable template a session starts from — a base
 image, a setup script, an egress allowlist, and the team secrets its sessions
@@ -129,5 +132,23 @@ make e2e                         # full stack on docker, driven by the real CLI
 The store contract suite runs against memstore by default and against
 Postgres when docker is available; the e2e scenes take
 `RAINIER_TEST_PG_DSN=postgres://…` to run the same scenarios against pgstore.
+
+## Terminal latency benchmark
+
+After `make build` and `rainier login`, the developer benchmark drives the real
+configured fleet with sequential synthetic scratch sessions:
+
+```bash
+bin/rainier-latency --rainier bin/rainier --samples 10
+bin/rainier-latency --rainier bin/rainier --samples 10 --cold
+```
+
+It performs one unreported warm-up by default, emits JSON Lines observations
+and R-7 percentile summaries, and removes every session it creates. Output
+contains no session identifiers, terminal contents, user identity, or runner
+names. The warmed-fleet targets are p95 under 1.5 s for create-to-usable, 200 ms
+for attach by id, 225 ms by name, and 75 ms for terminal interaction RTT.
+These exclude image pulls, environment setup, agent CLI boot, burst load, and
+geographic network differences; small `--samples` values make p95 directional.
 
 License: [Apache-2.0](LICENSE)

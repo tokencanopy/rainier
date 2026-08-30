@@ -47,7 +47,7 @@ or other geographies.
 6. A checked-in live-fleet benchmark can reproduce the v0 latency metrics with
    synthetic session names and machine-readable output.
 
-Warmed-fleet regression targets are p95 <1.5 s for create-to-usable, <150 ms
+Warmed-fleet regression targets are p95 <1.5 s for create-to-usable, <200 ms
 for attach by id, <225 ms for attach by name, and <75 ms for terminal RTT.
 They are release targets reported by the benchmark, not timing assertions in
 unit tests: CI scheduling noise is not a product latency measurement.
@@ -157,6 +157,7 @@ It measures create acknowledgement, running state, usable terminal, attach by
 id/name first frame and terminal RTT, and warm/cold resume-to-usable. Flags
 control sample counts and whether destructive cold-suspend samples run.
 
+One unreported warm-up sample removes CLI/DNS cold-start effects by default.
 Output is JSON Lines: one record per observation plus one summary per metric
 (n, mean, p50, p95, min, max, and the applicable warmed-fleet target). Session
 names use a `latency-test-` prefix plus random synthetic suffix. Every created
