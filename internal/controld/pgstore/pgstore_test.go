@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -192,12 +193,45 @@ func TestUserByTokenTouchesLastUsedAt(t *testing.T) {
 	}
 }
 
-// TestMigrate0003To0004AddsColumnsToLegacyRows pins the upgrade path 0004
-// actually takes in production: a database that already holds sessions and
-// environments gets three new columns bolted onto live tables. Every one of
-// them is additive with a default (or nullable), so the rows that were there
-// before the migration must still read back — and must read back as "no init"
-// and "no child exit", not as a zero dressed up as a real value.
+// embeddedMigrationVersions returns the version of every embedded migration,
+// ascending — exactly the set Open() brings a database up to, derived from the
+// same migrations/ listing Migrate walks rather than spelled out here.
+//
+// Spelling it out is what made this file's upgrade assertion go stale the
+// moment a migration was added (it read "want 1..4" and got 1..5). A count
+// nobody has to remember to bump cannot go stale again.
+func embeddedMigrationVersions(t *testing.T) []int {
+	t.Helper()
+	entries, err := migrationFS.ReadDir("migrations")
+	if err != nil {
+		t.Fatalf("read embedded migrations: %v", err)
+	}
+	var versions []int
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		v, err := migrationVersion(e.Name())
+		if err != nil {
+			t.Fatalf("embedded migration %s: %v", e.Name(), err)
+		}
+		versions = append(versions, v)
+	}
+	slices.Sort(versions)
+	return versions
+}
+
+// TestMigrate0003To0004AddsColumnsToLegacyRows pins the upgrade path a
+// deployed controld actually takes: a database that stopped at 0003 and
+// already holds sessions and environments gets every later migration applied
+// to live tables. Each is additive with a default (or nullable), so the rows
+// that were there before must still read back — and must read back as "no
+// init", "no child exit" and "no repo override", not as zeros dressed up as
+// real values.
+//
+// It is named for 0004 because that is the migration that first bolted
+// columns onto populated tables; it upgrades to HEAD, and every migration
+// after it is covered by the same assertions.
 func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	dsn := startPostgres(t)
 	ctx := context.Background()
@@ -247,10 +281,10 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	}
 	pool.Close()
 
-	// Open() runs the pending migration — here, 0004 alone.
+	// Open() runs every pending migration — 0004 and everything after it.
 	st, err := Open(ctx, legacyDSN)
 	if err != nil {
-		t.Fatalf("upgrading a 0003 database to 0004: %v", err)
+		t.Fatalf("upgrading a 0003 database to head: %v", err)
 	}
 	var applied []int
 	rows, err := st.pool.Query(ctx, `SELECT version FROM schema_migrations ORDER BY version`)
@@ -265,18 +299,23 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 		applied = append(applied, v)
 	}
 	rows.Close()
-	if len(applied) != 4 || applied[3] != 4 {
-		t.Fatalf("schema_migrations = %v, want 1..4", applied)
+	if want := embeddedMigrationVersions(t); !slices.Equal(applied, want) {
+		t.Fatalf("schema_migrations = %v, want every embedded migration in order %v", applied, want)
 	}
 
-	// The legacy session survived, and its new column reads as "never exited"
-	// rather than "exited 0".
+	// The legacy session survived, and its new columns read as "never exited"
+	// rather than "exited 0", and as "named no repo override" rather than
+	// "asked for no repositories" — a pre-0005 row stores SQL NULL there, and
+	// a nil Repos is what lets its environment's connectors still decide.
 	sess, err := st.GetSession(ctx, "sess_legacy")
 	if err != nil {
 		t.Fatalf("legacy session after upgrade: %v", err)
 	}
 	if sess.ChildExitCode != nil {
 		t.Fatalf("legacy session child_exit_code = %d, want NULL", *sess.ChildExitCode)
+	}
+	if sess.Repos != nil {
+		t.Fatalf("legacy session repos = %#v, want nil (no override), not an empty list", sess.Repos)
 	}
 	if sess.Name != "old" || sess.Image != "img:0" || sess.State != controld.StateRunning {
 		t.Fatalf("legacy session lost data across the migration: %+v", sess)
