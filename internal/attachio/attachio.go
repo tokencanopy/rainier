@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -78,12 +79,57 @@ func (e *DialError) Is(target error) bool {
 // reads it to find the right hub. Factored out so the URL contract (base is
 // just "scheme://host[:port]", never anything with a path already on it)
 // has one place to get right and one place to unit test.
-func AttachURL(base string, since uint64, session string) string {
-	u := base + "/attach?since=" + strconv.FormatUint(since, 10)
+//
+// The cursor is deliberately NOT part of it: Run puts `since` on whatever
+// URL it is handed (see withSince), so a caller that builds its own attach
+// URL — cmd/rainier's, which is a controld route, not a `<base>/attach` —
+// cannot end up dialing without one. That is exactly the bug this split
+// fixes; see TestRunDialsWithTheCursor.
+func AttachURL(base, session string) string {
+	u := base + "/attach"
 	if session != "" {
-		u += "&session=" + url.QueryEscape(session)
+		u += "?session=" + url.QueryEscape(session)
 	}
 	return u
+}
+
+// Cursor maps a `--since` flag to the cursor an attach carries on the wire.
+// given reports whether the user actually typed the flag, which is the whole
+// point: a uint64 flag defaulting to 0 cannot tell "no cursor" from "--since
+// 0" on its own, and those are opposite requests.
+//
+//   - not given → 0: no cursor. Snapshot of the current screen, then live —
+//     what a plain `attach` has always done and should keep doing (replaying
+//     a day's raw log to paint a screen is the thing spec §5 forbids).
+//   - `--since 0` → wire.SinceAll: the whole log, first entry onward. "I
+//     have seen nothing" is a coherent thing for a user to say, and it is
+//     what the runbook's read-the-failed-setup-log flow means by it.
+//   - `--since N` → N: resume, replaying the entries after N — the value the
+//     disconnect line prints ("rattach --since %d to resume").
+//
+// Shared by cmd/rainier and cmd/rattach so both spell it identically, which
+// is this package's whole reason for existing.
+func Cursor(given bool, since uint64) uint64 {
+	switch {
+	case !given:
+		return 0
+	case since == 0:
+		return wire.SinceAll
+	default:
+		return since
+	}
+}
+
+// withSince returns wsURL with the attach cursor on its query string. It
+// appends rather than parsing-and-re-encoding so the caller's URL comes back
+// otherwise byte-identical; the separator is the only thing that has to be
+// right.
+func withSince(wsURL string, since uint64) string {
+	sep := "?"
+	if strings.Contains(wsURL, "?") {
+		sep = "&"
+	}
+	return wsURL + sep + "since=" + strconv.FormatUint(since, 10)
 }
 
 // ScanDetach reports the index of the first Ctrl-] byte in buf, or -1 if
@@ -103,7 +149,17 @@ func ScanDetach(buf []byte) int {
 // direct-to-sessiond/runnerd use, non-nil to carry an Authorization bearer
 // against controld), performs the resize-first contract, and pipes the
 // local terminal (os.Stdin/os.Stdout) until detach, session exit, or
-// disconnect. It prints the exact status lines rattach always has:
+// disconnect.
+//
+// since is the attach cursor (see Cursor), and Run is what puts it on the
+// URL it dials — wsURL is a plain attach URL, with or without a query of its
+// own, and never carries `since` itself. It used to be the caller's job to
+// spell it into the URL AND pass it here, which is how `rainier attach
+// --since N` came to dial with no cursor at all for two plans: the argument
+// was accepted and never used. One place decides now, and it is the place
+// that dials.
+//
+// It prints the exact status lines rattach always has:
 //
 //	"\r\n[detached at seq %d; session still running]\r\n"
 //	"\r\n[disconnected at seq %d; rattach --since %d to resume]\r\n"
@@ -127,7 +183,7 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) er
 	if header != nil {
 		opts = &websocket.DialOptions{HTTPHeader: header}
 	}
-	c, resp, err := websocket.Dial(ctx, wsURL, opts)
+	c, resp, err := websocket.Dial(ctx, withSince(wsURL, since), opts)
 	if err != nil {
 		if resp != nil {
 			// A response came back but didn't upgrade (a plain HTTP error

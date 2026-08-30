@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"rainier/internal/cli"
+	"rainier/internal/wire"
 	"rainier/internal/xfer"
 )
 
@@ -90,9 +91,9 @@ func pagedSessions(t *testing.T, pages map[string]sessionsEnvelope) *httptest.Se
 
 // TestResolveSessionIDAmbiguousNameAcrossOwners is the finding's mandated
 // test: two owners ("alice", "bob") each have a session named "dev-box".
-// Without a cached owner id the CLI must refuse rather than silently acting
-// on whichever paginated first; with one cached, it must prefer the
-// caller's own.
+// Without a known owner id the CLI must refuse rather than silently acting
+// on whichever paginated first; with one — the caller's own id, cached by
+// login from the identity controld returns — it must prefer the caller's.
 func TestResolveSessionIDAmbiguousNameAcrossOwners(t *testing.T) {
 	ts := pagedSessions(t, map[string]sessionsEnvelope{
 		"": {Sessions: []session{
@@ -102,7 +103,7 @@ func TestResolveSessionIDAmbiguousNameAcrossOwners(t *testing.T) {
 	})
 	c := &cli.Client{Base: ts.URL}
 
-	t.Run("no cached owner id: ambiguous, both matches listed", func(t *testing.T) {
+	t.Run("no owner id known: ambiguous, both matches listed", func(t *testing.T) {
 		id, err := resolveSessionID(c, "", "dev-box")
 		if err == nil {
 			t.Fatalf("resolveSessionID = (%q, nil), want an ambiguous-name error", id)
@@ -132,7 +133,7 @@ func TestResolveSessionIDAmbiguousNameAcrossOwners(t *testing.T) {
 		}
 	})
 
-	t.Run("a cached owner id that owns none of the matches is still ambiguous", func(t *testing.T) {
+	t.Run("an owner id that owns none of the matches is still ambiguous", func(t *testing.T) {
 		_, err := resolveSessionID(c, "usr_carol", "dev-box")
 		if err == nil {
 			t.Fatal("resolveSessionID: want an ambiguous-name error, got nil")
@@ -774,8 +775,46 @@ func TestLoginRefreshPostsTheExchangeAndPrintsTheWarning(t *testing.T) {
 	if saved.Token != "rnr_new" {
 		t.Errorf("saved token = %q, want the refreshed one", saved.Token)
 	}
+	// This server's identity carries no id (an older controld, or any
+	// response that omits it), which must leave the cached one alone rather
+	// than blanking it: forgetting who the caller is would silently switch
+	// owner-preference off on the next ambiguous name.
 	if saved.OwnerID != "usr_alice" {
 		t.Errorf("saved owner id = %q, want the cached one preserved across a refresh", saved.OwnerID)
+	}
+}
+
+// TestLoginStoresTheOwnerID pins where owner-preference now gets its answer:
+// controld returns the caller's own id with the exchange (the same identity
+// GET /v1/me serves), and login caches it, so the very next command can tell
+// this user's sessions from a teammate's. It used to come only from a `new`
+// response, which meant a fresh login could not break an ambiguous name at
+// all until a session had been created with this CLI.
+func TestLoginStoresTheOwnerID(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, `{"token":"rnr_new","user":{"id":"usr_7","login":"alice","role":"member"},"scopes":"repo read:user"}`); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	defer ts.Close()
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if _, err := captureStdout(t, func() error {
+		return runLogin([]string{"--server", ts.URL, "--token", "gho_fresh"})
+	}); err != nil {
+		t.Fatalf("login: %v", err)
+	}
+
+	saved, err := cli.Load()
+	if err != nil {
+		t.Fatalf("cli.Load: %v", err)
+	}
+	if saved.OwnerID != "usr_7" {
+		t.Fatalf("saved owner id = %q, want the id the login returned", saved.OwnerID)
+	}
+	if saved.Token != "rnr_new" || saved.ServerURL != ts.URL {
+		t.Fatalf("saved config = %+v, want the new token and server", saved)
 	}
 }
 
@@ -853,5 +892,37 @@ func TestRenderDiffWithNoRepos(t *testing.T) {
 	renderDiff(&buf, xfer.DiffAnswer{})
 	if !strings.Contains(buf.String(), "no repositories") {
 		t.Errorf("diff output = %q, want it to say the session has no repositories", buf.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// attach: which of three requests --since spells
+// ---------------------------------------------------------------------------
+
+// TestAttachFlagsCursor pins the CLI half of the `--since` fix. The flag's
+// value alone cannot say what the user asked for — a uint64 defaulting to 0
+// makes "no flag" and "--since 0" identical, and those are opposite requests
+// (the current screen vs. the entire event log). Both argument orders are
+// checked because the acceptance run tried the flag before the positional
+// argument when the first attempt showed nothing, and reorderArgs is the only
+// reason that form parses at all.
+func TestAttachFlagsCursor(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		args   []string
+		ref    string
+		cursor uint64
+	}{
+		{"no flag is no cursor", []string{"sess_a"}, "sess_a", 0},
+		{"--since 0 is the whole log", []string{"--since", "0", "sess_a"}, "sess_a", wire.SinceAll},
+		{"--since 0 after the ref", []string{"sess_a", "--since", "0"}, "sess_a", wire.SinceAll},
+		{"--since N resumes", []string{"my-box", "--since", "19"}, "my-box", 19},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ref, cursor := attachFlags(tc.args)
+			if ref != tc.ref || cursor != tc.cursor {
+				t.Fatalf("attachFlags(%q) = (%q, %d), want (%q, %d)", tc.args, ref, cursor, tc.ref, tc.cursor)
+			}
+		})
 	}
 }

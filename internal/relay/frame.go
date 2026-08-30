@@ -26,10 +26,16 @@ const (
 type Frame struct {
 	Type     FrameType `json:"t"`
 	AttachID uint64    `json:"a"`
-	Since    uint64    `json:"s,omitempty"`
-	Cols     int       `json:"c,omitempty"`
-	Rows     int       `json:"r,omitempty"`
-	Payload  []byte    `json:"p,omitempty"`
+	// Since is a FrameOpen's attach cursor, interpreted by session.Attach: 0
+	// asks for a snapshot of the current screen, wire.SinceAll for the whole
+	// event log, anything else resumes after that sequence number. The
+	// omitempty is why "the whole log" has a value of its own instead of
+	// being spelled 0 — a zero Since is absent from these bytes entirely, so
+	// this hop cannot tell an explicit 0 from a Frame that never set it.
+	Since   uint64 `json:"s,omitempty"`
+	Cols    int    `json:"c,omitempty"`
+	Rows    int    `json:"r,omitempty"`
+	Payload []byte `json:"p,omitempty"`
 }
 
 // ControlEvent is the JSON payload a FrameControl carries: a message about

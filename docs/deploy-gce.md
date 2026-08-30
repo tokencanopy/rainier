@@ -305,14 +305,19 @@ enough to diagnose. The container is still there and sessiond is still serving
 viewers, so **attach to it and read the whole log**:
 
 ```bash
-./bin/rainier ls --all            # the failed session, with its runner
-./bin/rainier attach <id>         # replays everything the setup printed
-./bin/rainier rm <id>             # frees the slot
+./bin/rainier ls --all              # the failed session, with its runner
+./bin/rainier attach --since 0 <id> # replays everything the setup printed
+./bin/rainier rm <id>               # frees the slot
 ```
 
 Attach works on a `failed` session for exactly as long as its runner holds its
-current control connection; `--since 0` (the default) replays the full setup
-output, not the tail. **A failed session keeps its slot until you remove it** —
+current control connection. **`--since 0` is the flag that matters here:** a
+plain `attach` opens on the current screen (the last ~24 rows), while
+`--since 0` replays the whole event log — the full setup output, not the tail.
+`--since N` resumes after sequence number N, which is what the disconnect line
+prints when an attach drops.
+
+**A failed session keeps its slot until you remove it** —
 deliberate, so the evidence outlives the failure, but a forgotten one costs the
 fleet a slot. **Read the log before restarting runnerd:** a restart re-announces
 the container, reconciliation sees a session the store has already finished, and
@@ -386,7 +391,7 @@ ticking the box.
 | 1 | `rainier login && rainier new && rainier attach` works from Josh's laptop against a GCE e2-medium over Tailscale, from a cold VM in under an hour of ops. | Steps 1–6 above, timed from `gce-up.sh` to a live shell. | ☑ | 2026-08-29: cold VM → live shell ≈25 min including Tailscale install on the laptop; session running+reachable 3s after `new`; 167ms RTT. |
 | 2 | Kill controld mid-attach; restart it; `rainier attach` reconnects to the same session with full scrollback. The agent process never noticed. | Attach, type something, `kill $(pgrep controld)` on the VM, restart it with the step-4 command, `rainier attach <id>` again. | ☑ | 2026-08-29: mid-kill viewer disconnected at seq 19 (accepted); runner auto-reconnected; `--since 0` replay carried the pre-kill scrollback; state `running`, same runner, empty error. |
 | 3 | Kill runnerd on a VM with live sessions; restart it; sessions re-register and are attachable. No container is destroyed. | `docker ps` before, `pkill -x runnerd` (NOT `fleet-down.sh` — that is the teardown and removes session containers by design), re-run step 5, `docker ps` after, then attach. | ☑ | 2026-08-29: container id identical before/after; re-announce `used 1/16, 1 announced sessions`; sessiond re-registered; attach echoed live. |
-| 4 | A session survives the laptop sleeping overnight; reattach next morning shows the live TUI. | Attach, start something long-running, close the laptop. Reattach in the morning. **Spans a day — start it the evening before and note the start time.** | ☑ | 2026-08-29 19:05Z, 12h after start: container never restarted (StartedAt 07:05:36Z), PID-1 sessiond and the original shell both at 12h00 elapsed, event log contiguous seq 1→756 spanning the whole day, live ticks on attach. Survived 3 runnerd restarts and a full-stack Plan 4 redeploy along the way. Finding: the CLI's `--since 0` full replay does not reach the viewer (server log intact; client forwarding bug, follow-up). |
+| 4 | A session survives the laptop sleeping overnight; reattach next morning shows the live TUI. | Attach, start something long-running, close the laptop. Reattach in the morning. **Spans a day — start it the evening before and note the start time.** | ☑ | 2026-08-29 19:05Z, 12h after start: container never restarted (StartedAt 07:05:36Z), PID-1 sessiond and the original shell both at 12h00 elapsed, event log contiguous seq 1→756 spanning the whole day, live ticks on attach. Survived 3 runnerd restarts and a full-stack Plan 4 redeploy along the way. Finding: the CLI's `--since 0` full replay does not reach the viewer (server log intact; client forwarding bug) — fixed in Plan 5 T10: the CLI dialed with no cursor at all, and `--since 0` had no spelling on the wire that meant "the whole log". |
 | 5 | Burst 10 creates against a fleet with 4 free slots: 4 run, 6 sit visibly `queued`, and the queue drains as capacity frees — no failed creates, no lost sessions. | Covered by `go test ./internal/e2e/ -run TestBurstQueuesAndDrains` (two 2-slot runners, real HTTP, real websockets). To re-run it here: `./scripts/fleet-down.sh`, bring the fleet back with `SLOTS=4` added to the step-5 environment, then `for i in $(seq 10); do rainier new --detach --name burst-$i; done` and watch `rainier ls`. | ☑ | Automated: green under `-race -count=5` (memstore and pgstore). |
 | 6 | A fresh VM running runnerd with the join token appears in the fleet and receives placements with zero controld config changes or restarts. | Provision a second VM (step 1), build (step 2), run step 5 with `RUNNER_NAME=rainier-2`. Watch `rainier ls` place new sessions on it. | ☑ | 2026-08-29: throwaway e2-small joined over the VPC (`/etc/hosts` alias to rainier-1's internal IP keeps the dial-back origin check exact) with zero controld changes; placement landed on it once rainier-1 was capped full; cross-VM attach round-tripped; VM deleted after. Surfaced the first-ssh key-propagation race, now retried in `gce-up.sh`. |
 | 7 | Egress R4 closed: a session reaches an allowlisted host through egressd and cannot reach anything else (verified by an acceptance script). | `./scripts/egress-check.sh` on the VM. On Linux dockerd it must exit **0** — exit 3 (SKIPPED) means the network came up non-internal and something is wrong with the platform probe. | ☑ | 2026-08-29: exit 0 — direct egress blocked, allowlisted allowed, non-allowlisted denied, both audit lines present. First live run of the enforced path; probe said `R4 egress enforcement: ON`. |
@@ -412,7 +417,7 @@ ticking the box.
   restart, or a session marked `dead` at re-announce. Either means the
   registry rebuild (`Recover`) didn't see the container.
 - **4** — Nothing on the VM should notice at all; the laptop's attach dies and
-  a fresh one replays scrollback from `since=0`.
+  a fresh `attach --since 0` replays the whole log.
 - **7** — Read the audit lines in `/tmp/egressd.log`: an `allow` for the
   allowlisted host and a `deny` for the other, both carrying this session's id.
 

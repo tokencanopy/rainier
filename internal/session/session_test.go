@@ -84,6 +84,62 @@ func TestResumeReplaysOnlyMissedFrames(t *testing.T) {
 	if m.Type != "output" || string(m.Data) != "three" { t.Fatalf("resume = %+v", m) }
 }
 
+// TestSinceAllReplaysTheWholeLog is the second half of the `--since 0`
+// regression (Plan 5 T10): the whole-log cursor must replay the event log
+// from its FIRST entry, not paint a snapshot. `since > 0` alone could never
+// express that — 0 is "no cursor, paint me a screen" and always has been
+// (TestFreshAttachGetsSnapshotThenLive pins it), so `attach --since 0`, the
+// runbook's way to read a failed session's full setup output, silently got a
+// 24-row screen instead of the log the server was still holding.
+//
+// 50 entries, matching the plan's scene: every one of them arrives, in
+// order, starting at seq 1 — no snapshot frame anywhere.
+func TestSinceAllReplaysTheWholeLog(t *testing.T) {
+	s, fp := newFakeSession(t)
+	const n = 50
+	for i := 0; i < n; i++ {
+		fp.onOutput([]byte{byte('a' + i%26)})
+	}
+
+	a, err := s.Attach(wire.SinceAll, Size{20, 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Frame by frame rather than drainN, so the failure that matters — a
+	// snapshot where the log's first entry should be — is reported as
+	// itself instead of as a timeout waiting for 50 frames that never come.
+	for i := 0; i < n; i++ {
+		m := recv(t, a.Msgs)
+		wantSeq := uint64(i + 1)
+		wantByte := byte('a' + i%26)
+		if m.Type != "output" || m.Seq != wantSeq || len(m.Data) != 1 || m.Data[0] != wantByte {
+			t.Fatalf("frame %d = %+v, want an output frame seq=%d byte=%q", i, m, wantSeq, wantByte)
+		}
+	}
+
+	// And live output still follows the replay, on the same channel.
+	fp.onOutput([]byte("!"))
+	m := recv(t, a.Msgs)
+	if m.Type != "output" || string(m.Data) != "!" || m.Seq != n+1 {
+		t.Fatalf("live frame after replay = %+v, want output %q at seq %d", m, "!", n+1)
+	}
+}
+
+// TestSinceAllOnAnEmptyLogFallsBackToSnapshot: asking for the whole log of a
+// session that has not produced a byte yet must still leave the viewer with
+// a screen (and its size), exactly like a cursor past the end does. A replay
+// of nothing would open with silence instead.
+func TestSinceAllOnAnEmptyLogFallsBackToSnapshot(t *testing.T) {
+	s, _ := newFakeSession(t)
+	a, err := s.Attach(wire.SinceAll, Size{20, 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := recv(t, a.Msgs); m.Type != "snapshot" {
+		t.Fatalf("first frame = %+v, want a snapshot for a whole-log attach with an empty log", m)
+	}
+}
+
 func TestStdinForwarded(t *testing.T) {
 	s, fp := newFakeSession(t)
 	s.Stdin([]byte("x"))

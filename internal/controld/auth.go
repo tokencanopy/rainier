@@ -65,16 +65,26 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // user view + role
 // ---------------------------------------------------------------------------
 
-// userView is the client-facing rendering of a User: login and role only,
-// never the internal id or GitHub id.
+// userView is the client-facing rendering of a User: who the caller is and
+// what they may do. Never the GitHub id, and never anyone else's identity —
+// this view renders only the authenticated caller, on POST /v1/auth/github
+// and GET /v1/me.
+//
+// ID is controld's own user id. It is the same value every session row
+// already carries as owner_id, so publishing it here reveals nothing new; it
+// is here because a client that cannot learn its OWN id has no way to tell
+// its sessions from a teammate's when a name matches both (design: names are
+// unique per owner, the session list is team-visible). The CLI caches it at
+// login for exactly that.
 type userView struct {
+	ID    string `json:"id"`
 	Login string `json:"login"`
 	Role  string `json:"role"`
 }
 
 // userJSON renders u as its client-facing view.
 func userJSON(u User) userView {
-	return userView{Login: u.Login, Role: u.Role}
+	return userView{ID: u.ID, Login: u.Login, Role: u.Role}
 }
 
 // authResponse is the body of a successful POST /v1/auth/github. Token is
@@ -370,7 +380,8 @@ func (s *Server) requireAdmin(next func(http.ResponseWriter, *http.Request, User
 	})
 }
 
-// handleMe serves GET /v1/me: the caller's own identity and role.
+// handleMe serves GET /v1/me: the caller's own id, login and role — the one
+// route that answers "who am I" for a client holding nothing but a token.
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, u User) {
 	writeJSON(w, http.StatusOK, meResponse{User: userJSON(u)})
 }

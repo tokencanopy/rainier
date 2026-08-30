@@ -101,15 +101,34 @@ type Attachment struct {
 	Msgs <-chan wire.ServerMsg
 }
 
+// Attach adds a viewer and decides what it opens with, from its cursor:
+//
+//   - 0 — "I hold no cursor": a snapshot of the current screen, then live
+//     output. Every plain attach, and the only shape a fresh viewer should
+//     ever cost the log (spec §5: never repaint a screen by replaying raw
+//     bytes).
+//   - wire.SinceAll — "the whole log": every entry from the first, then
+//     live. What `rainier attach --since 0` asks for, and the only way to
+//     read output that has already scrolled off the screen — a failed
+//     setup's full log, an overnight session's history.
+//   - anything else — a resume cursor: the entries after it, then live.
+//
+// The last two both fall back to the snapshot when the log cannot answer
+// them (an empty log, or a cursor already past its end): a viewer must
+// never open on silence with no screen and no size.
 func (s *Session) Attach(since uint64, size Size) (*Attachment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	replay := since > 0 && since <= s.log.LastSeq()
+	from, all := since, since == wire.SinceAll
+	if all {
+		from = 0 // every entry, since sequence numbers start at 1
+	}
+	replay := s.log.LastSeq() > 0 && (all || (since > 0 && since <= s.log.LastSeq()))
 	var entries []eventlog.Entry
 	if replay {
 		var err error
-		entries, err = s.log.Since(since)
+		entries, err = s.log.Since(from)
 		if err != nil { replay = false }
 	}
 

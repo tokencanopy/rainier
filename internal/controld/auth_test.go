@@ -160,7 +160,58 @@ func TestGitHubAuthExchangeSuccess(t *testing.T) {
 		t.Fatalf("decode /v1/me response: %v; body = %s", err, meRaw)
 	}
 	if me.User.Login != "alice" || me.User.Role != "admin" {
-		t.Errorf("/v1/me user = %+v, want {alice admin}", me.User)
+		t.Errorf("/v1/me user = %+v, want alice/admin", me.User)
+	}
+	// The id is what a client cannot learn any other way about itself, and
+	// it must be the SAME identity the exchange just issued a token for —
+	// a client that caches one and compares it against session owner_ids
+	// would silently prefer nothing at all if these two disagreed.
+	if me.User.ID == "" {
+		t.Errorf("/v1/me user = %+v, want a non-empty id", me.User)
+	}
+	if me.User.ID != body.User.ID {
+		t.Errorf("/v1/me id = %q, want the exchange's %q — one identity, two routes", me.User.ID, body.User.ID)
+	}
+	assertKeySet(t, meRaw, "user")
+	var meOuter map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(meRaw), &meOuter); err != nil {
+		t.Fatalf("decode /v1/me for the key-set check: %v; body = %s", err, meRaw)
+	}
+	assertKeySet(t, string(meOuter["user"]), "id", "login", "role")
+}
+
+// TestMeIDIsTheSessionOwnerID pins the property the CLI's owner-preference
+// rests on: the id GET /v1/me hands a caller is exactly the owner_id its own
+// sessions carry. They come from different tables through different views, so
+// nothing but a test keeps them the same string — and if they ever drift, an
+// ambiguous name silently stops resolving instead of failing loudly.
+func TestMeIDIsTheSessionOwnerID(t *testing.T) {
+	_, st, ts := newTestControld(t)
+	u, tok := loginUser(t, st, "alice", "member")
+	seedSession(t, st, Session{ID: "sess_owned", OwnerID: u.ID, State: StateRunning})
+
+	raw := readBody(t, getWithBearer(t, ts, "/v1/me", tok))
+	var me meResponse
+	if err := json.Unmarshal([]byte(raw), &me); err != nil {
+		t.Fatalf("decode /v1/me: %v; body = %s", err, raw)
+	}
+
+	listRaw := readBody(t, getWithBearer(t, ts, "/v1/sessions", tok))
+	var list struct {
+		Sessions []struct {
+			ID      string `json:"id"`
+			OwnerID string `json:"owner_id"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal([]byte(listRaw), &list); err != nil {
+		t.Fatalf("decode /v1/sessions: %v; body = %s", err, listRaw)
+	}
+	if len(list.Sessions) != 1 {
+		t.Fatalf("sessions = %+v, want the one seeded row", list.Sessions)
+	}
+	if list.Sessions[0].OwnerID != me.User.ID {
+		t.Fatalf("session owner_id = %q, /v1/me id = %q; owner-preference compares these two",
+			list.Sessions[0].OwnerID, me.User.ID)
 	}
 }
 
