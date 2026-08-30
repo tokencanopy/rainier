@@ -562,6 +562,12 @@ ticking the box.
   a fresh `attach --since 0` replays the whole log.
 - **7** — Read the audit lines in `/tmp/egressd.log`: an `allow` for the
   allowlisted host and a `deny` for the other, both carrying this session's id.
+  A third decision, `challenge`, is normal and always carries an EMPTY session:
+  it is egressd answering 407 to a CONNECT that arrived without credentials, so
+  a client that waits to be asked (git does; curl does not) knows to send them.
+  Each such line should be followed by an `allow` or `deny` for the same host
+  that does name the session. A `challenge` with no follow-up means the client
+  never retried; a run with challenges and no allows at all means it could not.
 
 **Notes / follow-ups from the run:**
 
@@ -700,7 +706,10 @@ runs against one. Record what actually happened in the Result column.
   fast one. A hang is therefore the allowlist: controld appends `github.com`,
   `codeload.github.com` and `objects.githubusercontent.com` to a cloning
   session automatically, so check `/tmp/egressd.log` for a `deny` naming some
-  other host (LFS and third-party submodules are the usual ones).
+  other host (LFS and third-party submodules are the usual ones). Ignore the
+  `challenge` lines: they carry an empty session by definition and are how
+  every git request starts (see criterion 7's note). What would be wrong is a
+  `challenge` for a host with no `allow` or `deny` after it.
 - **2** — a commit authored as `root@<container id>` means the gitconfig's
   `[user]` block is missing, which happens when the owner's user row has no
   login/id — i.e. a session created before Plan 5's login stored one. Log in
