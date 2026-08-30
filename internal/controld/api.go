@@ -736,9 +736,11 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request, u User
 // yet, dispatch may already be in flight); a placed session is destroyed on
 // its runner if that runner is connected, or marked destroyed directly if
 // not — reconcile's terminal-row-orphan rule cleans the container up later
-// if the runner ever comes back (design §4.8); a terminal session is a
-// no-op 204 (idempotent). Every success path wakes the scheduler: even the
-// no-op paths are cheap to wake on, and it keeps the rule simple.
+// if the runner ever comes back (design §4.8). Most terminal sessions are a
+// no-op 204 (idempotent), but failed is deliberately different: setup/clone
+// failures retain a live container for attach, so rm must destroy it. Every
+// success path wakes the scheduler: even the no-op paths are cheap to wake
+// on, and it keeps the rule simple.
 //
 // Every path that reaches a runner ALSO reclaims the workspace volume (see
 // reclaimWorkspace), and this is the half of the durability rider that keeps
@@ -766,7 +768,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request, u U
 	}
 
 	switch {
-	case row.State.Terminal():
+	case row.State.Terminal() && row.State != StateFailed:
 		// Idempotent for the ROW, but not inert on the runner: a dead session
 		// still has the workspace its crash preserved, and this delete is the
 		// user saying they are done with it. A destroyed one has nothing left
@@ -795,8 +797,11 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request, u U
 		return
 	}
 
-	// running, suspended_warm, or suspended_cold: destroy it on the runner
-	// that holds it, if that runner is here to ask.
+	// running, suspended_warm, suspended_cold, or failed: destroy it on the
+	// runner that holds it, if that runner is here to ask. Failed is terminal
+	// in the store but may still have a live, attachable container after a
+	// setup/clone/init failure; the runner's destroy is idempotent when it
+	// does not.
 	if row.Runner != "" && s.runnerConnected(row.Runner) {
 		res, err := s.dispatch(r.Context(), row.Runner, rwire.ToRunner{Type: "destroy", Session: id})
 		switch {

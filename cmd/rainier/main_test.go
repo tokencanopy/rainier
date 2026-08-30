@@ -206,6 +206,135 @@ func TestResolveSessionIDNotFound(t *testing.T) {
 	}
 }
 
+// A failed create is hidden from the default list, but it is still a named
+// resource the user must be able to remove. This test drives the real rm
+// command boundary: it must opt into terminal rows during name resolution
+// and then delete the id it found.
+func TestRmResolvesALoneFailedSessionByName(t *testing.T) {
+	var paths []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.RequestURI())
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Query().Get("all") == "true":
+			json.NewEncoder(w).Encode(sessionsEnvelope{Sessions: []session{{
+				ID: "sess_failed", Name: "broken", OwnerID: "usr_alice", State: "failed",
+			}}})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/sessions/sess_failed":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			json.NewEncoder(w).Encode(sessionsEnvelope{})
+		}
+	}))
+	t.Cleanup(ts.Close)
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_test", OwnerID: "usr_alice"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := captureStdout(t, func() error { return runRm([]string{"broken"}) })
+	if err != nil {
+		t.Fatalf("rm failed session by name: %v; requests=%v", err, paths)
+	}
+	if !strings.Contains(out, "removed sess_failed") {
+		t.Fatalf("rm output = %q, want removed sess_failed", out)
+	}
+	if len(paths) != 2 || paths[0] != "/v1/sessions?all=true" || paths[1] != "/v1/sessions/sess_failed" {
+		t.Fatalf("requests = %v, want terminal lookup then delete", paths)
+	}
+}
+
+// Terminal names are reusable. Opting rm into terminal history must not turn
+// the ordinary `rm current-name` path ambiguous when an older failed row has
+// the same name; the active row remains the safe, unsurprising target.
+func TestRmNamePrefersAnActiveSessionOverTerminalHistory(t *testing.T) {
+	var deleted string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodDelete {
+			deleted = r.URL.Path
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		json.NewEncoder(w).Encode(sessionsEnvelope{Sessions: []session{
+			{ID: "sess_old", Name: "box", OwnerID: "usr_alice", State: "failed"},
+			{ID: "sess_current", Name: "box", OwnerID: "usr_alice", State: "running"},
+		}})
+	}))
+	t.Cleanup(ts.Close)
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_test", OwnerID: "usr_alice"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := captureStdout(t, func() error { return runRm([]string{"box"}) }); err != nil {
+		t.Fatalf("rm current session by reused name: %v", err)
+	}
+	if deleted != "/v1/sessions/sess_current" {
+		t.Fatalf("deleted %q, want the active session", deleted)
+	}
+}
+
+// Default ls keeps terminal history out of the table, but a failed session
+// must not disappear without a clue. The bounded probe asks only whether one
+// failed row exists and points the user at the established --all view.
+func TestLsHintsWhenFailedSessionsAreHidden(t *testing.T) {
+	var paths []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.RequestURI())
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("state") == "failed" {
+			json.NewEncoder(w).Encode(sessionsEnvelope{Sessions: []session{{
+				ID: "sess_failed", Name: "broken", State: "failed",
+			}}})
+			return
+		}
+		json.NewEncoder(w).Encode(sessionsEnvelope{})
+	}))
+	t.Cleanup(ts.Close)
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_test"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := captureStdout(t, func() error { return runLs(nil) })
+	if err != nil {
+		t.Fatalf("ls: %v; requests=%v", err, paths)
+	}
+	if !strings.Contains(out, "rainier ls --all") {
+		t.Fatalf("ls output = %q, want a --all hint", out)
+	}
+	if len(paths) != 2 || paths[0] != "/v1/sessions" || paths[1] != "/v1/sessions?all=true&limit=1&state=failed" {
+		t.Fatalf("requests = %v, want default list then bounded failed-session probe", paths)
+	}
+}
+
+func TestLsAllDoesNotPrintTheHiddenFailureHint(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(sessionsEnvelope{Sessions: []session{{
+			ID: "sess_failed", Name: "broken", State: "failed",
+		}}})
+	}))
+	t.Cleanup(ts.Close)
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_test"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := captureStdout(t, func() error { return runLs([]string{"--all"}) })
+	if err != nil {
+		t.Fatalf("ls --all: %v", err)
+	}
+	if strings.Contains(out, "sessions are hidden") {
+		t.Fatalf("ls --all output = %q, want no hidden-session hint", out)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // ls columns
 // ---------------------------------------------------------------------------

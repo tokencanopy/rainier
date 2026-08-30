@@ -1408,6 +1408,45 @@ func TestDeleteSession(t *testing.T) {
 		}
 	})
 
+	// A failed create is terminal in the database but may still be live on
+	// its runner so the user can attach and inspect the failure. Deleting it
+	// must therefore tear down the runner-side session, not merely reclaim a
+	// workspace from underneath the still-running container.
+	t.Run("a failed session still present on its runner is destroyed", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+
+		owner, tok := loginUser(t, st, "alice", "member")
+		reason := "clone failed"
+		seedSession(t, st, Session{ID: "sess_del_failed", OwnerID: owner.ID, State: StateFailed,
+			Runner: "vm1", Error: reason})
+
+		type result struct{ resp *http.Response }
+		resc := make(chan result, 1)
+		go func() {
+			resc <- result{doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_failed", tok, nil, nil)}
+		}()
+
+		cmd := f.nextCmd(t)
+		if cmd.Type != "destroy" || cmd.Session != "sess_del_failed" {
+			t.Fatalf("got %+v, want destroy of sess_del_failed", cmd)
+		}
+		f.reply(t, cmd, true, "")
+
+		resp := (<-resc).resp
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", resp.StatusCode)
+		}
+		if got := getSession(t, st, "sess_del_failed"); got.State != StateFailed || got.Error != reason {
+			t.Fatalf("row = %s / %q, want failed diagnosis preserved", got.State, got.Error)
+		}
+
+		next := f.nextCmd(t)
+		if next.Type != "remove_workspace" || next.Session != "sess_del_failed" {
+			t.Fatalf("after the destroy: got %+v, want remove_workspace of sess_del_failed", next)
+		}
+	})
+
 	// A dead session is where the durability rider's two halves meet. The
 	// crash path deliberately KEPT that session's workspace volume, and its
 	// container is long gone — so nothing on the runner will ever name that

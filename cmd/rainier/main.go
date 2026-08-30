@@ -671,7 +671,20 @@ func runLs(args []string) error {
 		}
 		cursor = page.NextCursor
 	}
-	return w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
+
+	if !*all {
+		var failed sessionsEnvelope
+		if err := c.Do(http.MethodGet, "/v1/sessions?all=true&limit=1&state=failed", nil, &failed); err != nil {
+			return err
+		}
+		if len(failed.Sessions) > 0 {
+			fmt.Println("hint: failed sessions are hidden; run `rainier ls --all` to inspect or remove them")
+		}
+	}
+	return nil
 }
 
 // sessionStateCell renders the STATE column: the state alone, plus whatever
@@ -825,7 +838,7 @@ func runRm(args []string) error {
 	fs.Parse(args)
 	ref := requireRef(fs, "rm")
 
-	_, c, id, err := resolveClientAndID(ref)
+	_, c, id, err := resolveClientAndIDIncludingTerminal(ref)
 	if err != nil {
 		return err
 	}
@@ -1666,17 +1679,30 @@ func requireLogin() (cli.Config, error) {
 	return cfg, nil
 }
 
-// resolveClientAndID is the requireLogin+resolveSessionID pair every
-// lifecycle command (suspend/resume/snapshot/rm/attach) needs. It returns
-// cfg too — runAttach needs ServerURL/Token beyond just the resolved id;
-// the other callers discard it.
+// resolveClientAndID is the requireLogin+resolveSessionID pair commands that
+// operate on non-terminal sessions need. It returns cfg too — runAttach needs
+// ServerURL/Token beyond just the resolved id; the other callers discard it.
+// rm uses resolveClientAndIDIncludingTerminal because a failed session can
+// still own a live container.
 func resolveClientAndID(ref string) (cli.Config, *cli.Client, string, error) {
+	return resolveClientAndIDWithTerminal(ref, false)
+}
+
+// resolveClientAndIDIncludingTerminal is the rm variant. A failed create is
+// terminal in controld's store but may still own a live container and runner
+// slot, so deletion must be able to find it by the same name the user passed
+// to new.
+func resolveClientAndIDIncludingTerminal(ref string) (cli.Config, *cli.Client, string, error) {
+	return resolveClientAndIDWithTerminal(ref, true)
+}
+
+func resolveClientAndIDWithTerminal(ref string, includeTerminal bool) (cli.Config, *cli.Client, string, error) {
 	cfg, err := requireLogin()
 	if err != nil {
 		return cli.Config{}, nil, "", err
 	}
 	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
-	id, err := resolveSessionID(c, cfg.OwnerID, ref)
+	id, err := resolveSessionIDWithTerminal(c, cfg.OwnerID, ref, includeTerminal)
 	if err != nil {
 		return cli.Config{}, nil, "", err
 	}
@@ -1687,10 +1713,10 @@ func resolveClientAndID(ref string) (cli.Config, *cli.Client, string, error) {
 // already an id, verbatim; anything else is looked up by paging GET
 // /v1/sessions and matching the name field client-side — controld has no
 // by-name endpoint in v0 (see the design's route table), so this is the
-// CLI's own job. Only non-terminal sessions are visible to this search
-// (the default GET /v1/sessions view), which matches every command that
-// uses it: you attach, suspend, resume, or snapshot a live session, not a
-// dead one.
+// CLI's own job. The default resolver sees only non-terminal sessions. rm's
+// variant opts into terminal rows because a failed create can still own a
+// live container; when an active row has reused a terminal row's name, the
+// active row keeps precedence and the historical one requires its id.
 //
 // Session names are unique only per owner (design), while GET /v1/sessions
 // is team-visible — two teammates can each have a session named e.g.
@@ -1713,18 +1739,30 @@ func resolveClientAndID(ref string) (cli.Config, *cli.Client, string, error) {
 // only for a config written before logins carried it — owner-preference is
 // then unavailable and an ambiguous name errors, exactly as it did.
 func resolveSessionID(c *cli.Client, myOwnerID, ref string) (string, error) {
+	return resolveSessionIDWithTerminal(c, myOwnerID, ref, false)
+}
+
+func resolveSessionIDWithTerminal(c *cli.Client, myOwnerID, ref string, includeTerminal bool) (string, error) {
 	if strings.HasPrefix(ref, "sess_") {
 		return ref, nil
 	}
 
 	type match struct{ id, owner string }
 	var matches []match
+	var activeMatches []match
 
 	cursor := ""
 	for {
-		path := "/v1/sessions"
+		q := url.Values{}
+		if includeTerminal {
+			q.Set("all", "true")
+		}
 		if cursor != "" {
-			path += "?cursor=" + url.QueryEscape(cursor)
+			q.Set("cursor", cursor)
+		}
+		path := "/v1/sessions"
+		if enc := q.Encode(); enc != "" {
+			path += "?" + enc
 		}
 		var page sessionsEnvelope
 		if err := c.Do(http.MethodGet, path, nil, &page); err != nil {
@@ -1732,13 +1770,23 @@ func resolveSessionID(c *cli.Client, myOwnerID, ref string) (string, error) {
 		}
 		for _, s := range page.Sessions {
 			if s.Name == ref {
-				matches = append(matches, match{id: s.ID, owner: s.OwnerID})
+				m := match{id: s.ID, owner: s.OwnerID}
+				matches = append(matches, m)
+				if !terminalSessionState(s.State) {
+					activeMatches = append(activeMatches, m)
+				}
 			}
 		}
 		if page.NextCursor == "" {
 			break
 		}
 		cursor = page.NextCursor
+	}
+	// Name uniqueness applies only to non-terminal sessions. Preserve the
+	// established `rm name` behavior when an active session has reused an old
+	// terminal session's name; the historical row remains addressable by id.
+	if len(activeMatches) > 0 {
+		matches = activeMatches
 	}
 
 	switch len(matches) {
@@ -1766,6 +1814,15 @@ func resolveSessionID(c *cli.Client, myOwnerID, ref string) (string, error) {
 	}
 	return "", fmt.Errorf("ambiguous name %q matches %d sessions: %s — use the session id",
 		ref, len(matches), strings.Join(listed, ", "))
+}
+
+func terminalSessionState(state string) bool {
+	switch state {
+	case "canceled", "failed", "dead", "destroyed":
+		return true
+	default:
+		return false
+	}
 }
 
 // wsURLFor renders id's attach URL against serverURL's http(s) base,
