@@ -675,9 +675,34 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.reg.removeIfHubless(id) {
-		s.drv.Destroy(context.Background(), handle)
+		// DestroyContainer, NOT Destroy: this is the crash path. The container
+		// is confirmed gone and its slot has to come back, but the session's
+		// workspace volume is the user's work and nobody has asked for it to
+		// be thrown away — a crashed session is the one people most want their
+		// files back from. controld reclaims the volume when (and only when)
+		// the session is explicitly removed; see its handleDeleteSession.
+		s.drv.DestroyContainer(context.Background(), handle)
 		s.fireEvent(id, "dead")
 	}
+}
+
+// RemoveWorkspace reclaims a session's workspace volume: the second act of an
+// explicit teardown, run when the crash path deliberately kept it and the user
+// has now asked for the session to be gone for good. controld dispatches it as
+// a "remove_workspace" command.
+//
+// It refuses while the registry still holds the session. remove_workspace
+// names a session rather than a container precisely because it is meant to run
+// when no container is left, so a command arriving for a LIVE one is a
+// misrouted or stale message — and honoring it would erase a running agent's
+// working tree. Docker itself would refuse (the volume is in use by a
+// container), which makes this guard belt-and-braces against the real driver;
+// against the fake it is the belt, and it is what keeps the two agreeing.
+func (s *Server) RemoveWorkspace(ctx context.Context, id string) error {
+	if _, ok := s.reg.get(id); ok {
+		return fmt.Errorf("session %s is still registered here; refusing to remove its workspace", id)
+	}
+	return s.drv.RemoveWorkspace(ctx, id)
 }
 
 // routeControl turns one FrameControl payload from session id into an event
@@ -702,6 +727,19 @@ func (s *Server) routeControl(id string, payload []byte) {
 	case "setup_failed":
 		log.Printf("session %s: setup failed (rc %d)", id, ev.RC)
 		s.fireEventDetail(id, "setup_failed", setupFailedDetail(ev.RC, ev.Tail))
+	case "child_exited":
+		// The agent process inside the container ended. This is news, not a
+		// verdict: the session stays up (sessiond outlives its child so
+		// viewers can read the scrollback), so runnerd reports the number and
+		// changes nothing.
+		//
+		// The detail is the bare exit code, undecorated, because controld
+		// parses it straight back into an integer column — anything added
+		// here would have to be stripped there. rc 0 is a real answer and
+		// travels as "0"; relay.ControlEvent's RC is `omitempty`, so a clean
+		// exit puts no rc on the wire at all and decodes back to the same 0.
+		log.Printf("session %s: agent exited with code %d", id, ev.RC)
+		s.fireEventDetail(id, "child_exited", strconv.Itoa(ev.RC))
 	default:
 		log.Printf("session %s: unknown control kind %q", id, ev.Kind)
 	}

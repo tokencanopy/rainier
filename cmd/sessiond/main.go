@@ -100,9 +100,23 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// events is where every control payload this sessiond originates — the
+	// setup verdict and the agent's exit — waits for a connection to carry it.
+	// Buffered so a watcher never blocks on a connection that isn't there
+	// yet, and shared by both producers so their events keep their order.
+	events := make(chan []byte, pendingCap)
+
 	go func() {
 		<-s.Exited()
-		log.Printf("child exited with code %d; sessiond stays up for viewers", s.ExitCode())
+		code := s.ExitCode()
+		log.Printf("child exited with code %d; sessiond stays up for viewers", code)
+		// Reported upstream, not acted on: the session deliberately outlives
+		// its child so viewers can still read the scrollback, and this is the
+		// only place in the whole system that knows what the agent's exit
+		// status was. In dev mode (no -dial) nothing drains the channel and
+		// the buffer simply absorbs it.
+		offerControl(events, childExitedPayload(code))
 	}()
 
 	// setupCtx stops the watcher on shutdown: a sessiond on its way out has
@@ -126,11 +140,10 @@ func main() {
 	}()
 
 	if *dial != "" {
-		var setup <-chan []byte
 		if runSetup {
-			setup = startSetupWatcher(setupCtx, s, *logPath, setupTimeout(os.Getenv("RAINIER_SETUP_TIMEOUT")))
+			startSetupWatcher(setupCtx, s, *logPath, setupTimeout(os.Getenv("RAINIER_SETUP_TIMEOUT")), events)
 		}
-		dialLoop(context.Background(), *dial, *sessionID, s, setup)
+		dialLoop(context.Background(), *dial, *sessionID, s, events)
 		return
 	}
 
@@ -149,13 +162,14 @@ func main() {
 // session's container is removed by runnerd itself, which is what actually
 // ends this loop (SIGTERM → main's handler).
 //
-// setup, when non-nil, is where the setup watcher's single verdict arrives.
-// It is threaded through the loop rather than sent from the watcher directly
-// because the conn it has to travel on is this loop's, and there may not be
-// one at the moment the verdict lands — see serveConn.
-func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, setup <-chan []byte) {
+// events is where this sessiond's control payloads (the setup verdict, the
+// agent's exit) arrive. They are threaded through the loop rather than sent
+// from their watchers directly because the conn they have to travel on is
+// this loop's, and there may not be one at the moment they land — see
+// serveConn.
+func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, events <-chan []byte) {
 	backoff := time.Second
-	var pending []byte // a setup outcome no connection has accepted yet
+	var pending [][]byte // control payloads no connection has accepted yet
 	for {
 		c, _, err := websocket.Dial(ctx, dial+"?session="+sessionID, nil)
 		if err == nil {
@@ -177,7 +191,7 @@ func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, s
 			// sandbox's relay.
 			sender, errc := relay.ServeSessionWithControl(ctx, relay.WSConn(c), s, nil)
 			var relayErr error
-			pending, setup, relayErr = serveConn(sender, errc, setup, pending)
+			pending, relayErr = serveConn(sender, errc, events, pending)
 			log.Printf("relay ended: %v; redialing", relayErr)
 		} else {
 			log.Printf("dial runnerd: %v; retrying in %s", err, backoff)
@@ -202,41 +216,108 @@ type controlSender interface {
 	Send(payload []byte) error
 }
 
-// serveConn waits for one connection's relay to end, delivering the setup
-// outcome over that connection's control channel if one lands (or is already
-// pending) while it lives. It returns the relay's error together with the
-// still-undelivered outcome state, so the next dial picks up exactly where
+// pendingCap bounds the queue of control payloads waiting for a connection,
+// and sizes the channel they arrive on.
+//
+// v0's vocabulary produces two — a setup verdict and one child exit — so
+// eight is slack, not a working limit, and overflowing it means something
+// upstream is wrong. It is bounded anyway because the alternative failure is
+// worse than a dropped event: an unbounded queue turns "runnerd has been away
+// for a while" into a sessiond whose memory grows without limit, and a
+// session outliving everything else (spec §10) is the one thing in this
+// system that must not be able to do that.
+const pendingCap = 8
+
+// serveConn waits for one connection's relay to end, delivering this
+// session's control payloads over that connection's control channel as they
+// land (or as they already sit queued). It returns the relay's error together
+// with whatever is still undelivered, so the next dial picks up exactly where
 // this one left off.
 //
-// The outcome is computed once by the watcher but may have to be offered
-// more than once: a conn can die between "setup finished" and "runnerd heard
-// about it", and there is nothing else in the system that knows a setup
-// outcome exists — controld would wait forever for an event no one will
-// resend. So a failed Send keeps the payload pending for the next
-// connection, and a successful one drops both the payload and the channel so
-// it can never be sent twice.
-func serveConn(sender controlSender, errc <-chan error, setup <-chan []byte, pending []byte) ([]byte, <-chan []byte, error) {
+// Each payload is computed once by its watcher but may have to be offered
+// more than once: a conn can die between "the setup finished" and "runnerd
+// heard about it", and nothing else in the system knows that outcome exists —
+// controld would wait forever for an event no one will resend. So a failed
+// Send leaves the payload at the head of the queue for the next connection,
+// and a successful one takes it off, which is what keeps it from being sent
+// twice.
+//
+// The queue is FIFO so that what a connection delivers is the order these
+// events were produced in, rather than an order that falls out of scheduling
+// — and so that "drop the oldest" (appendPending) has a well-defined meaning
+// at all. controld's arms are independent today and would survive a swap, but
+// a channel whose ordering is accidental is not one a later event can be
+// added to safely.
+//
+// It was a single pending payload until Plan 5, which is exactly one slot too
+// few now that setup and child_exited can both be waiting: a failing setup
+// produces BOTH (the wrapper writes its rc and then exits with it), so the
+// pair is the normal case, not a corner.
+func serveConn(sender controlSender, errc <-chan error, events <-chan []byte, pending [][]byte) ([][]byte, error) {
 	for {
-		if pending != nil {
-			if err := sender.Send(pending); err == nil {
-				pending, setup = nil, nil
-			} else {
+		for len(pending) > 0 {
+			if err := sender.Send(pending[0]); err != nil {
 				// This conn is already dying; errc says so below, and the
-				// payload rides along to the next one. Not retried on this
-				// conn: a Send that failed once on a dead conn fails again.
-				log.Printf("setup outcome not delivered (%v); retrying on the next connection", err)
+				// queue rides along to the next one. Not retried on this
+				// conn: a Send that failed once on a dead conn fails again,
+				// and the rest of the queue would fail behind it.
+				log.Printf("control event not delivered (%v); retrying on the next connection", err)
+				break
 			}
+			pending = pending[1:]
 		}
 		select {
 		case err := <-errc:
-			return pending, setup, err
-		case p := <-setup:
-			// Taken once: the watcher sends exactly one verdict, and nil'ing
-			// the channel here keeps a second receive (which would spin on a
-			// drained-and-nil'd channel) out of the loop entirely.
-			pending, setup = p, nil
+			return pending, err
+		case p := <-events:
+			pending = appendPending(pending, p)
 		}
 	}
+}
+
+// appendPending enqueues p, dropping the OLDEST payload when the queue is
+// already at pendingCap. Oldest-first because the newest news is the half a
+// late-arriving consumer can still act on, and because the drop is logged
+// loudly enough to find: reaching this at all means something produced more
+// events than v0's vocabulary has.
+func appendPending(q [][]byte, p []byte) [][]byte {
+	q = append(q, p)
+	if len(q) > pendingCap {
+		dropped := len(q) - pendingCap
+		log.Printf("control queue is at its %d cap; dropping the %d oldest undelivered event(s)", pendingCap, dropped)
+		q = q[dropped:]
+	}
+	return q
+}
+
+// offerControl hands one payload to the delivery queue without ever blocking
+// the goroutine that produced it. Those goroutines (the setup watcher, the
+// child-exit watcher) have no connection to wait for and nothing else to do
+// afterwards, so a blocking send would simply park one forever the first time
+// the queue backed up. A nil payload — what controlPayload returns when
+// encoding failed — is dropped rather than sent as an empty control frame.
+func offerControl(out chan<- []byte, p []byte) {
+	if p == nil {
+		return
+	}
+	select {
+	case out <- p:
+	default:
+		log.Printf("control queue full; dropping an undelivered event")
+	}
+}
+
+// childExitedPayload encodes the event sessiond sends when the agent process
+// ends: kind child_exited, carrying the exit status.
+//
+// It is an EVENT, not a request — ID stays 0, nobody answers it, and the
+// session's own state is unaffected (sessiond deliberately outlives its child
+// so viewers can read the scrollback). relay.ControlEvent's RC is omitempty,
+// so a clean exit puts no rc on the wire at all; that is safe here and only
+// here, because the field's zero value and the value being carried are the
+// same number, and it decodes back to the 0 that means "exited cleanly".
+func childExitedPayload(code int) []byte {
+	return controlPayload(relay.ControlEvent{Kind: "child_exited", RC: code})
 }
 
 // nextBackoff doubles d and clamps to the 30s cap. Extracted as a pure step
@@ -332,19 +413,16 @@ func prepareSetup(dir, b64 string) error {
 	return os.Chmod(path, 0o755)
 }
 
-// startSetupWatcher runs the watcher on its own goroutine and returns the
-// channel its single verdict arrives on. The channel is buffered so the
-// watcher never blocks on a connection that isn't there yet, and is never
-// closed: a closed channel reads as a ready value, which serveConn's select
-// would take for a delivered outcome.
-func startSetupWatcher(ctx context.Context, s *session.Session, logPath string, timeout time.Duration) <-chan []byte {
-	out := make(chan []byte, 1)
+// startSetupWatcher runs the watcher on its own goroutine, offering its single
+// verdict to the shared control queue. The channel is buffered and never
+// closed: a closed one reads as a ready value, which serveConn's select would
+// take for an event to deliver.
+func startSetupWatcher(ctx context.Context, s *session.Session, logPath string, timeout time.Duration, out chan<- []byte) {
 	go func() {
 		if p := watchSetup(ctx, s.Stop, setupRCPath, logPath, setupPollInterval, timeout); p != nil {
-			out <- p
+			offerControl(out, p)
 		}
 	}()
-	return out
 }
 
 // watchSetup polls for the exit code the wrapper writes and returns the one

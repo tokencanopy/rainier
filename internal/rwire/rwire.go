@@ -34,23 +34,27 @@ type RPCEnvelope struct {
 // message type so controld's runner view is always current without a separate
 // capacity message.
 //
-// The event States split in two: "running" | "dead" report the container's
-// lifecycle, while "setup_done" | "setup_failed" report the outcome of an
+// The event States split in three: "running" | "dead" report the container's
+// lifecycle; "setup_done" | "setup_failed" report the outcome of an
 // environment's setup script inside an already-running container (Plan 4
 // design §4.3, the setup pipeline) — a setup_failed carries the tail of the
-// script's output in Detail, the same field a result uses for its error text.
+// script's output in Detail, the same field a result uses for its error text;
+// and "child_exited" reports that the AGENT process inside a running session
+// ended, carrying its exit status in Detail as a bare decimal string ("0" for
+// a clean exit). That last one moves no state machine: the container stays up
+// for viewers, so it is an observation controld records against the session.
 type FromRunner struct {
-	Type     string        `json:"type"` // "announce" | "result" | "event" | "session_req"
+	Type     string        `json:"type"`               // "announce" | "result" | "event" | "session_req"
 	Proto    int           `json:"proto,omitempty"`    // announce
 	Runner   string        `json:"runner,omitempty"`   // announce
 	Sessions []SessionInfo `json:"sessions,omitempty"` // announce
 	Used     int           `json:"used"`
 	Total    int           `json:"total"`
-	ReqID    uint64        `json:"req_id,omitempty"` // result: correlates ToRunner.ReqID
-	OK       bool          `json:"ok,omitempty"`     // result
-	Detail   string        `json:"detail,omitempty"` // result: error text or snapshot ref; event: setup_failed tail
+	ReqID    uint64        `json:"req_id,omitempty"`  // result: correlates ToRunner.ReqID
+	OK       bool          `json:"ok,omitempty"`      // result
+	Detail   string        `json:"detail,omitempty"`  // result: error text or snapshot ref; event: setup_failed tail
 	Session  string        `json:"session,omitempty"` // event, session_req
-	State    string        `json:"state,omitempty"`   // event: "running" | "dead" | "setup_done" | "setup_failed"
+	State    string        `json:"state,omitempty"`   // event: "running" | "dead" | "setup_done" | "setup_failed" | "child_exited"
 	// RPC carries a session-RPC message the sandbox originated ("session_req")
 	// — a credential mint, say — which controld answers with a "session_rpc"
 	// back down. Session names which sandbox it came from; without it a
@@ -65,7 +69,10 @@ type SessionInfo struct {
 
 // ToRunner: controld → runnerd.
 type ToRunner struct {
-	Type    string  `json:"type"` // "create"|"destroy"|"suspend"|"resume"|"snapshot"|"prepull"|"dial_attach"|"session_rpc"
+	// "destroy" is the whole teardown (container + workspace);
+	// "remove_workspace" takes only the volume, for a session whose container
+	// the crash path already removed and whose workspace it deliberately kept.
+	Type    string  `json:"type"` // "create"|"destroy"|"remove_workspace"|"suspend"|"resume"|"snapshot"|"prepull"|"dial_attach"|"session_rpc"
 	ReqID   uint64  `json:"req_id,omitempty"`
 	Session string  `json:"session,omitempty"`
 	Spec    *Spec   `json:"spec,omitempty"`   // create

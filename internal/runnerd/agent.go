@@ -265,6 +265,21 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 		// simply arrived after some other path already had.
 		ok := err == nil || errors.Is(err, errNoSuchSession)
 		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: ok, Detail: errTextUnless(err, errNoSuchSession)})
+	case "remove_workspace":
+		// The reclaim controld sends after a session it holds is explicitly
+		// removed — including a crash-dead one, whose container went long ago
+		// and whose volume the crash path deliberately kept. It names a
+		// SESSION, not a handle, for exactly that reason.
+		//
+		// An absent volume is an ok result, not a failure: controld sends this
+		// on every explicit rm, including the ones where the destroy that ran
+		// first already took it. controld doesn't wait on the answer either
+		// (req_id 0), so this result exists to be logged, not correlated.
+		err := s.RemoveWorkspace(ctx, m.Session)
+		if err != nil {
+			log.Printf("agent: remove_workspace for %s: %v", m.Session, err)
+		}
+		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: errText(err)})
 	case "dial_attach":
 		// Deliberately not in a goroutine of its own: agentSession's read
 		// loop already runs one execute per inbound command precisely so a

@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -146,8 +147,12 @@ type session struct {
 	// still queued — controld derives it per request, so it is never stale.
 	Environment string `json:"environment"`
 	QueueReason string `json:"queue_reason"`
-	CreatedAt   string `json:"created_at"`
-	UpdatedAt   string `json:"updated_at"`
+	// ChildExitCode is the exit status of the session's agent process, null
+	// until it has one. A pointer because exit 0 is an answer: a session whose
+	// agent finished cleanly must not render the same as one still working.
+	ChildExitCode *int   `json:"child_exit_code"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
 }
 
 type sessionEnvelope struct {
@@ -641,15 +646,27 @@ func runLs(args []string) error {
 	return w.Flush()
 }
 
-// sessionStateCell renders the STATE column: the state alone, plus the reason
-// a queued session is still queued when controld gave one. "queued" by itself
-// invites the wrong question ("is it broken?"); "queued (waiting for runner
-// rainier-gpu)" answers it in the same glance.
+// sessionStateCell renders the STATE column: the state alone, plus whatever
+// the state alone leaves unanswered.
+//
+// "queued" by itself invites the wrong question ("is it broken?"); "queued
+// (waiting for runner rainier-gpu)" answers it in the same glance. "running"
+// has the same problem once the agent inside has finished: the session IS
+// still up — attachable, holding its slot — and nothing is ever going to
+// print in it again, so "running (exited 0)" is what the row actually means.
+//
+// The two annotations are mutually exclusive in practice (a queued session
+// has no agent to have exited) and the queue reason wins if they ever meet:
+// it explains why nothing is happening, which is the more urgent of the two.
 func sessionStateCell(s session) string {
-	if s.QueueReason == "" {
+	switch {
+	case s.QueueReason != "":
+		return s.State + " (" + s.QueueReason + ")"
+	case s.ChildExitCode != nil:
+		return s.State + " (exited " + strconv.Itoa(*s.ChildExitCode) + ")"
+	default:
 		return s.State
 	}
-	return s.State + " (" + s.QueueReason + ")"
 }
 
 // dashIfEmpty renders an empty column value as "-", so a scratch session's

@@ -69,8 +69,12 @@ func (f *Fake) hasVolume(name string) bool {
 	return f.volumes[name]
 }
 
-// volumeNames returns every live workspace volume name, sorted.
-func (f *Fake) volumeNames() []string {
+// Volumes returns every live workspace volume name, sorted. Exported — like
+// Pulls and Strips, and unlike this fake's other accessors — because the
+// packages whose behavior this models live elsewhere: runnerd's crash tests
+// assert that a container's death did NOT take a volume, and above the driver
+// this record is the only place that fact is observable at all.
+func (f *Fake) Volumes() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Sorted(maps.Keys(f.volumes))
@@ -222,16 +226,47 @@ func (f *Fake) Strips() [][]string {
 	}
 	return out
 }
-func (f *Fake) Destroy(_ context.Context, id string) error {
+
+// Destroy is the whole teardown: the container AND the session's volume, in
+// that order, exactly as in the docker driver. Suspend/Resume deliberately
+// don't touch the volume, so this and RemoveWorkspace are the only two places
+// a workspace disappears.
+func (f *Fake) Destroy(ctx context.Context, id string) error {
+	f.mu.Lock()
+	sessionID := ""
+	if it, ok := f.items[id]; ok {
+		sessionID = it.sessionID
+	}
+	f.mu.Unlock()
+
+	if err := f.DestroyContainer(ctx, id); err != nil {
+		return err
+	}
+	return f.RemoveWorkspace(ctx, sessionID)
+}
+
+// DestroyContainer removes the item and leaves its volume in place — the
+// fake's model of the crash path. Getting this right in the FAKE is what
+// makes runnerd's crash tests worth running: they assert on nothing but what
+// this records, so a fake that dropped the volume here would go green against
+// precisely the bug the split exists to prevent.
+func (f *Fake) DestroyContainer(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	// The session's volume goes with the session, exactly as in the docker
-	// driver — Suspend/Resume deliberately don't touch it, so this is the only
-	// place a workspace disappears.
-	if it, ok := f.items[id]; ok && it.volume != "" {
-		delete(f.volumes, it.volume)
-	}
 	delete(f.items, id)
+	return nil
+}
+
+// RemoveWorkspace releases the volume named for sessionID, tolerating one
+// that was never there — the docker driver's `volume rm -f`, and the same
+// no-op for an empty id (see driver.Driver.RemoveWorkspace).
+func (f *Fake) RemoveWorkspace(_ context.Context, sessionID string) error {
+	if sessionID == "" {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.volumes, workspaceVolume(sessionID))
 	return nil
 }
 func (f *Fake) Inspect(_ context.Context, id string) (Handle, error) {

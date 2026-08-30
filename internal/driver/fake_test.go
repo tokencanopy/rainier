@@ -32,7 +32,7 @@ func TestFakeRecordsWorkspaceVolumeAndEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !f.hasVolume("rainier-ws-sess-a") {
-		t.Fatalf("Create recorded no workspace volume: %v", f.volumeNames())
+		t.Fatalf("Create recorded no workspace volume: %v", f.Volumes())
 	}
 	if got := f.envFor(h.ID); !reflect.DeepEqual(got, map[string]string{"FOO": "bar"}) {
 		t.Errorf("recorded env = %v, want FOO=bar", got)
@@ -58,7 +58,43 @@ func TestFakeRecordsWorkspaceVolumeAndEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	if f.hasVolume("rainier-ws-sess-a") {
-		t.Errorf("Destroy left the workspace volume behind: %v", f.volumeNames())
+		t.Errorf("Destroy left the workspace volume behind: %v", f.Volumes())
+	}
+}
+
+// TestFakeDestroyContainerKeepsTheWorkspace is the fake's half of the crash
+// path. runnerd's crash tests run against this driver and assert on nothing
+// but what it records, so if the fake dropped the volume here those tests
+// would go green against exactly the bug they exist to catch: a container
+// death taking a user's workspace with it.
+func TestFakeDestroyContainerKeepsTheWorkspace(t *testing.T) {
+	f := NewFake(4)
+	ctx := context.Background()
+
+	h, err := f.Create(ctx, Spec{SessionID: "sess-crash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.DestroyContainer(ctx, h.ID); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := f.Inspect(ctx, h.ID); g.State != StateGone {
+		t.Fatalf("state after DestroyContainer = %s, want gone", g.State)
+	}
+	if !f.hasVolume("rainier-ws-sess-crash") {
+		t.Fatalf("DestroyContainer dropped the workspace volume: %v", f.Volumes())
+	}
+	// The container is gone, so its capacity slot is back — that is the whole
+	// reason the crash path destroys anything at all.
+	if used, _, _ := f.Capacity(ctx); used != 0 {
+		t.Fatalf("used after DestroyContainer = %d, want 0", used)
+	}
+
+	if err := f.RemoveWorkspace(ctx, "sess-crash"); err != nil {
+		t.Fatal(err)
+	}
+	if f.hasVolume("rainier-ws-sess-crash") {
+		t.Fatalf("RemoveWorkspace left the volume behind: %v", f.Volumes())
 	}
 }
 
@@ -86,7 +122,7 @@ func TestFakeNoSessionIDNoVolume(t *testing.T) {
 	if _, err := f.Create(context.Background(), Spec{}); err != nil {
 		t.Fatal(err)
 	}
-	if names := f.volumeNames(); len(names) != 0 {
+	if names := f.Volumes(); len(names) != 0 {
 		t.Errorf("id-less create recorded volumes %v, want none", names)
 	}
 }

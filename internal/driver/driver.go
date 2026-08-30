@@ -135,7 +135,41 @@ type Driver interface {
 	// the answer, and a failure costs nothing worse than the slow create the
 	// prepull was trying to avoid.
 	Prepull(ctx context.Context, ref string) error
+	// Destroy removes the container AND the session's workspace volume: the
+	// whole teardown, for the path where a user asked for the session to stop
+	// existing (`rainier rm`). It is DestroyContainer followed by
+	// RemoveWorkspace, and it is the only one of the three that takes a
+	// workspace away as a side effect of removing a container.
 	Destroy(ctx context.Context, id string) error
+	// DestroyContainer removes the container and NOTHING else — the session's
+	// workspace volume survives.
+	//
+	// This is the crash path. When a container dies on its own, runnerd
+	// removes what is left of it to reclaim the capacity slot, and that
+	// removal is not a user asking for their files to be thrown away: a
+	// crashed session is precisely the case someone most wants their work
+	// back from, and /workspace is where every hour of it lives. Before the
+	// split, that path called Destroy — the same call `rainier rm` makes —
+	// so a container dying quietly took the workspace with it.
+	//
+	// The two are separate METHODS rather than a flag because the difference
+	// is not a parameter of one operation, it is which of two operations the
+	// caller means; a boolean would put "delete the user's work" one inverted
+	// condition away from "reclaim a slot".
+	DestroyContainer(ctx context.Context, id string) error
+	// RemoveWorkspace removes sessionID's workspace volume
+	// (rainier-ws-<sessionID>), the second act of an explicit teardown after
+	// a crash deliberately kept it. It takes the SESSION id, not a driver
+	// handle, because by the time anything wants a kept workspace gone the
+	// container that could have named it is long gone.
+	//
+	// An absent volume is success, not an error: every caller is a teardown
+	// path that may be running second (a full Destroy already took it, a
+	// reconcile got there first, an rm was retried), and failing there would
+	// turn a completed teardown into a reported failure. An empty sessionID
+	// is a no-op — "rainier-ws-" alone is a real volume name, and no driver
+	// may be talked into removing whatever is under it.
+	RemoveWorkspace(ctx context.Context, sessionID string) error
 	Inspect(ctx context.Context, id string) (Handle, error)
 	Capacity(ctx context.Context) (used, total int, err error)
 	// List returns every rainier-labeled resource, in any state (running,

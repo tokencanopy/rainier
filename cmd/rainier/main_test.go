@@ -224,6 +224,26 @@ func TestSessionStateCell(t *testing.T) {
 			session{State: "queued", QueueReason: "waiting for runner rainier-gpu"},
 			"queued (waiting for runner rainier-gpu)",
 		},
+		{
+			// The session is still up — attachable, holding its slot — and the
+			// agent inside it has finished. "running" alone would leave a user
+			// watching a session that is never going to print anything again.
+			"running with a finished agent",
+			session{State: "running", ChildExitCode: intPtr(0)},
+			"running (exited 0)",
+		},
+		{
+			"running with a killed agent",
+			session{State: "running", ChildExitCode: intPtr(137)},
+			"running (exited 137)",
+		},
+		{
+			// A dead session's exit code is the diagnosis, and `ls --all` is
+			// where it is read.
+			"dead with an exit code",
+			session{State: "dead", ChildExitCode: intPtr(1)},
+			"dead (exited 1)",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -233,6 +253,9 @@ func TestSessionStateCell(t *testing.T) {
 		})
 	}
 }
+
+// intPtr is the one-liner a nullable int column needs at a test's call site.
+func intPtr(n int) *int { return &n }
 
 // TestDashIfEmpty pins the ENV column's empty rendering: a scratch session has
 // no environment, and a blank cell reads as a bug rather than as an answer.

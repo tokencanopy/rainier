@@ -1208,6 +1208,88 @@ func TestSetupFailedFailsTheSession(t *testing.T) {
 	}
 }
 
+// TestChildExitedRecordsTheExitCode pins the third event arm: the agent
+// process inside a session finished, and its exit status is the one fact
+// about a session that nothing else in the fleet can supply. It is an
+// OBSERVATION — the session is still running, still attachable, still holding
+// its slot — so it writes a column and moves no state machine.
+func TestChildExitedRecordsTheExitCode(t *testing.T) {
+	t.Run("records the code and leaves the session running", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		seedSession(t, st, Session{ID: "sess_exit", State: StateRunning, Runner: "vm1"})
+
+		f.eventDetail(t, "sess_exit", "child_exited", "137")
+		eventually(t, 3*time.Second, func() error {
+			got := getSession(t, st, "sess_exit")
+			if got.ChildExitCode == nil {
+				return fmt.Errorf("child exit code not recorded yet")
+			}
+			if *got.ChildExitCode != 137 {
+				return fmt.Errorf("child exit code = %d, want 137", *got.ChildExitCode)
+			}
+			return nil
+		})
+		if got := getSession(t, st, "sess_exit"); got.State != StateRunning {
+			t.Fatalf("state = %q after child_exited, want running — an exited agent leaves the session up for viewers", got.State)
+		}
+	})
+
+	t.Run("exit 0 is a recorded answer, not an absence", func(t *testing.T) {
+		// The failure this guards is a `if code != 0` anywhere on the path:
+		// a clean finish would then be indistinguishable from an agent still
+		// working, which is the single most common case there is.
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		seedSession(t, st, Session{ID: "sess_exit_zero", State: StateRunning, Runner: "vm1"})
+
+		f.eventDetail(t, "sess_exit_zero", "child_exited", "0")
+		eventually(t, 3*time.Second, func() error {
+			got := getSession(t, st, "sess_exit_zero")
+			if got.ChildExitCode == nil {
+				return fmt.Errorf("exit 0 not recorded")
+			}
+			if *got.ChildExitCode != 0 {
+				return fmt.Errorf("child exit code = %d, want 0", *got.ChildExitCode)
+			}
+			return nil
+		})
+	})
+
+	t.Run("from a runner the session is not placed on, ignored", func(t *testing.T) {
+		// Same guard as the setup arms, for the same reason: the runner token
+		// is fleet-wide, so without it any runner could stamp any session with
+		// any exit code.
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		seedSession(t, st, Session{ID: "sess_exit_elsewhere", State: StateRunning, Runner: "vm2"})
+
+		f.eventDetail(t, "sess_exit_elsewhere", "child_exited", "1")
+		wantEventHandled(t, st, f, "sess_sync_exit_e")
+
+		if got := getSession(t, st, "sess_exit_elsewhere"); got.ChildExitCode != nil {
+			t.Fatalf("child exit code = %d, recorded from a runner the session is not placed on", *got.ChildExitCode)
+		}
+	})
+
+	t.Run("an unparseable code is dropped, not guessed at", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		seedSession(t, st, Session{ID: "sess_exit_junk", State: StateRunning, Runner: "vm1"})
+
+		f.eventDetail(t, "sess_exit_junk", "child_exited", "not a number")
+		wantEventHandled(t, st, f, "sess_sync_exit_j")
+
+		got := getSession(t, st, "sess_exit_junk")
+		if got.ChildExitCode != nil {
+			t.Fatalf("child exit code = %d from an undecodable detail; 0 would read as a clean exit", *got.ChildExitCode)
+		}
+		if got.State != StateRunning {
+			t.Fatalf("state = %q, want running (untouched)", got.State)
+		}
+	})
+}
+
 // TestSetupEventsFromANonPlacedRunnerAreIgnored pins the placement guard on
 // both setup arms. The fleet token is one token: without this, any runner
 // could fail any session, or publish its own container's image as any
