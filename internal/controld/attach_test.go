@@ -40,7 +40,11 @@ func newAttachControld(t *testing.T, opts ...func(*Config)) (*Server, Store, *ht
 		RunnerToken: testRunnerToken,
 		ExternalURL: "http://" + ts.Listener.Addr().String(),
 		SecretsKey:  testSecretsKey,
-		OpTimeout:   2 * time.Second,
+		// Matching newTestControld's, and for the same reason: no test built on
+		// this helper asserts an OpTimeout, so a tight one is only a stopwatch
+		// over a websocket round trip. The attach tests that DO measure
+		// something measure AttachWait, which they pass explicitly.
+		OpTimeout: 10 * time.Second,
 	}
 	for _, o := range opts {
 		o(&cfg)
