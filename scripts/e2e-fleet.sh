@@ -705,12 +705,19 @@ ok "created the throwaway private repository $SCRATCH_SLUG on $GH_BASE (deleted 
 # lets it do something no setup script could: read the repository's own git
 # history. A marker that carries a commit hash out of the working tree is proof
 # of the ordering, not just of the hook.
+#
+# Its LAST act is to publish that marker inside a directory, which is what the
+# readiness gate below waits on: a directory is something the host can ask for
+# over `rainier pull` without attaching, and copying it last means its
+# existence says "the init stage finished", not "the init stage started".
 cat > "$GH_INIT_FILE" <<EOF
 #!/bin/sh
 set -eu
 git -C /workspace/$SCRATCH_REPO log -1 --format='init-sees-commit=%h' > /workspace/init-marker
 git -C /workspace/$SCRATCH_REPO rev-parse --abbrev-ref HEAD >> /workspace/init-marker
 echo init-ran >> /workspace/init-marker
+mkdir -p /workspace/init-done
+cp /workspace/init-marker /workspace/init-done/marker
 EOF
 
 GH_ENV_ID=$(./bin/rainier env create "$GH_ENV_NAME" \
@@ -734,11 +741,25 @@ session_error() {
 
 # "running" fires when sessiond REGISTERS, which is before the boot chain has
 # run — the clone and the init hook both happen ahead of the agent. So the wait
-# is for the chain to have finished (the diff endpoint answers only once the
-# clone is on disk) or for the session to have failed one of its stages.
+# is for the chain to have FINISHED, or for the session to have failed one of
+# its stages.
+#
+# Finished means INIT, not clone, and the difference is the next assertion:
+# it reads /workspace/init-marker, which the init stage writes. This gate used
+# to be `rainier diff`, which answers as soon as the CLONE is on disk — a stage
+# too early. It never went wrong only because the agent is exec'd after init,
+# so the attach probe could not get a shell prompt any sooner and the typed
+# line sat in the tty buffer meanwhile; that is an accident of the boot chain,
+# not a guarantee, and anything that read stdin during init would swallow the
+# command and time the probe out instead.
+#
+# A pull of the directory the hook publishes last is the version with no race
+# in it, and it needs no attach.
+GH_INIT_PULL=/tmp/rainier-e2e-gh-init
 gh_boot_settled() {
   [ "$(state_of "$GH_SID")" = failed ] && return 0
-  ./bin/rainier diff "$GH_SID" >/dev/null 2>&1
+  rm -rf "$GH_INIT_PULL"
+  ./bin/rainier pull "$GH_SID:/workspace/init-done" "$GH_INIT_PULL" >/dev/null 2>&1
 }
 waitfor '[ "$(state_of "$GH_SID")" = running ] || [ "$(state_of "$GH_SID")" = failed ]' 120 "the session to be placed" \
   || fail "$GH_SID never left queued/creating; see $CONTROLD_LOG and /tmp/runnerd.log"
@@ -747,7 +768,9 @@ waitfor gh_boot_settled 300 "the boot chain (clone, then init)" \
 if [ "$(state_of "$GH_SID")" = failed ]; then
   fail "the session failed its boot chain: $(session_error "$GH_SID")"
 fi
-ok "session $GH_SID booted with the repository cloned"
+grep -q 'init-sees-commit=' "$GH_INIT_PULL/marker" \
+  || fail "the init marker pulled out of the session does not carry a commit hash: $(cat "$GH_INIT_PULL/marker" 2>&1)"
+ok "session $GH_SID booted with the repository cloned and the init stage finished"
 
 # --- what the clone and the init hook actually did, from inside the session.
 GH_ATTACH1=/tmp/rainier-e2e-gh-attach1.txt
@@ -791,9 +814,20 @@ ok "GitHub attributes the pushed commit to $GH_ACCOUNT <$GH_NOREPLY> on $GH_BRAN
 # value: putting the real token into a command line would write it into this
 # session's scrollback and into a file under /tmp, which is exactly the leak
 # the design exists to prevent.
+#
+# `find -type f | xargs grep`, not `grep -r`, for the workspace sweep. Two
+# reasons, and the first is that `grep -r /workspace` walks
+# /workspace/.rainier/agent.sock and open()s it: the count stays 0 because -l
+# prints nothing for a file it could not read, which is the right answer
+# arrived at by luck. The second is coverage — the alternative fix,
+# --exclude-dir=.rainier, is a GNU option BusyBox grep does not have (this
+# image is alpine, so `grep --exclude-dir` exits 2 with a usage message that
+# 2>/dev/null would hide, turning the whole probe into a silent 0), and it
+# would skip the workspace gitconfig, which is precisely the file a leaked
+# token would be written into.
 GH_ATTACH3=/tmp/rainier-e2e-gh-attach3.txt
 attach_probe "$GH_SID" \
-  "printf 'cfg-hits=%s ws-hits=%s env-hits=%s\n' \"\$(grep -r -l -E 'gh[pousr]_[A-Za-z0-9]|github_pat_' /workspace/$SCRATCH_REPO/.git 2>/dev/null | wc -l | tr -d ' ')\" \"\$(grep -r -l -E 'gh[pousr]_[A-Za-z0-9]|github_pat_' /workspace 2>/dev/null | wc -l | tr -d ' ')\" \"\$(env | grep -c -E 'gh[pousr]_[A-Za-z0-9]|github_pat_' || true)\"" \
+  "printf 'cfg-hits=%s ws-hits=%s env-hits=%s\n' \"\$(grep -r -l -E 'gh[pousr]_[A-Za-z0-9]|github_pat_' /workspace/$SCRATCH_REPO/.git 2>/dev/null | wc -l | tr -d ' ')\" \"\$(find /workspace -type f | xargs grep -l -E 'gh[pousr]_[A-Za-z0-9]|github_pat_' 2>/dev/null | wc -l | tr -d ' ')\" \"\$(env | grep -c -E 'gh[pousr]_[A-Za-z0-9]|github_pat_' || true)\"" \
   "$GH_ATTACH3" 'cfg-hits=[0-9]+ ws-hits=[0-9]+ env-hits=[0-9]+' 60 \
   || { echo "--- attach output ---"; cat -v "$GH_ATTACH3"; echo "---------------------"; \
        fail "the session never answered the token-hygiene probe"; }
@@ -839,6 +873,68 @@ diff -r "$PP_SRC" "$PP_DST" >/tmp/rainier-e2e-xfer-diff.txt 2>&1 \
   || fail "run.sh came back without its executable bit"
 ok "push/pull round-tripped a directory (nested, binary, empty dir, executable bit) laptop↔session"
 
+# --- the failure half: design criterion 3, which is the one the vault exists
+# for and the only one every other assertion in this phase skips.
+#
+# "A revoked or expired GitHub credential surfaces as a clear, NAMED ACTION
+# within ONE FAILED OPERATION." Both halves are asserted below, and the second
+# is the one with teeth: a refused mint makes the credential helper print
+# controld's sentence and exit 1, and git's own answer to a helper that
+# produced no credential is to fall through and prompt — on the session's PTY,
+# where it blocks. That failure looks like the clone stage running for its
+# whole 600s-per-repo bound and then reporting "clone timed out", with the
+# named action nowhere in the tail. So the wait below is deliberately far
+# shorter than that bound: a slow failure here is a FAILED assertion, not a
+# slow test.
+#
+# The credential is flipped in the database rather than revoked on GitHub.
+# Revoking the operator's own token is not this script's to do — and `status`
+# is exactly what a revocation observed in the wild sets (the
+# credential_rejected path), so the session under test cannot tell the
+# difference.
+psql_e2e() { docker exec "$PG_CONTAINER" psql -U postgres -d "$PG_DB" -qtAc "$1"; }
+cred_status_row() { psql_e2e "SELECT status FROM credentials WHERE provider='github'" | tr -d ' \r'; }
+
+psql_e2e "UPDATE credentials SET status='needs_refresh' WHERE provider='github'" >/dev/null \
+  || setup_error "could not flip the stored github credential to needs_refresh"
+[ "$(cred_status_row)" = "needs_refresh" ] \
+  || setup_error "the stored credential is \"$(cred_status_row)\" after the flip; the rest of this scene would prove nothing"
+./bin/rainier creds > /tmp/rainier-e2e-gh-creds2.txt
+GH_CRED_STALE=$(cell github STATUS SCOPES < /tmp/rainier-e2e-gh-creds2.txt)
+[ "$GH_CRED_STALE" = "needs_refresh" ] \
+  || fail "rainier creds reports \"$GH_CRED_STALE\" for a credential the vault has flipped, want needs_refresh"
+
+# The create gate lets a STALE credential through on purpose (a missing one is
+# a 409; a stale one is not). The session is where the user finds out.
+GH_SID2=$(./bin/rainier new --detach --name "$GH_SESSION_NAME-stale" --env "$GH_ENV_NAME")
+case "$GH_SID2" in
+  sess_*) ;;
+  *) fail "new --env with a stale credential printed \"$GH_SID2\", want a sess_ id — a stale credential must not be a create-time refusal" ;;
+esac
+GH_STALE_START=$(date +%s)
+waitfor '[ "$(state_of "$GH_SID2")" = failed ]' 120 "the stale-credential session to fail" \
+  || fail "$GH_SID2 is \"$(state_of "$GH_SID2")\" 120s after a refused mint. A refused mint must fail the clone in seconds; if git is instead sitting on a terminal prompt it burns the whole 600s-per-repo clone bound and reports a timeout with no named action (check that the boot chain exports GIT_TERMINAL_PROMPT=0)."
+GH_STALE_SECS=$(( $(date +%s) - GH_STALE_START ))
+# Grepped out of the raw body rather than the extracted error: the error
+# column carries a 2KB tail of the session's own output, quotes and newlines
+# included, and session_error's sed stops at the first of either.
+GH_STALE_BODY=$(curl -sf -H "Authorization: Bearer $BEARER" "$CONTROLD_HTTP/v1/sessions/$GH_SID2")
+case "$GH_STALE_BODY" in
+  *"rainier login --refresh github"*) ;;
+  *) fail "the failed session's error does not name the action to run — the sentence must survive every hop verbatim: $(session_error "$GH_SID2")" ;;
+esac
+ok "a session created against a stale credential failed in ${GH_STALE_SECS}s, naming \`rainier login --refresh github\`"
+
+./bin/rainier rm "$GH_SID2" >/dev/null
+waitfor '[ -z "$(state_of "$GH_SID2")" ]' 60 "the stale-credential session to go" \
+  || fail "$GH_SID2 is still listed after rm"
+
+# Put the credential back the way this scene found it: a KEEP=1 stack, and
+# anything after this phase, should see the fleet it started with.
+psql_e2e "UPDATE credentials SET status='valid' WHERE provider='github'" >/dev/null \
+  || setup_error "could not restore the github credential to valid"
+[ "$(cred_status_row)" = "valid" ] || fail "the github credential was left as \"$(cred_status_row)\""
+
 # --- teardown of this phase's own state. The repository goes in cleanup, so it
 # is deleted whether or not everything above passed.
 ./bin/rainier rm "$GH_SID" >/dev/null
@@ -846,7 +942,7 @@ waitfor '[ -z "$(state_of "$GH_SID")" ]' 60 "the github session to go" \
   || fail "$GH_SID is still listed after rm"
 ./bin/rainier env rm "$GH_ENV_NAME" | grep -q removed || fail "env rm $GH_ENV_NAME"
 rm -f "$GH_INIT_FILE"
-rm -rf "$PP_SRC" "$PP_DST"
+rm -rf "$PP_SRC" "$PP_DST" "$GH_INIT_PULL"
 ok "github rehearsal session and environment removed"
 
 fi  # GH_PHASE
