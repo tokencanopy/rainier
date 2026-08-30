@@ -252,7 +252,37 @@ func prepareBoot(dir, root string, env bootEnv) ([]bootStage, []envVar, error) {
 		// the credential helper are as much the agent's as the clone stage's,
 		// and $HOME is not writable in the sandbox, so ~/.gitconfig is not an
 		// option (design §4.3).
-		vars = append(vars, envVar{Name: "GIT_CONFIG_GLOBAL", Value: path})
+		//
+		// The three that follow are one rule with three spellings: NOTHING in
+		// this sandbox may ask a human for a password. A refused mint (the
+		// vault says needs_refresh) makes the credential helper print
+		// controld's named action on stderr and exit 1 — and git's response to
+		// a helper that produced no credential is to fall through and prompt.
+		// The chain runs on the session's PTY (internal/session/proc.go sets
+		// Setsid/Setctty), so that prompt finds a real terminal and git BLOCKS:
+		// the clone stage would burn its whole 600s-per-repo bound and report
+		// "clone timed out" in place of the one sentence that says what to run,
+		// and the agent's own `git push` — which nothing bounds at all — would
+		// hang forever. With these exported, git dies in milliseconds with
+		// "terminal prompts disabled" on the line after the named action, and
+		// both land in the 2KB failure tail together.
+		//
+		//   - GIT_TERMINAL_PROMPT=0 is the prompt itself.
+		//   - GIT_ASKPASS="" is git's FIRST choice of prompter, consulted
+		//     before core.askPass and SSH_ASKPASS and before the terminal is
+		//     considered at all. Empty rather than absent is what matters: git
+		//     reads the variable's presence, so an empty value both disables
+		//     the askpass helper and shadows a core.askPass a user's own base
+		//     image might carry.
+		//   - SSH_ASKPASS="" for the same reason on the ssh side, which git
+		//     hands off to for an ssh:// remote and which this process does not
+		//     otherwise control.
+		vars = append(vars,
+			envVar{Name: "GIT_CONFIG_GLOBAL", Value: path},
+			envVar{Name: "GIT_TERMINAL_PROMPT", Value: "0"},
+			envVar{Name: "GIT_ASKPASS", Value: ""},
+			envVar{Name: "SSH_ASKPASS", Value: ""},
+		)
 	}
 
 	var stages []bootStage
