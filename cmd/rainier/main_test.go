@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -206,6 +207,37 @@ func TestResolveSessionIDNotFound(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `no session named "nope" found`) {
 		t.Fatalf("error = %q, want the not-found message", err.Error())
+	}
+}
+
+func TestAttachNameResolutionIncludesOnlyFailedTerminalRows(t *testing.T) {
+	ts := pagedSessions(t, map[string]sessionsEnvelope{
+		"": {Sessions: []session{
+			{ID: "sess_failed", Name: "diagnostic-box", OwnerID: "usr_synthetic", State: "failed"},
+			{ID: "sess_dead", Name: "diagnostic-box", OwnerID: "usr_synthetic", State: "dead"},
+			{ID: "sess_destroyed", Name: "diagnostic-box", OwnerID: "usr_synthetic", State: "destroyed"},
+		}},
+	})
+	id, err := resolveSessionIDWithScope(&cli.Client{Base: ts.URL}, "usr_synthetic", "diagnostic-box", resolveAttachable)
+	if err != nil {
+		t.Fatalf("resolve attachable name: %v", err)
+	}
+	if id != "sess_failed" {
+		t.Fatalf("resolved id = %q, want the failed diagnostic session", id)
+	}
+
+	live := pagedSessions(t, map[string]sessionsEnvelope{
+		"": {Sessions: []session{
+			{ID: "sess_own_failed", Name: "shared-box", OwnerID: "usr_synthetic", State: "failed"},
+			{ID: "sess_live", Name: "shared-box", OwnerID: "usr_teammate", State: "running"},
+		}},
+	})
+	id, err = resolveSessionIDWithScope(&cli.Client{Base: live.URL}, "usr_synthetic", "shared-box", resolveAttachable)
+	if err != nil {
+		t.Fatalf("resolve live attachable name: %v", err)
+	}
+	if id != "sess_live" {
+		t.Fatalf("resolved id = %q, want active row before failed fallback", id)
 	}
 }
 
@@ -1233,7 +1265,7 @@ func TestPrepareAttach(t *testing.T) {
 			case http.MethodGet:
 				gets++
 				state := "suspended_warm"
-				if gets > 1 {
+				if gets > 3 {
 					state = "running"
 				}
 				json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: state}})
@@ -1247,8 +1279,8 @@ func TestPrepareAttach(t *testing.T) {
 		if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach"); err != nil {
 			t.Fatalf("prepareAttach: %v", err)
 		}
-		if gets != 2 {
-			t.Fatalf("GET count = %d, want 2 (initial state plus convergence read)", gets)
+		if gets != 4 {
+			t.Fatalf("GET count = %d, want 4 (initial state plus delayed convergence)", gets)
 		}
 	})
 
@@ -1269,6 +1301,85 @@ func TestPrepareAttach(t *testing.T) {
 			t.Fatalf("prepareAttach error = %v, want the original resume failure", err)
 		}
 	})
+}
+
+func TestAttachWithRetryBacksOffTransientDisconnects(t *testing.T) {
+	requests := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		if requests < 3 {
+			c.Close(websocket.StatusGoingAway, "synthetic transient close")
+			return
+		}
+		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "exit", ExitCode: 0})
+	}))
+	defer ts.Close()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+	origStdin := os.Stdin
+	os.Stdin = stdinR
+	t.Cleanup(func() { os.Stdin = origStdin })
+
+	var delays []time.Duration
+	err = attachWithRetrySleep(cli.Config{ServerURL: ts.URL, Token: "rnr_synthetic"}, "sess_reconnect", 0, func(d time.Duration) {
+		delays = append(delays, d)
+	})
+	if err != nil {
+		t.Fatalf("attachWithRetrySleep: %v", err)
+	}
+	if !slices.Equal(delays, []time.Duration{100 * time.Millisecond, 200 * time.Millisecond}) {
+		t.Fatalf("reconnect delays = %v, want exponential [100ms 200ms]", delays)
+	}
+}
+
+func TestAttachWithRetryDoesNotRetryPolicyClose(t *testing.T) {
+	requests := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		c.Close(websocket.StatusPolicyViolation, "synthetic permanent close")
+	}))
+	defer ts.Close()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+	origStdin := os.Stdin
+	os.Stdin = stdinR
+	t.Cleanup(func() { os.Stdin = origStdin })
+
+	err = attachWithRetrySleep(cli.Config{ServerURL: ts.URL, Token: "rnr_synthetic"}, "sess_reconnect", 0, func(time.Duration) {})
+	if err == nil || websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
+		t.Fatalf("error = %v, want policy close", err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want one attempt for a permanent close", requests)
+	}
 }
 
 // TestAttachWithRetryReconnectsFromTheRenderedCursor crosses the real

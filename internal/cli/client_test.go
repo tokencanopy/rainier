@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,6 +26,23 @@ import (
 	"rainier/internal/wire"
 	"rainier/internal/xfer"
 )
+
+func TestDoContextCancelsAStalledRequest(t *testing.T) {
+	started := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := (&Client{Base: ts.URL}).DoContext(ctx, http.MethodGet, "/v1/sessions/sess_synthetic", nil, nil)
+	<-started
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DoContext error = %v, want context deadline exceeded", err)
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Config round-trip

@@ -18,8 +18,10 @@ package attachio
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -202,6 +204,10 @@ func ScanDetach(buf []byte) int {
 // immediately after create) should match on that sentinel rather than
 // inspecting error text.
 func Run(ctx context.Context, wsURL string, header http.Header, since uint64) (Outcome, error) {
+	return runWithIO(ctx, wsURL, header, since, os.Stdin, os.Stdout)
+}
+
+func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint64, stdin *os.File, stdout io.Writer) (Outcome, error) {
 	var opts *websocket.DialOptions
 	if header != nil {
 		opts = &websocket.DialOptions{HTTPHeader: header}
@@ -225,7 +231,6 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) (O
 	// is deferred to Plan 2.
 	c.SetReadLimit(attachReadLimit)
 
-	stdin, stdout := os.Stdin, os.Stdout
 	fd := int(stdin.Fd())
 	isTTY := term.IsTerminal(fd)
 
@@ -236,6 +241,13 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) (O
 	// that case.
 	restore := func() {}
 	if isTTY {
+		// The WebSocket dial happens while the terminal is still in cooked mode.
+		// Drop anything queued during that gap only after the connection is ready,
+		// immediately before this attempt takes input ownership. Otherwise a line
+		// typed at a reconnect notice can execute remotely after recovery.
+		if err := discardPendingInput(stdin); err != nil {
+			return Outcome{}, err
+		}
 		oldState, err := term.MakeRaw(fd)
 		if err != nil {
 			return Outcome{}, err
@@ -278,12 +290,11 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) (O
 	}
 
 	var lastSeq atomic.Uint64
-	if since != wire.SinceAll {
-		// If the connection drops before its first frame, resume from the
-		// caller's actual cursor rather than inventing zero. A snapshot/output
-		// frame replaces this as soon as one is rendered.
-		lastSeq.Store(since)
-	}
+	// If the connection drops before its first frame, resume from the caller's
+	// actual cursor rather than inventing zero. That includes SinceAll: changing
+	// the sentinel to zero would silently turn a requested full-log replay into
+	// a current-screen snapshot. A fully rendered frame replaces this value.
+	lastSeq.Store(since)
 	// decided/claim together decide which of the reader/stdin
 	// goroutines gets to own Run's outcome — exactly one of them prints its
 	// status line and unblocks Run, whichever notices its end condition
@@ -318,23 +329,38 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) (O
 				if !claim() {
 					return
 				}
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					finish(Outcome{}, ctxErr)
+					return
+				}
+				if !retryableWebSocketReadError(err) {
+					finish(Outcome{LastSeq: lastSeq.Load()}, fmt.Errorf("terminal connection closed: %w", err))
+					return
+				}
 				stdoutMu.Lock()
 				restore()
 				seq := lastSeq.Load()
 				fmt.Fprintf(stdout, "\r\n[connection lost at seq %d]\r\n", seq)
 				stdoutMu.Unlock()
-				if ctxErr := ctx.Err(); ctxErr != nil {
-					finish(Outcome{}, ctxErr)
-				} else {
-					finish(Outcome{Reason: Disconnected, LastSeq: seq}, nil)
-				}
+				finish(Outcome{Reason: Disconnected, LastSeq: seq}, nil)
 				return
 			}
 			switch m.Type {
 			case "snapshot", "output":
 				stdoutMu.Lock()
 				if !decided.Load() {
-					stdout.Write(m.Data)
+					n, writeErr := stdout.Write(m.Data)
+					if writeErr == nil && n != len(m.Data) {
+						writeErr = io.ErrShortWrite
+					}
+					if writeErr != nil {
+						if claim() {
+							restore()
+							finish(Outcome{LastSeq: lastSeq.Load()}, fmt.Errorf("writing terminal output: %w", writeErr))
+						}
+						stdoutMu.Unlock()
+						return
+					}
 					if m.Seq > 0 {
 						lastSeq.Store(m.Seq)
 					}
@@ -410,6 +436,31 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) (O
 		resizeWG.Wait()
 	}
 	return r.out, r.err
+}
+
+func retryableWebSocketReadError(err error) bool {
+	var syntaxErr *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
+		return false
+	}
+	switch websocket.CloseStatus(err) {
+	case -1, websocket.StatusNoStatusRcvd, websocket.StatusAbnormalClosure,
+		websocket.StatusGoingAway, websocket.StatusInternalError,
+		websocket.StatusServiceRestart, websocket.StatusTryAgainLater,
+		websocket.StatusBadGateway:
+		return true
+	default:
+		return false
+	}
+}
+
+func discardPendingInput(stdin *os.File) error {
+	fd := int(stdin.Fd())
+	if !term.IsTerminal(fd) {
+		return nil
+	}
+	return flushTTYInput(fd)
 }
 
 const stdinPollInterval = 100 * time.Millisecond

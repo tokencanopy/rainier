@@ -1,9 +1,20 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
 	"math"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"rainier/internal/cli"
 )
 
 func TestSummarizeReportsCenterSpreadAndInterpolatedTail(t *testing.T) {
@@ -46,6 +57,111 @@ func TestSummarizeReportsCenterSpreadAndInterpolatedTail(t *testing.T) {
 		if values[i] != want {
 			t.Fatalf("values mutated at %d: got %s want %s", i, values[i], want)
 		}
+	}
+}
+
+func TestSummarizeRequiresP95StrictlyBelowTarget(t *testing.T) {
+	got := summarize("terminal_rtt", []time.Duration{75 * time.Millisecond}, 75*time.Millisecond)
+	if got.Pass == nil || *got.Pass {
+		t.Fatalf("pass = %v at equality, want false because the target is strictly under 75ms", got.Pass)
+	}
+}
+
+func TestWaitRunningCancelsAStalledPoll(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	started := time.Now()
+	_, err := waitRunning(context.Background(), &cli.Client{Base: ts.URL}, "sess_synthetic", 50*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitRunning error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("waitRunning returned after %s, want prompt cancellation", elapsed)
+	}
+}
+
+func TestPublicFailureDoesNotExposeSessionOrServerDetails(t *testing.T) {
+	err := errors.New(`waiting for running state: Get "https://private.invalid/v1/sessions/sess_secret": context deadline exceeded`)
+	got := publicFailure(err)
+	for _, secret := range []string{"private.invalid", "/v1/sessions", "sess_secret"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("publicFailure = %q, leaked %q", got, secret)
+		}
+	}
+	if got != "waiting for running state" {
+		t.Fatalf("publicFailure = %q, want the allowlisted safe operation", got)
+	}
+}
+
+func TestPublicFailureHidesUnknownErrors(t *testing.T) {
+	got := publicFailure(errors.New(`/private/internal/path: request failed for sess_secret`))
+	if got != "operation failed" {
+		t.Fatalf("publicFailure = %q, want generic fallback for an unknown error", got)
+	}
+}
+
+func TestPublicFailureReportsOnlyAllowlistedAPICode(t *testing.T) {
+	err := fmt.Errorf("preflighting synthetic session name: %w", &cli.APIError{Code: "invalid_request", Message: "mentions sess_secret at private.invalid"})
+	got := publicFailure(err)
+	if got != "preflighting synthetic session name (API invalid_request)" {
+		t.Fatalf("publicFailure = %q, want safe operation and code", got)
+	}
+	if strings.Contains(got, "sess_secret") || strings.Contains(got, "private.invalid") {
+		t.Fatalf("publicFailure leaked API message: %q", got)
+	}
+}
+
+func TestMeasureSampleFallsBackToNameCleanupBeforeCreateAck(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"sessions":[]}`)
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	binary := filepath.Join(dir, "synthetic-rainier")
+	script := "#!/bin/sh\nif [ \"$1\" = \"rm\" ]; then printf '%s\\n' \"$*\" >> \"$RAINIER_TEST_LOG\"; fi\n"
+	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("RAINIER_TEST_LOG", logPath)
+
+	err := measureSample(context.Background(), options{Rainier: binary, Image: "synthetic.invalid/image", Timeout: time.Second}, &cli.Client{Base: ts.URL}, 1, func(string, int, time.Duration) error { return nil })
+	if err == nil {
+		t.Fatal("measureSample: want missing create acknowledgement error")
+	}
+	data, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatalf("read cleanup log: %v", readErr)
+	}
+	got := string(data)
+	if !strings.HasPrefix(got, "rm latency-test-") {
+		t.Fatalf("cleanup call = %q, want name-based rm fallback", got)
+	}
+}
+
+func TestEnsureNameAvailableFiltersAndPaginatesClientSide(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("cursor") == "page2" {
+			io.WriteString(w, `{"sessions":[{"id":"sess_collision","name":"latency-test-collision"}]}`)
+			return
+		}
+		// Model an older server that ignores the exact-name filter and returns
+		// unrelated rows; the client must not mistake these for a collision.
+		io.WriteString(w, `{"sessions":[{"id":"sess_unrelated","name":"other-synthetic"}],"next_cursor":"page2"}`)
+	}))
+	defer ts.Close()
+	c := &cli.Client{Base: ts.URL}
+	if err := ensureNameAvailable(context.Background(), c, "latency-test-free", time.Second); err != nil {
+		t.Fatalf("unrelated paginated rows: %v", err)
+	}
+	if err := ensureNameAvailable(context.Background(), c, "latency-test-collision", time.Second); err == nil {
+		t.Fatal("ensureNameAvailable: want exact collision from page 2")
 	}
 }
 

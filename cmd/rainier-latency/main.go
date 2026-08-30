@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -124,14 +126,14 @@ func main() {
 	}
 	for warmup := 1; warmup <= o.Warmups; warmup++ {
 		if err := measureSample(ctx, o, client, warmup, func(string, int, time.Duration) error { return nil }); err != nil {
-			fmt.Fprintf(os.Stderr, "rainier-latency: warm-up %d failed: %v\n", warmup, err)
+			fmt.Fprintf(os.Stderr, "rainier-latency: warm-up %d failed: %s\n", warmup, publicFailure(err))
 			os.Exit(1)
 		}
 	}
 
 	for sample := 1; sample <= o.Samples; sample++ {
 		if err := measureSample(ctx, o, client, sample, record); err != nil {
-			fmt.Fprintf(os.Stderr, "rainier-latency: sample %d failed: %v\n", sample, err)
+			fmt.Fprintf(os.Stderr, "rainier-latency: sample %d failed: %s\n", sample, publicFailure(err))
 			os.Exit(1)
 		}
 	}
@@ -159,13 +161,31 @@ func main() {
 type recordFunc func(metric string, sample int, d time.Duration) error
 
 func measureSample(ctx context.Context, o options, client *cli.Client, sample int, record recordFunc) (retErr error) {
+	sampleCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	suffix, err := randomHex(6)
 	if err != nil {
 		return fmt.Errorf("creating a synthetic session name: %w", err)
 	}
 	name := "latency-test-" + suffix
+	if err := ensureNameAvailable(sampleCtx, client, name, o.Timeout); err != nil {
+		cancel()
+		return fmt.Errorf("preflighting synthetic session name: %w", err)
+	}
 
-	created, err := startTerminal(ctx, o.Timeout, o.Rainier, "new", "--name", name, "--image", o.Image)
+	// The name is a safe cleanup handle before `rainier new` can acknowledge
+	// its id. Once the id arrives, prefer that exact handle. This defer is
+	// installed before the subprocess starts so interrupted/broken stdout cannot
+	// strand a server-side create.
+	cleanupRef := name
+	defer func() {
+		cancel()
+		cleanupErr := runCLI(context.Background(), o.Timeout, o.Rainier, "rm", cleanupRef)
+		if cleanupErr != nil && retErr == nil {
+			retErr = errors.New("synthetic session cleanup failed")
+		}
+	}()
+	created, err := startTerminal(sampleCtx, o.Timeout, o.Rainier, "new", "--name", name, "--image", o.Image)
 	if err != nil {
 		return fmt.Errorf("starting rainier new: %w", err)
 	}
@@ -179,24 +199,17 @@ func measureSample(ctx context.Context, o options, client *cli.Client, sample in
 	if !strings.HasPrefix(id, "sess_") {
 		return errors.New("create acknowledgement did not contain a session id")
 	}
-	defer func() {
-		// Cleanup gets its own context: Ctrl-C cancels measurement but should
-		// not strand the synthetic session it interrupted.
-		cleanupErr := runCLI(context.Background(), o.Timeout, o.Rainier, "rm", id)
-		if cleanupErr != nil && retErr == nil {
-			retErr = errors.New("synthetic session cleanup failed")
-		}
-	}()
+	cleanupRef = id
 	if err := record("new_create_ack", sample, ackAt.Sub(started)); err != nil {
 		return err
 	}
 
 	stateCh := make(chan timedResult, 1)
 	go func() {
-		at, err := waitRunning(ctx, client, id, o.Timeout)
+		at, err := waitRunning(sampleCtx, client, id, o.Timeout)
 		stateCh <- timedResult{at: at, err: err}
 	}()
-	usableAt, err := probeTerminal(ctx, created, o.Timeout)
+	usableAt, err := probeTerminal(sampleCtx, created, o.Timeout)
 	if err != nil {
 		return fmt.Errorf("waiting for new terminal usability: %w", err)
 	}
@@ -285,11 +298,48 @@ type sessionEnvelope struct {
 	} `json:"session"`
 }
 
+type sessionsEnvelope struct {
+	Sessions []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"sessions"`
+	NextCursor string `json:"next_cursor"`
+}
+
+func ensureNameAvailable(ctx context.Context, client *cli.Client, name string, timeout time.Duration) error {
+	requestCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cursor := ""
+	for {
+		q := url.Values{"all": {"true"}, "name": {name}}
+		if cursor != "" {
+			q.Set("cursor", cursor)
+		}
+		var resp sessionsEnvelope
+		if err := client.DoContext(requestCtx, http.MethodGet, "/v1/sessions?"+q.Encode(), nil, &resp); err != nil {
+			return err
+		}
+		for _, row := range resp.Sessions {
+			if row.Name == name {
+				return errors.New("synthetic session name already exists")
+			}
+		}
+		if resp.NextCursor == "" {
+			return nil
+		}
+		cursor = resp.NextCursor
+	}
+}
+
 func waitRunning(ctx context.Context, client *cli.Client, id string, timeout time.Duration) (time.Time, error) {
-	deadline := time.Now().Add(timeout)
+	pollCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	for {
 		var resp sessionEnvelope
-		if err := client.Do("GET", "/v1/sessions/"+id, nil, &resp); err != nil {
+		if err := client.DoContext(pollCtx, http.MethodGet, "/v1/sessions/"+id, nil, &resp); err != nil {
+			if pollCtx.Err() != nil {
+				return time.Time{}, pollCtx.Err()
+			}
 			return time.Time{}, err
 		}
 		if resp.Session.State == "running" {
@@ -298,12 +348,9 @@ func waitRunning(ctx context.Context, client *cli.Client, id string, timeout tim
 		if resp.Session.State == "failed" || resp.Session.State == "dead" || resp.Session.State == "canceled" || resp.Session.State == "destroyed" {
 			return time.Time{}, fmt.Errorf("session reached terminal state %s", resp.Session.State)
 		}
-		if !time.Now().Before(deadline) {
-			return time.Time{}, errors.New("timed out")
-		}
 		select {
-		case <-ctx.Done():
-			return time.Time{}, ctx.Err()
+		case <-pollCtx.Done():
+			return time.Time{}, pollCtx.Err()
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
@@ -562,10 +609,69 @@ func summarize(metric string, values []time.Duration, target time.Duration) summ
 	s.MinMS = milliseconds(sorted[0])
 	s.MaxMS = milliseconds(sorted[len(sorted)-1])
 	if target > 0 {
-		pass := p95 <= target
+		pass := p95 < target
 		s.Pass = &pass
 	}
 	return s
+}
+
+// publicFailure keeps benchmark stderr inside the same privacy boundary as
+// JSONL: only cancellation class is reported, never wrapped URLs, session ids,
+// configured binary paths, or transport details.
+func publicFailure(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "operation timed out"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "operation canceled"
+	}
+	message := err.Error()
+	for _, operation := range []string{
+		"creating a synthetic session name",
+		"preflighting synthetic session name",
+		"starting rainier new",
+		"waiting for create acknowledgement",
+		"create acknowledgement did not contain a session id",
+		"waiting for new terminal usability",
+		"waiting for running state",
+		"detaching new session",
+		"starting attach_by_id",
+		"waiting for attach_by_id first frame",
+		"waiting for attach_by_id terminal response",
+		"starting attach_by_name",
+		"waiting for attach_by_name first frame",
+		"waiting for attach_by_name terminal response",
+		"warm suspend failed",
+		"starting warm_attach",
+		"waiting for warm_attach first frame",
+		"waiting for warm_attach terminal response",
+		"cold suspend failed",
+		"starting cold_attach",
+		"waiting for cold_attach first frame",
+		"waiting for cold_attach terminal response",
+		"synthetic session cleanup failed",
+	} {
+		if message == operation || strings.HasPrefix(message, operation+":") {
+			var apiErr *cli.APIError
+			if errors.As(err, &apiErr) {
+				switch apiErr.Code {
+				case "invalid_request", "unauthorized", "forbidden", "not_found", "conflict", "internal":
+					return operation + " (API " + apiErr.Code + ")"
+				}
+			}
+			var syntaxErr *json.SyntaxError
+			var typeErr *json.UnmarshalTypeError
+			if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
+				return operation + " (invalid response)"
+			}
+			var transportErr *url.Error
+			if errors.As(err, &transportErr) {
+				return operation + " (transport error)"
+			}
+			return operation
+		}
+	}
+	return "operation failed"
 }
 
 // percentile uses the R-7 definition used by Go-adjacent analysis tools and
