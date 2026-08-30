@@ -596,7 +596,7 @@ func runNew(args []string) error {
 	// created seconds ago has a log measured in kilobytes, so replaying it
 	// from the first entry costs nothing and is the only way the user sees
 	// what happened before they got here.
-	return attachWithRetry(c, cfg, resp.Session.ID, wire.SinceAll)
+	return attachWithRetry(cfg, resp.Session.ID, wire.SinceAll)
 }
 
 // attachWithRetry is `new`'s "attach immediately and stream everything"
@@ -609,22 +609,68 @@ func runNew(args []string) error {
 // any other error (including a *DialError for some other status) is
 // treated as fatal immediately rather than burning the retry budget on a
 // failure that will never resolve itself.
-func attachWithRetry(c *cli.Client, cfg cli.Config, id string, since uint64) error {
+func attachWithRetry(cfg cli.Config, id string, since uint64) error {
 	wsURL := wsURLFor(cfg.ServerURL, id)
 	header := http.Header{"Authorization": {"Bearer " + cfg.Token}}
 	deadline := time.Now().Add(60 * time.Second)
+	established := false
+	backoff := 100 * time.Millisecond
 
 	for {
-		err := attachio.Run(context.Background(), wsURL, header, since)
+		outcome, err := attachio.Run(context.Background(), wsURL, header, since)
 		if err == nil {
-			return nil
+			if outcome.Reason != attachio.Disconnected {
+				return nil
+			}
+			// The server sequence is the acknowledgement that a frame reached
+			// local stdout. Resume after it: never repaint the whole terminal and
+			// never skip output the user had not actually seen.
+			established = true
+			since = outcome.LastSeq
+			backoff = 100 * time.Millisecond
+			fmt.Println("[reconnecting…]")
+			continue
 		}
+
+		if established {
+			if !retryableAttachError(err) {
+				return err
+			}
+			fmt.Printf("[reconnecting in %s…]\n", backoff)
+			time.Sleep(backoff)
+			backoff *= 2
+			if backoff > 2*time.Second {
+				backoff = 2 * time.Second
+			}
+			continue
+		}
+
 		if !errors.Is(err, attachio.ErrSessionNotReady) || !time.Now().Before(deadline) {
 			return err
 		}
 		fmt.Println("waiting for session…")
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+// retryableAttachError is deliberately narrow. Once a viewer has connected,
+// transport failures and transient gateway statuses can recover; auth,
+// authorization, not-found, protocol, and local-terminal failures cannot and
+// must not become an infinite loop. A plain websocket transport failure is a
+// *url.Error, while an HTTP response is attachio.DialError.
+func retryableAttachError(err error) bool {
+	var dialErr *attachio.DialError
+	if errors.As(err, &dialErr) {
+		switch dialErr.Status {
+		case http.StatusTooManyRequests, http.StatusBadGateway,
+			http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		default:
+			return false
+		}
+	}
+	var transportErr *url.Error
+	return errors.As(err, &transportErr)
 }
 
 // ---------------------------------------------------------------------------
@@ -752,7 +798,7 @@ func runAttach(args []string) error {
 	if err := prepareAttach(c, id); err != nil {
 		return err
 	}
-	return attachWithRetry(c, cfg, id, cursor)
+	return attachWithRetry(cfg, id, cursor)
 }
 
 // prepareAttach makes `rainier attach` the one entry command for an existing

@@ -3,6 +3,7 @@ package attachio
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -108,7 +109,7 @@ func TestRunDialsWithTheCursor(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			Run(context.Background(), tc.url("ws"+strings.TrimPrefix(ts.URL, "http")), nil, tc.since)
+			_, _ = Run(context.Background(), tc.url("ws"+strings.TrimPrefix(ts.URL, "http")), nil, tc.since)
 
 			select {
 			case got := <-queries:
@@ -242,8 +243,15 @@ func TestRunNoRaceOnFloodedOutputDuringDetach(t *testing.T) {
 		}
 	}()
 
-	runErr := make(chan error, 1)
-	go func() { runErr <- Run(context.Background(), wsURL, nil, 0) }()
+	type runResult struct {
+		out Outcome
+		err error
+	}
+	runDone := make(chan runResult, 1)
+	go func() {
+		out, err := Run(context.Background(), wsURL, nil, 0)
+		runDone <- runResult{out: out, err: err}
+	}()
 
 	// Let the flood actually get going — several KB in — before detaching,
 	// rather than detaching the instant Run starts: the goal is a real
@@ -262,9 +270,12 @@ func TestRunNoRaceOnFloodedOutputDuringDetach(t *testing.T) {
 	}
 
 	select {
-	case err := <-runErr:
-		if err != nil {
-			t.Fatalf("Run: %v", err)
+	case result := <-runDone:
+		if result.err != nil {
+			t.Fatalf("Run: %v", result.err)
+		}
+		if result.out.Reason != Detached {
+			t.Fatalf("Run outcome = %+v, want reason Detached", result.out)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return within 5s of the detach key")
@@ -290,7 +301,7 @@ func TestRunSessionNotReadyMapsToSentinel(t *testing.T) {
 	defer ts.Close()
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/attach"
 
-	err := Run(context.Background(), wsURL, nil, 0)
+	_, err := Run(context.Background(), wsURL, nil, 0)
 	if err == nil {
 		t.Fatal("Run: want an error for a 503 response, got nil")
 	}
@@ -317,7 +328,7 @@ func TestRunNon503DialErrorDoesNotMatchSentinel(t *testing.T) {
 	defer ts.Close()
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/attach"
 
-	err := Run(context.Background(), wsURL, nil, 0)
+	_, err := Run(context.Background(), wsURL, nil, 0)
 	if err == nil {
 		t.Fatal("Run: want an error for a 500 response, got nil")
 	}
@@ -338,7 +349,7 @@ func TestRunTransportErrorIsNotADialError(t *testing.T) {
 	closedURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/attach"
 	ts.Close() // nothing is listening here any more
 
-	err := Run(context.Background(), closedURL, nil, 0)
+	_, err := Run(context.Background(), closedURL, nil, 0)
 	if err == nil {
 		t.Fatal("Run: want a transport error, got nil")
 	}
@@ -346,4 +357,101 @@ func TestRunTransportErrorIsNotADialError(t *testing.T) {
 	if errors.As(err, &de) {
 		t.Fatalf("Run error = %v, want a plain transport error (no HTTP response), not a *DialError", err)
 	}
+}
+
+// TestRunReportsDisconnectCursor is the contract the reconnecting product CLI
+// needs: only a transport loss is retryable, and the next attach must start
+// after the last frame that actually reached local stdout. A snapshot counts
+// as rendered state and therefore advances the cursor too.
+func TestRunReportsDisconnectCursor(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "snapshot", Seq: 17, Data: []byte("ready")})
+		c.Close(websocket.StatusGoingAway, "synthetic network interruption")
+	}))
+	defer ts.Close()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe (stdin): %v", err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe (stdout): %v", err)
+	}
+	defer stdoutR.Close()
+	origStdin, origStdout := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = stdinR, stdoutW
+	t.Cleanup(func() { os.Stdin, os.Stdout = origStdin, origStdout })
+	drainDone := make(chan struct{})
+	go func() {
+		io.Copy(io.Discard, stdoutR)
+		close(drainDone)
+	}()
+
+	outcome, err := Run(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 9)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if outcome.Reason != Disconnected || outcome.LastSeq != 17 {
+		t.Fatalf("Run outcome = %+v, want disconnected at seq 17", outcome)
+	}
+
+	// No frame arrived on this attempt, so the cursor the caller supplied is
+	// still the last known rendered frame. Reconnecting from zero here would
+	// repaint or replay unrelated history.
+	beforeFrame := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		c.Close(websocket.StatusGoingAway, "synthetic interruption before first frame")
+	}))
+	defer beforeFrame.Close()
+	outcome, err = Run(context.Background(), "ws"+strings.TrimPrefix(beforeFrame.URL, "http")+"/attach", nil, 23)
+	if err != nil {
+		t.Fatalf("Run before first frame: %v", err)
+	}
+	if outcome.Reason != Disconnected || outcome.LastSeq != 23 {
+		t.Fatalf("Run before first frame outcome = %+v, want disconnected at original seq 23", outcome)
+	}
+
+	exitServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "exit", ExitCode: 7})
+	}))
+	defer exitServer.Close()
+	outcome, err = Run(context.Background(), "ws"+strings.TrimPrefix(exitServer.URL, "http")+"/attach", nil, 23)
+	if err != nil {
+		t.Fatalf("Run exit: %v", err)
+	}
+	if outcome.Reason != Exited || outcome.LastSeq != 23 || outcome.ExitCode != 7 {
+		t.Fatalf("Run exit outcome = %+v, want exited at seq 23 with code 7", outcome)
+	}
+
+	stdoutW.Close()
+	<-drainDone
 }

@@ -1052,7 +1052,8 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	header := http.Header{"Authorization": {"Bearer " + auth.Token}}
 	runErr := make(chan error, 1)
 	go func() {
-		runErr <- attachio.Run(context.Background(), wsURL, header, 0)
+		_, err := attachio.Run(context.Background(), wsURL, header, 0)
+		runErr <- err
 	}()
 
 	waitContains(t, sb, smokeSnapshot, 5*time.Second)

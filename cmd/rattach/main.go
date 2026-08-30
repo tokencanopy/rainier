@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 
 	"rainier/internal/attachio"
@@ -30,7 +31,11 @@ func main() {
 	})
 
 	ctx := context.Background()
-	if err := attachio.Run(ctx, attachio.AttachURL(*baseURL, *session), nil, attachio.Cursor(given, *since)); err != nil {
+	outcome, err := attachio.Run(ctx, attachio.AttachURL(*baseURL, *session), nil, attachio.Cursor(given, *since))
+	if err != nil {
 		log.Fatal(err)
+	}
+	if outcome.Reason == attachio.Disconnected {
+		fmt.Printf("[rattach --since %d to resume]\n", outcome.LastSeq)
 	}
 }

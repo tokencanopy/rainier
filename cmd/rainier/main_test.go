@@ -13,6 +13,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
+
 	"rainier/internal/cli"
 	"rainier/internal/wire"
 	"rainier/internal/xfer"
@@ -1266,4 +1269,72 @@ func TestPrepareAttach(t *testing.T) {
 			t.Fatalf("prepareAttach error = %v, want the original resume failure", err)
 		}
 	})
+}
+
+// TestAttachWithRetryReconnectsFromTheRenderedCursor crosses the real
+// WebSocket boundary. The first established viewer renders seq 17 and loses
+// its transport; the next dial gets a transient 503; the third must ask for
+// entries after 17 and finish only when the session itself reports exit.
+func TestAttachWithRetryReconnectsFromTheRenderedCursor(t *testing.T) {
+	requests := 0
+	var resumedQueries []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests > 1 {
+			resumedQueries = append(resumedQueries, r.URL.Query().Get("since"))
+		}
+		if requests == 2 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(w, `{"error":{"code":"session_not_ready","message":"runner is reconnecting"}}`)
+			return
+		}
+
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		if requests == 1 {
+			wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "output", Seq: 17, Data: []byte("before-drop")})
+			c.Close(websocket.StatusGoingAway, "synthetic network interruption")
+			return
+		}
+		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "output", Seq: 18, Data: []byte("after-drop")})
+		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "exit", ExitCode: 0})
+	}))
+	defer ts.Close()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe (stdin): %v", err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+	origStdin := os.Stdin
+	os.Stdin = stdinR
+	t.Cleanup(func() { os.Stdin = origStdin })
+
+	out, err := captureStdout(t, func() error {
+		cfg := cli.Config{ServerURL: ts.URL, Token: "rnr_synthetic"}
+		return attachWithRetry(cfg, "sess_reconnect", 0)
+	})
+	if err != nil {
+		t.Fatalf("attachWithRetry: %v", err)
+	}
+	if requests != 3 {
+		t.Fatalf("attach requests = %d, want 3 (connected, transient 503, reconnected)", requests)
+	}
+	if !slices.Equal(resumedQueries, []string{"17", "17"}) {
+		t.Fatalf("reconnect cursors = %v, want [17 17]", resumedQueries)
+	}
+	for _, want := range []string{"before-drop", "after-drop", "reconnecting"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("attach output missing %q:\n%s", want, out)
+		}
+	}
 }
