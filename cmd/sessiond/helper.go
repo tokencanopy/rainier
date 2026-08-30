@@ -38,6 +38,14 @@ const (
 	// git "I have no opinion" and lets the next helper — or the user's own
 	// prompt — take over.
 	credentialHelperHost = "github.com"
+	// credentialHelperProtocol is the only scheme it answers for. The boot
+	// chain writes https:// remotes and nothing else, but an agent — or a
+	// .gitmodules in somebody's repository — can name any remote it likes, and
+	// git asks the helper for `http://github.com/...` with protocol=http. A
+	// helper that ignored this key would hand the user's token to a cleartext
+	// request. An ABSENT protocol is refused for the same reason: this helper
+	// only ever mints for a request it can see is encrypted.
+	credentialHelperProtocol = "https"
 	// credentialUsername is the conventional username for token auth. GitHub
 	// accepts any non-empty username when the password is a token; using the
 	// documented one keeps the request recognizable in GitHub's own logs.
@@ -45,6 +53,12 @@ const (
 	// mintMethod is the session RPC this helper turns into. controld answers it
 	// (Task 8) out of the credential vault.
 	mintMethod = "mint_git_credential"
+	// credentialRejectedMethod is the socket call an "erase" turns into. Unlike
+	// mintMethod it does not travel upstream as a request: sessiond answers it
+	// locally by queueing the `credential_rejected` control event, which is the
+	// same event the clone-stage watcher emits and which controld already acts
+	// on (internal/controld/runners.go). See reportCredentialRejected.
+	credentialRejectedMethod = "report_credential_rejected"
 	// credentialHelperTimeout bounds the whole round trip: socket, sessiond,
 	// runnerd, controld, and back. It is sessiond's own budget for that call
 	// (agentSocketCallTimeout) plus the wait it may spend on a connection first
@@ -53,6 +67,13 @@ const (
 	// local timeout in place of the reason sessiond was about to give it, and
 	// the reason is the whole point (it names the action to run).
 	credentialHelperTimeout = agentSocketCallTimeout + agentSocketConnWait
+	// credentialRejectedTimeout bounds the erase report instead, and is much
+	// shorter on purpose. Git WAITS for the erase helper to exit before it
+	// finishes failing, so a long bound here would turn a broken socket into
+	// twenty extra seconds on top of a git command that has already failed —
+	// and unlike a mint there is nothing to show for the wait: the report is
+	// fire-and-forget and its outcome changes nothing the user will see.
+	credentialRejectedTimeout = 5 * time.Second
 )
 
 // runCredentialHelper is `sessiond git-credential-helper <op>`. args is
@@ -77,29 +98,91 @@ func runCredentialHelper(args []string, sockPath string, timeout time.Duration, 
 	if len(args) > 0 {
 		op = args[0]
 	}
-	// Only "get" is answered. "store" and "erase" are git offering to cache and
-	// to forget a credential — there is nothing to cache (the token is minted
-	// per operation and deliberately never persisted) and nothing to forget.
-	// Their request block carries the credential itself, which is why nothing in
-	// this function logs, echoes or persists what it just read: for those two
-	// operations the map above is a token's last stop before this process exits.
-	// (git sends "erase" after a 401, so this is the normal path for a revoked
-	// token, not a corner.)
-	if op != "get" || req["host"] != credentialHelperHost {
+	// A request for anything but https://github.com is one this helper has no
+	// opinion about: nothing on stdout, exit 0, and git moves on to the next
+	// helper or to its own prompt. That is true for EVERY operation, which is
+	// why the check is here rather than inside the get arm — an erase for
+	// gitlab.com is no more this vault's business than a get for it is.
+	if req["host"] != credentialHelperHost || req["protocol"] != credentialHelperProtocol {
 		return 0
 	}
 
-	token, err := mintCredential(sockPath, timeout)
-	if err != nil {
-		// Verbatim: for a refusal this is controld's own sentence, and it names
-		// the action the user has to run ("rainier login --refresh github").
-		// Rewording it here would break the one link between a failed git
-		// command and the fix for it.
-		fmt.Fprintln(stderr, err)
-		return 1
+	switch op {
+	case "get":
+		token, err := mintCredential(sockPath, timeout)
+		if err != nil {
+			// Verbatim: for a refusal this is controld's own sentence, and it
+			// names the action the user has to run ("rainier login --refresh
+			// github"). Rewording it here would break the one link between a
+			// failed git command and the fix for it.
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "username=%s\npassword=%s\n", credentialUsername, token)
+		return 0
+
+	case "erase":
+		// Git's own signal that the credential it was given did not work: it
+		// calls "erase" after an authentication failure, with the rejected
+		// credential in the request block. Nothing here is stored or forgotten
+		// — the token is minted per operation and deliberately never persisted
+		// — but the FACT is worth reporting, because it is the only way the
+		// fleet learns that a token was revoked while a session was running.
+		//
+		// TWO DETECTORS, ONE EVENT, deliberately. The clone stage reads git's
+		// OUTPUT and matches its shape (authRejected, gitchain.go): it is the
+		// only place that has the output, and it runs before any agent exists.
+		// This arm reads git's own PROTOCOL signal instead, which is the only
+		// thing available for the agent's git — nothing watches the agent's
+		// PTY, and its `git push` is where a mid-session revocation actually
+		// shows up. They are different evidence for the same fact, and both
+		// land on the same `credential_rejected` control event.
+		//
+		// Reported fire-and-forget, and a failure to report is not this
+		// helper's to surface: git has already failed the user's command with
+		// its own message, and turning a bookkeeping call into a second error
+		// on top of it would say nothing they can act on. Stdout stays empty
+		// and the exit stays 0, exactly as for "store".
+		reportCredentialRejected(sockPath, min(timeout, credentialRejectedTimeout))
+		return 0
+
+	default:
+		// "store" (git offering to cache) and anything a future git invents.
+		// Their request block carries the credential itself, which is why
+		// nothing in this function logs, echoes or persists what it just read:
+		// for those operations the parsed map above is a token's last stop
+		// before this process exits.
+		return 0
 	}
-	fmt.Fprintf(stdout, "username=%s\npassword=%s\n", credentialUsername, token)
-	return 0
+}
+
+// reportCredentialRejected tells sessiond that git rejected the credential it
+// was handed, so the vault can flip to needs_refresh and the NEXT operation
+// gets a named action instead of another opaque 403.
+//
+// It is deliberately silent about everything, including its own failures: the
+// caller is a helper git is waiting on, git has already failed the user's
+// command, and a second message would only compete with the first. It also
+// deliberately sends NO payload — whose credential it was is the session's own
+// answer upstream, and the erase request this helper just read carries the
+// rejected token, which has no business on any wire but the one it arrived on.
+func reportCredentialRejected(sockPath string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	c, err := net.DialTimeout("unix", sockPath, time.Until(deadline))
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	c.SetDeadline(deadline)
+	if err := json.NewEncoder(c).Encode(socketRequest{Method: credentialRejectedMethod}); err != nil {
+		return
+	}
+	// The answer is read and dropped. Nothing here acts on it — but the socket
+	// protocol is one request and one response per connection, and hanging up
+	// before the response would leave sessiond logging a broken pipe for a call
+	// that in fact succeeded.
+	var resp socketResponse
+	_ = json.NewDecoder(c).Decode(&resp)
 }
 
 // parseCredentialRequest reads git's key=value block. Unknown keys are kept
