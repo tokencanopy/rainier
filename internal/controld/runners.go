@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -407,6 +408,28 @@ func (s *Server) applyEvent(ctx context.Context, runner string, m rwire.FromRunn
 		// ENVIRONMENT, not about the session, whose state the registration
 		// "running" event governs exactly as it does for a scratch session.
 		s.cacheEnvironment(ctx, runner, row)
+	case "child_exited":
+		if !placedExactlyOn(row, runner, m.State) {
+			return
+		}
+		// An OBSERVATION, not a transition. The agent process ended but the
+		// session did not: sessiond outlives its child so viewers can still
+		// read the scrollback, so the container is up, attachable, and holding
+		// its slot. Recording the code and moving nothing is the whole arm —
+		// no transition, and no scheduler wake, because no capacity changed.
+		code, err := strconv.Atoi(m.Detail)
+		if err != nil {
+			// Dropped rather than defaulted: Atoi's zero would land in the
+			// column as a CLEAN exit, which is the most misleading value
+			// there is. A number we cannot read is better recorded as no
+			// number at all.
+			log.Printf("controld: runner %s: child_exited for %s carried an unreadable code %q; ignoring",
+				runner, row.ID, clip(m.Detail))
+			return
+		}
+		if err := s.st.SetChildExitCode(ctx, m.Session, code); err != nil {
+			log.Printf("controld: recording child exit code %d for %s: %v", code, row.ID, err)
+		}
 	default:
 		log.Printf("controld: runner %s: unknown event state %q for %s", runner, clip(m.State), clip(m.Session))
 	}

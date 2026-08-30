@@ -61,9 +61,17 @@ type sessionView struct {
 	Error       string   `json:"error"`
 	Environment string   `json:"environment"`
 	QueueReason string   `json:"queue_reason"`
-	CreatedAt   string   `json:"created_at"`
-	UpdatedAt   string   `json:"updated_at"`
-	LastEventAt string   `json:"last_event_at"`
+	// ChildExitCode is the exit status of the session's agent process, once
+	// it has one, and null until then. A POINTER, and rendered as null rather
+	// than omitted, because exit 0 is an ANSWER: a session whose agent
+	// finished cleanly has to be distinguishable from one still working, and
+	// a plain int would make those two the same 0. Present on every session
+	// like every other field here — a key that appears only sometimes cannot
+	// be told apart from an older controld that never had it.
+	ChildExitCode *int   `json:"child_exit_code"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
+	LastEventAt   string `json:"last_event_at"`
 }
 
 // sessionDerived carries the three view fields that cannot be read off the
@@ -95,9 +103,14 @@ func sessionJSON(s Session, d sessionDerived) sessionView {
 		Error:       s.Error,
 		Environment: d.Environment,
 		QueueReason: d.QueueReason,
-		CreatedAt:   s.CreatedAt.UTC().Format(time.RFC3339),
-		UpdatedAt:   s.UpdatedAt.UTC().Format(time.RFC3339),
-		LastEventAt: s.LastEventAt.UTC().Format(time.RFC3339),
+		// Copied, never aliased: the row's pointer may be into a store's own
+		// map (memstore hands out clones for exactly this reason, but a view
+		// that relied on that would be one refactor away from letting a
+		// response mutate the store).
+		ChildExitCode: copyIntPtr(s.ChildExitCode),
+		CreatedAt:     s.CreatedAt.UTC().Format(time.RFC3339),
+		UpdatedAt:     s.UpdatedAt.UTC().Format(time.RFC3339),
+		LastEventAt:   s.LastEventAt.UTC().Format(time.RFC3339),
 	}
 }
 
@@ -207,6 +220,17 @@ func emptyIfNil(ss []string) []string {
 		return []string{}
 	}
 	return ss
+}
+
+// copyIntPtr clones a nullable int so a rendered view never shares storage
+// with the row it came from. nil stays nil — which is the wire's null, and
+// the honest answer for a session whose agent has not exited.
+func copyIntPtr(p *int) *int {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
 }
 
 // reachable computes sessionJSON's "reachable" flag for row.
@@ -605,6 +629,15 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request, u User
 // if the runner ever comes back (design §4.8); a terminal session is a
 // no-op 204 (idempotent). Every success path wakes the scheduler: even the
 // no-op paths are cheap to wake on, and it keeps the rule simple.
+//
+// Every path that reaches a runner ALSO reclaims the workspace volume (see
+// reclaimWorkspace), and this is the half of the durability rider that keeps
+// the other half honest. Since Plan 5 a crash removes only the container and
+// keeps the session's workspace, so an rm is now the ONLY thing that ever
+// takes one — including for the terminal no-op path, where a crash-dead
+// session's container went long ago and nothing on that runner will ever name
+// its volume again. Without the reclaim there, "a crash preserves the
+// workspace" would read, on a host's disk, as "every crash leaks one".
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request, u User) {
 	id := r.PathValue("id")
 	row, err := s.st.GetSession(r.Context(), id)
@@ -624,6 +657,11 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request, u U
 
 	switch {
 	case row.State.Terminal():
+		// Idempotent for the ROW, but not inert on the runner: a dead session
+		// still has the workspace its crash preserved, and this delete is the
+		// user saying they are done with it. A destroyed one has nothing left
+		// to take, and the runner answers ok for an absent volume.
+		s.reclaimWorkspace(row)
 		s.wakeScheduler()
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -672,9 +710,49 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request, u U
 			return
 		}
 	}
+	// Unconditional, covering both branches above: after a destroy that
+	// already took the volume with its container (the reclaim is then a no-op
+	// the runner answers ok for), and after the disconnected branch, where it
+	// finds no runner to ask and says so by doing nothing. The one place a
+	// workspace may outlive its session is a crash — every explicit rm says
+	// that out loud rather than inferring it from which teardown ran.
+	s.reclaimWorkspace(row)
 	s.transitionQuiet(r.Context(), id, NonTerminal, StateDestroyed, TransitionOpts{})
 	s.wakeScheduler()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// reclaimWorkspace tells the runner holding row to remove its workspace
+// volume. Fire-and-forget: there is no answer worth waiting for (an absent
+// volume is a success, and a failure changes nothing the caller can act on),
+// and a delete must not turn into a 502 over a reclaim when the teardown it
+// was asked for has already happened.
+//
+// A session on no runner, or on one not connected to THIS replica, has nobody
+// to ask, and the two cases end differently:
+//
+//   - the container still exists (an rm while the runner was down). When that
+//     runner reconnects it announces the session, reconcile sees a terminal
+//     row announced present, and destroys it as an orphan — a FULL destroy,
+//     which takes the volume. Nothing leaks.
+//   - the container is already gone (a crash-dead session whose rm found its
+//     runner away). runnerd dropped that session from its registry when it
+//     crashed, so it will never be announced again and reconcile will never
+//     see it: the volume outlives everything that knows its name. That is a
+//     known v0 gap — v0 has no workspace GC — and it is bounded by the
+//     window in which a runner is disconnected while a dead session is
+//     removed.
+//
+// Blocking the delete until the runner returns is not the fix: it would let
+// an unreachable runner pin a row open indefinitely, which is worse than a
+// stray volume.
+func (s *Server) reclaimWorkspace(row Session) {
+	if row.Runner == "" || !s.runnerConnected(row.Runner) {
+		return
+	}
+	if err := s.sendToRunner(row.Runner, rwire.ToRunner{Type: "remove_workspace", Session: row.ID}); err != nil {
+		log.Printf("controld: reclaiming the workspace of %s on %s: %v", row.ID, row.Runner, err)
+	}
 }
 
 // ---------------------------------------------------------------------------

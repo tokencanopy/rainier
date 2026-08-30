@@ -301,8 +301,19 @@ func TestCreateSession(t *testing.T) {
 		}
 		assertKeySet(t, string(outer["session"]),
 			"id", "owner_id", "name", "image", "cmd", "egress_allow", "state", "runner",
-			"reachable", "error", "environment", "queue_reason",
+			"reachable", "error", "environment", "queue_reason", "child_exit_code",
 			"created_at", "updated_at", "last_event_at")
+		// child_exit_code is nullable and present on every session, never
+		// omitted: "the agent has not exited" and "the field wasn't rendered"
+		// have to be the same visible answer (null), or a client cannot tell
+		// an old controld from a running agent.
+		var view map[string]json.RawMessage
+		if err := json.Unmarshal(outer["session"], &view); err != nil {
+			t.Fatalf("decode session: %v", err)
+		}
+		if got := string(view["child_exit_code"]); got != "null" {
+			t.Fatalf("child_exit_code on a fresh session = %s, want null", got)
+		}
 	})
 }
 
@@ -1042,6 +1053,54 @@ func TestDeleteSession(t *testing.T) {
 		}
 	})
 
+	// A dead session is where the durability rider's two halves meet. The
+	// crash path deliberately KEPT that session's workspace volume, and its
+	// container is long gone — so nothing on the runner will ever name that
+	// volume again unless this delete does. Without this dispatch,
+	// "crash preserves the workspace" would mean "every crash leaks a
+	// workspace, forever".
+	t.Run("a dead session's rm reclaims the workspace the crash kept", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+
+		owner, tok := loginUser(t, st, "alice", "member")
+		reason := "runner reported dead"
+		seedSession(t, st, Session{ID: "sess_del_dead", OwnerID: owner.ID, State: StateDead,
+			Runner: "vm1", Error: reason})
+
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_dead", tok, nil, nil)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", resp.StatusCode)
+		}
+		cmd := f.nextCmd(t)
+		if cmd.Type != "remove_workspace" || cmd.Session != "sess_del_dead" {
+			t.Fatalf("got %+v, want remove_workspace of sess_del_dead", cmd)
+		}
+		if cmd.ReqID != 0 {
+			t.Fatalf("remove_workspace req_id = %d, want 0 — it is fire-and-forget", cmd.ReqID)
+		}
+		// The row is terminal and stays exactly as it was: a dead session's
+		// diagnosis is what the user came back for.
+		if got := getSession(t, st, "sess_del_dead"); got.State != StateDead || got.Error != reason {
+			t.Fatalf("row = %s / %q, want it unchanged", got.State, got.Error)
+		}
+	})
+
+	// A terminal row with no runner has nobody to ask; the delete is still a
+	// 204 and must not wedge waiting on a dispatch that can never happen.
+	t.Run("a terminal session with no runner reclaims nothing", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		owner, tok := loginUser(t, st, "alice", "member")
+		seedSession(t, st, Session{ID: "sess_del_unplaced", OwnerID: owner.ID, State: StateFailed})
+
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_unplaced", tok, nil, nil)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", resp.StatusCode)
+		}
+		wantNothingQueued(t, s, f)
+	})
+
 	t.Run("placed on a disconnected runner marks destroyed directly", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
@@ -1084,6 +1143,16 @@ func TestDeleteSession(t *testing.T) {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
 		wantState(t, st, "sess_del_live", StateDestroyed)
+
+		// The destroy already took the volume with it; the reclaim goes out
+		// anyway, and the runner answers ok for an absent one. Belt and
+		// braces on the path that must never leak: the ONE place a workspace
+		// is allowed to outlive its session is a crash, and every explicit rm
+		// says so out loud rather than trusting the destroy to have done it.
+		next := f.nextCmd(t)
+		if next.Type != "remove_workspace" || next.Session != "sess_del_live" {
+			t.Fatalf("after the destroy: got %+v, want remove_workspace of sess_del_live", next)
+		}
 	})
 
 	t.Run("runner unreachable is 502 runner_unreachable", func(t *testing.T) {

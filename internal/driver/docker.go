@@ -361,31 +361,41 @@ func withSessionUserinfo(base, sessionID string) string {
 	return u.String()
 }
 
-// Destroy removes the container and the session's workspace volume with it. A
-// session's volume is the session's: leaving it behind would grow the host's
-// disk by one workspace per session ever created, with nothing left that names
-// it — the container that did is exactly what Destroy just removed.
+// Destroy removes the container and the session's workspace volume with it —
+// the whole teardown, for an explicit `rainier rm`. A session's volume is the
+// session's: leaving it behind on THIS path would grow the host's disk by one
+// workspace per session ever removed, with nothing left that names it — the
+// container that did is exactly what Destroy just removed.
 //
 // Order matters. The session id is read off the container's label BEFORE the
 // container goes, because afterwards there is nothing left to ask; and the
 // volume is removed AFTER, because docker refuses to remove a volume any
 // container still references, stopped ones included.
 func (d *Docker) Destroy(ctx context.Context, id string) error {
-	// `with` rather than a bare `index`: a container without the label (not
-	// one of ours, or one from before the label existed) yields "" instead of
-	// Go's "<no value>", which would build a nonsense volume name.
-	sessionID, err := dockerRun(ctx, "inspect",
-		"-f", `{{ with index .Config.Labels "`+d.opts.Label+`" }}{{ . }}{{ end }}`, id)
-	if err != nil {
-		// Either the container is already gone or docker is unhappy; both
-		// leave us with no session id to derive a volume name from. Removal of
-		// the container below is the operation that gets to report the error.
-		sessionID = ""
-	}
-	if _, err := dockerRun(ctx, "rm", "-f", id); err != nil {
+	sessionID := d.sessionIDOf(ctx, id)
+	if err := d.DestroyContainer(ctx, id); err != nil {
 		return err
 	}
+	return d.RemoveWorkspace(ctx, sessionID)
+}
+
+// DestroyContainer removes the container and leaves the workspace volume
+// standing — the crash path (see driver.Driver.DestroyContainer for why the
+// two are separate operations). It is deliberately the whole of `docker rm
+// -f`: nothing here reads a label or derives a volume name, so there is no
+// code path from "reclaim this slot" to "remove a volume" at all.
+func (d *Docker) DestroyContainer(ctx context.Context, id string) error {
+	_, err := dockerRun(ctx, "rm", "-f", id)
+	return err
+}
+
+// RemoveWorkspace removes sessionID's workspace volume, tolerating one that is
+// already gone.
+func (d *Docker) RemoveWorkspace(ctx context.Context, sessionID string) error {
 	if sessionID == "" {
+		// Nothing names a workspace here, and `rainier-ws-` on its own is a
+		// volume like any other — building it from an empty id would make an
+		// id-less container's teardown remove someone else's data.
 		return nil
 	}
 	// -f here means "don't fail if it's already gone", not "remove it even if
@@ -395,6 +405,21 @@ func (d *Docker) Destroy(ctx context.Context, id string) error {
 		return fmt.Errorf("remove workspace volume for session %s: %w", sessionID, err)
 	}
 	return nil
+}
+
+// sessionIDOf reads the session id off a container's rainier label, or ""
+// when there is nothing to read — the container is already gone, docker is
+// unhappy, or it was never one of ours.
+func (d *Docker) sessionIDOf(ctx context.Context, id string) string {
+	// `with` rather than a bare `index`: a container without the label (not
+	// one of ours, or one from before the label existed) yields "" instead of
+	// Go's "<no value>", which would build a nonsense volume name.
+	sessionID, err := dockerRun(ctx, "inspect",
+		"-f", `{{ with index .Config.Labels "`+d.opts.Label+`" }}{{ . }}{{ end }}`, id)
+	if err != nil {
+		return ""
+	}
+	return sessionID
 }
 
 // isNotFoundErr reports whether a dockerRun error indicates the object

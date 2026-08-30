@@ -632,6 +632,85 @@ func TestDockerDestroyRemovesWorkspaceVolume(t *testing.T) {
 	}
 }
 
+// TestDockerDestroyContainerKeepsWorkspaceVolume is the crash half of the
+// split, against a real daemon: `docker rm -f` and nothing else, so the named
+// volume is still listed afterwards and a later RemoveWorkspace is what
+// finally takes it. The fake's version of this proves runnerd calls the right
+// method; only this one proves the method does the right thing to a host.
+func TestDockerDestroyContainerKeepsWorkspaceVolume(t *testing.T) {
+	dockerAvailable(t)
+	d := NewDocker(DockerOpts{
+		Image:      "alpine:3.20",
+		Network:    "bridge",
+		TotalSlots: 8,
+		Label:      "rainier.test",
+	})
+	d.defaultCmd = []string{"sleep", "3600"}
+	defer d.destroyAllLabeled(context.Background())
+	ctx := context.Background()
+
+	h, err := d.Create(ctx, Spec{Name: "tcrash", SessionID: "scrash", DialURL: "ws://x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !workspaceExists(t, d, "scrash") {
+		t.Fatal("Create did not leave a rainier-ws-scrash volume behind")
+	}
+
+	if err := d.DestroyContainer(ctx, h.ID); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ := d.Inspect(ctx, h.ID); g.State != StateGone {
+		t.Fatalf("state after DestroyContainer = %s, want gone", g.State)
+	}
+	if !workspaceExists(t, d, "scrash") {
+		t.Fatal("DestroyContainer removed rainier-ws-scrash; a crash must keep the workspace")
+	}
+
+	// Only now, and only because something asked for it.
+	if err := d.RemoveWorkspace(ctx, "scrash"); err != nil {
+		t.Fatal(err)
+	}
+	if workspaceExists(t, d, "scrash") {
+		t.Fatal("RemoveWorkspace left rainier-ws-scrash behind")
+	}
+	if err := d.RemoveWorkspace(ctx, "scrash"); err != nil {
+		t.Errorf("RemoveWorkspace of an already-absent volume = %v, want nil", err)
+	}
+}
+
+// TestDockerRemoveWorkspaceRefusesAnEmptySessionID: `rainier-ws-` with nothing
+// after it is a perfectly valid docker volume name, and a driver that built
+// it from an empty session id would `volume rm -f` whatever happened to be
+// sitting under it. The id-less case is a no-op, not a prefix-only removal.
+func TestDockerRemoveWorkspaceRefusesAnEmptySessionID(t *testing.T) {
+	dockerAvailable(t)
+	d := NewDocker(DockerOpts{Image: "alpine:3.20", Network: "bridge", TotalSlots: 8, Label: "rainier.test"})
+	ctx := context.Background()
+
+	if _, err := dockerRun(ctx, "volume", "create", workspaceVolumePrefix); err != nil {
+		t.Fatal(err)
+	}
+	defer dockerRun(ctx, "volume", "rm", "-f", workspaceVolumePrefix)
+
+	if err := d.RemoveWorkspace(ctx, ""); err != nil {
+		t.Fatalf("RemoveWorkspace(\"\") = %v, want nil", err)
+	}
+	out, err := dockerRun(ctx, "volume", "ls", "-q", "--filter", "name="+workspaceVolumePrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == workspaceVolumePrefix {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("RemoveWorkspace(\"\") removed the bare %q volume", workspaceVolumePrefix)
+	}
+}
+
 // TestWorkspaceInitArgs pins the one-shot container that prepares a fresh
 // workspace volume. It runs as root inside a user-supplied image, which is the
 // only place in the driver that happens — so every clamp on it is deliberate

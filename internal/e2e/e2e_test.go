@@ -639,6 +639,10 @@ type apiSession struct {
 	// derived by controld per request, never stored on the row.
 	Environment string `json:"environment"`
 	QueueReason string `json:"queue_reason"`
+	// ChildExitCode is the agent process's own exit status once it has one —
+	// null while it is still running, which is why it is a pointer: exit 0 is
+	// an answer and must not read as "no answer yet".
+	ChildExitCode *int `json:"child_exit_code"`
 }
 
 type sessionEnvelope struct {
@@ -1343,6 +1347,92 @@ func TestDeleteDisconnectedRunner(t *testing.T) {
 	}
 }
 
+// handleFor returns the driver handle the runner holds for session id, so a
+// scene can reach past runnerd and do to a container what a crash would.
+func (n *runnerNode) handleFor(t *testing.T, id string) string {
+	t.Helper()
+	listed, err := n.drv.List(context.Background())
+	if err != nil {
+		t.Fatalf("driver.List: %v", err)
+	}
+	for _, l := range listed {
+		if l.SessionID == id {
+			return l.Handle.ID
+		}
+	}
+	t.Fatalf("no driver handle for session %s: %+v", id, listed)
+	return ""
+}
+
+// ---------------------------------------------------------------------------
+// Scene 4b — Plan 5's durability rider: a crash keeps the workspace
+// ---------------------------------------------------------------------------
+
+// TestCrashKeepsTheWorkspaceAndRmReclaimsIt is the whole of the rider in one
+// scene, because its two halves only mean something together and neither
+// component can see both.
+//
+// A container dying is not a user throwing their work away. Everything a
+// session has produced lives on its workspace volume, and a crashed session is
+// precisely the one people come back for — so runnerd's crash path removes the
+// container (the slot must come back) and leaves the volume standing.
+//
+// That is only safe because of the second half: the volume then has NOTHING
+// left on the host that names it, so if an explicit rm did not reclaim it,
+// "a crash preserves the workspace" would read on disk as "every crash leaks
+// one, forever". controld sends remove_workspace on every rm, terminal rows
+// included, and that is what this scene follows all the way to the driver.
+func TestCrashKeepsTheWorkspaceAndRmReclaimsIt(t *testing.T) {
+	f := newFleet(t)
+	rn := f.addRunner("vm-a", 2)
+	f.waitRunner("vm-a", true, 30*time.Second)
+
+	created := f.create("crashes")
+	f.waitSessions(60*time.Second, "the session to reach running", func(rows map[string]apiSession) bool {
+		return rows[created.ID].State == "running"
+	})
+	volume := "rainier-ws-" + created.ID
+	if !slices.Contains(rn.drv.Volumes(), volume) {
+		t.Fatalf("session %s came up with no workspace volume: %v", created.ID, rn.drv.Volumes())
+	}
+
+	// The crash, modeled as the host actually presents one: the container's
+	// process died, so the container is no longer RUNNING — but its record and
+	// its volume are both still sitting there, which is what `docker ps -a`
+	// shows for an exited container and what runnerd's Inspect will find. (A
+	// container already removed out from under runnerd would be a weaker
+	// scene: there would then be no label left to derive a volume name from,
+	// so even a buggy whole-teardown would leave the volume alone by accident.)
+	handle := rn.handleFor(t, created.ID)
+	if err := rn.drv.Suspend(context.Background(), handle, false); err != nil {
+		t.Fatal(err)
+	}
+	f.dropSessiond(created.ID)
+
+	// waitUntil, not waitSessions: the latter boots a scripted sessiond for
+	// every running row on each pass, which would re-register this one
+	// mid-crash and heal exactly what the scene is trying to observe.
+	waitUntil(t, 60*time.Second, "controld to mark the crashed session dead", func() bool {
+		return f.list()[created.ID].State == "dead"
+	})
+	if got := rn.containers(t); len(got) != 0 {
+		t.Fatalf("containers after the crash = %v, want none — the slot must come back", got)
+	}
+	if !slices.Contains(rn.drv.Volumes(), volume) {
+		t.Fatalf("the crash took %s with it; a crashed session's workspace is what a user comes back for", volume)
+	}
+
+	// The rm. The row is already terminal, so this is the idempotent 204 path
+	// — and it is the ONLY thing left that knows this volume exists.
+	f.delete(created.ID)
+	waitUntil(t, 60*time.Second, "the explicit rm to reclaim the workspace", func() bool {
+		return !slices.Contains(rn.drv.Volumes(), volume)
+	})
+	if row := f.list()[created.ID]; row.State != "dead" {
+		t.Fatalf("session after the rm = %+v, want it still dead — reclaiming a volume is not a state change", row)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Scene 5 — Plan 4 criterion 2: setup runs once, then the cache boots
 // ---------------------------------------------------------------------------
@@ -1485,6 +1575,33 @@ func TestEnvSetupStreamsAndCaches(t *testing.T) {
 	if got := rows[second.ID].Environment; got != env.Name {
 		t.Fatalf("second session's view reports environment %q, want %q", got, env.Name)
 	}
+
+	// --- the agent inside that session finishes.
+	//
+	// child_exited is the one fact about a session only the container knows,
+	// and this is the whole of its journey in one place: sessiond's control
+	// frame → runnerd's event → controld's column → the session view every
+	// `rainier ls` renders. Each component's own tests can prove its hop; only
+	// here does the number actually arrive.
+	//
+	// Exit 0 deliberately, because it is the case a `!= 0` check anywhere on
+	// that path would silently swallow — and the session must stay RUNNING
+	// under it: the agent finishing is not the session ending, which is what
+	// makes the container still attachable afterwards.
+	if got := rows[second.ID].ChildExitCode; got != nil {
+		t.Fatalf("session reports child_exit_code %d before its agent exited, want null", *got)
+	}
+	f.sessiond(second.ID).control(t, relay.ControlEvent{Kind: "child_exited", RC: 0})
+	rows = f.waitSessions(60*time.Second, "the agent's exit code to reach the session view", func(rows map[string]apiSession) bool {
+		return rows[second.ID].ChildExitCode != nil
+	})
+	if got := *rows[second.ID].ChildExitCode; got != 0 {
+		t.Fatalf("child_exit_code = %d, want 0", got)
+	}
+	if got := rows[second.ID].State; got != "running" {
+		t.Fatalf("session is %q after its agent exited, want running — the container stays up for viewers", got)
+	}
+	f.echoes(second.ID, "still here")
 }
 
 // ---------------------------------------------------------------------------

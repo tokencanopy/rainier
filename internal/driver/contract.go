@@ -3,6 +3,7 @@ package driver
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -53,6 +54,38 @@ func assertStrippedFromImage(t *testing.T, d Driver, ref, value string, stripped
 				t.Fatalf("stripped key %s carries %q in the committed image's config:\n%s", k, v, out)
 			}
 		}
+	}
+}
+
+// workspaceExists reports whether sessionID's workspace volume is present
+// right now. It is a type switch for the same reason assertStrippedFromImage
+// is one: the two drivers keep their volumes in completely different places (a
+// docker daemon; a map in the fake), and the crash-vs-rm subtest below has to
+// be able to ask both of them the same question — otherwise the one guarantee
+// that matters ("a crash keeps the workspace") could only ever be pinned
+// against one driver, and the other would be free to drift.
+func workspaceExists(t *testing.T, d Driver, sessionID string) bool {
+	t.Helper()
+	name := workspaceVolume(sessionID)
+	switch dd := d.(type) {
+	case *Docker:
+		// `docker volume ls --filter name=` matches on substring, so the names
+		// are compared exactly rather than trusting the filter to be anchored.
+		out, err := dockerRun(context.Background(), "volume", "ls", "-q", "--filter", "name="+name)
+		if err != nil {
+			t.Fatalf("docker volume ls: %v", err)
+		}
+		for _, line := range strings.Split(out, "\n") {
+			if strings.TrimSpace(line) == name {
+				return true
+			}
+		}
+		return false
+	case *Fake:
+		return slices.Contains(dd.Volumes(), name)
+	default:
+		t.Fatalf("workspaceExists: no volume view for driver %T", d)
+		return false
 	}
 }
 
@@ -256,6 +289,86 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 			if l.SessionID == "s5" {
 				t.Fatalf("List after destroy still contains session s5: %+v", listed)
 			}
+		}
+	})
+
+	t.Run("destroy takes the container and the workspace together", func(t *testing.T) {
+		// The explicit-rm path, re-pinned unchanged as the crash path is
+		// carved out beside it: whatever else the split does, `rainier rm`
+		// must still leave nothing behind. A volume with no container left to
+		// name it is a workspace nobody will ever find again, one per session
+		// ever created.
+		d, cleanup := newDriver(t)
+		defer cleanup()
+		ctx := context.Background()
+		h, err := d.Create(ctx, Spec{Name: "t-rm", Image: "", SessionID: "s-rm", DialURL: "ws://x"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !workspaceExists(t, d, "s-rm") {
+			t.Fatal("Create left no workspace volume to remove")
+		}
+		if err := d.Destroy(ctx, h.ID); err != nil {
+			t.Fatal(err)
+		}
+		if g, _ := d.Inspect(ctx, h.ID); g.State != StateGone {
+			t.Fatalf("post-destroy state = %s, want gone", g.State)
+		}
+		if workspaceExists(t, d, "s-rm") {
+			t.Fatal("Destroy removed the container but left the workspace volume behind")
+		}
+	})
+
+	t.Run("a crash keeps the workspace; removing it is a separate act", func(t *testing.T) {
+		// The two halves of the split, in the order the crash path runs them.
+		// DestroyContainer reclaims the slot and NOTHING else: a session whose
+		// sessiond died still holds every hour of work under /workspace, and
+		// the container's death is not the user asking for that to be thrown
+		// away. RemoveWorkspace is the second act, and only an explicit rm
+		// ever performs it.
+		d, cleanup := newDriver(t)
+		defer cleanup()
+		ctx := context.Background()
+		h, err := d.Create(ctx, Spec{Name: "t-crash", Image: "", SessionID: "s-crash", DialURL: "ws://x"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !workspaceExists(t, d, "s-crash") {
+			t.Fatal("Create left no workspace volume to keep")
+		}
+
+		if err := d.DestroyContainer(ctx, h.ID); err != nil {
+			t.Fatal(err)
+		}
+		if g, _ := d.Inspect(ctx, h.ID); g.State != StateGone {
+			t.Fatalf("post-DestroyContainer state = %s, want gone", g.State)
+		}
+		if !workspaceExists(t, d, "s-crash") {
+			t.Fatal("DestroyContainer removed the workspace volume; a crash must keep it")
+		}
+
+		if err := d.RemoveWorkspace(ctx, "s-crash"); err != nil {
+			t.Fatal(err)
+		}
+		if workspaceExists(t, d, "s-crash") {
+			t.Fatal("RemoveWorkspace left the volume behind")
+		}
+
+		// Tolerating an absent volume is not politeness: every caller is a
+		// teardown path that may be running second (a full Destroy already
+		// took it, a reconcile got there first), and an error there would turn
+		// a completed teardown into a reported failure.
+		if err := d.RemoveWorkspace(ctx, "s-crash"); err != nil {
+			t.Fatalf("RemoveWorkspace of an already-removed volume = %v, want nil", err)
+		}
+		if err := d.RemoveWorkspace(ctx, "s-never-existed"); err != nil {
+			t.Fatalf("RemoveWorkspace of a volume that never existed = %v, want nil", err)
+		}
+		// An empty session id names no workspace. `rainier-ws-` on its own is
+		// a real volume name a driver must never be talked into removing, so
+		// the id-less case is a no-op rather than a prefix-only `volume rm`.
+		if err := d.RemoveWorkspace(ctx, ""); err != nil {
+			t.Fatalf("RemoveWorkspace(\"\") = %v, want nil", err)
 		}
 	})
 

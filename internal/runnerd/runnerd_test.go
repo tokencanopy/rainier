@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -634,16 +635,20 @@ func TestRecoverRebuildsRegistryFromDriverLabels(t *testing.T) {
 	}
 }
 
-// destroyTrackingFake wraps driver.Fake to record every id passed to
-// Destroy, so a test can assert whether runnerd's own hub-death path called
-// it — as opposed to merely observing the fake's post-hoc state (which
-// Destroy and a test's own setup calls would otherwise look identical
-// through). Everything but Destroy goes straight through to the embedded
+// destroyTrackingFake wraps driver.Fake to record every id passed to Destroy
+// and to DestroyContainer, so a test can assert whether runnerd's own
+// hub-death path called them — as opposed to merely observing the fake's
+// post-hoc state (which a teardown and a test's own setup calls would
+// otherwise look identical through). Recording the two SEPARATELY is what
+// makes the crash-vs-rm split assertable at all: both leave the same fake
+// with the same missing item, and only the volume — and this record — says
+// which one ran. Everything else goes straight through to the embedded
 // *driver.Fake, matching the slowFake pattern above.
 type destroyTrackingFake struct {
 	*driver.Fake
-	mu        sync.Mutex
-	destroyed []string
+	mu           sync.Mutex
+	destroyed    []string
+	containersRm []string
 }
 
 func newDestroyTrackingFake(total int) *destroyTrackingFake {
@@ -657,11 +662,26 @@ func (f *destroyTrackingFake) Destroy(ctx context.Context, id string) error {
 	return f.Fake.Destroy(ctx, id)
 }
 
+func (f *destroyTrackingFake) DestroyContainer(ctx context.Context, id string) error {
+	f.mu.Lock()
+	f.containersRm = append(f.containersRm, id)
+	f.mu.Unlock()
+	return f.Fake.DestroyContainer(ctx, id)
+}
+
 func (f *destroyTrackingFake) destroyCalls() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]string, len(f.destroyed))
 	copy(out, f.destroyed)
+	return out
+}
+
+func (f *destroyTrackingFake) destroyContainerCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.containersRm))
+	copy(out, f.containersRm)
 	return out
 }
 
@@ -740,12 +760,19 @@ func TestHubDeathAliveContainerKeepsSession(t *testing.T) {
 	attachAndAssertEcho(t, ctx, base, id, "post-redial-marker")
 }
 
-// TestHubDeathGoneContainerDestroys is TestHubDeathAliveContainerKeepsSession's
-// companion: when the driver's Inspect reports the container actually gone
-// (a real crash — the process died, unlike the redial case above), today's
-// behavior must be preserved — the registry entry is removed and the
-// container is destroyed to reclaim its capacity slot (I1).
-func TestHubDeathGoneContainerDestroys(t *testing.T) {
+// TestHubDeathGoneContainerDestroysContainerAndKeepsWorkspace is
+// TestHubDeathAliveContainerKeepsSession's companion: when the driver's
+// Inspect reports the container actually gone (a real crash — the process
+// died, unlike the redial case above), the registry entry is removed and the
+// container destroyed to reclaim its capacity slot (I1).
+//
+// What Plan 5 adds is the second half of that sentence: the WORKSPACE stays.
+// A crashed session is the case a user most wants their files back from, and
+// before this the crash path called the whole-teardown Destroy — the same call
+// `rainier rm` makes — so the container's death silently took hours of work
+// with it. The crash path must call DestroyContainer and nothing else; only an
+// explicit rm ever removes a volume.
+func TestHubDeathGoneContainerDestroysContainerAndKeepsWorkspace(t *testing.T) {
 	fd := newDestroyTrackingFake(4)
 	rd := New(fd, "", "", "")
 	srv := httptest.NewServer(rd.Handler())
@@ -763,12 +790,18 @@ func TestHubDeathGoneContainerDestroys(t *testing.T) {
 	if !ok || state != "running" || handle == "" {
 		t.Fatalf("session not running with a handle before crash: state=%q ok=%v handle=%q", state, ok, handle)
 	}
+	volume := "rainier-ws-" + id
+	if !slices.Contains(fd.Volumes(), volume) {
+		t.Fatalf("create left no workspace volume for %s to keep: %v", id, fd.Volumes())
+	}
 
 	// Simulate the container itself already being gone by the time runnerd
 	// asks (crashed and reaped) — call the embedded *driver.Fake directly, not
 	// through the tracking wrapper, so this setup step isn't mistaken for
-	// runnerd's own Destroy call below.
-	if err := fd.Fake.Destroy(ctx, handle); err != nil {
+	// runnerd's own call below. DestroyContainer, not Destroy: a crash removes
+	// a container, and using the whole teardown here would delete the very
+	// volume this test is about to assert on.
+	if err := fd.Fake.DestroyContainer(ctx, handle); err != nil {
 		t.Fatal(err)
 	}
 
@@ -787,15 +820,95 @@ func TestHubDeathGoneContainerDestroys(t *testing.T) {
 		t.Fatal("registry entry survived a gone-container hub death (should be removed, matching today's crash behavior)")
 	}
 
-	calls := fd.destroyCalls()
-	found := false
-	for _, c := range calls {
-		if c == handle {
-			found = true
-		}
+	if calls := fd.destroyContainerCalls(); !slices.Contains(calls, handle) {
+		t.Fatalf("DestroyContainer(%q) not called by runnerd's own crash path; calls=%v", handle, calls)
 	}
-	if !found {
-		t.Fatalf("Destroy(%q) not called by runnerd's own crash path; calls=%v", handle, calls)
+	if calls := fd.destroyCalls(); len(calls) != 0 {
+		t.Fatalf("the crash path called the whole-teardown Destroy %v; only an explicit rm may take a workspace", calls)
+	}
+	if !slices.Contains(fd.Volumes(), volume) {
+		t.Fatalf("the crash path removed %s; a crashed session's workspace is exactly what a user comes back for", volume)
+	}
+}
+
+// TestDeleteRemovesTheWorkspace is the other side of that split: an explicit
+// teardown — `rainier rm`, which arrives here as Delete — must leave nothing
+// behind. With the crash path no longer removing volumes, a leak here would
+// mean one orphaned workspace per session ever created, with nothing left on
+// the host that names it.
+func TestDeleteRemovesTheWorkspace(t *testing.T) {
+	fd := newDestroyTrackingFake(4)
+	rd := New(fd, "", "", "")
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+	ctx := context.Background()
+
+	id := createSession(t, srv.URL)
+	volume := "rainier-ws-" + id
+	if !slices.Contains(fd.Volumes(), volume) {
+		t.Fatalf("create left no workspace volume: %v", fd.Volumes())
+	}
+
+	if err := rd.Delete(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fd.destroyCalls(); len(calls) != 1 {
+		t.Fatalf("Destroy calls = %v, want exactly one whole teardown", calls)
+	}
+	if slices.Contains(fd.Volumes(), volume) {
+		t.Fatalf("Delete left %s behind: %v", volume, fd.Volumes())
+	}
+}
+
+// TestRemoveWorkspaceReclaimsAKeptVolume covers the command controld sends
+// after a crash-dead session is explicitly removed: the container is long
+// gone, so nothing but this reclaims the volume the crash path deliberately
+// kept.
+//
+// The refusal half is the guard that makes the split safe to have at all.
+// remove_workspace is a fire-and-forget command over a fleet-wide token; a
+// misrouted one against a LIVE session would erase a running agent's working
+// tree, which docker itself would refuse (the volume is in use) but the fake
+// would happily do. runnerd answers for both.
+func TestRemoveWorkspaceReclaimsAKeptVolume(t *testing.T) {
+	fd := newDestroyTrackingFake(4)
+	rd := New(fd, "", "", "")
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+	ctx := context.Background()
+
+	id := createSession(t, srv.URL)
+	volume := "rainier-ws-" + id
+
+	// Still registered: the session is alive, and its workspace is not
+	// something a stray command gets to take.
+	if err := rd.RemoveWorkspace(ctx, id); err == nil {
+		t.Fatal("RemoveWorkspace on a registered session = nil, want a refusal")
+	}
+	if !slices.Contains(fd.Volumes(), volume) {
+		t.Fatalf("a refused RemoveWorkspace took %s anyway: %v", volume, fd.Volumes())
+	}
+
+	// The crash: container gone, entry gone, volume kept.
+	handle, _, ok := rd.reg.opTarget(id)
+	if !ok {
+		t.Fatal("session vanished before the crash")
+	}
+	if err := fd.Fake.DestroyContainer(ctx, handle); err != nil {
+		t.Fatal(err)
+	}
+	rd.reg.remove(id)
+
+	if err := rd.RemoveWorkspace(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(fd.Volumes(), volume) {
+		t.Fatalf("RemoveWorkspace left %s behind: %v", volume, fd.Volumes())
+	}
+	// Running second is the normal case (a full Destroy already took it, or a
+	// retried rm), and must not report a failure.
+	if err := rd.RemoveWorkspace(ctx, id); err != nil {
+		t.Fatalf("RemoveWorkspace of an already-absent volume = %v, want nil", err)
 	}
 }
 
@@ -1279,6 +1392,24 @@ func TestControlFramesBecomeEvents(t *testing.T) {
 	}
 	if !strings.Contains(got.detail, "7") || !strings.Contains(got.detail, "unable to locate package foo") {
 		t.Fatalf("detail = %q, want it to carry both the rc and the tail", got.detail)
+	}
+
+	// child_exited is the third kind on this channel and the one that carries
+	// a number nothing else can supply: the agent process's own verdict. The
+	// detail is the bare exit code, because controld parses it back into an
+	// integer column rather than showing it — a decorated string here would
+	// have to be un-decorated there.
+	//
+	// Exit 0 is a real answer, not an absent one, so it has to survive the
+	// trip as "0" — the failure mode a `if rc != 0` anywhere in this path
+	// would produce is a successful agent that looks like it never finished.
+	sendControl(`{"kind":"child_exited","rc":0}`)
+	if got, want := nextEvent(t, events), (event{id, "child_exited", "0"}); got != want {
+		t.Fatalf("event = %+v, want %+v", got, want)
+	}
+	sendControl(`{"kind":"child_exited","rc":137}`)
+	if got, want := nextEvent(t, events), (event{id, "child_exited", "137"}); got != want {
+		t.Fatalf("event = %+v, want %+v", got, want)
 	}
 }
 

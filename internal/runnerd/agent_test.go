@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -532,6 +533,58 @@ func TestAgentSnapshotUsesTheCommandRef(t *testing.T) {
 	}
 	if res.Detail != ref {
 		t.Fatalf("result detail = %q, want the commanded ref %q", res.Detail, ref)
+	}
+}
+
+// TestAgentRemoveWorkspaceCommand pins the command controld sends to reclaim
+// a workspace the crash path kept: it names a SESSION (the volume is derived
+// from the session id, not from a container that no longer exists), it is
+// fire-and-forget — req_id 0, nobody waiting — and an already-absent volume is
+// an ok result, because every caller of it is a teardown that may be running
+// second.
+func TestAgentRemoveWorkspaceCommand(t *testing.T) {
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "", "")
+	ctx := context.Background()
+	if err := rd.CreateWithID(ctx, "sess_ws", driver.Spec{Image: "img", SessionID: "sess_ws"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The crash already took the container and the registry entry; only the
+	// volume is left, which is the state this command exists for.
+	handle, _, ok := rd.reg.opTarget("sess_ws")
+	if !ok {
+		t.Fatal("session missing right after create")
+	}
+	if err := fd.DestroyContainer(ctx, handle); err != nil {
+		t.Fatal(err)
+	}
+	rd.reg.remove("sess_ws")
+	if !slices.Contains(fd.Volumes(), "rainier-ws-sess_ws") {
+		t.Fatalf("no kept workspace to reclaim: %v", fd.Volumes())
+	}
+
+	fc := newFakeControld(t, testToken)
+	actx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go rd.RunAgent(actx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1"})
+
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+
+	conn.send(t, rwire.ToRunner{Type: "remove_workspace", Session: "sess_ws"})
+	res := conn.readMsg(t)
+	if res.Type != "result" || !res.OK || res.ReqID != 0 {
+		t.Fatalf("result = %+v, want an ok fire-and-forget result", res)
+	}
+	if slices.Contains(fd.Volumes(), "rainier-ws-sess_ws") {
+		t.Fatalf("remove_workspace left the volume behind: %v", fd.Volumes())
+	}
+
+	// Again, against nothing: still ok. controld sends this on the explicit-rm
+	// path whether or not a full destroy already took the volume.
+	conn.send(t, rwire.ToRunner{Type: "remove_workspace", Session: "sess_ws"})
+	if res := conn.readMsg(t); res.Type != "result" || !res.OK {
+		t.Fatalf("second result = %+v, want ok for an already-absent workspace", res)
 	}
 }
 

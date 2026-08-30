@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -428,117 +429,260 @@ func waitFor(t *testing.T, what string, f func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-// TestServeConnDeliversTheSetupOutcome covers the delivery half of the
-// contract: the outcome is computed once by the watcher, but a connection
-// can die before or during its delivery, so it stays pending until some
-// connection actually accepts it — and is never sent twice.
-func TestServeConnDeliversTheSetupOutcome(t *testing.T) {
+// sentStrings renders what a stubSender received, for readable assertions on
+// a queue's contents and order.
+func (s *stubSender) sentStrings() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.sent))
+	for i, p := range s.sent {
+		out[i] = string(p)
+	}
+	return out
+}
+
+// pendingStrings renders a returned queue the same way.
+func pendingStrings(q [][]byte) []string {
+	out := make([]string, len(q))
+	for i, p := range q {
+		out[i] = string(p)
+	}
+	return out
+}
+
+// TestServeConnDeliversControlEvents covers the delivery half of the
+// contract: an event is computed once by whichever watcher produced it, but a
+// connection can die before or during its delivery, so it stays queued until
+// some connection actually accepts it — and is never sent twice.
+func TestServeConnDeliversControlEvents(t *testing.T) {
 	payload := []byte(`{"kind":"setup_done"}`)
 
-	t.Run("an outcome arriving mid-connection is delivered", func(t *testing.T) {
-		setup := make(chan []byte, 1)
+	t.Run("an event arriving mid-connection is delivered", func(t *testing.T) {
+		events := make(chan []byte, pendingCap)
 		errc := make(chan error, 1)
 		snd := &stubSender{}
 		done := make(chan struct{})
 		go func() {
-			pending, ch, err := serveConn(snd, errc, setup, nil)
-			if pending != nil || ch != nil {
-				t.Errorf("after delivery: pending=%q setup=%v, want both nil", pending, ch)
+			pending, err := serveConn(snd, errc, events, nil)
+			if len(pending) != 0 {
+				t.Errorf("after delivery: pending=%q, want empty", pendingStrings(pending))
 			}
 			if err == nil {
 				t.Error("serveConn returned a nil relay error")
 			}
 			close(done)
 		}()
-		setup <- payload
+		events <- payload
 		// Only once the send has landed does the connection end.
-		waitFor(t, "the outcome to be sent", func() bool { return snd.count() == 1 })
+		waitFor(t, "the event to be sent", func() bool { return snd.count() == 1 })
 		errc <- errors.New("conn closed")
 		<-done
-		if snd.count() != 1 || string(snd.sent[0]) != string(payload) {
-			t.Fatalf("sent = %q, want exactly one %q", snd.sent, payload)
+		if got := snd.sentStrings(); len(got) != 1 || got[0] != string(payload) {
+			t.Fatalf("sent = %q, want exactly one %q", got, payload)
 		}
 	})
 
-	t.Run("a failed send keeps the outcome pending for the next connection", func(t *testing.T) {
-		setup := make(chan []byte, 1)
+	t.Run("a failed send keeps the event queued for the next connection", func(t *testing.T) {
+		events := make(chan []byte, pendingCap)
 		errc := make(chan error, 1)
 		dead := &stubSender{err: errors.New("write: broken pipe")}
 
-		type result struct {
-			pending []byte
-			ch      <-chan []byte
-		}
-		res := make(chan result, 1)
+		res := make(chan [][]byte, 1)
 		go func() {
-			pending, ch, _ := serveConn(dead, errc, setup, nil)
-			res <- result{pending, ch}
+			pending, _ := serveConn(dead, errc, events, nil)
+			res <- pending
 		}()
-		// Hand over the outcome first and wait for the send to be attempted
+		// Hand over the event first and wait for the send to be attempted
 		// and fail: with both channels ready at once the select would be
-		// free to end the connection before the outcome was ever taken (a
+		// free to end the connection before the event was ever taken (a
 		// legal outcome — it stays in the channel — but not the one under
 		// test here).
-		setup <- payload
+		events <- payload
 		waitFor(t, "the failing send to be attempted", func() bool { return dead.tries() == 1 })
 		errc <- errors.New("conn closed")
 		first := <-res
-		if string(first.pending) != string(payload) {
-			t.Fatalf("pending = %q, want the undelivered %q", first.pending, payload)
+		if got := pendingStrings(first); len(got) != 1 || got[0] != string(payload) {
+			t.Fatalf("pending = %q, want the undelivered %q", got, payload)
 		}
 
-		// The redial: same pending payload, a live conn this time.
+		// The redial: same queue, a live conn this time.
 		errc2 := make(chan error, 1)
 		errc2 <- errors.New("conn closed later")
 		live := &stubSender{}
-		pending, ch, _ := serveConn(live, errc2, first.ch, first.pending)
-		if pending != nil || ch != nil {
-			t.Fatalf("after the retry: pending=%q setup=%v, want both nil", pending, ch)
+		pending, _ := serveConn(live, errc2, events, first)
+		if len(pending) != 0 {
+			t.Fatalf("after the retry: pending=%q, want empty", pendingStrings(pending))
 		}
-		if live.count() != 1 || string(live.sent[0]) != string(payload) {
-			t.Fatalf("retry sent %q, want exactly one %q", live.sent, payload)
+		if got := live.sentStrings(); len(got) != 1 || got[0] != string(payload) {
+			t.Fatalf("retry sent %q, want exactly one %q", got, payload)
 		}
 	})
 
-	t.Run("an outcome is never lost when a connection dies under it", func(t *testing.T) {
+	t.Run("an event is never lost when a connection dies under it", func(t *testing.T) {
 		// Both channels ready at once, which is exactly what a conn dying the
 		// instant setup finished looks like: the select may take either
-		// first, so the outcome comes back either as a pending payload (it
-		// was taken, and the send failed) or still sitting in the channel
-		// (the conn ended before it was taken). The invariant is that it
-		// survives whichever way that lands — the next connection delivers
-		// it, once.
-		setup := make(chan []byte, 1)
-		setup <- payload
+		// first, so the event comes back either as a queued payload (it was
+		// taken, and the send failed) or still sitting in the channel (the
+		// conn ended before it was taken). The invariant is that it survives
+		// whichever way that lands — the next connection delivers it, once.
+		events := make(chan []byte, pendingCap)
+		events <- payload
 		errc := make(chan error, 1)
 		errc <- errors.New("conn closed")
-		pending, ch, _ := serveConn(&stubSender{err: errors.New("write: broken pipe")}, errc, setup, nil)
+		pending, _ := serveConn(&stubSender{err: errors.New("write: broken pipe")}, errc, events, nil)
 
 		errc2 := make(chan error, 1)
 		live := &stubSender{}
 		done := make(chan struct{})
 		go func() {
-			serveConn(live, errc2, ch, pending)
+			serveConn(live, errc2, events, pending)
 			close(done)
 		}()
-		waitFor(t, "the retained outcome to be delivered", func() bool { return live.count() == 1 })
+		waitFor(t, "the retained event to be delivered", func() bool { return live.count() == 1 })
 		errc2 <- errors.New("conn closed later")
 		<-done
-		if string(live.sent[0]) != string(payload) {
-			t.Fatalf("delivered %q, want %q", live.sent[0], payload)
+		if got := live.sentStrings(); got[0] != string(payload) {
+			t.Fatalf("delivered %q, want %q", got[0], payload)
 		}
 	})
 
-	t.Run("no setup means nothing is ever sent", func(t *testing.T) {
+	t.Run("no events means nothing is ever sent", func(t *testing.T) {
 		errc := make(chan error, 1)
 		errc <- errors.New("conn closed")
 		snd := &stubSender{}
-		pending, ch, err := serveConn(snd, errc, nil, nil)
-		if pending != nil || ch != nil || err == nil {
-			t.Fatalf("pending=%q setup=%v err=%v, want nil/nil/non-nil", pending, ch, err)
+		pending, err := serveConn(snd, errc, nil, nil)
+		if len(pending) != 0 || err == nil {
+			t.Fatalf("pending=%q err=%v, want empty/non-nil", pendingStrings(pending), err)
 		}
 		if snd.count() != 0 {
-			t.Fatalf("sent %d payloads with no setup configured, want 0", snd.count())
+			t.Fatalf("sent %d payloads with no events configured, want 0", snd.count())
 		}
 	})
+}
+
+// TestServeConnQueuesEventsFIFO is why the single pending payload became a
+// queue: a session now has two things to report on this channel — its setup's
+// verdict and its agent's exit — and both can be waiting at once. That is not
+// a corner case: a FAILING setup produces both, since the wrapper writes its
+// exit code and then exits with it. One slot would have silently dropped
+// whichever arrived first.
+//
+// Delivery order is the order of arrival, so what reaches controld is the
+// order things actually happened in rather than one that falls out of
+// scheduling — and so that "drop the oldest" has a well-defined meaning.
+func TestServeConnQueuesEventsFIFO(t *testing.T) {
+	setup := []byte(`{"kind":"setup_done"}`)
+	exited := []byte(`{"kind":"child_exited","rc":0}`)
+
+	events := make(chan []byte, pendingCap)
+	errc := make(chan error, 1)
+	dead := &stubSender{err: errors.New("write: broken pipe")}
+
+	res := make(chan [][]byte, 1)
+	go func() {
+		pending, _ := serveConn(dead, errc, events, nil)
+		res <- pending
+	}()
+	events <- setup
+	waitFor(t, "the first failing send", func() bool { return dead.tries() == 1 })
+	events <- exited
+	waitFor(t, "the second failing send", func() bool { return dead.tries() >= 2 })
+	errc <- errors.New("conn closed")
+
+	queued := <-res
+	want := []string{string(setup), string(exited)}
+	if got := pendingStrings(queued); !reflect.DeepEqual(got, want) {
+		t.Fatalf("queued = %q, want both in arrival order %q", got, want)
+	}
+
+	// The redial drains the whole queue, in that order, on one connection.
+	errc2 := make(chan error, 1)
+	errc2 <- errors.New("conn closed later")
+	live := &stubSender{}
+	pending, _ := serveConn(live, errc2, events, queued)
+	if len(pending) != 0 {
+		t.Fatalf("after the drain: pending=%q, want empty", pendingStrings(pending))
+	}
+	if got := live.sentStrings(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("delivered %q, want %q", got, want)
+	}
+}
+
+// TestPendingQueueDropsTheOldest bounds the queue. Nothing in v0's vocabulary
+// produces more than two events, so overflowing this is a bug somewhere else
+// — but an UNBOUNDED queue turns that bug into a sessiond whose memory grows
+// for as long as its runnerd stays away, which is the one failure mode a
+// session (the thing this whole system promises outlives everything) must not
+// have. Dropping the oldest keeps the most recent news, which is the half a
+// late-arriving consumer can still act on.
+func TestPendingQueueDropsTheOldest(t *testing.T) {
+	var q [][]byte
+	for i := range pendingCap + 3 {
+		q = appendPending(q, fmt.Appendf(nil, "e%d", i))
+	}
+	if len(q) != pendingCap {
+		t.Fatalf("queue length = %d, want the %d cap", len(q), pendingCap)
+	}
+	want := make([]string, 0, pendingCap)
+	for i := 3; i < pendingCap+3; i++ {
+		want = append(want, fmt.Sprintf("e%d", i))
+	}
+	if got := pendingStrings(q); !reflect.DeepEqual(got, want) {
+		t.Fatalf("queue = %q, want the newest %d %q", got, pendingCap, want)
+	}
+}
+
+// TestChildExitedPayload pins the event sessiond sends when the agent process
+// ends. Exit 0 is an ANSWER, not an absence — a session whose agent finished
+// cleanly has to be distinguishable from one still running — and
+// relay.ControlEvent.RC is `omitempty`, so a clean exit puts NO rc on the wire
+// at all. That is safe only because the field's zero value and the value it is
+// carrying are the same number; the assertion that matters is therefore the
+// round trip, not the bytes, and it is pinned for 0 first.
+func TestChildExitedPayload(t *testing.T) {
+	for _, code := range []int{0, 1, 137, -1} {
+		p := childExitedPayload(code)
+		var ev relay.ControlEvent
+		if err := json.Unmarshal(p, &ev); err != nil {
+			t.Fatalf("child_exited payload for %d does not decode: %v (%s)", code, err, p)
+		}
+		if ev.Kind != "child_exited" {
+			t.Fatalf("kind = %q, want child_exited", ev.Kind)
+		}
+		if ev.RC != code {
+			t.Fatalf("rc = %d, want %d (payload %s)", ev.RC, code, p)
+		}
+		if ev.ID != 0 {
+			t.Fatalf("id = %d, want 0 — child_exited is an event, not a request", ev.ID)
+		}
+	}
+}
+
+// TestOfferControlNeverBlocks: the watchers that produce these events run on
+// their own goroutines with no connection to wait for, and a blocking send
+// would park one forever the moment the queue backed up. The channel is the
+// buffer; a full one drops rather than wedges.
+func TestOfferControlNeverBlocks(t *testing.T) {
+	out := make(chan []byte, pendingCap)
+	done := make(chan struct{})
+	go func() {
+		for range pendingCap + 5 {
+			offerControl(out, []byte(`{"kind":"setup_done"}`))
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("offerControl blocked on a full queue")
+	}
+	if len(out) != pendingCap {
+		t.Fatalf("queue holds %d, want the %d cap", len(out), pendingCap)
+	}
+	// A nil payload is what controlPayload returns when encoding failed; it
+	// must not become an empty control frame on the wire.
+	offerControl(out, nil)
+	if len(out) != pendingCap {
+		t.Fatalf("a nil payload changed the queue: %d", len(out))
+	}
 }
