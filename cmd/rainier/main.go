@@ -1715,8 +1715,9 @@ func resolveClientAndIDWithTerminal(ref string, includeTerminal bool) (cli.Confi
 // by-name endpoint in v0 (see the design's route table), so this is the
 // CLI's own job. The default resolver sees only non-terminal sessions. rm's
 // variant opts into terminal rows because a failed create can still own a
-// live container; when an active row has reused a terminal row's name, the
-// active row keeps precedence and the historical one requires its id.
+// live container. The caller's own rows take precedence over teammates'
+// team-visible rows; within that set, an active row that reused a terminal
+// row's name wins and the historical one requires its id.
 //
 // Session names are unique only per owner (design), while GET /v1/sessions
 // is team-visible — two teammates can each have a session named e.g.
@@ -1747,9 +1748,11 @@ func resolveSessionIDWithTerminal(c *cli.Client, myOwnerID, ref string, includeT
 		return ref, nil
 	}
 
-	type match struct{ id, owner string }
+	type match struct {
+		id, owner string
+		terminal  bool
+	}
 	var matches []match
-	var activeMatches []match
 
 	cursor := ""
 	for {
@@ -1770,11 +1773,9 @@ func resolveSessionIDWithTerminal(c *cli.Client, myOwnerID, ref string, includeT
 		}
 		for _, s := range page.Sessions {
 			if s.Name == ref {
-				m := match{id: s.ID, owner: s.OwnerID}
-				matches = append(matches, m)
-				if !terminalSessionState(s.State) {
-					activeMatches = append(activeMatches, m)
-				}
+				matches = append(matches, match{
+					id: s.ID, owner: s.OwnerID, terminal: terminalSessionState(s.State),
+				})
 			}
 		}
 		if page.NextCursor == "" {
@@ -1782,9 +1783,31 @@ func resolveSessionIDWithTerminal(c *cli.Client, myOwnerID, ref string, includeT
 		}
 		cursor = page.NextCursor
 	}
+	// GET /v1/sessions is team-visible, but lifecycle commands should operate
+	// on the caller's own same-name row whenever one exists. Do this before
+	// active-history preference: my failed row is still my cleanup target even
+	// if a teammate currently has an active session with the same name.
+	if myOwnerID != "" {
+		var mine []match
+		for _, m := range matches {
+			if m.owner == myOwnerID {
+				mine = append(mine, m)
+			}
+		}
+		if len(mine) > 0 {
+			matches = mine
+		}
+	}
+
 	// Name uniqueness applies only to non-terminal sessions. Preserve the
 	// established `rm name` behavior when an active session has reused an old
 	// terminal session's name; the historical row remains addressable by id.
+	var activeMatches []match
+	for _, m := range matches {
+		if !m.terminal {
+			activeMatches = append(activeMatches, m)
+		}
+	}
 	if len(activeMatches) > 0 {
 		matches = activeMatches
 	}

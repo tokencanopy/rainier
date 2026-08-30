@@ -277,6 +277,39 @@ func TestRmNamePrefersAnActiveSessionOverTerminalHistory(t *testing.T) {
 	}
 }
 
+// Owner preference remains the first safety boundary even when rm can see
+// terminal history. My failed session must win over a teammate's active row
+// with the same team-visible name; otherwise rm would target their id and be
+// rejected with 403 instead of cleaning up my leaked container.
+func TestRmNamePrefersMyTerminalSessionOverATeammatesActiveSession(t *testing.T) {
+	var deleted string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodDelete {
+			deleted = r.URL.Path
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		json.NewEncoder(w).Encode(sessionsEnvelope{Sessions: []session{
+			{ID: "sess_mine", Name: "shared", OwnerID: "usr_alice", State: "failed"},
+			{ID: "sess_theirs", Name: "shared", OwnerID: "usr_bob", State: "running"},
+		}})
+	}))
+	t.Cleanup(ts.Close)
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_test", OwnerID: "usr_alice"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := captureStdout(t, func() error { return runRm([]string{"shared"}) }); err != nil {
+		t.Fatalf("rm my failed session by shared name: %v", err)
+	}
+	if deleted != "/v1/sessions/sess_mine" {
+		t.Fatalf("deleted %q, want my terminal session", deleted)
+	}
+}
+
 // Default ls keeps terminal history out of the table, but a failed session
 // must not disappear without a clue. The bounded probe asks only whether one
 // failed row exists and points the user at the established --all view.
