@@ -692,7 +692,14 @@ gh repo create "$SCRATCH_REPO" --private --add-readme \
   --description "throwaway; created and deleted by rainier scripts/e2e-fleet.sh" >/dev/null \
   || setup_error "gh repo create $SCRATCH_REPO failed"
 SCRATCH_SLUG="$GH_ACCOUNT/$SCRATCH_REPO"   # armed for cleanup from here on
-ok "created the throwaway private repository $SCRATCH_SLUG (deleted at teardown, including on failure)"
+# The base branch is READ, not assumed: a github connector defaults to "main",
+# but GitHub's default-branch name is an account setting, and a rehearsal that
+# hardcoded it would fail on somebody's account for a reason that has nothing
+# to do with rainier. Naming it explicitly also exercises the connector's
+# base_branch field rather than only its default.
+GH_BASE=$(gh api "repos/$SCRATCH_SLUG" --jq .default_branch 2>/dev/null || true)
+[ -n "$GH_BASE" ] || fail "could not read the default branch of $SCRATCH_SLUG"
+ok "created the throwaway private repository $SCRATCH_SLUG on $GH_BASE (deleted at teardown, including on failure)"
 
 # The init hook. It runs on EVERY boot and AFTER the clone stage, which is what
 # lets it do something no setup script could: read the repository's own git
@@ -708,7 +715,7 @@ EOF
 
 GH_ENV_ID=$(./bin/rainier env create "$GH_ENV_NAME" \
   --image rainier-session:latest --init-file "$GH_INIT_FILE" \
-  --connector-json "{\"type\":\"github\",\"repo\":\"$SCRATCH_SLUG\"}")
+  --connector-json "{\"type\":\"github\",\"repo\":\"$SCRATCH_SLUG\",\"base_branch\":\"$GH_BASE\"}")
 case "$GH_ENV_ID" in
   env_*) ok "created environment $GH_ENV_NAME with a github connector and an init hook" ;;
   *) fail "env create printed \"$GH_ENV_ID\", want an env_ id" ;;
@@ -797,11 +804,11 @@ ok "after a successful push, nothing token-shaped is in .git, anywhere under /wo
 # --- the diff endpoint, against the commit that was just made.
 ./bin/rainier diff "$GH_SID" > /tmp/rainier-e2e-gh-diff.txt 2>&1 \
   || { cat /tmp/rainier-e2e-gh-diff.txt >&2; fail "rainier diff $GH_SID"; }
-grep -q "$SCRATCH_SLUG  $GH_BRANCH vs origin/main" /tmp/rainier-e2e-gh-diff.txt \
+grep -q "$SCRATCH_SLUG  $GH_BRANCH vs origin/$GH_BASE" /tmp/rainier-e2e-gh-diff.txt \
   || fail "diff did not name the repository and both branches: $(head -1 /tmp/rainier-e2e-gh-diff.txt)"
 grep -q 'agent-note.txt' /tmp/rainier-e2e-gh-diff.txt \
   || { cat /tmp/rainier-e2e-gh-diff.txt; fail "diff does not show the file the session added"; }
-ok "rainier diff reports the session's change against the merge-base with origin/main"
+ok "rainier diff reports the session's change against the merge-base with origin/$GH_BASE"
 
 # --- `rainier creds`: the credential this whole phase used, still valid.
 ./bin/rainier creds > /tmp/rainier-e2e-gh-creds.txt
