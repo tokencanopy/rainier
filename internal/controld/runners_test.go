@@ -26,9 +26,10 @@ const testRunnerToken = "rnr_test_runner_token"
 // ---------------------------------------------------------------------------
 
 // newTestControld returns a Server over a fresh memstore plus an
-// httptest.Server serving its Handler(). OpTimeout is deliberately short so
-// timeout-path tests don't wait the production minute; opts override any
-// field before New validates it.
+// httptest.Server serving its Handler(). OpTimeout is shorter than production's
+// minute but not by much, for the reason spelled out below; opts override any
+// field before New validates it, and the tests that assert a timeout pass their
+// own.
 func newTestControld(t *testing.T, opts ...func(*Config)) (*Server, Store, *httptest.Server) {
 	t.Helper()
 	st := NewMemStore()
@@ -44,7 +45,19 @@ func newTestControldOver(t *testing.T, st Store, opts ...func(*Config)) (*Server
 		RunnerToken: testRunnerToken,
 		ExternalURL: "http://controld.test:9090",
 		SecretsKey:  testSecretsKey,
-		OpTimeout:   2 * time.Second,
+		// The package-wide default, and generous on purpose. Every happy-path
+		// round trip in this package — a runner dispatch, a session RPC —
+		// has to cross an httptest websocket and a fake-runner goroutine
+		// inside it, and none of those tests is ASSERTING a duration: they
+		// assert an answer. A tight default is therefore a stopwatch nobody
+		// asked for, and the first thing to give under `-race` on a loaded
+		// machine (it is the best explanation for the single unreproduced
+		// failure this package produced during Plan 5).
+		//
+		// The tests that genuinely test a timeout pass their own short
+		// OpTimeout through the opts func (150ms, 250ms) — raising this
+		// weakens none of them.
+		OpTimeout: 10 * time.Second,
 	}
 	for _, o := range opts {
 		o(&cfg)
