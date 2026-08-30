@@ -184,6 +184,13 @@ func (d *Docker) runArgs(spec Spec, image string) []string {
 		"--label", d.opts.Label + "=" + spec.SessionID,
 		"--user", sessionUser,
 		"--security-opt", "no-new-privileges",
+		// Unsized on purpose: a setup script's build products land here and
+		// there is no number that is right for all of them, so the bound is
+		// the host's default (half of RAM) rather than one this driver
+		// invents. Nothing rainier itself stages here — push and pull assemble
+		// their archives on the workspace VOLUME (cmd/sessiond/files.go's
+		// transferStagingDir) precisely so a 256MiB transfer is disk and not
+		// host memory.
 		"--tmpfs", "/tmp",
 	}
 	// The read-only rootfs is conditional on exactly one thing: whether this

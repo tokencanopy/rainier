@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -56,7 +57,7 @@ func registerFileHandlers(rpc *rpcDispatcher, env bootEnv) {
 	// One table for the whole process: transfers are keyed by the id their
 	// client chose, and they have to outlive the single request that started
 	// them (that is what makes chunking work at all).
-	ft := newFileTransfers(workspaceRoot, "")
+	ft := newFileTransfers(workspaceRoot, prepareTransferStaging(transferStagingDir))
 	rpc.RegisterRPCHandler(xfer.MethodPushFiles, ft.handlePush)
 	rpc.RegisterRPCHandler(xfer.MethodPullFiles, ft.handlePull)
 }
@@ -271,8 +272,47 @@ func (c *cappedWriter) Write(p []byte) (int, error) {
 // outlives every connection it has, so the table sweeps its own.
 const transferIdleTTL = 15 * time.Minute
 
+// transferStagingDir is where a push or a pull assembles its archive.
+//
+// It is on the WORKSPACE VOLUME, not in /tmp, and the difference is host RAM.
+// The driver mounts the container's /tmp as a tmpfs with no size option
+// (internal/driver/docker.go), so an archive staged there is resident memory —
+// up to xfer.MaxBytes (256MiB) per direction per session, on a runner already
+// hosting N of them, with no container memory limit above it. On the volume it
+// is ordinary disk, bounded by the disk, and `docker commit` excludes volumes
+// so nothing staged here can reach a cached environment image either.
+//
+// It is a subdirectory rather than .rainier itself so that clearing it at boot
+// (prepareTransferStaging) cannot touch the boot chain's own files, which live
+// beside it and are written by a different part of this process.
+const transferStagingDir = setupDir + "/transfers"
+
+// prepareTransferStaging readies that directory and returns it.
+//
+// The CLEARING is the point, and it is what buys back the one thing /tmp gave
+// for free: a tmpfs is empty at every boot, while /workspace survives a crash
+// and a cold park, so a transfer killed halfway would otherwise leave its
+// staging file on the volume forever (the in-process idle sweep only collects
+// entries this boot's table knows about). Nothing in a fresh boot refers to
+// anything already in here, so everything already in here is dead.
+//
+// A failure is logged, not fatal, and the directory is returned anyway: the
+// error a caller then gets from os.CreateTemp names this path, which is more
+// use than a session that refuses to start over a feature it may never use.
+func prepareTransferStaging(dir string) string {
+	if err := os.RemoveAll(dir); err != nil {
+		log.Printf("clearing the transfer staging directory %s: %v", dir, err)
+	}
+	// 0700: a staging file is one user's workspace in transit, and everything
+	// in the container runs as the session's own user anyway.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.Printf("preparing the transfer staging directory %s: %v", dir, err)
+	}
+	return dir
+}
+
 // fileTransfers is this sandbox's transfer state: one entry per push or pull
-// in flight, each holding a staging file under /tmp.
+// in flight, each holding a staging file in transferStagingDir.
 //
 // The staging file is why a transfer has state at all. A push is assembled
 // whole before ANY of it is extracted (a tar is only safe to trust once its
@@ -281,7 +321,7 @@ const transferIdleTTL = 15 * time.Minute
 // snapshot rather than a directory read live underneath it.
 type fileTransfers struct {
 	root string // the session's workspace: the only tree a transfer may touch
-	tmp  string // where staging files live ("" means os.TempDir)
+	tmp  string // where staging files live (transferStagingDir; "" means os.TempDir)
 	max  int64  // the compressed cap, overridden in tests
 
 	mu     sync.Mutex
