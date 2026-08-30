@@ -325,7 +325,29 @@ esac
 
 # `rainier ls`: ID NAME ENV STATE RUNNER REACHABLE AGE — read by header
 # offset, since ENV is empty on a scratch session (see `cell`).
-state_of()      { ./bin/rainier ls | cell "$1" STATE RUNNER; }
+#
+# TWO readers, and which one a check needs is not a detail. A plain `ls`
+# EXCLUDES the terminal states (canceled/failed/dead/destroyed) — that is what
+# `--all` is for — so state_of answers "" for a session that failed exactly as
+# it does for one that never existed. It is therefore the right reader for "is
+# it gone", and the WRONG one for "did it fail": `state_of X = failed` is a
+# condition that can never be true, so a waitfor on it always burns its whole
+# bound and then reports the state as "".
+#
+# That is not hypothetical. The stale-credential scene below waited 120s for a
+# session that had already failed in about a second, and blamed a boot chain
+# that was working (Plan 5, first live rehearsal). Anything asserting on a
+# terminal state reads state_all_of.
+#
+# Both take the FIRST WORD of the cell, because the STATE column is a rendered
+# sentence and not a bare state: cmd/rainier's sessionStateCell annotates it
+# with whatever the state alone leaves unanswered — "failed (exited 128)",
+# "running (exited 0)", "queued (waiting for runner rainier-gpu)". Comparing
+# the whole cell to "failed" is therefore false for every session whose agent
+# exited, which is all of them; the annotation is for a human reading the
+# table, and a check wants the state it decorates.
+state_of()      { ./bin/rainier ls | cell "$1" STATE RUNNER | awk '{print $1}'; }
+state_all_of()  { ./bin/rainier ls --all | cell "$1" STATE RUNNER | awk '{print $1}'; }
 session_state() { state_of "$SID"; }
 waitfor '[ "$(session_state)" = running ]' 90 "session running" \
   || fail "$SID never reached running (state: $(session_state)); see /tmp/runnerd.log"
@@ -395,7 +417,7 @@ waitfor '[ -z "$(session_state)" ]' 30 "session gone from ls" \
 # Scoped to THIS session's row: a bare `grep -q destroyed` over the whole
 # --all listing passes on any leftover destroyed session from an earlier run
 # — including one this run's rm never touched.
-session_state_all() { ./bin/rainier ls --all | cell "$SID" STATE RUNNER; }
+session_state_all() { state_all_of "$SID"; }
 [ "$(session_state_all)" = "destroyed" ] \
   || fail "ls --all shows $SID as \"$(session_state_all)\", want destroyed"
 ok "removed; $SID's terminal row is still visible under ls --all"
@@ -757,15 +779,15 @@ session_error() {
 # in it, and it needs no attach.
 GH_INIT_PULL=/tmp/rainier-e2e-gh-init
 gh_boot_settled() {
-  [ "$(state_of "$GH_SID")" = failed ] && return 0
+  [ "$(state_all_of "$GH_SID")" = failed ] && return 0
   rm -rf "$GH_INIT_PULL"
   ./bin/rainier pull "$GH_SID:/workspace/init-done" "$GH_INIT_PULL" >/dev/null 2>&1
 }
-waitfor '[ "$(state_of "$GH_SID")" = running ] || [ "$(state_of "$GH_SID")" = failed ]' 120 "the session to be placed" \
+waitfor '[ "$(state_of "$GH_SID")" = running ] || [ "$(state_all_of "$GH_SID")" = failed ]' 120 "the session to be placed" \
   || fail "$GH_SID never left queued/creating; see $CONTROLD_LOG and /tmp/runnerd.log"
 waitfor gh_boot_settled 300 "the boot chain (clone, then init)" \
-  || fail "$GH_SID never finished its boot chain (state: $(state_of "$GH_SID")); see /tmp/runnerd.log"
-if [ "$(state_of "$GH_SID")" = failed ]; then
+  || fail "$GH_SID never finished its boot chain (state: $(state_all_of "$GH_SID")); see /tmp/runnerd.log"
+if [ "$(state_all_of "$GH_SID")" = failed ]; then
   fail "the session failed its boot chain: $(session_error "$GH_SID")"
 fi
 grep -q 'init-sees-commit=' "$GH_INIT_PULL/marker" \
@@ -912,8 +934,8 @@ case "$GH_SID2" in
   *) fail "new --env with a stale credential printed \"$GH_SID2\", want a sess_ id — a stale credential must not be a create-time refusal" ;;
 esac
 GH_STALE_START=$(date +%s)
-waitfor '[ "$(state_of "$GH_SID2")" = failed ]' 120 "the stale-credential session to fail" \
-  || fail "$GH_SID2 is \"$(state_of "$GH_SID2")\" 120s after a refused mint. A refused mint must fail the clone in seconds; if git is instead sitting on a terminal prompt it burns the whole 600s-per-repo clone bound and reports a timeout with no named action (check that the boot chain exports GIT_TERMINAL_PROMPT=0)."
+waitfor '[ "$(state_all_of "$GH_SID2")" = failed ]' 120 "the stale-credential session to fail" \
+  || fail "$GH_SID2 is \"$(state_all_of "$GH_SID2")\" 120s after a refused mint. A refused mint must fail the clone in seconds; if git is instead sitting on a terminal prompt it burns the whole 600s-per-repo clone bound and reports a timeout with no named action (check that the boot chain exports GIT_TERMINAL_PROMPT=0)."
 GH_STALE_SECS=$(( $(date +%s) - GH_STALE_START ))
 # Grepped out of the raw body rather than the extracted error: the error
 # column carries a 2KB tail of the session's own output, quotes and newlines
@@ -925,9 +947,17 @@ case "$GH_STALE_BODY" in
 esac
 ok "a session created against a stale credential failed in ${GH_STALE_SECS}s, naming \`rainier login --refresh github\`"
 
-./bin/rainier rm "$GH_SID2" >/dev/null
-waitfor '[ -z "$(state_of "$GH_SID2")" ]' 60 "the stale-credential session to go" \
-  || fail "$GH_SID2 is still listed after rm"
+# rm on a session that is ALREADY terminal is an idempotent no-op for the row
+# (it reclaims the workspace volume and answers 204; internal/controld's
+# handleDeleteSession), so the state stays `failed` — it does not become
+# `destroyed` the way rm of a running session does, and it was never in the
+# plain `ls` listing to disappear from. Waiting for it to "go" was therefore
+# vacuously true the instant it was asked. What is worth asserting is that the
+# rm succeeded and left the row's verdict intact: a user who removes a failed
+# session must not lose the record of why it failed.
+./bin/rainier rm "$GH_SID2" >/dev/null || fail "rm of the failed session $GH_SID2"
+[ "$(state_all_of "$GH_SID2")" = failed ] \
+  || fail "after rm, $GH_SID2 reads \"$(state_all_of "$GH_SID2")\" under ls --all, want failed — removing a failed session must not erase its verdict"
 
 # Put the credential back the way this scene found it: a KEEP=1 stack, and
 # anything after this phase, should see the fleet it started with.
