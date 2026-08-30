@@ -870,6 +870,10 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 			body string
 		}{
 			{"not owner/name", `{"name":"x","repos":[{"repo":"nope"}]}`},
+			// The session override reaches the same directory the connector's
+			// does — expandRepos does not care which of them named the repo.
+			{"a repo named ..", `{"name":"x","repos":[{"repo":"acme/.."}]}`},
+			{"an owner named .", `{"name":"x","repos":[{"repo":"./app"}]}`},
 			{"empty base_branch", `{"name":"x","repos":[{"repo":"acme/app","base_branch":""}]}`},
 			{"unknown member", `{"name":"x","repos":[{"repo":"acme/app","branch":"main"}]}`},
 			{"missing repo", `{"name":"x","repos":[{}]}`},
@@ -2732,6 +2736,22 @@ func TestValidateConnectors(t *testing.T) {
 		}
 	})
 
+	t.Run("a dot-leading repository name is still a repository name", func(t *testing.T) {
+		// The path specials are refused, but `.github` is a real and extremely
+		// common repository, and a dotted directory under /workspace is still
+		// under /workspace. Refusing it would close nothing.
+		for _, in := range []string{
+			`{"type":"github","repo":"acme/.github"}`,
+			`{"type":"github","repo":"acme/dot.name"}`,
+			`{"type":"github","repo":"acme/with-dash"}`,
+			`{"type":"github","repo":"acme/_under"}`,
+		} {
+			if _, err := validateConnectors(connectorArray(in)); err != nil {
+				t.Errorf("validateConnectors(%s) = %v, want it accepted", in, err)
+			}
+		}
+	})
+
 	t.Run("rejections name what was wrong", func(t *testing.T) {
 		cases := []struct {
 			name, in, want string
@@ -2748,6 +2768,14 @@ func TestValidateConnectors(t *testing.T) {
 			{"repo without an owner", `[{"type":"github","repo":"widgets"}]`, "repo"},
 			{"repo with a space", `[{"type":"github","repo":"acme/wid gets"}]`, "repo"},
 			{"repo with a path segment too many", `[{"type":"github","repo":"acme/widgets/deep"}]`, "repo"},
+			// The name becomes a directory component under /workspace, so the
+			// two path specials are refused HERE rather than left to git's
+			// accident of declining a non-empty clone destination.
+			{"repo named ..", `[{"type":"github","repo":"acme/.."}]`, "repo"},
+			{"repo named .", `[{"type":"github","repo":"acme/."}]`, "repo"},
+			{"owner named ..", `[{"type":"github","repo":"../widgets"}]`, "repo"},
+			{"repo starting with a dash", `[{"type":"github","repo":"acme/-widgets"}]`, "repo"},
+			{"owner starting with a dash", `[{"type":"github","repo":"-acme/widgets"}]`, "repo"},
 			{"explicitly empty base_branch", `[{"type":"github","repo":"a/b","base_branch":""}]`, "base_branch"},
 			{"files with no paths", `[{"type":"files","paths":[]}]`, "paths"},
 			{"files with a missing paths key", `[{"type":"files"}]`, "paths"},

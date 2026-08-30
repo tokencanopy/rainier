@@ -292,6 +292,14 @@ func contains(root, p string) bool {
 // or a fifo is refused rather than skipped: silently shipping a tree that is
 // not the tree the user named is the worse failure, and the message says which
 // entry stopped it.
+//
+// A symlink is held to the SAME rule here as on extraction (checkLink), which
+// is what makes the refusal cheap. Both ends apply it, but only this end can
+// apply it before the bytes move: a tree containing `vendor/node ->
+// /usr/bin/node` would otherwise upload every one of up to 256MiB and fail on
+// the last chunk, in a message about an "archive entry" the user never wrote.
+// Refusing at pack time turns that into an error about a file on their own
+// disk, before the first byte.
 func TarGz(w io.Writer, dir string, limit int64) (int64, error) {
 	lw := &limitWriter{w: w, limit: limit}
 	zw := gzip.NewWriter(lw)
@@ -311,6 +319,11 @@ func TarGz(w io.Writer, dir string, limit int64) (int64, error) {
 		var link string
 		if fi.Mode()&os.ModeSymlink != 0 {
 			if link, err = os.Readlink(p); err != nil {
+				return err
+			}
+			// Checked against the name this entry will HAVE in the archive,
+			// which is the name the far end will check it under.
+			if err := checkLink(filepath.ToSlash(rel), link); err != nil {
 				return err
 			}
 		} else if !fi.Mode().IsRegular() && !fi.IsDir() {
