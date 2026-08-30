@@ -178,6 +178,74 @@ func TestRPCCallRoundTrips(t *testing.T) {
 	}
 }
 
+// TestRPCWaitsForItsFirstConnection covers the boot race the git credential
+// helper can lose. The chain's clone stage starts within milliseconds of the
+// process, while dialLoop's websocket dial to runnerd is still in flight — and
+// a Call with no connection fails at once by design (nothing is re-sent across
+// a reconnect). Without a wait, a session whose runnerd happened to be
+// restarting would fail its clone stage with "sessiond is not connected"
+// instead of cloning.
+func TestRPCWaitsForItsFirstConnection(t *testing.T) {
+	d := newRPCDispatcher()
+	if d.waitConn(20 * time.Millisecond) {
+		t.Fatal("waitConn reported a connection that does not exist")
+	}
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		d.online(&stubSender{})
+	}()
+	if !d.waitConn(2 * time.Second) {
+		t.Fatal("waitConn missed a connection that arrived while it was waiting")
+	}
+
+	// A live connection is not waited on at all: the common case pays nothing.
+	start := time.Now()
+	if !d.waitConn(time.Minute) {
+		t.Fatal("waitConn missed the live connection")
+	}
+	if took := time.Since(start); took > 100*time.Millisecond {
+		t.Fatalf("waitConn took %s for a connection that was already up", took)
+	}
+
+	// And a connection that goes away is not one to wait on either.
+	d.offline()
+	if d.waitConn(20 * time.Millisecond) {
+		t.Fatal("waitConn reported a connection that had ended")
+	}
+}
+
+// TestAgentSocketCallRidesOutABootRace: the in-sandbox socket's call is the
+// only caller that can legitimately arrive before the relay exists, so it — and
+// not Call itself — is where the wait lives.
+func TestAgentSocketCallRidesOutABootRace(t *testing.T) {
+	d := newRPCDispatcher()
+	stub := &stubSender{}
+
+	out := make(chan error, 1)
+	go func() {
+		_, err := agentSocketCall(d)("mint_git_credential", nil)
+		out <- err
+	}()
+
+	time.Sleep(20 * time.Millisecond) // the helper is waiting; nothing has been sent
+	if stub.count() != 0 {
+		t.Fatal("the request went out before there was a connection to send it on")
+	}
+	d.online(stub)
+
+	waitFor(t, "the request to be sent once the relay came up", func() bool { return stub.count() > 0 })
+	answer, err := json.Marshal(relay.ControlEvent{Kind: "resp", ID: lastEvent(t, stub).ID, OK: true,
+		Payload: json.RawMessage(`{"token":"ghs_x"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.OnControl(answer)
+	if err := <-out; err != nil {
+		t.Fatalf("the call failed across the boot race: %v", err)
+	}
+}
+
 // TestRPCCallSurfacesRefusals: an ok:false answer is not a transport failure.
 // Its message is what the credential helper prints on stderr, which is how a
 // user learns the named action they have to run, so it must survive verbatim.

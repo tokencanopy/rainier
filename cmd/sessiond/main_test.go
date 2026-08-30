@@ -2,7 +2,6 @@
 package main
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -222,104 +221,17 @@ func writeLog(t *testing.T, path string, chunks ...string) {
 	}
 }
 
-// TestWatchSetup covers the three outcomes the watcher can reach, each one a
-// control payload runnerd turns into an event.
-func TestWatchSetup(t *testing.T) {
-	const poll = 5 * time.Millisecond
+// The stage watcher and its timeout message moved to gitchain.go when the
+// setup wrapper became a staged chain; TestWatchStage and
+// TestStageTimedOutTail in gitchain_test.go carry every case that lived here,
+// plus the clone and init stages.
 
-	t.Run("rc 0 is setup_done", func(t *testing.T) {
-		dir := t.TempDir()
-		rc := filepath.Join(dir, "setup.rc")
-		if err := os.WriteFile(rc, []byte("0\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		got := decodeControl(t, watchSetup(context.Background(), func() {}, rc, filepath.Join(dir, "s.log"), poll, time.Minute))
-		if got.Kind != "setup_done" || got.RC != 0 || got.Tail != "" {
-			t.Fatalf("outcome = %+v, want {Kind:setup_done}", got)
-		}
-	})
-
-	t.Run("non-zero rc is setup_failed with the log tail", func(t *testing.T) {
-		dir := t.TempDir()
-		rc := filepath.Join(dir, "setup.rc")
-		logPath := filepath.Join(dir, "s.log")
-		writeLog(t, logPath, "installing...\n", "boom: no such package\n")
-		// The rc file appears only after the watcher has already polled once.
-		go func() {
-			time.Sleep(20 * time.Millisecond)
-			os.WriteFile(rc, []byte("7\n"), 0o644)
-		}()
-		got := decodeControl(t, watchSetup(context.Background(), func() {}, rc, logPath, poll, time.Minute))
-		if got.Kind != "setup_failed" || got.RC != 7 {
-			t.Fatalf("outcome = %+v, want {Kind:setup_failed RC:7}", got)
-		}
-		if !strings.Contains(got.Tail, "boom: no such package") {
-			t.Errorf("tail = %q, want it to carry the session's output", got.Tail)
-		}
-	})
-
-	t.Run("timeout stops the session and reports rc -1", func(t *testing.T) {
-		dir := t.TempDir()
-		var mu sync.Mutex
-		stops := 0
-		stop := func() { mu.Lock(); stops++; mu.Unlock() }
-		const timeout = 60 * time.Millisecond
-		got := decodeControl(t, watchSetup(context.Background(), stop, filepath.Join(dir, "setup.rc"), filepath.Join(dir, "s.log"), poll, timeout))
-		if got.Kind != "setup_failed" || got.RC != -1 {
-			t.Fatalf("outcome = %+v, want {Kind:setup_failed RC:-1}", got)
-		}
-		if got.Tail != setupTimedOutTail(timeout) {
-			t.Errorf("tail = %q, want %q", got.Tail, setupTimedOutTail(timeout))
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		if stops != 1 {
-			t.Errorf("session stopped %d times on timeout, want exactly 1", stops)
-		}
-	})
-
-	t.Run("a half-written rc file is not an outcome", func(t *testing.T) {
-		// `echo $rc > file` truncates before it writes, so a poll can catch
-		// the file existing and empty. Treating that as rc 0 would report
-		// setup_done for a setup that had not finished.
-		dir := t.TempDir()
-		rc := filepath.Join(dir, "setup.rc")
-		if err := os.WriteFile(rc, nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		go func() {
-			time.Sleep(30 * time.Millisecond)
-			os.WriteFile(rc, []byte("5\n"), 0o644)
-		}()
-		got := decodeControl(t, watchSetup(context.Background(), func() {}, rc, filepath.Join(dir, "s.log"), poll, time.Minute))
-		if got.Kind != "setup_failed" || got.RC != 5 {
-			t.Fatalf("outcome = %+v, want {Kind:setup_failed RC:5} — an empty rc file must not read as 0", got)
-		}
-	})
-
-	t.Run("a cancelled context reports nothing", func(t *testing.T) {
-		dir := t.TempDir()
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		if p := watchSetup(ctx, func() {}, filepath.Join(dir, "setup.rc"), filepath.Join(dir, "s.log"), poll, time.Minute); p != nil {
-			t.Fatalf("payload = %q, want nil when the process is shutting down", p)
-		}
-	})
-}
-
-// TestSetupTimedOutTail pins the timeout message's shape, which controld
-// renders into a session's error text verbatim.
-func TestSetupTimedOutTail(t *testing.T) {
-	if got, want := setupTimedOutTail(900*time.Second), "setup timed out after 900s"; got != want {
-		t.Errorf("setupTimedOutTail(900s) = %q, want %q", got, want)
-	}
-}
-
-// TestSetupTimeout pins how RAINIER_SETUP_TIMEOUT is read. controld owns the
-// default (it sends 900 when an environment declares none), so sessiond's
-// only job is to honor what arrived and treat anything non-positive or
-// unreadable as "no timeout bound" rather than inventing a policy of its own.
-func TestSetupTimeout(t *testing.T) {
+// TestStageTimeout pins how a stage's bound is read out of the environment
+// (RAINIER_SETUP_TIMEOUT, RAINIER_INIT_TIMEOUT). controld owns the default (it
+// sends 900 when an environment declares none), so sessiond's only job is to
+// honor what arrived and treat anything non-positive or unreadable as "no
+// timeout bound" rather than inventing a policy of its own.
+func TestStageTimeout(t *testing.T) {
 	cases := []struct {
 		in   string
 		want time.Duration
@@ -332,8 +244,8 @@ func TestSetupTimeout(t *testing.T) {
 		{"junk", 0},
 	}
 	for _, c := range cases {
-		if got := setupTimeout(c.in); got != c.want {
-			t.Errorf("setupTimeout(%q) = %s, want %s", c.in, got, c.want)
+		if got := stageTimeout(c.in); got != c.want {
+			t.Errorf("stageTimeout(%q) = %s, want %s", c.in, got, c.want)
 		}
 	}
 }

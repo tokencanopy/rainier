@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,6 +27,16 @@ import (
 )
 
 func main() {
+	// The credential helper is this same binary, re-invoked by git from inside
+	// the sandbox (the gitconfig sessiond writes names it). It is dispatched
+	// before anything else in main runs: it spawns no child, serves no session,
+	// and lives for one exchange, so a reaper, a flag set and a PTY would all be
+	// machinery for a process that is about to print two lines and exit.
+	if len(os.Args) > 1 && os.Args[1] == credentialHelperSubcommand {
+		os.Exit(runCredentialHelper(os.Args[2:], agentSocketPath, credentialHelperTimeout,
+			os.Stdin, os.Stdout, os.Stderr))
+	}
+
 	// Install the SIGCHLD reaper before anything can spawn a child: SIGCHLD's
 	// default disposition is ignore, and the kernel discards an ignored
 	// signal at generation (it is never queued for later delivery). If the
@@ -64,36 +73,52 @@ func main() {
 		}
 	}
 
-	// An environment's setup script (Plan 4) arrives as RAINIER_SETUP_B64,
-	// injected by the driver. When it is present the child is not the agent
-	// but a wrapper that runs setup first and only execs the agent if it
+	// The boot chain (design §4.3). An environment's setup script (Plan 4), the
+	// repositories controld resolved, and the environment's per-boot init hook
+	// all arrive as base64 in the environment block, injected by the driver.
+	// When any of them is present the child is not the agent but a staged
+	// wrapper that runs them in order and only execs the agent if every one
 	// succeeded, and a watcher reports the outcome upstream over the relay's
-	// control channel. When it is absent — a scratch session, or one whose
-	// environment was already snapshot-cached, where the image IS the
-	// finished setup — none of this happens and sessiond behaves exactly as
-	// it did before.
+	// control channel. When none is — a scratch session with no repos, or one
+	// whose environment was already snapshot-cached, where the image IS the
+	// finished setup — none of this happens and sessiond behaves exactly as it
+	// did before Plan 5.
 	//
-	// Gated on relay mode: the control channel a setup outcome travels on
-	// only exists on a dialed conn, and the local dev listener has no runnerd
-	// to report to.
-	setupB64 := os.Getenv("RAINIER_SETUP_B64")
-	runSetup := *dial != "" && setupB64 != ""
-	if setupB64 != "" && *dial == "" {
-		// Can't happen from the driver (it injects RAINIER_DIAL with the
-		// script), but a human running sessiond by hand with the var set
-		// would otherwise get an environment silently missing its setup.
-		log.Print("RAINIER_SETUP_B64 is set but sessiond has no runnerd to dial; skipping setup")
+	// Gated on relay mode: the control channel a stage's verdict travels on only
+	// exists on a dialed conn, the credential the clone stage needs can only be
+	// minted over it, and the local dev listener has no runnerd to reach.
+	bootEnvironment := bootEnvFromOS()
+	var stages []bootStage
+	if bootEnvironment.any() && *dial == "" {
+		// Can't happen from the driver (it injects RAINIER_DIAL alongside), but
+		// a human running sessiond by hand with the vars set would otherwise
+		// get an environment silently missing its setup and its repositories.
+		log.Print("a boot chain was requested but sessiond has no runnerd to dial; skipping setup, clone and init")
 	}
-	if runSetup {
-		if err := prepareSetup(setupDir, setupB64); err != nil {
-			// Deliberately fatal. Running the agent anyway would hand a user
-			// a session that looks healthy in an environment that was never
-			// built — the one outcome worse than not starting. Dying is what
-			// makes runnerd notice the container is gone and controld mark
-			// the session failed.
-			log.Fatalf("setup: %v", err)
+
+	// The session RPC's sandbox end, built BEFORE the session so it is already
+	// listening when the chain's first git runs: the dispatcher serves the
+	// requests controld sends down and originates the ones this side needs, and
+	// the unix socket is how a process inside the container (the git credential
+	// helper) reaches it. Handler registration happens here, at boot, for the
+	// same reason.
+	var rpc *rpcDispatcher
+	if *dial != "" {
+		rpc = newRPCDispatcher()
+		startAgentSocket(context.Background(), agentSocketPath, rpc)
+
+		var chainEnv []envVar
+		var err error
+		stages, chainEnv, err = prepareBoot(setupDir, workspaceRoot, bootEnvironment)
+		if err != nil {
+			// Deliberately fatal. Running the agent anyway would hand a user a
+			// session that looks healthy in an environment that was never built
+			// — the one outcome worse than not starting. Dying is what makes
+			// runnerd notice the container is gone and controld mark the
+			// session failed.
+			log.Fatalf("boot chain: %v", err)
 		}
-		argv = setupWrapperArgv(setupScriptPath, setupRCPath, argv)
+		argv = chainArgv(chainEnv, stages, argv)
 	}
 
 	s, err := session.New(session.Config{Argv: argv, Cols: *cols, Rows: *rows, LogPath: *logPath}, session.StartProc)
@@ -119,9 +144,9 @@ func main() {
 		offerControl(events, childExitedPayload(code))
 	}()
 
-	// setupCtx stops the watcher on shutdown: a sessiond on its way out has
-	// no business emitting a setup verdict for a session nobody will run.
-	setupCtx, stopWatching := context.WithCancel(context.Background())
+	// stageCtx stops the watcher on shutdown: a sessiond on its way out has
+	// no business emitting a stage verdict for a session nobody will run.
+	stageCtx, stopWatching := context.WithCancel(context.Background())
 	defer stopWatching()
 
 	term := make(chan os.Signal, 1)
@@ -140,18 +165,9 @@ func main() {
 	}()
 
 	if *dial != "" {
-		if runSetup {
-			startSetupWatcher(setupCtx, s, *logPath, setupTimeout(os.Getenv("RAINIER_SETUP_TIMEOUT")), events)
+		if len(stages) > 0 {
+			startStageWatcher(stageCtx, s.Stop, stages, *logPath, events)
 		}
-		// The session RPC's sandbox end: the dispatcher serves the requests
-		// controld sends down and originates the ones this side needs, and the
-		// unix socket is how a process inside the container (the git
-		// credential helper, Task 7) reaches it. Both are built before the
-		// relay so a request arriving on a connection's first frame finds them
-		// ready — handler registration happens here, at boot, for the same
-		// reason.
-		rpc := newRPCDispatcher()
-		startAgentSocket(context.Background(), agentSocketPath, rpc)
 		dialLoop(context.Background(), *dial, *sessionID, s, events, rpc)
 		return
 	}
@@ -370,43 +386,15 @@ const (
 )
 
 const (
-	// setupPollInterval is how often the watcher looks for the wrapper's rc
-	// file. Setup runs for minutes; a second's granularity on noticing it
+	// stagePollInterval is how often the watcher looks for a stage's rc file.
+	// A stage runs for minutes; a second's granularity on noticing it
 	// finished costs nothing and keeps the poll invisible.
-	setupPollInterval = time.Second
-	// setupTailBytes is how much of the session's output a failure carries
+	stagePollInterval = time.Second
+	// stageTailBytes is how much of the session's output a failure carries
 	// upstream. Enough for the last error and its context, small enough to
 	// sit in a control frame and a database column without thought.
-	setupTailBytes = 2 << 10
+	stageTailBytes = 2 << 10
 )
-
-// setupWrapperFmt is the exact program sessiond runs in place of the agent
-// when an environment ships a setup script: run setup, record its exit code
-// where the watcher can read it, and exec the agent ONLY if it succeeded.
-//
-// Every piece is load-bearing:
-//   - `sh <path>` rather than executing the script directly: the file is
-//     written 0755, but the workspace volume's mount options are not this
-//     program's to assume, and a setup script is not required to carry a
-//     shebang.
-//   - `rc=$?` captured immediately, before anything else can overwrite `$?`.
-//   - the rc file is written BEFORE the exec, because after a successful
-//     exec this shell no longer exists to write anything.
-//   - `exec` rather than a plain call: the agent must BE the session's
-//     process (pid 1's child, the PTY's owner), not a grandchild behind a
-//     shell that would swallow its exit status and its signals.
-//   - `"$@"` with a `wrapper` $0: the agent's argv arrives as positional
-//     parameters and is passed on byte for byte, so arguments containing
-//     spaces, quotes, globs or `$` reach it exactly as controld sent them.
-//     Interpolating the argv into this string instead would make every one
-//     of those a shell injection.
-const setupWrapperFmt = `sh %s; rc=$?; echo $rc > %s; [ "$rc" -eq 0 ] && exec "$@"; exit $rc`
-
-// setupWrapperArgv composes the child argv: the wrapper program, a $0
-// placeholder, and then the real argv verbatim as "$@".
-func setupWrapperArgv(scriptPath, rcPath string, argv []string) []string {
-	return append([]string{"sh", "-c", fmt.Sprintf(setupWrapperFmt, scriptPath, rcPath), "wrapper"}, argv...)
-}
 
 // prepareSetup lands the setup script in dir, ready for the wrapper to run.
 //
@@ -423,92 +411,7 @@ func prepareSetup(dir, b64 string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	if err := os.Remove(filepath.Join(dir, setupRCName)); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	path := filepath.Join(dir, setupScriptName)
-	if err := os.WriteFile(path, script, 0o755); err != nil {
-		return err
-	}
-	// WriteFile's mode applies only when it CREATES the file; on a resumed
-	// container the script is already there with whatever mode it had.
-	return os.Chmod(path, 0o755)
-}
-
-// startSetupWatcher runs the watcher on its own goroutine, offering its single
-// verdict to the shared control queue. The channel is buffered and never
-// closed: a closed one reads as a ready value, which serveConn's select would
-// take for an event to deliver.
-func startSetupWatcher(ctx context.Context, s *session.Session, logPath string, timeout time.Duration, out chan<- []byte) {
-	go func() {
-		if p := watchSetup(ctx, s.Stop, setupRCPath, logPath, setupPollInterval, timeout); p != nil {
-			offerControl(out, p)
-		}
-	}()
-}
-
-// watchSetup polls for the exit code the wrapper writes and returns the one
-// control payload describing what happened — or nil if ctx ended first,
-// which means sessiond is shutting down and there is no one left to tell.
-//
-// timeout <= 0 means no bound. sessiond does not have a default of its own:
-// controld owns that policy (it sends 900s when an environment declares
-// none, design §4.3), and inventing a second one here would mean two
-// components disagreeing about when a setup is too slow.
-func watchSetup(ctx context.Context, stop func(), rcPath, logPath string, poll, timeout time.Duration) []byte {
-	var timedOut <-chan time.Time
-	if timeout > 0 {
-		t := time.NewTimer(timeout)
-		defer t.Stop()
-		timedOut = t.C
-	}
-	tick := time.NewTicker(poll)
-	defer tick.Stop()
-	for {
-		// Checked before the first wait, so an rc file that is already there
-		// (the wrapper finished before this goroutine started) is noticed at
-		// once rather than a poll interval later.
-		if rc, ok := readSetupRC(rcPath); ok {
-			if rc == 0 {
-				return controlPayload(relay.ControlEvent{Kind: "setup_done"})
-			}
-			return controlPayload(relay.ControlEvent{
-				Kind: "setup_failed", RC: rc, Tail: logTail(logPath, setupTailBytes),
-			})
-		}
-		select {
-		case <-tick.C:
-		case <-timedOut:
-			// SIGTERM the wrapper: a setup that has run past its bound is
-			// not going to be allowed to finish, and leaving it running
-			// would leave a container burning a slot on work whose result
-			// nobody will accept. rc -1 is the "no exit code exists" marker
-			// — the script never got to write one.
-			stop()
-			return controlPayload(relay.ControlEvent{
-				Kind: "setup_failed", RC: -1, Tail: setupTimedOutTail(timeout),
-			})
-		case <-ctx.Done():
-			return nil
-		}
-	}
-}
-
-// setupTimedOutTail is the diagnostic a timed-out setup carries in place of
-// script output, which by definition has no ending to quote.
-func setupTimedOutTail(d time.Duration) string {
-	return fmt.Sprintf("setup timed out after %ds", int(d/time.Second))
-}
-
-// setupTimeout reads RAINIER_SETUP_TIMEOUT (whole seconds, injected by the
-// driver). Anything non-positive or unparseable means no bound — see
-// watchSetup on why sessiond holds no default of its own.
-func setupTimeout(v string) time.Duration {
-	n, err := strconv.Atoi(strings.TrimSpace(v))
-	if err != nil || n <= 0 {
-		return 0
-	}
-	return time.Duration(n) * time.Second
+	return writeStageScript(dir, setupScriptName, setupRCName, script)
 }
 
 // readSetupRC reads the wrapper's exit-code file, reporting ok=false while

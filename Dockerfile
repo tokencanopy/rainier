@@ -12,7 +12,13 @@ FROM alpine:3.20
 # — it cannot exercise egressd's CONNECT proxy at all, only curl can. Kept
 # even where egress isn't currently enforced (VM-backed dev docker, R4
 # amendment) so the same session image works identically everywhere.
-RUN apk add --no-cache bash curl
+#
+# git is here because the session's boot chain runs it: the clone stage shells
+# out to `git clone`/`git checkout` (cmd/sessiond/gitchain.go) and the agent
+# commits and pushes on the session branch afterwards. Without it in the base
+# image every repo-carrying session fails its clone stage with "git: not found"
+# before the agent ever starts.
+RUN apk add --no-cache bash curl git
 # The session user, by uid — the driver runs every container as 1000:1000
 # (internal/driver.sessionUser). Without a passwd entry for that uid docker
 # gives it HOME=/ on a root-owned rootfs, which means an environment's setup

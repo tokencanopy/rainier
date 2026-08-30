@@ -1396,6 +1396,37 @@ func TestControlFramesBecomeEvents(t *testing.T) {
 		t.Fatalf("detail = %q, want it to carry both the rc and the tail", got.detail)
 	}
 
+	// Plan 5's staged boot: setup is no longer the only stage a session can
+	// fail in, so the clone and init stages report "stage_failed" naming
+	// theirs. runnerd folds the stage into the one string an rwire event has
+	// room for, front-loaded so controld can prefix its own sentence onto it
+	// ("clone failed: rc 128: ...").
+	sendControl(`{"kind":"stage_failed","stage":"clone","rc":128,"tail":"fatal: Authentication failed"}`)
+	got = nextEvent(t, events)
+	if got.session != id || got.state != "stage_failed" {
+		t.Fatalf("event = %+v, want a stage_failed for %s", got, id)
+	}
+	if want := "clone: rc 128: fatal: Authentication failed"; got.detail != want {
+		t.Fatalf("detail = %q, want %q", got.detail, want)
+	}
+
+	// A stage_failed naming the SETUP stage lands under the legacy name. The
+	// two spellings are the same event: sessiond sends "setup_failed" (so that
+	// a Plan 4 runnerd, which has never heard of stage_failed, still reports
+	// it), and this arm makes the reverse pairing work too.
+	sendControl(`{"kind":"stage_failed","stage":"setup","rc":7,"tail":"boom"}`)
+	if got, want := nextEvent(t, events), (event{id, "setup_failed", "rc 7: boom"}); got != want {
+		t.Fatalf("event = %+v, want %+v", got, want)
+	}
+
+	// credential_rejected: a git operation inside the sandbox was refused by
+	// GitHub, which is the only signal an optimistically-minted token has been
+	// revoked. It carries nothing — controld knows whose credential it minted.
+	sendControl(`{"kind":"credential_rejected"}`)
+	if got, want := nextEvent(t, events), (event{id, "credential_rejected", ""}); got != want {
+		t.Fatalf("event = %+v, want %+v", got, want)
+	}
+
 	// child_exited is the third kind on this channel and the one that carries
 	// a number nothing else can supply: the agent process's own verdict. The
 	// detail is the bare exit code, because controld parses it back into an

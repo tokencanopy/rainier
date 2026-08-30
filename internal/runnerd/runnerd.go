@@ -788,9 +788,41 @@ func (s *Server) routeControl(id string, payload []byte) {
 	switch ev.Kind {
 	case "setup_done":
 		s.fireEventDetail(id, "setup_done", "")
-	case "setup_failed":
-		log.Printf("session %s: setup failed (rc %d)", id, ev.RC)
-		s.fireEventDetail(id, "setup_failed", setupFailedDetail(ev.RC, ev.Tail))
+	case "setup_failed", "stage_failed":
+		// One event under two names. A session's boot is a chain of stages
+		// (setup, then clone, then init — see cmd/sessiond/gitchain.go), and
+		// any of them can be the one that fails.
+		//
+		// "setup_failed" is Plan 4's name for the only stage that existed then,
+		// and it stays accepted forever: sessiond ships INSIDE the session
+		// image while this runs on the host, so the two are routinely different
+		// builds. sessiond still SENDS the legacy name for the setup stage, for
+		// the mirror-image reason (a Plan 4 runnerd would drop a stage_failed),
+		// and this arm makes the other pairing work too. An event that names no
+		// stage is read as the setup one — the only sender that can omit it is
+		// one speaking the old vocabulary, and mis-attributing a failure is
+		// still better than dropping it.
+		stage := ev.Stage
+		if stage == "" {
+			stage = "setup"
+		}
+		log.Printf("session %s: the %s stage failed (rc %d)", id, stage, ev.RC)
+		if stage == "setup" {
+			s.fireEventDetail(id, "setup_failed", setupFailedDetail(ev.RC, ev.Tail))
+			return
+		}
+		s.fireEventDetail(id, "stage_failed", stageFailedDetail(stage, ev.RC, ev.Tail))
+	case "credential_rejected":
+		// A git operation in the sandbox was refused by GitHub. The vault mints
+		// optimistically (no GitHub round-trip per mint, design §4.2), so an
+		// observed refusal is the ONLY signal a stored token has been revoked,
+		// and controld acts on it by flipping the credential to needs_refresh.
+		//
+		// It carries nothing at all, deliberately: controld knows whose
+		// credential it minted for this session, and a token — or anything
+		// derived from one — has no business on this channel.
+		log.Printf("session %s: a git operation was refused by GitHub; reporting the credential", id)
+		s.fireEventDetail(id, "credential_rejected", "")
 	case "child_exited":
 		// The agent process inside the container ended. This is news, not a
 		// verdict: the session stays up (sessiond outlives its child so
@@ -898,6 +930,18 @@ func setupFailedDetail(rc int, tail string) string {
 		return d
 	}
 	return d + ": " + tail
+}
+
+// stageFailedDetail is the same string for a stage that is not setup, with the
+// stage's name in front of it: "clone: rc 128: fatal: Authentication failed".
+//
+// The stage has to ride in the detail because an rwire event has exactly one
+// free-text field, and it goes FIRST so controld can read it back off the front
+// (split at the first ": ") and compose the sentence it writes into the
+// session's error column — "clone failed: rc 128: …", the same shape the setup
+// prefix produces.
+func stageFailedDetail(stage string, rc int, tail string) string {
+	return stage + ": " + setupFailedDetail(rc, tail)
 }
 
 // defaultHubWait bounds how long an attach (or a session RPC) waits for a
