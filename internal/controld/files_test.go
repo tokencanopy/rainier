@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -488,6 +489,40 @@ func TestPullFiles(t *testing.T) {
 		if int64(len(got)) > s.xferMax {
 			t.Fatalf("controld relayed %d bytes; the cap is %d — a sandbox must not be able to stream without end",
 				len(got), s.xferMax)
+		}
+	})
+
+	// A sandbox answering EMPTY chunks that never say done would spin this
+	// loop forever without ever reaching the byte cap — the cap counts bytes,
+	// and there are none. The request has to end.
+	t.Run("stops a sandbox answering empty chunks", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		u, tok := loginUser(t, st, "alice", "member")
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		transferSession(t, st, "sess_pull_empty", "vm1", u.ID)
+		s.xferMax = 4 << 20
+
+		var asked atomic.Int64
+		startSandbox(t, f, func(method string, payload json.RawMessage) (any, error) {
+			var req xfer.PullRequest
+			if err := json.Unmarshal(payload, &req); err != nil {
+				return nil, err
+			}
+			asked.Add(1)
+			return xfer.PullChunk{Seq: req.Seq}, nil // no data, never done
+		})
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_pull_empty/files?path=d", tok, nil, nil)
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("the pull never ended after %d empty chunks", asked.Load())
 		}
 	})
 

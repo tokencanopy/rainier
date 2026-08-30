@@ -307,6 +307,12 @@ func (s *Server) sessionDiff(ctx context.Context, sessionID string) (xfer.DiffAn
 	return boundDiff(ans), nil
 }
 
+// maxDiffLabel bounds the three short fields — a repository slug and two
+// branch names. They come from the session's own row by way of the sandbox,
+// but "by way of the sandbox" is the part that matters: nothing on a rendered
+// answer is trusted to be the length it should be.
+const maxDiffLabel = 256
+
 // boundDiff cuts an answer down to what this API is willing to relay.
 func boundDiff(ans xfer.DiffAnswer) xfer.DiffAnswer {
 	if len(ans.Repos) > maxDiffRepos {
@@ -314,13 +320,22 @@ func boundDiff(ans xfer.DiffAnswer) xfer.DiffAnswer {
 	}
 	for i := range ans.Repos {
 		r := &ans.Repos[i]
-		if len(r.Stat) > xfer.StatBytes {
-			// ToValidUTF8 because the cut lands mid-rune as often as not and
-			// this string is about to be JSON-encoded into a user's terminal.
-			r.Stat = strings.ToValidUTF8(r.Stat[:xfer.StatBytes], "")
-		}
+		r.Repo = clipTo(r.Repo, maxDiffLabel)
+		r.BaseBranch = clipTo(r.BaseBranch, maxDiffLabel)
+		r.SessionBranch = clipTo(r.SessionBranch, maxDiffLabel)
+		r.Stat = clipTo(r.Stat, xfer.StatBytes)
 	}
 	return ans
+}
+
+// clipTo truncates s to max bytes, keeping the result valid UTF-8 — the cut
+// lands mid-rune as often as not, and every one of these strings is about to
+// be JSON-encoded into somebody's terminal.
+func clipTo(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return strings.ToValidUTF8(s[:max], "")
 }
 
 // sessionPushChunk hands one chunk of an upload to a sandbox and returns its
@@ -353,6 +368,14 @@ func (s *Server) sessionPullChunk(ctx context.Context, sessionID string, req xfe
 	if len(chunk.Data) > xfer.ChunkBytes {
 		return xfer.PullChunk{}, fmt.Errorf("session %s answered a %d-byte chunk; the limit is %d",
 			sessionID, len(chunk.Data), xfer.ChunkBytes)
+	}
+	if len(chunk.Data) == 0 && !chunk.Done {
+		// A chunk that carries nothing and does not end the transfer makes no
+		// progress, and a sandbox answering those forever would spin the pull
+		// loop without ever reaching the byte cap — the cap counts bytes, and
+		// there are none. Only the LAST chunk may be empty.
+		return xfer.PullChunk{}, fmt.Errorf("session %s answered chunk %d with no data and no end",
+			sessionID, chunk.Seq)
 	}
 	return chunk, nil
 }

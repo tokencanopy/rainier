@@ -489,7 +489,12 @@ func extractArchive(archive, dest string) error {
 		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, entryMode(hdr, 0o755)); err != nil {
+			// |0o700: the archive's own bits are kept, but an extraction has
+			// to be able to write the entries that land INSIDE this directory,
+			// and a tree carrying a mode like 0555 would otherwise fail
+			// halfway through with a permission error about a file the user
+			// never mentioned.
+			if err := os.MkdirAll(target, entryMode(hdr, 0o755)|0o700); err != nil {
 				return err
 			}
 		case tar.TypeReg:
@@ -531,9 +536,12 @@ func writeFile(target string, tr *tar.Reader, hdr *tar.Header, mode os.FileMode)
 	// CopyN bounded by the header's own size: the scanning pass added exactly
 	// this many bytes to the total it checked against the limit, so copying
 	// anything else here would extract past a bound that was already approved.
-	if _, err := io.CopyN(f, tr, hdr.Size); err != nil && err != io.EOF {
+	// A short read is an error, not a short file — CopyN returns nil only when
+	// it moved exactly the bytes the header promised, and an archive that
+	// cannot keep that promise is truncated.
+	if _, err := io.CopyN(f, tr, hdr.Size); err != nil {
 		f.Close()
-		return err
+		return fmt.Errorf("extracting %q: %w", hdr.Name, err)
 	}
 	if err := f.Chmod(mode); err != nil {
 		f.Close()
