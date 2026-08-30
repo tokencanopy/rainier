@@ -6,12 +6,17 @@
 # login, new, ls, attach (non-tty, piped stdin), suspend, resume, rm, and
 # Plan 4's environments (secret set from stdin → env create with a setup
 # script → a first session that runs it → the snapshot controld commits → a
-# second session that boots the cache). It finishes with
-# scripts/egress-check.sh, the R4 acceptance.
+# second session that boots the cache). Then Plan 5's GITHUB REHEARSAL against
+# a throwaway private repo this script creates and deletes — clone at boot,
+# the init hook, a real commit and push through the in-sandbox credential
+# helper, the attribution GitHub records for it, `rainier diff`, `rainier
+# creds`, and a push/pull round trip. It finishes with scripts/egress-check.sh,
+# the R4 acceptance.
 #
 # Where internal/e2e's Go suite fakes the container runtime to make the chaos
 # scenes deterministic, this one fakes nothing: real docker containers, real
-# Postgres, real websockets, the real CLI binary, one host.
+# Postgres, real websockets, the real CLI binary, one host — and, in the github
+# phase, real GitHub.
 #
 # Exit codes: 0 = every executed check passed, 1 = a check failed,
 # 2 = setup/usage error, 3 = the CLI half was skipped (no GitHub auth) but
@@ -22,7 +27,9 @@
 # Env:
 #   GITHUB_USER   GitHub login to allowlist as admin (default: `gh api user`)
 #   GH_TOKEN      a GitHub token to log in with instead of `gh auth token`
-#   KEEP=1        leave the stack running afterwards (default: tear it down)
+#   SKIP_GITHUB=1 skip the github rehearsal phase even when it could run
+#   KEEP=1        leave the stack running afterwards (default: tear it down).
+#                 The throwaway GitHub repo is deleted regardless — see cleanup.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -92,9 +99,26 @@ finding() { FINDINGS=$((FINDINGS + 1)); printf 'FINDING: %s\n' "$*"; }
 PG_STARTED=0
 CONTROLD_STARTED=0
 FLEET_STARTED=0
+# SCRATCH_SLUG is the throwaway GitHub repository the github phase creates,
+# owner/name, empty until it exists. It is the one piece of state this script
+# creates OUTSIDE this machine, so it is torn down first, unconditionally, and
+# before any early return below: a leaked repository on somebody's account is
+# the one failure here that a re-run does not clean up.
+SCRATCH_SLUG=""
 
 cleanup() {
   local rc=$?
+  if [ -n "$SCRATCH_SLUG" ]; then
+    echo
+    echo "--- deleting the throwaway repository $SCRATCH_SLUG"
+    if gh repo delete "$SCRATCH_SLUG" --yes >/dev/null 2>&1; then
+      SCRATCH_SLUG=""
+    else
+      # Loud, and on stderr: this is the one thing a failed run can leave
+      # behind that the next run will not tidy up.
+      echo "WARNING: could not delete $SCRATCH_SLUG — delete it by hand: gh repo delete $SCRATCH_SLUG --yes" >&2
+    fi
+  fi
   if [ "$PG_STARTED$CONTROLD_STARTED$FLEET_STARTED" = "000" ]; then
     return $rc # nothing of ours ever started; destroy nothing
   fi
@@ -599,6 +623,228 @@ rm -f "$SETUP_FILE"
 ok "environment and secret deleted once nothing referenced them"
 
 # ---------------------------------------------------------------------------
+step "github rehearsal (real clone, commit and push against a throwaway repo)"
+# ---------------------------------------------------------------------------
+# Plan 5's whole delivery path against real GitHub: an environment with a
+# github connector and an init hook, a session that clones at boot onto its own
+# branch, a commit and a push authenticated by the in-sandbox credential helper
+# (which mints from controld's vault, per operation, and writes the token
+# nowhere), the attribution GitHub itself records for that commit, the diff
+# endpoint, `rainier creds`, and a push/pull round trip.
+#
+# Everything in it happens on a repository this script creates and deletes.
+# That is why the gate below is stricter than "is gh installed": we refuse to
+# CREATE a repository we would not be able to REMOVE, because the cost of
+# getting that wrong is a private repo left on somebody's account forever, and
+# no later run of this script would ever find it.
+GH_PHASE=1
+GH_SKIP=""
+GH_ACCOUNT=""
+GH_ID=""
+if [ "${SKIP_GITHUB:-0}" = "1" ]; then
+  GH_PHASE=0; GH_SKIP="SKIP_GITHUB=1"
+elif ! command -v gh >/dev/null 2>&1; then
+  GH_PHASE=0; GH_SKIP="the \`gh\` CLI is not installed — this phase creates and deletes its own repository through it"
+else
+  # The token's own scopes, read from GitHub rather than from `gh auth status`,
+  # whose wording is not a contract. gh honors GH_TOKEN here exactly as it does
+  # for the login above, so this is the scope set of whichever token this run
+  # is actually using.
+  GH_SCOPES=$(gh api --include user 2>/dev/null | tr -d '\r' | sed -n 's/^[Xx]-[Oo][Aa]uth-[Ss]copes:[[:space:]]*//p' | tr -d ' ' || true)
+  case ",$GH_SCOPES," in
+    *,repo,*) ;;
+    *) GH_PHASE=0; GH_SKIP="the GitHub token has scopes [$GH_SCOPES] and needs \`repo\` to clone and push a private repository — run: gh auth refresh -h github.com -s repo" ;;
+  esac
+  if [ "$GH_PHASE" = "1" ]; then
+    case ",$GH_SCOPES," in
+      *,delete_repo,*) ;;
+      *) GH_PHASE=0; GH_SKIP="the GitHub token has scopes [$GH_SCOPES] and cannot DELETE a repository, so this phase will not create one — run: gh auth refresh -h github.com -s delete_repo" ;;
+    esac
+  fi
+  if [ "$GH_PHASE" = "1" ]; then
+    GH_ACCOUNT=$(gh api user --jq .login 2>/dev/null || true)
+    GH_ID=$(gh api user --jq .id 2>/dev/null || true)
+    if [ -z "$GH_ACCOUNT" ] || [ -z "$GH_ID" ]; then
+      GH_PHASE=0; GH_SKIP="could not read the authenticated GitHub account from \`gh api user\`"
+    fi
+  fi
+fi
+
+if [ "$GH_PHASE" = "0" ]; then
+  echo "SKIPPED: $GH_SKIP"
+  echo "(nothing was created on GitHub; every other phase of this run still applies)"
+else
+
+SCRATCH_REPO="rainier-e2e-scratch-$$"
+GH_ENV_NAME="e2e-gh-$$"
+GH_SESSION_NAME="e2e-gh-$$"
+GH_BRANCH="rainier/$GH_SESSION_NAME"
+GH_INIT_FILE=/tmp/rainier-e2e-init.sh
+# The GitHub noreply address controld derives for this account, and therefore
+# the author every in-session commit must carry (design §1 criterion 2). Built
+# from what `gh api user` just said, never hardcoded.
+GH_NOREPLY="$GH_ID+$GH_ACCOUNT@users.noreply.github.com"
+
+# --add-readme, not a bare create: the clone stage asks for a base branch, and
+# a repository with no commits has none — an empty repo would fail the clone
+# for a reason that has nothing to do with what this phase is testing.
+gh repo create "$SCRATCH_REPO" --private --add-readme \
+  --description "throwaway; created and deleted by rainier scripts/e2e-fleet.sh" >/dev/null \
+  || setup_error "gh repo create $SCRATCH_REPO failed"
+SCRATCH_SLUG="$GH_ACCOUNT/$SCRATCH_REPO"   # armed for cleanup from here on
+ok "created the throwaway private repository $SCRATCH_SLUG (deleted at teardown, including on failure)"
+
+# The init hook. It runs on EVERY boot and AFTER the clone stage, which is what
+# lets it do something no setup script could: read the repository's own git
+# history. A marker that carries a commit hash out of the working tree is proof
+# of the ordering, not just of the hook.
+cat > "$GH_INIT_FILE" <<EOF
+#!/bin/sh
+set -eu
+git -C /workspace/$SCRATCH_REPO log -1 --format='init-sees-commit=%h' > /workspace/init-marker
+git -C /workspace/$SCRATCH_REPO rev-parse --abbrev-ref HEAD >> /workspace/init-marker
+echo init-ran >> /workspace/init-marker
+EOF
+
+GH_ENV_ID=$(./bin/rainier env create "$GH_ENV_NAME" \
+  --image rainier-session:latest --init-file "$GH_INIT_FILE" \
+  --connector-json "{\"type\":\"github\",\"repo\":\"$SCRATCH_SLUG\"}")
+case "$GH_ENV_ID" in
+  env_*) ok "created environment $GH_ENV_NAME with a github connector and an init hook" ;;
+  *) fail "env create printed \"$GH_ENV_ID\", want an env_ id" ;;
+esac
+
+GH_SID=$(./bin/rainier new --detach --name "$GH_SESSION_NAME" --env "$GH_ENV_NAME")
+case "$GH_SID" in sess_*) ;; *) fail "new --env printed \"$GH_SID\", want a sess_ id" ;; esac
+
+# The bearer the CLI just wrote, so a failure can be explained with the
+# session's own error column — `rainier ls` has no room for it.
+BEARER=$(sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RAINIER_CONFIG")
+session_error() {
+  curl -sf -H "Authorization: Bearer $BEARER" "$CONTROLD_HTTP/v1/sessions/$1" \
+    | sed -n 's/.*"error":[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+# "running" fires when sessiond REGISTERS, which is before the boot chain has
+# run — the clone and the init hook both happen ahead of the agent. So the wait
+# is for the chain to have finished (the diff endpoint answers only once the
+# clone is on disk) or for the session to have failed one of its stages.
+gh_boot_settled() {
+  [ "$(state_of "$GH_SID")" = failed ] && return 0
+  ./bin/rainier diff "$GH_SID" >/dev/null 2>&1
+}
+waitfor '[ "$(state_of "$GH_SID")" = running ] || [ "$(state_of "$GH_SID")" = failed ]' 120 "the session to be placed" \
+  || fail "$GH_SID never left queued/creating; see $CONTROLD_LOG and /tmp/runnerd.log"
+waitfor gh_boot_settled 300 "the boot chain (clone, then init)" \
+  || fail "$GH_SID never finished its boot chain (state: $(state_of "$GH_SID")); see /tmp/runnerd.log"
+if [ "$(state_of "$GH_SID")" = failed ]; then
+  fail "the session failed its boot chain: $(session_error "$GH_SID")"
+fi
+ok "session $GH_SID booted with the repository cloned"
+
+# --- what the clone and the init hook actually did, from inside the session.
+GH_ATTACH1=/tmp/rainier-e2e-gh-attach1.txt
+attach_probe "$GH_SID" \
+  "cat /workspace/init-marker; git -C /workspace/$SCRATCH_REPO rev-parse --abbrev-ref HEAD" \
+  "$GH_ATTACH1" 'init-ran' 120 \
+  || { echo "--- attach output ---"; cat -v "$GH_ATTACH1"; echo "---------------------"; \
+       fail "the session never answered the clone/init probe"; }
+grep -q 'init-sees-commit=' "$GH_ATTACH1" \
+  || fail "the init hook could not read the repository's history: it did not run after the clone"
+grep -q "$GH_BRANCH" "$GH_ATTACH1" \
+  || { echo "--- attach output ---"; cat -v "$GH_ATTACH1"; echo "---------------------"; \
+       fail "the clone is not on branch $GH_BRANCH"; }
+ok "cloned to /workspace/$SCRATCH_REPO on $GH_BRANCH, and the init hook ran after the clone (it read the git log)"
+
+# --- the commit and the push. This is the credential path end to end: git asks
+# the helper, the helper asks sessiond, sessiond asks controld, controld mints
+# from the vault, and the token exists only on the helper's stdout.
+GH_ATTACH2=/tmp/rainier-e2e-gh-attach2.txt
+attach_probe "$GH_SID" \
+  "cd /workspace/$SCRATCH_REPO && date > agent-note.txt && git add -A && git commit -q -m 'rainier rehearsal note' && git push -q; echo \"pushed:\$?\"; git log -1 --format='author=%an <%ae>'" \
+  "$GH_ATTACH2" 'pushed:[0-9]' 180 \
+  || { echo "--- attach output ---"; cat -v "$GH_ATTACH2"; echo "---------------------"; \
+       fail "the session never answered the commit/push probe"; }
+grep -q 'pushed:0' "$GH_ATTACH2" \
+  || { echo "--- attach output ---"; cat -v "$GH_ATTACH2"; echo "---------------------"; \
+       fail "the in-session git push failed; the credential helper could not authenticate"; }
+grep -q "author=$GH_ACCOUNT <$GH_NOREPLY>" "$GH_ATTACH2" \
+  || fail "the commit's local author is not \"$GH_ACCOUNT <$GH_NOREPLY>\": $(grep -o 'author=.*' "$GH_ATTACH2" | head -1)"
+ok "committed and pushed from inside the session over the minted credential"
+
+# The authoritative half of criterion 2: what GITHUB recorded for that commit,
+# read back from the API rather than from the container that made it.
+GH_REMOTE_AUTHOR=$(gh api "repos/$SCRATCH_SLUG/commits?sha=$GH_BRANCH&per_page=1" \
+  --jq '.[0].commit.author | .name + " <" + .email + ">"' 2>/dev/null || true)
+[ "$GH_REMOTE_AUTHOR" = "$GH_ACCOUNT <$GH_NOREPLY>" ] \
+  || fail "GitHub records the pushed commit's author as \"$GH_REMOTE_AUTHOR\", want \"$GH_ACCOUNT <$GH_NOREPLY>\""
+ok "GitHub attributes the pushed commit to $GH_ACCOUNT <$GH_NOREPLY> on $GH_BRANCH"
+
+# --- and the token is nowhere. The scan is for token SHAPES, never for the
+# value: putting the real token into a command line would write it into this
+# session's scrollback and into a file under /tmp, which is exactly the leak
+# the design exists to prevent.
+GH_ATTACH3=/tmp/rainier-e2e-gh-attach3.txt
+attach_probe "$GH_SID" \
+  "printf 'cfg-hits=%s ws-hits=%s env-hits=%s\n' \"\$(grep -r -l -E 'gh[pousr]_[A-Za-z0-9]|github_pat_' /workspace/$SCRATCH_REPO/.git 2>/dev/null | wc -l | tr -d ' ')\" \"\$(grep -r -l -E 'gh[pousr]_[A-Za-z0-9]|github_pat_' /workspace 2>/dev/null | wc -l | tr -d ' ')\" \"\$(env | grep -c -E 'gh[pousr]_[A-Za-z0-9]|github_pat_' || true)\"" \
+  "$GH_ATTACH3" 'cfg-hits=[0-9]+ ws-hits=[0-9]+ env-hits=[0-9]+' 60 \
+  || { echo "--- attach output ---"; cat -v "$GH_ATTACH3"; echo "---------------------"; \
+       fail "the session never answered the token-hygiene probe"; }
+grep -q 'cfg-hits=0 ws-hits=0 env-hits=0' "$GH_ATTACH3" \
+  || fail "something token-shaped is on disk or in the environment of a session that just pushed: $(grep -o 'cfg-hits=.*' "$GH_ATTACH3" | head -1)"
+ok "after a successful push, nothing token-shaped is in .git, anywhere under /workspace, or in the process environment"
+
+# --- the diff endpoint, against the commit that was just made.
+./bin/rainier diff "$GH_SID" > /tmp/rainier-e2e-gh-diff.txt 2>&1 \
+  || { cat /tmp/rainier-e2e-gh-diff.txt >&2; fail "rainier diff $GH_SID"; }
+grep -q "$SCRATCH_SLUG  $GH_BRANCH vs origin/main" /tmp/rainier-e2e-gh-diff.txt \
+  || fail "diff did not name the repository and both branches: $(head -1 /tmp/rainier-e2e-gh-diff.txt)"
+grep -q 'agent-note.txt' /tmp/rainier-e2e-gh-diff.txt \
+  || { cat /tmp/rainier-e2e-gh-diff.txt; fail "diff does not show the file the session added"; }
+ok "rainier diff reports the session's change against the merge-base with origin/main"
+
+# --- `rainier creds`: the credential this whole phase used, still valid.
+./bin/rainier creds > /tmp/rainier-e2e-gh-creds.txt
+GH_CRED_STATUS=$(cell github STATUS SCOPES < /tmp/rainier-e2e-gh-creds.txt)
+[ "$GH_CRED_STATUS" = "valid" ] \
+  || fail "rainier creds reports the github credential as \"$GH_CRED_STATUS\", want valid after a successful push"
+! grep -qE 'gh[pousr]_[A-Za-z0-9]|github_pat_' /tmp/rainier-e2e-gh-creds.txt \
+  || fail "rainier creds printed something token-shaped; the vault is write-only at that API"
+ok "rainier creds shows github valid, with no credential material in the table"
+
+# --- push/pull a directory, laptop↔session.
+PP_SRC=/tmp/rainier-e2e-xfer-src
+PP_DST=/tmp/rainier-e2e-xfer-dst
+rm -rf "$PP_SRC" "$PP_DST"
+mkdir -p "$PP_SRC/nested/deeper" "$PP_SRC/empty"
+printf '%s\n' "$MARK" > "$PP_SRC/note.txt"
+head -c 65536 /dev/urandom > "$PP_SRC/nested/blob.bin"
+printf '#!/bin/sh\nexit 0\n' > "$PP_SRC/nested/deeper/run.sh"
+chmod 755 "$PP_SRC/nested/deeper/run.sh"
+
+./bin/rainier push "$PP_SRC" "$GH_SID:/workspace/incoming" >/dev/null \
+  || fail "rainier push $PP_SRC $GH_SID:/workspace/incoming"
+./bin/rainier pull "$GH_SID:/workspace/incoming" "$PP_DST" >/dev/null \
+  || fail "rainier pull $GH_SID:/workspace/incoming $PP_DST"
+diff -r "$PP_SRC" "$PP_DST" >/tmp/rainier-e2e-xfer-diff.txt 2>&1 \
+  || { cat /tmp/rainier-e2e-xfer-diff.txt >&2; fail "the directory did not survive the push/pull round trip"; }
+[ -x "$PP_DST/nested/deeper/run.sh" ] \
+  || fail "run.sh came back without its executable bit"
+ok "push/pull round-tripped a directory (nested, binary, empty dir, executable bit) laptop↔session"
+
+# --- teardown of this phase's own state. The repository goes in cleanup, so it
+# is deleted whether or not everything above passed.
+./bin/rainier rm "$GH_SID" >/dev/null
+waitfor '[ -z "$(state_of "$GH_SID")" ]' 60 "the github session to go" \
+  || fail "$GH_SID is still listed after rm"
+./bin/rainier env rm "$GH_ENV_NAME" | grep -q removed || fail "env rm $GH_ENV_NAME"
+rm -f "$GH_INIT_FILE"
+rm -rf "$PP_SRC" "$PP_DST"
+ok "github rehearsal session and environment removed"
+
+fi  # GH_PHASE
+
+# ---------------------------------------------------------------------------
 step "egress R4 acceptance"
 # ---------------------------------------------------------------------------
 set +e; RUNNERD="http://127.0.0.1:$RUNNERD_PORT" ./scripts/egress-check.sh; EGRESS_RC=$?; set -e
@@ -609,7 +855,10 @@ case "$EGRESS_RC" in
 esac
 
 echo
-echo "e2e-fleet: ALL CHECKS PASSED (login, new, ls, attach, suspend, resume, rm, environments$([ "$EGRESS_RC" = 0 ] && echo ", egress R4"))"
+echo "e2e-fleet: ALL CHECKS PASSED (login, new, ls, attach, suspend, resume, rm, environments$([ "$GH_PHASE" = 1 ] && echo ", github rehearsal")$([ "$EGRESS_RC" = 0 ] && echo ", egress R4"))"
+if [ "$GH_PHASE" = "0" ]; then
+  echo "e2e-fleet: the github rehearsal was SKIPPED — $GH_SKIP"
+fi
 if [ "$FINDINGS" -gt 0 ]; then
   echo "e2e-fleet: $FINDINGS FINDING(S) recorded above — the flow works, the product has defects; see the acceptance table in docs/deploy-gce.md"
 fi

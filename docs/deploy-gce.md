@@ -4,7 +4,8 @@ One `e2-medium` in GCP project `rainier-cloud`, reached over Tailscale. No load
 balancer, no domain, no certificates, no systemd units — v0 is honest about
 being one box you can rebuild in twenty minutes. Steps 1–6 are the Plan 3
 design's §4.10 deployment story written out as commands; step 7 is Plan 4's
-environments on top of it.
+environments on top of it, and step 8 is Plan 5's: the code the sessions
+actually work on, and the credential that lets them push it.
 
 **What you end up with**
 
@@ -333,11 +334,14 @@ exactly as it would have with no pre-pull at all. The scheduler prefers the
 holder anyway, so this is rare in practice, and it goes away with the
 registry-backed distribution the design defers to §6.
 
-**Setup scripts must be idempotent.** A cold-parked session that is resumed
-starts its container again, and sessiond re-runs the setup wrapper on that
-boot — the script runs a second time, over a `/workspace` that already has
-the first run's output in it. Harmless for the cache, not harmless for a
-script that appends to a file or assumes a clean directory.
+**Every stage must be idempotent, not just `setup`.** A cold-parked session
+that is resumed starts its container again, and sessiond re-runs the whole boot
+chain on that boot — `setup`, then `clone`, then `init` — over a `/workspace`
+that already has the first run's output in it. The clone stage handles its own
+half (a directory that already has a `.git` is skipped, not re-cloned, so a
+resumed session keeps its branch and its uncommitted work), but a `setup` or
+`init` script that appends to a file or assumes a clean directory will run a
+second time and notice. Write both to be safe to re-run.
 
 **The session image must provide `sh` and `chown`.** Before the session
 container starts, the driver initializes its fresh workspace volume with a
@@ -360,15 +364,153 @@ is full, or has not joined — leaves the session `queued` with a visible
 somewhere else. `env rm` refuses while non-terminal sessions still reference
 the environment, and says how many.
 
-## 8. Rehearse locally first
+## 8. Code and credentials (the GitHub connector)
+
+An environment's **`github` connector** is what turns a session from an empty
+container into one holding the code, on a branch of its own, with a working
+`git push`. The credential behind it is **yours, per person**, sealed in
+controld's vault — a session clones and pushes as the human who created it.
+
+```bash
+# Log in with a token that can actually reach your repositories. The device
+# flow (--client-id) asks GitHub for `repo read:user`; --from-gh borrows the
+# `gh` CLI's own token, which normally already carries `repo`. A token without
+# it still logs you in — sessions, attach, ls all work — but cannot clone or
+# push, and login says so at the time rather than at the first failed clone.
+./bin/rainier login --from-gh --server http://rainier-1:9090
+./bin/rainier creds
+# PROVIDER  STATUS  SCOPES          LAST_VERIFIED  LAST_USED
+# github    valid   repo, read:user 2m             30s
+
+cat > init.sh <<'EOF'
+#!/bin/sh
+set -eu
+# init runs on EVERY boot, AFTER the clone — so unlike setup it may depend on
+# what is in the repository.
+npm ci --prefix /workspace/app
+EOF
+
+./bin/rainier env create app \
+  --image node:22 \
+  --setup-file ./setup.sh \
+  --init-file ./init.sh \
+  --connector-json '{"type":"github","repo":"acme/app"}'
+
+./bin/rainier new --env app --name app1
+# inside the session:
+#   /workspace/app is a clone of acme/app on branch rainier/app1
+#   git commit && git push just work; no token in .git/config or the env
+./bin/rainier diff app1          # per repo: what this branch changed vs main
+```
+
+**`setup` vs `init` — the split that decides what gets cached.** They are two
+scripts with two different jobs, and putting work in the wrong one is the
+common mistake:
+
+| | `setup` (`--setup-file`) | `init` (`--init-file`) |
+|---|---|---|
+| Runs | once per environment edit | on **every** session boot, cache hit included |
+| When | **before** the clone | **after** the clone |
+| Cached | yes — it *is* the snapshot | never |
+| For | the toolchain: compilers, package managers, system deps | the repo: `npm ci`, `go mod download`, generated files, a dev server's fixtures |
+| Must not | depend on repository content (there is none yet) | assume it is the first run (see idempotency, §7) |
+| Invalidates the cache when edited | yes (it is half of `setup_hash`) | no — it never touched the image |
+
+A cache-hit session runs `init` and **not** `setup`; that is the whole point of
+the pair. Both stream to an attached viewer as the session's own output, so
+`rainier attach --since 0 <id>` shows either one in full.
+
+**Where a session's branch comes from.** `rainier/<session name>`, or
+`rainier/<last 12 of the session id>` for a session created without `--name`.
+The prefix is what makes an agent's branches identifiable in a repository full
+of human ones. The name is **not** sanitized: a name git refuses as a ref fails
+the clone stage loudly, with git's own words in the error, rather than being
+quietly mangled into a branch you did not ask for.
+
+**Multiple repositories** are sibling directories under `/workspace`, one per
+connector, named after the repo (a collision is disambiguated with the owner).
+One session can override that list: `POST /v1/sessions` takes a `repos` array
+of `{"repo": "owner/name", "base_branch": "…"}`, where **absent** inherits the
+environment's connectors and an **explicit `[]`** means clone nothing — scratch
+semantics under an environment that normally clones. v0 has no CLI flag for it;
+`--env` plus the environment's own connectors is the daily path.
+
+**Where the token is, and is not.** controld seals your GitHub token under the
+same `RAINIER_SECRETS_KEY` team secrets use, and hands it out one operation at a
+time: git inside the sandbox runs a credential helper (`sessiond
+git-credential-helper`), the helper asks sessiond over a unix socket, sessiond
+asks controld over the session's own control channel, and the token is printed
+to the pipe git is reading and then forgotten when that helper process exits.
+It is never written to `.git/config`, never put in an environment variable,
+never stored on the workspace volume — which matters because that volume
+outlives the session. The workspace gitconfig names the *helper*, and clears
+any helper list the base image came with (an image carrying
+`credential.helper = store` would otherwise write every minted token to a file).
+
+**When a credential goes stale.** The vault mints **optimistically** — no round
+trip to GitHub per git operation — so the first thing that notices a revoked or
+expired token is a real git operation failing. When that happens the session
+reports it, controld flips the row to `needs_refresh`, and everything says the
+same sentence:
+
+```bash
+./bin/rainier creds
+# PROVIDER  STATUS         SCOPES           LAST_VERIFIED  LAST_USED
+# github    needs_refresh  repo, read:user  3h             1m
+./bin/rainier login --refresh github        # re-exchange; the row goes valid again
+```
+
+That sentence — `github credential needs refresh — run: rainier login --refresh
+github` — is what the failing `git push` prints inside the session too: it
+travels from controld's vault, through the credential helper, onto git's stderr,
+unchanged at every hop.
+
+Two consequences worth knowing before you hit them:
+
+- **A stale credential does not block `rainier new`.** Creating a session that
+  clones requires *some* stored credential, not a valid one, because
+  `login --refresh github` while the session sits there is a live fix — and a
+  create refused here would be one you have to make again. A create with **no**
+  credential at all is refused up front (409, naming `rainier login`), before
+  any row exists.
+- **A revoked token mid-clone fails the session**, not just the operation:
+  `clone failed: rc 128: … Authentication failed …` in `rainier ls`, with
+  `rainier creds` already reading `needs_refresh`. The container stays up, so
+  `rainier attach --since 0 <id>` still has the whole clone log.
+
+**Moving files without git.** `rainier push <dir> <session>:<path>` and
+`rainier pull <session>:<path> <dir>` move a directory between your machine and
+a session's `/workspace`. v0 is deliberately crude — one HTTP request per
+megabyte, 256MiB per transfer — and both ends refuse anything outside
+`/workspace` and any archive entry that would escape its destination.
+
+**`gh` works inside a session.** There is no PR command in this CLI on purpose:
+once a session can mint a credential, `gh pr create` in the session's own shell
+does the job, as the human whose credential it is.
+
+**Admin is not owner.** An admin can see and attach any session (the team-wide
+reads), but a credential is one person's GitHub identity: `rainier creds` shows
+only your own, and a session mints only from *its owner's* vault row. There is
+no API for reading somebody else's credential status, deliberately.
+
+## 9. Rehearse locally first
 
 `./scripts/e2e-fleet.sh` (or `make e2e`) runs this entire flow — postgres,
 controld, dial-mode runnerd, and the real CLI through login/new/ls/attach/
 suspend/resume/rm, then the environments phase (secret, setup script,
-snapshot cache, second session from the cache), plus the egress acceptance —
-on your own machine. It is the same wiring with `127.0.0.1` substituted for
-the tailnet name, and it fails faster than a VM does. Run it before you run
-this document.
+snapshot cache, second session from the cache), then the **github rehearsal**
+(a throwaway private repo it creates and deletes, cloned at boot, an init hook
+that reads the git log, a real commit and push through the credential helper,
+the attribution GitHub records for it, `rainier diff`, `rainier creds`, and a
+push/pull round trip), plus the egress acceptance — on your own machine. It is
+the same wiring with `127.0.0.1` substituted for the tailnet name, and it fails
+faster than a VM does. Run it before you run this document.
+
+The github phase needs the `gh` CLI authenticated with **both** `repo` and
+`delete_repo`; without either it skips loudly and creates nothing, because a
+repository this script cannot delete is one left on your account forever. Add
+the scope with `gh auth refresh -h github.com -s delete_repo`, or skip the
+phase deliberately with `SKIP_GITHUB=1`.
 
 It exits 0 when every check passed, and prints `FINDING:` lines for defects it
 proved in the product rather than in itself; the summary counts them. A run
@@ -511,3 +653,64 @@ rather than reporting it.
   shifted every field after it — `session_state` returned `-` forever, so the
   script's very first `rainier new` would have timed out. Columns are now read
   by their header's character offset (`cell`).
+
+---
+
+## Acceptance checklist — Plan 5 (GitHub connector + credential vault), success criteria 1–9
+
+Copied verbatim from
+[`docs/superpowers/specs/2026-08-29-plan5-github-vault-design.md`](superpowers/specs/2026-08-29-plan5-github-vault-design.md)
+§1. Criteria 4, 6, 7 and most of 8 are covered by the automated suite; 1, 2, 3
+and 5 are what a real repository proves and what the rehearsal's github phase
+runs against one. Record what actually happened in the Result column.
+
+| # | Criterion | How to run it | Status | Result |
+|---|---|---|---|---|
+| 1 | An env declaring `github{repo, base_branch}` + `rainier new --env` boots a session with the repo cloned at `/workspace/<name>` on branch `rainier/<session-name>`, and `git push` inside the session works with no token visible in `.git/config`, any file, or the process environment. | Step 8 above, on the VM; rehearsed by `./scripts/e2e-fleet.sh`'s github phase (which also scans `.git`, all of `/workspace`, and the environment for token shapes after the push). | ☐ | |
+| 2 | Commits made in-session attribute to the human: `user.name` = GitHub login, `user.email` = the GitHub noreply address (`<github_id>+<login>@users.noreply.github.com`). | `git log -1 --format='%an %ae'` in the session, and the same commit read back from GitHub's own API — the rehearsal asserts both. Also `go test ./internal/e2e/ -run TestConnectorSessionMintsAndReportsDiff`. | ☐ | |
+| 3 | A revoked/expired GitHub credential surfaces as a clear, named action within one failed operation: the in-session git error and the API error both say `rainier login --refresh github`; `rainier creds` shows per-provider status. | On the VM: revoke the token on GitHub, `git push` in a live session, read the error and `rainier creds`, then `rainier login --refresh github` and push again. Automated halves: `go test ./internal/e2e/ -run 'TestCredentialLifecycle|TestStageFailedClone'`. | ☐ | |
+| 4 | Session `repos` overrides beat env connector defaults; explicit `[]` means no clone (scratch semantics preserved); multi-repo clones land as sibling directories. | Covered by `go test ./internal/e2e/ -run TestConnectorSessionMintsAndReportsDiff` (two connectors → two sibling directories, each on the session branch) and controld's `repoOverrides`/`sessionRepoRefs` tests. | ☑ | Automated: green under `-race -count=5`. |
+| 5 | The cacheable/per-session split holds: `setup` (pre-clone, cached) and `init` (post-clone, every session, never cached) both stream to an attached viewer; a cache-hit session runs `init` but not `setup`. | Step 8's table, on the VM: an environment with both scripts, two sessions, `rainier attach --since 0` on each. The rehearsal proves the ordering half (its init hook reads the cloned repo's git log, which no cached image could contain). | ☐ | |
+| 6 | `rainier push <dir> <session>:<path>` and `pull` round-trip a directory laptop↔session (bounded size, v0). | `go test ./internal/e2e/ -run TestPushPullRoundTrip`; the rehearsal repeats it against a real container. | ☑ | Automated: green — nested directories, an empty one, binary content, a non-ASCII name and an executable bit all survive both directions. |
+| 7 | `GET /v1/sessions/{id}/diff` returns per-repo `--stat` vs the merge-base with the base branch. | `go test ./internal/e2e/ -run TestConnectorSessionMintsAndReportsDiff`; `rainier diff <id>` on the VM against a real commit. | ☑ | Automated for the plumbing (the sandbox's answer reaches the API verbatim); the real `git diff --stat origin/main...HEAD` is the rehearsal's and the VM's to prove. |
+| 8 | Riders land: a container crash preserves the workspace volume (salvage until `rm`); `child_exited` is visible in `ls`; `attach --since 0` full-history replay actually reaches the viewer; `/v1/me` exposes the user id (and the CLI's owner-preference uses it). | `go test ./internal/e2e/ -run 'TestCrashKeepsTheWorkspaceAndRmReclaimsIt|TestEnvSetupStreamsAndCaches|TestFullReplayReachesTheViewer'`. On the VM, the `--since 0` half is the one Plan 3's overnight run found broken — re-run it there. | ◐ | Automated: all four green. The `--since 0` fix is the direct answer to Plan 3 criterion 4's finding above; confirm it on rainier-1. |
+| 9 | All of the above pass in the e2e suite and in a live fleet-rehearsal phase (real clone/push against a throwaway GitHub repo when `gh` is available); GCE acceptance recorded in the runbook. | `go test ./... -race`, then `./scripts/e2e-fleet.sh`, then this table filled in from the VM. | ◐ | CI green 2026-08-29. The rehearsal's github phase is gated on `gh` carrying **both** `repo` and `delete_repo` — it refuses to create a repository it could not delete, and skips loudly instead. |
+
+**Where each criterion can go wrong, so you know what you're looking at:**
+
+- **1** — `new --env` returns `409 conflict … run: rainier login`: no credential
+  stored at all (that is the create gate; a *stale* one passes on purpose). The
+  session lands `failed` with `clone failed: rc 128: …`: read the tail. `could
+  not read Username` means the credential helper was never consulted — check
+  that the workspace gitconfig exists (`/workspace/.rainier/gitconfig`) and that
+  `GIT_CONFIG_GLOBAL` points at it. `Authentication failed` means GitHub said
+  no, and `rainier creds` will already read `needs_refresh`.
+- **1, egress** — a clone that hangs and then times out on a fleet with R4
+  enforced usually means the allowlist: controld appends `github.com`,
+  `codeload.github.com` and `objects.githubusercontent.com` to a cloning
+  session automatically, so check `/tmp/egressd.log` for a `deny` naming some
+  other host (LFS and third-party submodules are the usual ones).
+- **2** — a commit authored as `root@<container id>` means the gitconfig's
+  `[user]` block is missing, which happens when the owner's user row has no
+  login/id — i.e. a session created before Plan 5's login stored one. Log in
+  again.
+- **3** — the sentence must survive every hop *verbatim*. If the session shows
+  a generic `fatal: could not read Password`, the helper's stderr is being
+  swallowed somewhere; if the API shows a different wording than the session
+  does, someone rewrote a message that is supposed to travel unchanged.
+- **5** — a cache-hit session that re-runs `setup` is the Plan 4 failure mode
+  above (a stripped variable regressing); a cache-hit session that skips `init`
+  is the Plan 5 one — `init` is deliberately absent from `setup_hash` and must
+  be dispatched on every create.
+- **8** — `attach --since 0` printing only a screen is the Plan 3 finding
+  recurring: check that the CLI sends a cursor at all (`attachio.Cursor`), since
+  a `Since` of 0 is absent from the frame's own bytes.
+
+**Notes / follow-ups from the run:**
+
+- 2026-08-29 local rehearsal (`RUNNERD_PORT=8081 PG_PORT=5434
+  ./scripts/e2e-fleet.sh`): every non-github phase passed, no findings. The
+  **github phase skipped**, correctly and by design — the machine's `gh` token
+  carried `repo` but not `delete_repo`, and the phase refuses to create a
+  repository it could not remove. `gh auth refresh -h github.com -s delete_repo`
+  is the one command that turns it on; nothing was created on GitHub.

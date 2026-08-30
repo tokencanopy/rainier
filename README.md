@@ -10,15 +10,17 @@ terminal sessions. Sessions survive laptop sleep and network changes; attach
 shows the agent's real TUI from any machine; your subscriptions and your GitHub
 identity stay yours.
 
-Status: **v0 Plan 4 — control plane + CLI + environments.** One `controld`
-(Postgres-backed REST + WebSocket API, GitHub identity, least-loaded
-placement) fronts N `runnerd` VMs that dial it outbound, and the `rainier` CLI
-drives the whole fleet. Deploying it:
+Status: **v0 Plan 5 — control plane + CLI + environments + GitHub.** One
+`controld` (Postgres-backed REST + WebSocket API, GitHub identity, least-loaded
+placement, a credential vault) fronts N `runnerd` VMs that dial it outbound, and
+the `rainier` CLI drives the whole fleet. Sessions clone your repositories at
+boot and push back as you. Deploying it:
 [`docs/deploy-gce.md`](docs/deploy-gce.md). Design:
 [`docs/superpowers/specs/2026-08-27-rainier-design.md`](docs/superpowers/specs/2026-08-27-rainier-design.md),
-[`docs/superpowers/specs/2026-08-28-plan3-controld-design.md`](docs/superpowers/specs/2026-08-28-plan3-controld-design.md)
+[`docs/superpowers/specs/2026-08-28-plan3-controld-design.md`](docs/superpowers/specs/2026-08-28-plan3-controld-design.md),
+[`docs/superpowers/specs/2026-08-29-plan4-environments-design.md`](docs/superpowers/specs/2026-08-29-plan4-environments-design.md)
 and
-[`docs/superpowers/specs/2026-08-29-plan4-environments-design.md`](docs/superpowers/specs/2026-08-29-plan4-environments-design.md).
+[`docs/superpowers/specs/2026-08-29-plan5-github-vault-design.md`](docs/superpowers/specs/2026-08-29-plan5-github-vault-design.md).
 
 ## Quickstart
 
@@ -64,10 +66,37 @@ is a per-session volume the snapshot excludes. Details, including the one
 hardening flag a first build trades away and why `/usr/local` is not the
 install prefix, in [`docs/deploy-gce.md`](docs/deploy-gce.md) §7.
 
+Give an environment a **github connector** and its sessions arrive with the
+code already checked out, on a branch of their own, able to push:
+
+```bash
+bin/rainier login --from-gh --server http://rainier-1:9090  # asks for `repo`
+bin/rainier creds                                           # provider, status, scopes
+bin/rainier env create app --image node:22 \
+  --connector-json '{"type":"github","repo":"acme/app"}' \
+  --init-file ./init.sh                  # runs after the clone, on every boot
+bin/rainier new --env app --name app1    # /workspace/app on branch rainier/app1
+bin/rainier diff app1                    # per repo: this branch vs the base
+bin/rainier push ./notes app1:/workspace/notes   # and `pull` the other way
+```
+
+Commits from inside a session are the human's: `user.name` is your GitHub
+login and `user.email` your GitHub noreply address. The token behind them is
+sealed in controld and minted **per git operation** through an in-sandbox
+credential helper — it is never written to `.git/config`, an environment
+variable, or the workspace volume. When it goes stale, one failed operation is
+enough: `rainier creds` reads `needs_refresh` and both git and the API say
+`rainier login --refresh github`. `setup` is the cacheable, pre-clone half
+(toolchains); `init` is the per-boot, post-clone half (`npm ci` and friends),
+and it runs on cache hits too. [`docs/deploy-gce.md`](docs/deploy-gce.md) §8
+has the whole story.
+
 Locally, `make e2e` brings the whole stack up on your own machine (Postgres in
 docker; controld, egressd and a dial-mode runnerd on the host, with runnerd
 driving real containers) and drives that same CLI flow end to end, secrets and
-environments included — the dress rehearsal for a real deploy.
+environments included — plus, when `gh` is authenticated with `repo` and
+`delete_repo`, a real clone/commit/push against a throwaway private repo it
+creates and deletes. The dress rehearsal for a real deploy.
 
 ## What runs where
 
@@ -92,7 +121,7 @@ debugging a single box — `rainier` is the CLI to use.
 
 ```bash
 go test ./...                    # unit + contract suites (no services needed)
-go test ./internal/e2e/ -race    # in-process end-to-end scenes: chaos, and environments
+go test ./internal/e2e/ -race    # in-process e2e scenes: chaos, environments, git
 make e2e                         # full stack on docker, driven by the real CLI
 ./scripts/egress-check.sh        # egress R4 acceptance (exit 3 = skipped on VM-backed docker)
 ```
