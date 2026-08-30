@@ -4,6 +4,7 @@ package controld
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +42,52 @@ func seedVaultUser(t *testing.T, st Store, githubID int64, login string) User {
 		t.Fatalf("UpsertUser(%s): %v", login, err)
 	}
 	return u
+}
+
+// seedGitHubCredential stores userID's GitHub credential the way a login
+// does, then backdates its last-used stamp by an hour and returns that stamp.
+// A mint is a USE, so the tests that drive one through the session RPC prove
+// it by watching last_used_at leave a value it could not have written itself.
+func seedGitHubCredential(t *testing.T, s *Server, st Store, userID string) time.Time {
+	t.Helper()
+	ctx := context.Background()
+	if err := s.storeGitHubCredential(ctx, userID, vaultToken, "repo, read:user"); err != nil {
+		t.Fatalf("storeGitHubCredential: %v", err)
+	}
+	c, err := st.GetCredential(ctx, userID, githubProvider)
+	if err != nil {
+		t.Fatalf("GetCredential: %v", err)
+	}
+	stale := time.Now().Add(-time.Hour)
+	c.LastUsedAt = stale
+	if err := st.UpsertCredential(ctx, c); err != nil {
+		t.Fatalf("backdating the credential: %v", err)
+	}
+	return stale
+}
+
+func getCredential(t *testing.T, st Store, userID string) Credential {
+	t.Helper()
+	c, err := st.GetCredential(context.Background(), userID, githubProvider)
+	if err != nil {
+		t.Fatalf("GetCredential(%s): %v", userID, err)
+	}
+	return c
+}
+
+// wantCredentialStatus polls until userID's GitHub credential reaches want —
+// the store-side assertion for the events controld applies asynchronously.
+func wantCredentialStatus(t *testing.T, st Store, userID, want string) Credential {
+	t.Helper()
+	var got Credential
+	eventually(t, 3*time.Second, func() error {
+		got = getCredential(t, st, userID)
+		if got.Status != want {
+			return fmt.Errorf("credential status = %q, want %q", got.Status, want)
+		}
+		return nil
+	})
+	return got
 }
 
 // ---------------------------------------------------------------------------

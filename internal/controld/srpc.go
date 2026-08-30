@@ -352,24 +352,88 @@ func (s *Server) authorizeSessionRequest(ctx context.Context, runner, sessionID 
 			runner, clip(env.Method), row.ID, row.Runner)
 		return rpcRefusal(env.ID, "this session is not placed on the runner that asked")
 	}
-	return s.handleSessionRequest(ctx, runner, sessionID, env)
+	return s.handleSessionRequest(ctx, runner, row, env)
 }
 
 // handleSessionRequest performs one authorized sandbox-initiated request. The
-// caller has already established that the store places sessionID on runner, so
-// a method here may act with the session owner's authority.
+// caller has already established that the store places row on runner, so a
+// method here may act with the session owner's authority.
 //
-// v0 has no methods: this task lands the transport, and Task 8 fills in
-// "mint_git_credential" (session row → owner → the vault's mint decision).
-// Everything else is refused by name, which is also what a newer sandbox
-// talking to an older controld gets — a clear answer rather than a hang.
-func (s *Server) handleSessionRequest(ctx context.Context, runner, sessionID string, env rwire.RPCEnvelope) rwire.RPCEnvelope {
+// It takes the ROW the guard read rather than the id it was asked about: the
+// authorization and the work then act on one and the same session — a second
+// read could see a different row — and the owner every method needs is already
+// on it. Unknown methods are refused by name, which is also what a newer
+// sandbox talking to an older controld gets: a clear answer rather than a hang.
+func (s *Server) handleSessionRequest(ctx context.Context, runner string, row Session, env rwire.RPCEnvelope) rwire.RPCEnvelope {
 	switch env.Method {
+	case mintGitCredentialMethod:
+		return s.answerMintGitCredential(ctx, runner, row, env)
 	default:
 		log.Printf("controld: runner %s: session %s asked for unknown method %q",
-			runner, clip(sessionID), clip(env.Method))
+			runner, row.ID, clip(env.Method))
 		return rpcRefusal(env.ID, fmt.Sprintf("unknown method %q", clip(env.Method)))
 	}
+}
+
+// mintGitCredentialMethod is the method name a sandbox's credential helper
+// calls, spelled once here and once in cmd/sessiond/helper.go — the two ends
+// of the same wire word (plan §Global Constraints).
+const mintGitCredentialMethod = "mint_git_credential"
+
+// mintAnswer is the body of a successful mint, and the ONE place in controld
+// where a credential is rendered into anything. The shape is the contract the
+// in-sandbox helper reads (cmd/sessiond/helper.go: `{"token": …}`), and the
+// tag is why this is a named type rather than an inline literal — a renamed
+// field here silently breaks git inside every session.
+type mintAnswer struct {
+	Token string `json:"token"`
+}
+
+// answerMintGitCredential answers one sandbox's request for a git credential:
+// the session's owner names whose vault to open, and the vault decides.
+//
+// The refusals pass through VERBATIM, deliberately. Each vault sentinel is a
+// named action ("run: rainier login --refresh github") that travels from here
+// into the sandbox, out of the credential helper, through git's stderr and
+// onto the user's terminal; a message rewritten at any hop would cost them the
+// one sentence that says what to do. Everything else — a store that would not
+// read, a fleet key that no longer opens the row — is an internal fault, and
+// its text says nothing a sandbox could act on, so it is logged here and
+// answered with a flat sentence instead.
+//
+// The token itself appears in exactly one place: the payload below. Not in the
+// log line, not in an error, not in the refusal — see the vault's own note on
+// secret hygiene (vault.go).
+func (s *Server) answerMintGitCredential(ctx context.Context, runner string, row Session, env rwire.RPCEnvelope) rwire.RPCEnvelope {
+	if row.OwnerID == "" {
+		// Unreachable through the API (every create records its caller), and
+		// refused rather than looked up anyway: the owner IS the authority
+		// this mint acts with, and a lookup for the empty user is one stray
+		// row away from handing a sandbox a credential nobody granted it.
+		log.Printf("controld: runner %s: session %s has no owner; refusing to mint a credential", runner, row.ID)
+		return rpcRefusal(env.ID, "this session has no owner to mint a github credential for")
+	}
+
+	token, err := s.mintGitCredential(ctx, row.OwnerID)
+	switch {
+	case errors.Is(err, ErrCredentialNeedsRefresh), errors.Is(err, ErrCredentialMissing):
+		log.Printf("controld: session %s: no github credential to mint for user %s: %v", row.ID, row.OwnerID, err)
+		return rpcRefusal(env.ID, err.Error())
+	case err != nil:
+		log.Printf("controld: session %s: minting a github credential for user %s: %v", row.ID, row.OwnerID, err)
+		return rpcRefusal(env.ID, "the github credential could not be read")
+	}
+
+	body, err := json.Marshal(mintAnswer{Token: token})
+	if err != nil {
+		// Unreachable (a string always marshals) and logged WITHOUT the error,
+		// which is the one error in this package whose text could quote the
+		// value it failed on.
+		log.Printf("controld: session %s: encoding the github credential answer failed", row.ID)
+		return rpcRefusal(env.ID, "the github credential could not be encoded")
+	}
+	log.Printf("controld: session %s: minted a github credential for user %s on runner %s", row.ID, row.OwnerID, runner)
+	return rwire.RPCEnvelope{ID: env.ID, Method: "resp", OK: true, Payload: body}
 }
 
 // rpcRefusal builds an ok:false response carrying msg where every consumer
