@@ -143,7 +143,16 @@ func main() {
 		if runSetup {
 			startSetupWatcher(setupCtx, s, *logPath, setupTimeout(os.Getenv("RAINIER_SETUP_TIMEOUT")), events)
 		}
-		dialLoop(context.Background(), *dial, *sessionID, s, events)
+		// The session RPC's sandbox end: the dispatcher serves the requests
+		// controld sends down and originates the ones this side needs, and the
+		// unix socket is how a process inside the container (the git
+		// credential helper, Task 7) reaches it. Both are built before the
+		// relay so a request arriving on a connection's first frame finds them
+		// ready — handler registration happens here, at boot, for the same
+		// reason.
+		rpc := newRPCDispatcher()
+		startAgentSocket(context.Background(), agentSocketPath, rpc)
+		dialLoop(context.Background(), *dial, *sessionID, s, events, rpc)
 		return
 	}
 
@@ -167,7 +176,13 @@ func main() {
 // from their watchers directly because the conn they have to travel on is
 // this loop's, and there may not be one at the moment they land — see
 // serveConn.
-func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, events <-chan []byte) {
+//
+// rpc is the session-RPC dispatcher, which this loop owns the connection half
+// of: it handles the control frames arriving on each conn, and holds that
+// conn's sender for as long as it lives. The asymmetry with events is
+// deliberate — an event queues across a reconnect, a request does not (see
+// rpcConn).
+func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, events <-chan []byte, rpc *rpcDispatcher) {
 	backoff := time.Second
 	var pending [][]byte // control payloads no connection has accepted yet
 	for {
@@ -182,16 +197,23 @@ func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, e
 			// the sender is simply never used, and the relay behaves exactly
 			// as ServeSession did.
 			//
-			// The inbound handler is nil until sessiond has RPC methods to
-			// serve (the git and file operations controld drives from the
-			// other end): a nil handler reads inbound control frames and drops
-			// them, which is the right behaviour for a session that cannot
-			// answer anything yet — the alternative, refusing to decode them,
-			// would only be a way for a newer controld to kill an older
-			// sandbox's relay.
-			sender, errc := relay.ServeSessionWithControl(ctx, relay.WSConn(c), s, nil)
+			// The inbound handler is the RPC dispatcher: the control frames
+			// arriving the other way are the requests controld drives into
+			// this sandbox (a diff, a push) and the answers to the ones this
+			// side asked for. It is wired at construction rather than
+			// afterwards so a request on the conn's first frame finds it.
+			//
+			// The sender is installed for this conn's lifetime and taken back
+			// when the relay ends: an upstream call in flight fails at that
+			// moment rather than waiting out a timeout for an answer that
+			// cannot arrive, and a handler that outlives the conn answers over
+			// the (now dead) conn its request came in on rather than over a
+			// later one — see rpc.go.
+			sender, errc := relay.ServeSessionWithControl(ctx, relay.WSConn(c), s, rpc.OnControl)
+			rpc.online(sender)
 			var relayErr error
 			pending, relayErr = serveConn(sender, errc, events, pending)
+			rpc.offline()
 			log.Printf("relay ended: %v; redialing", relayErr)
 		} else {
 			log.Printf("dial runnerd: %v; retrying in %s", err, backoff)

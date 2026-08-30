@@ -121,6 +121,15 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 		send(rwire.FromRunner{Type: "event", Session: id, State: state, Detail: detail})
 	})
 	defer s.SetOnEvent(nil)
+	// The same per-connection swap for the session RPC's upward direction: a
+	// sandbox's request, or its response to one controld sent down, becomes a
+	// "session_req" on this connection. Cleared on exit for the same reason —
+	// a dead conn's closure would otherwise keep queueing onto an `out`
+	// channel nothing drains.
+	s.SetOnSessionRPC(func(id string, env rwire.RPCEnvelope) {
+		send(rwire.FromRunner{Type: "session_req", Session: id, RPC: &env})
+	})
+	defer s.SetOnSessionRPC(nil)
 
 	used, total, _ := s.drv.Capacity(ctx)
 	ann := rwire.FromRunner{Type: "announce", Proto: rwire.Proto, Runner: cfg.RunnerName,
@@ -280,6 +289,13 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 			log.Printf("agent: remove_workspace for %s: %v", m.Session, err)
 		}
 		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: errText(err)})
+	case "session_rpc":
+		// The one command type this runner does not execute: it carries a
+		// session RPC bound for the sandbox, and the answer (when there is
+		// one) comes from inside that container, not from here. So there is no
+		// result to send — m.ReqID is zero on this type — and correlation
+		// lives entirely in the envelope's own id.
+		s.forwardSessionRPC(m, send)
 	case "dial_attach":
 		// Deliberately not in a goroutine of its own: agentSession's read
 		// loop already runs one execute per inbound command precisely so a
@@ -289,6 +305,39 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 	default:
 		log.Printf("agent: unknown command type %q", m.Type)
 	}
+}
+
+// forwardSessionRPC carries one envelope from controld into the sandbox it
+// names. The runner reads nothing inside it: the method decides whether the
+// frame lands as a "req:<method>" or a "resp", and the payload is passed
+// through untouched.
+//
+// A request that cannot be delivered is answered with a failure rather than
+// dropped, because the far end is holding a pending entry either way — the
+// difference is whether it learns now or waits out its whole OpTimeout for an
+// answer that was never coming. A RESPONSE that cannot be delivered is only
+// logged: answering an answer is meaningless, and the sandbox that asked has
+// already lost its own pending entry along with the conn.
+func (s *Server) forwardSessionRPC(m rwire.ToRunner, send func(rwire.FromRunner)) {
+	if m.RPC == nil {
+		log.Printf("agent: session_rpc for %s carried no envelope; ignoring", m.Session)
+		return
+	}
+	env := *m.RPC
+	if env.ID == 0 || env.Method == "" {
+		log.Printf("agent: session_rpc for %s carried no id or method; ignoring", m.Session)
+		return
+	}
+	err := s.sendSessionRPC(m.Session, env)
+	if err == nil {
+		return
+	}
+	log.Printf("agent: forwarding %q to session %s: %v", env.Method, m.Session, err)
+	if env.Method == "resp" {
+		return
+	}
+	send(rwire.FromRunner{Type: "session_req", Session: m.Session,
+		RPC: &rwire.RPCEnvelope{ID: env.ID, Method: "resp", Payload: rpcErrorPayload(err.Error())}})
 }
 
 // reannounce fires one session's current state as an event, using the same

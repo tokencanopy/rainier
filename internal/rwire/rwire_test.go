@@ -111,6 +111,28 @@ func TestSessionRPCRoundTrip(t *testing.T) {
 		t.Fatalf("session_rpc response wrong on the wire: %s", ab)
 	}
 
+	// A response's verdict rides the envelope, in both directions, because
+	// runnerd reproduces the relay ControlEvent at the far end from the
+	// envelope alone — it never opens Payload to find out how a call went.
+	// False is the zero value and stays off the wire (the safe direction: a
+	// peer that fails to decode it reads a failure, never a spurious success),
+	// so only an ok:true response carries the tag.
+	okAnswer, err := json.Marshal(FromRunner{Type: "session_req", Session: "sess_ab12",
+		RPC: &RPCEnvelope{ID: 7, Method: "resp", OK: true, Payload: json.RawMessage(`{"token":"x"}`)}})
+	if err != nil { t.Fatal(err) }
+	if !strings.Contains(string(okAnswer), `"rpc":{"id":7,"method":"resp","ok":true,"payload":{"token":"x"}}`) {
+		t.Fatalf("ok response wrong on the wire: %s", okAnswer)
+	}
+	var okOut FromRunner
+	if err := json.Unmarshal(okAnswer, &okOut); err != nil { t.Fatal(err) }
+	if okOut.RPC == nil || !okOut.RPC.OK { t.Fatalf("round trip lost the verdict: %+v", okOut.RPC) }
+	failed, err := json.Marshal(ToRunner{Type: "session_rpc", Session: "sess_ab12",
+		RPC: &RPCEnvelope{ID: 7, Method: "resp"}})
+	if err != nil { t.Fatal(err) }
+	if strings.Contains(string(failed), `"ok"`) {
+		t.Fatalf("a failed response leaked an ok tag: %s", failed)
+	}
+
 	// A message with no RPC must not start carrying an empty envelope: every
 	// Plan 1-4 message type keeps its exact bytes.
 	for _, m := range []any{ToRunner{Type: "destroy", Session: "s"}, FromRunner{Type: "event", Session: "s", State: "running"}} {

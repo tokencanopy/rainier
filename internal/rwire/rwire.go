@@ -24,6 +24,16 @@ const Proto = 1
 type RPCEnvelope struct {
 	ID     uint64 `json:"id"`
 	Method string `json:"method"`
+	// OK is a response's verdict, meaningful only when Method is "resp". It
+	// mirrors relay.ControlEvent.OK field for field, and that is the whole
+	// reason it exists here: runnerd rebuilds one message from the other at
+	// each hop, so a verdict this envelope could not carry would have to be
+	// dug out of Payload — exactly the parse the forwarder is defined not to
+	// do. False is the zero value and therefore absent from the wire, which is
+	// the safe direction: a peer that fails to decode it reads a failure,
+	// never a spurious success. The failure's detail lives in Payload, by
+	// convention as {"error": "..."}.
+	OK bool `json:"ok,omitempty"`
 	// Payload is the method-specific body, opaque to runnerd. RawMessage so
 	// it forwards without being parsed and re-encoded, and so it lands as
 	// nested JSON rather than a base64 string.

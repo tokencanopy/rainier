@@ -108,7 +108,11 @@ type runnerConn struct {
 	mu      sync.Mutex
 	pending map[uint64]chan rwire.FromRunner
 
-	seq  atomic.Uint64
+	seq atomic.Uint64
+	// srpc is the pending table for the session RPCs controld sent INTO the
+	// sandboxes this runner holds. Separate from pending above because the two
+	// correlate different things — see srpcTable (srpc.go).
+	srpc *srpcTable
 	done chan struct{}
 
 	closeOnce sync.Once
@@ -120,6 +124,7 @@ func newRunnerConn(name string, ws *websocket.Conn) *runnerConn {
 		ws:      ws,
 		out:     make(chan rwire.ToRunner, runnerSendQueue),
 		pending: map[uint64]chan rwire.FromRunner{},
+		srpc:    newSRPCTable(),
 		done:    make(chan struct{}),
 	}
 }
@@ -309,6 +314,12 @@ func (s *Server) readLoop(ctx context.Context, rc *runnerConn) {
 			}
 		case "event":
 			s.applyEvent(ctx, rc.name, m)
+		case "session_req":
+			// One message type, both halves of the session RPC's upward
+			// direction: a sandbox's own request, and the answer to one this
+			// replica sent down. routeSessionReq tells them apart and keeps
+			// the slow half off this goroutine — see its doc comment.
+			s.routeSessionReq(ctx, rc, m)
 		default:
 			log.Printf("controld: runner %s: unexpected message type %q", rc.name, clip(m.Type))
 		}

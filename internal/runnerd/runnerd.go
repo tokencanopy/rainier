@@ -69,6 +69,24 @@ type Server struct {
 	// goroutines elsewhere in the test binary to be a reliable per-test
 	// signal. No production code reads it.
 	agentWriterCount atomic.Int64
+	// onSessionRPC carries session-RPC envelopes a sandbox sent UP — its own
+	// requests (a credential mint) and its responses to requests controld sent
+	// down — to whatever is holding the controld connection. Same
+	// atomic.Pointer discipline, and for the same reason, as onEvent: the
+	// agent swaps it in on every (re)connect and clears it on exit, while
+	// hub read-loop goroutines fire it.
+	//
+	// nil is the correct zero value and a real state, not just an
+	// unconfigured one: an HTTP-only runner, or one whose controld connection
+	// is down, has nowhere to forward a request to — see routeControl, which
+	// answers the sandbox itself rather than leaving it waiting.
+	onSessionRPC atomic.Pointer[func(sessionID string, env rwire.RPCEnvelope)]
+	// hubWait is how long waitHub gives a session to register (see
+	// defaultHubWait, which New sets it to). It is a field rather than a
+	// constant so a test can shorten it — the paths that answer "this session
+	// never registered" would otherwise take ten seconds each — and it is only
+	// ever written immediately after New, before this server serves anything.
+	hubWait time.Duration
 }
 
 // SetOnEvent installs f as the session-event callback (nil clears it).
@@ -96,6 +114,30 @@ func (s *Server) fireEventDetail(sessionID, state, detail string) {
 	}
 }
 
+// SetOnSessionRPC installs f as the sink for session-RPC envelopes coming up
+// out of a sandbox (nil clears it). The agent installs one per controld
+// connection; see the onSessionRPC field.
+func (s *Server) SetOnSessionRPC(f func(sessionID string, env rwire.RPCEnvelope)) {
+	if f == nil {
+		s.onSessionRPC.Store(nil)
+		return
+	}
+	s.onSessionRPC.Store(&f)
+}
+
+// fireSessionRPC hands one envelope upstream, reporting whether there was
+// anywhere to hand it to. Callers act on false: there is no queue behind this,
+// deliberately — a request nobody can forward is answered here and now, not
+// held for a connection that may be minutes away (see routeControl).
+func (s *Server) fireSessionRPC(sessionID string, env rwire.RPCEnvelope) bool {
+	p := s.onSessionRPC.Load()
+	if p == nil {
+		return false
+	}
+	(*p)(sessionID, env)
+	return true
+}
+
 // Sentinel errors returned by the extracted core ops (CreateWithID/Op/Delete)
 // so the HTTP handlers can map them to the right status code and the agent's
 // execute can special-case them (e.g. destroy on an already-gone session, or
@@ -121,7 +163,8 @@ func (e *egressError) Error() string { return "egress setup: " + e.err.Error() }
 func (e *egressError) Unwrap() error { return e.err }
 
 func New(drv driver.Driver, dialBase, egressAdmin, proxyURL string) *Server {
-	return &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin, proxyURL: proxyURL}
+	return &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin,
+		proxyURL: proxyURL, hubWait: defaultHubWait}
 }
 
 // Recover rebuilds the in-memory registry from the driver's labeled
@@ -610,10 +653,13 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		// contract.
 		//
 		// One goroutine per control frame means two frames could in
-		// principle be reported out of order. That is fine for the only
-		// vocabulary there is: a session has exactly one setup outcome, and
-		// after it there is nothing left to race with. A control channel
-		// that grows ordered events needs a queue here instead.
+		// principle be reported out of order. That is fine for the whole
+		// vocabulary this channel carries: a session has exactly one setup
+		// outcome and one child exit, with nothing left to race after
+		// either, and every session-RPC message names the request it
+		// belongs to — both ends match on that id, never on arrival order
+		// (which is exactly why the id is on the wire). A control channel
+		// that grows ORDERED events needs a queue here instead.
 		go s.routeControl(id, payload)
 	})
 	if !s.reg.setHub(id, hub) {
@@ -705,11 +751,20 @@ func (s *Server) RemoveWorkspace(ctx context.Context, id string) error {
 	return s.drv.RemoveWorkspace(ctx, id)
 }
 
-// routeControl turns one FrameControl payload from session id into an event
-// for controld. This is the runner's half of the setup pipeline: sessiond
-// watches the setup script's exit code inside the container and reports the
-// outcome here, and controld's orchestration (snapshot the image on success,
-// fail the session on failure) is waiting on the resulting event.
+// routeControl turns one FrameControl payload from session id into the message
+// controld is waiting for, of which there are two families.
+//
+// EVENTS are the runner's half of the setup pipeline and the child's exit:
+// sessiond watches the outcome inside the container and reports it here, and
+// controld's orchestration (snapshot the image on success, fail the session on
+// failure, record the exit code) acts on the resulting rwire event.
+//
+// SESSION-RPC messages — a request the sandbox originated, or its response to
+// one controld sent down — are forwarded upstream verbatim instead. This runner
+// reads nothing inside them: it matches the message to the session it came from
+// and passes the envelope on, ids included, because a response can only ever be
+// matched by the end that assigned its id (see sendSessionRPC for the mirror
+// direction).
 //
 // An undecodable payload or an unknown kind is logged and dropped, never
 // escalated: this arrives from inside a container over a conn that also
@@ -740,9 +795,84 @@ func (s *Server) routeControl(id string, payload []byte) {
 		// exit puts no rc on the wire at all and decodes back to the same 0.
 		log.Printf("session %s: agent exited with code %d", id, ev.RC)
 		s.fireEventDetail(id, "child_exited", strconv.Itoa(ev.RC))
+	case "resp":
+		// The sandbox's answer to a request controld sent down. Forwarded
+		// verbatim, id included: an id assigned by one end and echoed by the
+		// other can only ever be matched by the end that assigned it, so this
+		// hop has nothing to remap and no table to keep.
+		if ev.ID == 0 {
+			log.Printf("session %s: control response with no id; dropping", id)
+			return
+		}
+		if !s.fireSessionRPC(id, rwire.RPCEnvelope{ID: ev.ID, Method: "resp", OK: ev.OK, Payload: ev.Payload}) {
+			// Nothing to report to and nothing to answer: answering an answer
+			// is meaningless, and whoever asked has already given up (its
+			// pending entry died with the connection this would have gone out
+			// on).
+			log.Printf("session %s: no controld connection for the response to request %d; dropping", id, ev.ID)
+		}
 	default:
-		log.Printf("session %s: unknown control kind %q", id, ev.Kind)
+		method, isReq := strings.CutPrefix(ev.Kind, "req:")
+		if !isReq || method == "" || ev.ID == 0 {
+			log.Printf("session %s: unknown control kind %q", id, ev.Kind)
+			return
+		}
+		if s.fireSessionRPC(id, rwire.RPCEnvelope{ID: ev.ID, Method: method, Payload: ev.Payload}) {
+			return
+		}
+		// This runner has no controld connection to forward the request to.
+		// The sandbox is blocked on the answer — a git process waiting on the
+		// credential helper, in the case this exists for — so refusing now
+		// turns a wait for its whole timeout into an immediate, explainable
+		// failure the user can retry.
+		log.Printf("session %s: no controld connection for %q; refusing it locally", id, method)
+		if err := s.sendSessionRPC(id, rwire.RPCEnvelope{ID: ev.ID, Method: "resp",
+			Payload: rpcErrorPayload("this runner has no controld connection")}); err != nil {
+			log.Printf("session %s: refusing %q locally: %v", id, method, err)
+		}
 	}
+}
+
+// sendSessionRPC delivers one envelope into a sandbox as a control frame: a
+// request controld originated, or the response to one the sandbox originated.
+// It is the mirror of routeControl's forwarding, and the one place the
+// envelope/ControlEvent translation happens in this direction.
+//
+// It waits for the session's hub the same way an attach does: a container that
+// was just created is legitimately a second or two from dialing in, and both
+// callers run on a goroutine of their own (one command per goroutine in the
+// agent's execute; one frame per goroutine out of the hub's read loop), so the
+// wait blocks nothing that matters.
+func (s *Server) sendSessionRPC(id string, env rwire.RPCEnvelope) error {
+	ev := relay.ControlEvent{Kind: "req:" + env.Method, ID: env.ID, Payload: env.Payload}
+	if env.Method == "resp" {
+		ev = relay.ControlEvent{Kind: "resp", ID: env.ID, OK: env.OK, Payload: env.Payload}
+	}
+	b, err := json.Marshal(ev)
+	if err != nil {
+		return fmt.Errorf("encoding the control frame: %w", err)
+	}
+	hub, ok := s.waitHub(id)
+	if !ok {
+		return fmt.Errorf("session %s is not registered on this runner", id)
+	}
+	return hub.SendControl(b)
+}
+
+// rpcErrorPayload is the {"error": ...} body every failed response on this
+// channel carries — the shape controld's sandboxError and sessiond's Call both
+// read the message out of.
+func rpcErrorPayload(msg string) json.RawMessage {
+	b, err := json.Marshal(struct {
+		Error string `json:"error"`
+	}{msg})
+	if err != nil {
+		// Unreachable (a string always marshals); an empty body still decodes
+		// as a failure, just one with no reason attached.
+		log.Printf("runnerd: encoding an RPC error payload: %v", err)
+		return nil
+	}
+	return b
 }
 
 // setupFailedDetail composes the one string an rwire event has room for out
@@ -761,12 +891,13 @@ func setupFailedDetail(rc int, tail string) string {
 	return d + ": " + tail
 }
 
-// hubWait bounds how long an attach waits for a session's sessiond to
-// register, and hubPollInterval is how often it re-checks. A container that
-// was just created is legitimately a second or two from dialing in, so both
-// attach fronts wait rather than failing a client that arrived early.
+// defaultHubWait bounds how long an attach (or a session RPC) waits for a
+// session's sessiond to register, and hubPollInterval is how often it
+// re-checks. A container that was just created is legitimately a second or two
+// from dialing in, so both attach fronts wait rather than failing a client that
+// arrived early.
 const (
-	hubWait         = 10 * time.Second
+	defaultHubWait  = 10 * time.Second
 	hubPollInterval = 100 * time.Millisecond
 )
 
@@ -778,7 +909,7 @@ const (
 // dereferencing a get()-returned pointer's .hub field, which would race
 // register's setHub call on the connection's own goroutine.
 func (s *Server) waitHub(id string) (*relay.Hub, bool) {
-	deadline := time.Now().Add(hubWait)
+	deadline := time.Now().Add(s.hubWait)
 	for {
 		if h, ok := s.reg.hub(id); ok {
 			return h, true
