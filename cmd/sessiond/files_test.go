@@ -326,6 +326,63 @@ func newTestTransfers(t *testing.T, max int64) (*fileTransfers, string) {
 	return ft, root
 }
 
+// TestTransferStagingIsOnTheWorkspaceVolume: where a transfer stages is a
+// memory question, not a tidiness one. The container's /tmp is a tmpfs the
+// driver mounts with no size (internal/driver/docker.go), so an archive staged
+// there is HOST RAM — up to xfer.MaxBytes per direction per session, on a
+// runner already holding N of them. The workspace volume is disk.
+func TestTransferStagingIsOnTheWorkspaceVolume(t *testing.T) {
+	if !strings.HasPrefix(transferStagingDir, workspaceRoot+"/") {
+		t.Fatalf("staging dir = %q, want it under the workspace volume %q", transferStagingDir, workspaceRoot)
+	}
+	// Its own directory, not the boot chain's: prepareTransferStaging empties
+	// what it is given, and the boot chain's scripts live in setupDir.
+	if transferStagingDir == setupDir {
+		t.Fatalf("staging dir = %q, which is cleared at boot and holds the boot chain's own scripts", setupDir)
+	}
+	if !strings.HasPrefix(transferStagingDir, setupDir+"/") {
+		t.Fatalf("staging dir = %q, want it inside %q — the one part of the volume that is rainier's own",
+			transferStagingDir, setupDir)
+	}
+}
+
+// TestPrepareTransferStagingClearsAnEarlierBoot: the workspace survives a
+// crash and a cold park, which is exactly what /tmp did not. A transfer killed
+// halfway would otherwise leave its staging file on the volume forever — the
+// idle sweep only collects entries this boot's table knows about.
+func TestPrepareTransferStagingClearsAnEarlierBoot(t *testing.T) {
+	rainier := filepath.Join(t.TempDir(), ".rainier")
+	dir := filepath.Join(rainier, "transfers")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A previous boot's leftovers, and one of the boot chain's own files
+	// sitting beside them.
+	if err := os.WriteFile(filepath.Join(dir, "rainier-push-old.tgz"), []byte("half a transfer"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rainier, "setup.sh"), []byte("echo hi\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := prepareTransferStaging(dir); got != dir {
+		t.Fatalf("prepareTransferStaging = %q, want %q", got, dir)
+	}
+	if files := stagingFiles(t, dir); len(files) != 0 {
+		t.Fatalf("an earlier boot's staging files survived: %v", files)
+	}
+	if _, err := os.Stat(filepath.Join(rainier, "setup.sh")); err != nil {
+		t.Fatalf("clearing the staging directory removed a boot chain file: %v", err)
+	}
+
+	// And it works on a workspace that has never had one.
+	fresh := filepath.Join(t.TempDir(), ".rainier", "transfers")
+	prepareTransferStaging(fresh)
+	if fi, err := os.Stat(fresh); err != nil || !fi.IsDir() {
+		t.Fatalf("stat %s = %v, %v; want a directory", fresh, fi, err)
+	}
+}
+
 // call runs one handler the way the dispatcher does: JSON in, value out.
 func callPush(t *testing.T, ft *fileTransfers, c xfer.PushChunk) (xfer.PushAck, error) {
 	t.Helper()
