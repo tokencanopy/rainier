@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"rainier/internal/cli"
+	"rainier/internal/xfer"
 )
 
 // ---------------------------------------------------------------------------
@@ -788,5 +789,69 @@ func TestLoginRefreshRejectsUnknownProvider(t *testing.T) {
 	err := runLogin([]string{"--refresh", "gitlab", "--token", "gho_x"})
 	if err == nil || !strings.Contains(err.Error(), "gitlab") {
 		t.Fatalf("login --refresh gitlab err = %v, want a refusal naming the provider", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// push / pull / diff
+// ---------------------------------------------------------------------------
+
+// TestSplitRemote pins the "<session>:<path>" argument both transfer commands
+// take. The split is at the FIRST colon: a session ref never contains one, and
+// a remote path may.
+func TestSplitRemote(t *testing.T) {
+	cases := []struct {
+		spec, ref, path string
+		wantErr         bool
+	}{
+		{spec: "dev-box:widget/vendor", ref: "dev-box", path: "widget/vendor"},
+		{spec: "sess_abc123:/workspace/out", ref: "sess_abc123", path: "/workspace/out"},
+		{spec: "dev-box:a:b", ref: "dev-box", path: "a:b"},
+		{spec: "dev-box", wantErr: true},
+		{spec: ":path", wantErr: true},
+		{spec: "dev-box:", wantErr: true},
+		{spec: "", wantErr: true},
+	}
+	for _, tc := range cases {
+		ref, path, err := splitRemote(tc.spec)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("splitRemote(%q) = %q, %q; want an error", tc.spec, ref, path)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("splitRemote(%q): %v", tc.spec, err)
+			continue
+		}
+		if ref != tc.ref || path != tc.path {
+			t.Errorf("splitRemote(%q) = %q, %q; want %q, %q", tc.spec, ref, path, tc.ref, tc.path)
+		}
+	}
+}
+
+// TestRenderDiff: one heading per repository naming both branches, git's stat
+// underneath, and an explicit line for a repository with nothing to show —
+// silence there would read as a rendering bug.
+func TestRenderDiff(t *testing.T) {
+	var buf bytes.Buffer
+	renderDiff(&buf, xfer.DiffAnswer{Repos: []xfer.RepoDiff{
+		{Repo: "acme/widget", BaseBranch: "main", SessionBranch: "rainier/dev", Stat: " main.go | 2 +-\n 1 file changed\n"},
+		{Repo: "acme/other", BaseBranch: "trunk", SessionBranch: "rainier/dev", Stat: ""},
+	}})
+	out := buf.String()
+	for _, want := range []string{"acme/widget", "rainier/dev", "main", "main.go | 2 +-", "acme/other", "no changes"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("diff output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// A session with no repositories says so rather than printing an empty page.
+func TestRenderDiffWithNoRepos(t *testing.T) {
+	var buf bytes.Buffer
+	renderDiff(&buf, xfer.DiffAnswer{})
+	if !strings.Contains(buf.String(), "no repositories") {
+		t.Errorf("diff output = %q, want it to say the session has no repositories", buf.String())
 	}
 }

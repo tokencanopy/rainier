@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"rainier/internal/xfer"
 )
 
 const (
@@ -88,6 +90,14 @@ type Server struct {
 	// the fleet-wide runner map.
 	attaches *attachTable
 
+	// xferMax is the most this replica will relay in ONE file transfer, in
+	// either direction — xfer.MaxBytes in production, lowered by tests. It is
+	// a field rather than the constant used inline because the pull path is
+	// where a sandbox's own bound stops being enough: a compromised one that
+	// never says "done" is answering an endless stream, and something on this
+	// side has to be the thing that stops reading it.
+	xferMax int64
+
 	// schedWake carries capacity news to the scheduler loop (Task 8). It is
 	// buffered by one and written non-blockingly: the loop only needs to
 	// know that *something* changed, so a pending wake absorbs any number
@@ -135,6 +145,7 @@ func New(st Store, cfg Config) (*Server, error) {
 		runners:     map[string]*runnerConn{},
 		runnerLocks: map[string]*sync.Mutex{},
 		attaches:    newAttachTable(),
+		xferMax:     xfer.MaxBytes,
 		schedWake:   make(chan struct{}, 1),
 	}, nil
 }
@@ -159,6 +170,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/sessions/{id}/resume", s.requireUser(s.handleResumeSession))
 	mux.HandleFunc("POST /v1/sessions/{id}/snapshot", s.requireUser(s.handleSnapshotSession))
 	mux.HandleFunc("GET /v1/sessions/{id}/attach", s.requireUser(s.handleClientAttach))
+
+	// Workspace inspection — the session's working tree, read and written
+	// from outside. Like attach and unlike the other reads, all three are
+	// owner-or-admin: they carry a session's files, not its metadata (api.go,
+	// sessionForRPC).
+	mux.HandleFunc("GET /v1/sessions/{id}/diff", s.requireUser(s.handleSessionDiff))
+	mux.HandleFunc("POST /v1/sessions/{id}/files", s.requireUser(s.handlePushFiles))
+	mux.HandleFunc("GET /v1/sessions/{id}/files", s.requireUser(s.handlePullFiles))
+
 	mux.HandleFunc("GET /v1/runners", s.requireUser(s.handleListRunners))
 
 	// Secrets: writes are admin-only, the listing is team-visible (names and

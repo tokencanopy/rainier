@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"rainier/internal/rwire"
+	"rainier/internal/xfer"
 )
 
 // sessionsBodyLimit caps every request body this file decodes: the create
@@ -1883,6 +1884,259 @@ func (s *Server) handleDeleteEnvironment(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---------------------------------------------------------------------------
+// workspace inspection:
+//   GET  /v1/sessions/{id}/diff
+//   POST /v1/sessions/{id}/files        one chunk of an upload
+//   GET  /v1/sessions/{id}/files?path=  the whole download, streamed
+//
+// All three are the same shape: authorize, then drive a session RPC into the
+// sandbox and render what it says. The wire types belong to internal/xfer,
+// which the CLI and sessiond import too — one definition per hop rather than
+// three that happen to match.
+//
+// V0 CRUDENESS, DELIBERATE (design §4.5). The transfer is a chunk per request:
+// the client POSTs a megabyte, waits for its ack, and POSTs the next one, and
+// a pull is the same loop run from here. It is a slow way to move 200MB and an
+// obviously correct one — no new plane, no pairing, no backpressure protocol,
+// no half-transferred state anywhere but the sandbox's own staging file, and
+// no way for a transfer to starve the terminal traffic sharing the session's
+// connection, because only one chunk is ever in flight.
+//
+// THE UPGRADE PATH IS NAMED AND NOT BUILT: when the 256MiB cap starts to hurt,
+// the attach plane already does exactly what an unbounded transfer needs —
+// pairing, a runner dial-back, and a bidirectional byte stream that never
+// touches this replica's memory (attach.go). A transfer would ride it as one
+// more attachment. That is a task-week; this is two hundred lines, and the two
+// have the same REST surface, so the swap is invisible to the CLI.
+// ---------------------------------------------------------------------------
+
+// filesBodyLimit caps one push chunk's request body. A chunk carries at most
+// xfer.ChunkBytes of payload, which base64 inflates by a third; 2MiB leaves
+// room for that and the envelope around it, and matches the session RPC's own
+// payload cap (plan §Global Constraints) — the body is about to become one.
+const filesBodyLimit = 2 << 20
+
+// handleSessionDiff serves GET /v1/sessions/{id}/diff: one `--stat` per
+// repository the session cloned, straight from the sandbox.
+func (s *Server) handleSessionDiff(w http.ResponseWriter, r *http.Request, u User) {
+	row, ok := s.sessionForRPC(w, r, u, "inspect")
+	if !ok {
+		return
+	}
+	ans, err := s.sessionDiff(r.Context(), row.ID)
+	if err != nil {
+		writeSandboxErr(w, row.ID, "diff", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ans)
+}
+
+// handlePushFiles serves POST /v1/sessions/{id}/files: one chunk, forwarded to
+// the sandbox, answered with the sandbox's ack.
+//
+// controld holds NO per-transfer state, and must not: a session's replica is
+// whichever one the client's request reaches, so state kept here would have to
+// be shared between them. Everything a chunk needs to be understood — the
+// transfer id, the destination, the sequence number — rides on the chunk
+// itself, and the sandbox is the one place that remembers.
+func (s *Server) handlePushFiles(w http.ResponseWriter, r *http.Request, u User) {
+	row, ok := s.sessionForRPC(w, r, u, "transfer files to")
+	if !ok {
+		return
+	}
+	var chunk xfer.PushChunk
+	if !decodeJSONBodyLimit(w, r, &chunk, filesBodyLimit) {
+		return
+	}
+	if msg := validatePushChunk(chunk); msg != "" {
+		writeErr(w, http.StatusBadRequest, "invalid_request", msg)
+		return
+	}
+
+	ack, err := s.sessionPushChunk(r.Context(), row.ID, chunk)
+	if err != nil {
+		writeSandboxErr(w, row.ID, "push", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, ack)
+}
+
+// validatePushChunk checks everything about a chunk that can be checked
+// without asking the sandbox, and returns the caller-facing reason it cannot
+// be forwarded (empty when it can).
+//
+// It is not a duplicate of the sandbox's own checks, it is the OUTER one: a
+// path that never leaves this process is a path that never had a chance to
+// escape a workspace, and a chunk refused here costs a round trip rather than
+// a container's disk.
+func validatePushChunk(c xfer.PushChunk) string {
+	switch {
+	case c.Xfer == "":
+		return "xfer is required: every chunk names the transfer it belongs to"
+	case len(c.Xfer) > maxXferIDLen:
+		return fmt.Sprintf("xfer must be at most %d characters", maxXferIDLen)
+	case c.Seq < 0:
+		return "seq must not be negative"
+	case len(c.Data) > xfer.ChunkBytes:
+		return fmt.Sprintf("data is %s; one chunk carries at most %s",
+			xfer.HumanBytes(int64(len(c.Data))), xfer.HumanBytes(xfer.ChunkBytes))
+	}
+	if err := xfer.ValidatePath(c.Path); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// maxXferIDLen bounds the client-chosen transfer id. It is an opaque
+// correlation token, never a filename (the sandbox stages under a name of its
+// own choosing), but it does reach log lines and error messages.
+const maxXferIDLen = 64
+
+// handlePullFiles serves GET /v1/sessions/{id}/files?path=…: the sandbox's
+// archive of that path, streamed out chunk by chunk as it arrives.
+//
+// Errors have two eras. Before the first byte, a failure is an ordinary JSON
+// envelope like every other route's. After it, the status line is already
+// sent and the only honest signal left is to abandon the response mid-body —
+// http.ErrAbortHandler, which closes the connection rather than ending the
+// body cleanly, so a client sees a transport failure instead of a truncated
+// archive it might mistake for a complete one. (Its own gzip trailer would
+// catch it too; this fails it sooner and louder.)
+func (s *Server) handlePullFiles(w http.ResponseWriter, r *http.Request, u User) {
+	path := r.URL.Query().Get("path")
+	if err := xfer.ValidatePath(path); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	row, ok := s.sessionForRPC(w, r, u, "transfer files from")
+	if !ok {
+		return
+	}
+
+	id := randHex(8)
+	var sent int64
+	for seq := 0; ; seq++ {
+		chunk, err := s.sessionPullChunk(r.Context(), row.ID, xfer.PullRequest{Xfer: id, Path: path, Seq: seq})
+		if err != nil {
+			if sent == 0 {
+				writeSandboxErr(w, row.ID, "pull", err)
+				return
+			}
+			log.Printf("controld: pull %s from %s failed after %d bytes: %v", path, row.ID, sent, err)
+			panic(http.ErrAbortHandler)
+		}
+		// The cap is checked BEFORE the write, so the bytes this replica
+		// relays never exceed it even by one chunk. A sandbox that never says
+		// done is the case this exists for: nothing else would stop it.
+		if sent+int64(len(chunk.Data)) > s.xferMax {
+			log.Printf("controld: pull %s from %s exceeded the %s transfer limit; abandoning",
+				path, row.ID, xfer.HumanBytes(s.xferMax))
+			if sent == 0 {
+				writeErr(w, http.StatusConflict, "conflict",
+					fmt.Sprintf("this path is larger than the %s transfer limit", xfer.HumanBytes(s.xferMax)))
+				return
+			}
+			panic(http.ErrAbortHandler)
+		}
+		if sent == 0 {
+			// Written on the first chunk rather than up front: everything that
+			// can fail before any byte moves gets to answer with a JSON
+			// envelope, which is only possible while the header is unwritten.
+			w.Header().Set("Content-Type", "application/gzip")
+			w.WriteHeader(http.StatusOK)
+		}
+		if _, err := w.Write(chunk.Data); err != nil {
+			// The client hung up. Nothing to report to anyone.
+			log.Printf("controld: pull %s from %s: writing to the client: %v", path, row.ID, err)
+			return
+		}
+		sent += int64(len(chunk.Data))
+		// Flushed per chunk so the client sees progress on a slow transfer
+		// rather than a stall followed by everything at once. ResponseController
+		// follows statusWriter's Unwrap to the real writer.
+		http.NewResponseController(w).Flush()
+		if chunk.Done {
+			return
+		}
+	}
+}
+
+// sessionForRPC is the preamble every route above shares: find the session,
+// authorize the caller, and establish that there is a sandbox to talk to. It
+// answers the client and reports false on every failure.
+//
+// AUTHORIZATION IS OWNER-OR-ADMIN, not the team-wide rule this API's other
+// reads take. A diff and a pull read a session's WORKING TREE — its files, its
+// uncommitted work — and a push writes into it, which puts all three on the
+// attach side of §4.4's line rather than the "list sessions" side. The design's
+// §4.6 sketch called the diff team-visible; tightening it is the direction
+// that can be relaxed later without taking anything back from anyone.
+func (s *Server) sessionForRPC(w http.ResponseWriter, r *http.Request, u User, verb string) (Session, bool) {
+	id := r.PathValue("id")
+	row, err := s.st.GetSession(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "session not found")
+			return Session{}, false
+		}
+		log.Printf("controld: get session %s: %v", clip(id), err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not read session")
+		return Session{}, false
+	}
+	if !authorizeOwnerOrAdmin(u, row) {
+		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to "+verb+" this session")
+		return Session{}, false
+	}
+	if row.State != StateRunning {
+		// No bounded wait here, unlike attach: these are one-shot requests a
+		// client can simply repeat, and holding one open would tie up a
+		// connection for a session that may be minutes from starting.
+		writeErr(w, http.StatusServiceUnavailable, "session_not_ready",
+			fmt.Sprintf("session is %s, not running", row.State))
+		return Session{}, false
+	}
+	if row.Runner == "" || !s.runnerConnected(row.Runner) {
+		writeErr(w, http.StatusBadGateway, "runner_unreachable", "runner is not connected")
+		return Session{}, false
+	}
+	return row, true
+}
+
+// writeSandboxErr maps a session-RPC failure onto this API's error envelope.
+//
+// A *sandboxError is a REFUSAL: the request crossed into the sandbox, was
+// understood, and was declined — a path that does not exist, a git that could
+// not fetch, a chunk out of order. Its message is the sandbox's own and travels
+// verbatim (clipped), because that sentence is usually the only thing that says
+// what to do; `conflict` is this API's code for "understood and declined", the
+// same one a create with no credential gets.
+func writeSandboxErr(w http.ResponseWriter, sessionID, what string, err error) {
+	var sbx *sandboxError
+	switch {
+	case errors.As(err, &sbx):
+		writeErr(w, http.StatusConflict, "conflict", sandboxMessage(sbx.Error()))
+	case errors.Is(err, ErrRunnerUnreachable):
+		writeErr(w, http.StatusBadGateway, "runner_unreachable", "session did not answer")
+	default:
+		log.Printf("controld: %s for %s: %v", what, clip(sessionID), err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not "+what+" this session")
+	}
+}
+
+// maxSandboxMessage bounds a sentence that came from inside a container before
+// it reaches a user's terminal. clip() is 48 characters — right for a log line
+// or a websocket close reason, far too short for git's own diagnostics, which
+// are the whole reason these messages are passed through.
+const maxSandboxMessage = 512
+
+func sandboxMessage(s string) string {
+	if len(s) <= maxSandboxMessage {
+		return s
+	}
+	return strings.ToValidUTF8(s[:maxSandboxMessage], "") + "..."
 }
 
 // ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,7 @@ import (
 	"rainier/internal/relay"
 	"rainier/internal/runnerd"
 	"rainier/internal/wire"
+	"rainier/internal/xfer"
 )
 
 // ---------------------------------------------------------------------------
@@ -522,6 +524,10 @@ func waitSessionState(t *testing.T, c *Client, id, want string, timeout time.Dur
 // relay's public API since that helper is package-internal to controld.
 type scriptedSessiond struct {
 	conn relay.Conn
+	// files is what a push left behind, keyed by its destination — the
+	// sandbox's staging and extraction reduced to the one property a
+	// round-trip smoke can check: the bytes that went in come back out.
+	files map[string][]byte
 }
 
 // startScriptedSessiond dials runnerd's /register for sessionID, retrying
@@ -537,7 +543,7 @@ func startScriptedSessiond(t *testing.T, ctx context.Context, runnerdWSBase, ses
 		if err == nil {
 			c.SetReadLimit(16 << 20)
 			t.Cleanup(func() { c.CloseNow() })
-			ss := &scriptedSessiond{conn: relay.WSConn(c)}
+			ss := &scriptedSessiond{conn: relay.WSConn(c), files: map[string][]byte{}}
 			go ss.serve(ctx)
 			return ss
 		}
@@ -569,8 +575,75 @@ func (ss *scriptedSessiond) serve(ctx context.Context) {
 			if m.Type == "stdin" {
 				ss.send(ctx, f.AttachID, wire.ServerMsg{Type: "output", Seq: 2, Data: m.Data})
 			}
+		case relay.FrameControl:
+			ss.serveControl(ctx, f.Payload)
 		}
 	}
+}
+
+// serveControl answers the session RPCs controld drives INTO a sandbox — the
+// half cmd/sessiond implements for real (its diff, its staging file, its
+// tar). Here it is cut down to what a round-trip smoke can check: remember the
+// archive a push delivered, hand the same bytes back on a pull, and answer a
+// diff with a fixed stat.
+//
+// It runs on the same goroutine as the frame loop above, which is also the
+// conn's only writer — so there is no locking here and none needed.
+func (ss *scriptedSessiond) serveControl(ctx context.Context, payload []byte) {
+	var ev relay.ControlEvent
+	if json.Unmarshal(payload, &ev) != nil || !strings.HasPrefix(ev.Kind, "req:") {
+		return
+	}
+	reply := relay.ControlEvent{Kind: "resp", ID: ev.ID}
+	out, err := ss.invoke(strings.TrimPrefix(ev.Kind, "req:"), ev.Payload)
+	if err != nil {
+		reply.Payload, _ = json.Marshal(map[string]string{"error": err.Error()})
+	} else {
+		reply.OK = true
+		reply.Payload, _ = json.Marshal(out)
+	}
+	b, err := json.Marshal(reply)
+	if err != nil {
+		return
+	}
+	raw, err := relay.Encode(relay.Frame{Type: relay.FrameControl, Payload: b})
+	if err != nil {
+		return
+	}
+	ss.conn.Write(ctx, raw)
+}
+
+func (ss *scriptedSessiond) invoke(method string, payload []byte) (any, error) {
+	switch method {
+	case xfer.MethodDiff:
+		return xfer.DiffAnswer{Repos: []xfer.RepoDiff{{
+			Repo: "acme/widgets", BaseBranch: "main", SessionBranch: "rainier/smoke-session",
+			Stat: " main.go | 2 +-\n",
+		}}}, nil
+	case xfer.MethodPushFiles:
+		var c xfer.PushChunk
+		if err := json.Unmarshal(payload, &c); err != nil {
+			return nil, err
+		}
+		ss.files[c.Path] = append(ss.files[c.Path], c.Data...)
+		return xfer.PushAck{Seq: c.Seq, Synced: c.Done}, nil
+	case xfer.MethodPullFiles:
+		var req xfer.PullRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			return nil, err
+		}
+		blob, ok := ss.files[req.Path]
+		if !ok {
+			return nil, fmt.Errorf("%s does not exist in this session's workspace", req.Path)
+		}
+		off := req.Seq * xfer.ChunkBytes
+		if off > len(blob) {
+			return nil, fmt.Errorf("pull chunk %d is past the end of the archive", req.Seq)
+		}
+		end := min(off+xfer.ChunkBytes, len(blob))
+		return xfer.PullChunk{Seq: req.Seq, Data: blob[off:end], Done: end >= len(blob)}, nil
+	}
+	return nil, fmt.Errorf("unknown method %q", method)
 }
 
 func (ss *scriptedSessiond) send(ctx context.Context, attachID uint64, m wire.ServerMsg) {
@@ -887,6 +960,66 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	}
 	if len(afterRm.Secrets) != 0 {
 		t.Fatalf("secrets after delete = %+v, want none", afterRm.Secrets)
+	}
+
+	// --- diff / push / pull: the workspace-inspection routes, driven exactly
+	// as cmd/rainier's `diff`, `push` and `pull` drive them. The push's bytes
+	// cross controld chunk by chunk into the scripted sessiond and come back
+	// out through the pull's streamed response; extracting them has to
+	// reproduce the tree that was pushed, file for file ---
+	var diffAns xfer.DiffAnswer
+	if err := c.Do(http.MethodGet, "/v1/sessions/"+id+"/diff", nil, &diffAns); err != nil {
+		t.Fatalf("GET /v1/sessions/%s/diff: %v", id, err)
+	}
+	if len(diffAns.Repos) != 1 || diffAns.Repos[0].Repo != "acme/widgets" ||
+		!strings.Contains(diffAns.Repos[0].Stat, "main.go") {
+		t.Fatalf("diff = %+v, want the sandbox's own answer", diffAns.Repos)
+	}
+
+	// A member who does not own the session may not read its working tree.
+	diffAsAdminErr := admin.Do(http.MethodGet, "/v1/sessions/"+id+"/diff", nil, &diffAns)
+	if diffAsAdminErr != nil {
+		t.Fatalf("GET diff as an admin: %v; admins may reach any session", diffAsAdminErr)
+	}
+
+	srcDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(srcDir, "pkg"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	pushed := map[string]string{
+		"README.md":     "# smoke\n",
+		"pkg/data.bin":  strings.Repeat("payload-", 4096),
+		"pkg/script.sh": "#!/bin/sh\necho hi\n",
+	}
+	for name, body := range pushed {
+		if err := os.WriteFile(filepath.Join(srcDir, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	if err := Push(c, id, srcDir, "widget/vendor", nil); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	landing := filepath.Join(t.TempDir(), "landing")
+	if err := Pull(c, id, "widget/vendor", landing, nil); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	for name, want := range pushed {
+		got, err := os.ReadFile(filepath.Join(landing, name))
+		if err != nil {
+			t.Fatalf("read %s after the round trip: %v", name, err)
+		}
+		if string(got) != want {
+			t.Fatalf("%s came back %d bytes, want the %d that were pushed", name, len(got), len(want))
+		}
+	}
+
+	// A path that is not there answers with the sandbox's own sentence, not a
+	// truncated archive.
+	if err := Pull(c, id, "widget/nothing", t.TempDir(), nil); err == nil {
+		t.Fatal("Pull of a path the session does not have returned nil")
+	} else if !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("Pull of a missing path = %v, want the sandbox's own sentence", err)
 	}
 
 	// --- attach: attachio.Run's non-tty path, exactly like cmd/rainier's
