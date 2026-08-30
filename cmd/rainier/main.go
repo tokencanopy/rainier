@@ -745,14 +745,61 @@ func formatAge(rfc3339 string) string {
 func runAttach(args []string) error {
 	ref, cursor := attachFlags(args)
 
-	cfg, _, id, err := resolveClientAndID(ref)
+	cfg, c, id, err := resolveClientAndID(ref)
 	if err != nil {
 		return err
 	}
+	if err := prepareAttach(c, id); err != nil {
+		return err
+	}
+	return attachWithRetry(c, cfg, id, cursor)
+}
 
-	wsURL := wsURLFor(cfg.ServerURL, id)
-	header := http.Header{"Authorization": {"Bearer " + cfg.Token}}
-	return attachio.Run(context.Background(), wsURL, header, cursor)
+// prepareAttach makes `rainier attach` the one entry command for an existing
+// session. Running/starting sessions can go straight to the attach plane;
+// suspended sessions first use the ordinary resume endpoint. No convenience
+// endpoint is needed server-side — the CLI is the only consumer that wants
+// these two operations composed.
+//
+// A failed session is deliberately admitted. Plan 5 made a failed setup
+// attachable while its runner is still connected so `--since 0` can show the
+// complete diagnostic log; the attach endpoint remains the authority on
+// whether that particular failed row still has a live sessiond behind it.
+func prepareAttach(c *cli.Client, id string) error {
+	row, err := getSession(c, id)
+	if err != nil {
+		return err
+	}
+	switch row.State {
+	case "running", "creating", "queued", "failed":
+		return nil
+	case "suspended_warm", "suspended_cold":
+		var resumed sessionEnvelope
+		resumeErr := c.Do(http.MethodPost, "/v1/sessions/"+id+"/resume", nil, &resumed)
+		if resumeErr == nil {
+			return nil
+		}
+
+		// Another client can win the resume between our GET and POST. Do not
+		// parse the 409's prose: re-read the resource and continue only when
+		// the desired transition visibly happened. Otherwise preserve the
+		// original, more useful resume failure (e.g. no_capacity).
+		current, readErr := getSession(c, id)
+		if readErr == nil && (current.State == "running" || current.State == "creating") {
+			return nil
+		}
+		return resumeErr
+	default:
+		return fmt.Errorf("session %s is %s and cannot be attached", id, row.State)
+	}
+}
+
+func getSession(c *cli.Client, id string) (session, error) {
+	var resp sessionEnvelope
+	if err := c.Do(http.MethodGet, "/v1/sessions/"+id, nil, &resp); err != nil {
+		return session{}, err
+	}
+	return resp.Session, nil
 }
 
 // attachFlags parses `attach`'s arguments into the session ref and the

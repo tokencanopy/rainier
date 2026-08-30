@@ -1151,3 +1151,119 @@ func TestAttachFlagsCursor(t *testing.T) {
 		})
 	}
 }
+
+// TestPrepareAttach makes `attach` the only lifecycle command a terminal
+// user needs. The API already has separate read and resume operations; this
+// test pins how the CLI composes them without adding a second server-side
+// lifecycle path.
+func TestPrepareAttach(t *testing.T) {
+	for _, state := range []string{"running", "creating", "queued", "failed"} {
+		t.Run("does not resume "+state, func(t *testing.T) {
+			var resumes int
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/sessions/sess_attach":
+					json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: state}})
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/sessions/sess_attach/resume":
+					resumes++
+					json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: "running"}})
+				default:
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL.RequestURI())
+				}
+			}))
+			defer ts.Close()
+
+			if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach"); err != nil {
+				t.Fatalf("prepareAttach: %v", err)
+			}
+			if resumes != 0 {
+				t.Fatalf("resume requests = %d, want 0 for state %q", resumes, state)
+			}
+		})
+	}
+
+	for _, state := range []string{"suspended_warm", "suspended_cold"} {
+		t.Run("resumes "+state, func(t *testing.T) {
+			var resumes int
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/sessions/sess_attach":
+					json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: state}})
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/sessions/sess_attach/resume":
+					resumes++
+					json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: "running"}})
+				default:
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL.RequestURI())
+				}
+			}))
+			defer ts.Close()
+
+			if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach"); err != nil {
+				t.Fatalf("prepareAttach: %v", err)
+			}
+			if resumes != 1 {
+				t.Fatalf("resume requests = %d, want 1 for state %q", resumes, state)
+			}
+		})
+	}
+
+	t.Run("refuses a permanently ended session", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: "dead"}})
+		}))
+		defer ts.Close()
+
+		err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach")
+		if err == nil || !strings.Contains(err.Error(), `session sess_attach is dead and cannot be attached`) {
+			t.Fatalf("prepareAttach error = %v, want a direct dead-session error", err)
+		}
+	})
+
+	t.Run("a concurrent resume winner converges", func(t *testing.T) {
+		gets := 0
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.Method {
+			case http.MethodGet:
+				gets++
+				state := "suspended_warm"
+				if gets > 1 {
+					state = "running"
+				}
+				json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: state}})
+			case http.MethodPost:
+				w.WriteHeader(http.StatusConflict)
+				io.WriteString(w, `{"error":{"code":"conflict","message":"session is not suspended"}}`)
+			}
+		}))
+		defer ts.Close()
+
+		if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach"); err != nil {
+			t.Fatalf("prepareAttach: %v", err)
+		}
+		if gets != 2 {
+			t.Fatalf("GET count = %d, want 2 (initial state plus convergence read)", gets)
+		}
+	})
+
+	t.Run("a resume failure is preserved when the state did not advance", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.Method == http.MethodGet {
+				json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: "suspended_cold"}})
+				return
+			}
+			w.WriteHeader(http.StatusConflict)
+			io.WriteString(w, `{"error":{"code":"no_capacity","message":"runner is full"}}`)
+		}))
+		defer ts.Close()
+
+		err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach")
+		if err == nil || !strings.Contains(err.Error(), "no_capacity: runner is full") {
+			t.Fatalf("prepareAttach error = %v, want the original resume failure", err)
+		}
+	})
+}
