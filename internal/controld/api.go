@@ -1942,6 +1942,12 @@ func (s *Server) handleSessionDiff(w http.ResponseWriter, r *http.Request, u Use
 // be shared between them. Everything a chunk needs to be understood — the
 // transfer id, the destination, the sequence number — rides on the chunk
 // itself, and the sandbox is the one place that remembers.
+//
+// That is also why the TOTAL size cap is the sandbox's to enforce on this
+// direction and not this replica's: the sandbox is the only end that sees a
+// whole transfer. What is bounded here is one request — the body limit and the
+// chunk cap — which is all this side ever holds at once, so an oversized push
+// costs the pusher's own session's disk quota and nothing of controld's.
 func (s *Server) handlePushFiles(w http.ResponseWriter, r *http.Request, u User) {
 	row, ok := s.sessionForRPC(w, r, u, "transfer files to")
 	if !ok {
@@ -2018,10 +2024,21 @@ func (s *Server) handlePullFiles(w http.ResponseWriter, r *http.Request, u User)
 
 	id := randHex(8)
 	var sent int64
+	var started bool // whether the 200 and its headers have been written
+	// Two chunks of slack over the cap's worth: a transfer within the cap
+	// cannot need more than that unless the far end is sending short chunks,
+	// which nothing honest does. It is the second of the two rules that keep
+	// this loop finite — the first is that only the last chunk may be empty
+	// (sessionPullChunk) — and the belt to that one's braces.
+	maxChunks := int(s.xferMax/xfer.ChunkBytes) + 2
 	for seq := 0; ; seq++ {
+		if seq > maxChunks {
+			log.Printf("controld: pull %s from %s took more than %d chunks; abandoning", path, row.ID, maxChunks)
+			panic(http.ErrAbortHandler)
+		}
 		chunk, err := s.sessionPullChunk(r.Context(), row.ID, xfer.PullRequest{Xfer: id, Path: path, Seq: seq})
 		if err != nil {
-			if sent == 0 {
+			if !started {
 				writeSandboxErr(w, row.ID, "pull", err)
 				return
 			}
@@ -2034,19 +2051,20 @@ func (s *Server) handlePullFiles(w http.ResponseWriter, r *http.Request, u User)
 		if sent+int64(len(chunk.Data)) > s.xferMax {
 			log.Printf("controld: pull %s from %s exceeded the %s transfer limit; abandoning",
 				path, row.ID, xfer.HumanBytes(s.xferMax))
-			if sent == 0 {
+			if !started {
 				writeErr(w, http.StatusConflict, "conflict",
 					fmt.Sprintf("this path is larger than the %s transfer limit", xfer.HumanBytes(s.xferMax)))
 				return
 			}
 			panic(http.ErrAbortHandler)
 		}
-		if sent == 0 {
+		if !started {
 			// Written on the first chunk rather than up front: everything that
 			// can fail before any byte moves gets to answer with a JSON
 			// envelope, which is only possible while the header is unwritten.
 			w.Header().Set("Content-Type", "application/gzip")
 			w.WriteHeader(http.StatusOK)
+			started = true
 		}
 		if _, err := w.Write(chunk.Data); err != nil {
 			// The client hung up. Nothing to report to anyone.
@@ -2136,7 +2154,7 @@ func sandboxMessage(s string) string {
 	if len(s) <= maxSandboxMessage {
 		return s
 	}
-	return strings.ToValidUTF8(s[:maxSandboxMessage], "") + "..."
+	return clipTo(s, maxSandboxMessage) + "..."
 }
 
 // ---------------------------------------------------------------------------
