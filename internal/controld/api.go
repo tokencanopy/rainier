@@ -655,7 +655,8 @@ func (s *Server) writeCurrentSession(w http.ResponseWriter, r *http.Request, id 
 // ---------------------------------------------------------------------------
 
 // handleListSessions serves GET /v1/sessions: team-visible, cursor-paginated,
-// terminal states hidden unless all=true.
+// terminal states hidden unless all=true. name is an optional exact filter;
+// the CLI uses it to resolve one resource without paging through team history.
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request, u User) {
 	q := r.URL.Query()
 
@@ -673,6 +674,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request, u Us
 	}
 
 	query := SessionQuery{
+		Name:            q.Get("name"),
 		Runner:          q.Get("runner"),
 		IncludeTerminal: q.Get("all") == "true",
 		Limit:           limit,
@@ -832,7 +834,11 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request, u U
 	// workspace may outlive its session is a crash — every explicit rm says
 	// that out loud rather than inferring it from which teardown ran.
 	s.reclaimWorkspace(row)
-	s.transitionQuiet(r.Context(), id, NonTerminal, StateDestroyed, TransitionOpts{})
+	from := NonTerminal
+	if row.State == StateFailed {
+		from = []SessionState{StateFailed}
+	}
+	s.transitionQuiet(r.Context(), id, from, StateDestroyed, TransitionOpts{})
 	s.wakeScheduler()
 	w.WriteHeader(http.StatusNoContent)
 }

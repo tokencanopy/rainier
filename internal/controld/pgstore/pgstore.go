@@ -310,6 +310,10 @@ func (s *Store) ListSessions(ctx context.Context, q controld.SessionQuery) ([]co
 		args = append(args, states)
 		fmt.Fprintf(&sb, " AND state = ANY($%d)", len(args))
 	}
+	if q.Name != "" {
+		args = append(args, q.Name)
+		fmt.Fprintf(&sb, " AND name = $%d", len(args))
+	}
 	if q.Runner != "" {
 		args = append(args, q.Runner)
 		fmt.Fprintf(&sb, " AND runner = $%d", len(args))

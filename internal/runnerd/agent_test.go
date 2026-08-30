@@ -588,6 +588,44 @@ func TestAgentRemoveWorkspaceCommand(t *testing.T) {
 	}
 }
 
+// The fleet wire must not turn a real driver teardown failure back into an
+// apparent success. controld relies on OK=false to leave the row unchanged so
+// a retry or reconciliation can still reach the runner's retained entry.
+func TestAgentDestroyReportsDriverFailureAndAllowsRetry(t *testing.T) {
+	wantErr := errors.New("synthetic destroy failure")
+	fd := &failOnceDestroyFake{Fake: driver.NewFake(4), err: wantErr}
+	rd := New(fd, "", "", "")
+	if err := rd.CreateWithID(context.Background(), "sess_destroy", driver.Spec{Image: "img"}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1"})
+
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+
+	conn.send(t, rwire.ToRunner{Type: "destroy", ReqID: 31, Session: "sess_destroy"})
+	res := conn.readMsg(t)
+	if res.Type != "result" || res.ReqID != 31 || res.OK || res.Detail != wantErr.Error() {
+		t.Fatalf("first destroy result = %+v, want failed req_id 31 carrying %q", res, wantErr)
+	}
+	if _, _, ok := rd.reg.opTarget("sess_destroy"); !ok {
+		t.Fatal("failed destroy disappeared from the runner registry")
+	}
+
+	conn.send(t, rwire.ToRunner{Type: "destroy", ReqID: 32, Session: "sess_destroy"})
+	res = conn.readMsg(t)
+	if res.Type != "result" || res.ReqID != 32 || !res.OK {
+		t.Fatalf("retry destroy result = %+v, want ok req_id 32", res)
+	}
+	if _, _, ok := rd.reg.opTarget("sess_destroy"); ok {
+		t.Fatal("successful retry left the runner registry entry behind")
+	}
+}
+
 // TestAgentPrepullPullsAndReports: prepull is advisory — controld dispatches
 // it with no pending entry to correlate against, so the command carries
 // neither a session nor a req_id, and the agent must handle both absences.

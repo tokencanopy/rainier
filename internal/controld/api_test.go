@@ -1198,6 +1198,26 @@ func TestListSessions(t *testing.T) {
 		}
 	})
 
+	t.Run("name filters exactly", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		owner, tok := loginUser(t, st, "alice", "member")
+		seedSession(t, st, Session{ID: "sess_name_want", OwnerID: owner.ID, State: StateRunning, Name: "box"})
+		seedSession(t, st, Session{ID: "sess_name_other", OwnerID: owner.ID, State: StateRunning, Name: "box-extra"})
+
+		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions?name=box", tok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
+		}
+		var body sessionsEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		if len(body.Sessions) != 1 || body.Sessions[0].ID != "sess_name_want" {
+			t.Fatalf("sessions = %+v, want only exact name box", body.Sessions)
+		}
+	})
+
 	t.Run("invalid cursor is 400 invalid_request", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
@@ -1437,8 +1457,8 @@ func TestDeleteSession(t *testing.T) {
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
-		if got := getSession(t, st, "sess_del_failed"); got.State != StateFailed || got.Error != reason {
-			t.Fatalf("row = %s / %q, want failed diagnosis preserved", got.State, got.Error)
+		if got := getSession(t, st, "sess_del_failed"); got.State != StateDestroyed || got.Error != reason {
+			t.Fatalf("row = %s / %q, want destroyed with the failed diagnosis preserved", got.State, got.Error)
 		}
 
 		next := f.nextCmd(t)

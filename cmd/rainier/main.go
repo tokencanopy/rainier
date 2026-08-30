@@ -677,10 +677,7 @@ func runLs(args []string) error {
 
 	if !*all {
 		var failed sessionsEnvelope
-		if err := c.Do(http.MethodGet, "/v1/sessions?all=true&limit=1&state=failed", nil, &failed); err != nil {
-			return err
-		}
-		if len(failed.Sessions) > 0 {
+		if err := c.Do(http.MethodGet, "/v1/sessions?all=true&limit=1&state=failed", nil, &failed); err == nil && len(failed.Sessions) > 0 {
 			fmt.Println("hint: failed sessions are hidden; run `rainier ls --all` to inspect or remove them")
 		}
 	}
@@ -1710,18 +1707,18 @@ func resolveClientAndIDWithTerminal(ref string, includeTerminal bool) (cli.Confi
 }
 
 // resolveSessionID resolves ref to a session id: a "sess_" prefix is
-// already an id, verbatim; anything else is looked up by paging GET
-// /v1/sessions and matching the name field client-side — controld has no
-// by-name endpoint in v0 (see the design's route table), so this is the
-// CLI's own job. The default resolver sees only non-terminal sessions. rm's
-// variant opts into terminal rows because a failed create can still own a
-// live container. The caller's own rows take precedence over teammates'
-// team-visible rows; within that set, an active row that reused a terminal
-// row's name wins and the historical one requires its id.
+// already an id, verbatim; anything else is looked up through the exact-name
+// filter on paginated GET /v1/sessions. The CLI still makes the ambiguity
+// decision because that collection is team-visible. The default resolver sees
+// only non-terminal sessions. rm's variant opts into terminal rows because a
+// failed create can still own a live container. The caller's own rows take
+// precedence over teammates' team-visible rows; within that set, an active
+// row that reused a terminal row's name wins and the historical one requires
+// its id.
 //
 // Session names are unique only per owner (design), while GET /v1/sessions
 // is team-visible — two teammates can each have a session named e.g.
-// "dev-box". Every non-terminal match is collected across every page
+// "dev-box". Every exact-name match is collected across every page
 // before deciding anything (a match on page 1 does not short-circuit the
 // search): acting on "whichever paginated first" risks silently suspending
 // or deleting a teammate's session by mistake.
@@ -1760,6 +1757,7 @@ func resolveSessionIDWithTerminal(c *cli.Client, myOwnerID, ref string, includeT
 		if includeTerminal {
 			q.Set("all", "true")
 		}
+		q.Set("name", ref)
 		if cursor != "" {
 			q.Set("cursor", cursor)
 		}
@@ -1802,14 +1800,16 @@ func resolveSessionIDWithTerminal(c *cli.Client, myOwnerID, ref string, includeT
 	// Name uniqueness applies only to non-terminal sessions. Preserve the
 	// established `rm name` behavior when an active session has reused an old
 	// terminal session's name; the historical row remains addressable by id.
-	var activeMatches []match
-	for _, m := range matches {
-		if !m.terminal {
-			activeMatches = append(activeMatches, m)
+	if myOwnerID != "" {
+		var activeMatches []match
+		for _, m := range matches {
+			if !m.terminal {
+				activeMatches = append(activeMatches, m)
+			}
 		}
-	}
-	if len(activeMatches) > 0 {
-		matches = activeMatches
+		if len(activeMatches) > 0 {
+			matches = activeMatches
+		}
 	}
 
 	switch len(matches) {

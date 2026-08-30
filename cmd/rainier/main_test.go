@@ -240,7 +240,7 @@ func TestRmResolvesALoneFailedSessionByName(t *testing.T) {
 	if !strings.Contains(out, "removed sess_failed") {
 		t.Fatalf("rm output = %q, want removed sess_failed", out)
 	}
-	if len(paths) != 2 || paths[0] != "/v1/sessions?all=true" || paths[1] != "/v1/sessions/sess_failed" {
+	if len(paths) != 2 || paths[0] != "/v1/sessions?all=true&name=broken" || paths[1] != "/v1/sessions/sess_failed" {
 		t.Fatalf("requests = %v, want terminal lookup then delete", paths)
 	}
 }
@@ -310,6 +310,39 @@ func TestRmNamePrefersMyTerminalSessionOverATeammatesActiveSession(t *testing.T)
 	}
 }
 
+// A pre-owner-id config cannot safely apply active precedence across owners:
+// it does not know which same-name row belongs to the caller. Refuse with the
+// established ambiguity error instead of selecting a teammate's active id.
+func TestRmWithLegacyConfigDoesNotDiscardTerminalMatchesAcrossOwners(t *testing.T) {
+	deleted := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodDelete {
+			deleted = true
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		json.NewEncoder(w).Encode(sessionsEnvelope{Sessions: []session{
+			{ID: "sess_alice", Name: "shared", OwnerID: "usr_alice", State: "failed"},
+			{ID: "sess_bob", Name: "shared", OwnerID: "usr_bob", State: "running"},
+		}})
+	}))
+	t.Cleanup(ts.Close)
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_test"}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := captureStdout(t, func() error { return runRm([]string{"shared"}) })
+	if err == nil || !strings.Contains(err.Error(), "ambiguous name") {
+		t.Fatalf("rm legacy shared name error = %v, want ambiguity", err)
+	}
+	if deleted {
+		t.Fatal("rm issued DELETE despite cross-owner ambiguity")
+	}
+}
+
 // Default ls keeps terminal history out of the table, but a failed session
 // must not disappear without a clue. The bounded probe asks only whether one
 // failed row exists and points the user at the established --all view.
@@ -365,6 +398,36 @@ func TestLsAllDoesNotPrintTheHiddenFailureHint(t *testing.T) {
 	}
 	if strings.Contains(out, "sessions are hidden") {
 		t.Fatalf("ls --all output = %q, want no hidden-session hint", out)
+	}
+}
+
+// The hint is supplemental. A transient failure in its second request must
+// not turn a successfully rendered session table into a failed command.
+func TestLsIgnoresHiddenFailureProbeErrors(t *testing.T) {
+	requests := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		if requests == 1 {
+			json.NewEncoder(w).Encode(sessionsEnvelope{})
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		io.WriteString(w, `{"error":{"code":"internal","message":"synthetic probe failure"}}`)
+	}))
+	t.Cleanup(ts.Close)
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_test"}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := captureStdout(t, func() error { return runLs(nil) })
+	if err != nil {
+		t.Fatalf("ls returned the optional probe error: %v", err)
+	}
+	if !strings.Contains(out, "ID") || strings.Contains(out, "sessions are hidden") {
+		t.Fatalf("ls output = %q, want the table without an unproven hint", out)
 	}
 }
 

@@ -242,6 +242,9 @@ func (m *memStore) ListSessions(ctx context.Context, q SessionQuery) ([]Session,
 		if stateSet != nil && !stateSet[s.State] {
 			continue
 		}
+		if q.Name != "" && s.Name != q.Name {
+			continue
+		}
 		if q.Runner != "" && s.Runner != q.Runner {
 			continue
 		}

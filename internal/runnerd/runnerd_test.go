@@ -860,6 +860,60 @@ func TestDeleteRemovesTheWorkspace(t *testing.T) {
 	}
 }
 
+type failOnceDestroyFake struct {
+	*driver.Fake
+	err   error
+	calls int
+}
+
+func (f *failOnceDestroyFake) Destroy(ctx context.Context, id string) error {
+	f.calls++
+	if f.calls == 1 {
+		return f.err
+	}
+	return f.Fake.Destroy(ctx, id)
+}
+
+// A driver teardown failure must remain visible and retryable. Removing the
+// registry entry after a failed docker rm would make Announce forget a live
+// container that still consumes capacity, leaving controld no path to heal it.
+func TestDeleteKeepsTheSessionRetryableWhenDriverDestroyFails(t *testing.T) {
+	wantErr := errors.New("synthetic destroy failure")
+	fd := &failOnceDestroyFake{Fake: driver.NewFake(4), err: wantErr}
+	rd := New(fd, "", "", "")
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+
+	id := createSession(t, srv.URL)
+	handle, state, ok := rd.reg.opTarget(id)
+	if !ok || handle == "" || state != "running" {
+		t.Fatalf("created session = (%q, %q, %t), want a running registry entry", handle, state, ok)
+	}
+
+	err := rd.Delete(context.Background(), id)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("first Delete error = %v, want %v", err, wantErr)
+	}
+	gotHandle, gotState, ok := rd.reg.opTarget(id)
+	if !ok || gotHandle != handle || gotState != "running" {
+		t.Fatalf("registry after failed destroy = (%q, %q, %t), want retryable (%q, running, true)",
+			gotHandle, gotState, ok, handle)
+	}
+	if got := rd.Announce(); len(got) != 1 || got[0].ID != id || got[0].State != "running" {
+		t.Fatalf("Announce after failed destroy = %+v, want the live session retained", got)
+	}
+	if h, err := fd.Inspect(context.Background(), handle); err != nil || h.State != driver.StateRunning {
+		t.Fatalf("driver resource after failed destroy = %+v, %v; want it still running", h, err)
+	}
+
+	if err := rd.Delete(context.Background(), id); err != nil {
+		t.Fatalf("retry Delete: %v", err)
+	}
+	if _, _, ok := rd.reg.opTarget(id); ok {
+		t.Fatal("registry entry survived successful retry")
+	}
+}
+
 // TestRemoveWorkspaceReclaimsAKeptVolume covers the command controld sends
 // after a crash-dead session is explicitly removed: the container is long
 // gone, so nothing but this reclaims the volume the crash path deliberately

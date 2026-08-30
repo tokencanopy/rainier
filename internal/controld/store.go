@@ -30,8 +30,10 @@ const (
 	StateDestroyed     SessionState = "destroyed"
 )
 
-// Terminal reports whether s is one of the states a session never leaves:
-// canceled, failed, dead, or destroyed.
+// Terminal reports whether s is out of the schedulable lifecycle and hidden
+// from the default list: canceled, failed, dead, or destroyed. Failed has one
+// explicit exit: rm destroys its retained diagnostic container and advances
+// the row to destroyed; no scheduler/event transition revives a terminal row.
 func (s SessionState) Terminal() bool {
 	switch s {
 	case StateCanceled, StateFailed, StateDead, StateDestroyed:
@@ -259,9 +261,11 @@ type TransitionOpts struct {
 	Error  *string
 }
 
-// SessionQuery filters and paginates ListSessions.
+// SessionQuery filters and paginates ListSessions. Name is an exact match;
+// empty means every name.
 type SessionQuery struct {
 	States          []SessionState
+	Name            string
 	Runner          string
 	IncludeTerminal bool
 	Limit           int

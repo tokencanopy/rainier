@@ -734,9 +734,10 @@ runs against one. Record what actually happened in the Result column.
   cleanup bug: a `failed` session retained its attachable container, while the
   terminal DELETE path reclaimed only its workspace. `rainier rm <name>` also
   could not find the hidden terminal row. The follow-up fix makes failed-session
-  deletion dispatch the runner's idempotent destroy, lets `rm` resolve terminal
-  names without changing active-name precedence, and makes default `ls` point to
-  `ls --all` when a failed row is hidden.
+  deletion dispatch the runner's idempotent destroy and then mark the row
+  destroyed (retaining its diagnostic), lets `rm` resolve terminal names without
+  changing owner/active-name precedence, and points from default `ls` to
+  `ls --all` while an unremoved failed row is hidden.
 
 - 2026-08-29 local rehearsal (`RUNNERD_PORT=8081 PG_PORT=5434
   ./scripts/e2e-fleet.sh`): every non-github phase passed, no findings. The
