@@ -241,10 +241,40 @@ func TestSessionDiff(t *testing.T) {
 		}
 	})
 
-	t.Run("authorization and readiness", func(t *testing.T) {
+	// TEAM-VISIBLE, deliberately: `--stat` is metadata — file paths and churn
+	// counts, no content — and design §4.6 puts it on the read side of §4.4's
+	// line, where GET /v1/sessions/{id} already sits. A teammate reading which
+	// files another member's branch touched is the endpoint working, not a
+	// leak: this fleet's posture already lets an admin attach to any session
+	// and push as its owner.
+	t.Run("a teammate may read another member's diff", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		u, _ := loginUser(t, st, "alice", "member")
+		_, otherTok := loginUser(t, st, "bob", "member")
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		transferSession(t, st, "sess_diff_teammate", "vm1", u.ID)
+		startSandbox(t, f, func(string, json.RawMessage) (any, error) {
+			return diffAnswerOf(xfer.RepoDiff{
+				Repo: "acme/widget", BaseBranch: "main", SessionBranch: "rainier/x", Stat: " main.go | 2 +-\n"}), nil
+		})
+
+		resp := doJSON(t, ts, http.MethodGet, "/v1/sessions/sess_diff_teammate/diff", otherTok, nil, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200 — the diff is a team-visible read; body = %s", resp.StatusCode, raw)
+		}
+		var body xfer.DiffAnswer
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body = %s", err, raw)
+		}
+		if len(body.Repos) != 1 || body.Repos[0].Repo != "acme/widget" {
+			t.Fatalf("repos = %+v, want the owner's own answer rendered for a teammate", body.Repos)
+		}
+	})
+
+	t.Run("readiness", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		u, tok := loginUser(t, st, "alice", "member")
-		_, otherTok := loginUser(t, st, "bob", "member")
 		joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 
 		resp := doJSON(t, ts, http.MethodGet, "/v1/sessions/sess_nope/diff", tok, nil, nil)
@@ -252,13 +282,6 @@ func TestSessionDiff(t *testing.T) {
 			t.Fatalf("unknown session status = %d, want 404", resp.StatusCode)
 		}
 		assertErrCode(t, resp, "not_found")
-
-		transferSession(t, st, "sess_diff_authz", "vm1", u.ID)
-		resp = doJSON(t, ts, http.MethodGet, "/v1/sessions/sess_diff_authz/diff", otherTok, nil, nil)
-		if resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("another member's session status = %d, want 403", resp.StatusCode)
-		}
-		assertErrCode(t, resp, "forbidden")
 
 		seedSession(t, st, Session{ID: "sess_diff_queued", State: StateQueued, OwnerID: u.ID})
 		resp = doJSON(t, ts, http.MethodGet, "/v1/sessions/sess_diff_queued/diff", tok, nil, nil)
@@ -381,10 +404,20 @@ func TestPushFiles(t *testing.T) {
 			t.Fatalf("unknown session status = %d, want 404", resp.StatusCode)
 		}
 
+		// OWNER-OR-ADMIN, unlike the diff above: a push writes into somebody
+		// else's working tree, which is the attach side of §4.4's line.
 		transferSession(t, st, "sess_push_authz", "vm1", u.ID)
 		resp = doJSON(t, ts, http.MethodPost, "/v1/sessions/sess_push_authz/files", otherTok, body, nil)
 		if resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("another member's session status = %d, want 403", resp.StatusCode)
+			t.Fatalf("pushing into another member's session status = %d, want 403", resp.StatusCode)
+		}
+		assertErrCode(t, resp, "forbidden")
+
+		// An admin may, which is the same trust-your-team rule attach takes.
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp = doJSON(t, ts, http.MethodPost, "/v1/sessions/sess_push_authz/files", adminTok, body, nil)
+		if resp.StatusCode == http.StatusForbidden {
+			t.Fatal("an admin was refused a push; admins reach every session")
 		}
 
 		seedSession(t, st, Session{ID: "sess_push_queued", State: StateQueued, OwnerID: u.ID})
@@ -537,11 +570,14 @@ func TestPullFiles(t *testing.T) {
 			t.Fatalf("unknown session status = %d, want 404", resp.StatusCode)
 		}
 
+		// OWNER-OR-ADMIN, unlike the diff: a pull carries the working tree's
+		// raw bytes out, not the metadata `--stat` reports.
 		transferSession(t, st, "sess_pull_authz", "vm1", u.ID)
 		resp = doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_pull_authz/files?path=d", otherTok, nil, nil)
 		if resp.StatusCode != http.StatusForbidden {
-			t.Fatalf("another member's session status = %d, want 403", resp.StatusCode)
+			t.Fatalf("pulling from another member's session status = %d, want 403", resp.StatusCode)
 		}
+		assertErrCode(t, resp, "forbidden")
 
 		seedSession(t, st, Session{ID: "sess_pull_queued", State: StateQueued, OwnerID: u.ID})
 		resp = doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_pull_queued/files?path=d", tok, nil, nil)

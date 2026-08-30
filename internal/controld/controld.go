@@ -172,9 +172,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/sessions/{id}/attach", s.requireUser(s.handleClientAttach))
 
 	// Workspace inspection — the session's working tree, read and written
-	// from outside. Like attach and unlike the other reads, all three are
-	// owner-or-admin: they carry a session's files, not its metadata (api.go,
-	// sessionForRPC).
+	// from outside. The diff is team-visible like the other session reads
+	// (design §4.6): `--stat` is metadata, file paths and churn counts. The
+	// two file routes are owner-or-admin like attach, because they carry the
+	// tree itself — bytes out, and writes in (§4.4; api.go, sessionForRPC).
 	mux.HandleFunc("GET /v1/sessions/{id}/diff", s.requireUser(s.handleSessionDiff))
 	mux.HandleFunc("POST /v1/sessions/{id}/files", s.requireUser(s.handlePushFiles))
 	mux.HandleFunc("GET /v1/sessions/{id}/files", s.requireUser(s.handlePullFiles))
