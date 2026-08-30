@@ -224,7 +224,7 @@ func TestAgentSocketCallRidesOutABootRace(t *testing.T) {
 
 	out := make(chan error, 1)
 	go func() {
-		_, err := agentSocketCall(d)("mint_git_credential", nil)
+		_, err := agentSocketCall(d, nil)("mint_git_credential", nil)
 		out <- err
 	}()
 

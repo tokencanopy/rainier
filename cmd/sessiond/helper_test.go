@@ -68,11 +68,18 @@ func TestCredentialHelperAnswersOnlyGitHubGets(t *testing.T) {
 		stdin string
 	}{
 		{"store", []string{"store"}, gitAsks("protocol=https", "host=github.com", "username=x", "password=y")},
-		{"erase", []string{"erase"}, gitAsks("protocol=https", "host=github.com")},
 		{"another host", []string{"get"}, gitAsks("protocol=https", "host=gitlab.com")},
 		{"a lookalike host", []string{"get"}, gitAsks("protocol=https", "host=github.com.evil.test")},
 		{"no host at all", []string{"get"}, gitAsks("protocol=https")},
 		{"no operation", nil, gitAsks("protocol=https", "host=github.com")},
+		// The protocol is as load-bearing as the host: git asks this helper for
+		// an `http://github.com/...` remote too, and an answer there would put
+		// the user's token on the wire in cleartext. An agent, or a
+		// .gitmodules, can name any remote it likes.
+		{"plain http", []string{"get"}, gitAsks("protocol=http", "host=github.com")},
+		{"no protocol at all", []string{"get"}, gitAsks("host=github.com")},
+		{"an erase over http", []string{"erase"}, gitAsks("protocol=http", "host=github.com")},
+		{"an erase for another host", []string{"erase"}, gitAsks("protocol=https", "host=gitlab.com")},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -91,6 +98,68 @@ func TestCredentialHelperAnswersOnlyGitHubGets(t *testing.T) {
 	}
 }
 
+// TestCredentialHelperReportsAnErase: git calls "erase" after an
+// authentication failure, and that is the ONLY notice anything in the system
+// gets that a token was revoked while a session was running — the clone stage
+// finished hours ago and nothing watches the agent's PTY. So the helper turns
+// it into the fire-and-forget report that reaches controld's existing
+// credential_rejected path.
+//
+// The helper's discipline is unchanged by it: nothing on stdout, exit 0, and
+// the credential the erase request carries goes nowhere at all.
+func TestCredentialHelperReportsAnErase(t *testing.T) {
+	const rejected = "not-a-real-credential"
+	type call struct {
+		method  string
+		payload string
+	}
+	calls := make(chan call, 4)
+	sock := startSocket(t, time.Second, func(method string, payload json.RawMessage) (json.RawMessage, error) {
+		calls <- call{method, string(payload)}
+		return nil, nil
+	})
+
+	code, stdout, stderr := runHelper(t, sock, time.Second, []string{"erase"},
+		gitAsks("protocol=https", "host=github.com", "username=x-access-token", "password="+rejected))
+
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 — an erase is not a failure git should see", code)
+	}
+	if stdout != "" || stderr != "" {
+		t.Fatalf("stdout = %q, stderr = %q; want both empty", stdout, stderr)
+	}
+	select {
+	case c := <-calls:
+		if c.method != credentialRejectedMethod {
+			t.Fatalf("method = %q, want %q", c.method, credentialRejectedMethod)
+		}
+		// No payload, ever: the request this helper just read carries the
+		// rejected credential, and whose credential it is is controld's own
+		// answer from the session row.
+		if c.payload != "" && c.payload != "{}" {
+			t.Fatalf("payload = %q, want none — the erase request carries a credential", c.payload)
+		}
+		if strings.Contains(c.payload, rejected) {
+			t.Fatal("the rejected credential was forwarded upstream")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the erase never reached sessiond; a token revoked mid-session would go unnoticed")
+	}
+}
+
+// TestCredentialHelperSurvivesAnUnreportableErase: reporting is bookkeeping.
+// Git has already failed the user's command by the time it calls erase, and a
+// second error about a socket would say nothing they can act on — so a
+// report that cannot be delivered changes nothing about this helper's answer.
+func TestCredentialHelperSurvivesAnUnreportableErase(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "absent.sock")
+	code, stdout, stderr := runHelper(t, sock, time.Second, []string{"erase"},
+		gitAsks("protocol=https", "host=github.com", "username=x-access-token", "password=not-a-real-credential"))
+	if code != 0 || stdout != "" || stderr != "" {
+		t.Fatalf("exit = %d, stdout = %q, stderr = %q; want 0 and silence", code, stdout, stderr)
+	}
+}
+
 // TestCredentialHelperSurfacesARefusal: the upstream message is the named
 // action the user has to run, and git prints a helper's stderr straight to the
 // terminal. It must arrive verbatim, and nothing may go to stdout — a partial
@@ -101,7 +170,7 @@ func TestCredentialHelperSurfacesARefusal(t *testing.T) {
 		return nil, errors.New(msg)
 	})
 
-	code, stdout, stderr := runHelper(t, sock, 5*time.Second, []string{"get"}, gitAsks("host=github.com"))
+	code, stdout, stderr := runHelper(t, sock, 5*time.Second, []string{"get"}, gitAsks("protocol=https", "host=github.com"))
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1", code)
 	}
@@ -119,7 +188,7 @@ func TestCredentialHelperSurfacesARefusal(t *testing.T) {
 func TestCredentialHelperReportsLocalFailures(t *testing.T) {
 	t.Run("no socket", func(t *testing.T) {
 		sock := filepath.Join(t.TempDir(), "absent.sock")
-		code, stdout, stderr := runHelper(t, sock, time.Second, []string{"get"}, gitAsks("host=github.com"))
+		code, stdout, stderr := runHelper(t, sock, time.Second, []string{"get"}, gitAsks("protocol=https", "host=github.com"))
 		if code != 1 || stdout != "" {
 			t.Fatalf("exit = %d, stdout = %q; want 1 and no output", code, stdout)
 		}
@@ -135,7 +204,7 @@ func TestCredentialHelperReportsLocalFailures(t *testing.T) {
 			<-block
 			return nil, nil
 		})
-		code, stdout, stderr := runHelper(t, sock, 80*time.Millisecond, []string{"get"}, gitAsks("host=github.com"))
+		code, stdout, stderr := runHelper(t, sock, 80*time.Millisecond, []string{"get"}, gitAsks("protocol=https", "host=github.com"))
 		if code != 1 || stdout != "" {
 			t.Fatalf("exit = %d, stdout = %q; want 1 and no output", code, stdout)
 		}
@@ -148,7 +217,7 @@ func TestCredentialHelperReportsLocalFailures(t *testing.T) {
 		sock := startSocket(t, time.Second, func(string, json.RawMessage) (json.RawMessage, error) {
 			return json.RawMessage(`{}`), nil
 		})
-		code, stdout, stderr := runHelper(t, sock, time.Second, []string{"get"}, gitAsks("host=github.com"))
+		code, stdout, stderr := runHelper(t, sock, time.Second, []string{"get"}, gitAsks("protocol=https", "host=github.com"))
 		if code != 1 || stdout != "" {
 			t.Fatalf("exit = %d, stdout = %q; want 1 and no output", code, stdout)
 		}

@@ -96,6 +96,17 @@ func main() {
 		log.Print("a boot chain was requested but sessiond has no runnerd to dial; skipping setup, clone and init")
 	}
 
+	// events is where every control payload this sessiond originates — the
+	// setup verdict, a rejected credential, the agent's exit — waits for a
+	// connection to carry it. Buffered so a producer never blocks on a
+	// connection that isn't there yet, and shared by all of them so their
+	// events keep their order.
+	//
+	// Made before the socket below rather than beside the session, because the
+	// socket is one of those producers: the credential helper's erase report is
+	// answered by queueing an event here (see agentSocketCall).
+	events := make(chan []byte, pendingCap)
+
 	// The session RPC's sandbox end, built BEFORE the session so it is already
 	// listening when the chain's first git runs: the dispatcher serves the
 	// requests controld sends down and originates the ones this side needs, and
@@ -105,7 +116,7 @@ func main() {
 	var rpc *rpcDispatcher
 	if *dial != "" {
 		rpc = newRPCDispatcher()
-		startAgentSocket(context.Background(), agentSocketPath, rpc)
+		startAgentSocket(context.Background(), agentSocketPath, rpc, events)
 		// The workspace-inspection methods controld drives INTO this sandbox:
 		// the session diff and the bounded push/pull (files.go). Registered
 		// here, before the relay is serving, so a request arriving on the
@@ -130,12 +141,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	// events is where every control payload this sessiond originates — the
-	// setup verdict and the agent's exit — waits for a connection to carry it.
-	// Buffered so a watcher never blocks on a connection that isn't there
-	// yet, and shared by both producers so their events keep their order.
-	events := make(chan []byte, pendingCap)
 
 	go func() {
 		<-s.Exited()

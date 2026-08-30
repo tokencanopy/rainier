@@ -155,6 +155,42 @@ func TestAgentSocketDeadlineClosesAStalledClient(t *testing.T) {
 	}
 }
 
+// TestAgentSocketCallReportsARejectionLocally: the credential helper's erase
+// report is answered by sessiond itself — it becomes the `credential_rejected`
+// control event, the same one the clone stage's watcher emits and the only one
+// controld listens for — rather than travelling upstream as a request.
+//
+// The two halves that matter: nothing is sent to controld as an RPC (a
+// dispatcher with no connection would fail one, and this must succeed anyway),
+// and the event that comes out carries no payload at all.
+func TestAgentSocketCallReportsARejectionLocally(t *testing.T) {
+	d := newRPCDispatcher() // deliberately never brought online
+	events := make(chan []byte, pendingCap)
+
+	start := time.Now()
+	out, err := agentSocketCall(d, events)(credentialRejectedMethod, json.RawMessage(`{"ignored":1}`))
+	if err != nil {
+		t.Fatalf("reporting a rejection with no upstream connection: %v", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("answer = %s, want none — the report is fire-and-forget", out)
+	}
+	// It must not have waited for a connection either: git is holding this
+	// call open, and there is nothing upstream to wait for.
+	if took := time.Since(start); took > agentSocketConnWait {
+		t.Errorf("the report took %s; it waited for a connection it never needed", took)
+	}
+
+	select {
+	case p := <-events:
+		if string(p) != `{"kind":"credential_rejected"}` {
+			t.Fatalf("event = %s, want the bare credential_rejected event", p)
+		}
+	default:
+		t.Fatal("no control event was queued; a token revoked mid-session would go unnoticed")
+	}
+}
+
 // TestListenAgentSocketReplacesAStaleSocket: /workspace persists across a cold
 // park, so a previous boot's socket file is normally still sitting there. Bind
 // would fail on it ("address already in use") and the credential helper would

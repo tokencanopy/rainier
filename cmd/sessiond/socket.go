@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"rainier/internal/relay"
 )
 
 // The agent socket is how a process INSIDE the sandbox reaches sessiond: the
@@ -168,14 +170,18 @@ func (a *agentSocket) serveConn(c net.Conn) {
 // session that is otherwise perfectly serviceable over a socket nobody may ask
 // for is the wrong trade — the sessions that DO need it fail loudly at their
 // first git operation, with this log line waiting in the terminal.
-func startAgentSocket(ctx context.Context, path string, d *rpcDispatcher) {
+//
+// events is the same control queue the stage watcher offers to: one of the
+// methods served here is answered locally by producing an event rather than by
+// asking controld anything (see agentSocketCall).
+func startAgentSocket(ctx context.Context, path string, d *rpcDispatcher, events chan<- []byte) {
 	ln, err := listenAgentSocket(path)
 	if err != nil {
 		log.Printf("agent socket: %v; in-sandbox RPC is unavailable for this boot", err)
 		return
 	}
 	log.Printf("agent socket listening on %s", path)
-	a := &agentSocket{deadline: agentSocketDeadline, call: agentSocketCall(d)}
+	a := &agentSocket{deadline: agentSocketDeadline, call: agentSocketCall(d, events)}
 	go a.serve(ctx, ln)
 }
 
@@ -196,8 +202,30 @@ func startAgentSocket(ctx context.Context, path string, d *rpcDispatcher) {
 // budget afterwards. The helper sizes its own deadline to cover both (see
 // credentialHelperTimeout), which is what keeps a real refusal — the one that
 // names the action to run — from being replaced by a local timeout.
-func agentSocketCall(d *rpcDispatcher) func(string, json.RawMessage) (json.RawMessage, error) {
+//
+// One method is answered HERE rather than upstream. credentialRejectedMethod
+// is the credential helper reporting that git rejected the token it was given
+// (helper.go's "erase" arm), and what controld already listens for is not a
+// request but the `credential_rejected` control EVENT — the same one the clone
+// stage's watcher emits. So the socket call becomes that event and returns at
+// once: it is fire-and-forget in both directions, the caller is a git process
+// that has already failed and is only waiting to exit, and an event queues
+// across a reconnect where a request would not (see rpcConn).
+//
+// It carries no payload, and must not: the erase request the helper read
+// carries the rejected token, and WHOSE credential this is is controld's own
+// answer from the session row.
+//
+// Any process in the sandbox can make this call, which costs nothing worth
+// guarding: the worst it can do is make its own owner's credential read
+// needs_refresh until they run `rainier login --refresh github`, and the same
+// process could already ask for a mint.
+func agentSocketCall(d *rpcDispatcher, events chan<- []byte) func(string, json.RawMessage) (json.RawMessage, error) {
 	return func(method string, payload json.RawMessage) (json.RawMessage, error) {
+		if method == credentialRejectedMethod {
+			offerControl(events, controlPayload(relay.ControlEvent{Kind: "credential_rejected"}))
+			return nil, nil
+		}
 		d.waitConn(agentSocketConnWait)
 		return d.Call(method, payload, agentSocketCallTimeout)
 	}

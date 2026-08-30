@@ -523,6 +523,15 @@ func stageTimedOutTail(stage string, d time.Duration) string {
 // what turns the NEXT operation's opaque 403 into a named action. A false
 // positive costs one `rainier login --refresh github`; a false negative costs a
 // user who never finds out why their session cannot clone.
+//
+// It is one of TWO detectors, and the asymmetry between them is deliberate. The
+// clone stage has git's OUTPUT and nothing else — it runs before any agent
+// exists, and its verdict is a rc file plus a log tail — so it matches on the
+// output's shape, here. The AGENT's git has no watcher at all, but it does talk
+// to the credential helper, so that path uses git's own protocol signal instead
+// (an "erase" after an authentication failure, see helper.go). Different
+// evidence, same conclusion, and both emit the same `credential_rejected`
+// control event.
 var authRejectedRe = regexp.MustCompile(`(?i)authentication failed|\b401\b|\b403\b`)
 
 func authRejected(tail string) bool { return authRejectedRe.MatchString(tail) }
