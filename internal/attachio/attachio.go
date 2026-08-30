@@ -379,6 +379,12 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 				stdoutMu.Unlock()
 				finish(Outcome{Reason: Exited, LastSeq: lastSeq.Load(), ExitCode: m.ExitCode}, nil)
 				return
+			default:
+				if !claim() {
+					return
+				}
+				finish(Outcome{LastSeq: lastSeq.Load()}, errors.New("terminal protocol: unsupported server message type"))
+				return
 			}
 		}
 	}()
@@ -439,6 +445,9 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 }
 
 func retryableWebSocketReadError(err error) bool {
+	if errors.Is(err, websocket.ErrMessageTooBig) {
+		return false
+	}
 	var syntaxErr *json.SyntaxError
 	var typeErr *json.UnmarshalTypeError
 	if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {

@@ -521,9 +521,46 @@ func TestRunRejectsPermanentWebSocketClose(t *testing.T) {
 	}
 	defer stdinR.Close()
 	defer stdinW.Close()
-	_, err = runWithIO(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 0, stdinR, io.Discard)
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	_, err = runWithIO(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 0, stdinR, io.Discard)
 	if err == nil || websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
 		t.Fatalf("runWithIO error = %v, want policy close", err)
+	}
+}
+
+func TestOversizedFrameIsNotRetryable(t *testing.T) {
+	if retryableWebSocketReadError(websocket.ErrMessageTooBig) {
+		t.Fatal("websocket.ErrMessageTooBig must be a permanent local protocol error")
+	}
+}
+
+func TestRunRejectsUnknownServerMessage(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "synthetic-unknown"})
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	_, err = runWithIO(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 0, stdinR, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "unsupported server message type") {
+		t.Fatalf("runWithIO error = %v, want permanent unknown-message error", err)
 	}
 }
 
