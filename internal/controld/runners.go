@@ -72,12 +72,16 @@ const (
 	// deadByRunner is the error recorded when a runner reports a session
 	// dead.
 	deadByRunner = "runner reported dead"
-	// setupFailedPrefix is what a failed setup script reads as in a session's
-	// error column. runnerd's Detail is already a composed sentence — "rc N:
-	// <tail of the script's output>", with rc -1 for the timeout kill — so
-	// controld prefixes it and never parses the rc back out; how a setup
-	// failure is described is the runner's half of the contract.
-	setupFailedPrefix = "setup failed: "
+	// setupStage is the boot stage Plan 4's `setup_failed` event names, and
+	// the stage a `stage_failed` that names none is read as. A session's boot
+	// is a chain — setup, then clone, then init (cmd/sessiond/gitchain.go) —
+	// and every stage composes its failure the same way; see stageFailure.
+	setupStage = "setup"
+	// unnamedStage stands in when a stage_failed's detail carries no stage in
+	// front of it, which only a sender that is not following the contract can
+	// produce. The session behind it really has stopped booting, so it still
+	// fails — under a name that claims nothing about which stage it was.
+	unnamedStage = "boot"
 	// snapshotRefHashLen is how much of an environment's setup hash goes into
 	// its snapshot ref: 12 hex characters, enough that no fleet collides and
 	// short enough to read in a `docker images` listing (design §4.3).
@@ -358,12 +362,12 @@ func (s *Server) touchRunner(ctx context.Context, rc *runnerConn, m rwire.FromRu
 //
 // A runner may only report on sessions the store places on it, or on ones it
 // places nowhere yet (a "running" event can outrun the create's own
-// queued→creating transition; "dead" and the two setup outcomes tighten that
-// to an exact match — see placedExactlyOn). Without that guard the fleet-wide
-// runner token would let any runner drive any session to a terminal state,
-// and the stale holder of a duplicate — the case reconcileUnplaced destroys —
-// could mark a session dead that has since been re-placed and is running fine
-// somewhere else.
+// queued→creating transition; every other arm tightens that to an exact match
+// — see placedExactlyOn). Without that guard the fleet-wide runner token would
+// let any runner drive any session to a terminal state, and the stale holder
+// of a duplicate — the case reconcileUnplaced destroys — could mark a session
+// dead that has since been re-placed and is running fine somewhere else, or
+// (since Plan 5) flip the credential of a user whose work it does not hold.
 func (s *Server) applyEvent(ctx context.Context, runner string, m rwire.FromRunner) {
 	if m.Session == "" {
 		log.Printf("controld: runner %s: event with no session", runner)
@@ -405,12 +409,32 @@ func (s *Server) applyEvent(ctx context.Context, runner string, m rwire.FromRunn
 		if !placedExactlyOn(row, runner, m.State) {
 			return
 		}
-		// m.Detail is runnerd's composed sentence, prefixed and never parsed
-		// (see setupFailedPrefix). It lands in the row's error column, which
-		// the API hands straight back to the caller.
-		reason := setupFailedPrefix + m.Detail
-		s.transitionQuiet(ctx, m.Session, setupFailedFrom, StateFailed, TransitionOpts{Error: &reason})
-		s.wakeScheduler() // a failed session gives its slot back
+		// Plan 4's name for what is now one stage among three, and one that
+		// stays accepted forever: sessiond ships INSIDE the session image
+		// while runnerd runs on the host, so a session whose image predates
+		// the boot chain still reports its setup failure under this name (and
+		// today's sessiond still SENDS it for the setup stage, so that a Plan
+		// 4 runnerd in the other direction keeps working too). m.Detail is
+		// already the composed "rc N: <tail>" with no stage in front, so it
+		// goes straight to the stage arm as the stage it always meant.
+		s.failStage(ctx, m.Session, setupStage, m.Detail)
+	case "stage_failed":
+		if !placedExactlyOn(row, runner, m.State) {
+			return
+		}
+		// One event for every stage of the boot chain. The stage rides at the
+		// FRONT of the detail because an rwire event has exactly one free-text
+		// field: "clone: rc 128: fatal: Authentication failed" splits at the
+		// first ": " into the stage and the sentence runnerd composed, which
+		// is never parsed further — how a stage failure is described is the
+		// runner's half of the contract.
+		stage, rest, ok := strings.Cut(m.Detail, ": ")
+		if !ok {
+			stage, rest = unnamedStage, m.Detail
+			log.Printf("controld: runner %s: stage_failed for %s named no stage (%q)",
+				runner, row.ID, clip(m.Detail))
+		}
+		s.failStage(ctx, m.Session, stage, rest)
 	case "setup_done":
 		if !placedExactlyOn(row, runner, m.State) {
 			return
@@ -441,9 +465,64 @@ func (s *Server) applyEvent(ctx context.Context, runner string, m rwire.FromRunn
 		if err := s.st.SetChildExitCode(ctx, m.Session, code); err != nil {
 			log.Printf("controld: recording child exit code %d for %s: %v", code, row.ID, err)
 		}
+	case "credential_rejected":
+		if !placedExactlyOn(row, runner, m.State) {
+			return
+		}
+		// A git operation inside the sandbox was refused by GitHub. The vault
+		// mints OPTIMISTICALLY — no GitHub round-trip per mint (design §4.2) —
+		// so an observed refusal is the only signal a stored token has been
+		// revoked, and this is where the fleet acts on it: the credential
+		// flips to needs_refresh, so the next mint refuses with the named
+		// action instead of handing out a value known not to work.
+		//
+		// The event carries nothing, deliberately: WHOSE credential it was is
+		// the row's own answer, and a token — or anything derived from one —
+		// has no business on this channel. Reading the owner here rather than
+		// trusting a field is also what makes the placement guard above worth
+		// having: a runner can only ever reject the credential of a user whose
+		// session it is actually holding.
+		//
+		// No transition and no scheduler wake: the git operation failed, the
+		// session did not. It is still running, still attachable, still
+		// holding its slot.
+		if row.OwnerID == "" {
+			log.Printf("controld: runner %s: credential_rejected for %s, which has no owner; ignoring", runner, row.ID)
+			return
+		}
+		s.rejectCredential(ctx, row.OwnerID, githubProvider)
 	default:
 		log.Printf("controld: runner %s: unknown event state %q for %s", runner, clip(m.State), clip(m.Session))
 	}
+}
+
+// failStage fails a session whose boot chain stopped at stage, recording the
+// sentence a human reads in `rainier ls`. Both failure events land here: the
+// legacy `setup_failed` with its implied stage, and `stage_failed` with the
+// one it names.
+//
+// A failed stage gives the runner's slot back, so the scheduler is woken —
+// the same reason the setup arm has always woken it.
+func (s *Server) failStage(ctx context.Context, id, stage, detail string) {
+	reason := stageFailure(stage, detail)
+	s.transitionQuiet(ctx, id, setupFailedFrom, StateFailed, TransitionOpts{Error: &reason})
+	s.wakeScheduler()
+}
+
+// stageFailure composes what a failed boot stage reads as in a session's
+// error column: "<stage> failed: rc N: <tail of the output>". controld writes
+// the verdict, the runner supplies the evidence — front-loading the rc is what
+// keeps the two halves legible as one sentence — and nothing here parses the
+// rc back out.
+//
+// The stage is clipped because it is runner-supplied text being promoted to
+// the first word of controld's own sentence; every stage the contract defines
+// (setup, clone, init) passes through untouched.
+func stageFailure(stage, detail string) string {
+	if detail == "" {
+		return clip(stage) + " failed"
+	}
+	return clip(stage) + " failed: " + detail
 }
 
 // placedExactlyOn reports whether the store places row on the runner now
@@ -451,12 +530,13 @@ func (s *Server) applyEvent(ctx context.Context, runner string, m rwire.FromRunn
 //
 // applyEvent's own guard is deliberately looser — it accepts a row the store
 // places nowhere, because a "running" event can outrun the create's own
-// queued→creating transition. The events that END a session (dead,
-// setup_failed) or publish a fleet-wide fact (setup_done) need the exact
-// match instead: an unplaced row is one a requeue cleared and the scheduler
-// may have re-placed elsewhere, so a stale holder must not be able to kill
-// the live copy, nor to have its own container's image published as an
-// environment's cache.
+// queued→creating transition. The events that END a session (dead, a failed
+// boot stage), publish a fleet-wide fact (setup_done), or act on the OWNER's
+// behalf (credential_rejected) need the exact match instead: an unplaced row
+// is one a requeue cleared and the scheduler may have re-placed elsewhere, so
+// a stale holder must not be able to kill the live copy, to have its own
+// container's image published as an environment's cache, or to invalidate a
+// credential for work it is no longer running.
 func placedExactlyOn(row Session, runner, state string) bool {
 	if row.Runner == runner {
 		return true

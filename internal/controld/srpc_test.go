@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"strings"
 	"sync"
 	"testing"
@@ -50,6 +51,15 @@ func (f *fakeRunner) answerRPC(t *testing.T, cmd rwire.ToRunner, ok bool, payloa
 	t.Helper()
 	f.write(t, rwire.FromRunner{Type: "session_req", Session: cmd.Session,
 		RPC: &rwire.RPCEnvelope{ID: cmd.RPC.ID, Method: "resp", OK: ok, Payload: rawOrNil(payload)}})
+}
+
+// sandboxSessionFor is sandboxSession for a session with an OWNER: the mint
+// reads whose credential to unseal off the row, so the tests that drive one
+// have to say who that is.
+func sandboxSessionFor(t *testing.T, st Store, id, runner, userID string) string {
+	t.Helper()
+	seedSession(t, st, Session{ID: id, State: StateRunning, Runner: runner, OwnerID: userID})
+	return id
 }
 
 // sandboxRequest scripts a sandbox-initiated request arriving upward — the
@@ -385,6 +395,234 @@ func TestSandboxRequestFromTheWrongRunnerIsRefused(t *testing.T) {
 	cmd = nextSessionRPC(t, f)
 	if cmd.RPC.ID != 6 || cmd.RPC.OK {
 		t.Fatalf("answer = %+v, want an ok:false resp for id 6", cmd.RPC)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// sandbox-initiated: mint_git_credential
+// ---------------------------------------------------------------------------
+
+// rpcAnswer reads one answer envelope's two mutually exclusive bodies: the
+// {"token": …} a success carries, and the {"error": …} a refusal does.
+func rpcAnswer(t *testing.T, env *rwire.RPCEnvelope) (token, errText string) {
+	t.Helper()
+	var body struct {
+		Token string `json:"token"`
+		Error string `json:"error"`
+	}
+	if len(env.Payload) > 0 {
+		if err := json.Unmarshal(env.Payload, &body); err != nil {
+			t.Fatalf("decoding the answer payload %s: %v", env.Payload, err)
+		}
+	}
+	return body.Token, body.Error
+}
+
+// TestMintGitCredentialAnswersTheSandbox is the credential loop's controld
+// half end to end: a sandbox asks, the row says who owns it, the vault
+// unseals that user's token, and it goes back down in the exact shape the
+// in-sandbox helper reads (cmd/sessiond/helper.go: {"token": …} and nothing
+// else).
+func TestMintGitCredentialAnswersTheSandbox(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
+	u := seedVaultUser(t, st, 5150, "alice")
+	stale := seedGitHubCredential(t, s, st, u.ID)
+	id := sandboxSessionFor(t, st, "sess_mint_ok", "vm1", u.ID)
+
+	f.sandboxRequest(t, id, 11, "mint_git_credential", `{"host":"github.com"}`)
+
+	cmd := nextSessionRPC(t, f)
+	if cmd.Session != id {
+		t.Fatalf("answer routed to session %q, want %q", cmd.Session, id)
+	}
+	if cmd.RPC.ID != 11 || cmd.RPC.Method != "resp" {
+		t.Fatalf("answer = id %d method %q, want id 11 method \"resp\"", cmd.RPC.ID, cmd.RPC.Method)
+	}
+	if !cmd.RPC.OK {
+		_, errText := rpcAnswer(t, cmd.RPC)
+		t.Fatalf("mint refused with %q, want the token", errText)
+	}
+	// Pinned as bytes, not as a decode: the helper on the far side reads this
+	// one key, so the wire shape is the contract, not merely a struct that
+	// happens to round-trip.
+	if got, want := string(cmd.RPC.Payload), `{"token":"`+vaultToken+`"}`; got != want {
+		t.Fatalf("payload = %s, want %s", got, want)
+	}
+
+	// A mint is a USE: last_used_at moves so `rainier creds` can show it, and
+	// the row stays valid — nothing about handing a token out is a rejection.
+	c := getCredential(t, st, u.ID)
+	if !c.LastUsedAt.After(stale) {
+		t.Fatalf("last_used_at = %s, want it moved past the seeded %s", c.LastUsedAt, stale)
+	}
+	if c.Status != CredentialValid {
+		t.Fatalf("status after a mint = %q, want %q", c.Status, CredentialValid)
+	}
+}
+
+// TestMintGitCredentialRefusesWithTheNamedAction: both vault refusals reach
+// the sandbox as ok:false carrying the sentinel's own words. That text is not
+// decoration — sessiond hands it to git, git prints it, and the user reads the
+// exact command that fixes their session. Asserted verbatim for that reason.
+func TestMintGitCredentialRefusesWithTheNamedAction(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed func(t *testing.T, s *Server, st Store, userID string)
+		want string
+	}{
+		{
+			name: "a credential something has already rejected",
+			seed: func(t *testing.T, s *Server, st Store, userID string) {
+				seedGitHubCredential(t, s, st, userID)
+				s.rejectCredential(context.Background(), userID, githubProvider)
+			},
+			want: ErrCredentialNeedsRefresh.Error(),
+		},
+		{
+			name: "no credential at all",
+			seed: func(t *testing.T, s *Server, st Store, userID string) {},
+			want: ErrCredentialMissing.Error(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, st, ts := newTestControld(t)
+			f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
+			u := seedVaultUser(t, st, 5151, "alice")
+			tc.seed(t, s, st, u.ID)
+			id := sandboxSessionFor(t, st, "sess_mint_refused", "vm1", u.ID)
+
+			f.sandboxRequest(t, id, 12, "mint_git_credential", "")
+
+			cmd := nextSessionRPC(t, f)
+			if cmd.RPC.ID != 12 || cmd.RPC.OK {
+				t.Fatalf("answer = %+v, want an ok:false resp for id 12", cmd.RPC)
+			}
+			token, errText := rpcAnswer(t, cmd.RPC)
+			if token != "" {
+				t.Fatal("a refusal carried a token")
+			}
+			if errText != tc.want {
+				t.Fatalf("error = %q, want the sentinel's own words %q", errText, tc.want)
+			}
+		})
+	}
+}
+
+// TestCredentialRejectedMakesTheNextMintRefuse is the whole lazy-revocation
+// loop in one test: a token is minted, GitHub refuses it, the sandbox says so,
+// and the NEXT mint refuses with the named action instead of handing out a
+// value that is known not to work. Without the flip, every git operation in
+// every session that user owns keeps failing with GitHub's own opaque wording.
+func TestCredentialRejectedMakesTheNextMintRefuse(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
+	u := seedVaultUser(t, st, 5152, "alice")
+	seedGitHubCredential(t, s, st, u.ID)
+	id := sandboxSessionFor(t, st, "sess_mint_then_reject", "vm1", u.ID)
+
+	f.sandboxRequest(t, id, 21, "mint_git_credential", "")
+	if cmd := nextSessionRPC(t, f); !cmd.RPC.OK {
+		t.Fatalf("the first mint was refused: %s", cmd.RPC.Payload)
+	}
+
+	f.event(t, id, "credential_rejected")
+	wantCredentialStatus(t, st, u.ID, CredentialNeedsRefresh)
+
+	f.sandboxRequest(t, id, 22, "mint_git_credential", "")
+	cmd := nextSessionRPC(t, f)
+	if cmd.RPC.ID != 22 || cmd.RPC.OK {
+		t.Fatalf("the second mint = %+v, want an ok:false resp for id 22", cmd.RPC)
+	}
+	token, errText := rpcAnswer(t, cmd.RPC)
+	if token != "" {
+		t.Fatal("a rejected credential was minted anyway")
+	}
+	if errText != ErrCredentialNeedsRefresh.Error() {
+		t.Fatalf("error = %q, want %q", errText, ErrCredentialNeedsRefresh.Error())
+	}
+}
+
+// TestMintForASessionWithNoOwnerIsRefused: the owner is the whole authority
+// the mint acts with, so a row that names none must produce a refusal rather
+// than a lookup for the empty user — which would otherwise be one accidental
+// store row away from handing a sandbox somebody else's credential.
+func TestMintForASessionWithNoOwnerIsRefused(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
+	// Written straight through the store: seedSession supplies an owner, and
+	// the row this test needs is the one nothing in the API can produce.
+	if _, err := st.CreateSession(context.Background(),
+		Session{ID: "sess_ownerless", State: StateRunning, Runner: "vm1"}); err != nil {
+		t.Fatalf("seeding an ownerless session: %v", err)
+	}
+
+	f.sandboxRequest(t, "sess_ownerless", 31, "mint_git_credential", "")
+
+	cmd := nextSessionRPC(t, f)
+	if cmd.RPC.ID != 31 || cmd.RPC.OK {
+		t.Fatalf("answer = %+v, want an ok:false resp for id 31", cmd.RPC)
+	}
+}
+
+// syncLog is a log sink a test can read while the connection goroutines are
+// still writing to it.
+type syncLog struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *syncLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *syncLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// captureLogs redirects the standard logger for the duration of one test.
+func captureLogs(t *testing.T) *syncLog {
+	t.Helper()
+	sink := &syncLog{}
+	prev := log.Writer()
+	log.SetOutput(sink)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	return sink
+}
+
+// TestMintGitCredentialNeverLogsTheToken holds the plan's hygiene rule where
+// it is easiest to break: a minted token may appear in the RPC response
+// payload and NOWHERE else. controld's logs are the fleet's most-copied
+// artifact — pasted into issues, shipped to an aggregator — and a token that
+// reaches one has escaped the vault for good.
+//
+// It drives every path that has a token in scope: the success, the failure
+// that follows a rejection, and the rejection itself.
+func TestMintGitCredentialNeverLogsTheToken(t *testing.T) {
+	sink := captureLogs(t)
+	s, st, ts := newTestControld(t)
+	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
+	u := seedVaultUser(t, st, 5153, "alice")
+	seedGitHubCredential(t, s, st, u.ID)
+	id := sandboxSessionFor(t, st, "sess_mint_quiet", "vm1", u.ID)
+
+	f.sandboxRequest(t, id, 41, "mint_git_credential", "")
+	if cmd := nextSessionRPC(t, f); !cmd.RPC.OK {
+		t.Fatalf("the mint was refused: %s", cmd.RPC.Payload)
+	}
+	f.event(t, id, "credential_rejected")
+	wantCredentialStatus(t, st, u.ID, CredentialNeedsRefresh)
+	f.sandboxRequest(t, id, 42, "mint_git_credential", "")
+	if cmd := nextSessionRPC(t, f); cmd.RPC.OK {
+		t.Fatal("the mint after a rejection succeeded")
+	}
+
+	if got := sink.String(); strings.Contains(got, vaultToken) {
+		t.Fatalf("the minted token reached the log:\n%s", got)
 	}
 }
 

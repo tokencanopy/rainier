@@ -1208,6 +1208,141 @@ func TestSetupFailedFailsTheSession(t *testing.T) {
 	}
 }
 
+// TestStageFailedFailsTheSession pins the generalization of the arm above: a
+// session's boot is a CHAIN of stages (setup, then clone, then init) and any
+// of them can be the one that fails. runnerd front-loads the stage into the
+// one free-text field an event has ("clone: rc 128: ..."), controld reads it
+// back off the front and writes the same sentence the setup stage has always
+// produced.
+func TestStageFailedFailsTheSession(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		from   SessionState
+		detail string
+		want   string
+	}{
+		{
+			name:   "a clone that could not authenticate",
+			from:   StateCreating,
+			detail: "clone: rc 128: fatal: Authentication failed for 'https://github.com/acme/app.test/'",
+			want:   "clone failed: rc 128: fatal: Authentication failed for 'https://github.com/acme/app.test/'",
+		},
+		{
+			// The registration `running` event can outrun the stage's rc
+			// write, exactly as it can for setup, so that from-state is
+			// accepted too (see setupFailedFrom).
+			name:   "an init that was killed at its timeout",
+			from:   StateRunning,
+			detail: "init: rc -1: init timed out after 300s",
+			want:   "init failed: rc -1: init timed out after 300s",
+		},
+		{
+			// The same failure the legacy `setup_failed` name carries, under
+			// the new one: both spellings must compose the identical sentence,
+			// because which one a session sends depends only on how old the
+			// sessiond inside its image is.
+			name:   "the setup stage under the new name",
+			from:   StateCreating,
+			detail: "setup: rc 7: boom",
+			want:   "setup failed: rc 7: boom",
+		},
+		{
+			// A detail that names no stage at all can only come from a sender
+			// that is not following the contract — but the session behind it
+			// really has stopped booting, and dropping the event would leave
+			// the row `creating` forever. It fails under a stage name that
+			// claims nothing.
+			name:   "a detail with no stage in front of it",
+			from:   StateCreating,
+			detail: "rc 3",
+			want:   "boot failed: rc 3",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, st, ts := newTestControld(t)
+			f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+			seedSession(t, st, Session{ID: "sess_staged", State: tc.from, Runner: "vm1"})
+
+			f.eventDetail(t, "sess_staged", "stage_failed", tc.detail)
+
+			got := wantState(t, st, "sess_staged", StateFailed)
+			if got.Error != tc.want {
+				t.Fatalf("error = %q, want %q", got.Error, tc.want)
+			}
+		})
+	}
+}
+
+// TestCredentialRejectedFlipsTheStoredCredential pins the lazy revocation
+// arm. The vault mints optimistically — no GitHub round-trip per mint — so a
+// git operation that GitHub refused is the ONLY signal a stored token has
+// been revoked, and this event is how that signal gets out of the sandbox.
+//
+// The event carries nothing at all: controld knows whose credential it minted
+// for this session, because the session row says who owns it.
+func TestCredentialRejectedFlipsTheStoredCredential(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+	u := seedVaultUser(t, st, 8801, "alice")
+	seedGitHubCredential(t, s, st, u.ID)
+	seedSession(t, st, Session{ID: "sess_rejected", State: StateRunning, Runner: "vm1", OwnerID: u.ID})
+
+	f.event(t, "sess_rejected", "credential_rejected")
+
+	wantCredentialStatus(t, st, u.ID, CredentialNeedsRefresh)
+	// A rejection says nothing about the SESSION: the git operation failed,
+	// the container did not. It keeps running (and its slot).
+	if got := getSession(t, st, "sess_rejected"); got.State != StateRunning {
+		t.Fatalf("session state = %q, want it left running — a refused credential is not a dead session", got.State)
+	}
+}
+
+// TestCredentialEventsFromANonPlacedRunnerAreIgnored is the credential half
+// of the placement guard. The runner token is fleet-wide, so without it any
+// runner in the fleet could flip any user's credential to needs_refresh by
+// naming a session it does not hold — a one-message denial of service against
+// every git operation that user has running anywhere.
+func TestCredentialEventsFromANonPlacedRunnerAreIgnored(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+	u := seedVaultUser(t, st, 8802, "bob")
+	seedGitHubCredential(t, s, st, u.ID)
+
+	t.Run("credential_rejected for a session placed elsewhere", func(t *testing.T) {
+		seedSession(t, st, Session{ID: "sess_cred_elsewhere", State: StateRunning, Runner: "vm2", OwnerID: u.ID})
+
+		f.event(t, "sess_cred_elsewhere", "credential_rejected")
+		wantEventHandled(t, st, f, "sess_sync_cr")
+
+		if got := getCredential(t, st, u.ID); got.Status != CredentialValid {
+			t.Fatalf("credential status = %q, want it untouched (%q)", got.Status, CredentialValid)
+		}
+	})
+
+	t.Run("credential_rejected for an unplaced (requeued) row", func(t *testing.T) {
+		seedSession(t, st, Session{ID: "sess_cred_requeued", State: StateQueued, OwnerID: u.ID})
+
+		f.event(t, "sess_cred_requeued", "credential_rejected")
+		wantEventHandled(t, st, f, "sess_sync_cq")
+
+		if got := getCredential(t, st, u.ID); got.Status != CredentialValid {
+			t.Fatalf("credential status = %q, want it untouched (%q)", got.Status, CredentialValid)
+		}
+	})
+
+	t.Run("stage_failed for a session placed elsewhere", func(t *testing.T) {
+		seedSession(t, st, Session{ID: "sess_stage_elsewhere", State: StateRunning, Runner: "vm2", OwnerID: u.ID})
+
+		f.eventDetail(t, "sess_stage_elsewhere", "stage_failed", "clone: rc 128: nope")
+		wantEventHandled(t, st, f, "sess_sync_se")
+
+		got := getSession(t, st, "sess_stage_elsewhere")
+		if got.State != StateRunning || got.Runner != "vm2" {
+			t.Fatalf("row = %s on %q, want running on vm2 (untouched)", got.State, got.Runner)
+		}
+	})
+}
+
 // TestChildExitedRecordsTheExitCode pins the third event arm: the agent
 // process inside a session finished, and its exit status is the one fact
 // about a session that nothing else in the fleet can supply. It is an
