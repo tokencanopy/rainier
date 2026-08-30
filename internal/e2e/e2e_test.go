@@ -17,6 +17,7 @@
 //	TestSetupFailureLandsFailed   P4 §4.3's failure path (rc + tail reach the session's error)
 //	TestSecretsReachSpec          P4 criterion 4 (a secret is decrypted into the dispatched Spec)
 //	TestPlacementPinQueuesWithReason P4 criterion 5 (a pin queues visibly, then places)
+//	TestFullReplayReachesTheViewer P5 §4.7's rider (`attach --since 0` replays the whole log)
 //
 // Every scene builds its OWN stack from public surfaces only (controld.New/
 // Handler/Run/NewMemStore, runnerd.New/Handler/Recover/RunAgent,
@@ -48,6 +49,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/jackc/pgx/v5"
 
+	"rainier/internal/attachio"
 	"rainier/internal/cli"
 	"rainier/internal/controld"
 	"rainier/internal/controld/pgstore"
@@ -478,6 +480,59 @@ func (n *runnerNode) containers(t *testing.T) []string {
 type scriptedSessiond struct {
 	id   string
 	conn relay.Conn
+
+	// mu guards the scripted event log and the record of what every attach
+	// asked for; serve() runs on its own goroutine, and the scene reads both
+	// from the test's.
+	mu    sync.Mutex
+	log   [][]byte // scripted event log: entry i has sequence number i+1
+	opens []uint64 // the cursor of every FrameOpen served, in order
+}
+
+// script gives this sessiond an n-entry event log to replay — output events
+// the way a real session's would already be in its log by the time a viewer
+// asks for them. Entry i is "line-<i+1>\n", so a replay's order and
+// completeness are both checkable from the bytes alone.
+func (ss *scriptedSessiond) script(n int) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.log = make([][]byte, n)
+	for i := range ss.log {
+		ss.log[i] = []byte(fmt.Sprintf("line-%d\n", i+1))
+	}
+}
+
+// cursors returns the cursor every attach served so far arrived with — the
+// value that survived (or didn't) the trip from the client's query string
+// through controld's dial_attach, runnerd's hub, and relay's Frame.
+func (ss *scriptedSessiond) cursors() []uint64 {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return slices.Clone(ss.opens)
+}
+
+// openFrames is what an attach opens with, mirroring session.Attach's rule
+// (whose own tests pin the real one): the whole log for wire.SinceAll, the
+// entries after a resume cursor, and the snapshot for everything else —
+// including a cursor the log cannot answer.
+func (ss *scriptedSessiond) openFrames(since uint64) []wire.ServerMsg {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.opens = append(ss.opens, since)
+
+	last := uint64(len(ss.log))
+	from := since
+	if since == wire.SinceAll {
+		from = 0
+	}
+	if last == 0 || (since != wire.SinceAll && (since == 0 || since > last)) {
+		return []wire.ServerMsg{{Type: "snapshot", Seq: 1, Data: []byte(snapshotFor(ss.id))}}
+	}
+	out := make([]wire.ServerMsg, 0, last-from)
+	for i := from; i < last; i++ {
+		out = append(out, wire.ServerMsg{Type: "output", Seq: i + 1, Data: ss.log[i]})
+	}
+	return out
 }
 
 // snapshotFor is the snapshot text a session's scripted sessiond replays, so
@@ -516,7 +571,9 @@ func (ss *scriptedSessiond) serve() {
 		}
 		switch f.Type {
 		case relay.FrameOpen:
-			ss.send(ctx, f.AttachID, wire.ServerMsg{Type: "snapshot", Seq: 1, Data: []byte(snapshotFor(ss.id))})
+			for _, m := range ss.openFrames(f.Since) {
+				ss.send(ctx, f.AttachID, m)
+			}
 		case relay.FrameClient:
 			var m wire.ClientMsg
 			if json.Unmarshal(f.Payload, &m) != nil {
@@ -1430,6 +1487,77 @@ func TestCrashKeepsTheWorkspaceAndRmReclaimsIt(t *testing.T) {
 	})
 	if row := f.list()[created.ID]; row.State != "dead" {
 		t.Fatalf("session after the rm = %+v, want it still dead — reclaiming a volume is not a state change", row)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Scene 4b — Plan 5 rider: `attach --since 0` replays the whole log
+// ---------------------------------------------------------------------------
+
+// TestFullReplayReachesTheViewer is the plan's Step 1 scene for the `--since`
+// bug the Plan 3 overnight run found: three attempts at
+// `rainier attach <id> --since 0` rendered a screen snapshot and nothing
+// else, while `docker exec` into the container showed the event log intact and
+// contiguous, seq 1 → 756. Nothing was wrong with the log; the request never
+// arrived as the request that was typed.
+//
+// Two things had to be true for that, and this scene is the integration half
+// of both (the unit halves are attachio's TestRunDialsWithTheCursor and
+// session's TestSinceAllReplaysTheWholeLog):
+//
+//   - The cursor has to survive the trip. It crosses the attach query string,
+//     controld's dial_attach (rwire.Attach.Since), runnerd's hub, and
+//     relay.Frame.Since — which is `json:"s,omitempty"`, so a cursor of 0 is
+//     literally absent from that hop's bytes. This scene asserts the value
+//     the "container" was opened with, not just what came back.
+//   - `--since 0` has to mean the whole log, while a plain attach still means
+//     the current screen. They are opposite requests and the flag's zero
+//     value cannot tell them apart, so both halves are checked here in the
+//     spelling the CLI produces (attachio.Cursor).
+//
+// The sessiond here is scripted, so what it replays is this file's rule and
+// not sessiond's — mirroring it deliberately (openFrames), because what this
+// scene is qualified to prove is that the request reaches the container
+// intact and 50 frames make it back out to a viewer.
+func TestFullReplayReachesTheViewer(t *testing.T) {
+	f := newFleet(t)
+	f.addRunner("vm-a", 2)
+	f.waitRunner("vm-a", true, 30*time.Second)
+
+	created := f.create("replays")
+	f.waitSessions(60*time.Second, "the session to reach running", func(rows map[string]apiSession) bool {
+		return rows[created.ID].State == "running"
+	})
+
+	const events = 50
+	ss := f.sessiond(created.ID)
+	ss.script(events)
+
+	// A plain `rainier attach` (no --since) still opens on the screen: a
+	// viewer that asked for no history must not be handed a day of it.
+	plain := f.attach(created.ID, attachio.Cursor(false, 0))
+	plain.expect(snapshotFor(created.ID))
+	plain.close()
+
+	// `rainier attach --since 0`: every event, in order, first to last.
+	full := f.attach(created.ID, attachio.Cursor(true, 0))
+	for i := 1; i <= events; i++ {
+		m := full.read()
+		want := fmt.Sprintf("line-%d\n", i)
+		if m.Type != "output" || m.Seq != uint64(i) || string(m.Data) != want {
+			t.Fatalf("replayed frame %d = %+v (data %q), want an output frame seq=%d data=%q",
+				i, m, string(m.Data), i, want)
+		}
+	}
+	full.close()
+
+	// And the cursor the container was actually opened with is the one the
+	// CLI spelled — the assertion that would have caught the omitempty hop
+	// eating it, or controld dropping it out of dial_attach.
+	got := ss.cursors()
+	if len(got) != 2 || got[0] != 0 || got[1] != wire.SinceAll {
+		t.Fatalf("cursors the session was attached with = %v, want [0 %d] (plain attach, then --since 0)",
+			got, wire.SinceAll)
 	}
 }
 

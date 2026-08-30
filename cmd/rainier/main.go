@@ -25,6 +25,7 @@ import (
 
 	"rainier/internal/attachio"
 	"rainier/internal/cli"
+	"rainier/internal/wire"
 	"rainier/internal/xfer"
 )
 
@@ -110,6 +111,11 @@ new --env starts the session from an environment (by name or id): its image,
 setup script, egress and secrets. --image and --egress override the
 environment's own for that one session; everything else comes from it.
 
+attach opens on the session's current screen. --since 0 replays the whole
+event log instead — a failed setup's full output, or a day of scrollback —
+and --since N resumes after sequence number N, the number the disconnect
+line prints when an attach drops.
+
 login stores your GitHub token in the server's credential vault (sealed), so
 sessions can clone, pull and push as you. "creds" shows what's stored:
 provider, status, scopes and when it was last verified and used. A status of
@@ -137,10 +143,10 @@ they become environment variables inside your sessions.
 <id|name>: a "sess_" prefix is used as a session id directly. Anything else
 is resolved by name against your team's non-terminal sessions — names are
 unique only per owner, so two teammates can share one. If the name matches
-more than one session, a session this CLI has seen you create (cached from
-a prior "new") is preferred when it's the only one of the matches that's
-yours; otherwise the name is rejected as ambiguous and every matching
-session's id and owner are listed so you can pass the id explicitly.`)
+more than one session, your own is preferred when it's the only one of the
+matches that's yours (login records who you are); otherwise the name is
+rejected as ambiguous and every matching session's id and owner are listed
+so you can pass the id explicitly.`)
 }
 
 // ---------------------------------------------------------------------------
@@ -185,7 +191,12 @@ type snapshotResponse struct {
 	Ref string `json:"ref"`
 }
 
+// userView mirrors controld's own: the caller's identity, as returned by
+// both POST /v1/auth/github and GET /v1/me. ID is the caller's own user id —
+// the same string their sessions carry as owner_id, which is what makes
+// owner-preference possible (see resolveSessionID).
 type userView struct {
+	ID    string `json:"id"`
 	Login string `json:"login"`
 	Role  string `json:"role"`
 }
@@ -359,10 +370,19 @@ func runLogin(args []string) error {
 		return err
 	}
 
-	// Only ServerURL and Token are replaced: OwnerID is this CLI's own cache
-	// of who the caller is (see runNew), and a refresh of a GitHub credential
-	// is no reason to forget it.
+	// Login is where this CLI learns who it is. The identity in the exchange
+	// response is the same one GET /v1/me answers with — id, login, role —
+	// and its id is what resolveSessionID compares against a session's
+	// owner_id, so caching it here is what makes owner-preference work from
+	// the first command after a login rather than only after a `new`.
+	//
+	// An older controld that does not send an id leaves whatever is already
+	// cached alone: a refresh of a GitHub credential is no reason to forget
+	// who the caller is.
 	cfg.ServerURL, cfg.Token = serverURL, resp.Token
+	if resp.User.ID != "" {
+		cfg.OwnerID = resp.User.ID
+	}
 	if err := cli.Save(cfg); err != nil {
 		return fmt.Errorf("saving config: %w", err)
 	}
@@ -567,25 +587,16 @@ func runNew(args []string) error {
 	}
 	fmt.Println(resp.Session.ID)
 
-	// Best-effort cache of the caller's own owner_id: controld's
-	// client-facing API (POST /v1/auth/github, GET /v1/me) never exposes a
-	// user's own id, only their login and role, so a session this CLI just
-	// created — unambiguously the caller's own — is the only place it's
-	// ever learned. resolveSessionID uses it to break a name that matches
-	// more than one session (see its doc comment). A failure to persist it
-	// isn't fatal to `new` itself; it only means owner-preference isn't
-	// available yet on some future ambiguous lookup.
-	if resp.Session.OwnerID != "" && resp.Session.OwnerID != cfg.OwnerID {
-		cfg.OwnerID = resp.Session.OwnerID
-		if err := cli.Save(cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "rainier: warning: could not cache owner id: %v\n", err)
-		}
-	}
-
 	if *detach {
 		return nil
 	}
-	return attachWithRetry(c, cfg, resp.Session.ID, 0)
+	// The whole log, not a snapshot: `new`'s attach is "stream everything"
+	// (design §4.10/§9), and the interesting output — a setup script's, a
+	// clone's — starts before this socket can possibly be up. A session
+	// created seconds ago has a log measured in kilobytes, so replaying it
+	// from the first entry costs nothing and is the only way the user sees
+	// what happened before they got here.
+	return attachWithRetry(c, cfg, resp.Session.ID, wire.SinceAll)
 }
 
 // attachWithRetry is `new`'s "attach immediately and stream everything"
@@ -715,11 +726,14 @@ func formatAge(rfc3339 string) string {
 // attach
 // ---------------------------------------------------------------------------
 
+// runAttach attaches to a session's terminal. What the viewer opens with is
+// the --since flag's to decide, and "not passed" is one of its three answers
+// (attachio.Cursor owns the mapping): no flag paints the current screen,
+// `--since 0` replays the whole event log — the runbook's way to read a
+// failed setup's full output, and what the disconnect line's advice means
+// when it fires before the first frame — and `--since N` resumes after N.
 func runAttach(args []string) error {
-	fs := flag.NewFlagSet("attach", flag.ExitOnError)
-	since := fs.Uint64("since", 0, "resume from sequence number")
-	fs.Parse(reorderArgs(fs, args))
-	ref := requireRef(fs, "attach")
+	ref, cursor := attachFlags(args)
 
 	cfg, _, id, err := resolveClientAndID(ref)
 	if err != nil {
@@ -728,7 +742,20 @@ func runAttach(args []string) error {
 
 	wsURL := wsURLFor(cfg.ServerURL, id)
 	header := http.Header{"Authorization": {"Bearer " + cfg.Token}}
-	return attachio.Run(context.Background(), wsURL, header, *since)
+	return attachio.Run(context.Background(), wsURL, header, cursor)
+}
+
+// attachFlags parses `attach`'s arguments into the session ref and the
+// attach cursor. Split out of runAttach so the part with no network in it —
+// which of three requests `--since` spells, in either argument order — is
+// testable on its own; the flag-after-the-positional form is the one the
+// acceptance run reached for when the first attempt showed nothing, so it
+// gets pinned rather than assumed (reorderArgs is what makes it work).
+func attachFlags(args []string) (ref string, cursor uint64) {
+	fs := flag.NewFlagSet("attach", flag.ExitOnError)
+	since := fs.Uint64("since", 0, "resume from sequence number; 0 replays the whole event log (omit for the current screen)")
+	fs.Parse(reorderArgs(fs, args))
+	return requireRef(fs, "attach"), attachio.Cursor(passedFlags(fs)["since"], *since)
 }
 
 // ---------------------------------------------------------------------------
@@ -1679,13 +1706,12 @@ func resolveClientAndID(ref string) (cli.Config, *cli.Client, string, error) {
 //     otherwise refuse and list every match's id and owner so the caller
 //     can pass the id explicitly.
 //
-// myOwnerID is this CLI's best-effort cache of the caller's own owner_id
-// (cli.Config.OwnerID, populated by `rainier new` from its own create
-// response — see runNew). controld's client-facing API never exposes a
-// user's own id any other way (POST /v1/auth/github and GET /v1/me return
-// only login and role), so an empty myOwnerID (a fresh login that has
-// never created a session with this CLI) means owner-preference simply
-// isn't available yet: an ambiguous name always errors in that case.
+// myOwnerID is the caller's own user id, cached in cli.Config.OwnerID by
+// `rainier login` from the identity controld returns (the same one GET
+// /v1/me answers with). It is the same string a session row carries as
+// owner_id, which is the whole reason this comparison is possible. Empty
+// only for a config written before logins carried it — owner-preference is
+// then unavailable and an ambiguous name errors, exactly as it did.
 func resolveSessionID(c *cli.Client, myOwnerID, ref string) (string, error) {
 	if strings.HasPrefix(ref, "sess_") {
 		return ref, nil

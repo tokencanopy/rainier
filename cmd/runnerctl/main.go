@@ -41,12 +41,12 @@ func main() {
 		fmt.Println()
 	case "attach":
 		id := requireID(args, "attach")
-		// rattach's --url is a BASE it appends /attach?since=... to itself
-		// (see attachURL in cmd/rattach/main.go); passing it a URL that
-		// already has /attach?session=<id> on it would double up the path
-		// and mangle the session id into the since query string. Pass the
-		// bare ws://host:port base and the session id separately instead —
-		// rattach folds them into the same URL contract it uses talking to
+		// rattach's --url is a BASE it appends /attach (and the cursor, and
+		// the session) to itself — see attachio.AttachURL and Run; passing
+		// it a URL that already has /attach?session=<id> on it would double
+		// up the path and mangle the session id into the query string. Pass
+		// the bare ws://host:port base and the session id separately instead
+		// — rattach folds them into the same URL contract it uses talking to
 		// sessiond directly.
 		wsBase := strings.Replace(*base, "http", "ws", 1)
 		cmd := exec.Command("./bin/rattach", "--url", wsBase, "--session", id)

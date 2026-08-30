@@ -63,8 +63,8 @@ func TestConfigRoundTrip(t *testing.T) {
 	}
 }
 
-// TestConfigOwnerIDRoundTrips pins the field `rainier new` caches the
-// caller's own owner_id into (see cmd/rainier's resolveSessionID) — added
+// TestConfigOwnerIDRoundTrips pins the field `rainier login` caches the
+// caller's own user id into (see cmd/rainier's resolveSessionID) — added
 // alongside review round 1, finding 3's ambiguity handling.
 func TestConfigOwnerIDRoundTrips(t *testing.T) {
 	dir := t.TempDir()

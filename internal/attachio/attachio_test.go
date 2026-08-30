@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,14 +18,15 @@ import (
 	"rainier/internal/wire"
 )
 
-// TestAttachURL is moved verbatim from cmd/rattach/main_test.go's
-// TestAttachURL (unexported attachURL there) — same cases, now against the
-// exported AttachURL.
+// TestAttachURL is moved from cmd/rattach/main_test.go's TestAttachURL
+// (unexported attachURL there) — same cases, now against the exported
+// AttachURL, whose cursor argument moved into Run (see
+// TestRunDialsWithTheCursor).
 func TestAttachURL(t *testing.T) {
 	t.Run("session present", func(t *testing.T) {
-		got := AttachURL("ws://127.0.0.1:8080", 42, "sess-7")
-		if !strings.Contains(got, "since=42") {
-			t.Errorf("AttachURL(...) = %q, want it to contain since=42", got)
+		got := AttachURL("ws://127.0.0.1:8080", "sess-7")
+		if !strings.HasPrefix(got, "ws://127.0.0.1:8080/attach") {
+			t.Errorf("AttachURL(...) = %q, want the base's /attach path", got)
 		}
 		if !strings.Contains(got, "session=sess-7") {
 			t.Errorf("AttachURL(...) = %q, want it to contain session=sess-7", got)
@@ -32,21 +34,92 @@ func TestAttachURL(t *testing.T) {
 	})
 
 	t.Run("session present with characters needing escaping", func(t *testing.T) {
-		got := AttachURL("ws://127.0.0.1:8080", 0, "sess a/b")
+		got := AttachURL("ws://127.0.0.1:8080", "sess a/b")
 		if !strings.Contains(got, "session=sess+a%2Fb") {
 			t.Errorf("AttachURL(...) = %q, want an escaped session param", got)
 		}
 	})
 
 	t.Run("session empty", func(t *testing.T) {
-		got := AttachURL("ws://127.0.0.1:7070", 0, "")
-		if !strings.Contains(got, "since=0") {
-			t.Errorf("AttachURL(...) = %q, want it to contain since=0", got)
-		}
-		if strings.Contains(got, "session=") {
-			t.Errorf("AttachURL(...) = %q, want no session param when session is empty", got)
+		got := AttachURL("ws://127.0.0.1:7070", "")
+		if got != "ws://127.0.0.1:7070/attach" {
+			t.Errorf("AttachURL(...) = %q, want a bare /attach URL", got)
 		}
 	})
+}
+
+// TestCursor pins the one mapping both CLIs share: a `--since` flag that was
+// never typed is not the same request as `--since 0`, and the whole reported
+// bug lives in the gap between them.
+func TestCursor(t *testing.T) {
+	if got := Cursor(false, 0); got != 0 {
+		t.Errorf("Cursor(not given) = %d, want 0 (no cursor: snapshot then live)", got)
+	}
+	if got := Cursor(true, 0); got != wire.SinceAll {
+		t.Errorf("Cursor(--since 0) = %d, want wire.SinceAll (%d)", got, wire.SinceAll)
+	}
+	if got := Cursor(true, 19); got != 19 {
+		t.Errorf("Cursor(--since 19) = %d, want 19", got)
+	}
+	// A flag value that happens to equal the sentinel is still the sentinel;
+	// there is no cursor above it to confuse it with.
+	if got := Cursor(true, wire.SinceAll); got != wire.SinceAll {
+		t.Errorf("Cursor(--since SinceAll) = %d, want %d", got, wire.SinceAll)
+	}
+}
+
+// TestRunDialsWithTheCursor is the regression test for the bug the Plan 3
+// overnight run found on live infrastructure: `rainier attach <id> --since 0`
+// rendered a screen snapshot and nothing else, while the session's event log
+// was intact and contiguous on the server. Run accepted a `since` argument
+// and never put it anywhere — the URL it dialed carried no cursor at all, so
+// every `--since N` the CLI ever passed was dropped on the floor before it
+// left the client. (cmd/rattach was unaffected only because it happened to
+// spell the cursor into the URL itself.)
+//
+// The cursor is the one thing this test looks at: whatever URL a caller
+// hands Run, the URL Run actually dials must carry `since=<cursor>`.
+func TestRunDialsWithTheCursor(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		url   func(base string) string
+		since uint64
+		want  string
+	}{
+		{"resume cursor", func(b string) string { return b + "/v1/sessions/sess_1/attach" }, 7, "since=7"},
+		{"no cursor", func(b string) string { return b + "/v1/sessions/sess_1/attach" }, 0, "since=0"},
+		{"whole log", func(b string) string { return b + "/v1/sessions/sess_1/attach" },
+			wire.SinceAll, "since=" + strconv.FormatUint(wire.SinceAll, 10)},
+		// A URL that already carries a query (rattach's --session) must get
+		// the cursor appended, not a second '?' that swallows it.
+		{"url already has a query", func(b string) string { return b + "/attach?session=sess-7" }, 3, "since=3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			queries := make(chan string, 1)
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				select {
+				case queries <- r.URL.RawQuery:
+				default:
+				}
+				// Refuse the upgrade: the dial URL is the whole subject here,
+				// and a failed handshake gets Run back without any terminal
+				// I/O to stage.
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			defer ts.Close()
+
+			Run(context.Background(), tc.url("ws"+strings.TrimPrefix(ts.URL, "http")), nil, tc.since)
+
+			select {
+			case got := <-queries:
+				if !strings.Contains(got, tc.want) {
+					t.Fatalf("dialed query = %q, want it to contain %q", got, tc.want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Run never dialed the server")
+			}
+		})
+	}
 }
 
 // TestScanDetach pins the three cases the brief calls out: mid-buffer,
