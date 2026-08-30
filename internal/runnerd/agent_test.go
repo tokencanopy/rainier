@@ -739,6 +739,75 @@ func TestAgentCreateCarriesSetupAndEnvToTheDriver(t *testing.T) {
 	}
 }
 
+// TestAgentCreateCarriesReposInitAndAttribution pins the other half of the
+// create mapping: the repositories controld resolved for this session, the
+// per-boot init hook, and the git identity its commits are attributed to all
+// reach the driver unchanged. runnerd decides none of it — controld expanded
+// the environment's connectors and the owner's GitHub account into these
+// fields — so the only thing that can go wrong here is a field this hop
+// forgets to copy, which would produce a container that silently clones
+// nothing.
+func TestAgentCreateCarriesReposInitAndAttribution(t *testing.T) {
+	fd := newCreateTrackingFake(4)
+	rd := New(fd, "", "", "")
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1"})
+
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+
+	repos := []rwire.RepoSpec{
+		{Owner: "acme", Name: "app", BaseBranch: "main", SessionBranch: "rainier/work", Dir: "app"},
+		{Owner: "other", Name: "app", BaseBranch: "dev", SessionBranch: "rainier/work", Dir: "other__app"},
+	}
+	conn.send(t, rwire.ToRunner{Type: "create", ReqID: 1, Session: "sess_repo", Spec: &rwire.Spec{
+		Image: "img", Repos: repos,
+		Init: "make dev-server &", InitTimeoutSec: 120,
+		GitAuthorName: "alice", GitAuthorEmail: "42+alice@users.noreply.github.com",
+	}})
+	if res := conn.readMsg(t); !res.OK {
+		t.Fatalf("create result = %+v, want ok", res)
+	}
+
+	calls := fd.createCalls()
+	if len(calls) != 1 {
+		t.Fatalf("Create called %d times, want 1", len(calls))
+	}
+	got := calls[0]
+	want := []driver.RepoSpec{
+		{Owner: "acme", Name: "app", BaseBranch: "main", SessionBranch: "rainier/work", Dir: "app"},
+		{Owner: "other", Name: "app", BaseBranch: "dev", SessionBranch: "rainier/work", Dir: "other__app"},
+	}
+	if !reflect.DeepEqual(got.Repos, want) {
+		t.Errorf("Spec.Repos = %+v, want %+v", got.Repos, want)
+	}
+	if got.Init != "make dev-server &" || got.InitTimeoutSec != 120 {
+		t.Errorf("Spec init = %q/%d, want the dispatched hook and bound", got.Init, got.InitTimeoutSec)
+	}
+	if got.GitAuthorName != "alice" || got.GitAuthorEmail != "42+alice@users.noreply.github.com" {
+		t.Errorf("Spec attribution = %q/%q, want alice's", got.GitAuthorName, got.GitAuthorEmail)
+	}
+
+	// A create carrying none of it leaves all of it zero: a scratch session
+	// clones nothing and commits as nobody in particular.
+	conn.send(t, rwire.ToRunner{Type: "create", ReqID: 2, Session: "sess_bare",
+		Spec: &rwire.Spec{Image: "img"}})
+	if res := conn.readMsg(t); !res.OK {
+		t.Fatalf("create result = %+v, want ok", res)
+	}
+	calls = fd.createCalls()
+	if len(calls) != 2 {
+		t.Fatalf("Create called %d times, want 2", len(calls))
+	}
+	if bare := calls[1]; bare.Repos != nil || bare.Init != "" || bare.InitTimeoutSec != 0 ||
+		bare.GitAuthorName != "" || bare.GitAuthorEmail != "" {
+		t.Fatalf("Spec = %+v, want no repos, init or attribution", bare)
+	}
+}
+
 // TestAgentCreateWithoutSetupLeavesTheSpecEmpty: a session whose environment
 // was already snapshot-cached carries no setup at all (the image IS the
 // finished setup), and a spec that invented one would make every cached

@@ -611,6 +611,357 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// POST /v1/sessions repo resolution (design §4.3): an environment's github
+// connectors, or the session's own `repos`, become the RepoSpecs the create
+// dispatches — plus the git identity they commit as, the three GitHub hosts
+// they need to reach, and the credential gate that refuses a clone nobody can
+// authenticate. Same evidence as the environment rules above: the rwire.Spec
+// controld actually sent.
+// ---------------------------------------------------------------------------
+
+// repoTestToken is the GitHub token the repo-resolution fixture seals. It is
+// distinctive so "the response does not contain it" is a real assertion.
+const repoTestToken = "gho_repo_resolution_token"
+
+// githubConnectorJSON renders a github connector object the way a client
+// would have written it — the bytes the store keeps verbatim.
+func githubConnectorJSON(repo, baseBranch string) json.RawMessage {
+	if baseBranch == "" {
+		return json.RawMessage(fmt.Sprintf(`{"type":"github","repo":%q}`, repo))
+	}
+	return json.RawMessage(fmt.Sprintf(`{"type":"github","repo":%q,"base_branch":%q}`, repo, baseBranch))
+}
+
+// repoFleet is the repo tests' fixture: a controld with its scheduler
+// running, one connected runner to receive the create, and an owner who has
+// already logged in to GitHub.
+func repoFleet(t *testing.T) (*Server, Store, *httptest.Server, *fakeRunner, User, string) {
+	t.Helper()
+	s, st, ts := newTestControld(t)
+	f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+	startRun(t, s)
+	u, tok := loginUser(t, st, "alice", "member")
+	if err := s.storeGitHubCredential(context.Background(), u.ID, repoTestToken, "repo, read:user"); err != nil {
+		t.Fatalf("storeGitHubCredential: %v", err)
+	}
+	return s, st, ts, f, u, tok
+}
+
+// noreplyFor renders the GitHub noreply address commits are attributed to.
+func noreplyFor(u User) string {
+	return fmt.Sprintf("%d+%s@users.noreply.github.com", u.GitHubID, u.Login)
+}
+
+func TestCreateSessionResolvesRepos(t *testing.T) {
+	t.Run("a github connector becomes a RepoSpec, with attribution and the git egress", func(t *testing.T) {
+		_, st, ts, f, u, tok := repoFleet(t)
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
+			EgressAllow: []string{"pypi.org"},
+			Connectors: []Connector{
+				{Type: "github", Raw: githubConnectorJSON("acme/app", "")},
+				{Type: "github", Raw: githubConnectorJSON("acme/infra", "develop")},
+			}})
+
+		got := createWithEnv(t, ts, tok, map[string]any{"name": "work", "environment": "dev"})
+		spec := nextCreate(t, f).Spec
+
+		want := []rwire.RepoSpec{
+			{Owner: "acme", Name: "app", BaseBranch: "main", SessionBranch: "rainier/work", Dir: "app"},
+			{Owner: "acme", Name: "infra", BaseBranch: "develop", SessionBranch: "rainier/work", Dir: "infra"},
+		}
+		if !slices.Equal(spec.Repos, want) {
+			t.Errorf("spec.Repos =\n  %+v\nwant\n  %+v", spec.Repos, want)
+		}
+		// The human, not the fleet: a commit made in the sandbox has to show
+		// up as the person whose credential pushed it.
+		if spec.GitAuthorName != u.Login || spec.GitAuthorEmail != noreplyFor(u) {
+			t.Errorf("spec attribution = %q/%q, want %q/%q",
+				spec.GitAuthorName, spec.GitAuthorEmail, u.Login, noreplyFor(u))
+		}
+		// The three hosts a clone/push needs, appended to what the session
+		// already had — and recorded on the row, so the allowlist a session
+		// actually runs with is visible rather than implied.
+		wantEgress := []string{"pypi.org", "github.com", "codeload.github.com", "objects.githubusercontent.com"}
+		if !slices.Equal(spec.EgressAllow, wantEgress) {
+			t.Errorf("spec.EgressAllow = %v, want %v", spec.EgressAllow, wantEgress)
+		}
+		if row := getSession(t, st, got.ID); !slices.Equal(row.EgressAllow, wantEgress) {
+			t.Errorf("stored egress_allow = %v, want %v", row.EgressAllow, wantEgress)
+		}
+	})
+
+	t.Run("the git hosts are appended once, not duplicated", func(t *testing.T) {
+		_, st, ts, f, _, tok := repoFleet(t)
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
+			EgressAllow: []string{"github.com"},
+			Connectors:  []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "dup", "environment": "dev"})
+		want := []string{"github.com", "codeload.github.com", "objects.githubusercontent.com"}
+		if got := nextCreate(t, f).Spec.EgressAllow; !slices.Equal(got, want) {
+			t.Errorf("spec.EgressAllow = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a session repos override beats the environment's connectors", func(t *testing.T) {
+		_, st, ts, f, _, tok := repoFleet(t)
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
+			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "over", "environment": "dev",
+			"repos": []map[string]any{{"repo": "other/svc", "base_branch": "develop"}}})
+		want := []rwire.RepoSpec{
+			{Owner: "other", Name: "svc", BaseBranch: "develop", SessionBranch: "rainier/over", Dir: "svc"},
+		}
+		if got := nextCreate(t, f).Spec.Repos; !slices.Equal(got, want) {
+			t.Errorf("spec.Repos = %+v, want the session's own override %+v", got, want)
+		}
+	})
+
+	t.Run("an explicit empty repos array clones nothing", func(t *testing.T) {
+		_, st, ts, f, _, tok := repoFleet(t)
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", EgressAllow: []string{"pypi.org"},
+			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "bare", "environment": "dev", "repos": []any{}})
+		spec := nextCreate(t, f).Spec
+		if spec.Repos != nil {
+			t.Errorf("spec.Repos = %+v, want none — an explicit [] is scratch semantics", spec.Repos)
+		}
+		if spec.GitAuthorName != "" || spec.GitAuthorEmail != "" {
+			t.Errorf("spec attribution = %q/%q, want none for a session that clones nothing",
+				spec.GitAuthorName, spec.GitAuthorEmail)
+		}
+		if !slices.Equal(spec.EgressAllow, []string{"pypi.org"}) {
+			t.Errorf("spec.EgressAllow = %v, want the environment's untouched", spec.EgressAllow)
+		}
+	})
+
+	t.Run("a session with no name branches off its id", func(t *testing.T) {
+		_, st, ts, f, _, tok := repoFleet(t)
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
+			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
+
+		got := createWithEnv(t, ts, tok, map[string]any{"environment": "dev"})
+		wantBranch := "rainier/" + got.ID[len(got.ID)-12:]
+		spec := nextCreate(t, f).Spec
+		if len(spec.Repos) != 1 || spec.Repos[0].SessionBranch != wantBranch {
+			t.Fatalf("spec.Repos = %+v, want the branch %q", spec.Repos, wantBranch)
+		}
+	})
+
+	t.Run("two repos of the same name land in different directories", func(t *testing.T) {
+		_, st, ts, f, _, tok := repoFleet(t)
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
+			Connectors: []Connector{
+				{Type: "github", Raw: githubConnectorJSON("acme/app", "")},
+				{Type: "github", Raw: githubConnectorJSON("other/app", "")},
+			}})
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "multi", "environment": "dev"})
+		want := []rwire.RepoSpec{
+			{Owner: "acme", Name: "app", BaseBranch: "main", SessionBranch: "rainier/multi", Dir: "app"},
+			{Owner: "other", Name: "app", BaseBranch: "main", SessionBranch: "rainier/multi", Dir: "other__app"},
+		}
+		if got := nextCreate(t, f).Spec.Repos; !slices.Equal(got, want) {
+			t.Errorf("spec.Repos =\n  %+v\nwant\n  %+v", got, want)
+		}
+	})
+
+	t.Run("a scratch session may name its own repos", func(t *testing.T) {
+		_, st, ts, f, u, tok := repoFleet(t)
+
+		got := createWithEnv(t, ts, tok, map[string]any{"name": "solo", "image": "ubuntu:latest",
+			"repos": []map[string]any{{"repo": "acme/app"}}})
+		spec := nextCreate(t, f).Spec
+		want := []rwire.RepoSpec{
+			{Owner: "acme", Name: "app", BaseBranch: "main", SessionBranch: "rainier/solo", Dir: "app"},
+		}
+		if !slices.Equal(spec.Repos, want) {
+			t.Errorf("spec.Repos = %+v, want %+v", spec.Repos, want)
+		}
+		if spec.GitAuthorEmail != noreplyFor(u) {
+			t.Errorf("spec.GitAuthorEmail = %q, want %q", spec.GitAuthorEmail, noreplyFor(u))
+		}
+		wantEgress := []string{"github.com", "codeload.github.com", "objects.githubusercontent.com"}
+		if !slices.Equal(spec.EgressAllow, wantEgress) {
+			t.Errorf("spec.EgressAllow = %v, want %v", spec.EgressAllow, wantEgress)
+		}
+		if row := getSession(t, st, got.ID); !slices.Equal(row.EgressAllow, wantEgress) {
+			t.Errorf("stored egress_allow = %v, want %v", row.EgressAllow, wantEgress)
+		}
+	})
+
+	// The gate. A session that will clone needs a credential to clone WITH,
+	// and the create is where that can still be a fixable answer rather than a
+	// container that boots and immediately fails a stage.
+	t.Run("cloning with no github credential is 409 naming the login, before the row exists", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		alice, _ := loginUser(t, st, "alice", "member")
+		if err := s.storeGitHubCredential(context.Background(), alice.ID, repoTestToken, "repo"); err != nil {
+			t.Fatalf("storeGitHubCredential: %v", err)
+		}
+		_, bobTok := loginUser(t, st, "bob", "member")
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
+			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
+
+		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions", bobTok,
+			map[string]any{"name": "nocred", "environment": "dev"}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
+		}
+		e := decodeErrBody(t, raw)
+		if e.Error.Code != "conflict" {
+			t.Errorf("code = %q, want conflict", e.Error.Code)
+		}
+		if !strings.Contains(e.Error.Message, "rainier login") {
+			t.Errorf("message = %q, want it to name the action that fixes it", e.Error.Message)
+		}
+		// Someone else's credential is not this caller's business, and no
+		// refusal may carry token material of any kind.
+		if strings.Contains(raw, repoTestToken) {
+			t.Fatalf("the refusal leaked a stored token: %s", raw)
+		}
+		if n := countSessions(t, st); n != 0 {
+			t.Fatalf("stored %d sessions, want none — the gate must refuse before the insert", n)
+		}
+	})
+
+	t.Run("a session that clones nothing needs no credential", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		startRun(t, s)
+		_, tok := loginUser(t, st, "alice", "member")
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
+			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "none", "environment": "dev", "repos": []any{}})
+		if spec := nextCreate(t, f).Spec; spec.Repos != nil {
+			t.Fatalf("spec.Repos = %+v, want none", spec.Repos)
+		}
+	})
+
+	// A credential a git operation has already seen rejected still passes the
+	// gate: it is REFRESHABLE mid-flight (the user runs `rainier login
+	// --refresh github` while the session sits there and the next clone
+	// works), where a missing credential never becomes present without a
+	// create the user has to make again anyway. The clone, not the create, is
+	// where a stale credential says so.
+	t.Run("a needs_refresh credential still passes the gate", func(t *testing.T) {
+		_, st, ts, f, u, tok := repoFleet(t)
+		if err := st.SetCredentialStatus(context.Background(), u.ID, "github", CredentialNeedsRefresh); err != nil {
+			t.Fatalf("SetCredentialStatus: %v", err)
+		}
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
+			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "stale", "environment": "dev"})
+		if got := nextCreate(t, f).Spec.Repos; len(got) != 1 || got[0].Name != "app" {
+			t.Fatalf("spec.Repos = %+v, want the clone dispatched anyway", got)
+		}
+	})
+
+	t.Run("a malformed repos entry is 400, and nothing is stored", func(t *testing.T) {
+		_, st, ts, _, _, tok := repoFleet(t)
+
+		for _, tc := range []struct {
+			name string
+			body string
+		}{
+			{"not owner/name", `{"name":"x","repos":[{"repo":"nope"}]}`},
+			{"empty base_branch", `{"name":"x","repos":[{"repo":"acme/app","base_branch":""}]}`},
+			{"unknown member", `{"name":"x","repos":[{"repo":"acme/app","branch":"main"}]}`},
+			{"missing repo", `{"name":"x","repos":[{}]}`},
+		} {
+			resp := doRaw(t, ts, http.MethodPost, "/v1/sessions", tok, tc.body)
+			raw := readBody(t, resp)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("%s: status = %d, want 400; body=%s", tc.name, resp.StatusCode, raw)
+			}
+			if e := decodeErrBody(t, raw); e.Error.Code != "invalid_request" {
+				t.Errorf("%s: code = %q, want invalid_request", tc.name, e.Error.Code)
+			}
+		}
+		if n := countSessions(t, st); n != 0 {
+			t.Fatalf("stored %d sessions, want none", n)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// the init hook: dispatched on EVERY create, cache hit included (design §4.4)
+// ---------------------------------------------------------------------------
+
+func TestCreateSessionDispatchesInit(t *testing.T) {
+	oneRunnerFleet := func(t *testing.T) (Store, *httptest.Server, *fakeRunner, string) {
+		t.Helper()
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		startRun(t, s)
+		_, tok := loginUser(t, st, "alice", "member")
+		return st, ts, f, tok
+	}
+
+	t.Run("an environment's init rides the create with the default bound", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", Init: "make dev-server &"})
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "i1", "environment": "dev"})
+		spec := nextCreate(t, f).Spec
+		if spec.Init != "make dev-server &" {
+			t.Errorf("spec.Init = %q, want the environment's init", spec.Init)
+		}
+		if spec.InitTimeoutSec != defaultInitTimeoutSec {
+			t.Errorf("spec.InitTimeoutSec = %d, want the %d default", spec.InitTimeoutSec, defaultInitTimeoutSec)
+		}
+	})
+
+	t.Run("an explicit init_timeout_sec is dispatched verbatim", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", Init: "sleep 1", InitTimeoutSec: 60})
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "i2", "environment": "dev"})
+		if got := nextCreate(t, f).Spec.InitTimeoutSec; got != 60 {
+			t.Fatalf("spec.InitTimeoutSec = %d, want 60", got)
+		}
+	})
+
+	t.Run("an environment with no init dispatches neither the hook nor a bound", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", InitTimeoutSec: 60})
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "i3", "environment": "dev"})
+		spec := nextCreate(t, f).Spec
+		if spec.Init != "" || spec.InitTimeoutSec != 0 {
+			t.Fatalf("spec init = %q/%d, want both zero", spec.Init, spec.InitTimeoutSec)
+		}
+	})
+
+	// The cacheable/per-session split: setup built the image and is baked into
+	// it, so a cache hit must not run it again — but init runs after the code
+	// is in place, on every boot, and a cached image that skipped it would
+	// hand the session a workspace with no dev server and no explanation.
+	t.Run("a cache hit runs init but not setup", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
+		env := seedEnv(t, st, Environment{Name: "cached", Image: "env-img:1",
+			Setup: "echo hi", Init: "make dev-server &", InitTimeoutSec: 60})
+		const ref = "rainier-env:cached-0123456789ab"
+		cacheEnvSnapshot(t, st, env, ref, "vm1")
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "i4", "environment": "cached"})
+		spec := nextCreate(t, f).Spec
+		if spec.Image != ref || spec.Setup != "" {
+			t.Errorf("spec = %+v, want the snapshot with no setup", spec)
+		}
+		if spec.Init != "make dev-server &" || spec.InitTimeoutSec != 60 {
+			t.Errorf("spec init = %q/%d, want the hook dispatched on a cache hit too",
+				spec.Init, spec.InitTimeoutSec)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
 // sessionJSON's two derived fields: "environment" and "queue_reason"
 // ---------------------------------------------------------------------------
 

@@ -183,14 +183,19 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 		var spec driver.Spec
 		var allow []string
 		if m.Spec != nil {
-			// Setup/SetupTimeoutSec/Env are carried straight through to the
-			// driver: controld resolved them (the environment's script, its
-			// timeout, and its declared vars plus decrypted secret values)
-			// and this runner's only job is to hand them to the container.
-			// Nothing here logs Env — its values are secrets as often as not.
+			// Everything here is carried straight through to the driver:
+			// controld resolved it all — the environment's scripts and their
+			// timeouts, its declared vars plus decrypted secret values, the
+			// repositories this session clones and the identity its commits
+			// carry — and this runner's only job is to hand it to the
+			// container. Nothing here logs Env; its values are secrets as
+			// often as not.
 			spec = driver.Spec{
 				Name: m.Spec.Name, Image: m.Spec.Image, Cmd: m.Spec.Cmd, EgressAllow: m.Spec.EgressAllow,
 				Setup: m.Spec.Setup, SetupTimeoutSec: m.Spec.SetupTimeoutSec, Env: m.Spec.Env,
+				Repos: driverRepos(m.Spec.Repos),
+				Init:  m.Spec.Init, InitTimeoutSec: m.Spec.InitTimeoutSec,
+				GitAuthorName: m.Spec.GitAuthorName, GitAuthorEmail: m.Spec.GitAuthorEmail,
 			}
 			allow = m.Spec.EgressAllow
 		}
@@ -490,4 +495,24 @@ func errTextUnless(err, sentinel error) string {
 		return ""
 	}
 	return errText(err)
+}
+
+// driverRepos converts the wire's repo list into the driver's, field for
+// field. The two types are deliberately identical and deliberately separate
+// (rwire is the control-plane vocabulary, driver.Spec is the sandbox
+// boundary), so this hop is a copy and nothing else — no defaulting, no
+// validation, no reordering. A nil list stays nil: a session that clones
+// nothing must not arrive at the driver carrying an empty instruction.
+func driverRepos(repos []rwire.RepoSpec) []driver.RepoSpec {
+	if len(repos) == 0 {
+		return nil
+	}
+	out := make([]driver.RepoSpec, len(repos))
+	for i, r := range repos {
+		out[i] = driver.RepoSpec{
+			Owner: r.Owner, Name: r.Name, BaseBranch: r.BaseBranch,
+			SessionBranch: r.SessionBranch, Dir: r.Dir,
+		}
+	}
+	return out
 }

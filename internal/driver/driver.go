@@ -40,23 +40,62 @@ type Spec struct {
 	// the default (design §4.3 — it sends 900 when an environment declares
 	// none) and sessiond treats anything non-positive as an unbounded run.
 	SetupTimeoutSec int
+	// Repos are the repositories this session clones at boot, resolved by
+	// controld. They reach the container as RAINIER_REPOS_B64: base64 of the
+	// JSON array, for the same reason the setup script is encoded — an env
+	// var carries one line, and JSON quoting through an argv is a parser
+	// nobody should have to write twice.
+	Repos []RepoSpec
+	// Init is the environment's per-boot hook, run after the clones. It rides
+	// as RAINIER_INIT_B64 with its bound in RAINIER_INIT_TIMEOUT, a channel
+	// separate from the setup one because a cache-hit create carries an init
+	// and no setup — the image IS the finished setup, and init is the part
+	// that could not be baked into it.
+	Init           string
+	InitTimeoutSec int
+	// GitAuthorName and GitAuthorEmail are the identity the session's commits
+	// carry, injected as RAINIER_GIT_AUTHOR_NAME / RAINIER_GIT_AUTHOR_EMAIL
+	// for sessiond to write into the workspace gitconfig. Neither is a
+	// credential; the token never rides the environment block at all.
+	GitAuthorName  string
+	GitAuthorEmail string
 }
 
-// MaxSetupBytes caps Spec.Setup before encoding. The script rides to the
-// container in its environment block, which is not an unbounded place to put
-// a file: an oversized one fails deep inside `docker run` with an errno that
-// names nothing useful, or is silently truncated into a script that does
-// something other than what the environment declared. Rejecting it in Create,
-// before anything with a side effect runs, is what turns that into an error
-// naming the limit and the input that broke it.
+// RepoSpec is one repository a session clones, mirroring rwire.RepoSpec field
+// for field — the driver layer keeps its own type for the same reason it keeps
+// its own Spec: it is the boundary the fake and the docker driver share, and
+// it must not depend on the control-plane wire package. The JSON tags are the
+// ones sessiond decodes, so the two spellings have to stay identical.
+type RepoSpec struct {
+	Owner         string `json:"owner"`
+	Name          string `json:"name"`
+	BaseBranch    string `json:"base_branch"`
+	SessionBranch string `json:"session_branch"`
+	Dir           string `json:"dir"`
+}
+
+// MaxSetupBytes caps Spec.Setup (and Spec.Init, which rides the same channel)
+// before encoding. A script rides to the container in its environment block,
+// which is not an unbounded place to put a file: an oversized one fails deep
+// inside `docker run` with an errno that names nothing useful, or is silently
+// truncated into a script that does something other than what the environment
+// declared. Rejecting it in Create, before anything with a side effect runs,
+// is what turns that into an error naming the limit and the input that broke
+// it.
 const MaxSetupBytes = 512 << 10
 
-// checkSetupSize enforces MaxSetupBytes. Shared by both drivers so the fake
-// can never accept a spec the real one refuses — a test that passed against
-// one and not the other would be worse than no test.
-func checkSetupSize(spec Spec) error {
-	if len(spec.Setup) > MaxSetupBytes {
-		return fmt.Errorf("setup script is %d bytes, over the %d-byte limit", len(spec.Setup), MaxSetupBytes)
+// checkScriptSizes enforces MaxSetupBytes on both scripts a spec can carry.
+// Shared by both drivers so the fake can never accept a spec the real one
+// refuses — a test that passed against one and not the other would be worse
+// than no test.
+func checkScriptSizes(spec Spec) error {
+	for _, s := range []struct {
+		what   string
+		script string
+	}{{"setup", spec.Setup}, {"init", spec.Init}} {
+		if len(s.script) > MaxSetupBytes {
+			return fmt.Errorf("%s script is %d bytes, over the %d-byte limit", s.what, len(s.script), MaxSetupBytes)
+		}
 	}
 	return nil
 }

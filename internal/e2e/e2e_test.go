@@ -1531,6 +1531,8 @@ func TestEnvSetupStreamsAndCaches(t *testing.T) {
 	wantStrip := []string{
 		"ENV_TOKEN",
 		"RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT",
+		"RAINIER_REPOS_B64", "RAINIER_INIT_B64", "RAINIER_INIT_TIMEOUT",
+		"RAINIER_GIT_AUTHOR_NAME", "RAINIER_GIT_AUTHOR_EMAIL",
 		"RAINIER_DIAL", "RAINIER_SESSION",
 		"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy",
 	}

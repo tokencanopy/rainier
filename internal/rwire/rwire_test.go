@@ -54,8 +54,58 @@ func TestEnvironmentSpecRoundTrip(t *testing.T) {
 	// a plain scratch create byte-identical to what Plan 1-3 peers expect.
 	eb, err := json.Marshal(ToRunner{Type: "create", Spec: &Spec{Image: "img"}})
 	if err != nil { t.Fatal(err) }
-	for _, tag := range []string{"setup", "setup_timeout_sec", "env", "ref", "rpc"} {
+	for _, tag := range []string{"setup", "setup_timeout_sec", "env", "ref", "rpc",
+		"repos", "init", "init_timeout_sec", "git_author_name", "git_author_email"} {
 		if strings.Contains(string(eb), `"`+tag+`"`) { t.Fatalf("empty spec leaked %q: %s", tag, eb) }
+	}
+}
+
+// TestRepoAndInitSpecRoundTrip pins the Plan 5 create vocabulary: the
+// repositories a session clones (owner, name, and the three names the clone
+// resolves to — base branch, session branch, and the directory it lands in),
+// the per-boot init hook with its bound, and the git identity commits made
+// inside the session are attributed to.
+//
+// The literal JSON is the assertion that matters. sessiond decodes these
+// bytes out of an environment variable the driver base64s them into, so a
+// renamed tag would not fail any dispatch test — it would produce a container
+// that clones nothing and says nothing about why.
+func TestRepoAndInitSpecRoundTrip(t *testing.T) {
+	in := ToRunner{Type: "create", ReqID: 12, Session: "sess_ef56", Spec: &Spec{
+		Image: "img",
+		Repos: []RepoSpec{
+			{Owner: "acme", Name: "app", BaseBranch: "main", SessionBranch: "rainier/work", Dir: "app"},
+			{Owner: "other", Name: "app", BaseBranch: "dev", SessionBranch: "rainier/work", Dir: "other__app"},
+		},
+		Init: "make dev-server", InitTimeoutSec: 900,
+		GitAuthorName: "alice", GitAuthorEmail: "42+alice@users.noreply.github.com",
+	}}
+	b, err := json.Marshal(in)
+	if err != nil { t.Fatal(err) }
+	for _, want := range []string{
+		`"repos":[{"owner":"acme","name":"app","base_branch":"main","session_branch":"rainier/work","dir":"app"},`,
+		`{"owner":"other","name":"app","base_branch":"dev","session_branch":"rainier/work","dir":"other__app"}]`,
+		`"init":"make dev-server"`,
+		`"init_timeout_sec":900`,
+		`"git_author_name":"alice"`,
+		`"git_author_email":"42+alice@users.noreply.github.com"`,
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("spec tags wrong on the wire: missing %s in\n%s", want, b)
+		}
+	}
+
+	var out ToRunner
+	if err := json.Unmarshal(b, &out); err != nil { t.Fatal(err) }
+	if out.Spec == nil || len(out.Spec.Repos) != 2 {
+		t.Fatalf("round trip mangled: %+v", out.Spec)
+	}
+	if got := out.Spec.Repos[0]; got != in.Spec.Repos[0] {
+		t.Fatalf("repo[0] = %+v, want %+v", got, in.Spec.Repos[0])
+	}
+	if out.Spec.Init != in.Spec.Init || out.Spec.InitTimeoutSec != 900 ||
+		out.Spec.GitAuthorName != "alice" || out.Spec.GitAuthorEmail != in.Spec.GitAuthorEmail {
+		t.Fatalf("round trip mangled: %+v", out.Spec)
 	}
 }
 

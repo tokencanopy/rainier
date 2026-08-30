@@ -88,6 +88,23 @@ type Session struct {
 	// while the script ran, and the row carries no other trace of which script
 	// that was.
 	SetupHash string
+	// Repos is the session's own `repos` override: the repositories it clones
+	// INSTEAD of the ones its environment's github connectors declare. Three
+	// states, all distinct and all load-bearing:
+	//
+	//   - nil: the caller named none, so the environment's connectors decide
+	//     (a scratch session with no override clones nothing).
+	//   - empty but non-nil: the caller explicitly asked for no clone at all,
+	//     which an environment's connectors must not override.
+	//   - populated: exactly these, in this order.
+	//
+	// It is recorded on the row rather than resolved into the Spec at create
+	// time because the create only QUEUES the session: the dispatch that turns
+	// this into clone instructions happens later, from a row read back out of
+	// the store, possibly after a restart and possibly on another replica. The
+	// expansion itself (branch names, directories) still happens at dispatch,
+	// like every other thing the Spec carries.
+	Repos []RepoRef
 	// ChildExitCode is the exit status of the session's agent process, once
 	// it has exited. It is a pointer because "the child has not exited" and
 	// "the child exited 0" are different facts and a plain int cannot tell
@@ -111,6 +128,19 @@ func (s Session) effectiveImage() string {
 		return s.ResolvedImage
 	}
 	return s.Image
+}
+
+// RepoRef is one entry of a session's `repos` override, in the spelling the
+// client sent: "owner/name" plus the branch to clone from. It is deliberately
+// the REQUEST's shape and not the resolved one — the session branch and the
+// directory a repository lands in are derived at dispatch from the session
+// itself, so storing them here would be storing a copy of a derivation.
+//
+// An empty BaseBranch means the default branch; the API rejects an explicitly
+// empty one, so "" here can only ever mean "unset".
+type RepoRef struct {
+	Repo       string `json:"repo"`
+	BaseBranch string `json:"base_branch,omitempty"`
 }
 
 // Connector is one entry of an Environment's connectors array: the "type"
@@ -245,6 +275,11 @@ type Store interface {
 	UpsertUser(ctx context.Context, githubID int64, login, role string) (User, error)
 	InsertToken(ctx context.Context, userID, tokenHash string) error
 	UserByToken(ctx context.Context, tokenHash string) (User, error) // touches last_used_at; ErrNotFound
+	// GetUser looks a user up by id, for the paths that hold a row rather
+	// than a request: the create dispatch turns a session's owner_id into the
+	// GitHub login and numeric id its commits are attributed to, long after
+	// the bearer token that created it is out of scope. ErrNotFound.
+	GetUser(ctx context.Context, id string) (User, error)
 
 	CreateSession(ctx context.Context, s Session) (Session, error) // ErrConflict (name), ErrIdemReplay (idem key)
 	GetSession(ctx context.Context, id string) (Session, error)

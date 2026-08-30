@@ -90,6 +90,16 @@ func (m *memStore) InsertToken(ctx context.Context, userID, tokenHash string) er
 	return nil
 }
 
+func (m *memStore) GetUser(ctx context.Context, id string) (User, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.users[id]
+	if !ok {
+		return User{}, ErrNotFound
+	}
+	return *u, nil
+}
+
 func (m *memStore) UserByToken(ctx context.Context, tokenHash string) (User, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -105,14 +115,20 @@ func (m *memStore) UserByToken(ctx context.Context, tokenHash string) (User, err
 }
 
 // cloneSession returns a deep copy of s. A plain struct copy would still
-// share Cmd's and EgressAllow's backing arrays — and, worse, the
+// share Cmd's, EgressAllow's and Repos's backing arrays — and, worse, the
 // ChildExitCode pointer — with the map's own row, so a caller could write
 // straight through into the store. Every session that crosses the mutex is
 // cloned instead, same discipline as cloneEnvironment.
+//
+// slices.Clone preserves the nil/empty distinction Repos depends on (a nil
+// clones to nil, an empty slice to an empty one), which is what keeps "no
+// override" and "explicitly no repositories" different answers here as well
+// as in Postgres.
 func cloneSession(s Session) Session {
 	cp := s
 	cp.Cmd = slices.Clone(s.Cmd)
 	cp.EgressAllow = slices.Clone(s.EgressAllow)
+	cp.Repos = slices.Clone(s.Repos)
 	if s.ChildExitCode != nil {
 		code := *s.ChildExitCode
 		cp.ChildExitCode = &code

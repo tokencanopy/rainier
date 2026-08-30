@@ -4,6 +4,7 @@ package driver
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -87,7 +88,7 @@ func (d *Docker) Create(ctx context.Context, spec Spec) (Handle, error) {
 	// First, before the capacity probe and every side effect after it: an
 	// oversized setup script is a caller error, and it costs nothing to say
 	// so without touching the daemon.
-	if err := checkSetupSize(spec); err != nil {
+	if err := checkScriptSizes(spec); err != nil {
 		return Handle{}, err
 	}
 	used, total, err := d.Capacity(ctx)
@@ -261,6 +262,34 @@ func (d *Docker) runArgs(spec Spec, image string) []string {
 			"-e", "RAINIER_SETUP_B64="+base64.StdEncoding.EncodeToString([]byte(spec.Setup)),
 			"-e", "RAINIER_SETUP_TIMEOUT="+strconv.Itoa(spec.SetupTimeoutSec),
 		)
+	}
+	if len(spec.Repos) > 0 {
+		// The repo list is structured, so it rides as base64'd JSON: one
+		// decode and one json.Unmarshal in sessiond, with no quoting or
+		// separator convention for a branch name to break. Marshaling a slice
+		// of all-string structs cannot fail, so the error branch is
+		// unreachable; leaving the variable off rather than injecting an empty
+		// one is the honest reading of it anyway — sessiond treats an absent
+		// variable as "nothing to clone" and a present-but-unparseable one as
+		// a failed stage.
+		if blob, err := json.Marshal(spec.Repos); err == nil {
+			args = append(args, "-e", "RAINIER_REPOS_B64="+base64.StdEncoding.EncodeToString(blob))
+		}
+	}
+	if spec.Init != "" {
+		// Separate from the setup channel on purpose: a cache-hit create
+		// carries an init and no setup, and sessiond gates the two stages on
+		// their own variables.
+		args = append(args,
+			"-e", "RAINIER_INIT_B64="+base64.StdEncoding.EncodeToString([]byte(spec.Init)),
+			"-e", "RAINIER_INIT_TIMEOUT="+strconv.Itoa(spec.InitTimeoutSec),
+		)
+	}
+	if spec.GitAuthorName != "" {
+		args = append(args, "-e", "RAINIER_GIT_AUTHOR_NAME="+spec.GitAuthorName)
+	}
+	if spec.GitAuthorEmail != "" {
+		args = append(args, "-e", "RAINIER_GIT_AUTHOR_EMAIL="+spec.GitAuthorEmail)
 	}
 	// Spec.Env goes in LAST, after everything the driver injects itself.
 	// `docker run` honors the last -e for a repeated key (verified against
