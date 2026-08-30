@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"rainier/internal/rwire"
+	"rainier/internal/xfer"
 )
 
 // The session RPC is controld's request/response channel to the inside of a
@@ -271,6 +273,88 @@ func rpcPayload(v any) (json.RawMessage, error) {
 		return nil, nil
 	}
 	return b, nil
+}
+
+// ---------------------------------------------------------------------------
+// controld-initiated: workspace inspection
+//
+// The three methods behind GET /v1/sessions/{id}/diff and the push/pull file
+// transfer. Each is a thin wrapper on sessionRPC that does one thing the
+// handler must not have to remember: BOUND WHAT THE SANDBOX SENT BACK.
+//
+// A sandbox is not a trusted peer. It runs a user's own agent, on a runner
+// this replica reaches over a socket, and its answers become a client's
+// response body — so every field of every answer that a compromised or simply
+// broken sandbox could inflate is cut down to the same limit the honest one
+// applies inside. The caps exist at both ends on purpose: the one inside keeps
+// an honest sandbox from producing an enormous frame, and the one here keeps a
+// dishonest one from spending this replica's memory (design §5, "size cap
+// enforced client-side AND sessiond-side" — this is the third side).
+// ---------------------------------------------------------------------------
+
+// maxDiffRepos bounds how many repositories one diff answer may describe. A
+// session's repository list is resolved at create and is small; the number is
+// slack, not a working limit, and a sandbox that exceeds it is answering about
+// a session it was not asked about.
+const maxDiffRepos = 64
+
+// sessionDiff asks a sandbox for its per-repository diff.
+func (s *Server) sessionDiff(ctx context.Context, sessionID string) (xfer.DiffAnswer, error) {
+	var ans xfer.DiffAnswer
+	if err := s.sessionRPC(ctx, sessionID, xfer.MethodDiff, nil, &ans); err != nil {
+		return xfer.DiffAnswer{}, err
+	}
+	return boundDiff(ans), nil
+}
+
+// boundDiff cuts an answer down to what this API is willing to relay.
+func boundDiff(ans xfer.DiffAnswer) xfer.DiffAnswer {
+	if len(ans.Repos) > maxDiffRepos {
+		ans.Repos = ans.Repos[:maxDiffRepos]
+	}
+	for i := range ans.Repos {
+		r := &ans.Repos[i]
+		if len(r.Stat) > xfer.StatBytes {
+			// ToValidUTF8 because the cut lands mid-rune as often as not and
+			// this string is about to be JSON-encoded into a user's terminal.
+			r.Stat = strings.ToValidUTF8(r.Stat[:xfer.StatBytes], "")
+		}
+	}
+	return ans
+}
+
+// sessionPushChunk hands one chunk of an upload to a sandbox and returns its
+// ack.
+func (s *Server) sessionPushChunk(ctx context.Context, sessionID string, chunk xfer.PushChunk) (xfer.PushAck, error) {
+	var ack xfer.PushAck
+	if err := s.sessionRPC(ctx, sessionID, xfer.MethodPushFiles, chunk, &ack); err != nil {
+		return xfer.PushAck{}, err
+	}
+	// The ack's sequence number is the client's correlation, and a sandbox
+	// that answered about a different chunk would have the client believing a
+	// chunk landed that never did.
+	if ack.Seq != chunk.Seq {
+		return xfer.PushAck{}, fmt.Errorf("session %s acked chunk %d for a request about chunk %d",
+			sessionID, ack.Seq, chunk.Seq)
+	}
+	return ack, nil
+}
+
+// sessionPullChunk asks a sandbox for one chunk of a download.
+func (s *Server) sessionPullChunk(ctx context.Context, sessionID string, req xfer.PullRequest) (xfer.PullChunk, error) {
+	var chunk xfer.PullChunk
+	if err := s.sessionRPC(ctx, sessionID, xfer.MethodPullFiles, req, &chunk); err != nil {
+		return xfer.PullChunk{}, err
+	}
+	if chunk.Seq != req.Seq {
+		return xfer.PullChunk{}, fmt.Errorf("session %s answered chunk %d for a request about chunk %d",
+			sessionID, chunk.Seq, req.Seq)
+	}
+	if len(chunk.Data) > xfer.ChunkBytes {
+		return xfer.PullChunk{}, fmt.Errorf("session %s answered a %d-byte chunk; the limit is %d",
+			sessionID, len(chunk.Data), xfer.ChunkBytes)
+	}
+	return chunk, nil
 }
 
 // ---------------------------------------------------------------------------

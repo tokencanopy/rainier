@@ -25,6 +25,7 @@ import (
 
 	"rainier/internal/attachio"
 	"rainier/internal/cli"
+	"rainier/internal/xfer"
 )
 
 // devicePollTimeout bounds a single poll request to GitHub's device-flow
@@ -58,6 +59,12 @@ func main() {
 		err = runSnapshot(rest)
 	case "rm":
 		err = runRm(rest)
+	case "diff":
+		err = runDiff(rest)
+	case "push":
+		err = runPush(rest)
+	case "pull":
+		err = runPull(rest)
 	case "creds":
 		err = runCreds(rest)
 	case "secret":
@@ -92,6 +99,9 @@ commands:
   resume   <id|name>
   snapshot <id|name>
   rm       <id|name>
+  diff     <id|name>
+  push     <local-dir> <id|name>:<path>
+  pull     <id|name>:<path> <local-dir>
   creds
   secret   set <NAME> [--value V] | ls | rm <NAME>
   env      create <name> [flags] | ls | show <ref> | update <ref> [flags] | rm <ref>
@@ -110,6 +120,13 @@ needs_refresh means git saw that token rejected — run
 to log in again with a fresh token and clear it. Use the same command when
 "creds" shows scopes without "repo": that token can prove who you are but
 cannot do git.
+
+diff shows, per repository the session cloned, what its branch changed against
+the base branch it started from — git's own "--stat", read from inside the
+session. push and pull move a directory between your machine and a session's
+workspace: they are one-shot and bounded (256MiB per transfer), the remote
+path is always inside /workspace, and neither follows a symlink out of the
+tree it is moving.
 
 secret set reads the value from stdin when --value is omitted, so it never
 lands in your shell history:  cat token.txt | rainier secret set GH_TOKEN
@@ -790,6 +807,129 @@ func runRm(args []string) error {
 	}
 	fmt.Println("removed", id)
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// diff / push / pull
+//
+// The three workspace-inspection commands. All the work is in internal/cli
+// (Push/Pull) and internal/xfer (the archive rules); what is left here is
+// argument parsing and rendering, which is the same split every other
+// subcommand takes.
+// ---------------------------------------------------------------------------
+
+func runDiff(args []string) error {
+	fs := flag.NewFlagSet("diff", flag.ExitOnError)
+	fs.Parse(args)
+	ref := requireRef(fs, "diff")
+
+	_, c, id, err := resolveClientAndID(ref)
+	if err != nil {
+		return err
+	}
+	var ans xfer.DiffAnswer
+	if err := c.Do(http.MethodGet, "/v1/sessions/"+id+"/diff", nil, &ans); err != nil {
+		return err
+	}
+	renderDiff(os.Stdout, ans)
+	return nil
+}
+
+// renderDiff prints one heading per repository — both branches named, because
+// "what changed" is meaningless without saying against what — and git's stat
+// underneath it.
+//
+// A repository with an empty stat says so explicitly. Printing nothing there
+// reads as a bug in this command rather than as an answer about the session.
+func renderDiff(w io.Writer, ans xfer.DiffAnswer) {
+	if len(ans.Repos) == 0 {
+		fmt.Fprintln(w, "this session has no repositories")
+		return
+	}
+	for i, r := range ans.Repos {
+		if i > 0 {
+			fmt.Fprintln(w)
+		}
+		fmt.Fprintf(w, "%s  %s vs origin/%s\n", r.Repo, r.SessionBranch, r.BaseBranch)
+		stat := strings.TrimRight(r.Stat, "\n")
+		if stat == "" {
+			fmt.Fprintln(w, "  (no changes)")
+			continue
+		}
+		fmt.Fprintln(w, stat)
+	}
+}
+
+func runPush(args []string) error {
+	fs := flag.NewFlagSet("push", flag.ExitOnError)
+	fs.Parse(reorderArgs(fs, args))
+	if fs.NArg() < 2 {
+		fmt.Fprintln(os.Stderr, "usage: rainier push <local-dir> <id|name>:<path>")
+		os.Exit(2)
+	}
+	localDir, spec := fs.Arg(0), fs.Arg(1)
+	ref, remotePath, err := splitRemote(spec)
+	if err != nil {
+		return err
+	}
+	_, c, id, err := resolveClientAndID(ref)
+	if err != nil {
+		return err
+	}
+	if err := cli.Push(c, id, localDir, remotePath, progressPrinter("pushing")); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr)
+	fmt.Printf("pushed %s to %s:%s\n", localDir, ref, remotePath)
+	return nil
+}
+
+func runPull(args []string) error {
+	fs := flag.NewFlagSet("pull", flag.ExitOnError)
+	fs.Parse(reorderArgs(fs, args))
+	if fs.NArg() < 2 {
+		fmt.Fprintln(os.Stderr, "usage: rainier pull <id|name>:<path> <local-dir>")
+		os.Exit(2)
+	}
+	spec, localDir := fs.Arg(0), fs.Arg(1)
+	ref, remotePath, err := splitRemote(spec)
+	if err != nil {
+		return err
+	}
+	_, c, id, err := resolveClientAndID(ref)
+	if err != nil {
+		return err
+	}
+	if err := cli.Pull(c, id, remotePath, localDir, progressPrinter("pulling")); err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stderr)
+	fmt.Printf("pulled %s:%s into %s\n", ref, remotePath, localDir)
+	return nil
+}
+
+// splitRemote splits a "<session>:<path>" argument.
+//
+// At the FIRST colon: a session ref never contains one (an id is sess_<hex>,
+// a name is a name), and a remote path may. Both halves are required — a bare
+// directory is a different command's argument, and half of this one is always
+// a mistake worth naming.
+func splitRemote(spec string) (ref, path string, err error) {
+	ref, path, ok := strings.Cut(spec, ":")
+	if !ok || ref == "" || path == "" {
+		return "", "", fmt.Errorf("%q must be <id|name>:<path>, e.g. dev-box:widget/vendor", spec)
+	}
+	return ref, path, nil
+}
+
+// progressPrinter returns a progress callback that rewrites one line on
+// stderr — stderr so that redirecting stdout to a file (or a pipe) keeps the
+// command's real output clean, and a carriage return so a long transfer is one
+// line rather than a thousand.
+func progressPrinter(verb string) func(done, total int64) {
+	return func(done, total int64) {
+		fmt.Fprintf(os.Stderr, "\r%s", cli.ProgressLine(verb, done, total))
+	}
 }
 
 // ---------------------------------------------------------------------------

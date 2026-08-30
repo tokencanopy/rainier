@@ -106,6 +106,11 @@ func main() {
 	if *dial != "" {
 		rpc = newRPCDispatcher()
 		startAgentSocket(context.Background(), agentSocketPath, rpc)
+		// The workspace-inspection methods controld drives INTO this sandbox:
+		// the session diff and the bounded push/pull (files.go). Registered
+		// here, before the relay is serving, so a request arriving on the
+		// conn's first frame finds its method already installed.
+		registerFileHandlers(rpc, bootEnvironment)
 
 		var chainEnv []envVar
 		var err error

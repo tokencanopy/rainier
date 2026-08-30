@@ -72,26 +72,64 @@ func RandHex(n int) string {
 // nil). It always sets Authorization (when c.Token is set) and a fresh
 // X-Request-Id; opts may add more headers (IdempotencyKey).
 //
-// A non-2xx response is decoded as controld's error envelope and returned
-// as fmt.Errorf("%s: %s", code, message); a body that isn't that shape at
-// all (an upstream proxy's plain-text 502, a truncated response) falls back
-// to a generic error carrying the status and a clipped body rather than
-// panicking on the failed decode. A transport failure (DNS, connection
-// refused, timeout) is returned exactly as http.Client.Do returned it — no
-// wrapping — so callers and tests can match on the underlying error type.
+// Errors are send's, below — including the error-envelope decoding every
+// non-2xx response on this API gets.
 func (c *Client) Do(method, path string, in, out any, opts ...Option) error {
+	resp, err := c.send(method, path, in, opts...)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Open is Do for a response that is NOT JSON: it returns the successful
+// response's body for the caller to read and close. The one such response on
+// this API is a pull's archive (GET /v1/sessions/{id}/files), which is
+// streamed and may be hundreds of megabytes — decoding it into memory the way
+// Do does would defeat the point of streaming it.
+//
+// Failures are identical to Do's: a non-2xx is read as the error envelope and
+// returned as an error, with the body already closed, so a caller only ever
+// holds a body it is going to read.
+func (c *Client) Open(method, path string, opts ...Option) (io.ReadCloser, error) {
+	resp, err := c.send(method, path, nil, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
+// send performs one request and returns the response with its status already
+// judged: a 2xx comes back with the body open and unread, anything else comes
+// back as an error with the body closed.
+//
+// A non-2xx response is decoded as controld's error envelope and returned as
+// fmt.Errorf("%s: %s", code, message); a body that isn't that shape at all
+// (an upstream proxy's plain-text 502, a truncated response) falls back to a
+// generic error carrying the status and a clipped body rather than panicking
+// on the failed decode. A transport failure (DNS, connection refused, timeout)
+// is returned exactly as http.Client.Do returned it — no wrapping — so callers
+// and tests can match on the underlying error type.
+func (c *Client) send(method, path string, in any, opts ...Option) (*http.Response, error) {
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		body = bytes.NewReader(b)
 	}
 
 	req, err := http.NewRequest(method, c.Base+path, body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -110,11 +148,11 @@ func (c *Client) Do(method, path string, in, out any, opts ...Option) error {
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyLimit))
 		var env errorEnvelope
 		if err := json.Unmarshal(data, &env); err != nil || env.Error.Code == "" {
@@ -123,15 +161,9 @@ func (c *Client) Do(method, path string, in, out any, opts ...Option) error {
 			if len(text) > clip {
 				text = text[:clip]
 			}
-			return fmt.Errorf("unexpected response: %d %s", resp.StatusCode, text)
+			return nil, fmt.Errorf("unexpected response: %d %s", resp.StatusCode, text)
 		}
-		return fmt.Errorf("%s: %s", env.Error.Code, env.Error.Message)
+		return nil, fmt.Errorf("%s: %s", env.Error.Code, env.Error.Message)
 	}
-
-	if out != nil {
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-			return err
-		}
-	}
-	return nil
+	return resp, nil
 }
