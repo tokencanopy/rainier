@@ -562,6 +562,7 @@ func runNew(args []string) error {
 	image := fs.String("image", "", "container image (overrides the environment's)")
 	egress := fs.String("egress", "", "comma-separated egress allowlist (overrides the environment's)")
 	detach := fs.Bool("detach", false, "create without attaching")
+	idempotencyKey := fs.String("idempotency-key", "", "stable create retry key (developer tooling)")
 	fs.Parse(reorderArgs(fs, args))
 	cmdArgs := fs.Args() // whatever followed "--"
 
@@ -582,7 +583,11 @@ func runNew(args []string) error {
 	}
 
 	var resp sessionEnvelope
-	if err := c.Do(http.MethodPost, "/v1/sessions", body, &resp, cli.IdempotencyKey(cli.RandHex(8))); err != nil {
+	key := *idempotencyKey
+	if key == "" {
+		key = cli.RandHex(8)
+	}
+	if err := c.Do(http.MethodPost, "/v1/sessions", body, &resp, cli.IdempotencyKey(key)); err != nil {
 		return err
 	}
 	fmt.Println(resp.Session.ID)
@@ -1938,20 +1943,6 @@ func resolveSessionIDWithScope(c *cli.Client, myOwnerID, ref string, scope sessi
 			break
 		}
 		cursor = page.NextCursor
-	}
-	// Attach prefers a live name match over failed history even when the live
-	// row belongs to a teammate. A failed row is a diagnostic fallback, not a
-	// reason to shadow the only currently attachable session with that name.
-	if scope == resolveAttachable {
-		var activeMatches []match
-		for _, m := range matches {
-			if !m.terminal {
-				activeMatches = append(activeMatches, m)
-			}
-		}
-		if len(activeMatches) > 0 {
-			matches = activeMatches
-		}
 	}
 	// GET /v1/sessions is team-visible, but lifecycle commands should operate
 	// on the caller's own same-name row whenever one exists. Do this before

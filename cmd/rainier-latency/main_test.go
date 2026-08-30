@@ -124,7 +124,7 @@ func TestMeasureSampleFallsBackToNameCleanupBeforeCreateAck(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "calls.log")
 	binary := filepath.Join(dir, "synthetic-rainier")
-	script := "#!/bin/sh\nif [ \"$1\" = \"rm\" ]; then printf '%s\\n' \"$*\" >> \"$RAINIER_TEST_LOG\"; fi\n"
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$RAINIER_TEST_LOG\"\nif [ \"$1\" = \"new\" ]; then case \" $* \" in *\" --detach \"*) printf 'sess_recovered\\n';; esac; fi\n"
 	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -139,8 +139,11 @@ func TestMeasureSampleFallsBackToNameCleanupBeforeCreateAck(t *testing.T) {
 		t.Fatalf("read cleanup log: %v", readErr)
 	}
 	got := string(data)
-	if !strings.HasPrefix(got, "rm latency-test-") {
-		t.Fatalf("cleanup call = %q, want name-based rm fallback", got)
+	if !strings.Contains(got, "new --detach") || !strings.Contains(got, "rm sess_recovered") {
+		t.Fatalf("cleanup calls = %q, want idempotent create recovery followed by exact-id rm", got)
+	}
+	if strings.Contains(got, "rm latency-test-") {
+		t.Fatalf("cleanup calls = %q, must never delete by name", got)
 	}
 }
 

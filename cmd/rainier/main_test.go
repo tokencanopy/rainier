@@ -236,8 +236,8 @@ func TestAttachNameResolutionIncludesOnlyFailedTerminalRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve live attachable name: %v", err)
 	}
-	if id != "sess_live" {
-		t.Fatalf("resolved id = %q, want active row before failed fallback", id)
+	if id != "sess_own_failed" {
+		t.Fatalf("resolved id = %q, want the caller's own failed diagnostic row", id)
 	}
 }
 
@@ -1379,6 +1379,28 @@ func TestAttachWithRetryDoesNotRetryPolicyClose(t *testing.T) {
 	}
 	if requests != 1 {
 		t.Fatalf("requests = %d, want one attempt for a permanent close", requests)
+	}
+}
+
+func TestRunNewUsesSuppliedIdempotencyKey(t *testing.T) {
+	var gotKey string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("Idempotency-Key")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_synthetic", State: "queued"}})
+	}))
+	defer ts.Close()
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_synthetic"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureStdout(t, func() error {
+		return runNew([]string{"--detach", "--name", "synthetic-box", "--idempotency-key", "synthetic-create-key"})
+	}); err != nil {
+		t.Fatalf("runNew: %v", err)
+	}
+	if gotKey != "synthetic-create-key" {
+		t.Fatalf("Idempotency-Key = %q, want supplied recovery key", gotKey)
 	}
 }
 

@@ -168,30 +168,50 @@ func measureSample(ctx context.Context, o options, client *cli.Client, sample in
 		return fmt.Errorf("creating a synthetic session name: %w", err)
 	}
 	name := "latency-test-" + suffix
+	createKey, err := randomHex(16)
+	if err != nil {
+		return fmt.Errorf("creating a synthetic request key: %w", err)
+	}
 	if err := ensureNameAvailable(sampleCtx, client, name, o.Timeout); err != nil {
 		cancel()
 		return fmt.Errorf("preflighting synthetic session name: %w", err)
 	}
 
-	// The name is a safe cleanup handle before `rainier new` can acknowledge
-	// its id. Once the id arrives, prefer that exact handle. This defer is
-	// installed before the subprocess starts so interrupted/broken stdout cannot
-	// strand a server-side create.
-	cleanupRef := name
+	// Cleanup is exact-id only. Before `rainier new` acknowledges that id, replay
+	// the same create with its private idempotency key to recover the row this
+	// benchmark owns; never resolve and delete by name. This defer is installed
+	// before the subprocess starts so interrupted/broken stdout cannot strand a
+	// server-side create.
+	cleanupID := ""
+	createStarted := false
 	defer func() {
 		cancel()
-		cleanupErr := runCLI(context.Background(), o.Timeout, o.Rainier, "rm", cleanupRef)
+		if cleanupID == "" && createStarted {
+			var recoverErr error
+			cleanupID, recoverErr = recoverCreatedID(o.Timeout, o.Rainier, createKey, name, o.Image)
+			if recoverErr != nil {
+				if retErr == nil {
+					retErr = errors.New("synthetic session recovery failed")
+				}
+				return
+			}
+		}
+		if cleanupID == "" {
+			return
+		}
+		cleanupErr := runCLI(context.Background(), o.Timeout, o.Rainier, "rm", cleanupID)
 		if cleanupErr != nil && retErr == nil {
 			retErr = errors.New("synthetic session cleanup failed")
 		}
 	}()
-	created, err := startTerminal(sampleCtx, o.Timeout, o.Rainier, "new", "--name", name, "--image", o.Image)
+	created, err := startTerminal(sampleCtx, o.Timeout, o.Rainier, "new", "--name", name, "--image", o.Image, "--idempotency-key", createKey)
 	if err != nil {
 		return fmt.Errorf("starting rainier new: %w", err)
 	}
+	createStarted = true
 	defer created.abort()
 	started := created.started
-	line, ackAt, err := created.stream.waitForLine(ctx, o.Timeout)
+	line, ackAt, err := created.stream.waitForLine(sampleCtx, o.Timeout)
 	if err != nil {
 		return fmt.Errorf("waiting for create acknowledgement: %w", err)
 	}
@@ -199,7 +219,7 @@ func measureSample(ctx context.Context, o options, client *cli.Client, sample in
 	if !strings.HasPrefix(id, "sess_") {
 		return errors.New("create acknowledgement did not contain a session id")
 	}
-	cleanupRef = id
+	cleanupID = id
 	if err := record("new_create_ack", sample, ackAt.Sub(started)); err != nil {
 		return err
 	}
@@ -258,6 +278,22 @@ func measureSample(ctx context.Context, o options, client *cli.Client, sample in
 		}
 	}
 	return nil
+}
+
+func recoverCreatedID(timeout time.Duration, binary, key, name, image string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, "new", "--detach", "--idempotency-key", key, "--name", name, "--image", image)
+	cmd.Stderr = io.Discard
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(string(out))
+	if !strings.HasPrefix(id, "sess_") || strings.ContainsAny(id, "\r\n\t ") {
+		return "", errors.New("create recovery did not return one session id")
+	}
+	return id, nil
 }
 
 func measureAttach(ctx context.Context, o options, sample int, ref, prefix string, record recordFunc) error {
@@ -628,6 +664,7 @@ func publicFailure(err error) string {
 	message := err.Error()
 	for _, operation := range []string{
 		"creating a synthetic session name",
+		"creating a synthetic request key",
 		"preflighting synthetic session name",
 		"starting rainier new",
 		"waiting for create acknowledgement",
@@ -650,6 +687,7 @@ func publicFailure(err error) string {
 		"waiting for cold_attach first frame",
 		"waiting for cold_attach terminal response",
 		"synthetic session cleanup failed",
+		"synthetic session recovery failed",
 	} {
 		if message == operation || strings.HasPrefix(message, operation+":") {
 			var apiErr *cli.APIError
