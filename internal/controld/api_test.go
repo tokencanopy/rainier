@@ -1530,6 +1530,51 @@ func TestDeleteSession(t *testing.T) {
 		}
 	})
 
+	t.Run("disconnected failed delete retries orphan destroy after reconnect", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		owner, tok := loginUser(t, st, "alice", "member")
+		id := "sess_del_retry"
+		seedSession(t, st, Session{ID: id, OwnerID: owner.ID, State: StateFailed, Runner: "vm1"})
+
+		resp := doRequest(t, ts, http.MethodDelete, "/v1/sessions/"+id, tok, nil, nil)
+		if resp.StatusCode != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204", resp.StatusCode)
+		}
+		wantState(t, st, id, StateDestroyed)
+
+		// The runner was offline for the DELETE and still has the attachable
+		// failed container. Its reconnect makes that container an orphan. A
+		// transient driver failure must be retried on this same connection;
+		// waiting for another reconnect would leave capacity occupied forever.
+		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Used: 1, Total: 4,
+			Sessions: []rwire.SessionInfo{{ID: id, State: "running"}}})
+		first := f.nextCmd(t)
+		if first.Type != "destroy" || first.Session != id || first.ReqID == 0 {
+			t.Fatalf("first command = %+v, want tracked destroy of %s", first, id)
+		}
+		f.reply(t, first, false, "transient driver failure")
+
+		second := f.nextCmd(t)
+		if second.Type != "destroy" || second.Session != id || second.ReqID == 0 {
+			t.Fatalf("retry command = %+v, want tracked destroy of %s", second, id)
+		}
+		if second.ReqID == first.ReqID {
+			t.Fatalf("retry req_id = %d, want a fresh id", second.ReqID)
+		}
+		f.setCapacity(0, 4)
+		f.reply(t, second, true, "")
+		eventually(t, 3*time.Second, func() error {
+			runners, err := st.ListRunners(context.Background())
+			if err != nil {
+				return err
+			}
+			if len(runners) != 1 || runners[0].CapacityUsed != 0 {
+				return fmt.Errorf("runners = %+v, want released capacity", runners)
+			}
+			return nil
+		})
+	})
+
 	t.Run("placed on a connected runner dispatches destroy", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,

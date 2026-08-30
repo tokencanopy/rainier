@@ -346,6 +346,10 @@ On runner announce, controld reconciles Postgres against announced reality:
 | queued | — | scheduler dispatches normally |
 | — (unknown id) | present | orphan: log loudly, instruct destroy (Postgres is the source of desired state) |
 
+- **Retryable orphan teardown:** orphan destroy is a tracked dispatch outside
+  the connection reader, with three bounded attempts and backoff. A transient
+  driver failure therefore releases the container and capacity on the current
+  connection; if all attempts fail, a later announce begins a fresh series.
 - **Idempotent dispatch:** `create` carries controld's `session_id`; runnerd
   checks its registry/labels first and answers with current state instead of
   double-creating. Safe across control-conn flaps and controld restarts.
