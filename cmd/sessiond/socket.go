@@ -33,10 +33,17 @@ const (
 	// client hold a goroutine for the life of the session.
 	agentSocketDeadline = 5 * time.Second
 	// agentSocketCallTimeout bounds the upstream RPC one request turns into.
-	// It matches the helper's own timeout (Task 7): the helper is the only
-	// caller, and a bound longer than its would just leave sessiond talking to
-	// a client that has already given up.
+	// The credential helper — the only caller — derives its own bound from this
+	// one (credentialHelperTimeout), so the client always outlives sessiond's
+	// attempt: a client that gave up first would replace the reason for a
+	// refusal with a bare local timeout.
 	agentSocketCallTimeout = 20 * time.Second
+	// agentSocketConnWait is how long a request may wait for a relay connection
+	// to exist before it is attempted anyway. See agentSocketCall: it covers the
+	// boot race (a git process asking for a credential while sessiond is still
+	// dialing runnerd) and a reconnect blip, and is short enough that the call
+	// it precedes still fits inside the caller's own bound.
+	agentSocketConnWait = 3 * time.Second
 )
 
 // socketRequest is one call from inside the sandbox. Method names the session
@@ -168,11 +175,30 @@ func startAgentSocket(ctx context.Context, path string, d *rpcDispatcher) {
 		return
 	}
 	log.Printf("agent socket listening on %s", path)
-	a := &agentSocket{
-		deadline: agentSocketDeadline,
-		call: func(method string, payload json.RawMessage) (json.RawMessage, error) {
-			return d.Call(method, payload, agentSocketCallTimeout)
-		},
-	}
+	a := &agentSocket{deadline: agentSocketDeadline, call: agentSocketCall(d)}
 	go a.serve(ctx, ln)
+}
+
+// agentSocketCall is what one in-sandbox request turns into: an upstream
+// session RPC, preceded by a short wait for a connection to make it on.
+//
+// The wait is the difference between this caller and every other one. The boot
+// chain's clone stage runs a git that asks for a credential within milliseconds
+// of the process starting, while dialLoop's first websocket dial may still be
+// in flight — and during a reconnect there is legitimately no conn for a moment.
+// Call fails immediately in both cases (an upstream request is never re-sent
+// across a reconnect, see rpcConn), which for a git process means a failed clone
+// stage and a failed session. Waiting out a boot or a blip costs nothing and
+// saves that.
+//
+// The wait is bounded separately from the call rather than carved out of it, so
+// that a request which spent its first seconds waiting still gets the FULL call
+// budget afterwards. The helper sizes its own deadline to cover both (see
+// credentialHelperTimeout), which is what keeps a real refusal — the one that
+// names the action to run — from being replaced by a local timeout.
+func agentSocketCall(d *rpcDispatcher) func(string, json.RawMessage) (json.RawMessage, error) {
+	return func(method string, payload json.RawMessage) (json.RawMessage, error) {
+		d.waitConn(agentSocketConnWait)
+		return d.Call(method, payload, agentSocketCallTimeout)
+	}
 }

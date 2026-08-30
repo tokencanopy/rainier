@@ -98,6 +98,37 @@ func (d *rpcDispatcher) offline() {
 	}
 }
 
+// waitConn blocks until a connection is live, reporting whether one appeared
+// within timeout. A live one returns immediately.
+//
+// It exists for exactly one caller — the in-sandbox agent socket (see
+// agentSocketCall) — and deliberately is NOT folded into Call. Call fails at
+// once with no connection because that is right for controld-driven work: the
+// far end is already waiting and can retry. The helper's caller is a git
+// process that started before this sessiond finished dialing runnerd, or during
+// a reconnect, and its failure costs a whole boot chain.
+//
+// Polling rather than a notification: online/offline are a single atomic swap
+// on the hot path, and a condition variable or a broadcast channel would put
+// bookkeeping there to save a caller that runs once per git operation a few
+// milliseconds.
+func (d *rpcDispatcher) waitConn(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if d.conn.Load() != nil {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(connPollInterval)
+	}
+}
+
+// connPollInterval is how often waitConn re-checks. Short enough to be
+// invisible next to a git operation, long enough not to spin.
+const connPollInterval = 25 * time.Millisecond
+
 // OnControl is the handler relay calls for every control frame arriving from
 // runnerd. It is wired into ServeSessionWithControl at construction, so it
 // exists from the conn's first frame.
