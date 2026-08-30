@@ -976,10 +976,11 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 		t.Fatalf("diff = %+v, want the sandbox's own answer", diffAns.Repos)
 	}
 
-	// A member who does not own the session may not read its working tree.
-	diffAsAdminErr := admin.Do(http.MethodGet, "/v1/sessions/"+id+"/diff", nil, &diffAns)
-	if diffAsAdminErr != nil {
-		t.Fatalf("GET diff as an admin: %v; admins may reach any session", diffAsAdminErr)
+	// The diff is a team-visible read: this session is alice's, and root —
+	// another account entirely — reads it without owning it (design §4.6).
+	// The file routes below are the ones that take ownership into account.
+	if err := admin.Do(http.MethodGet, "/v1/sessions/"+id+"/diff", nil, &diffAns); err != nil {
+		t.Fatalf("GET diff as another user: %v; the diff is a team-visible read", err)
 	}
 
 	srcDir := t.TempDir()

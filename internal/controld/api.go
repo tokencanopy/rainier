@@ -1892,10 +1892,11 @@ func (s *Server) handleDeleteEnvironment(w http.ResponseWriter, r *http.Request,
 //   POST /v1/sessions/{id}/files        one chunk of an upload
 //   GET  /v1/sessions/{id}/files?path=  the whole download, streamed
 //
-// All three are the same shape: authorize, then drive a session RPC into the
-// sandbox and render what it says. The wire types belong to internal/xfer,
-// which the CLI and sessiond import too — one definition per hop rather than
-// three that happen to match.
+// All three are the same shape: check the session is reachable (and, for the
+// two that carry files, that this caller owns it), then drive a session RPC
+// into the sandbox and render what it says. The wire types belong to
+// internal/xfer, which the CLI and sessiond import too — one definition per hop
+// rather than three that happen to match.
 //
 // V0 CRUDENESS, DELIBERATE (design §4.5). The transfer is a chunk per request:
 // the client POSTs a megabyte, waits for its ack, and POSTs the next one, and
@@ -1921,8 +1922,12 @@ const filesBodyLimit = 2 << 20
 
 // handleSessionDiff serves GET /v1/sessions/{id}/diff: one `--stat` per
 // repository the session cloned, straight from the sandbox.
+//
+// Team-visible, like the other session reads — nil owner below, deliberately
+// (design §4.6; see sessionForRPC for why this route and not the two beneath
+// it).
 func (s *Server) handleSessionDiff(w http.ResponseWriter, r *http.Request, u User) {
-	row, ok := s.sessionForRPC(w, r, u, "inspect")
+	row, ok := s.sessionForRPC(w, r, nil, "inspect")
 	if !ok {
 		return
 	}
@@ -1949,7 +1954,7 @@ func (s *Server) handleSessionDiff(w http.ResponseWriter, r *http.Request, u Use
 // chunk cap — which is all this side ever holds at once, so an oversized push
 // costs the pusher's own session's disk quota and nothing of controld's.
 func (s *Server) handlePushFiles(w http.ResponseWriter, r *http.Request, u User) {
-	row, ok := s.sessionForRPC(w, r, u, "transfer files to")
+	row, ok := s.sessionForRPC(w, r, &u, "transfer files to")
 	if !ok {
 		return
 	}
@@ -2017,7 +2022,7 @@ func (s *Server) handlePullFiles(w http.ResponseWriter, r *http.Request, u User)
 		writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	row, ok := s.sessionForRPC(w, r, u, "transfer files from")
+	row, ok := s.sessionForRPC(w, r, &u, "transfer files from")
 	if !ok {
 		return
 	}
@@ -2083,16 +2088,25 @@ func (s *Server) handlePullFiles(w http.ResponseWriter, r *http.Request, u User)
 }
 
 // sessionForRPC is the preamble every route above shares: find the session,
-// authorize the caller, and establish that there is a sandbox to talk to. It
-// answers the client and reports false on every failure.
+// establish that there is a sandbox to talk to, and — when the route carries
+// files rather than metadata — that this caller may reach into it. It answers
+// the client and reports false on every failure.
 //
-// AUTHORIZATION IS OWNER-OR-ADMIN, not the team-wide rule this API's other
-// reads take. A diff and a pull read a session's WORKING TREE — its files, its
-// uncommitted work — and a push writes into it, which puts all three on the
-// attach side of §4.4's line rather than the "list sessions" side. The design's
-// §4.6 sketch called the diff team-visible; tightening it is the direction
-// that can be relaxed later without taking anything back from anyone.
-func (s *Server) sessionForRPC(w http.ResponseWriter, r *http.Request, u User, verb string) (Session, bool) {
+// AUTHORIZATION SPLITS BY WHAT THE ROUTE CARRIES, on the line design §4.4 draws
+// between reads and mutations:
+//
+//   - The DIFF is team-visible, like every other session read (§4.6 says so
+//     explicitly, and handleGetSession takes no ownership check either).
+//     `git diff --stat` is metadata — file paths and churn counts, no content —
+//     and seeing which files a teammate's branch touched is the point of the
+//     endpoint rather than an incidental read. The posture it fits is already
+//     the fleet's: an admin may attach to any session and push as its owner.
+//   - PUSH and PULL are owner-or-admin. They carry the working tree itself —
+//     raw file bytes out, and writes into somebody's checkout — which puts them
+//     on the attach side of that line, not the list-sessions side.
+//
+// owner is the caller to authorize against, or nil for the team-visible read.
+func (s *Server) sessionForRPC(w http.ResponseWriter, r *http.Request, owner *User, verb string) (Session, bool) {
 	id := r.PathValue("id")
 	row, err := s.st.GetSession(r.Context(), id)
 	if err != nil {
@@ -2104,7 +2118,7 @@ func (s *Server) sessionForRPC(w http.ResponseWriter, r *http.Request, u User, v
 		writeErr(w, http.StatusInternalServerError, "internal", "could not read session")
 		return Session{}, false
 	}
-	if !authorizeOwnerOrAdmin(u, row) {
+	if owner != nil && !authorizeOwnerOrAdmin(*owner, row) {
 		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to "+verb+" this session")
 		return Session{}, false
 	}
