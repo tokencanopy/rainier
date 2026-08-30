@@ -530,9 +530,7 @@ func stageTimedOutTail(stage string, d time.Duration) string {
 // This is deliberately a shape match, not a diagnosis. The vault mints
 // OPTIMISTICALLY — no GitHub round-trip per mint (design §4.2) — so an observed
 // auth failure is the only signal that a token was revoked, and acting on it is
-// what turns the NEXT operation's opaque 403 into a named action. A false
-// positive costs one `rainier login --refresh github`; a false negative costs a
-// user who never finds out why their session cannot clone.
+// what turns the NEXT operation's opaque 403 into a named action.
 //
 // It is one of TWO detectors, and the asymmetry between them is deliberate. The
 // clone stage has git's OUTPUT and nothing else — it runs before any agent
@@ -544,7 +542,53 @@ func stageTimedOutTail(stage string, d time.Duration) string {
 // control event.
 var authRejectedRe = regexp.MustCompile(`(?i)authentication failed|\b401\b|\b403\b`)
 
-func authRejected(tail string) bool { return authRejectedRe.MatchString(tail) }
+// proxyRefusalRe matches a line in which the CONNECT PROXY — not GitHub —
+// refused the request. Such a line is DELETED before the auth patterns are
+// considered, and that exclusion is a fix for a real corruption, not a
+// nicety.
+//
+// egressd answers a CONNECT it will not tunnel with an HTTP status, and git
+// reports it verbatim:
+//
+//	fatal: unable to access '<url>': CONNECT tunnel failed, response 403
+//
+// which contains "403" and so matched authRejectedRe outright. A pure
+// network-policy failure — a host missing from the session's egress allowlist,
+// or (before internal/egress grew its 407 challenge) every git request that
+// session ever made — therefore emitted `credential_rejected`, and controld
+// flipped the user's GitHub credential to needs_refresh. The user is then told
+// to run `rainier login --refresh github`, which cannot fix an allowlist, and
+// a credential that was never rejected by anyone is left marked stale in the
+// vault. The proxy's own status code says nothing whatsoever about the token
+// git was carrying — git had not reached GitHub to present it.
+//
+// This was accepted at task review as a tolerable false positive costing "one
+// refresh". That was wrong on both counts: it fires on a NORMAL failure path
+// rather than an exotic one, and its cost is a wrong vault state plus a named
+// action that does not work, not a wasted command.
+//
+// The three wordings are libcurl's, which is the transport git uses: the
+// current one, the pre-7.72 one, and the aborted-tunnel one (which carries no
+// status code, so it could never have matched anyway — it is here so the set
+// reads as "proxy refusals" rather than "the two that happened to bite").
+var proxyRefusalRe = regexp.MustCompile(`(?i)CONNECT tunnel failed|HTTP code \d+ from proxy after CONNECT|Proxy CONNECT aborted`)
+
+// authRejected is per-LINE, not whole-tail, which is what keeps the exclusion
+// from becoming its own false negative: the clone stage can clone several
+// repositories, and one of them failing at the proxy must not suppress
+// another's genuine "Authentication failed". Only the proxy's own lines are
+// dropped; everything else is still read exactly as before.
+func authRejected(tail string) bool {
+	for _, line := range strings.Split(tail, "\n") {
+		if proxyRefusalRe.MatchString(line) {
+			continue
+		}
+		if authRejectedRe.MatchString(line) {
+			return true
+		}
+	}
+	return false
+}
 
 // stageFailedEvent composes the control event one failed stage reports.
 //
