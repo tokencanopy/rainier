@@ -36,7 +36,17 @@ func TestChainProgram(t *testing.T) {
 	setup := bootStage{Name: stageSetup, ScriptPath: "/w/setup.sh", RCPath: "/w/setup.rc"}
 	clone := bootStage{Name: stageClone, ScriptPath: "/w/clones.sh", RCPath: "/w/clone.rc"}
 	initS := bootStage{Name: stageInit, ScriptPath: "/w/init.sh", RCPath: "/w/init.rc"}
-	gitEnv := []envVar{{Name: "GIT_CONFIG_GLOBAL", Value: "/w/gitconfig"}}
+	gitEnv := []envVar{
+		{Name: "GIT_CONFIG_GLOBAL", Value: "/w/gitconfig"},
+		{Name: "GIT_TERMINAL_PROMPT", Value: "0"},
+		{Name: "GIT_ASKPASS", Value: ""},
+		{Name: "SSH_ASKPASS", Value: ""},
+	}
+	// Spelled out once, next to the cases that use it: the exports are a
+	// contract with a shell no unit test runs, and an empty value has to
+	// survive as `=''` rather than as a bare `=`.
+	const gitExports = `export GIT_CONFIG_GLOBAL='/w/gitconfig'; export GIT_TERMINAL_PROMPT='0'; ` +
+		`export GIT_ASKPASS=''; export SSH_ASKPASS=''; `
 
 	cases := []struct {
 		name   string
@@ -53,14 +63,14 @@ func TestChainProgram(t *testing.T) {
 			name:   "clone alone",
 			env:    gitEnv,
 			stages: []bootStage{clone},
-			want: `export GIT_CONFIG_GLOBAL='/w/gitconfig'; ` +
+			want: gitExports +
 				`sh /w/clones.sh; rc=$?; echo $rc > /w/clone.rc; [ "$rc" -eq 0 ] && exec "$@"; exit $rc`,
 		},
 		{
 			name:   "clone then init",
 			env:    gitEnv,
 			stages: []bootStage{clone, initS},
-			want: `export GIT_CONFIG_GLOBAL='/w/gitconfig'; ` +
+			want: gitExports +
 				`sh /w/clones.sh; rc=$?; echo $rc > /w/clone.rc; [ "$rc" -eq 0 ] || exit $rc; ` +
 				`sh /w/init.sh; rc=$?; echo $rc > /w/init.rc; [ "$rc" -eq 0 ] && exec "$@"; exit $rc`,
 		},
@@ -68,7 +78,7 @@ func TestChainProgram(t *testing.T) {
 			name:   "the whole chain",
 			env:    gitEnv,
 			stages: []bootStage{setup, clone, initS},
-			want: `export GIT_CONFIG_GLOBAL='/w/gitconfig'; ` +
+			want: gitExports +
 				`sh /w/setup.sh; rc=$?; echo $rc > /w/setup.rc; [ "$rc" -eq 0 ] || exit $rc; ` +
 				`sh /w/clones.sh; rc=$?; echo $rc > /w/clone.rc; [ "$rc" -eq 0 ] || exit $rc; ` +
 				`sh /w/init.sh; rc=$?; echo $rc > /w/init.rc; [ "$rc" -eq 0 ] && exec "$@"; exit $rc`,
@@ -367,7 +377,17 @@ func TestPrepareBoot(t *testing.T) {
 		if got, want := stages[2].Timeout, 120*time.Second; got != want {
 			t.Errorf("init timeout = %s, want %s", got, want)
 		}
-		if want := []envVar{{Name: "GIT_CONFIG_GLOBAL", Value: dir + "/gitconfig"}}; !reflect.DeepEqual(env, want) {
+		// The gitconfig, and the three that keep git from ever asking a human
+		// for a password. A refused mint makes the helper exit 1 with nothing
+		// on stdout, and git's answer to that is to prompt — on the session's
+		// own PTY, where it would block for the whole clone bound.
+		want := []envVar{
+			{Name: "GIT_CONFIG_GLOBAL", Value: dir + "/gitconfig"},
+			{Name: "GIT_TERMINAL_PROMPT", Value: "0"},
+			{Name: "GIT_ASKPASS", Value: ""},
+			{Name: "SSH_ASKPASS", Value: ""},
+		}
+		if !reflect.DeepEqual(env, want) {
 			t.Errorf("env = %v, want %v", env, want)
 		}
 		files := bootFiles(t, dir)
@@ -396,8 +416,8 @@ func TestPrepareBoot(t *testing.T) {
 		if got := stageNames(stages); !reflect.DeepEqual(got, []string{stageInit}) {
 			t.Fatalf("stages = %v, want just init", got)
 		}
-		if len(env) != 1 {
-			t.Fatalf("env = %v, want GIT_CONFIG_GLOBAL", env)
+		if len(env) != 4 {
+			t.Fatalf("env = %v, want the gitconfig and the three no-prompt variables", env)
 		}
 		if _, ok := bootFiles(t, dir)["gitconfig"]; !ok {
 			t.Error("no gitconfig for an init-only boot")
@@ -677,7 +697,13 @@ func TestChainAgainstRealSh(t *testing.T) {
 		}
 	})
 
-	t.Run("GIT_CONFIG_GLOBAL reaches the agent, not just the stages", func(t *testing.T) {
+	t.Run("the git environment reaches the agent, not just the stages", func(t *testing.T) {
+		// The agent's own `git push` is as much a user of this environment as
+		// the clone stage is — and it is the one nothing bounds, so a git that
+		// could still prompt there would hang the session's terminal forever.
+		// The variables are read back from a child that runs where the AGENT
+		// runs, after every stage, with `set -u` so an unset one is a failure
+		// rather than an empty string that looks like the right answer.
 		binDir, _ := stubGit(t, "exit 0\n")
 		root := t.TempDir()
 		dir := filepath.Join(root, ".rainier")
@@ -685,13 +711,16 @@ func TestChainAgainstRealSh(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		argv := chainArgv(vars, stages, []string{"sh", "-c", `echo "cfg=$GIT_CONFIG_GLOBAL"`, "child"})
+		argv := chainArgv(vars, stages, []string{"sh", "-c",
+			`set -u; echo "cfg=$GIT_CONFIG_GLOBAL prompt=[$GIT_TERMINAL_PROMPT] ask=[$GIT_ASKPASS] sshask=[$SSH_ASKPASS]"`,
+			"child"})
 		out, rc := runChain(t, binDir, argv)
 		if rc != 0 {
 			t.Fatalf("chain rc = %d (output %q)", rc, out)
 		}
-		if want := "cfg=" + filepath.Join(dir, "gitconfig"); !strings.Contains(out, want) {
-			t.Errorf("output %q, want %q — the agent's own git must use the same config", out, want)
+		want := "cfg=" + filepath.Join(dir, "gitconfig") + " prompt=[0] ask=[] sshask=[]"
+		if !strings.Contains(out, want) {
+			t.Errorf("output %q, want %q — the agent's own git must use the same config and never prompt", out, want)
 		}
 	})
 }

@@ -680,13 +680,24 @@ runs against one. Record what actually happened in the Result column.
 
 - **1** — `new --env` returns `409 conflict … run: rainier login`: no credential
   stored at all (that is the create gate; a *stale* one passes on purpose). The
-  session lands `failed` with `clone failed: rc 128: …`: read the tail. `could
-  not read Username` means the credential helper was never consulted — check
-  that the workspace gitconfig exists (`/workspace/.rainier/gitconfig`) and that
-  `GIT_CONFIG_GLOBAL` points at it. `Authentication failed` means GitHub said
-  no, and `rainier creds` will already read `needs_refresh`.
+  session lands `failed` with `clone failed: rc 128: …`: read the tail, and read
+  the line *above* the last one — git's own last word is rarely the diagnosis.
+  `could not read Username … terminal prompts disabled` means a helper was
+  consulted and DECLINED (that is what git prints after a helper produces no
+  credential, not what it prints when none ran); the reason is the line above
+  it, which is controld's own sentence and names the action to run. If that line
+  is instead `sh: /usr/local/bin/sessiond: not found`, the session image does not
+  install sessiond where the workspace gitconfig names it — that path is part of
+  the image contract. If there is no line above it at all, then the helper really
+  was never consulted: check that `/workspace/.rainier/gitconfig` exists and that
+  `GIT_CONFIG_GLOBAL` points at it. `Authentication failed` means GitHub said no
+  to a credential that WAS minted, and `rainier creds` will already read
+  `needs_refresh`.
 - **1, egress** — a clone that hangs and then times out on a fleet with R4
-  enforced usually means the allowlist: controld appends `github.com`,
+  enforced means the network, not the credential: the boot chain exports
+  `GIT_TERMINAL_PROMPT=0` (plus an empty `GIT_ASKPASS`/`SSH_ASKPASS`), so no git
+  in a session can stall on a password prompt — every credential failure is a
+  fast one. A hang is therefore the allowlist: controld appends `github.com`,
   `codeload.github.com` and `objects.githubusercontent.com` to a cloning
   session automatically, so check `/tmp/egressd.log` for a `deny` naming some
   other host (LFS and third-party submodules are the usual ones).
@@ -694,10 +705,12 @@ runs against one. Record what actually happened in the Result column.
   `[user]` block is missing, which happens when the owner's user row has no
   login/id — i.e. a session created before Plan 5's login stored one. Log in
   again.
-- **3** — the sentence must survive every hop *verbatim*. If the session shows
-  a generic `fatal: could not read Password`, the helper's stderr is being
-  swallowed somewhere; if the API shows a different wording than the session
-  does, someone rewrote a message that is supposed to travel unchanged.
+- **3** — the sentence must survive every hop *verbatim*, and it must arrive
+  *quickly*: a refusal is one failed operation, not a ten-minute stall. If git's
+  `terminal prompts disabled` line stands alone with nothing above it, the
+  helper's stderr is being swallowed somewhere; if the API shows a different
+  wording than the session does, someone rewrote a message that is supposed to
+  travel unchanged.
 - **5** — a cache-hit session that re-runs `setup` is the Plan 4 failure mode
   above (a stripped variable regressing); a cache-hit session that skips `init`
   is the Plan 5 one — `init` is deliberately absent from `setup_hash` and must
