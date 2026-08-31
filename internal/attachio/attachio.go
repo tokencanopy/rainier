@@ -18,8 +18,10 @@ package attachio
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,9 +31,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 
 	"rainier/internal/wire"
@@ -61,6 +65,25 @@ var ErrSessionNotReady = errors.New("attachio: session not ready")
 type DialError struct {
 	Status int
 	err    error
+}
+
+// Reason says why an established attach ended. Dial and local terminal setup
+// failures are errors instead, because no terminal session started.
+type Reason string
+
+const (
+	Detached     Reason = "detached"
+	Disconnected Reason = "disconnected"
+	Exited       Reason = "exited"
+)
+
+// Outcome is the non-error result of one established attach. LastSeq is the
+// last frame successfully rendered to local stdout and is therefore the only
+// safe reconnect cursor. ExitCode is meaningful only when Reason is Exited.
+type Outcome struct {
+	Reason   Reason
+	LastSeq  uint64
+	ExitCode int
 }
 
 func (e *DialError) Error() string { return e.err.Error() }
@@ -162,23 +185,29 @@ func ScanDetach(buf []byte) int {
 // It prints the exact status lines rattach always has:
 //
 //	"\r\n[detached at seq %d; session still running]\r\n"
-//	"\r\n[disconnected at seq %d; rattach --since %d to resume]\r\n"
+//	"\r\n[connection lost at seq %d]\r\n"
 //	"\r\n[session process exited: %d]\r\n"
 //
 // Raw mode is entered only when os.Stdin is a real tty; a non-tty stdin
 // (piped input, a test) skips raw mode entirely and announces a fixed
 // 80x24 size so the server's resize-first contract is still satisfied.
 //
-// Run returns nil for all three status lines above (detach, disconnect,
-// session exit — rattach's old os.Exit(0) cases) and a non-nil error for
-// anything that keeps the loop from ever starting (the dial, or putting the
-// terminal in raw mode). A dial failure that received an HTTP response
+// Run returns an explicit Outcome for all three status lines above and a
+// non-nil error for anything that keeps the loop from starting (the dial or
+// putting the terminal in raw mode). It stops every stdin/stdout goroutine
+// before returning, so a caller may safely start another Run after a
+// Disconnected outcome without creating two readers for the local terminal.
+// A dial failure that received an HTTP response
 // (rather than a pure transport failure) comes back as a *DialError;
 // errors.Is(err, ErrSessionNotReady) matches specifically controld's 503
 // session_not_ready — callers (cmd/rainier's `new`, retrying an attach
 // immediately after create) should match on that sentinel rather than
 // inspecting error text.
-func Run(ctx context.Context, wsURL string, header http.Header, since uint64) error {
+func Run(ctx context.Context, wsURL string, header http.Header, since uint64) (Outcome, error) {
+	return runWithIO(ctx, wsURL, header, since, os.Stdin, os.Stdout)
+}
+
+func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint64, stdin *os.File, stdout io.Writer) (Outcome, error) {
 	var opts *websocket.DialOptions
 	if header != nil {
 		opts = &websocket.DialOptions{HTTPHeader: header}
@@ -190,9 +219,9 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) er
 			// status, e.g. controld's 503 session_not_ready before the
 			// handshake) — as opposed to a transport failure, where resp is
 			// nil and err is returned unwrapped below.
-			return &DialError{Status: resp.StatusCode, err: err}
+			return Outcome{}, &DialError{Status: resp.StatusCode, err: err}
 		}
-		return err
+		return Outcome{}, err
 	}
 	defer c.CloseNow()
 	// See internal/server/server.go: match the server's raised read limit so
@@ -202,7 +231,7 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) er
 	// is deferred to Plan 2.
 	c.SetReadLimit(attachReadLimit)
 
-	fd := int(os.Stdin.Fd())
+	fd := int(stdin.Fd())
 	isTTY := term.IsTerminal(fd)
 
 	// restore is a no-op unless stdin is a real tty. Raw mode, and the
@@ -212,14 +241,24 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) er
 	// that case.
 	restore := func() {}
 	if isTTY {
+		// The WebSocket dial happens while the terminal is still in cooked mode.
+		// Drop anything queued during that gap only after the connection is ready,
+		// immediately before this attempt takes input ownership. Otherwise a line
+		// typed at a reconnect notice can execute remotely after recovery.
+		if err := discardPendingInput(stdin); err != nil {
+			return Outcome{}, err
+		}
 		oldState, err := term.MakeRaw(fd)
 		if err != nil {
-			return err
+			return Outcome{}, err
 		}
 		restore = func() { term.Restore(fd, oldState) }
 	}
 	defer restore()
 
+	var resizeDone chan struct{}
+	var resizeWG sync.WaitGroup
+	var winch chan os.Signal
 	if isTTY {
 		sendSize := func() {
 			w, h, err := term.GetSize(fd)
@@ -229,17 +268,17 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) er
 		}
 		sendSize() // required first message
 
-		winch := make(chan os.Signal, 1)
+		winch = make(chan os.Signal, 1)
 		signal.Notify(winch, syscall.SIGWINCH)
-		defer signal.Stop(winch)
-		winchDone := make(chan struct{})
-		defer close(winchDone)
+		resizeDone = make(chan struct{})
+		resizeWG.Add(1)
 		go func() {
+			defer resizeWG.Done()
 			for {
 				select {
 				case <-winch:
 					sendSize()
-				case <-winchDone:
+				case <-resizeDone:
 					return
 				}
 			}
@@ -251,7 +290,12 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) er
 	}
 
 	var lastSeq atomic.Uint64
-	// decided/claim/finish together decide which of the reader/stdin
+	// If the connection drops before its first frame, resume from the caller's
+	// actual cursor rather than inventing zero. That includes SinceAll: changing
+	// the sentinel to zero would silently turn a requested full-log replay into
+	// a current-screen snapshot. A fully rendered frame replaces this value.
+	lastSeq.Store(since)
+	// decided/claim together decide which of the reader/stdin
 	// goroutines gets to own Run's outcome — exactly one of them prints its
 	// status line and unblocks Run, whichever notices its end condition
 	// first. Without claim's CAS gate, the loser — e.g. the reader
@@ -261,63 +305,62 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) er
 	// original os.Exit(0) sidestepped this entirely by ending the whole
 	// process on whichever path got there first).
 	//
-	// claim and finish are deliberately separate calls, not one combined
-	// win(err): claim only decides (CAS), and finish is what actually sends
-	// to result and lets Run's `return <-result` complete. Combining them —
-	// an earlier version of this file sent to result as part of the same
-	// call as the CAS — let Run return to ITS caller while the winning
-	// goroutine was still inside restore()/fmt.Printf(), still writing to
-	// os.Stdout; a caller that swaps os.Stdout right after Run returns (a
-	// test capturing output, e.g.) is entitled to assume Run has stopped
-	// touching it by then. The race detector caught exactly that. Calling
-	// finish only once restore()+fmt.Printf() have both already run is what
-	// makes "Run has returned" a true happens-after for "this goroutine is
-	// done touching the terminal".
-	//
-	// That earlier fix was still incomplete on its own: it only gated the
-	// three DECISION paths (disconnect/exit/detach), not the reader's
-	// ordinary os.Stdout.Write(m.Data) for plain "snapshot"/"output"
-	// messages. With output still streaming at the instant of detach, the
-	// reader can be mid-write to os.Stdout the moment the stdin goroutine
-	// claims and Run returns — a caller that reassigns os.Stdout right
-	// after Run returns (a test capturing output, e.g.) races that
-	// in-flight write. A bare `if !decided.Load() { write }` check doesn't
-	// close this: decided can flip to true, and the deciding goroutine's
-	// finish() can unblock Run and hand control back to the caller, all
-	// while a write that passed the check a moment earlier is still in
-	// progress. stdoutMu is what actually serializes "touching stdout" —
-	// every write (the reader's ordinary writes AND each decision path's
-	// restore()+fmt.Printf()) holds it, and a decision path only calls
-	// finish() after releasing it, so by the time Run returns, no goroutine
-	// can still be mid-write: any reader write already in flight has
-	// necessarily completed (it holds the mutex the decision path is
-	// waiting on), and any reader write that hasn't started yet will see
-	// decided already true once it acquires the mutex and skip.
+	// stdoutMu serializes ordinary terminal writes with the winning status
+	// line. Run additionally closes the socket and joins both goroutines before
+	// returning, so neither stdin nor stdout remains owned by an old attempt
+	// when the product CLI reconnects.
 	var decided atomic.Bool
 	var stdoutMu sync.Mutex
-	result := make(chan error, 1)
+	type runResult struct {
+		out Outcome
+		err error
+	}
+	result := make(chan runResult, 1)
 	claim := func() bool { return decided.CompareAndSwap(false, true) }
-	finish := func(err error) { result <- err }
+	finish := func(out Outcome, err error) { result <- runResult{out: out, err: err} }
+	var pumps sync.WaitGroup
+	pumps.Add(2)
 
 	go func() {
+		defer pumps.Done()
 		for {
 			var m wire.ServerMsg
 			if err := wsjson.Read(ctx, c, &m); err != nil {
 				if !claim() {
 					return
 				}
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					finish(Outcome{}, ctxErr)
+					return
+				}
+				if !retryableWebSocketReadError(err) {
+					finish(Outcome{LastSeq: lastSeq.Load()}, fmt.Errorf("terminal connection closed: %w", err))
+					return
+				}
 				stdoutMu.Lock()
 				restore()
-				fmt.Printf("\r\n[disconnected at seq %d; rattach --since %d to resume]\r\n", lastSeq.Load(), lastSeq.Load())
+				seq := lastSeq.Load()
+				fmt.Fprintf(stdout, "\r\n[connection lost at seq %d]\r\n", seq)
 				stdoutMu.Unlock()
-				finish(nil)
+				finish(Outcome{Reason: Disconnected, LastSeq: seq}, nil)
 				return
 			}
 			switch m.Type {
 			case "snapshot", "output":
 				stdoutMu.Lock()
 				if !decided.Load() {
-					os.Stdout.Write(m.Data)
+					n, writeErr := stdout.Write(m.Data)
+					if writeErr == nil && n != len(m.Data) {
+						writeErr = io.ErrShortWrite
+					}
+					if writeErr != nil {
+						if claim() {
+							restore()
+							finish(Outcome{LastSeq: lastSeq.Load()}, fmt.Errorf("writing terminal output: %w", writeErr))
+						}
+						stdoutMu.Unlock()
+						return
+					}
 					if m.Seq > 0 {
 						lastSeq.Store(m.Seq)
 					}
@@ -332,18 +375,28 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) er
 				}
 				stdoutMu.Lock()
 				restore()
-				fmt.Printf("\r\n[session process exited: %d]\r\n", m.ExitCode)
+				fmt.Fprintf(stdout, "\r\n[session process exited: %d]\r\n", m.ExitCode)
 				stdoutMu.Unlock()
-				finish(nil)
+				finish(Outcome{Reason: Exited, LastSeq: lastSeq.Load(), ExitCode: m.ExitCode}, nil)
+				return
+			default:
+				if !claim() {
+					return
+				}
+				finish(Outcome{LastSeq: lastSeq.Load()}, errors.New("terminal protocol: unsupported server message type"))
 				return
 			}
 		}
 	}()
 
 	go func() {
+		defer pumps.Done()
 		buf := make([]byte, 1024)
 		for {
-			n, err := os.Stdin.Read(buf)
+			n, err, stopped := readStdin(decided.Load, stdin, buf)
+			if stopped {
+				return
+			}
 			if err != nil {
 				// Stdin closed (EOF on a pipe, or a read error on a real
 				// tty). There's nothing left to forward, but the session may
@@ -369,12 +422,85 @@ func Run(ctx context.Context, wsURL string, header http.Header, since uint64) er
 			}
 			stdoutMu.Lock()
 			restore()
-			fmt.Printf("\r\n[detached at seq %d; session still running]\r\n", lastSeq.Load())
+			seq := lastSeq.Load()
+			fmt.Fprintf(stdout, "\r\n[detached at seq %d; session still running]\r\n", seq)
 			stdoutMu.Unlock()
-			finish(nil)
+			finish(Outcome{Reason: Detached, LastSeq: seq}, nil)
 			return
 		}
 	}()
 
-	return <-result
+	r := <-result
+	// Unblock the losing WebSocket reader, then wait for both pumps. The stdin
+	// side polls with a bounded timeout specifically so it observes decided and
+	// joins here even when nobody is typing.
+	c.CloseNow()
+	pumps.Wait()
+	if resizeDone != nil {
+		signal.Stop(winch)
+		close(resizeDone)
+		resizeWG.Wait()
+	}
+	return r.out, r.err
+}
+
+func retryableWebSocketReadError(err error) bool {
+	if errors.Is(err, websocket.ErrMessageTooBig) {
+		return false
+	}
+	var syntaxErr *json.SyntaxError
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &syntaxErr) || errors.As(err, &typeErr) {
+		return false
+	}
+	switch websocket.CloseStatus(err) {
+	case -1, websocket.StatusNoStatusRcvd, websocket.StatusAbnormalClosure,
+		websocket.StatusGoingAway, websocket.StatusInternalError,
+		websocket.StatusServiceRestart, websocket.StatusTryAgainLater,
+		websocket.StatusBadGateway:
+		return true
+	default:
+		return false
+	}
+}
+
+func discardPendingInput(stdin *os.File) error {
+	fd := int(stdin.Fd())
+	if !term.IsTerminal(fd) {
+		return nil
+	}
+	return flushTTYInput(fd)
+}
+
+const stdinPollInterval = 100 * time.Millisecond
+
+// readStdin waits for one local input chunk while periodically checking done.
+// A plain os.File.Read on a terminal can block forever, which used to leave an
+// old Run's goroutine alive after disconnect. Poll makes ownership bounded so
+// the reconnecting caller never creates two readers for the same terminal.
+func readStdin(done func() bool, stdin *os.File, buf []byte) (n int, err error, stopped bool) {
+	fd := int32(stdin.Fd())
+	for {
+		if done() {
+			return 0, nil, true
+		}
+		fds := []unix.PollFd{{Fd: fd, Events: unix.POLLIN}}
+		ready, pollErr := unix.Poll(fds, int(stdinPollInterval/time.Millisecond))
+		if pollErr != nil {
+			if errors.Is(pollErr, syscall.EINTR) {
+				continue
+			}
+			return 0, pollErr, false
+		}
+		if ready == 0 {
+			continue
+		}
+		if fds[0].Revents&(unix.POLLIN|unix.POLLHUP) != 0 {
+			n, err := stdin.Read(buf)
+			return n, err, false
+		}
+		if fds[0].Revents&(unix.POLLERR|unix.POLLNVAL) != 0 {
+			return 0, fmt.Errorf("polling stdin: event %#x", fds[0].Revents), false
+		}
+	}
 }

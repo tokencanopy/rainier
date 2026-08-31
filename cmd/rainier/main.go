@@ -562,6 +562,7 @@ func runNew(args []string) error {
 	image := fs.String("image", "", "container image (overrides the environment's)")
 	egress := fs.String("egress", "", "comma-separated egress allowlist (overrides the environment's)")
 	detach := fs.Bool("detach", false, "create without attaching")
+	idempotencyKey := fs.String("idempotency-key", "", "stable create retry key (developer tooling)")
 	fs.Parse(reorderArgs(fs, args))
 	cmdArgs := fs.Args() // whatever followed "--"
 
@@ -582,7 +583,11 @@ func runNew(args []string) error {
 	}
 
 	var resp sessionEnvelope
-	if err := c.Do(http.MethodPost, "/v1/sessions", body, &resp, cli.IdempotencyKey(cli.RandHex(8))); err != nil {
+	key := *idempotencyKey
+	if key == "" {
+		key = cli.RandHex(8)
+	}
+	if err := c.Do(http.MethodPost, "/v1/sessions", body, &resp, cli.IdempotencyKey(key)); err != nil {
 		return err
 	}
 	fmt.Println(resp.Session.ID)
@@ -596,7 +601,7 @@ func runNew(args []string) error {
 	// created seconds ago has a log measured in kilobytes, so replaying it
 	// from the first entry costs nothing and is the only way the user sees
 	// what happened before they got here.
-	return attachWithRetry(c, cfg, resp.Session.ID, wire.SinceAll)
+	return attachWithRetry(cfg, resp.Session.ID, wire.SinceAll)
 }
 
 // attachWithRetry is `new`'s "attach immediately and stream everything"
@@ -609,22 +614,82 @@ func runNew(args []string) error {
 // any other error (including a *DialError for some other status) is
 // treated as fatal immediately rather than burning the retry budget on a
 // failure that will never resolve itself.
-func attachWithRetry(c *cli.Client, cfg cli.Config, id string, since uint64) error {
+func attachWithRetry(cfg cli.Config, id string, since uint64) error {
+	return attachWithRetrySleep(cfg, id, since, time.Sleep)
+}
+
+func attachWithRetrySleep(cfg cli.Config, id string, since uint64, sleep func(time.Duration)) error {
 	wsURL := wsURLFor(cfg.ServerURL, id)
 	header := http.Header{"Authorization": {"Bearer " + cfg.Token}}
 	deadline := time.Now().Add(60 * time.Second)
+	established := false
+	backoff := 100 * time.Millisecond
 
 	for {
-		err := attachio.Run(context.Background(), wsURL, header, since)
+		attemptStarted := time.Now()
+		outcome, err := attachio.Run(context.Background(), wsURL, header, since)
 		if err == nil {
-			return nil
+			if outcome.Reason != attachio.Disconnected {
+				return nil
+			}
+			// The server sequence is the acknowledgement that a frame reached
+			// local stdout. Resume after it: never repaint the whole terminal and
+			// never skip output the user had not actually seen.
+			established = true
+			since = outcome.LastSeq
+			if time.Since(attemptStarted) >= 10*time.Second {
+				backoff = 100 * time.Millisecond
+			}
+			fmt.Printf("[reconnecting in %s…]\n", backoff)
+			sleep(backoff)
+			backoff = nextAttachBackoff(backoff)
+			continue
 		}
+
+		if established {
+			if !retryableAttachError(err) {
+				return err
+			}
+			fmt.Printf("[reconnecting in %s…]\n", backoff)
+			sleep(backoff)
+			backoff = nextAttachBackoff(backoff)
+			continue
+		}
+
 		if !errors.Is(err, attachio.ErrSessionNotReady) || !time.Now().Before(deadline) {
 			return err
 		}
 		fmt.Println("waiting for session…")
-		time.Sleep(500 * time.Millisecond)
+		sleep(500 * time.Millisecond)
 	}
+}
+
+func nextAttachBackoff(current time.Duration) time.Duration {
+	next := current * 2
+	if next > 2*time.Second {
+		return 2 * time.Second
+	}
+	return next
+}
+
+// retryableAttachError is deliberately narrow. Once a viewer has connected,
+// transport failures and transient gateway statuses can recover; auth,
+// authorization, not-found, protocol, and local-terminal failures cannot and
+// must not become an infinite loop. A plain websocket transport failure is a
+// *url.Error, while an HTTP response is attachio.DialError.
+func retryableAttachError(err error) bool {
+	var dialErr *attachio.DialError
+	if errors.As(err, &dialErr) {
+		switch dialErr.Status {
+		case http.StatusTooManyRequests, http.StatusBadGateway,
+			http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		default:
+			return false
+		}
+	}
+	var transportErr *url.Error
+	return errors.As(err, &transportErr)
 }
 
 // ---------------------------------------------------------------------------
@@ -745,14 +810,87 @@ func formatAge(rfc3339 string) string {
 func runAttach(args []string) error {
 	ref, cursor := attachFlags(args)
 
-	cfg, _, id, err := resolveClientAndID(ref)
+	cfg, c, id, err := resolveClientAndIDForAttach(ref)
 	if err != nil {
 		return err
 	}
+	if err := prepareAttach(c, id); err != nil {
+		return err
+	}
+	return attachWithRetry(cfg, id, cursor)
+}
 
-	wsURL := wsURLFor(cfg.ServerURL, id)
-	header := http.Header{"Authorization": {"Bearer " + cfg.Token}}
-	return attachio.Run(context.Background(), wsURL, header, cursor)
+// prepareAttach makes `rainier attach` the one entry command for an existing
+// session. Running/starting sessions can go straight to the attach plane;
+// suspended sessions first use the ordinary resume endpoint. No convenience
+// endpoint is needed server-side — the CLI is the only consumer that wants
+// these two operations composed.
+//
+// A failed session is deliberately admitted. Plan 5 made a failed setup
+// attachable while its runner is still connected so `--since 0` can show the
+// complete diagnostic log; the attach endpoint remains the authority on
+// whether that particular failed row still has a live sessiond behind it.
+func prepareAttach(c *cli.Client, id string) error {
+	row, err := getSession(c, id)
+	if err != nil {
+		return err
+	}
+	switch row.State {
+	case "running", "creating", "queued", "failed":
+		return nil
+	case "suspended_warm", "suspended_cold":
+		var resumed sessionEnvelope
+		resumeErr := c.Do(http.MethodPost, "/v1/sessions/"+id+"/resume", nil, &resumed)
+		if resumeErr == nil {
+			return nil
+		}
+
+		// Another client can win the resume between our GET and POST. A conflict
+		// can arrive before that winner's state is committed, so converge for a
+		// short bounded window instead of relying on one immediate re-read. The
+		// structured error code keeps capacity/auth failures immediate and
+		// preserves their more useful original message.
+		var apiErr *cli.APIError
+		if !errors.As(resumeErr, &apiErr) || apiErr.Code != "conflict" {
+			return resumeErr
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		for {
+			current, readErr := getSessionContext(ctx, c, id)
+			if readErr != nil {
+				return resumeErr
+			}
+			switch current.State {
+			case "running", "creating":
+				return nil
+			case "suspended_warm", "suspended_cold":
+			case "queued":
+				return nil
+			default:
+				return resumeErr
+			}
+			select {
+			case <-ctx.Done():
+				return resumeErr
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	default:
+		return fmt.Errorf("session %s is %s and cannot be attached", id, row.State)
+	}
+}
+
+func getSession(c *cli.Client, id string) (session, error) {
+	return getSessionContext(context.Background(), c, id)
+}
+
+func getSessionContext(ctx context.Context, c *cli.Client, id string) (session, error) {
+	var resp sessionEnvelope
+	if err := c.DoContext(ctx, http.MethodGet, "/v1/sessions/"+id, nil, &resp); err != nil {
+		return session{}, err
+	}
+	return resp.Session, nil
 }
 
 // attachFlags parses `attach`'s arguments into the session ref and the
@@ -1682,7 +1820,14 @@ func requireLogin() (cli.Config, error) {
 // rm uses resolveClientAndIDIncludingTerminal because a failed session can
 // still own a live container.
 func resolveClientAndID(ref string) (cli.Config, *cli.Client, string, error) {
-	return resolveClientAndIDWithTerminal(ref, false)
+	return resolveClientAndIDWithScope(ref, resolveActive)
+}
+
+// resolveClientAndIDForAttach includes failed rows because a failed setup can
+// still have a live diagnostic terminal. Other historical terminal rows stay
+// hidden, so a stale dead/destroyed name is never selected as an attach target.
+func resolveClientAndIDForAttach(ref string) (cli.Config, *cli.Client, string, error) {
+	return resolveClientAndIDWithScope(ref, resolveAttachable)
 }
 
 // resolveClientAndIDIncludingTerminal is the rm variant. A failed create is
@@ -1690,16 +1835,16 @@ func resolveClientAndID(ref string) (cli.Config, *cli.Client, string, error) {
 // slot, so deletion must be able to find it by the same name the user passed
 // to new.
 func resolveClientAndIDIncludingTerminal(ref string) (cli.Config, *cli.Client, string, error) {
-	return resolveClientAndIDWithTerminal(ref, true)
+	return resolveClientAndIDWithScope(ref, resolveAll)
 }
 
-func resolveClientAndIDWithTerminal(ref string, includeTerminal bool) (cli.Config, *cli.Client, string, error) {
+func resolveClientAndIDWithScope(ref string, scope sessionResolveScope) (cli.Config, *cli.Client, string, error) {
 	cfg, err := requireLogin()
 	if err != nil {
 		return cli.Config{}, nil, "", err
 	}
 	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
-	id, err := resolveSessionIDWithTerminal(c, cfg.OwnerID, ref, includeTerminal)
+	id, err := resolveSessionIDWithScope(c, cfg.OwnerID, ref, scope)
 	if err != nil {
 		return cli.Config{}, nil, "", err
 	}
@@ -1737,10 +1882,25 @@ func resolveClientAndIDWithTerminal(ref string, includeTerminal bool) (cli.Confi
 // only for a config written before logins carried it — owner-preference is
 // then unavailable and an ambiguous name errors, exactly as it did.
 func resolveSessionID(c *cli.Client, myOwnerID, ref string) (string, error) {
-	return resolveSessionIDWithTerminal(c, myOwnerID, ref, false)
+	return resolveSessionIDWithScope(c, myOwnerID, ref, resolveActive)
 }
 
 func resolveSessionIDWithTerminal(c *cli.Client, myOwnerID, ref string, includeTerminal bool) (string, error) {
+	if includeTerminal {
+		return resolveSessionIDWithScope(c, myOwnerID, ref, resolveAll)
+	}
+	return resolveSessionIDWithScope(c, myOwnerID, ref, resolveActive)
+}
+
+type sessionResolveScope int
+
+const (
+	resolveActive sessionResolveScope = iota
+	resolveAttachable
+	resolveAll
+)
+
+func resolveSessionIDWithScope(c *cli.Client, myOwnerID, ref string, scope sessionResolveScope) (string, error) {
 	if strings.HasPrefix(ref, "sess_") {
 		return ref, nil
 	}
@@ -1754,7 +1914,7 @@ func resolveSessionIDWithTerminal(c *cli.Client, myOwnerID, ref string, includeT
 	cursor := ""
 	for {
 		q := url.Values{}
-		if includeTerminal {
+		if scope != resolveActive {
 			q.Set("all", "true")
 		}
 		q.Set("name", ref)
@@ -1771,6 +1931,9 @@ func resolveSessionIDWithTerminal(c *cli.Client, myOwnerID, ref string, includeT
 		}
 		for _, s := range page.Sessions {
 			if s.Name == ref {
+				if scope == resolveAttachable && terminalSessionState(s.State) && s.State != "failed" {
+					continue
+				}
 				matches = append(matches, match{
 					id: s.ID, owner: s.OwnerID, terminal: terminalSessionState(s.State),
 				})

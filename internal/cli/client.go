@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -52,6 +53,16 @@ type errorEnvelope struct {
 	} `json:"error"`
 }
 
+// APIError is controld's stable non-2xx error envelope. Error preserves the
+// CLI's existing "code: message" text while errors.As lets callers make
+// decisions from Code instead of parsing prose.
+type APIError struct {
+	Code    string
+	Message string
+}
+
+func (e *APIError) Error() string { return e.Code + ": " + e.Message }
+
 // RandHex returns n random bytes rendered as 2n lowercase hex characters —
 // used for X-Request-Id (below) and by cmd/rainier for a fresh
 // Idempotency-Key per `rainier new` invocation.
@@ -75,7 +86,13 @@ func RandHex(n int) string {
 // Errors are send's, below — including the error-envelope decoding every
 // non-2xx response on this API gets.
 func (c *Client) Do(method, path string, in, out any, opts ...Option) error {
-	resp, err := c.send(method, path, in, opts...)
+	return c.DoContext(context.Background(), method, path, in, out, opts...)
+}
+
+// DoContext is Do with the request bound to ctx. Use it for polling and
+// other bounded operations so cancellation can interrupt a stalled transport.
+func (c *Client) DoContext(ctx context.Context, method, path string, in, out any, opts ...Option) error {
+	resp, err := c.send(ctx, method, path, in, opts...)
 	if err != nil {
 		return err
 	}
@@ -99,7 +116,7 @@ func (c *Client) Do(method, path string, in, out any, opts ...Option) error {
 // returned as an error, with the body already closed, so a caller only ever
 // holds a body it is going to read.
 func (c *Client) Open(method, path string, opts ...Option) (io.ReadCloser, error) {
-	resp, err := c.send(method, path, nil, opts...)
+	resp, err := c.send(context.Background(), method, path, nil, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +134,7 @@ func (c *Client) Open(method, path string, opts ...Option) (io.ReadCloser, error
 // on the failed decode. A transport failure (DNS, connection refused, timeout)
 // is returned exactly as http.Client.Do returned it — no wrapping — so callers
 // and tests can match on the underlying error type.
-func (c *Client) send(method, path string, in any, opts ...Option) (*http.Response, error) {
+func (c *Client) send(ctx context.Context, method, path string, in any, opts ...Option) (*http.Response, error) {
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
@@ -127,7 +144,7 @@ func (c *Client) send(method, path string, in any, opts ...Option) (*http.Respon
 		body = bytes.NewReader(b)
 	}
 
-	req, err := http.NewRequest(method, c.Base+path, body)
+	req, err := http.NewRequestWithContext(ctx, method, c.Base+path, body)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +180,7 @@ func (c *Client) send(method, path string, in any, opts ...Option) (*http.Respon
 			}
 			return nil, fmt.Errorf("unexpected response: %d %s", resp.StatusCode, text)
 		}
-		return nil, fmt.Errorf("%s: %s", env.Error.Code, env.Error.Message)
+		return nil, &APIError{Code: env.Error.Code, Message: env.Error.Message}
 	}
 	return resp, nil
 }

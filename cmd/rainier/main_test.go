@@ -12,6 +12,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 
 	"rainier/internal/cli"
 	"rainier/internal/wire"
@@ -203,6 +207,37 @@ func TestResolveSessionIDNotFound(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `no session named "nope" found`) {
 		t.Fatalf("error = %q, want the not-found message", err.Error())
+	}
+}
+
+func TestAttachNameResolutionIncludesOnlyFailedTerminalRows(t *testing.T) {
+	ts := pagedSessions(t, map[string]sessionsEnvelope{
+		"": {Sessions: []session{
+			{ID: "sess_failed", Name: "diagnostic-box", OwnerID: "usr_synthetic", State: "failed"},
+			{ID: "sess_dead", Name: "diagnostic-box", OwnerID: "usr_synthetic", State: "dead"},
+			{ID: "sess_destroyed", Name: "diagnostic-box", OwnerID: "usr_synthetic", State: "destroyed"},
+		}},
+	})
+	id, err := resolveSessionIDWithScope(&cli.Client{Base: ts.URL}, "usr_synthetic", "diagnostic-box", resolveAttachable)
+	if err != nil {
+		t.Fatalf("resolve attachable name: %v", err)
+	}
+	if id != "sess_failed" {
+		t.Fatalf("resolved id = %q, want the failed diagnostic session", id)
+	}
+
+	live := pagedSessions(t, map[string]sessionsEnvelope{
+		"": {Sessions: []session{
+			{ID: "sess_own_failed", Name: "shared-box", OwnerID: "usr_synthetic", State: "failed"},
+			{ID: "sess_live", Name: "shared-box", OwnerID: "usr_teammate", State: "running"},
+		}},
+	})
+	id, err = resolveSessionIDWithScope(&cli.Client{Base: live.URL}, "usr_synthetic", "shared-box", resolveAttachable)
+	if err != nil {
+		t.Fatalf("resolve live attachable name: %v", err)
+	}
+	if id != "sess_own_failed" {
+		t.Fatalf("resolved id = %q, want the caller's own failed diagnostic row", id)
 	}
 }
 
@@ -1149,5 +1184,290 @@ func TestAttachFlagsCursor(t *testing.T) {
 				t.Fatalf("attachFlags(%q) = (%q, %d), want (%q, %d)", tc.args, ref, cursor, tc.ref, tc.cursor)
 			}
 		})
+	}
+}
+
+// TestPrepareAttach makes `attach` the only lifecycle command a terminal
+// user needs. The API already has separate read and resume operations; this
+// test pins how the CLI composes them without adding a second server-side
+// lifecycle path.
+func TestPrepareAttach(t *testing.T) {
+	for _, state := range []string{"running", "creating", "queued", "failed"} {
+		t.Run("does not resume "+state, func(t *testing.T) {
+			var resumes int
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/sessions/sess_attach":
+					json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: state}})
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/sessions/sess_attach/resume":
+					resumes++
+					json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: "running"}})
+				default:
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL.RequestURI())
+				}
+			}))
+			defer ts.Close()
+
+			if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach"); err != nil {
+				t.Fatalf("prepareAttach: %v", err)
+			}
+			if resumes != 0 {
+				t.Fatalf("resume requests = %d, want 0 for state %q", resumes, state)
+			}
+		})
+	}
+
+	for _, state := range []string{"suspended_warm", "suspended_cold"} {
+		t.Run("resumes "+state, func(t *testing.T) {
+			var resumes int
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v1/sessions/sess_attach":
+					json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: state}})
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/sessions/sess_attach/resume":
+					resumes++
+					json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: "running"}})
+				default:
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL.RequestURI())
+				}
+			}))
+			defer ts.Close()
+
+			if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach"); err != nil {
+				t.Fatalf("prepareAttach: %v", err)
+			}
+			if resumes != 1 {
+				t.Fatalf("resume requests = %d, want 1 for state %q", resumes, state)
+			}
+		})
+	}
+
+	t.Run("refuses a permanently ended session", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: "dead"}})
+		}))
+		defer ts.Close()
+
+		err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach")
+		if err == nil || !strings.Contains(err.Error(), `session sess_attach is dead and cannot be attached`) {
+			t.Fatalf("prepareAttach error = %v, want a direct dead-session error", err)
+		}
+	})
+
+	t.Run("a concurrent resume winner converges", func(t *testing.T) {
+		gets := 0
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.Method {
+			case http.MethodGet:
+				gets++
+				state := "suspended_warm"
+				if gets > 3 {
+					state = "running"
+				}
+				json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: state}})
+			case http.MethodPost:
+				w.WriteHeader(http.StatusConflict)
+				io.WriteString(w, `{"error":{"code":"conflict","message":"session is not suspended"}}`)
+			}
+		}))
+		defer ts.Close()
+
+		if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach"); err != nil {
+			t.Fatalf("prepareAttach: %v", err)
+		}
+		if gets != 4 {
+			t.Fatalf("GET count = %d, want 4 (initial state plus delayed convergence)", gets)
+		}
+	})
+
+	t.Run("a resume failure is preserved when the state did not advance", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.Method == http.MethodGet {
+				json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: "suspended_cold"}})
+				return
+			}
+			w.WriteHeader(http.StatusConflict)
+			io.WriteString(w, `{"error":{"code":"no_capacity","message":"runner is full"}}`)
+		}))
+		defer ts.Close()
+
+		err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach")
+		if err == nil || !strings.Contains(err.Error(), "no_capacity: runner is full") {
+			t.Fatalf("prepareAttach error = %v, want the original resume failure", err)
+		}
+	})
+}
+
+func TestAttachWithRetryBacksOffTransientDisconnects(t *testing.T) {
+	requests := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		if requests < 3 {
+			c.Close(websocket.StatusGoingAway, "synthetic transient close")
+			return
+		}
+		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "exit", ExitCode: 0})
+	}))
+	defer ts.Close()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+	origStdin := os.Stdin
+	os.Stdin = stdinR
+	t.Cleanup(func() { os.Stdin = origStdin })
+
+	var delays []time.Duration
+	err = attachWithRetrySleep(cli.Config{ServerURL: ts.URL, Token: "rnr_synthetic"}, "sess_reconnect", 0, func(d time.Duration) {
+		delays = append(delays, d)
+	})
+	if err != nil {
+		t.Fatalf("attachWithRetrySleep: %v", err)
+	}
+	if !slices.Equal(delays, []time.Duration{100 * time.Millisecond, 200 * time.Millisecond}) {
+		t.Fatalf("reconnect delays = %v, want exponential [100ms 200ms]", delays)
+	}
+}
+
+func TestAttachWithRetryDoesNotRetryPolicyClose(t *testing.T) {
+	requests := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		c.Close(websocket.StatusPolicyViolation, "synthetic permanent close")
+	}))
+	defer ts.Close()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+	origStdin := os.Stdin
+	os.Stdin = stdinR
+	t.Cleanup(func() { os.Stdin = origStdin })
+
+	err = attachWithRetrySleep(cli.Config{ServerURL: ts.URL, Token: "rnr_synthetic"}, "sess_reconnect", 0, func(time.Duration) {})
+	if err == nil || websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
+		t.Fatalf("error = %v, want policy close", err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want one attempt for a permanent close", requests)
+	}
+}
+
+func TestRunNewUsesSuppliedIdempotencyKey(t *testing.T) {
+	var gotKey string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("Idempotency-Key")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_synthetic", State: "queued"}})
+	}))
+	defer ts.Close()
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_synthetic"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureStdout(t, func() error {
+		return runNew([]string{"--detach", "--name", "synthetic-box", "--idempotency-key", "synthetic-create-key"})
+	}); err != nil {
+		t.Fatalf("runNew: %v", err)
+	}
+	if gotKey != "synthetic-create-key" {
+		t.Fatalf("Idempotency-Key = %q, want supplied recovery key", gotKey)
+	}
+}
+
+// TestAttachWithRetryReconnectsFromTheRenderedCursor crosses the real
+// WebSocket boundary. The first established viewer renders seq 17 and loses
+// its transport; the next dial gets a transient 503; the third must ask for
+// entries after 17 and finish only when the session itself reports exit.
+func TestAttachWithRetryReconnectsFromTheRenderedCursor(t *testing.T) {
+	requests := 0
+	var resumedQueries []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if requests > 1 {
+			resumedQueries = append(resumedQueries, r.URL.Query().Get("since"))
+		}
+		if requests == 2 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(w, `{"error":{"code":"session_not_ready","message":"runner is reconnecting"}}`)
+			return
+		}
+
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		if requests == 1 {
+			wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "output", Seq: 17, Data: []byte("before-drop")})
+			c.Close(websocket.StatusGoingAway, "synthetic network interruption")
+			return
+		}
+		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "output", Seq: 18, Data: []byte("after-drop")})
+		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "exit", ExitCode: 0})
+	}))
+	defer ts.Close()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe (stdin): %v", err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+	origStdin := os.Stdin
+	os.Stdin = stdinR
+	t.Cleanup(func() { os.Stdin = origStdin })
+
+	out, err := captureStdout(t, func() error {
+		cfg := cli.Config{ServerURL: ts.URL, Token: "rnr_synthetic"}
+		return attachWithRetry(cfg, "sess_reconnect", 0)
+	})
+	if err != nil {
+		t.Fatalf("attachWithRetry: %v", err)
+	}
+	if requests != 3 {
+		t.Fatalf("attach requests = %d, want 3 (connected, transient 503, reconnected)", requests)
+	}
+	if !slices.Equal(resumedQueries, []string{"17", "17"}) {
+		t.Fatalf("reconnect cursors = %v, want [17 17]", resumedQueries)
+	}
+	for _, want := range []string{"before-drop", "after-drop", "reconnecting"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("attach output missing %q:\n%s", want, out)
+		}
 	}
 }

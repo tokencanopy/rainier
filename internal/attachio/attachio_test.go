@@ -1,8 +1,10 @@
 package attachio
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +16,8 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 
 	"rainier/internal/wire"
 )
@@ -46,6 +50,17 @@ func TestAttachURL(t *testing.T) {
 			t.Errorf("AttachURL(...) = %q, want a bare /attach URL", got)
 		}
 	})
+}
+
+type shortWriter struct {
+	bytes.Buffer
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	return w.Buffer.Write(p[:len(p)-1])
 }
 
 // TestCursor pins the one mapping both CLIs share: a `--since` flag that was
@@ -108,7 +123,7 @@ func TestRunDialsWithTheCursor(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			Run(context.Background(), tc.url("ws"+strings.TrimPrefix(ts.URL, "http")), nil, tc.since)
+			_, _ = Run(context.Background(), tc.url("ws"+strings.TrimPrefix(ts.URL, "http")), nil, tc.since)
 
 			select {
 			case got := <-queries:
@@ -242,8 +257,15 @@ func TestRunNoRaceOnFloodedOutputDuringDetach(t *testing.T) {
 		}
 	}()
 
-	runErr := make(chan error, 1)
-	go func() { runErr <- Run(context.Background(), wsURL, nil, 0) }()
+	type runResult struct {
+		out Outcome
+		err error
+	}
+	runDone := make(chan runResult, 1)
+	go func() {
+		out, err := Run(context.Background(), wsURL, nil, 0)
+		runDone <- runResult{out: out, err: err}
+	}()
 
 	// Let the flood actually get going — several KB in — before detaching,
 	// rather than detaching the instant Run starts: the goal is a real
@@ -262,9 +284,12 @@ func TestRunNoRaceOnFloodedOutputDuringDetach(t *testing.T) {
 	}
 
 	select {
-	case err := <-runErr:
-		if err != nil {
-			t.Fatalf("Run: %v", err)
+	case result := <-runDone:
+		if result.err != nil {
+			t.Fatalf("Run: %v", result.err)
+		}
+		if result.out.Reason != Detached {
+			t.Fatalf("Run outcome = %+v, want reason Detached", result.out)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return within 5s of the detach key")
@@ -290,7 +315,7 @@ func TestRunSessionNotReadyMapsToSentinel(t *testing.T) {
 	defer ts.Close()
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/attach"
 
-	err := Run(context.Background(), wsURL, nil, 0)
+	_, err := Run(context.Background(), wsURL, nil, 0)
 	if err == nil {
 		t.Fatal("Run: want an error for a 503 response, got nil")
 	}
@@ -317,7 +342,7 @@ func TestRunNon503DialErrorDoesNotMatchSentinel(t *testing.T) {
 	defer ts.Close()
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/attach"
 
-	err := Run(context.Background(), wsURL, nil, 0)
+	_, err := Run(context.Background(), wsURL, nil, 0)
 	if err == nil {
 		t.Fatal("Run: want an error for a 500 response, got nil")
 	}
@@ -338,12 +363,327 @@ func TestRunTransportErrorIsNotADialError(t *testing.T) {
 	closedURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/attach"
 	ts.Close() // nothing is listening here any more
 
-	err := Run(context.Background(), closedURL, nil, 0)
+	_, err := Run(context.Background(), closedURL, nil, 0)
 	if err == nil {
 		t.Fatal("Run: want a transport error, got nil")
 	}
 	var de *DialError
 	if errors.As(err, &de) {
 		t.Fatalf("Run error = %v, want a plain transport error (no HTTP response), not a *DialError", err)
+	}
+}
+
+// TestRunReportsDisconnectCursor is the contract the reconnecting product CLI
+// needs: only a transport loss is retryable, and the next attach must start
+// after the last frame that actually reached local stdout. A snapshot counts
+// as rendered state and therefore advances the cursor too.
+func TestRunReportsDisconnectCursor(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "snapshot", Seq: 17, Data: []byte("ready")})
+		c.Close(websocket.StatusGoingAway, "synthetic network interruption")
+	}))
+	defer ts.Close()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe (stdin): %v", err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe (stdout): %v", err)
+	}
+	defer stdoutR.Close()
+	origStdin, origStdout := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = stdinR, stdoutW
+	t.Cleanup(func() { os.Stdin, os.Stdout = origStdin, origStdout })
+	drainDone := make(chan struct{})
+	go func() {
+		io.Copy(io.Discard, stdoutR)
+		close(drainDone)
+	}()
+
+	outcome, err := Run(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 9)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if outcome.Reason != Disconnected || outcome.LastSeq != 17 {
+		t.Fatalf("Run outcome = %+v, want disconnected at seq 17", outcome)
+	}
+
+	// No frame arrived on this attempt, so the cursor the caller supplied is
+	// still the last known rendered frame. Reconnecting from zero here would
+	// repaint or replay unrelated history.
+	beforeFrame := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		c.Close(websocket.StatusGoingAway, "synthetic interruption before first frame")
+	}))
+	defer beforeFrame.Close()
+	outcome, err = Run(context.Background(), "ws"+strings.TrimPrefix(beforeFrame.URL, "http")+"/attach", nil, 23)
+	if err != nil {
+		t.Fatalf("Run before first frame: %v", err)
+	}
+	if outcome.Reason != Disconnected || outcome.LastSeq != 23 {
+		t.Fatalf("Run before first frame outcome = %+v, want disconnected at original seq 23", outcome)
+	}
+
+	exitServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "exit", ExitCode: 7})
+	}))
+	defer exitServer.Close()
+	outcome, err = Run(context.Background(), "ws"+strings.TrimPrefix(exitServer.URL, "http")+"/attach", nil, 23)
+	if err != nil {
+		t.Fatalf("Run exit: %v", err)
+	}
+	if outcome.Reason != Exited || outcome.LastSeq != 23 || outcome.ExitCode != 7 {
+		t.Fatalf("Run exit outcome = %+v, want exited at seq 23 with code 7", outcome)
+	}
+
+	stdoutW.Close()
+	<-drainDone
+}
+
+func TestRunPreservesSinceAllBeforeFirstFrame(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		c.Close(websocket.StatusGoingAway, "synthetic interruption before replay")
+	}))
+	defer ts.Close()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+	outcome, err := runWithIO(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, wire.SinceAll, stdinR, io.Discard)
+	if err != nil {
+		t.Fatalf("runWithIO: %v", err)
+	}
+	if outcome.Reason != Disconnected || outcome.LastSeq != wire.SinceAll {
+		t.Fatalf("outcome = %+v, want disconnected at SinceAll", outcome)
+	}
+}
+
+func TestRunRejectsPermanentWebSocketClose(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		c.Close(websocket.StatusPolicyViolation, "synthetic policy rejection")
+	}))
+	defer ts.Close()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	_, err = runWithIO(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 0, stdinR, io.Discard)
+	if err == nil || websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
+		t.Fatalf("runWithIO error = %v, want policy close", err)
+	}
+}
+
+func TestOversizedFrameIsNotRetryable(t *testing.T) {
+	if retryableWebSocketReadError(websocket.ErrMessageTooBig) {
+		t.Fatal("websocket.ErrMessageTooBig must be a permanent local protocol error")
+	}
+}
+
+func TestRunRejectsUnknownServerMessage(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "synthetic-unknown"})
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	_, err = runWithIO(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 0, stdinR, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "unsupported server message type") {
+		t.Fatalf("runWithIO error = %v, want permanent unknown-message error", err)
+	}
+}
+
+func TestRunDoesNotAdvanceCursorAfterShortOutputWrite(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var first wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &first); err != nil {
+			return
+		}
+		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "output", Seq: 17, Data: []byte("render-me")})
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	stdinR, stdinW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stdinR.Close()
+	defer stdinW.Close()
+	w := &shortWriter{}
+	outcome, err := runWithIO(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 9, stdinR, w)
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("runWithIO error = %v, want io.ErrShortWrite", err)
+	}
+	if outcome.LastSeq != 9 {
+		t.Fatalf("outcome cursor = %d, want prior cursor 9", outcome.LastSeq)
+	}
+}
+
+func TestDiscardPendingInputFlushesTTYButPreservesPipes(t *testing.T) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Fatalf("pty.Open: %v", err)
+	}
+	defer master.Close()
+	defer slave.Close()
+	if _, err := master.Write([]byte("typed-during-outage\n")); err != nil {
+		t.Fatalf("queue tty input: %v", err)
+	}
+	if err := discardPendingInput(slave); err != nil {
+		t.Fatalf("discardPendingInput(tty): %v", err)
+	}
+	fds := []unix.PollFd{{Fd: int32(slave.Fd()), Events: unix.POLLIN}}
+	ready, err := unix.Poll(fds, 0)
+	if err != nil {
+		t.Fatalf("poll flushed tty: %v", err)
+	}
+	if ready != 0 {
+		t.Fatalf("poll flushed tty = %d ready descriptors, want no queued input", ready)
+	}
+
+	pipeR, pipeW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pipeR.Close()
+	defer pipeW.Close()
+	if _, err := pipeW.Write([]byte("scripted-input")); err != nil {
+		t.Fatal(err)
+	}
+	if err := discardPendingInput(pipeR); err != nil {
+		t.Fatalf("discardPendingInput(pipe): %v", err)
+	}
+	got := make([]byte, len("scripted-input"))
+	if _, err := io.ReadFull(pipeR, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "scripted-input" {
+		t.Fatalf("pipe input = %q, want preserved scripted input", got)
+	}
+}
+
+func TestRunDiscardsTTYInputQueuedDuringDial(t *testing.T) {
+	handlerStarted := make(chan struct{})
+	allowUpgrade := make(chan struct{})
+	receivedInput := make(chan bool, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(handlerStarted)
+		<-allowUpgrade
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.CloseNow()
+		var resize wire.ClientMsg
+		if err := wsjson.Read(r.Context(), c, &resize); err != nil {
+			return
+		}
+		readCtx, cancel := context.WithTimeout(r.Context(), 150*time.Millisecond)
+		defer cancel()
+		var next wire.ClientMsg
+		err = wsjson.Read(readCtx, c, &next)
+		receivedInput <- err == nil && next.Type == "stdin" && len(next.Data) > 0
+		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "exit", ExitCode: 0})
+	}))
+	defer ts.Close()
+
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Fatalf("pty.Open: %v", err)
+	}
+	defer master.Close()
+	defer slave.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := runWithIO(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 0, slave, io.Discard)
+		done <- err
+	}()
+	<-handlerStarted
+	if _, err := master.Write([]byte("typed-while-dialing\n")); err != nil {
+		t.Fatalf("queue input during dial: %v", err)
+	}
+	close(allowUpgrade)
+	if err := <-done; err != nil {
+		t.Fatalf("runWithIO: %v", err)
+	}
+	if <-receivedInput {
+		t.Fatal("server received input queued while the reconnect dial was pending")
 	}
 }
