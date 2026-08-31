@@ -191,7 +191,7 @@ runner VMs). Not viable.
 
 ### 4.3 Wire/versioning stance
 
-The repository made a clean pre-GA path cut to `/v0/` after Plan 6; there is no `/v1/` compatibility surface.
+The repository made a clean pre-GA path cut to `/v0/` after Plan 6; the retired HTTP path has no compatibility surface.
 
 - Client REST/WS surface: `/v0/...`, additive-only evolution; pre-GA status noted
   in the API doc (licenses field additions without ceremony, not renames).
