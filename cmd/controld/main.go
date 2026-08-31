@@ -9,8 +9,8 @@ import (
 	"os"
 	"strings"
 
-	"rainier/internal/controld"
-	"rainier/internal/controld/pgstore"
+	"github.com/tokencanopy/rainier/internal/controld"
+	"github.com/tokencanopy/rainier/internal/controld/pgstore"
 )
 
 func main() {

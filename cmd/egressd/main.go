@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"os"
 
-	"rainier/internal/egress"
+	"github.com/tokencanopy/rainier/internal/egress"
 )
 
 func main() {

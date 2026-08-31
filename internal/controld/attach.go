@@ -15,9 +15,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
-	"rainier/internal/relay"
-	"rainier/internal/rwire"
-	"rainier/internal/wire"
+	"github.com/tokencanopy/rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/internal/wire"
 )
 
 const (

@@ -15,9 +15,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
-	"rainier/internal/driver"
-	"rainier/internal/relay"
-	"rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/internal/driver"
+	"github.com/tokencanopy/rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/rwire"
 )
 
 // AgentConfig configures RunAgent's outbound dial to controld.

@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/relay"
 )
 
 // The agent socket is how a process INSIDE the sandbox reaches sessiond: the

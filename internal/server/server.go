@@ -11,8 +11,8 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
-	"rainier/internal/session"
-	"rainier/internal/wire"
+	"github.com/tokencanopy/rainier/internal/session"
+	"github.com/tokencanopy/rainier/internal/wire"
 )
 
 const defaultPingInterval = 15 * time.Second

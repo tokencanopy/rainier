@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/internal/rwire"
 )
 
 // ---------------------------------------------------------------------------

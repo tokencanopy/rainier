@@ -1,4 +1,4 @@
-module rainier
+module github.com/tokencanopy/rainier
 
 go 1.25.0
 

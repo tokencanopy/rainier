@@ -19,11 +19,11 @@ import (
 
 	"github.com/coder/websocket"
 
-	"rainier/internal/eventlog"
-	"rainier/internal/reap"
-	"rainier/internal/relay"
-	"rainier/internal/server"
-	"rainier/internal/session"
+	"github.com/tokencanopy/rainier/internal/eventlog"
+	"github.com/tokencanopy/rainier/internal/reap"
+	"github.com/tokencanopy/rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/server"
+	"github.com/tokencanopy/rainier/internal/session"
 )
 
 func main() {

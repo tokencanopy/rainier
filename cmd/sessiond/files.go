@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/internal/xfer"
 )
 
 // This file is the sandbox end of the workspace-inspection RPCs: the session

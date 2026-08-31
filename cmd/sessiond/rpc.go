@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/relay"
 )
 
 // This file is sessiond's end of the session RPC — both directions of the

@@ -11,9 +11,9 @@ import (
 
 	"github.com/coder/websocket"
 
-	"rainier/internal/driver"
-	"rainier/internal/relay"
-	"rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/internal/driver"
+	"github.com/tokencanopy/rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/rwire"
 )
 
 // ---------------------------------------------------------------------------

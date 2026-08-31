@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"sync"
 
-	"rainier/internal/session"
-	"rainier/internal/wire"
+	"github.com/tokencanopy/rainier/internal/session"
+	"github.com/tokencanopy/rainier/internal/wire"
 )
 
 // connWriter is the single-writer discipline for one relay conn. Every frame

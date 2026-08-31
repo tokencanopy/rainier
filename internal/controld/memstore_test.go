@@ -1,8 +1,8 @@
 package controld_test
 
 import (
-	"rainier/internal/controld"
-	"rainier/internal/controld/storetest"
+	"github.com/tokencanopy/rainier/internal/controld"
+	"github.com/tokencanopy/rainier/internal/controld/storetest"
 	"testing"
 )
 

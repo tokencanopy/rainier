@@ -1,4 +1,4 @@
-.PHONY: test build demo e2e
+.PHONY: test build demo e2e verify module-path
 test:
 	go test ./...
 build:
@@ -12,3 +12,8 @@ demo: build
 # of GitHub auth — see scripts/e2e-fleet.sh.
 e2e: build
 	./scripts/e2e-fleet.sh
+module-path:
+	./scripts/check-module-path.sh
+
+verify: module-path test build
+	go vet ./...

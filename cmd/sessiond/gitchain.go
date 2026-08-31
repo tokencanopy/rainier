@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"rainier/internal/relay"
-	"rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/xfer"
 )
 
 // This file is sessiond's boot chain: the staged program that runs in place of

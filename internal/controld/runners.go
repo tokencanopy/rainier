@@ -17,7 +17,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
-	"rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/internal/rwire"
 )
 
 // ErrRunnerUnreachable is what every dispatch that never produced an answer

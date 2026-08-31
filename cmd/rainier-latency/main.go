@@ -27,7 +27,7 @@ import (
 	"syscall"
 	"time"
 
-	"rainier/internal/cli"
+	"github.com/tokencanopy/rainier/internal/cli"
 )
 
 const maxCapturedOutput = 32 << 20

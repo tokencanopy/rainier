@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"rainier/internal/rwire"
-	"rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/internal/xfer"
 )
 
 // sessionsBodyLimit caps every request body this file decodes: the create

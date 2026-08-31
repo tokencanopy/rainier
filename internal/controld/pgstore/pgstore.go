@@ -17,7 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"rainier/internal/controld"
+	"github.com/tokencanopy/rainier/internal/controld"
 )
 
 // terminalStates lists the SessionState values SessionState.Terminal

@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"os"
 
-	"rainier/internal/driver"
-	"rainier/internal/runnerd"
+	"github.com/tokencanopy/rainier/internal/driver"
+	"github.com/tokencanopy/rainier/internal/runnerd"
 )
 
 func main() {

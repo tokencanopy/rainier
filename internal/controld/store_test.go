@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"testing"
 
-	"rainier/internal/controld"
+	"github.com/tokencanopy/rainier/internal/controld"
 )
 
 // TestSetupHash pins the wire-visible definition of an environment's build
