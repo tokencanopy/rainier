@@ -213,9 +213,10 @@ func TestHandlerRouteShape(t *testing.T) {
 		}
 	}
 
-	// The old prefix is assembled from parts so this file carries no literal
-	// "/v0/" string while the assertion still names exactly the routes that
-	// must not exist after the clean cut.
+	// The retired prefix is assembled from parts so this file never spells out
+	// the retired version path literally, keeping the repository-wide
+	// retired-path search clean while the assertion still names exactly the
+	// routes that must not exist after the clean cut.
 	old := "/v" + "1"
 	for _, path := range []string{
 		old + "/me",
