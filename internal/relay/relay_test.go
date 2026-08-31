@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/tokencanopy/rainier/internal/session"
-	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 // pipeConn is an in-memory Conn pair for tests. The two ends returned by
@@ -63,11 +63,11 @@ func (p *pipeConn) Close() error {
 }
 
 // readServerMsg reads one message off a client-facing pipe and decodes it as
-// a wire.ServerMsg. The Hub forwards a FrameServer's Payload to the client
+// a terminal.ServerMessage. The Hub forwards a FrameServer's Payload to the client
 // verbatim (see runnerd_side.go's readLoop), so what lands on this pipe is
-// raw wire.ServerMsg JSON, not a Frame — rattach never needs to know about
+// raw terminal.ServerMessage JSON, not a Frame — rattach never needs to know about
 // relay.Frame at all.
-func readServerMsg(t *testing.T, c *pipeConn) wire.ServerMsg {
+func readServerMsg(t *testing.T, c *pipeConn) terminal.ServerMessage {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -75,19 +75,19 @@ func readServerMsg(t *testing.T, c *pipeConn) wire.ServerMsg {
 	if err != nil {
 		t.Fatalf("read server msg: %v", err)
 	}
-	var m wire.ServerMsg
+	var m terminal.ServerMessage
 	if err := json.Unmarshal(raw, &m); err != nil {
 		t.Fatalf("unmarshal ServerMsg: %v (raw: %s)", err, raw)
 	}
 	return m
 }
 
-// writeClientMsg encodes m as raw wire.ClientMsg JSON and writes it to a
+// writeClientMsg encodes m as raw terminal.ClientMessage JSON and writes it to a
 // client-facing pipe. AttachClient wraps whatever it reads off this pipe
 // into a FrameClient before forwarding it to the session conn (see
 // runnerd_side.go), so the client itself only ever speaks the raw wire
 // protocol.
-func writeClientMsg(t *testing.T, c *pipeConn, m wire.ClientMsg) {
+func writeClientMsg(t *testing.T, c *pipeConn, m terminal.ClientMessage) {
 	t.Helper()
 	raw, err := json.Marshal(m)
 	if err != nil {
@@ -107,7 +107,9 @@ func TestRelayAttachStreamsOutput(t *testing.T) {
 		session.Config{Argv: []string{"sh", "-i"}, Cols: 80, Rows: 24, LogPath: filepath.Join(t.TempDir(), "s.log")},
 		session.StartProc,
 	)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	sessConn, runConn := newPipe()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -121,12 +123,14 @@ func TestRelayAttachStreamsOutput(t *testing.T) {
 	go hub.AttachClient(ctx, hubClient, 0, 80, 24)
 
 	// Client should receive a snapshot frame first (as a FrameServer wrapping a
-	// wire.ServerMsg of type "snapshot"), then output after we send stdin.
+	// terminal.ServerMessage of type "snapshot"), then output after we send stdin.
 	first := readServerMsg(t, client)
-	if first.Type != "snapshot" { t.Fatalf("first msg = %s, want snapshot", first.Type) }
+	if first.Type != "snapshot" {
+		t.Fatalf("first msg = %s, want snapshot", first.Type)
+	}
 
 	// Send stdin through the client → hub → session → shell, expect echo.
-	writeClientMsg(t, client, wire.ClientMsg{Type: "stdin", Data: []byte("echo relay-marker\n")})
+	writeClientMsg(t, client, terminal.ClientMessage{Type: "stdin", Data: []byte("echo relay-marker\n")})
 	deadline := time.After(3 * time.Second)
 	for {
 		select {
@@ -135,7 +139,9 @@ func TestRelayAttachStreamsOutput(t *testing.T) {
 		default:
 		}
 		m := readServerMsg(t, client)
-		if m.Type == "output" && contains(m.Data, "relay-marker") { return }
+		if m.Type == "output" && contains(m.Data, "relay-marker") {
+			return
+		}
 	}
 }
 
@@ -153,7 +159,9 @@ func TestControlFramesReachHub(t *testing.T) {
 		session.Config{Argv: []string{"sh", "-i"}, Cols: 80, Rows: 24, LogPath: filepath.Join(t.TempDir(), "s.log")},
 		session.StartProc,
 	)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer s.Stop()
 
 	sessConn, runConn := newPipe()
@@ -172,10 +180,14 @@ func TestControlFramesReachHub(t *testing.T) {
 	defer hub.Close()
 
 	want := []byte(`{"kind":"setup_done"}`)
-	if err := sender.Send(want); err != nil { t.Fatalf("send control: %v", err) }
+	if err := sender.Send(want); err != nil {
+		t.Fatalf("send control: %v", err)
+	}
 	select {
 	case p := <-got:
-		if !bytes.Equal(p, want) { t.Fatalf("control payload = %q, want %q", p, want) }
+		if !bytes.Equal(p, want) {
+			t.Fatalf("control payload = %q, want %q", p, want)
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("control frame never reached the hub's control handler")
 	}
@@ -184,8 +196,10 @@ func TestControlFramesReachHub(t *testing.T) {
 	client, hubClient := newPipe()
 	go hub.AttachClient(ctx, hubClient, 0, 80, 24)
 	first := readServerMsg(t, client)
-	if first.Type != "snapshot" { t.Fatalf("first msg = %s, want snapshot", first.Type) }
-	writeClientMsg(t, client, wire.ClientMsg{Type: "stdin", Data: []byte("echo control-marker\n")})
+	if first.Type != "snapshot" {
+		t.Fatalf("first msg = %s, want snapshot", first.Type)
+	}
+	writeClientMsg(t, client, terminal.ClientMessage{Type: "stdin", Data: []byte("echo control-marker\n")})
 	deadline := time.After(5 * time.Second)
 	for done := false; !done; {
 		select {
@@ -194,7 +208,9 @@ func TestControlFramesReachHub(t *testing.T) {
 		default:
 		}
 		m := readServerMsg(t, client)
-		if m.Type == "output" && contains(m.Data, "control-marker") { done = true }
+		if m.Type == "output" && contains(m.Data, "control-marker") {
+			done = true
+		}
 	}
 
 	// The error channel yields the relay's exit EXACTLY once: one value, and
@@ -206,13 +222,17 @@ func TestControlFramesReachHub(t *testing.T) {
 	sessConn.Close()
 	select {
 	case err := <-errc:
-		if err == nil { t.Fatal("error channel yielded nil after session conn death, want the read error") }
+		if err == nil {
+			t.Fatal("error channel yielded nil after session conn death, want the read error")
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("error channel never yielded after session conn death")
 	}
 	select {
 	case v, ok := <-errc:
-		if !ok { t.Fatal("error channel was closed after its one value; the contract is one value and no close") }
+		if !ok {
+			t.Fatal("error channel was closed after its one value; the contract is one value and no close")
+		}
 		t.Fatalf("error channel yielded a second value %v, want exactly one", v)
 	default:
 	}
@@ -222,7 +242,9 @@ func TestControlFramesReachHub(t *testing.T) {
 	// already returned by now, so anything it was going to do, it has done.
 	select {
 	case v, ok := <-errc:
-		if !ok { t.Fatal("error channel closed after a delay; the contract is one value and no close") }
+		if !ok {
+			t.Fatal("error channel closed after a delay; the contract is one value and no close")
+		}
 		t.Fatalf("error channel yielded a late second value %v, want exactly one", v)
 	case <-time.After(100 * time.Millisecond):
 	}
@@ -251,7 +273,9 @@ func recvControl(t *testing.T, ch <-chan []byte, what string) ControlEvent {
 func encodeControl(t *testing.T, ev ControlEvent) []byte {
 	t.Helper()
 	b, err := json.Marshal(ev)
-	if err != nil { t.Fatalf("marshal control event: %v", err) }
+	if err != nil {
+		t.Fatalf("marshal control event: %v", err)
+	}
 	return b
 }
 
@@ -275,7 +299,9 @@ func TestControlRPCRoundTripBothDirections(t *testing.T) {
 		session.Config{Argv: []string{"sh", "-i"}, Cols: 80, Rows: 24, LogPath: filepath.Join(t.TempDir(), "s.log")},
 		session.StartProc,
 	)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer s.Stop()
 
 	sessConn, runConn := newPipe()
@@ -342,8 +368,10 @@ func TestControlRPCRoundTripBothDirections(t *testing.T) {
 	client, hubClient := newPipe()
 	go hub.AttachClient(ctx, hubClient, 0, 80, 24)
 	first := readServerMsg(t, client)
-	if first.Type != "snapshot" { t.Fatalf("first msg = %s, want snapshot", first.Type) }
-	writeClientMsg(t, client, wire.ClientMsg{Type: "stdin", Data: []byte("echo rpc-marker\n")})
+	if first.Type != "snapshot" {
+		t.Fatalf("first msg = %s, want snapshot", first.Type)
+	}
+	writeClientMsg(t, client, terminal.ClientMessage{Type: "stdin", Data: []byte("echo rpc-marker\n")})
 	deadline := time.After(5 * time.Second)
 	for {
 		select {
@@ -352,7 +380,9 @@ func TestControlRPCRoundTripBothDirections(t *testing.T) {
 		default:
 		}
 		m := readServerMsg(t, client)
-		if m.Type == "output" && contains(m.Data, "rpc-marker") { return }
+		if m.Type == "output" && contains(m.Data, "rpc-marker") {
+			return
+		}
 	}
 }
 
@@ -407,7 +437,9 @@ func TestSessionConnDeathClosesClient(t *testing.T) {
 		session.Config{Argv: []string{"sh", "-i"}, Cols: 80, Rows: 24, LogPath: filepath.Join(t.TempDir(), "s.log")},
 		session.StartProc,
 	)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	sessConn, runConn := newPipe()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -423,7 +455,9 @@ func TestSessionConnDeathClosesClient(t *testing.T) {
 	// Wait for the snapshot so the attachment is fully live end to end
 	// (session.Attach'd, registered in the Hub) before killing the conn.
 	first := readServerMsg(t, client)
-	if first.Type != "snapshot" { t.Fatalf("first msg = %s, want snapshot", first.Type) }
+	if first.Type != "snapshot" {
+		t.Fatalf("first msg = %s, want snapshot", first.Type)
+	}
 
 	// Kill the session-side conn — the one ServeSession reads. This is what
 	// a dropped/dead outbound WebSocket to runnerd looks like in production.
@@ -448,7 +482,9 @@ func TestSessionConnDeathClosesClient(t *testing.T) {
 	}()
 	select {
 	case err := <-done:
-		if err == nil { t.Fatal("expected client conn Read to error after session conn death, got nil") }
+		if err == nil {
+			t.Fatal("expected client conn Read to error after session conn death, got nil")
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("client conn was never closed after session conn death — cascade failed")
 	}

@@ -10,7 +10,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"github.com/tokencanopy/rainier/internal/session"
-	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 // A viewer that stops responding (its transport goes silent without ever
@@ -24,7 +24,9 @@ func TestDeadViewerIsDetachedAndSizeRecovers(t *testing.T) {
 		session.Config{Argv: []string{"sh", "-i"}, Cols: 120, Rows: 40, LogPath: filepath.Join(t.TempDir(), "s.log")},
 		session.StartProc,
 	)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(NewWithKeepalive(s, 200*time.Millisecond)) // NEW ctor with fast interval for tests
 	defer srv.Close()
 
@@ -46,7 +48,7 @@ func TestDeadViewerIsDetachedAndSizeRecovers(t *testing.T) {
 	// contains " 40" as the COLS half, which would wrongly look like the
 	// post-recovery ROWS reading if we searched for " 40" alone).
 	ctx := context.Background()
-	wsjson.Write(ctx, big, wire.ClientMsg{Type: "stdin", Data: []byte("stty size\n")})
+	wsjson.Write(ctx, big, terminal.ClientMessage{Type: "stdin", Data: []byte("stty size\n")})
 	readUntil(t, big, "10 40") // rows clamped to 10, cols clamped to 40 (smallest of each)
 
 	// Do NOT close small's transport here. coder/websocket only processes
@@ -70,8 +72,10 @@ func TestDeadViewerIsDetachedAndSizeRecovers(t *testing.T) {
 	// stty size, matching the full "40 120" pair for the same reason as above.
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		wsjson.Write(ctx, big, wire.ClientMsg{Type: "stdin", Data: []byte("stty size\n")})
-		if readUntilOrTimeout(t, big, "40 120", 400*time.Millisecond) { return }
+		wsjson.Write(ctx, big, terminal.ClientMessage{Type: "stdin", Data: []byte("stty size\n")})
+		if readUntilOrTimeout(t, big, "40 120", 400*time.Millisecond) {
+			return
+		}
 	}
 	t.Fatal("size never recovered after dead viewer; liveness kick not working")
 }

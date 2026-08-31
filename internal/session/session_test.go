@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 // fakeProc lets tests drive output and observe stdin/resize without a real PTY.
@@ -17,10 +17,13 @@ type fakeProc struct {
 	exit     chan int
 }
 
-func (f *fakeProc) Write(p []byte) (int, error) { f.stdin <- append([]byte(nil), p...); return len(p), nil }
-func (f *fakeProc) Resize(c, r int) error       { f.resizes <- Size{c, r}; return nil }
-func (f *fakeProc) Wait() int                   { return <-f.exit }
-func (f *fakeProc) Stop()                       { close(f.exit) }
+func (f *fakeProc) Write(p []byte) (int, error) {
+	f.stdin <- append([]byte(nil), p...)
+	return len(p), nil
+}
+func (f *fakeProc) Resize(c, r int) error { f.resizes <- Size{c, r}; return nil }
+func (f *fakeProc) Wait() int             { return <-f.exit }
+func (f *fakeProc) Stop()                 { close(f.exit) }
 
 func newFakeSession(t *testing.T) (*Session, *fakeProc) {
 	t.Helper()
@@ -30,27 +33,29 @@ func newFakeSession(t *testing.T) (*Session, *fakeProc) {
 			fp.onOutput = onOutput
 			return fp, nil
 		})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	return s, fp
 }
 
-func recv(t *testing.T, ch <-chan wire.ServerMsg) wire.ServerMsg {
+func recv(t *testing.T, ch <-chan terminal.ServerMessage) terminal.ServerMessage {
 	t.Helper()
 	select {
 	case m := <-ch:
 		return m
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for msg")
-		return wire.ServerMsg{}
+		return terminal.ServerMessage{}
 	}
 }
 
 // drainN reads exactly n messages off ch, each guarded by recv's timeout, so
 // a stuck sender (e.g. a deadlocked Attach) fails the test instead of
 // hanging the suite.
-func drainN(t *testing.T, ch <-chan wire.ServerMsg, n int) []wire.ServerMsg {
+func drainN(t *testing.T, ch <-chan terminal.ServerMessage, n int) []terminal.ServerMessage {
 	t.Helper()
-	out := make([]wire.ServerMsg, 0, n)
+	out := make([]terminal.ServerMessage, 0, n)
 	for i := 0; i < n; i++ {
 		out = append(out, recv(t, ch))
 	}
@@ -61,9 +66,13 @@ func TestFreshAttachGetsSnapshotThenLive(t *testing.T) {
 	s, fp := newFakeSession(t)
 	fp.onOutput([]byte("hello"))
 	a, err := s.Attach(0, Size{20, 5})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	m1 := recv(t, a.Msgs)
-	if m1.Type != "snapshot" || m1.Seq == 0 { t.Fatalf("first = %+v", m1) }
+	if m1.Type != "snapshot" || m1.Seq == 0 {
+		t.Fatalf("first = %+v", m1)
+	}
 	fp.onOutput([]byte(" world"))
 	m2 := recv(t, a.Msgs)
 	if m2.Type != "output" || string(m2.Data) != " world" || m2.Seq != m1.Seq+1 {
@@ -81,7 +90,9 @@ func TestResumeReplaysOnlyMissedFrames(t *testing.T) {
 	fp.onOutput([]byte("three"))
 	b, _ := s.Attach(snap.Seq, Size{20, 5})
 	m := recv(t, b.Msgs)
-	if m.Type != "output" || string(m.Data) != "three" { t.Fatalf("resume = %+v", m) }
+	if m.Type != "output" || string(m.Data) != "three" {
+		t.Fatalf("resume = %+v", m)
+	}
 }
 
 // TestSinceAllReplaysTheWholeLog is the second half of the `--since 0`
@@ -101,7 +112,7 @@ func TestSinceAllReplaysTheWholeLog(t *testing.T) {
 		fp.onOutput([]byte{byte('a' + i%26)})
 	}
 
-	a, err := s.Attach(wire.SinceAll, Size{20, 5})
+	a, err := s.Attach(terminal.SinceAll, Size{20, 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +142,7 @@ func TestSinceAllReplaysTheWholeLog(t *testing.T) {
 // of nothing would open with silence instead.
 func TestSinceAllOnAnEmptyLogFallsBackToSnapshot(t *testing.T) {
 	s, _ := newFakeSession(t)
-	a, err := s.Attach(wire.SinceAll, Size{20, 5})
+	a, err := s.Attach(terminal.SinceAll, Size{20, 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +156,9 @@ func TestStdinForwarded(t *testing.T) {
 	s.Stdin([]byte("x"))
 	select {
 	case got := <-fp.stdin:
-		if string(got) != "x" { t.Fatalf("stdin = %q", got) }
+		if string(got) != "x" {
+			t.Fatalf("stdin = %q", got)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("stdin not forwarded")
 	}
@@ -159,7 +172,9 @@ func TestSmallestViewerResizesProc(t *testing.T) {
 	b, _ := s.Attach(0, Size{80, 50})
 	recv(t, b.Msgs)
 	got := <-fp.resizes
-	if got != (Size{80, 40}) { t.Fatalf("resize = %+v, want {80 40}", got) }
+	if got != (Size{80, 40}) {
+		t.Fatalf("resize = %+v, want {80 40}", got)
+	}
 	_ = b
 }
 
@@ -173,7 +188,9 @@ func TestReplayLargerThanBufferDoesNotDeadlock(t *testing.T) {
 		fp.onOutput([]byte{byte('a' + i%26)})
 	}
 	a, err := s.Attach(1, Size{20, 5})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	msgs := drainN(t, a.Msgs, n-1) // since=1: entries with seq 2..n replay (n-1 frames)
 	for i, m := range msgs {
 		wantSeq := uint64(i + 2)
@@ -189,14 +206,20 @@ func TestReplayLargerThanBufferDoesNotDeadlock(t *testing.T) {
 func TestExitSendsExitThenClosesViewerChannel(t *testing.T) {
 	s, fp := newFakeSession(t)
 	a, err := s.Attach(0, Size{20, 5})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	recv(t, a.Msgs) // snapshot
 	fp.Stop()
 	m := recv(t, a.Msgs)
-	if m.Type != "exit" || m.ExitCode != 0 { t.Fatalf("exit msg = %+v", m) }
+	if m.Type != "exit" || m.ExitCode != 0 {
+		t.Fatalf("exit msg = %+v", m)
+	}
 	select {
 	case _, ok := <-a.Msgs:
-		if ok { t.Fatalf("channel not closed after exit") }
+		if ok {
+			t.Fatalf("channel not closed after exit")
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for channel close")
 	}
@@ -210,14 +233,22 @@ func TestAttachAfterExitGetsSnapshotThenExit(t *testing.T) {
 	fp.Stop()
 	<-s.Exited() // deterministic: exit goroutine has fully run
 	a, err := s.Attach(0, Size{20, 5})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	m1 := recv(t, a.Msgs)
-	if m1.Type != "snapshot" { t.Fatalf("first = %+v", m1) }
+	if m1.Type != "snapshot" {
+		t.Fatalf("first = %+v", m1)
+	}
 	m2 := recv(t, a.Msgs)
-	if m2.Type != "exit" || m2.ExitCode != 0 { t.Fatalf("exit = %+v", m2) }
+	if m2.Type != "exit" || m2.ExitCode != 0 {
+		t.Fatalf("exit = %+v", m2)
+	}
 	select {
 	case _, ok := <-a.Msgs:
-		if ok { t.Fatalf("channel not closed after exit") }
+		if ok {
+			t.Fatalf("channel not closed after exit")
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for channel close")
 	}
@@ -236,7 +267,9 @@ func TestConcurrentAttachDuringExitNeverStrands(t *testing.T) {
 		done := make(chan *Attachment, 8)
 		go func() {
 			for j := 0; j < 4; j++ {
-				if a, err := s.Attach(0, Size{20, 5}); err == nil { done <- a }
+				if a, err := s.Attach(0, Size{20, 5}); err == nil {
+					done <- a
+				}
 			}
 			close(done)
 		}()

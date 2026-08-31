@@ -1,6 +1,6 @@
 // Package runner defines the JSON messages exchanged between runnerd and
 // controld over runnerd's single outbound control WebSocket. One struct per
-// direction, same idiom as internal/wire. ProtocolVersion gates major
+// direction, same idiom as protocol/terminal. ProtocolVersion gates major
 // changes: controld rejects an announce whose ProtocolVersion it doesn't
 // speak, with a close reason naming both versions (design §4.3).
 package runner

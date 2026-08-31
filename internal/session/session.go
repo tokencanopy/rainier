@@ -9,7 +9,7 @@ import (
 
 	"github.com/tokencanopy/rainier/internal/eventlog"
 	"github.com/tokencanopy/rainier/internal/term"
-	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 type Config struct {
@@ -20,7 +20,7 @@ type Config struct {
 
 type viewer struct {
 	id   int
-	ch   chan wire.ServerMsg
+	ch   chan terminal.ServerMessage
 	size Size
 }
 
@@ -38,7 +38,9 @@ type Session struct {
 
 func New(cfg Config, start func(argv []string, cols, rows int, onOutput func([]byte)) (Proc, error)) (*Session, error) {
 	lg, err := eventlog.Open(cfg.LogPath)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	s := &Session{
 		emu:     term.NewEmulator(cfg.Cols, cfg.Rows),
 		log:     lg,
@@ -47,16 +49,23 @@ func New(cfg Config, start func(argv []string, cols, rows int, onOutput func([]b
 		exited:  make(chan struct{}),
 	}
 	p, err := start(cfg.Argv, cfg.Cols, cfg.Rows, s.onOutput)
-	if err != nil { lg.Close(); return nil, err }
+	if err != nil {
+		lg.Close()
+		return nil, err
+	}
 	s.proc = p
 	go func() {
 		code := p.Wait()
 		s.mu.Lock()
 		s.exitC = code
-		for _, v := range s.viewers { s.trySend(v, wire.ServerMsg{Type: "exit", ExitCode: code}) }
+		for _, v := range s.viewers {
+			s.trySend(v, terminal.ServerMessage{Type: "exit", ExitCode: code})
+		}
 		// Attachment.Msgs is documented "closed on detach/exit": finish the
 		// lifecycle for every viewer still attached at exit time.
-		for _, v := range s.viewers { close(v.ch) }
+		for _, v := range s.viewers {
+			close(v.ch)
+		}
 		s.viewers = map[int]*viewer{}
 		// Close s.exited before releasing s.mu: any Attach that acquires
 		// s.mu after this point is guaranteed (via the mutex) to observe it
@@ -82,12 +91,14 @@ func (s *Session) onOutput(b []byte) {
 		// correctness only for the frames it drops; accepted for v0.
 		log.Printf("event log append failed: %v", err)
 	}
-	msg := wire.ServerMsg{Type: "output", Seq: seq, Data: append([]byte(nil), b...)}
-	for _, v := range s.viewers { s.trySend(v, msg) }
+	msg := terminal.ServerMessage{Type: "output", Seq: seq, Data: append([]byte(nil), b...)}
+	for _, v := range s.viewers {
+		s.trySend(v, msg)
+	}
 }
 
 // trySend enforces the slow-consumer policy: overflow force-detaches.
-func (s *Session) trySend(v *viewer, m wire.ServerMsg) {
+func (s *Session) trySend(v *viewer, m terminal.ServerMessage) {
 	select {
 	case v.ch <- m:
 	default:
@@ -98,7 +109,7 @@ func (s *Session) trySend(v *viewer, m wire.ServerMsg) {
 
 type Attachment struct {
 	ID   int
-	Msgs <-chan wire.ServerMsg
+	Msgs <-chan terminal.ServerMessage
 }
 
 // Attach adds a viewer and decides what it opens with, from its cursor:
@@ -107,7 +118,7 @@ type Attachment struct {
 //     output. Every plain attach, and the only shape a fresh viewer should
 //     ever cost the log (spec §5: never repaint a screen by replaying raw
 //     bytes).
-//   - wire.SinceAll — "the whole log": every entry from the first, then
+//   - terminal.SinceAll — "the whole log": every entry from the first, then
 //     live. What `rainier attach --since 0` asks for, and the only way to
 //     read output that has already scrolled off the screen — a failed
 //     setup's full log, an overnight session's history.
@@ -120,7 +131,7 @@ func (s *Session) Attach(since uint64, size Size) (*Attachment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	from, all := since, since == wire.SinceAll
+	from, all := since, since == terminal.SinceAll
 	if all {
 		from = 0 // every entry, since sequence numbers start at 1
 	}
@@ -129,7 +140,9 @@ func (s *Session) Attach(since uint64, size Size) (*Attachment, error) {
 	if replay {
 		var err error
 		entries, err = s.log.Since(from)
-		if err != nil { replay = false }
+		if err != nil {
+			replay = false
+		}
 	}
 
 	// The replay path stages len(entries) sends into the viewer's channel
@@ -137,18 +150,20 @@ func (s *Session) Attach(since uint64, size Size) (*Attachment, error) {
 	// time). Size the channel so the entire backlog fits without blocking;
 	// a fresh snapshot-only attach only ever needs the steady-state 256.
 	chCap := 256
-	if replay { chCap = len(entries) + 256 }
-	v := &viewer{id: s.nextID, ch: make(chan wire.ServerMsg, chCap), size: size}
+	if replay {
+		chCap = len(entries) + 256
+	}
+	v := &viewer{id: s.nextID, ch: make(chan terminal.ServerMessage, chCap), size: size}
 	s.nextID++
 	s.viewers[v.id] = v
 
 	if replay {
 		for _, e := range entries {
-			v.ch <- wire.ServerMsg{Type: "output", Seq: e.Seq, Data: append([]byte(nil), e.Data...)}
+			v.ch <- terminal.ServerMessage{Type: "output", Seq: e.Seq, Data: append([]byte(nil), e.Data...)}
 		}
 	} else {
 		scr := s.emu.Screen()
-		v.ch <- wire.ServerMsg{
+		v.ch <- terminal.ServerMessage{
 			Type: "snapshot", Seq: s.log.LastSeq(),
 			Data: term.Serialize(scr), Cols: scr.Cols, Rows: scr.Rows,
 		}
@@ -160,7 +175,7 @@ func (s *Session) Attach(since uint64, size Size) (*Attachment, error) {
 	// "closed on detach/exit" contract for every attach path.
 	select {
 	case <-s.exited:
-		v.ch <- wire.ServerMsg{Type: "exit", ExitCode: s.exitC}
+		v.ch <- terminal.ServerMessage{Type: "exit", ExitCode: s.exitC}
 		delete(s.viewers, v.id)
 		close(v.ch)
 	default:
@@ -193,9 +208,13 @@ func (s *Session) SetSize(id int, size Size) {
 
 func (s *Session) applySizeLocked() {
 	var sizes []Size
-	for _, v := range s.viewers { sizes = append(sizes, v.size) }
+	for _, v := range s.viewers {
+		sizes = append(sizes, v.size)
+	}
 	eff, ok := EffectiveSize(sizes)
-	if !ok || eff == s.size { return }
+	if !ok || eff == s.size {
+		return
+	}
 	s.size = eff
 	s.emu.Resize(eff.Cols, eff.Rows)
 	s.proc.Resize(eff.Cols, eff.Rows)

@@ -16,8 +16,8 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"github.com/tokencanopy/rainier/internal/relay"
-	"github.com/tokencanopy/rainier/internal/wire"
 	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 const (
@@ -121,7 +121,7 @@ func (t *attachTable) has(id string) bool {
 // the caller, waits (bounded) for the session to be attachable, parks the
 // socket under a fresh attach_id, asks the owning runner to dial back, and
 // then splices the two sockets as a dumb byte pipe. The client speaks
-// wire.ClientMsg/ServerMsg end to end — byte-identical to attaching to
+// terminal.ClientMessage/ServerMsg end to end — byte-identical to attaching to
 // runnerd directly.
 //
 // Every failure that can be reported as HTTP is reported before the upgrade:
@@ -318,7 +318,7 @@ func (s *Server) failedButAttachable(row Session) bool {
 	return row.State == StateFailed && row.Runner != "" && s.runnerConnected(row.Runner)
 }
 
-// readFirstResize reads exactly one wire.ClientMsg off a freshly attached
+// readFirstResize reads exactly one terminal.ClientMessage off a freshly attached
 // client and requires it to be a "resize" — the same contract runnerd's own
 // readFirstResize enforces, so a client attaching through controld and one
 // attaching to runnerd directly behave identically.
@@ -328,16 +328,16 @@ func (s *Server) failedButAttachable(row Session) bool {
 // the FrameOpen already conveys the size, and forwarding would double-deliver
 // the same resize. Every later resize flows through the splice as ordinary
 // client traffic.
-func readFirstResize(ctx context.Context, c *websocket.Conn) (wire.ClientMsg, error) {
+func readFirstResize(ctx context.Context, c *websocket.Conn) (terminal.ClientMessage, error) {
 	ctx, cancel := context.WithTimeout(ctx, attachFirstMsgTimeout)
 	defer cancel()
 
-	var m wire.ClientMsg
+	var m terminal.ClientMessage
 	if err := wsjson.Read(ctx, c, &m); err != nil {
-		return wire.ClientMsg{}, fmt.Errorf("reading the first attach message: %w", err)
+		return terminal.ClientMessage{}, fmt.Errorf("reading the first attach message: %w", err)
 	}
 	if m.Type != "resize" {
-		return wire.ClientMsg{}, fmt.Errorf("first attach message must be resize, got %q", clip(m.Type))
+		return terminal.ClientMessage{}, fmt.Errorf("first attach message must be resize, got %q", clip(m.Type))
 	}
 	return m, nil
 }

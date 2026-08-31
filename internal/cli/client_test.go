@@ -23,8 +23,8 @@ import (
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/internal/runnerd"
-	"github.com/tokencanopy/rainier/internal/wire"
 	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 func TestDoContextCancelsAStalledRequest(t *testing.T) {
@@ -584,14 +584,14 @@ func (ss *scriptedSessiond) serve(ctx context.Context) {
 		}
 		switch f.Type {
 		case relay.FrameOpen:
-			ss.send(ctx, f.AttachID, wire.ServerMsg{Type: "snapshot", Seq: 1, Data: []byte(smokeSnapshot)})
+			ss.send(ctx, f.AttachID, terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte(smokeSnapshot)})
 		case relay.FrameClient:
-			var m wire.ClientMsg
+			var m terminal.ClientMessage
 			if json.Unmarshal(f.Payload, &m) != nil {
 				continue
 			}
 			if m.Type == "stdin" {
-				ss.send(ctx, f.AttachID, wire.ServerMsg{Type: "output", Seq: 2, Data: m.Data})
+				ss.send(ctx, f.AttachID, terminal.ServerMessage{Type: "output", Seq: 2, Data: m.Data})
 			}
 		case relay.FrameControl:
 			ss.serveControl(ctx, f.Payload)
@@ -664,7 +664,7 @@ func (ss *scriptedSessiond) invoke(method string, payload []byte) (any, error) {
 	return nil, fmt.Errorf("unknown method %q", method)
 }
 
-func (ss *scriptedSessiond) send(ctx context.Context, attachID uint64, m wire.ServerMsg) {
+func (ss *scriptedSessiond) send(ctx context.Context, attachID uint64, m terminal.ServerMessage) {
 	payload, err := json.Marshal(m)
 	if err != nil {
 		return

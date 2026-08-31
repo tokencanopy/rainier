@@ -18,8 +18,8 @@ import (
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/internal/runnerd"
-	"github.com/tokencanopy/rainier/internal/wire"
 	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 // ---------------------------------------------------------------------------
@@ -120,7 +120,7 @@ func pendingAttaches(s *Server) int {
 	return len(s.attaches.m)
 }
 
-func writeClient(t *testing.T, c *websocket.Conn, m wire.ClientMsg) {
+func writeClient(t *testing.T, c *websocket.Conn, m terminal.ClientMessage) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -129,11 +129,11 @@ func writeClient(t *testing.T, c *websocket.Conn, m wire.ClientMsg) {
 	}
 }
 
-func readServer(t *testing.T, c *websocket.Conn) wire.ServerMsg {
+func readServer(t *testing.T, c *websocket.Conn) terminal.ServerMessage {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	var m wire.ServerMsg
+	var m terminal.ServerMessage
 	if err := wsjson.Read(ctx, c, &m); err != nil {
 		t.Fatalf("read server msg: %v", err)
 	}
@@ -152,7 +152,7 @@ type fakeSessiond struct {
 	raw     *websocket.Conn
 	conn    relay.Conn
 	opens   chan relay.Frame
-	resizes chan wire.ClientMsg
+	resizes chan terminal.ClientMessage
 	closes  chan uint64
 }
 
@@ -168,7 +168,7 @@ func startFakeSessiond(t *testing.T, ctx context.Context, wsBase, id string) *fa
 		raw:     c,
 		conn:    relay.WSConn(c),
 		opens:   make(chan relay.Frame, 8),
-		resizes: make(chan wire.ClientMsg, 8),
+		resizes: make(chan terminal.ClientMessage, 8),
 		closes:  make(chan uint64, 8),
 	}
 	go fs.serve(ctx)
@@ -194,17 +194,17 @@ func (fs *fakeSessiond) serve(ctx context.Context) {
 		switch f.Type {
 		case relay.FrameOpen:
 			fs.opens <- f
-			fs.send(ctx, f.AttachID, wire.ServerMsg{
+			fs.send(ctx, f.AttachID, terminal.ServerMessage{
 				Type: "snapshot", Seq: 1, Cols: f.Cols, Rows: f.Rows, Data: []byte(snapshotText),
 			})
 		case relay.FrameClient:
-			var m wire.ClientMsg
+			var m terminal.ClientMessage
 			if json.Unmarshal(f.Payload, &m) != nil {
 				continue
 			}
 			switch m.Type {
 			case "stdin":
-				fs.send(ctx, f.AttachID, wire.ServerMsg{Type: "output", Data: m.Data})
+				fs.send(ctx, f.AttachID, terminal.ServerMessage{Type: "output", Data: m.Data})
 			case "resize":
 				fs.resizes <- m
 			}
@@ -214,7 +214,7 @@ func (fs *fakeSessiond) serve(ctx context.Context) {
 	}
 }
 
-func (fs *fakeSessiond) send(ctx context.Context, attachID uint64, m wire.ServerMsg) {
+func (fs *fakeSessiond) send(ctx context.Context, attachID uint64, m terminal.ServerMessage) {
 	payload, err := json.Marshal(m)
 	if err != nil {
 		return
@@ -319,7 +319,7 @@ func TestAttachEndToEnd(t *testing.T) {
 		t.Fatalf("attach status = %d, want 101", resp.StatusCode)
 	}
 	cli.SetReadLimit(16 << 20)
-	writeClient(t, cli, wire.ClientMsg{Type: "resize", Cols: 120, Rows: 40})
+	writeClient(t, cli, terminal.ClientMessage{Type: "resize", Cols: 120, Rows: 40})
 
 	// The FrameOpen carries what the client asked for, all the way through
 	// controld's dial_attach and runnerd's AttachClient.
@@ -333,7 +333,7 @@ func TestAttachEndToEnd(t *testing.T) {
 		t.Fatalf("first server msg = %+v, want a snapshot carrying %q", m, snapshotText)
 	}
 
-	writeClient(t, cli, wire.ClientMsg{Type: "stdin", Data: []byte("hi")})
+	writeClient(t, cli, terminal.ClientMessage{Type: "stdin", Data: []byte("hi")})
 	if m := readServer(t, cli); m.Type != "output" || string(m.Data) != "hi" {
 		t.Fatalf("echo = %+v, want output %q", m, "hi")
 	}
@@ -377,7 +377,7 @@ func TestAttachSessionDeathCascadesToClient(t *testing.T) {
 	}
 	defer cli.CloseNow()
 	cli.SetReadLimit(16 << 20)
-	writeClient(t, cli, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24})
+	writeClient(t, cli, terminal.ClientMessage{Type: "resize", Cols: 80, Rows: 24})
 
 	// Wait for the pipe to be demonstrably live before killing it, so a
 	// failure below is unambiguously about the cascade, not the plumbing.
@@ -490,7 +490,7 @@ func TestAttachAuthorization(t *testing.T) {
 		if resp.StatusCode != http.StatusSwitchingProtocols {
 			t.Fatalf("admin attach status = %d, want 101", resp.StatusCode)
 		}
-		writeClient(t, cli, wire.ClientMsg{Type: "resize", Cols: 90, Rows: 20})
+		writeClient(t, cli, terminal.ClientMessage{Type: "resize", Cols: 90, Rows: 20})
 		cmd := f.nextCmd(t)
 		if cmd.Type != "dial_attach" || cmd.Session != id {
 			t.Fatalf("command = %+v, want dial_attach for %s", cmd, id)
@@ -627,7 +627,7 @@ func TestAttachToFailedSession(t *testing.T) {
 		t.Fatalf("attach to a failed session took %s; it must not sit out the wait budget", elapsed)
 	}
 	cli.SetReadLimit(16 << 20)
-	writeClient(t, cli, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24})
+	writeClient(t, cli, terminal.ClientMessage{Type: "resize", Cols: 80, Rows: 24})
 
 	// The dial_attach went out and the splice is live: the session's own
 	// FrameOpen arrived, and its reply reaches the client. That reply is the
@@ -740,7 +740,7 @@ func TestAttachRequiresResizeFirst(t *testing.T) {
 		t.Fatalf("dial attach: %v", err)
 	}
 	defer cli.CloseNow()
-	writeClient(t, cli, wire.ClientMsg{Type: "stdin", Data: []byte("oops")})
+	writeClient(t, cli, terminal.ClientMessage{Type: "stdin", Data: []byte("oops")})
 
 	readCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -785,7 +785,7 @@ func TestPairingTTL(t *testing.T) {
 		t.Fatalf("dial attach: %v", err)
 	}
 	defer cli.CloseNow()
-	writeClient(t, cli, wire.ClientMsg{Type: "resize", Cols: 100, Rows: 30})
+	writeClient(t, cli, terminal.ClientMessage{Type: "resize", Cols: 100, Rows: 30})
 
 	cmd := f.nextCmd(t)
 	if cmd.Type != "dial_attach" || cmd.Session != id || cmd.Attach == nil {

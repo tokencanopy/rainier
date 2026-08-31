@@ -20,8 +20,8 @@ import (
 
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/relay"
-	"github.com/tokencanopy/rainier/internal/wire"
 	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 type Server struct {
@@ -1007,7 +1007,7 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 	}
 	defer c.CloseNow()
 	c.SetReadLimit(16 << 20)
-	// The client speaks wire.ClientMsg/ServerMsg; the hub forwards raw payloads.
+	// The client speaks terminal.ClientMessage/ServerMsg; the hub forwards raw payloads.
 	// The relay expects the first client frame to be a resize (like Plan 1 serve);
 	// rattach sends it. cols/rows for the FrameOpen come from that first message.
 	first, err := readFirstResize(r.Context(), c)
@@ -1018,7 +1018,7 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 	hub.AttachClient(r.Context(), relay.WSConn(c), since, first.Cols, first.Rows)
 }
 
-// readFirstResize reads exactly one wire.ClientMsg off a freshly attached
+// readFirstResize reads exactly one terminal.ClientMessage off a freshly attached
 // client's websocket and requires it to be a "resize" — mirroring Plan 1's
 // resize-first contract (internal/server/server.go's serve()) so a client
 // relayed through runnerd and one attached directly to sessiond behave
@@ -1030,13 +1030,13 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 // FrameOpen already conveys the size, and re-sending it would double-deliver
 // the same resize. Every resize after this first one flows normally, as a
 // FrameClient carrying a "resize" ClientMsg.
-func readFirstResize(ctx context.Context, c *websocket.Conn) (wire.ClientMsg, error) {
-	var m wire.ClientMsg
+func readFirstResize(ctx context.Context, c *websocket.Conn) (terminal.ClientMessage, error) {
+	var m terminal.ClientMessage
 	if err := wsjson.Read(ctx, c, &m); err != nil {
-		return wire.ClientMsg{}, err
+		return terminal.ClientMessage{}, err
 	}
 	if m.Type != "resize" {
-		return wire.ClientMsg{}, fmt.Errorf("first attach message must be resize, got %q", m.Type)
+		return terminal.ClientMessage{}, fmt.Errorf("first attach message must be resize, got %q", m.Type)
 	}
 	return m, nil
 }

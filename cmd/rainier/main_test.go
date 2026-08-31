@@ -18,8 +18,8 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"github.com/tokencanopy/rainier/internal/cli"
-	"github.com/tokencanopy/rainier/internal/wire"
 	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 // ---------------------------------------------------------------------------
@@ -1174,8 +1174,8 @@ func TestAttachFlagsCursor(t *testing.T) {
 		cursor uint64
 	}{
 		{"no flag is no cursor", []string{"sess_a"}, "sess_a", 0},
-		{"--since 0 is the whole log", []string{"--since", "0", "sess_a"}, "sess_a", wire.SinceAll},
-		{"--since 0 after the ref", []string{"sess_a", "--since", "0"}, "sess_a", wire.SinceAll},
+		{"--since 0 is the whole log", []string{"--since", "0", "sess_a"}, "sess_a", terminal.SinceAll},
+		{"--since 0 after the ref", []string{"sess_a", "--since", "0"}, "sess_a", terminal.SinceAll},
 		{"--since N resumes", []string{"my-box", "--since", "19"}, "my-box", 19},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1312,7 +1312,7 @@ func TestAttachWithRetryBacksOffTransientDisconnects(t *testing.T) {
 			return
 		}
 		defer c.CloseNow()
-		var first wire.ClientMsg
+		var first terminal.ClientMessage
 		if err := wsjson.Read(r.Context(), c, &first); err != nil {
 			return
 		}
@@ -1320,7 +1320,7 @@ func TestAttachWithRetryBacksOffTransientDisconnects(t *testing.T) {
 			c.Close(websocket.StatusGoingAway, "synthetic transient close")
 			return
 		}
-		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "exit", ExitCode: 0})
+		wsjson.Write(r.Context(), c, terminal.ServerMessage{Type: "exit", ExitCode: 0})
 	}))
 	defer ts.Close()
 
@@ -1355,7 +1355,7 @@ func TestAttachWithRetryDoesNotRetryPolicyClose(t *testing.T) {
 			return
 		}
 		defer c.CloseNow()
-		var first wire.ClientMsg
+		var first terminal.ClientMessage
 		if err := wsjson.Read(r.Context(), c, &first); err != nil {
 			return
 		}
@@ -1428,17 +1428,17 @@ func TestAttachWithRetryReconnectsFromTheRenderedCursor(t *testing.T) {
 			return
 		}
 		defer c.CloseNow()
-		var first wire.ClientMsg
+		var first terminal.ClientMessage
 		if err := wsjson.Read(r.Context(), c, &first); err != nil {
 			return
 		}
 		if requests == 1 {
-			wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "output", Seq: 17, Data: []byte("before-drop")})
+			wsjson.Write(r.Context(), c, terminal.ServerMessage{Type: "output", Seq: 17, Data: []byte("before-drop")})
 			c.Close(websocket.StatusGoingAway, "synthetic network interruption")
 			return
 		}
-		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "output", Seq: 18, Data: []byte("after-drop")})
-		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "exit", ExitCode: 0})
+		wsjson.Write(r.Context(), c, terminal.ServerMessage{Type: "output", Seq: 18, Data: []byte("after-drop")})
+		wsjson.Write(r.Context(), c, terminal.ServerMessage{Type: "exit", ExitCode: 0})
 	}))
 	defer ts.Close()
 

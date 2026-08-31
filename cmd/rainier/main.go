@@ -25,8 +25,8 @@ import (
 
 	"github.com/tokencanopy/rainier/internal/attachio"
 	"github.com/tokencanopy/rainier/internal/cli"
-	"github.com/tokencanopy/rainier/internal/wire"
 	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 // devicePollTimeout bounds a single poll request to GitHub's device-flow
@@ -601,7 +601,7 @@ func runNew(args []string) error {
 	// created seconds ago has a log measured in kilobytes, so replaying it
 	// from the first entry costs nothing and is the only way the user sees
 	// what happened before they got here.
-	return attachWithRetry(cfg, resp.Session.ID, wire.SinceAll)
+	return attachWithRetry(cfg, resp.Session.ID, terminal.SinceAll)
 }
 
 // attachWithRetry is `new`'s "attach immediately and stream everything"

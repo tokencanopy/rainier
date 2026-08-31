@@ -27,7 +27,7 @@ type Frame struct {
 	Type     FrameType `json:"t"`
 	AttachID uint64    `json:"a"`
 	// Since is a FrameOpen's attach cursor, interpreted by session.Attach: 0
-	// asks for a snapshot of the current screen, wire.SinceAll for the whole
+	// asks for a snapshot of the current screen, terminal.SinceAll for the whole
 	// event log, anything else resumes after that sequence number. The
 	// omitempty is why "the whole log" has a value of its own instead of
 	// being spelled 0 — a zero Since is absent from these bytes entirely, so

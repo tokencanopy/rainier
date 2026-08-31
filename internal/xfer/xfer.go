@@ -2,7 +2,7 @@
 // per-repository diff and the bounded push/pull file transfer — together with
 // the archive rules both ends of a transfer apply.
 //
-// It exists for the reason internal/wire and internal/relay do: three programs
+// It exists for the reason protocol/terminal and internal/relay do: three programs
 // speak this protocol (cmd/rainier at one end, cmd/sessiond at the other,
 // internal/controld bridging them) and the shapes they exchange have to be ONE
 // definition rather than three that happen to match today.

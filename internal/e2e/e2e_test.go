@@ -77,8 +77,8 @@ import (
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/internal/runnerd"
-	"github.com/tokencanopy/rainier/internal/wire"
 	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 const (
@@ -563,25 +563,25 @@ func (ss *scriptedSessiond) cursors() []uint64 {
 }
 
 // openFrames is what an attach opens with, mirroring session.Attach's rule
-// (whose own tests pin the real one): the whole log for wire.SinceAll, the
+// (whose own tests pin the real one): the whole log for terminal.SinceAll, the
 // entries after a resume cursor, and the snapshot for everything else —
 // including a cursor the log cannot answer.
-func (ss *scriptedSessiond) openFrames(since uint64) []wire.ServerMsg {
+func (ss *scriptedSessiond) openFrames(since uint64) []terminal.ServerMessage {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	ss.opens = append(ss.opens, since)
 
 	last := uint64(len(ss.log))
 	from := since
-	if since == wire.SinceAll {
+	if since == terminal.SinceAll {
 		from = 0
 	}
-	if last == 0 || (since != wire.SinceAll && (since == 0 || since > last)) {
-		return []wire.ServerMsg{{Type: "snapshot", Seq: 1, Data: []byte(snapshotFor(ss.id))}}
+	if last == 0 || (since != terminal.SinceAll && (since == 0 || since > last)) {
+		return []terminal.ServerMessage{{Type: "snapshot", Seq: 1, Data: []byte(snapshotFor(ss.id))}}
 	}
-	out := make([]wire.ServerMsg, 0, last-from)
+	out := make([]terminal.ServerMessage, 0, last-from)
 	for i := from; i < last; i++ {
-		out = append(out, wire.ServerMsg{Type: "output", Seq: i + 1, Data: ss.log[i]})
+		out = append(out, terminal.ServerMessage{Type: "output", Seq: i + 1, Data: ss.log[i]})
 	}
 	return out
 }
@@ -631,12 +631,12 @@ func (ss *scriptedSessiond) serve() {
 				ss.send(ctx, f.AttachID, m)
 			}
 		case relay.FrameClient:
-			var m wire.ClientMsg
+			var m terminal.ClientMessage
 			if json.Unmarshal(f.Payload, &m) != nil {
 				continue
 			}
 			if m.Type == "stdin" {
-				ss.send(ctx, f.AttachID, wire.ServerMsg{Type: "output", Seq: 2, Data: m.Data})
+				ss.send(ctx, f.AttachID, terminal.ServerMessage{Type: "output", Seq: 2, Data: m.Data})
 			}
 		case relay.FrameControl:
 			ss.onControl(f.Payload)
@@ -644,7 +644,7 @@ func (ss *scriptedSessiond) serve() {
 	}
 }
 
-func (ss *scriptedSessiond) send(ctx context.Context, attachID uint64, m wire.ServerMsg) {
+func (ss *scriptedSessiond) send(ctx context.Context, attachID uint64, m terminal.ServerMessage) {
 	payload, err := json.Marshal(m)
 	if err != nil {
 		return
@@ -1477,7 +1477,7 @@ func (f *fleet) diff(id string) xfer.DiffAnswer {
 // ---------------------------------------------------------------------------
 
 // attachConn is a client attached through controld's attach plane, speaking
-// the same wire.ClientMsg/ServerMsg protocol `rainier attach` speaks.
+// the same terminal.ClientMessage/ServerMsg protocol `rainier attach` speaks.
 type attachConn struct {
 	t      *testing.T
 	c      *websocket.Conn
@@ -1508,7 +1508,7 @@ func (f *fleet) attach(id string, since uint64) *attachConn {
 			f.t.Cleanup(a.close)
 			wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
 			defer wcancel()
-			if err := wsjson.Write(wctx, c, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24}); err != nil {
+			if err := wsjson.Write(wctx, c, terminal.ClientMessage{Type: "resize", Cols: 80, Rows: 24}); err != nil {
 				f.t.Fatalf("attach %s: sending the first resize: %v", id, err)
 			}
 			return a
@@ -1522,7 +1522,7 @@ func (f *fleet) attach(id string, since uint64) *attachConn {
 }
 
 // read takes the next server message, failing the test if none arrives.
-func (a *attachConn) read() wire.ServerMsg {
+func (a *attachConn) read() terminal.ServerMessage {
 	a.t.Helper()
 	m, err := a.readErr(10 * time.Second)
 	if err != nil {
@@ -1533,10 +1533,10 @@ func (a *attachConn) read() wire.ServerMsg {
 
 // readErr is read without the assertion — for the scene that wants to prove
 // the attach DID die.
-func (a *attachConn) readErr(timeout time.Duration) (wire.ServerMsg, error) {
+func (a *attachConn) readErr(timeout time.Duration) (terminal.ServerMessage, error) {
 	ctx, cancel := context.WithTimeout(a.ctx, timeout)
 	defer cancel()
-	var m wire.ServerMsg
+	var m terminal.ServerMessage
 	err := wsjson.Read(ctx, a.c, &m)
 	return m, err
 }
@@ -1546,7 +1546,7 @@ func (a *attachConn) stdin(s string) {
 	a.t.Helper()
 	ctx, cancel := context.WithTimeout(a.ctx, 10*time.Second)
 	defer cancel()
-	if err := wsjson.Write(ctx, a.c, wire.ClientMsg{Type: "stdin", Data: []byte(s)}); err != nil {
+	if err := wsjson.Write(ctx, a.c, terminal.ClientMessage{Type: "stdin", Data: []byte(s)}); err != nil {
 		a.t.Fatalf("attach write: %v", err)
 	}
 }
@@ -2036,9 +2036,9 @@ func TestFullReplayReachesTheViewer(t *testing.T) {
 	// CLI spelled — the assertion that would have caught the omitempty hop
 	// eating it, or controld dropping it out of dial_attach.
 	got := ss.cursors()
-	if len(got) != 2 || got[0] != 0 || got[1] != wire.SinceAll {
+	if len(got) != 2 || got[0] != 0 || got[1] != terminal.SinceAll {
 		t.Fatalf("cursors the session was attached with = %v, want [0 %d] (plain attach, then --since 0)",
-			got, wire.SinceAll)
+			got, terminal.SinceAll)
 	}
 }
 
