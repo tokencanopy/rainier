@@ -17,8 +17,8 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
-	"rainier/internal/driver"
-	"rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/internal/driver"
+	"github.com/tokencanopy/rainier/internal/rwire"
 )
 
 const testToken = "testtoken"

@@ -18,10 +18,10 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
-	"rainier/internal/driver"
-	"rainier/internal/relay"
-	"rainier/internal/session"
-	"rainier/internal/wire"
+	"github.com/tokencanopy/rainier/internal/driver"
+	"github.com/tokencanopy/rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/session"
+	"github.com/tokencanopy/rainier/internal/wire"
 )
 
 // This test wires the real relay end-to-end without Docker: create a session

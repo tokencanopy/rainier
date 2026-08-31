@@ -23,10 +23,10 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"rainier/internal/attachio"
-	"rainier/internal/cli"
-	"rainier/internal/wire"
-	"rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/internal/attachio"
+	"github.com/tokencanopy/rainier/internal/cli"
+	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/internal/xfer"
 )
 
 // devicePollTimeout bounds a single poll request to GitHub's device-flow

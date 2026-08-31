@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"rainier/internal/rwire"
-	"rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/internal/xfer"
 )
 
 // The session RPC is controld's request/response channel to the inside of a

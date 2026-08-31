@@ -5,7 +5,7 @@ import (
 	"slices"
 	"sync"
 
-	"rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/relay"
 )
 
 type sessionEntry struct {

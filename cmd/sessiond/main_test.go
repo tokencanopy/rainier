@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"rainier/internal/eventlog"
-	"rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/eventlog"
+	"github.com/tokencanopy/rainier/internal/relay"
 )
 
 // TestNextBackoff pins dialLoop's backoff step: double, then clamp to the

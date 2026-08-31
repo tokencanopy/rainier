@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"rainier/internal/session"
-	"rainier/internal/wire"
+	"github.com/tokencanopy/rainier/internal/session"
+	"github.com/tokencanopy/rainier/internal/wire"
 )
 
 // pipeConn is an in-memory Conn pair for tests. The two ends returned by

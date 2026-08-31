@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"log"
 
-	"rainier/internal/attachio"
+	"github.com/tokencanopy/rainier/internal/attachio"
 )
 
 func main() {

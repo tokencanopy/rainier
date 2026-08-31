@@ -10,7 +10,7 @@ import (
 
 	"golang.org/x/term"
 
-	"rainier/internal/session"
+	"github.com/tokencanopy/rainier/internal/session"
 )
 
 func main() {

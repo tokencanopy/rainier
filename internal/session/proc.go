@@ -12,7 +12,7 @@ import (
 
 	"github.com/creack/pty"
 
-	"rainier/internal/reap"
+	"github.com/tokencanopy/rainier/internal/reap"
 )
 
 type proc struct {

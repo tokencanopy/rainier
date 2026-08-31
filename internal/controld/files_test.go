@@ -18,8 +18,8 @@ import (
 
 	"github.com/coder/websocket/wsjson"
 
-	"rainier/internal/rwire"
-	"rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/internal/xfer"
 )
 
 // ---------------------------------------------------------------------------

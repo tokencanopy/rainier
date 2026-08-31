@@ -38,7 +38,7 @@ import (
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 
-	"rainier/internal/wire"
+	"github.com/tokencanopy/rainier/internal/wire"
 )
 
 // detachKey is Ctrl-].

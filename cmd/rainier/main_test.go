@@ -17,9 +17,9 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
-	"rainier/internal/cli"
-	"rainier/internal/wire"
-	"rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/internal/cli"
+	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/internal/xfer"
 )
 
 // ---------------------------------------------------------------------------

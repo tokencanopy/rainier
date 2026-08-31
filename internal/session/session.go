@@ -7,9 +7,9 @@ import (
 	"log"
 	"sync"
 
-	"rainier/internal/eventlog"
-	"rainier/internal/term"
-	"rainier/internal/wire"
+	"github.com/tokencanopy/rainier/internal/eventlog"
+	"github.com/tokencanopy/rainier/internal/term"
+	"github.com/tokencanopy/rainier/internal/wire"
 )
 
 type Config struct {

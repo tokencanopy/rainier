@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"rainier/internal/wire"
+	"github.com/tokencanopy/rainier/internal/wire"
 )
 
 // fakeProc lets tests drive output and observe stdin/resize without a real PTY.

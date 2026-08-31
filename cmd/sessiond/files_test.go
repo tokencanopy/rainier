@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/internal/xfer"
 )
 
 // ---------------------------------------------------------------------------

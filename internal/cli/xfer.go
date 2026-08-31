@@ -7,7 +7,7 @@ import (
 	"net/url"
 	"os"
 
-	"rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/internal/xfer"
 )
 
 // This file is the client end of the bounded file transfer: `rainier push` and

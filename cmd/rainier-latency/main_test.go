@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"rainier/internal/cli"
+	"github.com/tokencanopy/rainier/internal/cli"
 )
 
 func TestSummarizeReportsCenterSpreadAndInterpolatedTail(t *testing.T) {

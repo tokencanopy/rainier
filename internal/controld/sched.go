@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/internal/rwire"
 )
 
 // runnerView is one connected runner's placement-relevant state: just

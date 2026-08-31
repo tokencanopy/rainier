@@ -70,15 +70,15 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/jackc/pgx/v5"
 
-	"rainier/internal/attachio"
-	"rainier/internal/cli"
-	"rainier/internal/controld"
-	"rainier/internal/controld/pgstore"
-	"rainier/internal/driver"
-	"rainier/internal/relay"
-	"rainier/internal/runnerd"
-	"rainier/internal/wire"
-	"rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/internal/attachio"
+	"github.com/tokencanopy/rainier/internal/cli"
+	"github.com/tokencanopy/rainier/internal/controld"
+	"github.com/tokencanopy/rainier/internal/controld/pgstore"
+	"github.com/tokencanopy/rainier/internal/driver"
+	"github.com/tokencanopy/rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/runnerd"
+	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/internal/xfer"
 )
 
 const (

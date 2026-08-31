@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/relay"
 )
 
 // --- chain composition ---

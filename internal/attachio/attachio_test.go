@@ -19,7 +19,7 @@ import (
 	"github.com/creack/pty"
 	"golang.org/x/sys/unix"
 
-	"rainier/internal/wire"
+	"github.com/tokencanopy/rainier/internal/wire"
 )
 
 // TestAttachURL is moved from cmd/rattach/main_test.go's TestAttachURL

@@ -9,8 +9,8 @@ import (
 
 	"github.com/coder/websocket/wsjson"
 
-	"rainier/internal/session"
-	"rainier/internal/wire"
+	"github.com/tokencanopy/rainier/internal/session"
+	"github.com/tokencanopy/rainier/internal/wire"
 )
 
 // A viewer that stops responding (its transport goes silent without ever

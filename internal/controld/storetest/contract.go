@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"rainier/internal/controld"
+	"github.com/tokencanopy/rainier/internal/controld"
 )
 
 // sameJSON fails the test unless got carries the same JSON value as want.

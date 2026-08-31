@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/relay"
 )
 
 // lastEvent decodes what a stubSender was last asked to send, which for the

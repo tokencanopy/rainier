@@ -14,8 +14,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"rainier/internal/controld"
-	"rainier/internal/controld/storetest"
+	"github.com/tokencanopy/rainier/internal/controld"
+	"github.com/tokencanopy/rainier/internal/controld/storetest"
 )
 
 // startPostgres runs a disposable postgres:16-alpine container on an

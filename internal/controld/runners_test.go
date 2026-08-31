@@ -15,7 +15,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
-	"rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/internal/rwire"
 )
 
 const testRunnerToken = "rnr_test_runner_token"
