@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tokencanopy/rainier/internal/xfer"
 	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 // sessionsBodyLimit caps every request body this file decodes: the create
@@ -1939,7 +1939,7 @@ func (s *Server) handleDeleteEnvironment(w http.ResponseWriter, r *http.Request,
 // All three are the same shape: check the session is reachable (and, for the
 // two that carry files, that this caller owns it), then drive a session RPC
 // into the sandbox and render what it says. The wire types belong to
-// internal/xfer, which the CLI and sessiond import too — one definition per hop
+// protocol/workspace, which the CLI and sessiond import too — one definition per hop
 // rather than three that happen to match.
 //
 // V0 CRUDENESS, DELIBERATE (design §4.5). The transfer is a chunk per request:
@@ -1959,7 +1959,7 @@ func (s *Server) handleDeleteEnvironment(w http.ResponseWriter, r *http.Request,
 // ---------------------------------------------------------------------------
 
 // filesBodyLimit caps one push chunk's request body. A chunk carries at most
-// xfer.ChunkBytes of payload, which base64 inflates by a third; 2MiB leaves
+// workspace.ChunkBytes of payload, which base64 inflates by a third; 2MiB leaves
 // room for that and the envelope around it, and matches the session RPC's own
 // payload cap (plan §Global Constraints) — the body is about to become one.
 const filesBodyLimit = 2 << 20
@@ -2002,7 +2002,7 @@ func (s *Server) handlePushFiles(w http.ResponseWriter, r *http.Request, u User)
 	if !ok {
 		return
 	}
-	var chunk xfer.PushChunk
+	var chunk workspace.PushChunk
 	if !decodeJSONBodyLimit(w, r, &chunk, filesBodyLimit) {
 		return
 	}
@@ -2027,7 +2027,7 @@ func (s *Server) handlePushFiles(w http.ResponseWriter, r *http.Request, u User)
 // path that never leaves this process is a path that never had a chance to
 // escape a workspace, and a chunk refused here costs a round trip rather than
 // a container's disk.
-func validatePushChunk(c xfer.PushChunk) string {
+func validatePushChunk(c workspace.PushChunk) string {
 	switch {
 	case c.Xfer == "":
 		return "xfer is required: every chunk names the transfer it belongs to"
@@ -2035,11 +2035,11 @@ func validatePushChunk(c xfer.PushChunk) string {
 		return fmt.Sprintf("xfer must be at most %d characters", maxXferIDLen)
 	case c.Seq < 0:
 		return "seq must not be negative"
-	case len(c.Data) > xfer.ChunkBytes:
+	case len(c.Data) > workspace.ChunkBytes:
 		return fmt.Sprintf("data is %s; one chunk carries at most %s",
-			xfer.HumanBytes(int64(len(c.Data))), xfer.HumanBytes(xfer.ChunkBytes))
+			workspace.HumanBytes(int64(len(c.Data))), workspace.HumanBytes(workspace.ChunkBytes))
 	}
-	if err := xfer.ValidatePath(c.Path); err != nil {
+	if err := workspace.ValidatePath(c.Path); err != nil {
 		return err.Error()
 	}
 	return ""
@@ -2062,7 +2062,7 @@ const maxXferIDLen = 64
 // catch it too; this fails it sooner and louder.)
 func (s *Server) handlePullFiles(w http.ResponseWriter, r *http.Request, u User) {
 	path := r.URL.Query().Get("path")
-	if err := xfer.ValidatePath(path); err != nil {
+	if err := workspace.ValidatePath(path); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -2079,13 +2079,13 @@ func (s *Server) handlePullFiles(w http.ResponseWriter, r *http.Request, u User)
 	// which nothing honest does. It is the second of the two rules that keep
 	// this loop finite — the first is that only the last chunk may be empty
 	// (sessionPullChunk) — and the belt to that one's braces.
-	maxChunks := int(s.xferMax/xfer.ChunkBytes) + 2
+	maxChunks := int(s.xferMax/workspace.ChunkBytes) + 2
 	for seq := 0; ; seq++ {
 		if seq > maxChunks {
 			log.Printf("controld: pull %s from %s took more than %d chunks; abandoning", path, row.ID, maxChunks)
 			panic(http.ErrAbortHandler)
 		}
-		chunk, err := s.sessionPullChunk(r.Context(), row.ID, xfer.PullRequest{Xfer: id, Path: path, Seq: seq})
+		chunk, err := s.sessionPullChunk(r.Context(), row.ID, workspace.PullRequest{Xfer: id, Path: path, Seq: seq})
 		if err != nil {
 			if !started {
 				writeSandboxErr(w, row.ID, "pull", err)
@@ -2099,10 +2099,10 @@ func (s *Server) handlePullFiles(w http.ResponseWriter, r *http.Request, u User)
 		// done is the case this exists for: nothing else would stop it.
 		if sent+int64(len(chunk.Data)) > s.xferMax {
 			log.Printf("controld: pull %s from %s exceeded the %s transfer limit; abandoning",
-				path, row.ID, xfer.HumanBytes(s.xferMax))
+				path, row.ID, workspace.HumanBytes(s.xferMax))
 			if !started {
 				writeErr(w, http.StatusConflict, "conflict",
-					fmt.Sprintf("this path is larger than the %s transfer limit", xfer.HumanBytes(s.xferMax)))
+					fmt.Sprintf("this path is larger than the %s transfer limit", workspace.HumanBytes(s.xferMax)))
 				return
 			}
 			panic(http.ErrAbortHandler)

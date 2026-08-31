@@ -25,8 +25,8 @@ import (
 
 	"github.com/tokencanopy/rainier/internal/attachio"
 	"github.com/tokencanopy/rainier/internal/cli"
-	"github.com/tokencanopy/rainier/internal/xfer"
 	"github.com/tokencanopy/rainier/protocol/terminal"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 // devicePollTimeout bounds a single poll request to GitHub's device-flow
@@ -988,7 +988,7 @@ func runRm(args []string) error {
 // diff / push / pull
 //
 // The three workspace-inspection commands. All the work is in internal/cli
-// (Push/Pull) and internal/xfer (the archive rules); what is left here is
+// (Push/Pull) and protocol/workspace (the archive rules); what is left here is
 // argument parsing and rendering, which is the same split every other
 // subcommand takes.
 // ---------------------------------------------------------------------------
@@ -1002,7 +1002,7 @@ func runDiff(args []string) error {
 	if err != nil {
 		return err
 	}
-	var ans xfer.DiffAnswer
+	var ans workspace.DiffAnswer
 	if err := c.Do(http.MethodGet, "/v0/sessions/"+id+"/diff", nil, &ans); err != nil {
 		return err
 	}
@@ -1016,7 +1016,7 @@ func runDiff(args []string) error {
 //
 // A repository with an empty stat says so explicitly. Printing nothing there
 // reads as a bug in this command rather than as an answer about the session.
-func renderDiff(w io.Writer, ans xfer.DiffAnswer) {
+func renderDiff(w io.Writer, ans workspace.DiffAnswer) {
 	if len(ans.Repos) == 0 {
 		fmt.Fprintln(w, "this session has no repositories")
 		return

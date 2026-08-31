@@ -18,8 +18,8 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"github.com/tokencanopy/rainier/internal/cli"
-	"github.com/tokencanopy/rainier/internal/xfer"
 	"github.com/tokencanopy/rainier/protocol/terminal"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 // ---------------------------------------------------------------------------
@@ -1134,7 +1134,7 @@ func TestSplitRemote(t *testing.T) {
 // silence there would read as a rendering bug.
 func TestRenderDiff(t *testing.T) {
 	var buf bytes.Buffer
-	renderDiff(&buf, xfer.DiffAnswer{Repos: []xfer.RepoDiff{
+	renderDiff(&buf, workspace.DiffAnswer{Repos: []workspace.RepoDiff{
 		{Repo: "acme/widget", BaseBranch: "main", SessionBranch: "rainier/dev", Stat: " main.go | 2 +-\n 1 file changed\n"},
 		{Repo: "acme/other", BaseBranch: "trunk", SessionBranch: "rainier/dev", Stat: ""},
 	}})
@@ -1149,7 +1149,7 @@ func TestRenderDiff(t *testing.T) {
 // A session with no repositories says so rather than printing an empty page.
 func TestRenderDiffWithNoRepos(t *testing.T) {
 	var buf bytes.Buffer
-	renderDiff(&buf, xfer.DiffAnswer{})
+	renderDiff(&buf, workspace.DiffAnswer{})
 	if !strings.Contains(buf.String(), "no repositories") {
 		t.Errorf("diff output = %q, want it to say the session has no repositories", buf.String())
 	}

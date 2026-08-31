@@ -15,7 +15,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 // ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ func (p *pushCollector) handler(t *testing.T) http.HandlerFunc {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		var c xfer.PushChunk
+		var c workspace.PushChunk
 		if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
 			t.Errorf("decode chunk: %v", err)
 			w.WriteHeader(http.StatusBadRequest)
@@ -75,8 +75,8 @@ func (p *pushCollector) handler(t *testing.T) http.HandlerFunc {
 		if c.Seq != p.chunks {
 			t.Errorf("chunk arrived with seq %d, want %d — chunks must be sequential", c.Seq, p.chunks)
 		}
-		if len(c.Data) > xfer.ChunkBytes {
-			t.Errorf("chunk %d carried %d bytes, over the %d limit", c.Seq, len(c.Data), xfer.ChunkBytes)
+		if len(c.Data) > workspace.ChunkBytes {
+			t.Errorf("chunk %d carried %d bytes, over the %d limit", c.Seq, len(c.Data), workspace.ChunkBytes)
 		}
 		if p.xferID == "" {
 			p.xferID, p.path = c.Xfer, c.Path
@@ -90,7 +90,7 @@ func (p *pushCollector) handler(t *testing.T) http.HandlerFunc {
 		p.body = append(p.body, c.Data...)
 		p.chunks++
 		p.done = p.done || c.Done
-		json.NewEncoder(w).Encode(xfer.PushAck{Seq: c.Seq, Synced: c.Done || p.chunks%xfer.SyncEvery == 0})
+		json.NewEncoder(w).Encode(workspace.PushAck{Seq: c.Seq, Synced: c.Done || p.chunks%workspace.SyncEvery == 0})
 	}
 }
 
@@ -138,7 +138,7 @@ func TestPushStreamsAnArchiveInOrder(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	dest := t.TempDir()
-	if err := xfer.UntarGz(archive, dest, xfer.MaxExtractBytes); err != nil {
+	if err := workspace.UntarGz(archive, dest, workspace.MaxExtractBytes); err != nil {
 		t.Fatalf("UntarGz what the server received: %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(dest, "pkg", "big.bin"))
@@ -212,7 +212,7 @@ func TestPushSurfacesTheServersRefusal(t *testing.T) {
 // disagree about where the transfer is, and continuing would corrupt it.
 func TestPushRefusesAMismatchedAck(t *testing.T) {
 	c := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(xfer.PushAck{Seq: 42})
+		json.NewEncoder(w).Encode(workspace.PushAck{Seq: 42})
 	}))
 	err := Push(c, "sess_x", sourceTree(t), "dst", nil)
 	if err == nil {
@@ -257,7 +257,7 @@ func archiveServer(t *testing.T, body []byte) *Client {
 func TestPullExtractsTheArchive(t *testing.T) {
 	src := sourceTree(t)
 	var buf bytes.Buffer
-	if _, err := xfer.TarGz(&buf, src, xfer.MaxBytes); err != nil {
+	if _, err := workspace.TarGz(&buf, src, workspace.MaxBytes); err != nil {
 		t.Fatalf("TarGz: %v", err)
 	}
 	c := archiveServer(t, buf.Bytes())

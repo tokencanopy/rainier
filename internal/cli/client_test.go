@@ -23,8 +23,8 @@ import (
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/internal/runnerd"
-	"github.com/tokencanopy/rainier/internal/xfer"
 	"github.com/tokencanopy/rainier/protocol/terminal"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 func TestDoContextCancelsAStalledRequest(t *testing.T) {
@@ -633,20 +633,20 @@ func (ss *scriptedSessiond) serveControl(ctx context.Context, payload []byte) {
 
 func (ss *scriptedSessiond) invoke(method string, payload []byte) (any, error) {
 	switch method {
-	case xfer.MethodDiff:
-		return xfer.DiffAnswer{Repos: []xfer.RepoDiff{{
+	case workspace.MethodDiff:
+		return workspace.DiffAnswer{Repos: []workspace.RepoDiff{{
 			Repo: "acme/widgets", BaseBranch: "main", SessionBranch: "rainier/smoke-session",
 			Stat: " main.go | 2 +-\n",
 		}}}, nil
-	case xfer.MethodPushFiles:
-		var c xfer.PushChunk
+	case workspace.MethodPushFiles:
+		var c workspace.PushChunk
 		if err := json.Unmarshal(payload, &c); err != nil {
 			return nil, err
 		}
 		ss.files[c.Path] = append(ss.files[c.Path], c.Data...)
-		return xfer.PushAck{Seq: c.Seq, Synced: c.Done}, nil
-	case xfer.MethodPullFiles:
-		var req xfer.PullRequest
+		return workspace.PushAck{Seq: c.Seq, Synced: c.Done}, nil
+	case workspace.MethodPullFiles:
+		var req workspace.PullRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return nil, err
 		}
@@ -654,12 +654,12 @@ func (ss *scriptedSessiond) invoke(method string, payload []byte) (any, error) {
 		if !ok {
 			return nil, fmt.Errorf("%s does not exist in this session's workspace", req.Path)
 		}
-		off := req.Seq * xfer.ChunkBytes
+		off := req.Seq * workspace.ChunkBytes
 		if off > len(blob) {
 			return nil, fmt.Errorf("pull chunk %d is past the end of the archive", req.Seq)
 		}
-		end := min(off+xfer.ChunkBytes, len(blob))
-		return xfer.PullChunk{Seq: req.Seq, Data: blob[off:end], Done: end >= len(blob)}, nil
+		end := min(off+workspace.ChunkBytes, len(blob))
+		return workspace.PullChunk{Seq: req.Seq, Data: blob[off:end], Done: end >= len(blob)}, nil
 	}
 	return nil, fmt.Errorf("unknown method %q", method)
 }
@@ -985,7 +985,7 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	// cross controld chunk by chunk into the scripted sessiond and come back
 	// out through the pull's streamed response; extracting them has to
 	// reproduce the tree that was pushed, file for file ---
-	var diffAns xfer.DiffAnswer
+	var diffAns workspace.DiffAnswer
 	if err := c.Do(http.MethodGet, "/v0/sessions/"+id+"/diff", nil, &diffAns); err != nil {
 		t.Fatalf("GET /v0/sessions/%s/diff: %v", id, err)
 	}

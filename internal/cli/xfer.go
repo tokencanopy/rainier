@@ -7,7 +7,7 @@ import (
 	"net/url"
 	"os"
 
-	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 // This file is the client end of the bounded file transfer: `rainier push` and
@@ -23,7 +23,7 @@ import (
 // "that is too big".
 //
 // The archive rules (what may be in a tar, where an entry may land) belong to
-// internal/xfer and are shared with the sandbox. That sharing is the point: a
+// protocol/workspace and are shared with the sandbox. That sharing is the point: a
 // pull's archive comes out of somebody's container and is extracted into
 // somebody's home directory, so the checks that keep its entries inside the
 // destination have to be the same ones, not two implementations that agree
@@ -34,13 +34,13 @@ import (
 // progress, when non-nil, is called after every acked chunk with the bytes
 // sent so far and the archive's total size.
 func Push(c *Client, sessionID, localDir, remotePath string, progress func(sent, total int64)) error {
-	return pushLimited(c, sessionID, localDir, remotePath, progress, xfer.MaxBytes)
+	return pushLimited(c, sessionID, localDir, remotePath, progress, workspace.MaxBytes)
 }
 
 // pushLimited is Push with the cap as a parameter, so a test can reach it
 // without moving a quarter of a gigabyte.
 func pushLimited(c *Client, sessionID, localDir, remotePath string, progress func(sent, total int64), limit int64) error {
-	if err := xfer.ValidatePath(remotePath); err != nil {
+	if err := workspace.ValidatePath(remotePath); err != nil {
 		return fmt.Errorf("destination: %w", err)
 	}
 	fi, err := os.Stat(localDir)
@@ -63,7 +63,7 @@ func pushLimited(c *Client, sessionID, localDir, remotePath string, progress fun
 	// repeat rather than as a new transfer.
 	id := RandHex(headerIDBytes)
 	path := "/v0/sessions/" + sessionID + "/files"
-	buf := make([]byte, xfer.ChunkBytes)
+	buf := make([]byte, workspace.ChunkBytes)
 
 	var sent int64
 	for seq := 0; ; seq++ {
@@ -72,9 +72,9 @@ func pushLimited(c *Client, sessionID, localDir, remotePath string, progress fun
 			return fmt.Errorf("reading the archive: %w", readErr)
 		}
 		done := sent+int64(n) >= size
-		chunk := xfer.PushChunk{Xfer: id, Path: remotePath, Seq: seq, Data: buf[:n], Done: done}
+		chunk := workspace.PushChunk{Xfer: id, Path: remotePath, Seq: seq, Data: buf[:n], Done: done}
 
-		var ack xfer.PushAck
+		var ack workspace.PushAck
 		if err := c.Do(http.MethodPost, path, chunk, &ack); err != nil {
 			return err
 		}
@@ -105,7 +105,7 @@ func tarToTemp(dir string, limit int64) (*os.File, int64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	size, err := xfer.TarGz(f, dir, limit)
+	size, err := workspace.TarGz(f, dir, limit)
 	if err != nil {
 		f.Close()
 		os.Remove(f.Name())
@@ -125,11 +125,11 @@ func tarToTemp(dir string, limit int64) (*os.File, int64, error) {
 // progress, when non-nil, is called as bytes arrive; the total is 0 because
 // nothing on this side knows it until the stream ends.
 func Pull(c *Client, sessionID, remotePath, localDir string, progress func(received, total int64)) error {
-	return pullLimited(c, sessionID, remotePath, localDir, progress, xfer.MaxBytes)
+	return pullLimited(c, sessionID, remotePath, localDir, progress, workspace.MaxBytes)
 }
 
 func pullLimited(c *Client, sessionID, remotePath, localDir string, progress func(received, total int64), limit int64) error {
-	if err := xfer.ValidatePath(remotePath); err != nil {
+	if err := workspace.ValidatePath(remotePath); err != nil {
 		return fmt.Errorf("source: %w", err)
 	}
 	path := "/v0/sessions/" + sessionID + "/files?path=" + url.QueryEscape(remotePath)
@@ -142,7 +142,7 @@ func pullLimited(c *Client, sessionID, remotePath, localDir string, progress fun
 	// To a temp file first, then extracted. Streaming a tar straight into the
 	// destination would mean writing entries before the archive's last one has
 	// been seen — and the archive is a session's, which is not a peer this
-	// side trusts (xfer.UntarGz validates the whole thing before it writes
+	// side trusts (workspace.UntarGz validates the whole thing before it writes
 	// anything, and it needs a file to do that twice over).
 	f, err := os.CreateTemp("", "rainier-pull-*.tgz")
 	if err != nil {
@@ -161,7 +161,7 @@ func pullLimited(c *Client, sessionID, remotePath, localDir string, progress fun
 	if err := f.Sync(); err != nil {
 		return err
 	}
-	return xfer.UntarGz(f.Name(), localDir, xfer.MaxExtractBytes)
+	return workspace.UntarGz(f.Name(), localDir, workspace.MaxExtractBytes)
 }
 
 // copyBounded copies src to dst, stopping with an error the moment the total
@@ -170,14 +170,14 @@ func pullLimited(c *Client, sessionID, remotePath, localDir string, progress fun
 // client that trusted either of them would still be one compromised session
 // away from filling its own disk.
 func copyBounded(dst io.Writer, src io.Reader, limit int64, progress func(received, total int64)) (int64, error) {
-	buf := make([]byte, xfer.ChunkBytes)
+	buf := make([]byte, workspace.ChunkBytes)
 	var total int64
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
 			if total+int64(n) > limit {
 				return total, fmt.Errorf("the transfer is larger than the %s limit: %w",
-					xfer.HumanBytes(limit), xfer.ErrTooLarge)
+					workspace.HumanBytes(limit), workspace.ErrTooLarge)
 			}
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return total, werr
@@ -204,7 +204,7 @@ func copyBounded(dst io.Writer, src io.Reader, limit int64, progress func(receiv
 // knows how big the archive is until it ends.
 func ProgressLine(verb string, done, total int64) string {
 	if total <= 0 {
-		return fmt.Sprintf("%s %s", verb, xfer.HumanBytes(done))
+		return fmt.Sprintf("%s %s", verb, workspace.HumanBytes(done))
 	}
-	return fmt.Sprintf("%s %s / %s (%d%%)", verb, xfer.HumanBytes(done), xfer.HumanBytes(total), done*100/total)
+	return fmt.Sprintf("%s %s / %s (%d%%)", verb, workspace.HumanBytes(done), workspace.HumanBytes(total), done*100/total)
 }

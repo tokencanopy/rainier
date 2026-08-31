@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/tokencanopy/rainier/internal/relay"
-	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 // This file is sessiond's boot chain: the staged program that runs in place of
@@ -62,10 +62,10 @@ const (
 // workspaceRoot is where the driver mounts the session's volume, and therefore
 // where a repo whose Dir is relative (every one controld resolves — Dir is the
 // repo's name) is cloned to. It is also the only tree a push or a pull may
-// touch, which is why the constant lives in internal/xfer: controld validates a
+// touch, which is why the constant lives in protocol/workspace: controld validates a
 // transfer path before it ever reaches this process, and a rule only the
 // sandbox knows is a rule the sandbox has to be trusted to apply.
-const workspaceRoot = xfer.WorkspaceRoot
+const workspaceRoot = workspace.WorkspaceRoot
 
 // credentialHelperCommand is what the workspace gitconfig names as
 // credential.helper. It is an absolute path, so git treats the whole string as

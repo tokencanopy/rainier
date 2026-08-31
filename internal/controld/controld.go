@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 const (
@@ -91,7 +91,7 @@ type Server struct {
 	attaches *attachTable
 
 	// xferMax is the most this replica will relay in ONE file transfer, in
-	// either direction — xfer.MaxBytes in production, lowered by tests. It is
+	// either direction — workspace.MaxBytes in production, lowered by tests. It is
 	// a field rather than the constant used inline because the pull path is
 	// where a sandbox's own bound stops being enough: a compromised one that
 	// never says "done" is answering an endless stream, and something on this
@@ -145,7 +145,7 @@ func New(st Store, cfg Config) (*Server, error) {
 		runners:     map[string]*runnerConn{},
 		runnerLocks: map[string]*sync.Mutex{},
 		attaches:    newAttachTable(),
-		xferMax:     xfer.MaxBytes,
+		xferMax:     workspace.MaxBytes,
 		schedWake:   make(chan struct{}, 1),
 	}, nil
 }
