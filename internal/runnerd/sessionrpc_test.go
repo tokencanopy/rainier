@@ -13,7 +13,7 @@ import (
 
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/relay"
-	"github.com/tokencanopy/rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ func shortHubWait(rd *Server) { rd.hubWait = 100 * time.Millisecond }
 
 // nextSessionReq returns the next session_req the runner sent up, skipping the
 // events (a registration's "running", say) that share the same socket.
-func nextSessionReq(t *testing.T, conn *fakeConn) rwire.FromRunner {
+func nextSessionReq(t *testing.T, conn *fakeConn) runner.FromRunner {
 	t.Helper()
 	for {
 		m := conn.readMsg(t)
@@ -161,8 +161,8 @@ func TestSessionRPCReachesTheSandboxAndAnswersBack(t *testing.T) {
 	rd, srv, conn := runnerWithControld(t)
 	id, sb := dialSandbox(t, rd, srv)
 
-	conn.send(t, rwire.ToRunner{Type: "session_rpc", Session: id,
-		RPC: &rwire.RPCEnvelope{ID: 42, Method: "diff", Payload: json.RawMessage(`{"repo":"api"}`)}})
+	conn.send(t, runner.ToRunner{Type: "session_rpc", Session: id,
+		RPC: &runner.RPCEnvelope{ID: 42, Method: "diff", Payload: json.RawMessage(`{"repo":"api"}`)}})
 
 	got := sb.nextControl(t)
 	if got.Kind != "req:diff" {
@@ -206,8 +206,8 @@ func TestSandboxRequestReachesControldAndTheAnswerComesDown(t *testing.T) {
 		t.Fatalf("envelope = %+v, want mint_git_credential id 3", up.RPC)
 	}
 
-	conn.send(t, rwire.ToRunner{Type: "session_rpc", Session: id,
-		RPC: &rwire.RPCEnvelope{ID: 3, Method: "resp", OK: true, Payload: json.RawMessage(`{"token":"t"}`)}})
+	conn.send(t, runner.ToRunner{Type: "session_rpc", Session: id,
+		RPC: &runner.RPCEnvelope{ID: 3, Method: "resp", OK: true, Payload: json.RawMessage(`{"token":"t"}`)}})
 
 	down := sb.nextControl(t)
 	if down.Kind != "resp" || down.ID != 3 || !down.OK {
@@ -227,8 +227,8 @@ func TestSessionRPCForAnUnregisteredSessionIsRefused(t *testing.T) {
 	// ten-second wait would be ten seconds of nothing.
 	_, _, conn := runnerWithControld(t, shortHubWait)
 
-	conn.send(t, rwire.ToRunner{Type: "session_rpc", Session: "sess-nope",
-		RPC: &rwire.RPCEnvelope{ID: 8, Method: "diff"}})
+	conn.send(t, runner.ToRunner{Type: "session_rpc", Session: "sess-nope",
+		RPC: &runner.RPCEnvelope{ID: 8, Method: "diff"}})
 
 	up := nextSessionReq(t, conn)
 	if up.RPC.ID != 8 || up.RPC.Method != "resp" || up.RPC.OK {
@@ -252,14 +252,14 @@ func TestSessionRPCForAnUnregisteredSessionIsRefused(t *testing.T) {
 func TestUndeliverableRPCResponseIsDropped(t *testing.T) {
 	rd, srv, conn := runnerWithControld(t, shortHubWait)
 
-	conn.send(t, rwire.ToRunner{Type: "session_rpc", Session: "sess-nope",
-		RPC: &rwire.RPCEnvelope{ID: 9, Method: "resp", OK: true}})
+	conn.send(t, runner.ToRunner{Type: "session_rpc", Session: "sess-nope",
+		RPC: &runner.RPCEnvelope{ID: 9, Method: "resp", OK: true}})
 	// A session_rpc with no envelope at all is dropped the same way.
-	conn.send(t, rwire.ToRunner{Type: "session_rpc", Session: "sess-nope"})
+	conn.send(t, runner.ToRunner{Type: "session_rpc", Session: "sess-nope"})
 
 	id, sb := dialSandbox(t, rd, srv)
-	conn.send(t, rwire.ToRunner{Type: "session_rpc", Session: id,
-		RPC: &rwire.RPCEnvelope{ID: 10, Method: "diff"}})
+	conn.send(t, runner.ToRunner{Type: "session_rpc", Session: id,
+		RPC: &runner.RPCEnvelope{ID: 10, Method: "diff"}})
 	if got := sb.nextControl(t); got.Kind != "req:diff" || got.ID != 10 {
 		t.Fatalf("event = %+v, want the runner still forwarding after two undeliverable messages", got)
 	}

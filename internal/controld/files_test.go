@@ -18,8 +18,8 @@ import (
 
 	"github.com/coder/websocket/wsjson"
 
-	"github.com/tokencanopy/rainier/internal/rwire"
 	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // ---------------------------------------------------------------------------
@@ -72,13 +72,13 @@ func startSandbox(t *testing.T, f *fakeRunner, fn sandboxFunc) {
 // answerRPCRaw is answerRPC without the *testing.T: the sandbox goroutine
 // outlives the test's own, and calling t.Fatalf from it would be a data race
 // with the test finishing.
-func (f *fakeRunner) answerRPCRaw(cmd rwire.ToRunner, ok bool, payload json.RawMessage) {
+func (f *fakeRunner) answerRPCRaw(cmd runner.ToRunner, ok bool, payload json.RawMessage) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	f.wmu.Lock()
 	defer f.wmu.Unlock()
-	m := rwire.FromRunner{Type: "session_req", Session: cmd.Session,
-		RPC: &rwire.RPCEnvelope{ID: cmd.RPC.ID, Method: "resp", OK: ok, Payload: payload}}
+	m := runner.FromRunner{Type: "session_req", Session: cmd.Session,
+		RPC: &runner.RPCEnvelope{ID: cmd.RPC.ID, Method: "resp", OK: ok, Payload: payload}}
 	m.Used, m.Total = f.used, f.total
 	// A write failure here means the test is over and the socket is gone;
 	// there is nobody left to tell.

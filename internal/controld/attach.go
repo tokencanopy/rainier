@@ -16,8 +16,8 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"github.com/tokencanopy/rainier/internal/relay"
-	"github.com/tokencanopy/rainier/internal/rwire"
 	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 const (
@@ -206,7 +206,7 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 		return
 	}
 
-	dial := rwire.ToRunner{Type: "dial_attach", Session: id, Attach: &rwire.Attach{
+	dial := runner.ToRunner{Type: "dial_attach", Session: id, Attach: &runner.Attach{
 		AttachID:  attachID,
 		Since:     since,
 		Cols:      first.Cols,

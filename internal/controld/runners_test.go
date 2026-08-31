@@ -15,7 +15,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
-	"github.com/tokencanopy/rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 const testRunnerToken = "rnr_test_runner_token"
@@ -99,7 +99,7 @@ type runnerScript struct {
 	Name     string
 	Token    string
 	Proto    *int
-	Sessions []rwire.SessionInfo
+	Sessions []runner.SessionInfo
 	Used     int
 	Total    int
 }
@@ -111,7 +111,7 @@ type runnerScript struct {
 type fakeRunner struct {
 	name  string
 	c     *websocket.Conn
-	cmds  chan rwire.ToRunner
+	cmds  chan runner.ToRunner
 	readE chan error
 
 	wmu         sync.Mutex
@@ -128,7 +128,7 @@ func startFakeRunner(t *testing.T, ts *httptest.Server, sc runnerScript) *fakeRu
 	if sc.Token == "" {
 		sc.Token = testRunnerToken
 	}
-	proto := rwire.Proto
+	proto := runner.ProtocolVersion
 	if sc.Proto != nil {
 		proto = *sc.Proto
 	}
@@ -140,20 +140,20 @@ func startFakeRunner(t *testing.T, ts *httptest.Server, sc runnerScript) *fakeRu
 	f := &fakeRunner{
 		name:  sc.Name,
 		c:     c,
-		cmds:  make(chan rwire.ToRunner, 64),
+		cmds:  make(chan runner.ToRunner, 64),
 		readE: make(chan error, 1),
 		used:  sc.Used,
 		total: sc.Total,
 	}
 	t.Cleanup(f.close)
-	f.write(t, rwire.FromRunner{Type: "announce", Proto: proto, Runner: sc.Name, Sessions: sc.Sessions})
+	f.write(t, runner.FromRunner{Type: "announce", Proto: proto, Runner: sc.Name, Sessions: sc.Sessions})
 	go f.readLoop()
 	return f
 }
 
 func (f *fakeRunner) readLoop() {
 	for {
-		var m rwire.ToRunner
+		var m runner.ToRunner
 		if err := wsjson.Read(context.Background(), f.c, &m); err != nil {
 			f.readE <- err
 			return
@@ -164,7 +164,7 @@ func (f *fakeRunner) readLoop() {
 
 // write is the fake's single writer. Like the real agent it stamps its
 // current capacity onto every outbound message, whatever the type.
-func (f *fakeRunner) write(t *testing.T, m rwire.FromRunner) {
+func (f *fakeRunner) write(t *testing.T, m runner.FromRunner) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -184,34 +184,34 @@ func (f *fakeRunner) setCapacity(used, total int) {
 
 // nextCmd returns the next ToRunner controld sent, failing the test if none
 // arrives in time.
-func (f *fakeRunner) nextCmd(t *testing.T) rwire.ToRunner {
+func (f *fakeRunner) nextCmd(t *testing.T) runner.ToRunner {
 	t.Helper()
 	select {
 	case m := <-f.cmds:
 		return m
 	case <-time.After(3 * time.Second):
 		t.Fatal("no command from controld within 3s")
-		return rwire.ToRunner{}
+		return runner.ToRunner{}
 	}
 }
 
 // reply answers one dispatched command, echoing its ReqID (the correlation
 // the whole dispatch path turns on) and the runner's current capacity.
-func (f *fakeRunner) reply(t *testing.T, cmd rwire.ToRunner, ok bool, detail string) {
+func (f *fakeRunner) reply(t *testing.T, cmd runner.ToRunner, ok bool, detail string) {
 	t.Helper()
-	f.write(t, rwire.FromRunner{Type: "result", ReqID: cmd.ReqID, OK: ok, Detail: detail})
+	f.write(t, runner.FromRunner{Type: "result", ReqID: cmd.ReqID, OK: ok, Detail: detail})
 }
 
 func (f *fakeRunner) event(t *testing.T, session, state string) {
 	t.Helper()
-	f.write(t, rwire.FromRunner{Type: "event", Session: session, State: state})
+	f.write(t, runner.FromRunner{Type: "event", Session: session, State: state})
 }
 
 // eventDetail is event with the Detail the setup events carry: runnerd's
 // pre-composed "rc N: <tail>" sentence on a failure, empty on success.
 func (f *fakeRunner) eventDetail(t *testing.T, session, state, detail string) {
 	t.Helper()
-	f.write(t, rwire.FromRunner{Type: "event", Session: session, State: state, Detail: detail})
+	f.write(t, runner.FromRunner{Type: "event", Session: session, State: state, Detail: detail})
 }
 
 // waitClosed returns the error that ended the fake's read loop — how a test
@@ -255,7 +255,7 @@ func joinRunner(t *testing.T, s *Server, ts *httptest.Server, sc runnerScript) *
 		sc.Name = "vm1"
 	}
 	probe := ghostSession + "-" + sc.Name
-	sc.Sessions = append(append([]rwire.SessionInfo{}, sc.Sessions...), rwire.SessionInfo{ID: probe, State: "running"})
+	sc.Sessions = append(append([]runner.SessionInfo{}, sc.Sessions...), runner.SessionInfo{ID: probe, State: "running"})
 	f := startFakeRunner(t, ts, sc)
 	waitConnected(t, s, sc.Name)
 	cmd := f.nextCmd(t)
@@ -268,7 +268,7 @@ func joinRunner(t *testing.T, s *Server, ts *httptest.Server, sc runnerScript) *
 
 // nextOfType returns the next command of type typ f receives, skipping
 // anything else controld happens to send in the meantime.
-func nextOfType(t *testing.T, f *fakeRunner, typ string) rwire.ToRunner {
+func nextOfType(t *testing.T, f *fakeRunner, typ string) runner.ToRunner {
 	t.Helper()
 	for {
 		if cmd := f.nextCmd(t); cmd.Type == typ {
@@ -277,7 +277,7 @@ func nextOfType(t *testing.T, f *fakeRunner, typ string) rwire.ToRunner {
 	}
 }
 
-func nextCreate(t *testing.T, f *fakeRunner) rwire.ToRunner {
+func nextCreate(t *testing.T, f *fakeRunner) runner.ToRunner {
 	t.Helper()
 	return nextOfType(t, f, "create")
 }
@@ -288,7 +288,7 @@ func nextCreate(t *testing.T, f *fakeRunner) rwire.ToRunner {
 func wantNothingQueued(t *testing.T, s *Server, f *fakeRunner) {
 	t.Helper()
 	probe := "sess_quiet_probe_" + f.name
-	if err := s.sendToRunner(f.name, rwire.ToRunner{Type: "destroy", Session: probe}); err != nil {
+	if err := s.sendToRunner(f.name, runner.ToRunner{Type: "destroy", Session: probe}); err != nil {
 		t.Fatalf("sendToRunner(%s): %v", f.name, err)
 	}
 	if cmd := f.nextCmd(t); cmd.Type != "destroy" || cmd.Session != probe {
@@ -540,7 +540,7 @@ func TestReconcileTable(t *testing.T) {
 		id := "sess_agree"
 		seedSession(t, st, Session{ID: id, State: StateRunning, Runner: "vm1", CreatedAt: old, UpdatedAt: old, LastEventAt: old})
 		startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: id, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: id, State: "running"}}})
 		waitConnected(t, s, "vm1")
 
 		eventually(t, 3*time.Second, func() error {
@@ -560,7 +560,7 @@ func TestReconcileTable(t *testing.T) {
 		id := "sess_adopt"
 		seedSession(t, st, Session{ID: id, State: StateRunning, Runner: "vm1"})
 		startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: id, State: "suspended_cold"}}})
+			Sessions: []runner.SessionInfo{{ID: id, State: "suspended_cold"}}})
 		waitConnected(t, s, "vm1")
 
 		got := wantState(t, st, id, StateSuspendedCold)
@@ -600,7 +600,7 @@ func TestReconcileTable(t *testing.T) {
 		id := "sess_terminal"
 		seedSession(t, st, Session{ID: id, State: StateDestroyed, Runner: "vm1"})
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: id, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: id, State: "running"}}})
 
 		cmd := f.nextCmd(t)
 		if cmd.Type != "destroy" || cmd.Session != id {
@@ -615,7 +615,7 @@ func TestReconcileTable(t *testing.T) {
 	t.Run("unknown id announced present is destroyed as an orphan", func(t *testing.T) {
 		_, _, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: "sess_ghost", State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: "sess_ghost", State: "running"}}})
 
 		cmd := f.nextCmd(t)
 		if cmd.Type != "destroy" || cmd.Session != "sess_ghost" {
@@ -632,7 +632,7 @@ func TestReconcileTable(t *testing.T) {
 		id := "sess_dupe"
 		seedSession(t, st, Session{ID: id, State: StateRunning, Runner: "vm2"})
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: id, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: id, State: "running"}}})
 
 		cmd := f.nextCmd(t)
 		if cmd.Type != "destroy" || cmd.Session != id {
@@ -655,7 +655,7 @@ func TestReconcileTable(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		id := "sess_unplaced"
 		seedSession(t, st, Session{ID: id, State: StateQueued})
-		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4, Sessions: []rwire.SessionInfo{
+		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4, Sessions: []runner.SessionInfo{
 			{ID: id, State: "running"},
 			{ID: ghostSession, State: "running"},
 		}})
@@ -675,13 +675,13 @@ func TestDispatchCorrelatesResults(t *testing.T) {
 	waitConnected(t, s, "vm1")
 
 	type outcome struct {
-		res rwire.FromRunner
+		res runner.FromRunner
 		err error
 	}
 	run := func(session string) <-chan outcome {
 		ch := make(chan outcome, 1)
 		go func() {
-			res, err := s.dispatch(context.Background(), "vm1", rwire.ToRunner{Type: "snapshot", Session: session})
+			res, err := s.dispatch(context.Background(), "vm1", runner.ToRunner{Type: "snapshot", Session: session})
 			ch <- outcome{res, err}
 		}()
 		return ch
@@ -737,7 +737,7 @@ func TestDestroyOrphanRetriesAfterLiveQueueSaturation(t *testing.T) {
 	// Hold the writer still with a completely full live queue. The first
 	// dispatch therefore fails in enqueue, not because the connection died.
 	for i := 0; i < runnerSendQueue; i++ {
-		rc.out <- rwire.ToRunner{Type: "prepull", Ref: fmt.Sprintf("image-%d", i)}
+		rc.out <- runner.ToRunner{Type: "prepull", Ref: fmt.Sprintf("image-%d", i)}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -762,7 +762,7 @@ func TestDestroyOrphanRetriesAfterLiveQueueSaturation(t *testing.T) {
 	// Free one slot. The bounded retry must use it and produce a tracked
 	// destroy rather than abandoning this orphan until another reconnect.
 	<-rc.out
-	var destroy rwire.ToRunner
+	var destroy runner.ToRunner
 	for i := 0; i < runnerSendQueue; i++ {
 		select {
 		case cmd := <-rc.out:
@@ -779,7 +779,7 @@ func TestDestroyOrphanRetriesAfterLiveQueueSaturation(t *testing.T) {
 	if destroy.ReqID == 1 {
 		t.Fatalf("retry req_id = %d, want a fresh id after the saturated attempt", destroy.ReqID)
 	}
-	if !rc.deliver(rwire.FromRunner{Type: "result", ReqID: destroy.ReqID, OK: true}) {
+	if !rc.deliver(runner.FromRunner{Type: "result", ReqID: destroy.ReqID, OK: true}) {
 		t.Fatal("successful retry had no pending dispatcher")
 	}
 	eventually(t, time.Second, func() error {
@@ -799,7 +799,7 @@ func TestDestroyOrphanRetriesAfterLiveQueueSaturation(t *testing.T) {
 func TestDispatchUnreachable(t *testing.T) {
 	t.Run("never connected", func(t *testing.T) {
 		s, _, _ := newTestControld(t)
-		_, err := s.dispatch(context.Background(), "vm-nope", rwire.ToRunner{Type: "destroy", Session: "sess_x"})
+		_, err := s.dispatch(context.Background(), "vm-nope", runner.ToRunner{Type: "destroy", Session: "sess_x"})
 		if !errors.Is(err, ErrRunnerUnreachable) {
 			t.Fatalf("err = %v, want ErrRunnerUnreachable", err)
 		}
@@ -812,7 +812,7 @@ func TestDispatchUnreachable(t *testing.T) {
 
 		errc := make(chan error, 1)
 		go func() {
-			_, err := s.dispatch(context.Background(), "vm1", rwire.ToRunner{Type: "suspend", Session: "sess_x"})
+			_, err := s.dispatch(context.Background(), "vm1", runner.ToRunner{Type: "suspend", Session: "sess_x"})
 			errc <- err
 		}()
 		f.nextCmd(t) // the command reached the runner; now the runner dies
@@ -834,7 +834,7 @@ func TestDispatchUnreachable(t *testing.T) {
 		waitConnected(t, s, "vm1")
 
 		start := time.Now()
-		_, err := s.dispatch(context.Background(), "vm1", rwire.ToRunner{Type: "suspend", Session: "sess_x"})
+		_, err := s.dispatch(context.Background(), "vm1", runner.ToRunner{Type: "suspend", Session: "sess_x"})
 		if !errors.Is(err, ErrRunnerUnreachable) {
 			t.Fatalf("err = %v, want ErrRunnerUnreachable", err)
 		}
@@ -850,7 +850,7 @@ func TestEventUpdatesStore(t *testing.T) {
 	// The ghost's destroy is the reconcile-finished signal: rows seeded after
 	// it can't be swept by the announce reconciliation that runs first.
 	f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-		Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+		Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 	waitConnected(t, s, "vm1")
 	awaitReconciled(t, f)
 
@@ -964,7 +964,7 @@ func TestReconnectReplacesConn(t *testing.T) {
 
 	errc := make(chan error, 1)
 	go func() {
-		_, err := s.dispatch(context.Background(), "vm1", rwire.ToRunner{Type: "destroy", Session: "sess_x"})
+		_, err := s.dispatch(context.Background(), "vm1", runner.ToRunner{Type: "destroy", Session: "sess_x"})
 		errc <- err
 	}()
 	cmd := second.nextCmd(t)
@@ -1089,7 +1089,7 @@ func TestBroadcastToRunners(t *testing.T) {
 	f3 := joinRunner(t, s, ts, runnerScript{Name: "vm3", Total: 4})
 
 	const ref = "rainier-env:env_x-0123456789ab"
-	s.broadcastToRunners(rwire.ToRunner{Type: "prepull", Ref: ref}, "vm1")
+	s.broadcastToRunners(runner.ToRunner{Type: "prepull", Ref: ref}, "vm1")
 
 	for _, f := range []*fakeRunner{f2, f3} {
 		cmd := f.nextCmd(t)
@@ -1101,7 +1101,7 @@ func TestBroadcastToRunners(t *testing.T) {
 	// vm1 was excluded. Sending it something else now and seeing that arrive
 	// first proves no prepull was ever queued ahead of it — the connection
 	// delivers in order.
-	if err := s.sendToRunner("vm1", rwire.ToRunner{Type: "destroy", Session: "sess_probe"}); err != nil {
+	if err := s.sendToRunner("vm1", runner.ToRunner{Type: "destroy", Session: "sess_probe"}); err != nil {
 		t.Fatalf("sendToRunner(vm1): %v", err)
 	}
 	if cmd := f1.nextCmd(t); cmd.Type != "destroy" {
@@ -1113,7 +1113,7 @@ func TestBroadcastToRunners(t *testing.T) {
 // later tasks map to the API's runner_unreachable code.
 func TestSendToRunnerUnreachable(t *testing.T) {
 	s, _, _ := newTestControld(t)
-	err := s.sendToRunner("vm-nope", rwire.ToRunner{Type: "destroy", Session: "sess_x"})
+	err := s.sendToRunner("vm-nope", runner.ToRunner{Type: "destroy", Session: "sess_x"})
 	if !errors.Is(err, ErrRunnerUnreachable) {
 		t.Fatalf("err = %v, want ErrRunnerUnreachable", err)
 	}

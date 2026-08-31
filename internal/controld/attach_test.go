@@ -18,8 +18,8 @@ import (
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/internal/runnerd"
-	"github.com/tokencanopy/rainier/internal/rwire"
 	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // ---------------------------------------------------------------------------
@@ -445,7 +445,7 @@ func TestAttachAuthorization(t *testing.T) {
 	_, adminTok := loginUser(t, st, "root", "admin")
 
 	f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-		Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+		Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 	waitConnected(t, s, "vm1")
 	awaitReconciled(t, f)
 
@@ -728,7 +728,7 @@ func TestAttachRequiresResizeFirst(t *testing.T) {
 	u, tok := loginUser(t, st, "alice", "member")
 
 	f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-		Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+		Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 	waitConnected(t, s, "vm1")
 	awaitReconciled(t, f)
 
@@ -773,7 +773,7 @@ func TestPairingTTL(t *testing.T) {
 	// The ghost's destroy proves reconciliation has finished, so the session
 	// seeded after it can't be swept by the announce that ran first.
 	f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-		Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+		Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 	waitConnected(t, s, "vm1")
 	awaitReconciled(t, f)
 

@@ -18,7 +18,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"github.com/tokencanopy/rainier/internal/driver"
-	"github.com/tokencanopy/rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 const testToken = "testtoken"
@@ -104,7 +104,7 @@ func (fc *fakeControld) nextConn(t *testing.T) *fakeConn {
 	}
 }
 
-func (fcn *fakeConn) readAnnounce(t *testing.T) rwire.FromRunner {
+func (fcn *fakeConn) readAnnounce(t *testing.T) runner.FromRunner {
 	t.Helper()
 	m := fcn.readMsg(t)
 	if m.Type != "announce" {
@@ -113,18 +113,18 @@ func (fcn *fakeConn) readAnnounce(t *testing.T) rwire.FromRunner {
 	return m
 }
 
-func (fcn *fakeConn) readMsg(t *testing.T) rwire.FromRunner {
+func (fcn *fakeConn) readMsg(t *testing.T) runner.FromRunner {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	var m rwire.FromRunner
+	var m runner.FromRunner
 	if err := wsjson.Read(ctx, fcn.c, &m); err != nil {
 		t.Fatalf("read from agent: %v", err)
 	}
 	return m
 }
 
-func (fcn *fakeConn) send(t *testing.T, m rwire.ToRunner) {
+func (fcn *fakeConn) send(t *testing.T, m runner.ToRunner) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -158,8 +158,8 @@ func TestAgentAnnounces(t *testing.T) {
 	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1"})
 
 	ann := fc.nextConn(t).readAnnounce(t)
-	if ann.Proto != rwire.Proto {
-		t.Fatalf("Proto = %d, want %d", ann.Proto, rwire.Proto)
+	if ann.Proto != runner.ProtocolVersion {
+		t.Fatalf("Proto = %d, want %d", ann.Proto, runner.ProtocolVersion)
 	}
 	if ann.Runner != "vm1" {
 		t.Fatalf("Runner = %q, want \"vm1\"", ann.Runner)
@@ -200,7 +200,7 @@ func TestAgentExecutesCreateAndReportsResult(t *testing.T) {
 	conn := fc.nextConn(t)
 	conn.readAnnounce(t)
 
-	conn.send(t, rwire.ToRunner{Type: "create", ReqID: 1, Session: "sess_x", Spec: &rwire.Spec{Image: "img"}})
+	conn.send(t, runner.ToRunner{Type: "create", ReqID: 1, Session: "sess_x", Spec: &runner.Spec{Image: "img"}})
 	res := conn.readMsg(t)
 	if res.Type != "result" || res.ReqID != 1 || !res.OK {
 		t.Fatalf("result = %+v, want ok result for req_id 1", res)
@@ -230,7 +230,7 @@ func TestAgentIdempotentCreate(t *testing.T) {
 	conn := fc.nextConn(t)
 	conn.readAnnounce(t)
 
-	msg := rwire.ToRunner{Type: "create", ReqID: 1, Session: "sess_x", Spec: &rwire.Spec{Image: "img"}}
+	msg := runner.ToRunner{Type: "create", ReqID: 1, Session: "sess_x", Spec: &runner.Spec{Image: "img"}}
 	conn.send(t, msg)
 	res1 := conn.readMsg(t)
 	if !res1.OK {
@@ -326,7 +326,7 @@ func TestAgentForwardsEvents(t *testing.T) {
 	conn := fc.nextConn(t)
 	conn.readAnnounce(t)
 
-	conn.send(t, rwire.ToRunner{Type: "create", ReqID: 1, Session: "sess_evt", Spec: &rwire.Spec{Image: "img"}})
+	conn.send(t, runner.ToRunner{Type: "create", ReqID: 1, Session: "sess_evt", Spec: &runner.Spec{Image: "img"}})
 	res := conn.readMsg(t)
 	if !res.OK {
 		t.Fatalf("create result = %+v, want ok", res)
@@ -378,7 +378,7 @@ func TestDialAttachBackChecksTargetOrigin(t *testing.T) {
 		t.Helper()
 		hits.Store(0)
 		rd := New(driver.NewFake(4), "", "", "")
-		msg := rwire.ToRunner{Type: "dial_attach", Session: "sess_x", Attach: &rwire.Attach{
+		msg := runner.ToRunner{Type: "dial_attach", Session: "sess_x", Attach: &runner.Attach{
 			AttachID: "0123456789abcdef", Cols: 80, Rows: 24,
 			TargetURL: probeWS + "/v0/runners/attach-back?attach_id=0123456789abcdef",
 		}}
@@ -526,7 +526,7 @@ func TestAgentSnapshotUsesTheCommandRef(t *testing.T) {
 	conn.readAnnounce(t)
 
 	const ref = "rainier-env:e-1"
-	conn.send(t, rwire.ToRunner{Type: "snapshot", ReqID: 9, Session: "sess_env", Ref: ref})
+	conn.send(t, runner.ToRunner{Type: "snapshot", ReqID: 9, Session: "sess_env", Ref: ref})
 	res := conn.readMsg(t)
 	if res.Type != "result" || res.ReqID != 9 || !res.OK {
 		t.Fatalf("result = %+v, want an ok result for req_id 9", res)
@@ -571,7 +571,7 @@ func TestAgentRemoveWorkspaceCommand(t *testing.T) {
 	conn := fc.nextConn(t)
 	conn.readAnnounce(t)
 
-	conn.send(t, rwire.ToRunner{Type: "remove_workspace", Session: "sess_ws"})
+	conn.send(t, runner.ToRunner{Type: "remove_workspace", Session: "sess_ws"})
 	res := conn.readMsg(t)
 	if res.Type != "result" || !res.OK || res.ReqID != 0 {
 		t.Fatalf("result = %+v, want an ok fire-and-forget result", res)
@@ -582,7 +582,7 @@ func TestAgentRemoveWorkspaceCommand(t *testing.T) {
 
 	// Again, against nothing: still ok. controld sends this on the explicit-rm
 	// path whether or not a full destroy already took the volume.
-	conn.send(t, rwire.ToRunner{Type: "remove_workspace", Session: "sess_ws"})
+	conn.send(t, runner.ToRunner{Type: "remove_workspace", Session: "sess_ws"})
 	if res := conn.readMsg(t); res.Type != "result" || !res.OK {
 		t.Fatalf("second result = %+v, want ok for an already-absent workspace", res)
 	}
@@ -607,7 +607,7 @@ func TestAgentDestroyReportsDriverFailureAndAllowsRetry(t *testing.T) {
 	conn := fc.nextConn(t)
 	conn.readAnnounce(t)
 
-	conn.send(t, rwire.ToRunner{Type: "destroy", ReqID: 31, Session: "sess_destroy"})
+	conn.send(t, runner.ToRunner{Type: "destroy", ReqID: 31, Session: "sess_destroy"})
 	res := conn.readMsg(t)
 	if res.Type != "result" || res.ReqID != 31 || res.OK || res.Detail != wantErr.Error() {
 		t.Fatalf("first destroy result = %+v, want failed req_id 31 carrying %q", res, wantErr)
@@ -616,7 +616,7 @@ func TestAgentDestroyReportsDriverFailureAndAllowsRetry(t *testing.T) {
 		t.Fatal("failed destroy disappeared from the runner registry")
 	}
 
-	conn.send(t, rwire.ToRunner{Type: "destroy", ReqID: 32, Session: "sess_destroy"})
+	conn.send(t, runner.ToRunner{Type: "destroy", ReqID: 32, Session: "sess_destroy"})
 	res = conn.readMsg(t)
 	if res.Type != "result" || res.ReqID != 32 || !res.OK {
 		t.Fatalf("retry destroy result = %+v, want ok req_id 32", res)
@@ -643,7 +643,7 @@ func TestAgentPrepullPullsAndReports(t *testing.T) {
 	conn.readAnnounce(t)
 
 	const ref = "rainier-env:e-2"
-	conn.send(t, rwire.ToRunner{Type: "prepull", Ref: ref})
+	conn.send(t, runner.ToRunner{Type: "prepull", Ref: ref})
 	res := conn.readMsg(t)
 	if res.Type != "result" || !res.OK {
 		t.Fatalf("result = %+v, want an ok result", res)
@@ -679,7 +679,7 @@ func TestAgentPrepullFailureReportsTheError(t *testing.T) {
 
 	// An empty ref is the one failure every driver rejects identically (see
 	// driver.Fake.Prepull / Docker.Prepull), so it needs no fake of its own.
-	conn.send(t, rwire.ToRunner{Type: "prepull", ReqID: 4})
+	conn.send(t, runner.ToRunner{Type: "prepull", ReqID: 4})
 	res := conn.readMsg(t)
 	if res.Type != "result" || res.ReqID != 4 || res.OK {
 		t.Fatalf("result = %+v, want a failed result for req_id 4", res)
@@ -710,7 +710,7 @@ func TestAgentPrepullDoesNotBlockTheReader(t *testing.T) {
 	conn := fc.nextConn(t)
 	conn.readAnnounce(t)
 
-	conn.send(t, rwire.ToRunner{Type: "prepull", ReqID: 1, Ref: "rainier-env:slow"})
+	conn.send(t, runner.ToRunner{Type: "prepull", ReqID: 1, Ref: "rainier-env:slow"})
 	select {
 	case <-fd.entered:
 	case <-time.After(5 * time.Second):
@@ -718,7 +718,7 @@ func TestAgentPrepullDoesNotBlockTheReader(t *testing.T) {
 	}
 
 	// Sent while the prepull is parked inside the driver.
-	conn.send(t, rwire.ToRunner{Type: "snapshot", ReqID: 2, Session: "sess_par", Ref: "rainier-env:fast"})
+	conn.send(t, runner.ToRunner{Type: "snapshot", ReqID: 2, Session: "sess_par", Ref: "rainier-env:fast"})
 	res := conn.readMsg(t)
 	if res.ReqID != 2 || !res.OK || res.Detail != "rainier-env:fast" {
 		t.Fatalf("first result = %+v, want the snapshot's (req_id 2) — the prepull is blocking the reader", res)
@@ -735,7 +735,7 @@ func TestAgentPrepullDoesNotBlockTheReader(t *testing.T) {
 // environment resolution depends on: the setup script, its timeout, and the
 // resolved environment (declared vars plus decrypted secret values) all have
 // to reach driver.Spec, or a session boots with none of its environment and
-// no setup ever runs. The rwire→driver hop is the only place that can drop
+// no setup ever runs. The runner→driver hop is the only place that can drop
 // them silently, since both sides have a field of the same name.
 func TestAgentCreateCarriesSetupAndEnvToTheDriver(t *testing.T) {
 	fd := newCreateTrackingFake(4)
@@ -750,7 +750,7 @@ func TestAgentCreateCarriesSetupAndEnvToTheDriver(t *testing.T) {
 	conn.readAnnounce(t)
 
 	const setup = "#!/bin/sh\nnpm ci\n"
-	conn.send(t, rwire.ToRunner{Type: "create", ReqID: 1, Session: "sess_env", Spec: &rwire.Spec{
+	conn.send(t, runner.ToRunner{Type: "create", ReqID: 1, Session: "sess_env", Spec: &runner.Spec{
 		Image:           "img",
 		Setup:           setup,
 		SetupTimeoutSec: 900,
@@ -797,11 +797,11 @@ func TestAgentCreateCarriesReposInitAndAttribution(t *testing.T) {
 	conn := fc.nextConn(t)
 	conn.readAnnounce(t)
 
-	repos := []rwire.RepoSpec{
+	repos := []runner.RepoSpec{
 		{Owner: "acme", Name: "app", BaseBranch: "main", SessionBranch: "rainier/work", Dir: "app"},
 		{Owner: "other", Name: "app", BaseBranch: "dev", SessionBranch: "rainier/work", Dir: "other__app"},
 	}
-	conn.send(t, rwire.ToRunner{Type: "create", ReqID: 1, Session: "sess_repo", Spec: &rwire.Spec{
+	conn.send(t, runner.ToRunner{Type: "create", ReqID: 1, Session: "sess_repo", Spec: &runner.Spec{
 		Image: "img", Repos: repos,
 		Init: "make dev-server &", InitTimeoutSec: 120,
 		GitAuthorName: "alice", GitAuthorEmail: "42+alice@users.noreply.github.com",
@@ -831,8 +831,8 @@ func TestAgentCreateCarriesReposInitAndAttribution(t *testing.T) {
 
 	// A create carrying none of it leaves all of it zero: a scratch session
 	// clones nothing and commits as nobody in particular.
-	conn.send(t, rwire.ToRunner{Type: "create", ReqID: 2, Session: "sess_bare",
-		Spec: &rwire.Spec{Image: "img"}})
+	conn.send(t, runner.ToRunner{Type: "create", ReqID: 2, Session: "sess_bare",
+		Spec: &runner.Spec{Image: "img"}})
 	if res := conn.readMsg(t); !res.OK {
 		t.Fatalf("create result = %+v, want ok", res)
 	}
@@ -861,8 +861,8 @@ func TestAgentCreateWithoutSetupLeavesTheSpecEmpty(t *testing.T) {
 
 	conn := fc.nextConn(t)
 	conn.readAnnounce(t)
-	conn.send(t, rwire.ToRunner{Type: "create", ReqID: 1, Session: "sess_cached",
-		Spec: &rwire.Spec{Image: "rainier-env:e1-abc123"}})
+	conn.send(t, runner.ToRunner{Type: "create", ReqID: 1, Session: "sess_cached",
+		Spec: &runner.Spec{Image: "rainier-env:e1-abc123"}})
 	if res := conn.readMsg(t); !res.OK {
 		t.Fatalf("create result = %+v, want ok", res)
 	}

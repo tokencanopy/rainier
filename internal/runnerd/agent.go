@@ -17,7 +17,7 @@ import (
 
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/relay"
-	"github.com/tokencanopy/rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // AgentConfig configures RunAgent's outbound dial to controld.
@@ -68,7 +68,7 @@ func (s *Server) RunAgent(ctx context.Context, cfg AgentConfig) error {
 }
 
 // agentSession dials controld once, sends the announce as the FIRST message
-// on the conn, then serves rwire.ToRunner commands until the conn ends.
+// on the conn, then serves runner.ToRunner commands until the conn ends.
 //
 // agentSession does not return until its writer goroutine has actually
 // stopped (writerDone.Wait(), gated by connCtx). Review round 1, finding 3:
@@ -103,8 +103,8 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 		writerDone.Wait()
 	}()
 
-	out := make(chan rwire.FromRunner, 64)
-	send := func(m rwire.FromRunner) {
+	out := make(chan runner.FromRunner, 64)
+	send := func(m runner.FromRunner) {
 		cctx, ccancel := context.WithTimeout(ctx, 5*time.Second)
 		m.Used, m.Total, _ = s.drv.Capacity(cctx) // best-effort; piggybacked on every message
 		ccancel()
@@ -118,7 +118,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 	// channel nothing drains any more). SetOnEvent/fireEvent are the
 	// synchronized accessors — see the Server.onEvent field's doc comment.
 	s.SetOnEvent(func(id, state, detail string) {
-		send(rwire.FromRunner{Type: "event", Session: id, State: state, Detail: detail})
+		send(runner.FromRunner{Type: "event", Session: id, State: state, Detail: detail})
 	})
 	defer s.SetOnEvent(nil)
 	// The same per-connection swap for the session RPC's upward direction: a
@@ -126,13 +126,13 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 	// "session_req" on this connection. Cleared on exit for the same reason —
 	// a dead conn's closure would otherwise keep queueing onto an `out`
 	// channel nothing drains.
-	s.SetOnSessionRPC(func(id string, env rwire.RPCEnvelope) {
-		send(rwire.FromRunner{Type: "session_req", Session: id, RPC: &env})
+	s.SetOnSessionRPC(func(id string, env runner.RPCEnvelope) {
+		send(runner.FromRunner{Type: "session_req", Session: id, RPC: &env})
 	})
 	defer s.SetOnSessionRPC(nil)
 
 	used, total, _ := s.drv.Capacity(ctx)
-	ann := rwire.FromRunner{Type: "announce", Proto: rwire.Proto, Runner: cfg.RunnerName,
+	ann := runner.FromRunner{Type: "announce", Proto: runner.ProtocolVersion, Runner: cfg.RunnerName,
 		Sessions: s.Announce(), Used: used, Total: total}
 	if err := wsjson.Write(connCtx, c, ann); err != nil {
 		return err
@@ -166,7 +166,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 	}()
 
 	for {
-		var m rwire.ToRunner
+		var m runner.ToRunner
 		if err := wsjson.Read(connCtx, c, &m); err != nil {
 			return err
 		}
@@ -177,7 +177,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 // execute runs one ToRunner command and reports its result via send. Called
 // in its own goroutine per inbound message (agentSession's read loop) so a
 // slow docker op never blocks the next command from being read.
-func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.FromRunner), cfg AgentConfig) {
+func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runner.FromRunner), cfg AgentConfig) {
 	switch m.Type {
 	case "create":
 		var spec driver.Spec
@@ -210,7 +210,7 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 		// it's reported the same as a fresh success.
 		err := s.CreateWithID(ctx, m.Session, spec, allow)
 		ok := err == nil || errors.Is(err, errSessionExists)
-		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: ok, Detail: errTextUnless(err, errSessionExists)})
+		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: ok, Detail: errTextUnless(err, errSessionExists)})
 		if errors.Is(err, errSessionExists) {
 			// The result alone says "it exists", not what it is doing — and a
 			// controld that requeued a create it never heard back on, then
@@ -223,7 +223,7 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 		}
 	case "suspend", "resume":
 		err := s.Op(ctx, m.Session, m.Type, m.Warm)
-		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: errText(err)})
+		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: errText(err)})
 	case "snapshot":
 		// m.Ref is controld's content-addressed environment ref
 		// (rainier-env:<envID>-<setupHash>), passed through untouched — see
@@ -239,7 +239,7 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 		if err != nil {
 			detail = err.Error()
 		}
-		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: detail})
+		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: detail})
 	case "prepull":
 		// Advisory and session-less: controld dispatches a prepull without a
 		// pending entry to correlate against (design §4.3 — it is warming an
@@ -271,14 +271,14 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 			// is exactly what would have happened with no prepull at all.
 			log.Printf("agent: prepull %s did not land (expected without a registry; sessions here rebuild from setup): %v", m.Ref, err)
 		}
-		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: detail})
+		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: detail})
 	case "destroy":
 		err := s.Delete(ctx, m.Session)
 		// A missing session is still ok: the desired end state (no session)
 		// is already reached, whether we just deleted it or this destroy
 		// simply arrived after some other path already had.
 		ok := err == nil || errors.Is(err, errNoSuchSession)
-		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: ok, Detail: errTextUnless(err, errNoSuchSession)})
+		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: ok, Detail: errTextUnless(err, errNoSuchSession)})
 	case "remove_workspace":
 		// The reclaim controld sends after a session it holds is explicitly
 		// removed — including a crash-dead one, whose container went long ago
@@ -293,7 +293,7 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 		if err != nil {
 			log.Printf("agent: remove_workspace for %s: %v", m.Session, err)
 		}
-		send(rwire.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: errText(err)})
+		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: errText(err)})
 	case "session_rpc":
 		// The one command type this runner does not execute: it carries a
 		// session RPC bound for the sandbox, and the answer (when there is
@@ -323,7 +323,7 @@ func (s *Server) execute(ctx context.Context, m rwire.ToRunner, send func(rwire.
 // answer that was never coming. A RESPONSE that cannot be delivered is only
 // logged: answering an answer is meaningless, and the sandbox that asked has
 // already lost its own pending entry along with the conn.
-func (s *Server) forwardSessionRPC(m rwire.ToRunner, send func(rwire.FromRunner)) {
+func (s *Server) forwardSessionRPC(m runner.ToRunner, send func(runner.FromRunner)) {
 	if m.RPC == nil {
 		log.Printf("agent: session_rpc for %s carried no envelope; ignoring", m.Session)
 		return
@@ -341,8 +341,8 @@ func (s *Server) forwardSessionRPC(m rwire.ToRunner, send func(rwire.FromRunner)
 	if env.Method == "resp" {
 		return
 	}
-	send(rwire.FromRunner{Type: "session_req", Session: m.Session,
-		RPC: &rwire.RPCEnvelope{ID: env.ID, Method: "resp", Payload: rpcErrorPayload(err.Error())}})
+	send(runner.FromRunner{Type: "session_req", Session: m.Session,
+		RPC: &runner.RPCEnvelope{ID: env.ID, Method: "resp", Payload: rpcErrorPayload(err.Error())}})
 }
 
 // reannounce fires one session's current state as an event, using the same
@@ -354,7 +354,7 @@ func (s *Server) forwardSessionRPC(m rwire.ToRunner, send func(rwire.FromRunner)
 // controld acts on "running" today and merely logs the suspended states as
 // unrecognized; the mapping is shared with Announce anyway so the two can't
 // drift as that vocabulary grows.
-func (s *Server) reannounce(id string, send func(rwire.FromRunner)) {
+func (s *Server) reannounce(id string, send func(runner.FromRunner)) {
 	e, ok := s.reg.snapshot(id)
 	if !ok {
 		return
@@ -363,7 +363,7 @@ func (s *Server) reannounce(id string, send func(rwire.FromRunner)) {
 	if !ok {
 		return
 	}
-	send(rwire.FromRunner{Type: "event", Session: id, State: state})
+	send(runner.FromRunner{Type: "event", Session: id, State: state})
 }
 
 // dialAttachBack completes controld's attach pairing from the runner side
@@ -386,7 +386,7 @@ func (s *Server) reannounce(id string, send func(rwire.FromRunner)) {
 //
 // ctx is the agent's lifetime, not one control connection's: an attach must
 // survive the control conn flapping and redialing underneath it.
-func (s *Server) dialAttachBack(ctx context.Context, m rwire.ToRunner, cfg AgentConfig) {
+func (s *Server) dialAttachBack(ctx context.Context, m runner.ToRunner, cfg AgentConfig) {
 	at := m.Attach
 	if at == nil {
 		log.Printf("agent: dial_attach for %s carried no attach block; ignoring", m.Session)
@@ -499,11 +499,11 @@ func errTextUnless(err, sentinel error) string {
 
 // driverRepos converts the wire's repo list into the driver's, field for
 // field. The two types are deliberately identical and deliberately separate
-// (rwire is the control-plane vocabulary, driver.Spec is the sandbox
+// (runner is the control-plane vocabulary, driver.Spec is the sandbox
 // boundary), so this hop is a copy and nothing else — no defaulting, no
 // validation, no reordering. A nil list stays nil: a session that clones
 // nothing must not arrive at the driver carrying an empty instruction.
-func driverRepos(repos []rwire.RepoSpec) []driver.RepoSpec {
+func driverRepos(repos []runner.RepoSpec) []driver.RepoSpec {
 	if len(repos) == 0 {
 		return nil
 	}

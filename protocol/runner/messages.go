@@ -1,13 +1,13 @@
-// Package rwire defines the JSON messages exchanged between runnerd and
+// Package runner defines the JSON messages exchanged between runnerd and
 // controld over runnerd's single outbound control WebSocket. One struct per
-// direction, same idiom as internal/wire. Proto gates major changes: controld
-// rejects an announce whose Proto it doesn't speak, with a close reason
-// naming both versions (design §4.3).
-package rwire
+// direction, same idiom as internal/wire. ProtocolVersion gates major
+// changes: controld rejects an announce whose ProtocolVersion it doesn't
+// speak, with a close reason naming both versions (design §4.3).
+package runner
 
 import "encoding/json"
 
-const Proto = 1
+const ProtocolVersion = 1
 
 // RPCEnvelope is one message of the session RPC — the bidirectional
 // request/response channel that reaches all the way into a sandbox. It rides

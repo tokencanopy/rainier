@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tokencanopy/rainier/internal/rwire"
 	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // sessionsBodyLimit caps every request body this file decodes: the create
@@ -805,7 +805,7 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request, u U
 	// setup/clone/init failure; the runner's destroy is idempotent when it
 	// does not.
 	if row.Runner != "" && s.runnerConnected(row.Runner) {
-		res, err := s.dispatch(r.Context(), row.Runner, rwire.ToRunner{Type: "destroy", Session: id})
+		res, err := s.dispatch(r.Context(), row.Runner, runner.ToRunner{Type: "destroy", Session: id})
 		switch {
 		// ErrDispatchTimeout wraps ErrRunnerUnreachable, so it lands here
 		// too — deliberately, here and at the three sibling ops
@@ -871,7 +871,7 @@ func (s *Server) reclaimWorkspace(row Session) {
 	if row.Runner == "" || !s.runnerConnected(row.Runner) {
 		return
 	}
-	if err := s.sendToRunner(row.Runner, rwire.ToRunner{Type: "remove_workspace", Session: row.ID}); err != nil {
+	if err := s.sendToRunner(row.Runner, runner.ToRunner{Type: "remove_workspace", Session: row.ID}); err != nil {
 		log.Printf("controld: reclaiming the workspace of %s on %s: %v", row.ID, row.Runner, err)
 	}
 }
@@ -911,7 +911,7 @@ func (s *Server) handleSuspendSession(w http.ResponseWriter, r *http.Request, u 
 		return
 	}
 
-	res, err := s.dispatch(r.Context(), row.Runner, rwire.ToRunner{Type: "suspend", Session: id, Warm: warm})
+	res, err := s.dispatch(r.Context(), row.Runner, runner.ToRunner{Type: "suspend", Session: id, Warm: warm})
 	switch {
 	case errors.Is(err, ErrRunnerUnreachable):
 		writeErr(w, http.StatusBadGateway, "runner_unreachable", "runner did not respond")
@@ -1003,7 +1003,7 @@ func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request, u U
 		}
 	}
 
-	res, err := s.dispatch(r.Context(), row.Runner, rwire.ToRunner{Type: "resume", Session: id})
+	res, err := s.dispatch(r.Context(), row.Runner, runner.ToRunner{Type: "resume", Session: id})
 	switch {
 	case errors.Is(err, ErrRunnerUnreachable):
 		writeErr(w, http.StatusBadGateway, "runner_unreachable", "runner did not respond")
@@ -1065,7 +1065,7 @@ func (s *Server) handleSnapshotSession(w http.ResponseWriter, r *http.Request, u
 		return
 	}
 
-	res, err := s.dispatch(r.Context(), row.Runner, rwire.ToRunner{Type: "snapshot", Session: id})
+	res, err := s.dispatch(r.Context(), row.Runner, runner.ToRunner{Type: "snapshot", Session: id})
 	switch {
 	case errors.Is(err, ErrRunnerUnreachable):
 		writeErr(w, http.StatusBadGateway, "runner_unreachable", "runner did not respond")
