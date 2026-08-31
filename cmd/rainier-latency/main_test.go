@@ -84,9 +84,9 @@ func TestWaitRunningCancelsAStalledPoll(t *testing.T) {
 }
 
 func TestPublicFailureDoesNotExposeSessionOrServerDetails(t *testing.T) {
-	err := errors.New(`waiting for running state: Get "https://private.invalid/v1/sessions/sess_secret": context deadline exceeded`)
+	err := errors.New(`waiting for running state: Get "https://private.invalid/v0/sessions/sess_secret": context deadline exceeded`)
 	got := publicFailure(err)
-	for _, secret := range []string{"private.invalid", "/v1/sessions", "sess_secret"} {
+	for _, secret := range []string{"private.invalid", "/v0/sessions", "sess_secret"} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("publicFailure = %q, leaked %q", got, secret)
 		}

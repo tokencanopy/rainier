@@ -125,7 +125,7 @@ func decodeErrBody(t *testing.T, raw string) errorEnvelope {
 // ---------------------------------------------------------------------------
 
 // 1. exchange with valid token + allowlisted login -> 200 with token+user;
-// the returned token then passes GET /v1/me.
+// the returned token then passes GET /v0/me.
 func TestGitHubAuthExchangeSuccess(t *testing.T) {
 	gh := fakeGitHubOK(t)
 	_, _, ts := newTestControld(t, func(c *Config) {
@@ -133,7 +133,7 @@ func TestGitHubAuthExchangeSuccess(t *testing.T) {
 		c.Admins = []string{"alice"}
 	})
 
-	resp := postJSON(t, ts, "/v1/auth/github", map[string]any{"access_token": "gho_good"})
+	resp := postJSON(t, ts, "/v0/auth/github", map[string]any{"access_token": "gho_good"})
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, raw)
@@ -150,38 +150,38 @@ func TestGitHubAuthExchangeSuccess(t *testing.T) {
 		t.Errorf("user = %+v, want {alice admin}", body.User)
 	}
 
-	meResp := getWithBearer(t, ts, "/v1/me", body.Token)
+	meResp := getWithBearer(t, ts, "/v0/me", body.Token)
 	meRaw := readBody(t, meResp)
 	if meResp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /v1/me status = %d, want 200; body = %s", meResp.StatusCode, meRaw)
+		t.Fatalf("GET /v0/me status = %d, want 200; body = %s", meResp.StatusCode, meRaw)
 	}
 	var me meResponse
 	if err := json.Unmarshal([]byte(meRaw), &me); err != nil {
-		t.Fatalf("decode /v1/me response: %v; body = %s", err, meRaw)
+		t.Fatalf("decode /v0/me response: %v; body = %s", err, meRaw)
 	}
 	if me.User.Login != "alice" || me.User.Role != "admin" {
-		t.Errorf("/v1/me user = %+v, want alice/admin", me.User)
+		t.Errorf("/v0/me user = %+v, want alice/admin", me.User)
 	}
 	// The id is what a client cannot learn any other way about itself, and
 	// it must be the SAME identity the exchange just issued a token for —
 	// a client that caches one and compares it against session owner_ids
 	// would silently prefer nothing at all if these two disagreed.
 	if me.User.ID == "" {
-		t.Errorf("/v1/me user = %+v, want a non-empty id", me.User)
+		t.Errorf("/v0/me user = %+v, want a non-empty id", me.User)
 	}
 	if me.User.ID != body.User.ID {
-		t.Errorf("/v1/me id = %q, want the exchange's %q — one identity, two routes", me.User.ID, body.User.ID)
+		t.Errorf("/v0/me id = %q, want the exchange's %q — one identity, two routes", me.User.ID, body.User.ID)
 	}
 	assertKeySet(t, meRaw, "user")
 	var meOuter map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(meRaw), &meOuter); err != nil {
-		t.Fatalf("decode /v1/me for the key-set check: %v; body = %s", err, meRaw)
+		t.Fatalf("decode /v0/me for the key-set check: %v; body = %s", err, meRaw)
 	}
 	assertKeySet(t, string(meOuter["user"]), "id", "login", "role")
 }
 
 // TestMeIDIsTheSessionOwnerID pins the property the CLI's owner-preference
-// rests on: the id GET /v1/me hands a caller is exactly the owner_id its own
+// rests on: the id GET /v0/me hands a caller is exactly the owner_id its own
 // sessions carry. They come from different tables through different views, so
 // nothing but a test keeps them the same string — and if they ever drift, an
 // ambiguous name silently stops resolving instead of failing loudly.
@@ -190,13 +190,13 @@ func TestMeIDIsTheSessionOwnerID(t *testing.T) {
 	u, tok := loginUser(t, st, "alice", "member")
 	seedSession(t, st, Session{ID: "sess_owned", OwnerID: u.ID, State: StateRunning})
 
-	raw := readBody(t, getWithBearer(t, ts, "/v1/me", tok))
+	raw := readBody(t, getWithBearer(t, ts, "/v0/me", tok))
 	var me meResponse
 	if err := json.Unmarshal([]byte(raw), &me); err != nil {
-		t.Fatalf("decode /v1/me: %v; body = %s", err, raw)
+		t.Fatalf("decode /v0/me: %v; body = %s", err, raw)
 	}
 
-	listRaw := readBody(t, getWithBearer(t, ts, "/v1/sessions", tok))
+	listRaw := readBody(t, getWithBearer(t, ts, "/v0/sessions", tok))
 	var list struct {
 		Sessions []struct {
 			ID      string `json:"id"`
@@ -204,13 +204,13 @@ func TestMeIDIsTheSessionOwnerID(t *testing.T) {
 		} `json:"sessions"`
 	}
 	if err := json.Unmarshal([]byte(listRaw), &list); err != nil {
-		t.Fatalf("decode /v1/sessions: %v; body = %s", err, listRaw)
+		t.Fatalf("decode /v0/sessions: %v; body = %s", err, listRaw)
 	}
 	if len(list.Sessions) != 1 {
 		t.Fatalf("sessions = %+v, want the one seeded row", list.Sessions)
 	}
 	if list.Sessions[0].OwnerID != me.User.ID {
-		t.Fatalf("session owner_id = %q, /v1/me id = %q; owner-preference compares these two",
+		t.Fatalf("session owner_id = %q, /v0/me id = %q; owner-preference compares these two",
 			list.Sessions[0].OwnerID, me.User.ID)
 	}
 }
@@ -224,7 +224,7 @@ func TestGitHubAuthNotAllowlisted(t *testing.T) {
 		c.Members = []string{"another-one"}
 	})
 
-	resp := postJSON(t, ts, "/v1/auth/github", map[string]any{"access_token": "gho_good"})
+	resp := postJSON(t, ts, "/v0/auth/github", map[string]any{"access_token": "gho_good"})
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403; body = %s", resp.StatusCode, raw)
@@ -247,7 +247,7 @@ func TestGitHubAuthUpstreamUnauthorized(t *testing.T) {
 		c.Admins = []string{"alice"}
 	})
 
-	resp := postJSON(t, ts, "/v1/auth/github", map[string]any{"access_token": "gho_bad"})
+	resp := postJSON(t, ts, "/v0/auth/github", map[string]any{"access_token": "gho_bad"})
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401; body = %s", resp.StatusCode, raw)
@@ -273,7 +273,7 @@ func TestGitHubAuthUpstreamServerError(t *testing.T) {
 		c.Admins = []string{"alice"}
 	})
 
-	resp := postJSON(t, ts, "/v1/auth/github", map[string]any{"access_token": "gho_good"})
+	resp := postJSON(t, ts, "/v0/auth/github", map[string]any{"access_token": "gho_good"})
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500; body = %s", resp.StatusCode, raw)
@@ -290,7 +290,7 @@ func TestGitHubAuthUpstreamServerError(t *testing.T) {
 	}
 }
 
-// 5. GET /v1/me without/with a bogus bearer -> 401.
+// 5. GET /v0/me without/with a bogus bearer -> 401.
 func TestMeRequiresBearer(t *testing.T) {
 	_, _, ts := newTestControld(t)
 
@@ -304,7 +304,7 @@ func TestMeRequiresBearer(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			resp := getWithBearer(t, ts, "/v1/me", tc.token)
+			resp := getWithBearer(t, ts, "/v0/me", tc.token)
 			raw := readBody(t, resp)
 			if resp.StatusCode != http.StatusUnauthorized {
 				t.Fatalf("status = %d, want 401; body = %s", resp.StatusCode, raw)
@@ -325,7 +325,7 @@ func TestGitHubAuthEmptyAllowlistFailsClosed(t *testing.T) {
 		// Admins/Members deliberately left empty.
 	})
 
-	resp := postJSON(t, ts, "/v1/auth/github", map[string]any{"access_token": "gho_good"})
+	resp := postJSON(t, ts, "/v0/auth/github", map[string]any{"access_token": "gho_good"})
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("status = %d, want 403; body = %s", resp.StatusCode, raw)
@@ -344,7 +344,7 @@ func TestGitHubAuthRejectsUnknownFields(t *testing.T) {
 		c.Admins = []string{"alice"}
 	})
 
-	resp := postRaw(t, ts, "/v1/auth/github", `{"access_token":"gho_good","extra_field":"nope"}`)
+	resp := postRaw(t, ts, "/v0/auth/github", `{"access_token":"gho_good","extra_field":"nope"}`)
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body = %s", resp.StatusCode, raw)
@@ -402,7 +402,7 @@ func TestGitHubAuthMemberRole(t *testing.T) {
 		c.Members = []string{"alice"}
 	})
 
-	resp := postJSON(t, ts, "/v1/auth/github", map[string]any{"access_token": "gho_good"})
+	resp := postJSON(t, ts, "/v0/auth/github", map[string]any{"access_token": "gho_good"})
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, raw)
@@ -426,7 +426,7 @@ func TestGitHubAuthBodyTooLarge(t *testing.T) {
 	})
 
 	huge := `{"access_token":"` + strings.Repeat("x", 5<<10) + `"}`
-	resp := postRaw(t, ts, "/v1/auth/github", huge)
+	resp := postRaw(t, ts, "/v0/auth/github", huge)
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body = %s", resp.StatusCode, raw)
@@ -444,7 +444,7 @@ func TestGitHubAuthEmptyAccessToken(t *testing.T) {
 		c.Admins = []string{"alice"}
 	})
 
-	resp := postJSON(t, ts, "/v1/auth/github", map[string]any{"access_token": ""})
+	resp := postJSON(t, ts, "/v0/auth/github", map[string]any{"access_token": ""})
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body = %s", resp.StatusCode, raw)
@@ -476,7 +476,7 @@ func TestGitHubAuthRejectsMalformedUpstreamShape(t *testing.T) {
 				c.Admins = []string{"alice"}
 			})
 
-			resp := postJSON(t, ts, "/v1/auth/github", map[string]any{"access_token": "gho_good"})
+			resp := postJSON(t, ts, "/v0/auth/github", map[string]any{"access_token": "gho_good"})
 			raw := readBody(t, resp)
 			if resp.StatusCode != http.StatusInternalServerError {
 				t.Fatalf("status = %d, want 500; body = %s", resp.StatusCode, raw)
@@ -502,7 +502,7 @@ func TestGitHubAuthStoresCredential(t *testing.T) {
 		c.Admins = []string{"alice"}
 	})
 
-	resp := postJSON(t, ts, "/v1/auth/github", map[string]any{"access_token": "gho_good"})
+	resp := postJSON(t, ts, "/v0/auth/github", map[string]any{"access_token": "gho_good"})
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, raw)
@@ -575,7 +575,7 @@ func TestGitHubAuthScopeWarning(t *testing.T) {
 				c.Admins = []string{"alice"}
 			})
 
-			resp := postJSON(t, ts, "/v1/auth/github", map[string]any{"access_token": "gho_good"})
+			resp := postJSON(t, ts, "/v0/auth/github", map[string]any{"access_token": "gho_good"})
 			raw := readBody(t, resp)
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, raw)
@@ -609,7 +609,7 @@ func TestGitHubAuthScopeWarning(t *testing.T) {
 func TestRequireUserUniformOn401(t *testing.T) {
 	_, _, ts := newTestControld(t)
 	tok, _ := NewToken() // well-formed but never issued (no InsertToken)
-	resp := getWithBearer(t, ts, "/v1/me", tok)
+	resp := getWithBearer(t, ts, "/v0/me", tok)
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401; body = %s", resp.StatusCode, raw)

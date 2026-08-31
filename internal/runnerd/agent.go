@@ -22,7 +22,7 @@ import (
 
 // AgentConfig configures RunAgent's outbound dial to controld.
 type AgentConfig struct {
-	ControldURL string // e.g. ws://host:9090 — /v1/runners/connect appended
+	ControldURL string // e.g. ws://host:9090 — /v0/runners/connect appended
 	Token       string
 	RunnerName  string
 	ProxyURL    string // forwarded into every driver.Spec (egress R4)
@@ -82,7 +82,7 @@ func (s *Server) RunAgent(ctx context.Context, cfg AgentConfig) error {
 // died (not just the writer itself).
 func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 	hdr := http.Header{"Authorization": {"Bearer " + cfg.Token}}
-	c, _, err := websocket.Dial(ctx, cfg.ControldURL+"/v1/runners/connect", &websocket.DialOptions{HTTPHeader: hdr})
+	c, _, err := websocket.Dial(ctx, cfg.ControldURL+"/v0/runners/connect", &websocket.DialOptions{HTTPHeader: hdr})
 	if err != nil {
 		return err
 	}

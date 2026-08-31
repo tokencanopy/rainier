@@ -34,7 +34,7 @@ internal/controld/pgstore/pgstore.go         Postgres Store (Task 3)
 internal/controld/pgstore/migrate.go         embedded migration runner (Task 3)
 internal/controld/pgstore/migrations/0001_init.sql  (Task 3)
 internal/controld/controld.go                Server, Config, New, Handler, Run (Task 7)
-internal/controld/runners.go                 runner conns, /v1/runners/connect, reconcile, dispatch (Task 7)
+internal/controld/runners.go                 runner conns, /v0/runners/connect, reconcile, dispatch (Task 7)
 internal/controld/sched.go                   scheduler loop, placement (Task 8)
 internal/controld/auth.go                    GitHub exchange, bearer middleware, roles (Task 9)
 internal/controld/api.go                     sessions/runners REST, error envelope, pagination (Task 10)
@@ -760,7 +760,7 @@ func (s *Server) Delete(ctx context.Context, id string) error
 func (s *Server) Announce() []rwire.SessionInfo // registry snapshot in rwire vocabulary
 // The agent:
 type AgentConfig struct {
-	ControldURL string // e.g. ws://host:9090 — /v1/runners/connect appended
+	ControldURL string // e.g. ws://host:9090 — /v0/runners/connect appended
 	Token       string
 	RunnerName  string
 	ProxyURL    string // forwarded into every driver.Spec (egress R4)
@@ -770,7 +770,7 @@ func (s *Server) RunAgent(ctx context.Context, cfg AgentConfig) error // reconne
 
 - [ ] **Step 1: Extract core ops (refactor, no behavior change).** Move the bodies of `sessions` POST and `sessionOp` into `CreateWithID` / `Op` / `Delete`; the HTTP handlers keep id minting (`s.newID()` — dev surface only), status-code mapping, and JSON. `CreateWithID` performs exactly today's sequence: `pushEgress` → `reg.put(starting)` → `drv.Create` (with `SessionID: id, DialURL: s.dialBase+"/register", ProxyURL: s.proxyURL`) → `setHandle` → `setState("running")`. `Op("suspend", warm=false)` keeps the `suspending`-before-Suspend ordering and its rollback. `Delete` keeps hub-close-before-remove. Run `go test ./internal/runnerd/` after the refactor — every existing test must still pass unmodified. Commit: `refactor: extract runnerd core ops from HTTP handlers`.
 - [ ] **Step 2: `Announce()`** — registry snapshot mapped to rwire states: entry `running` (hub set or awaiting re-register) → `"running"`; `suspended` with hub ≠ nil (warm pause keeps the conn) → `"suspended_warm"`; `suspended` with nil hub → `"suspended_cold"`; skip `starting` entries (mid-create; the create's result will speak for them).
-- [ ] **Step 3: Write the failing agent test.** In `agent_test.go`, stand up a fake controld: `httptest.NewServer` whose `/v1/runners/connect` accepts the ws (checking `Authorization: Bearer testtoken`), reads the announce, then drives a script. Test cases:
+- [ ] **Step 3: Write the failing agent test.** In `agent_test.go`, stand up a fake controld: `httptest.NewServer` whose `/v0/runners/connect` accepts the ws (checking `Authorization: Bearer testtoken`), reads the announce, then drives a script. Test cases:
   - `TestAgentAnnounces`: seed fake driver with one running session; `RunAgent`; fake controld asserts announce has `Proto: 1`, `Runner: "vm1"`, that session `running`, and `Used/Total` populated.
   - `TestAgentExecutesCreateAndReportsResult`: controld sends `{"type":"create","req_id":1,"session":"sess_x","spec":{"image":"img"}}`; assert a `result{req_id:1, ok:true}` comes back and the fake driver saw `Spec{SessionID:"sess_x", Image:"img"}`.
   - `TestAgentIdempotentCreate`: send the same create twice; assert the second returns `ok:true` without a second driver `Create` call.
@@ -799,7 +799,7 @@ func (s *Server) RunAgent(ctx context.Context, cfg AgentConfig) error {
 
 func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 	hdr := http.Header{"Authorization": {"Bearer " + cfg.Token}}
-	c, _, err := websocket.Dial(ctx, cfg.ControldURL+"/v1/runners/connect", &websocket.DialOptions{HTTPHeader: hdr})
+	c, _, err := websocket.Dial(ctx, cfg.ControldURL+"/v0/runners/connect", &websocket.DialOptions{HTTPHeader: hdr})
 	if err != nil { return err }
 	defer c.CloseNow()
 	c.SetReadLimit(16 << 20)
@@ -877,7 +877,7 @@ func (s *Server) sendToRunner(runner string, m rwire.ToRunner) error // fire-and
 func (s *Server) runnerConnected(name string) bool
 ```
 
-- [ ] **Step 1: Write the failing tests** (`runners_test.go`) with a **fake runner** helper — dials `/v1/runners/connect` on an `httptest.Server` running `Handler()`, sends a scripted announce, then records every `ToRunner` and answers per script:
+- [ ] **Step 1: Write the failing tests** (`runners_test.go`) with a **fake runner** helper — dials `/v0/runners/connect` on an `httptest.Server` running `Handler()`, sends a scripted announce, then records every `ToRunner` and answers per script:
   - `TestRunnerAuthRequired`: dial without/with wrong bearer → HTTP 401 before upgrade.
   - `TestProtoRejected`: announce `Proto: 99` → conn closed; close reason contains `"proto 99"` and `"proto 1"`.
   - `TestAnnounceUpsertsRunner`: after announce, `ListRunners` shows `{Name:"vm1", Connected:true, Used:1, Total:4}`; after conn close, `Connected:false`.
@@ -966,14 +966,14 @@ func (s *Server) schedulerLoop(ctx context.Context) {
 
 **Interfaces:**
 - Consumes: Store (Task 2), Config (Task 7).
-- Produces: `POST /v1/auth/github` route; `func (s *Server) requireUser(next func(http.ResponseWriter, *http.Request, User)) http.HandlerFunc`; `GET /v1/me`; `func (s *Server) roleFor(login string) (string, bool)` (admin beats member; not listed ⇒ false).
+- Produces: `POST /v0/auth/github` route; `func (s *Server) requireUser(next func(http.ResponseWriter, *http.Request, User)) http.HandlerFunc`; `GET /v0/me`; `func (s *Server) roleFor(login string) (string, bool)` (admin beats member; not listed ⇒ false).
 
 - [ ] **Step 1: Write the failing tests** with a fake GitHub (`httptest.Server` serving `GET /user` → `{"id":42,"login":"alice"}` when `Authorization: Bearer gho_good`, 401 otherwise); `cfg.GitHubAPIBase` pointed at it:
-  - exchange with valid token + allowlisted login → 200 `{"token":"rnr_...","user":{"login":"alice","role":"admin"}}`; the returned token then passes `GET /v1/me`.
+  - exchange with valid token + allowlisted login → 200 `{"token":"rnr_...","user":{"login":"alice","role":"admin"}}`; the returned token then passes `GET /v0/me`.
   - valid GitHub token, login not allowlisted → 403 `forbidden`.
   - invalid GitHub token → 401 `unauthenticated` (GitHub's 401 mapped, body not leaked).
   - GitHub 500 → 502-style mapping: use 500 + code `internal` with generic message (upstream text logged, not returned).
-  - `GET /v1/me` without/with bogus bearer → 401.
+  - `GET /v0/me` without/with bogus bearer → 401.
   - empty allowlists: exchange with any valid GitHub user → 403 (fail closed).
   - unknown fields in the request body → 400 `invalid_request` (decoder with `DisallowUnknownFields`).
 - [ ] **Step 2: Run to verify fail**, then implement. Exchange handler: decode `{access_token string}` (reject unknown fields, cap body 4 KB via `http.MaxBytesReader`); call `{GitHubAPIBase}/user` with 10 s timeout; **validate the upstream shape** (`id > 0`, `login != ""` — third-party responses are untrusted input); `roleFor` → `UpsertUser` → `NewToken` → `InsertToken` → respond. `requireUser`: parse `Authorization: Bearer `, `HashToken`, `UserByToken`; 401 on any miss. Log request outcomes with the request id (Task 10's middleware); never log tokens.
@@ -990,26 +990,26 @@ func (s *Server) schedulerLoop(ctx context.Context) {
 
 **Interfaces:**
 - Consumes: everything above.
-- Produces: the `/v1` client surface (design §4.4) — exact routes and status codes below; `sessionJSON(s Session, reachable bool)` (adds `"reachable"`, RFC 3339 times); the middleware chain (request id, `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` on GETs).
+- Produces: the `/v0` client surface (design §4.4) — exact routes and status codes below; `sessionJSON(s Session, reachable bool)` (adds `"reachable"`, RFC 3339 times); the middleware chain (request id, `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` on GETs).
 
 Route → behavior map (each line is a contract test):
 
 | Route | Behavior |
 |---|---|
-| `POST /v1/sessions` | body `{name?, image?, cmd?, egress_allow?}` (unknown fields → 400; body cap 64 KB). Insert row `queued` (owner = caller) — **commit before reply** — `wakeScheduler()`, reply **202** + `Location: /v1/sessions/{id}` + `{"session":{...}}`. `Idempotency-Key` header → replay returns the existing row, still 202. Name taken → 409 `conflict`. |
-| `GET /v1/sessions` | query `state`, `runner`, `all`, `limit` (default 50, cap 100), `cursor` (invalid → 400). 200 `{"sessions":[...],"next_cursor":""}`. Team-visible. |
-| `GET /v1/sessions/{id}` | 200 `{"session":{...}}`; unknown id → 404. |
-| `DELETE /v1/sessions/{id}` | owner or admin (else 403). `queued`→`canceled` (204, no dispatch). `creating` → 409 `conflict`. Placed + runner connected → dispatch destroy; `ok` → `destroyed`, 204; unreachable/timeout → 502 `runner_unreachable`. Placed + runner disconnected → mark `destroyed`, 204 (reconcile's terminal-row-orphan rule cleans the container if the runner returns — design §5). Terminal already → 204 idempotent. Always `wakeScheduler()` on success. |
-| `POST /v1/sessions/{id}/suspend` | owner/admin. body `{warm?}` default true. From `running` only (else 409). Dispatch; `ok` → `suspended_warm|suspended_cold`. Unreachable → 502 `runner_unreachable`. |
-| `POST /v1/sessions/{id}/resume` | from `suspended_*` only. Runner disconnected → 502 `runner_unreachable`. Cold resume onto a full runner (free ≤ 0 by the Task 8 formula) → 409 `no_capacity`, message names the runner. `ok` → `running`. |
-| `POST /v1/sessions/{id}/snapshot` | from `running|suspended_*`; dispatch; 200 `{"ref": result.Detail}`. |
-| `GET /v1/runners` | 200 `{"runners":[{name, connected, capacity_used, capacity_total, last_seen_at}]}` (auth'd, team-visible). |
+| `POST /v0/sessions` | body `{name?, image?, cmd?, egress_allow?}` (unknown fields → 400; body cap 64 KB). Insert row `queued` (owner = caller) — **commit before reply** — `wakeScheduler()`, reply **202** + `Location: /v0/sessions/{id}` + `{"session":{...}}`. `Idempotency-Key` header → replay returns the existing row, still 202. Name taken → 409 `conflict`. |
+| `GET /v0/sessions` | query `state`, `runner`, `all`, `limit` (default 50, cap 100), `cursor` (invalid → 400). 200 `{"sessions":[...],"next_cursor":""}`. Team-visible. |
+| `GET /v0/sessions/{id}` | 200 `{"session":{...}}`; unknown id → 404. |
+| `DELETE /v0/sessions/{id}` | owner or admin (else 403). `queued`→`canceled` (204, no dispatch). `creating` → 409 `conflict`. Placed + runner connected → dispatch destroy; `ok` → `destroyed`, 204; unreachable/timeout → 502 `runner_unreachable`. Placed + runner disconnected → mark `destroyed`, 204 (reconcile's terminal-row-orphan rule cleans the container if the runner returns — design §5). Terminal already → 204 idempotent. Always `wakeScheduler()` on success. |
+| `POST /v0/sessions/{id}/suspend` | owner/admin. body `{warm?}` default true. From `running` only (else 409). Dispatch; `ok` → `suspended_warm|suspended_cold`. Unreachable → 502 `runner_unreachable`. |
+| `POST /v0/sessions/{id}/resume` | from `suspended_*` only. Runner disconnected → 502 `runner_unreachable`. Cold resume onto a full runner (free ≤ 0 by the Task 8 formula) → 409 `no_capacity`, message names the runner. `ok` → `running`. |
+| `POST /v0/sessions/{id}/snapshot` | from `running|suspended_*`; dispatch; 200 `{"ref": result.Detail}`. |
+| `GET /v0/runners` | 200 `{"runners":[{name, connected, capacity_used, capacity_total, last_seen_at}]}` (auth'd, team-visible). |
 | `GET /healthz` | 200 `ok`, unauthenticated, no internals. |
 
 `reachable` in session JSON = `s.Runner != "" && runnerConnected(s.Runner) && !s.State.Terminal()`.
 
 - [ ] **Step 1: Write the failing contract tests** — table-driven over an httptest server with memstore + the Task 7 fake runner; per endpoint at minimum: happy path, one validation rejection, one authZ denial (non-owner non-admin DELETE → 403), and a response-shape regression pin (marshal the response into a `map[string]any` and assert the exact key set — additive evolution starts from a pinned shape). Plus: create-then-kill-store? no — write-ahead ordering is pinned by `TestCreateDurableBeforeDispatch`: wrap the memstore with a store whose `CreateSession` records a timestamp and a fake runner that records dispatch time; assert row-commit strictly precedes dispatch, and that a fake runner that never answers still leaves a `queued`/`creating` row in the store (never lost).
-- [ ] **Step 2: Run to verify fail**, then implement `api.go`. Shared plumbing: `writeErr(w, status, code, msg)`; `writeJSON(w, status, v)` (sets `Content-Type: application/json; charset=utf-8`); middleware wrapping the whole mux: request id (accept `X-Request-Id` ≤ 128 chars or generate 16-hex; echo header; attach to logs), `nosniff`, `no-store` on GET. Method routing via `http.ServeMux` patterns (`"POST /v1/sessions"`, Go 1.22+ pattern syntax).
+- [ ] **Step 2: Run to verify fail**, then implement `api.go`. Shared plumbing: `writeErr(w, status, code, msg)`; `writeJSON(w, status, v)` (sets `Content-Type: application/json; charset=utf-8`); middleware wrapping the whole mux: request id (accept `X-Request-Id` ≤ 128 chars or generate 16-hex; echo header; attach to logs), `nosniff`, `no-store` on GET. Method routing via `http.ServeMux` patterns (`"POST /v0/sessions"`, Go 1.22+ pattern syntax).
 - [ ] **Step 3: Run to verify pass** — `go test ./internal/controld/... -race -count=1`.
 - [ ] **Step 4: `cmd/controld/main.go`** — flags (env-overridable, flag wins): `--listen :9090`, `--db` DSN (**required**), `--runner-token` (**required**, or env `RAINIER_RUNNER_TOKEN`), `--admins`, `--members` (comma-separated logins), `--external-url` (**required**; printed at startup), `--github-api` (default `https://api.github.com`). Wire `pgstore.Open` → `controld.New` → `go srv.Run(ctx)` → `http.ListenAndServe(listen, srv.Handler())`. Startup log states admin/member counts and warns loudly when both are empty (nobody can log in). `make build` clean.
 - [ ] **Step 5: Commit** — `git commit -m "feat: controld REST API for sessions and runners; cmd/controld"`
@@ -1025,14 +1025,14 @@ Route → behavior map (each line is a contract test):
 
 **Interfaces:**
 - Consumes: `relay.Conn`/`relay.WSConn` (reused as the transport abstraction), `dispatch`/`sendToRunner`, `hub.AttachClient` (runnerd side).
-- Produces: `WS GET /v1/sessions/{id}/attach?since=` (bearer auth); `WS GET /v1/runners/attach-back?attach_id=` (runner-token auth); `attachTable` with 15 s pairing TTL.
+- Produces: `WS GET /v0/sessions/{id}/attach?since=` (bearer auth); `WS GET /v0/runners/attach-back?attach_id=` (runner-token auth); `attachTable` with 15 s pairing TTL.
 
-Flow (design §4.2): client WS arrives → auth + session must be `running` and reachable (wait up to 10 s for `running`, mirroring runnerd's hub wait; then 503 `session_not_ready` / 502 `runner_unreachable`) → park under `attach_id` (16-hex) → `sendToRunner(dial_attach{attach_id, since, cols, rows, target_url})` where `target_url` = `cfg.ExternalURL` with scheme http→ws + `/v1/runners/attach-back?attach_id=...` → runnerd dials back, feeds the conn into `hub.AttachClient(ctx, relay.WSConn(c), since, cols, rows)` → controld pairs the two sockets and splices raw text frames both ways until either dies.
+Flow (design §4.2): client WS arrives → auth + session must be `running` and reachable (wait up to 10 s for `running`, mirroring runnerd's hub wait; then 503 `session_not_ready` / 502 `runner_unreachable`) → park under `attach_id` (16-hex) → `sendToRunner(dial_attach{attach_id, since, cols, rows, target_url})` where `target_url` = `cfg.ExternalURL` with scheme http→ws + `/v0/runners/attach-back?attach_id=...` → runnerd dials back, feeds the conn into `hub.AttachClient(ctx, relay.WSConn(c), since, cols, rows)` → controld pairs the two sockets and splices raw text frames both ways until either dies.
 
 The client speaks `wire.ClientMsg/ServerMsg` end-to-end. **Resize-first contract:** controld reads the client's first message (must be `resize`, else close) to fill `dial_attach`'s cols/rows and does NOT forward it — identical to runnerd's `readFirstResize` discipline (the FrameOpen conveys the size; forwarding would double-deliver).
 
 - [ ] **Step 1: Write the failing tests:**
-  - `TestAttachEndToEnd`: full in-process chain — controld (memstore) + real runnerd `Server` with fake driver running `RunAgent` against it + a scripted fake sessiond that dials runnerd's `/register` and, on FrameOpen, replies with a `snapshot` ServerMsg then echoes stdin back as `output` (the pattern Plan 2's relay tests use). Client dials `/v1/sessions/{id}/attach`, sends resize, asserts snapshot arrives, sends stdin `"hi"`, asserts echoed output. Then closes; assert the runnerd-side attach conn closes too (splice teardown cascades).
+  - `TestAttachEndToEnd`: full in-process chain — controld (memstore) + real runnerd `Server` with fake driver running `RunAgent` against it + a scripted fake sessiond that dials runnerd's `/register` and, on FrameOpen, replies with a `snapshot` ServerMsg then echoes stdin back as `output` (the pattern Plan 2's relay tests use). Client dials `/v0/sessions/{id}/attach`, sends resize, asserts snapshot arrives, sends stdin `"hi"`, asserts echoed output. Then closes; assert the runnerd-side attach conn closes too (splice teardown cascades).
   - `TestAttachRequiresAuth` (401 before upgrade), `TestAttachWrongState` (queued session → 503 `session_not_ready` after the bounded wait — use a 100 ms wait override on Server for tests), `TestAttachBackBogusID` (unknown attach_id → 404, nothing crashes), `TestPairingTTL`: park a client, never dial back (fake runner drops dial_attach) → client conn closed within TTL; table entry gone.
 - [ ] **Step 2: Run to verify fail**, then implement `attach.go`:
 
@@ -1120,7 +1120,7 @@ type Client struct { Base, Token string; HTTP *http.Client }
 func (c *Client) Do(method, path string, in, out any) error
 // non-2xx: decodes the error envelope and returns fmt.Errorf("%s: %s", code, message);
 // transport errors returned as-is. Sets Authorization, X-Request-Id, Idempotency-Key
-// (callers pass it via path-independent option — POST /v1/sessions generates one per invocation).
+// (callers pass it via path-independent option — POST /v0/sessions generates one per invocation).
 ```
 
 CLI command surface (exact):
@@ -1139,9 +1139,9 @@ rainier rm <id|name>
 - [ ] **Step 1: Extract attachio (refactor).** Move rattach's loop into `attachio.Run`; `cmd/rattach/main.go` becomes flag-parsing + `attachio.Run(ctx, attachio.AttachURL(*baseURL, *since, *session), nil, *since)`. Unit-test `AttachURL` (move the existing cases) and `ScanDetach` (mid-buffer, absent, first byte). Behavior must be byte-identical: detach message text, exit-code line, non-tty fallback resize 80×24. Run `make build`; manually smoke `make demo` + rattach. Commit: `refactor: extract attach terminal loop into internal/attachio`.
 - [ ] **Step 2: Write failing client tests** — httptest server asserting auth header present, error envelope decoded (`404 {"error":{"code":"not_found",...}}` → error string `not_found: ...`), unknown-server-junk (non-JSON 500) doesn't panic.
 - [ ] **Step 3: Implement `internal/cli` + `cmd/rainier`.** Subcommand dispatch in the runnerctl style (stdlib `flag` per subcommand, no cobra). Details that matter:
-  - `login`: resolve server URL (`--server` flag > config > error with guidance). Token acquisition: `--from-gh` → `exec.Command("gh","auth","token")`; `--token` → use directly; `--client-id` → GitHub device flow: POST `https://github.com/login/device/code` (`client_id`, `scope=read:user`), print `user_code` + `verification_uri`, poll `https://github.com/login/oauth/access_token` at `interval` until success/expiry; none of the three → print the three options and exit 2. Then `POST /v1/auth/github`, save `{ServerURL, Token}`, print `logged in as <login> (<role>)`.
+  - `login`: resolve server URL (`--server` flag > config > error with guidance). Token acquisition: `--from-gh` → `exec.Command("gh","auth","token")`; `--token` → use directly; `--client-id` → GitHub device flow: POST `https://github.com/login/device/code` (`client_id`, `scope=read:user`), print `user_code` + `verification_uri`, poll `https://github.com/login/oauth/access_token` at `interval` until success/expiry; none of the three → print the three options and exit 2. Then `POST /v0/auth/github`, save `{ServerURL, Token}`, print `logged in as <login> (<role>)`.
   - `new`: build `{name, image, cmd, egress_allow}` from flags/args; generate a fresh `Idempotency-Key` (16-hex) per invocation; POST; print the id; unless `--detach`, immediately attach (below), retrying `session_not_ready` for up to 60 s with a `waiting for session…` spinner line — this is "attach immediately and stream everything" (design §4.10).
-  - `attach`: resolve arg — `sess_` prefix ⇒ id; else `GET /v1/sessions?state=&…` client-side name match via `SessionByName` semantics: call `GET /v1/sessions` pages and match `name` field (server has no by-name endpoint in v0; note in code). Then `attachio.Run(ctx, wsURL, http.Header{"Authorization": {"Bearer "+tok}}, since)` where `wsURL` = config ServerURL http→ws + `/v1/sessions/<id>/attach`.
+  - `attach`: resolve arg — `sess_` prefix ⇒ id; else `GET /v0/sessions?state=&…` client-side name match via `SessionByName` semantics: call `GET /v0/sessions` pages and match `name` field (server has no by-name endpoint in v0; note in code). Then `attachio.Run(ctx, wsURL, http.Header{"Authorization": {"Bearer "+tok}}, since)` where `wsURL` = config ServerURL http→ws + `/v0/sessions/<id>/attach`.
   - `ls`: text/tabwriter columns `ID  NAME  STATE  RUNNER  REACHABLE  AGE`; `--all` adds `all=true`; follows `next_cursor` to exhaustion.
   - `suspend --cold` maps to `{"warm":false}`; `rm`/`resume`/`snapshot` are thin `Do` calls printing outcomes (snapshot prints the ref).
 - [ ] **Step 4: Run to verify pass** — `go test ./internal/attachio/ ./internal/cli/ -count=1`; `make build`.
@@ -1238,7 +1238,7 @@ echo "Next: docs/deploy-gce.md — build binaries on the VM, start postgres+cont
 
 - **Design §4.1 module map** → Tasks 1–3, 7–12 create exactly those files; `storetest` mirrors the existing driver-contract pattern.
 - **§4.2 control conn + dial-back** → Tasks 6, 7, 11; single-mux alternative rejected in the design, not revisited here.
-- **§4.3 proto/versioning** → Task 1 (Proto const, unknown-field tolerance), Task 7 (reject with legible reason); `/v1` additive stance pinned by shape-regression tests (Task 10).
+- **§4.3 proto/versioning** → Task 1 (Proto const, unknown-field tolerance), Task 7 (reject with legible reason); `/v0` additive stance pinned by shape-regression tests (Task 10).
 - **§4.4 REST surface** → Task 10 route table 1:1, envelope/codes in Global Constraints; pagination day-one; opaque ids; object-level authZ (owner-or-admin on mutations, team-visible reads).
 - **§4.5 identity** → Task 9 (exchange, allowlist fail-closed, hash-only storage); Task 12 (`--from-gh`, `--token`, `--client-id` device flow; 0600 config). Runner token: Tasks 6/7.
 - **§4.6 schema + state machine + write-ahead** → Tasks 2/3 (guarded `Transition` is the state machine's enforcement; partial unique indexes for idem/name); write-ahead pinned by `TestCreateDurableBeforeDispatch` (Task 10).

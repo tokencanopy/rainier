@@ -37,7 +37,7 @@ func TestDoContextCancelsAStalledRequest(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	err := (&Client{Base: ts.URL}).DoContext(ctx, http.MethodGet, "/v1/sessions/sess_synthetic", nil, nil)
+	err := (&Client{Base: ts.URL}).DoContext(ctx, http.MethodGet, "/v0/sessions/sess_synthetic", nil, nil)
 	<-started
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("DoContext error = %v, want context deadline exceeded", err)
@@ -150,7 +150,7 @@ func TestDoSetsAuthHeader(t *testing.T) {
 
 	c := &Client{Base: ts.URL, Token: "rnr_test_token"}
 	var out map[string]string
-	if err := c.Do(http.MethodPost, "/v1/sessions", map[string]string{"name": "x"}, &out, IdempotencyKey("idem-123")); err != nil {
+	if err := c.Do(http.MethodPost, "/v0/sessions", map[string]string{"name": "x"}, &out, IdempotencyKey("idem-123")); err != nil {
 		t.Fatalf("Do: %v", err)
 	}
 
@@ -202,7 +202,7 @@ func TestDoDecodesErrorEnvelope(t *testing.T) {
 	defer ts.Close()
 
 	c := &Client{Base: ts.URL}
-	err := c.Do(http.MethodGet, "/v1/sessions/sess_x", nil, nil)
+	err := c.Do(http.MethodGet, "/v0/sessions/sess_x", nil, nil)
 	if err == nil {
 		t.Fatal("Do: want an error, got nil")
 	}
@@ -229,7 +229,7 @@ func TestDoJunkNonJSON5xxDoesNotPanic(t *testing.T) {
 		}
 	}()
 
-	err := c.Do(http.MethodGet, "/v1/sessions", nil, nil)
+	err := c.Do(http.MethodGet, "/v0/sessions", nil, nil)
 	if err == nil {
 		t.Fatal("Do: want an error for a 500 response, got nil")
 	}
@@ -252,7 +252,7 @@ func TestDoEmptyBodyJunk5xxDoesNotPanic(t *testing.T) {
 			t.Fatalf("Do panicked on empty 5xx body: %v", r)
 		}
 	}()
-	if err := c.Do(http.MethodGet, "/v1/sessions", nil, nil); err == nil {
+	if err := c.Do(http.MethodGet, "/v0/sessions", nil, nil); err == nil {
 		t.Fatal("Do: want an error for a 503 response, got nil")
 	}
 }
@@ -285,7 +285,7 @@ func TestDoSuccessNoOutDoesNotDecode(t *testing.T) {
 	defer ts.Close()
 
 	c := &Client{Base: ts.URL}
-	if err := c.Do(http.MethodDelete, "/v1/sessions/sess_x", nil, nil); err != nil {
+	if err := c.Do(http.MethodDelete, "/v0/sessions/sess_x", nil, nil); err != nil {
 		t.Fatalf("Do: %v", err)
 	}
 }
@@ -343,7 +343,7 @@ type smokeAuthResponse struct {
 	Warning string        `json:"warning"`
 }
 
-// smokeCredential mirrors one element of GET /v1/credentials. Like
+// smokeCredential mirrors one element of GET /v0/credentials. Like
 // smokeSecret it has no value field, because the response has none.
 type smokeCredential struct {
 	Provider       string `json:"provider"`
@@ -482,7 +482,7 @@ func newSmokeControld(t *testing.T, gh *httptest.Server) *httptest.Server {
 // smokeWSBase renders ts's URL as its ws:// base.
 func smokeWSBase(ts *httptest.Server) string { return "ws" + strings.TrimPrefix(ts.URL, "http") }
 
-// waitRunnerConnected polls GET /v1/runners (the exact call `rainier` itself
+// waitRunnerConnected polls GET /v0/runners (the exact call `rainier` itself
 // would have no reason to make, but the fixture needs, to know when it's
 // safe to create a session) until name reports connected, or fails the test
 // after 5s.
@@ -497,8 +497,8 @@ func waitRunnerConnected(t *testing.T, c *Client, name string) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		var resp runnersResp
-		if err := c.Do(http.MethodGet, "/v1/runners", nil, &resp); err != nil {
-			t.Fatalf("GET /v1/runners: %v", err)
+		if err := c.Do(http.MethodGet, "/v0/runners", nil, &resp); err != nil {
+			t.Fatalf("GET /v0/runners: %v", err)
 		}
 		for _, r := range resp.Runners {
 			if r.Name == name && r.Connected {
@@ -512,7 +512,7 @@ func waitRunnerConnected(t *testing.T, c *Client, name string) {
 	}
 }
 
-// waitSessionState polls GET /v1/sessions/{id} until its state matches want,
+// waitSessionState polls GET /v0/sessions/{id} until its state matches want,
 // or fails the test after timeout.
 func waitSessionState(t *testing.T, c *Client, id, want string, timeout time.Duration) smokeSession {
 	t.Helper()
@@ -520,8 +520,8 @@ func waitSessionState(t *testing.T, c *Client, id, want string, timeout time.Dur
 	var last smokeSession
 	for {
 		var env smokeSessionEnvelope
-		if err := c.Do(http.MethodGet, "/v1/sessions/"+id, nil, &env); err != nil {
-			t.Fatalf("GET /v1/sessions/%s: %v", id, err)
+		if err := c.Do(http.MethodGet, "/v0/sessions/"+id, nil, &env); err != nil {
+			t.Fatalf("GET /v0/sessions/%s: %v", id, err)
 		}
 		last = env.Session
 		if last.State == want {
@@ -723,12 +723,12 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	gh := newSmokeGitHub(t)
 	controldTS := newSmokeControld(t, gh)
 
-	// --- login: POST /v1/auth/github against the real handler, which in
+	// --- login: POST /v0/auth/github against the real handler, which in
 	// turn calls the fake GitHub above ---
 	anon := &Client{Base: controldTS.URL}
 	var auth smokeAuthResponse
-	if err := anon.Do(http.MethodPost, "/v1/auth/github", map[string]string{"access_token": smokeGHToken}, &auth); err != nil {
-		t.Fatalf("POST /v1/auth/github: %v", err)
+	if err := anon.Do(http.MethodPost, "/v0/auth/github", map[string]string{"access_token": smokeGHToken}, &auth); err != nil {
+		t.Fatalf("POST /v0/auth/github: %v", err)
 	}
 	if auth.User.Login != "alice" || auth.User.Role != "member" {
 		t.Fatalf("auth response user = %+v, want login=alice role=member", auth.User)
@@ -744,16 +744,16 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	}
 	c := &Client{Base: controldTS.URL, Token: auth.Token}
 
-	// --- creds: GET /v1/credentials, the one call cmd/rainier's `creds`
+	// --- creds: GET /v0/credentials, the one call cmd/rainier's `creds`
 	// makes. Logging in above sealed alice's GitHub token into the vault;
 	// this is the only view of it the API offers, and it carries metadata
 	// only — the same write-only discipline as secrets ---
 	var rawCreds json.RawMessage
-	if err := c.Do(http.MethodGet, "/v1/credentials", nil, &rawCreds); err != nil {
-		t.Fatalf("GET /v1/credentials: %v", err)
+	if err := c.Do(http.MethodGet, "/v0/credentials", nil, &rawCreds); err != nil {
+		t.Fatalf("GET /v0/credentials: %v", err)
 	}
 	if strings.Contains(string(rawCreds), smokeGHToken) {
-		t.Fatalf("GET /v1/credentials leaked the GitHub token: %s", rawCreds)
+		t.Fatalf("GET /v0/credentials leaked the GitHub token: %s", rawCreds)
 	}
 	var creds smokeCredentialsEnvelope
 	if err := json.Unmarshal(rawCreds, &creds); err != nil {
@@ -783,12 +783,12 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	})
 	waitRunnerConnected(t, c, "vm1")
 
-	// --- create: POST /v1/sessions with a fresh Idempotency-Key, exactly
+	// --- create: POST /v0/sessions with a fresh Idempotency-Key, exactly
 	// like cmd/rainier's `new` command ---
 	var created smokeSessionEnvelope
 	createBody := map[string]any{"name": "smoke-session", "image": "smoke-image"}
-	if err := c.Do(http.MethodPost, "/v1/sessions", createBody, &created, IdempotencyKey(RandHex(8))); err != nil {
-		t.Fatalf("POST /v1/sessions: %v", err)
+	if err := c.Do(http.MethodPost, "/v0/sessions", createBody, &created, IdempotencyKey(RandHex(8))); err != nil {
+		t.Fatalf("POST /v0/sessions: %v", err)
 	}
 	id := created.Session.ID
 	if !strings.HasPrefix(id, "sess_") {
@@ -808,10 +808,10 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 		t.Fatalf("session once running = %+v, want runner=vm1 reachable=true", got)
 	}
 
-	// --- ls: GET /v1/sessions must list it ---
+	// --- ls: GET /v0/sessions must list it ---
 	var list smokeSessionsEnvelope
-	if err := c.Do(http.MethodGet, "/v1/sessions", nil, &list); err != nil {
-		t.Fatalf("GET /v1/sessions: %v", err)
+	if err := c.Do(http.MethodGet, "/v0/sessions", nil, &list); err != nil {
+		t.Fatalf("GET /v0/sessions: %v", err)
 	}
 	var listed *smokeSession
 	for i := range list.Sessions {
@@ -820,27 +820,27 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 		}
 	}
 	if listed == nil {
-		t.Fatalf("GET /v1/sessions did not list %s: %+v", id, list.Sessions)
+		t.Fatalf("GET /v0/sessions did not list %s: %+v", id, list.Sessions)
 	}
 	if listed.Name != "smoke-session" || listed.State != "running" {
 		t.Fatalf("listed session = %+v, want name=smoke-session state=running", listed)
 	}
 
-	// --- get: GET /v1/sessions/{id} ---
+	// --- get: GET /v0/sessions/{id} ---
 	var one smokeSessionEnvelope
-	if err := c.Do(http.MethodGet, "/v1/sessions/"+id, nil, &one); err != nil {
-		t.Fatalf("GET /v1/sessions/%s: %v", id, err)
+	if err := c.Do(http.MethodGet, "/v0/sessions/"+id, nil, &one); err != nil {
+		t.Fatalf("GET /v0/sessions/%s: %v", id, err)
 	}
 	if one.Session.State != "running" {
-		t.Fatalf("GET /v1/sessions/%s state = %q, want running", id, one.Session.State)
+		t.Fatalf("GET /v0/sessions/%s state = %q, want running", id, one.Session.State)
 	}
 
 	// --- secrets: exactly the three calls cmd/rainier's `secret set|ls|rm`
 	// make. Writes are admin-only, the listing is team-visible, and no
 	// response on any path carries a value ---
 	var adminAuth smokeAuthResponse
-	if err := anon.Do(http.MethodPost, "/v1/auth/github", map[string]string{"access_token": smokeAdminGHToken}, &adminAuth); err != nil {
-		t.Fatalf("POST /v1/auth/github (admin): %v", err)
+	if err := anon.Do(http.MethodPost, "/v0/auth/github", map[string]string{"access_token": smokeAdminGHToken}, &adminAuth); err != nil {
+		t.Fatalf("POST /v0/auth/github (admin): %v", err)
 	}
 	if adminAuth.User.Login != "root" || adminAuth.User.Role != "admin" {
 		t.Fatalf("admin auth user = %+v, want login=root role=admin", adminAuth.User)
@@ -848,15 +848,15 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	admin := &Client{Base: controldTS.URL, Token: adminAuth.Token}
 
 	const smokeSecretValue = "ghp_smoke_secret_value"
-	if err := admin.Do(http.MethodPut, "/v1/secrets/SMOKE_TOKEN", map[string]string{"value": smokeSecretValue}, nil); err != nil {
-		t.Fatalf("PUT /v1/secrets/SMOKE_TOKEN as admin: %v", err)
+	if err := admin.Do(http.MethodPut, "/v0/secrets/SMOKE_TOKEN", map[string]string{"value": smokeSecretValue}, nil); err != nil {
+		t.Fatalf("PUT /v0/secrets/SMOKE_TOKEN as admin: %v", err)
 	}
 
 	// The member (alice) may not write one; the error must be the envelope's
 	// forbidden code, surfaced by Client.Do as "forbidden: ...".
-	memberPutErr := c.Do(http.MethodPut, "/v1/secrets/MEMBER_TRY", map[string]string{"value": "nope"}, nil)
+	memberPutErr := c.Do(http.MethodPut, "/v0/secrets/MEMBER_TRY", map[string]string{"value": "nope"}, nil)
 	if memberPutErr == nil {
-		t.Fatal("PUT /v1/secrets as a member: want a forbidden error, got nil")
+		t.Fatal("PUT /v0/secrets as a member: want a forbidden error, got nil")
 	}
 	if !strings.Contains(memberPutErr.Error(), "forbidden") {
 		t.Fatalf("member PUT error = %q, want a forbidden error", memberPutErr)
@@ -866,11 +866,11 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	// bytes on the wire (no value key, no value), and once as the shape the
 	// CLI renders.
 	var rawSecrets json.RawMessage
-	if err := c.Do(http.MethodGet, "/v1/secrets", nil, &rawSecrets); err != nil {
-		t.Fatalf("GET /v1/secrets as a member: %v", err)
+	if err := c.Do(http.MethodGet, "/v0/secrets", nil, &rawSecrets); err != nil {
+		t.Fatalf("GET /v0/secrets as a member: %v", err)
 	}
 	if strings.Contains(string(rawSecrets), "value") || strings.Contains(string(rawSecrets), smokeSecretValue) {
-		t.Fatalf("GET /v1/secrets leaked a value: %s", rawSecrets)
+		t.Fatalf("GET /v0/secrets leaked a value: %s", rawSecrets)
 	}
 	var secrets smokeSecretsEnvelope
 	if err := json.Unmarshal(rawSecrets, &secrets); err != nil {
@@ -901,8 +901,8 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	// runs while SMOKE_TOKEN is still stored (above) — the API refuses a
 	// dangling reference, which is itself worth smoking.
 	var createdEnv smokeEnvironmentEnvelope
-	if err := admin.Do(http.MethodPost, "/v1/environments", envBody, &createdEnv); err != nil {
-		t.Fatalf("POST /v1/environments as admin: %v", err)
+	if err := admin.Do(http.MethodPost, "/v0/environments", envBody, &createdEnv); err != nil {
+		t.Fatalf("POST /v0/environments as admin: %v", err)
 	}
 	if !strings.HasPrefix(createdEnv.Environment.ID, "env_") {
 		t.Fatalf("created environment id = %q, want an env_ prefix", createdEnv.Environment.ID)
@@ -915,23 +915,23 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	}
 
 	// A member may not define one.
-	memberEnvErr := c.Do(http.MethodPost, "/v1/environments", map[string]any{"name": "member-env", "image": "i"}, nil)
+	memberEnvErr := c.Do(http.MethodPost, "/v0/environments", map[string]any{"name": "member-env", "image": "i"}, nil)
 	if memberEnvErr == nil || !strings.Contains(memberEnvErr.Error(), "forbidden") {
-		t.Fatalf("POST /v1/environments as a member = %v, want a forbidden error", memberEnvErr)
+		t.Fatalf("POST /v0/environments as a member = %v, want a forbidden error", memberEnvErr)
 	}
 
 	// `env ls` (team-visible) and `env show <name>` (the name→id resolution
 	// the route does server-side).
 	var envList smokeEnvironmentsEnvelope
-	if err := c.Do(http.MethodGet, "/v1/environments", nil, &envList); err != nil {
-		t.Fatalf("GET /v1/environments as a member: %v", err)
+	if err := c.Do(http.MethodGet, "/v0/environments", nil, &envList); err != nil {
+		t.Fatalf("GET /v0/environments as a member: %v", err)
 	}
 	if len(envList.Environments) != 1 || envList.Environments[0].Name != "smoke-env" {
 		t.Fatalf("environments = %+v, want exactly smoke-env (the member's rejected create stored nothing)", envList.Environments)
 	}
 	var shown smokeEnvironmentEnvelope
-	if err := c.Do(http.MethodGet, "/v1/environments/smoke-env", nil, &shown); err != nil {
-		t.Fatalf("GET /v1/environments/smoke-env as a member: %v", err)
+	if err := c.Do(http.MethodGet, "/v0/environments/smoke-env", nil, &shown); err != nil {
+		t.Fatalf("GET /v0/environments/smoke-env as a member: %v", err)
 	}
 	if shown.Environment.ID != createdEnv.Environment.ID || shown.Environment.Placement != "vm1" {
 		t.Fatalf("shown environment = %+v, want %s pinned to vm1", shown.Environment, createdEnv.Environment.ID)
@@ -944,9 +944,9 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	// this body carries. The environment pins placement to vm1, so reaching
 	// `creating` there is the placement hint honored end to end ---
 	var envSession smokeSessionEnvelope
-	if err := c.Do(http.MethodPost, "/v1/sessions", map[string]any{"name": "smoke-env-session", "environment": "smoke-env"},
+	if err := c.Do(http.MethodPost, "/v0/sessions", map[string]any{"name": "smoke-env-session", "environment": "smoke-env"},
 		&envSession, IdempotencyKey(RandHex(8))); err != nil {
-		t.Fatalf("POST /v1/sessions with an environment: %v", err)
+		t.Fatalf("POST /v0/sessions with an environment: %v", err)
 	}
 	if envSession.Session.Environment != "smoke-env" {
 		t.Fatalf("created session environment = %q, want smoke-env", envSession.Session.Environment)
@@ -961,20 +961,20 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 
 	// An environment nobody has heard of is refused, and names itself in the
 	// error the CLI would print.
-	unknownEnvErr := c.Do(http.MethodPost, "/v1/sessions", map[string]any{"name": "nope", "environment": "no-such-env"}, nil)
+	unknownEnvErr := c.Do(http.MethodPost, "/v0/sessions", map[string]any{"name": "nope", "environment": "no-such-env"}, nil)
 	if unknownEnvErr == nil || !strings.Contains(unknownEnvErr.Error(), "no-such-env") {
-		t.Fatalf("POST /v1/sessions with an unknown environment = %v, want an error naming it", unknownEnvErr)
+		t.Fatalf("POST /v0/sessions with an unknown environment = %v, want an error naming it", unknownEnvErr)
 	}
 
 	// The secret delete runs last of the secrets calls: the environment above
 	// had to reference a secret that still existed (the API refuses a
 	// dangling secret_ref at create), and so did the session started from it.
-	if err := admin.Do(http.MethodDelete, "/v1/secrets/SMOKE_TOKEN", nil, nil); err != nil {
-		t.Fatalf("DELETE /v1/secrets/SMOKE_TOKEN as admin: %v", err)
+	if err := admin.Do(http.MethodDelete, "/v0/secrets/SMOKE_TOKEN", nil, nil); err != nil {
+		t.Fatalf("DELETE /v0/secrets/SMOKE_TOKEN as admin: %v", err)
 	}
 	var afterRm smokeSecretsEnvelope
-	if err := c.Do(http.MethodGet, "/v1/secrets", nil, &afterRm); err != nil {
-		t.Fatalf("GET /v1/secrets after delete: %v", err)
+	if err := c.Do(http.MethodGet, "/v0/secrets", nil, &afterRm); err != nil {
+		t.Fatalf("GET /v0/secrets after delete: %v", err)
 	}
 	if len(afterRm.Secrets) != 0 {
 		t.Fatalf("secrets after delete = %+v, want none", afterRm.Secrets)
@@ -986,8 +986,8 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	// out through the pull's streamed response; extracting them has to
 	// reproduce the tree that was pushed, file for file ---
 	var diffAns xfer.DiffAnswer
-	if err := c.Do(http.MethodGet, "/v1/sessions/"+id+"/diff", nil, &diffAns); err != nil {
-		t.Fatalf("GET /v1/sessions/%s/diff: %v", id, err)
+	if err := c.Do(http.MethodGet, "/v0/sessions/"+id+"/diff", nil, &diffAns); err != nil {
+		t.Fatalf("GET /v0/sessions/%s/diff: %v", id, err)
 	}
 	if len(diffAns.Repos) != 1 || diffAns.Repos[0].Repo != "acme/widgets" ||
 		!strings.Contains(diffAns.Repos[0].Stat, "main.go") {
@@ -997,7 +997,7 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	// The diff is a team-visible read: this session is alice's, and root —
 	// another account entirely — reads it without owning it (design §4.6).
 	// The file routes below are the ones that take ownership into account.
-	if err := admin.Do(http.MethodGet, "/v1/sessions/"+id+"/diff", nil, &diffAns); err != nil {
+	if err := admin.Do(http.MethodGet, "/v0/sessions/"+id+"/diff", nil, &diffAns); err != nil {
 		t.Fatalf("GET diff as another user: %v; the diff is a team-visible read", err)
 	}
 
@@ -1066,7 +1066,7 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 		io.Copy(sb, stdoutR)
 	}()
 
-	wsURL := strings.Replace(controldTS.URL, "http", "ws", 1) + "/v1/sessions/" + id + "/attach"
+	wsURL := strings.Replace(controldTS.URL, "http", "ws", 1) + "/v0/sessions/" + id + "/attach"
 	header := http.Header{"Authorization": {"Bearer " + auth.Token}}
 	runErr := make(chan error, 1)
 	go func() {

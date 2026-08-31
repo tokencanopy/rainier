@@ -192,9 +192,9 @@ func ParseSecretsKey(hexKey string) ([32]byte, error)                  // exactl
 func Seal(key [32]byte, plaintext []byte) (ciphertext, nonce []byte, err error)  // AES-256-GCM, fresh 12-byte crypto/rand nonce per call
 func Open(key [32]byte, ciphertext, nonce []byte) ([]byte, error)
 // Config gains SecretsKey [32]byte; New() errors when zero (fail closed, message names RAINIER_SECRETS_KEY).
-// Routes: PUT /v1/secrets/{name} (admin; body {"value":"..."} ≤64KB, name [A-Z0-9_]{1,64}) → 204
-//         GET /v1/secrets (auth'd) → {"secrets":[{name,created_at,updated_at}]}
-//         DELETE /v1/secrets/{name} (admin) → 204; unknown → 404
+// Routes: PUT /v0/secrets/{name} (admin; body {"value":"..."} ≤64KB, name [A-Z0-9_]{1,64}) → 204
+//         GET /v0/secrets (auth'd) → {"secrets":[{name,created_at,updated_at}]}
+//         DELETE /v0/secrets/{name} (admin) → 204; unknown → 404
 // CLI: rainier secret set <name> [--value v | reads stdin], secret ls, secret rm <name>
 ```
 
@@ -220,11 +220,11 @@ Route contract (each row = tests per the four-kind convention):
 
 | Route | Behavior |
 |---|---|
-| `POST /v1/environments` | admin. Body `{name, image, setup?, egress_allow?, secret_refs?, connectors?, placement?, setup_timeout_sec?}`; name regex + image non-empty; secret_refs must all exist (else 400 naming the missing one); connectors validated (below); → 201 + Location + `{"environment":{...}}` (snapshot fields included, empty). |
-| `GET /v1/environments` | auth'd → `{"environments":[...]}` name asc. |
-| `GET /v1/environments/{id}` | id or name lookup (ids are `env_`-prefixed — same disambiguation trick as the CLI's session refs) → 200/404. |
-| `PATCH /v1/environments/{id}` | admin; partial update of the POST fields; changing image/setup recomputes hash (store does it) — response shows `snapshot_ref` still set but STALE is fine (resolution compares hashes; Task 7). 200. |
-| `DELETE /v1/environments/{id}` | admin; `CountSessionsByEnvironment(NonTerminal) > 0` → 409 conflict naming the count; else 204. |
+| `POST /v0/environments` | admin. Body `{name, image, setup?, egress_allow?, secret_refs?, connectors?, placement?, setup_timeout_sec?}`; name regex + image non-empty; secret_refs must all exist (else 400 naming the missing one); connectors validated (below); → 201 + Location + `{"environment":{...}}` (snapshot fields included, empty). |
+| `GET /v0/environments` | auth'd → `{"environments":[...]}` name asc. |
+| `GET /v0/environments/{id}` | id or name lookup (ids are `env_`-prefixed — same disambiguation trick as the CLI's session refs) → 200/404. |
+| `PATCH /v0/environments/{id}` | admin; partial update of the POST fields; changing image/setup recomputes hash (store does it) — response shows `snapshot_ref` still set but STALE is fine (resolution compares hashes; Task 7). 200. |
+| `DELETE /v0/environments/{id}` | admin; `CountSessionsByEnvironment(NonTerminal) > 0` → 409 conflict naming the count; else 204. |
 
 Connector validation — exact v0 rules, `DisallowUnknownFields` per type:
 
@@ -300,7 +300,7 @@ Prepull(ctx context.Context, ref string) error                  // docker pull; 
 
 **Interfaces:**
 - Consumes: env store methods, Seal/Open (secret decryption), validateConnectors, rwire Spec fields.
-- Produces: `POST /v1/sessions` accepts `"environment": "<name-or-id>"`; resolution rules (exact):
+- Produces: `POST /v0/sessions` accepts `"environment": "<name-or-id>"`; resolution rules (exact):
 
 1. Env not found → 400 `invalid_request` naming it. Scratch (no env) unchanged.
 2. `resolved_image`: session `image` if set (override wins), else env snapshot when `SnapshotRef != "" && SnapshotHash == SetupHash` (cache hit → `Spec.Setup` empty), else `env.Image` with `Spec.Setup = env.Setup`, `Spec.SetupTimeoutSec` from env (0⇒900).

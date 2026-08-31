@@ -90,7 +90,7 @@ type RepoDiff struct {
 }
 
 // DiffAnswer is the whole session's diff, and — passed through unchanged — the
-// body of GET /v1/sessions/{id}/diff. A session with no repositories answers
+// body of GET /v0/sessions/{id}/diff. A session with no repositories answers
 // an empty array, never null, which is why MarshalJSON normalizes it.
 type DiffAnswer struct {
 	Repos []RepoDiff `json:"repos"`
@@ -108,7 +108,7 @@ func (a DiffAnswer) MarshalJSON() ([]byte, error) {
 }
 
 // PushChunk is one chunk of an upload, and the body of one POST
-// /v1/sessions/{id}/files. Data is []byte so JSON carries it as base64 with no
+// /v0/sessions/{id}/files. Data is []byte so JSON carries it as base64 with no
 // hand-rolled encoding at any hop.
 //
 // Xfer names the transfer this chunk belongs to; Path repeats on every chunk

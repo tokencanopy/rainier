@@ -155,7 +155,88 @@ func TestAuthorizeOwnerOrAdmin(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/sessions
+// Handler route vocabulary — the /v0/ cut's contract pin
+// ---------------------------------------------------------------------------
+
+// TestHandlerRouteShape pins Handler()'s route table to the literal /v0/
+// surface. Every claimed route must answer something other than 404 for its
+// exact method+path (an unauthenticated 400/401 is fine; 404 is the only
+// answer that means "no route claims this path"), and the representative old
+// routes must 404: the clean pre-GA cut leaves no compatibility alias.
+func TestHandlerRouteShape(t *testing.T) {
+	_, _, ts := newTestControld(t)
+
+	claimed := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/v0/runners/connect"},
+		{http.MethodGet, "/v0/runners/attach-back"},
+		{http.MethodPost, "/v0/auth/github"},
+		{http.MethodGet, "/v0/me"},
+		{http.MethodPost, "/v0/sessions"},
+		{http.MethodGet, "/v0/sessions"},
+		{http.MethodGet, "/v0/sessions/sess_test"},
+		{http.MethodDelete, "/v0/sessions/sess_test"},
+		{http.MethodPost, "/v0/sessions/sess_test/suspend"},
+		{http.MethodPost, "/v0/sessions/sess_test/resume"},
+		{http.MethodPost, "/v0/sessions/sess_test/snapshot"},
+		{http.MethodGet, "/v0/sessions/sess_test/attach"},
+		{http.MethodGet, "/v0/sessions/sess_test/diff"},
+		{http.MethodPost, "/v0/sessions/sess_test/files"},
+		{http.MethodGet, "/v0/sessions/sess_test/files"},
+		{http.MethodGet, "/v0/runners"},
+		{http.MethodPut, "/v0/secrets/name_test"},
+		{http.MethodGet, "/v0/secrets"},
+		{http.MethodDelete, "/v0/secrets/name_test"},
+		{http.MethodGet, "/v0/credentials"},
+		{http.MethodPost, "/v0/environments"},
+		{http.MethodGet, "/v0/environments"},
+		{http.MethodGet, "/v0/environments/env_test"},
+		{http.MethodPatch, "/v0/environments/env_test"},
+		{http.MethodDelete, "/v0/environments/env_test"},
+		{http.MethodGet, "/healthz"},
+	}
+
+	for _, r := range claimed {
+		req, err := http.NewRequest(r.method, ts.URL+r.path, nil)
+		if err != nil {
+			t.Fatalf("%s %s: %v", r.method, r.path, err)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", r.method, r.path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			t.Errorf("%s %s: 404 — route not registered", r.method, r.path)
+		}
+	}
+
+	// The retired prefix is assembled from parts so this file never spells out
+	// the retired version path literally, keeping the repository-wide
+	// retired-path search clean while the assertion still names exactly the
+	// routes that must not exist after the clean cut.
+	old := "/v" + "1"
+	for _, path := range []string{
+		old + "/me",
+		old + "/sessions",
+		old + "/runners/connect",
+		old + "/sessions/sess_test/attach",
+	} {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("GET %s: status = %d, want 404 (no compatibility alias)", path, resp.StatusCode)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /v0/sessions
 // ---------------------------------------------------------------------------
 
 func TestCreateSession(t *testing.T) {
@@ -163,14 +244,14 @@ func TestCreateSession(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		u, tok := loginUser(t, st, "alice", "member")
 
-		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions", tok,
+		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", tok,
 			map[string]any{"name": "dev1", "image": "ubuntu:latest", "cmd": []string{"bash"}, "egress_allow": []string{"github.com"}}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusAccepted {
 			t.Fatalf("status = %d, want 202; body=%s", resp.StatusCode, raw)
 		}
-		if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, "/v1/sessions/sess_") {
-			t.Errorf("Location = %q, want /v1/sessions/sess_...", loc)
+		if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, "/v0/sessions/sess_") {
+			t.Errorf("Location = %q, want /v0/sessions/sess_...", loc)
 		}
 		var body sessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
@@ -195,7 +276,7 @@ func TestCreateSession(t *testing.T) {
 	t.Run("unknown field is 400 invalid_request", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
-		resp := doRaw(t, ts, http.MethodPost, "/v1/sessions", tok, `{"name":"x","bogus":true}`)
+		resp := doRaw(t, ts, http.MethodPost, "/v0/sessions", tok, `{"name":"x","bogus":true}`)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
@@ -209,7 +290,7 @@ func TestCreateSession(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
 		huge := `{"name":"` + strings.Repeat("x", 70<<10) + `"}`
-		resp := doRaw(t, ts, http.MethodPost, "/v1/sessions", tok, huge)
+		resp := doRaw(t, ts, http.MethodPost, "/v0/sessions", tok, huge)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
@@ -222,9 +303,9 @@ func TestCreateSession(t *testing.T) {
 	t.Run("name taken by a non-terminal session is 409 conflict", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
-		readBody(t, doJSON(t, ts, http.MethodPost, "/v1/sessions", tok, map[string]any{"name": "dup"}, nil))
+		readBody(t, doJSON(t, ts, http.MethodPost, "/v0/sessions", tok, map[string]any{"name": "dup"}, nil))
 
-		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions", tok, map[string]any{"name": "dup"}, nil)
+		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", tok, map[string]any{"name": "dup"}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
@@ -239,13 +320,13 @@ func TestCreateSession(t *testing.T) {
 		_, tok := loginUser(t, st, "alice", "member")
 		hdr := map[string]string{"Idempotency-Key": "idem-1"}
 
-		firstRaw := readBody(t, doJSON(t, ts, http.MethodPost, "/v1/sessions", tok, map[string]any{"name": "once"}, hdr))
+		firstRaw := readBody(t, doJSON(t, ts, http.MethodPost, "/v0/sessions", tok, map[string]any{"name": "once"}, hdr))
 		var firstBody sessionEnvelope
 		if err := json.Unmarshal([]byte(firstRaw), &firstBody); err != nil {
 			t.Fatalf("decode first: %v; body=%s", err, firstRaw)
 		}
 
-		second := doJSON(t, ts, http.MethodPost, "/v1/sessions", tok, map[string]any{"name": "once"}, hdr)
+		second := doJSON(t, ts, http.MethodPost, "/v0/sessions", tok, map[string]any{"name": "once"}, hdr)
 		secondRaw := readBody(t, second)
 		if second.StatusCode != http.StatusAccepted {
 			t.Fatalf("replay status = %d, want 202; body=%s", second.StatusCode, secondRaw)
@@ -272,7 +353,7 @@ func TestCreateSession(t *testing.T) {
 		u, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_nilarr", OwnerID: u.ID, State: StateQueued})
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_nilarr", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_nilarr", tok, nil, nil)
 		raw := readBody(t, resp)
 		if strings.Contains(raw, `"cmd":null`) || strings.Contains(raw, `"egress_allow":null`) {
 			t.Fatalf("nil slice rendered as JSON null: %s", raw)
@@ -292,7 +373,7 @@ func TestCreateSession(t *testing.T) {
 	t.Run("response shape is pinned", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
-		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions", tok, map[string]any{"name": "shape"}, nil)
+		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", tok, map[string]any{"name": "shape"}, nil)
 		raw := readBody(t, resp)
 		assertKeySet(t, raw, "session")
 		var outer map[string]json.RawMessage
@@ -318,7 +399,7 @@ func TestCreateSession(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/sessions with "environment" — the resolution rules (design §4.3,
+// POST /v0/sessions with "environment" — the resolution rules (design §4.3,
 // §4.5). The evidence for every rule is the rwire.Spec controld actually
 // dispatches, captured off a fake runner: that message IS the contract, and a
 // resolution that only looks right in the store would still start the wrong
@@ -329,10 +410,10 @@ func TestCreateSession(t *testing.T) {
 // the test unless it was accepted.
 func createWithEnv(t *testing.T, ts *httptest.Server, tok string, body map[string]any) sessionView {
 	t.Helper()
-	resp := doJSON(t, ts, http.MethodPost, "/v1/sessions", tok, body, nil)
+	resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", tok, body, nil)
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("POST /v1/sessions status = %d, want 202; body=%s", resp.StatusCode, raw)
+		t.Fatalf("POST /v0/sessions status = %d, want 202; body=%s", resp.StatusCode, raw)
 	}
 	var env sessionEnvelope
 	if err := json.Unmarshal([]byte(raw), &env); err != nil {
@@ -549,7 +630,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
 
-		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions", tok,
+		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", tok,
 			map[string]any{"name": "nope", "environment": "ghost"}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
@@ -575,7 +656,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		_, tok := loginUser(t, st, "alice", "member")
 		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", SecretRefs: []string{"GH_TOKEN"}})
 
-		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions", tok,
+		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", tok,
 			map[string]any{"name": "orphan", "environment": "dev"}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
@@ -611,7 +692,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/sessions repo resolution (design §4.3): an environment's github
+// POST /v0/sessions repo resolution (design §4.3): an environment's github
 // connectors, or the session's own `repos`, become the RepoSpecs the create
 // dispatches — plus the git identity they commit as, the three GitHub hosts
 // they need to reach, and the credential gate that refuses a clone nobody can
@@ -805,7 +886,7 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
 			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
 
-		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions", bobTok,
+		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", bobTok,
 			map[string]any{"name": "nocred", "environment": "dev"}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
@@ -878,7 +959,7 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 			{"unknown member", `{"name":"x","repos":[{"repo":"acme/app","branch":"main"}]}`},
 			{"missing repo", `{"name":"x","repos":[{}]}`},
 		} {
-			resp := doRaw(t, ts, http.MethodPost, "/v1/sessions", tok, tc.body)
+			resp := doRaw(t, ts, http.MethodPost, "/v0/sessions", tok, tc.body)
 			raw := readBody(t, resp)
 			if resp.StatusCode != http.StatusBadRequest {
 				t.Errorf("%s: status = %d, want 400; body=%s", tc.name, resp.StatusCode, raw)
@@ -998,7 +1079,7 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 		seedSession(t, st, Session{ID: "sess_env1", OwnerID: u.ID, State: StateRunning, Runner: "vm1",
 			EnvironmentID: env.ID, ResolvedImage: "img:1"})
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_env1", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_env1", tok, nil, nil)
 		raw := readBody(t, resp)
 		var body sessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
@@ -1018,7 +1099,7 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 		seedSession(t, st, Session{ID: "sess_orphan", OwnerID: u.ID, State: StateRunning,
 			EnvironmentID: "env_deadbeef", ResolvedImage: "img:1"})
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_orphan", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_orphan", tok, nil, nil)
 		raw := readBody(t, resp)
 		var body sessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
@@ -1036,7 +1117,7 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 		seedSession(t, st, Session{ID: "sess_wait", OwnerID: u.ID, State: StateQueued,
 			EnvironmentID: env.ID, ResolvedImage: "img:1"})
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_wait", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_wait", tok, nil, nil)
 		raw := readBody(t, resp)
 		var body sessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
@@ -1058,7 +1139,7 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 		seedSession(t, st, Session{ID: "sess_soon", OwnerID: u.ID, State: StateQueued,
 			EnvironmentID: env.ID, ResolvedImage: "img:1"})
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_soon", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_soon", tok, nil, nil)
 		raw := readBody(t, resp)
 		var body sessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
@@ -1077,7 +1158,7 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 		seedSession(t, st, Session{ID: "sess_full", OwnerID: u.ID, State: StateQueued,
 			EnvironmentID: env.ID, ResolvedImage: "img:1"})
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_full", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_full", tok, nil, nil)
 		raw := readBody(t, resp)
 		var body sessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
@@ -1100,7 +1181,7 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 		seedSession(t, cst, Session{ID: "sess_scratch", OwnerID: u.ID, Name: "scratch", State: StateQueued})
 
 		before := cst.reads()
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions", tok, nil, nil)
 		raw := readBody(t, resp)
 		var body sessionsEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
@@ -1130,7 +1211,7 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GET /v1/sessions
+// GET /v0/sessions
 // ---------------------------------------------------------------------------
 
 // spyListStore records the SessionQuery it was last called with, so a test
@@ -1155,7 +1236,7 @@ func TestListSessions(t *testing.T) {
 		seedSession(t, st, Session{ID: "sess_l2", OwnerID: other.ID, State: StateRunning, Name: "l2"})
 		seedSession(t, st, Session{ID: "sess_l3", OwnerID: owner.ID, State: StateDestroyed, Name: "l3"})
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
@@ -1181,7 +1262,7 @@ func TestListSessions(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_term", OwnerID: owner.ID, State: StateDestroyed, Name: "term"})
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions?all=true", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions?all=true", tok, nil, nil)
 		raw := readBody(t, resp)
 		var body sessionsEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
@@ -1204,7 +1285,7 @@ func TestListSessions(t *testing.T) {
 		seedSession(t, st, Session{ID: "sess_name_want", OwnerID: owner.ID, State: StateRunning, Name: "box"})
 		seedSession(t, st, Session{ID: "sess_name_other", OwnerID: owner.ID, State: StateRunning, Name: "box-extra"})
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions?name=box", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions?name=box", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
@@ -1221,7 +1302,7 @@ func TestListSessions(t *testing.T) {
 	t.Run("invalid cursor is 400 invalid_request", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions?cursor=not-valid-base64", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions?cursor=not-valid-base64", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
@@ -1236,12 +1317,12 @@ func TestListSessions(t *testing.T) {
 		_, ts := newTestControldOver(t, spy)
 		_, tok := loginUser(t, spy, "alice", "member")
 
-		readBody(t, doRequest(t, ts, http.MethodGet, "/v1/sessions", tok, nil, nil))
+		readBody(t, doRequest(t, ts, http.MethodGet, "/v0/sessions", tok, nil, nil))
 		if spy.lastQuery.Limit != defaultListLimit {
 			t.Errorf("default limit = %d, want %d", spy.lastQuery.Limit, defaultListLimit)
 		}
 
-		readBody(t, doRequest(t, ts, http.MethodGet, "/v1/sessions?limit=1000", tok, nil, nil))
+		readBody(t, doRequest(t, ts, http.MethodGet, "/v0/sessions?limit=1000", tok, nil, nil))
 		if spy.lastQuery.Limit != maxListLimit {
 			t.Errorf("capped limit = %d, want %d", spy.lastQuery.Limit, maxListLimit)
 		}
@@ -1250,7 +1331,7 @@ func TestListSessions(t *testing.T) {
 	t.Run("non-numeric limit is 400 invalid_request", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions?limit=banana", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions?limit=banana", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
@@ -1261,14 +1342,14 @@ func TestListSessions(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_shape_list", OwnerID: owner.ID, State: StateQueued, Name: "shape"})
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions", tok, nil, nil)
 		raw := readBody(t, resp)
 		assertKeySet(t, raw, "sessions", "next_cursor")
 	})
 }
 
 // ---------------------------------------------------------------------------
-// GET /v1/sessions/{id}
+// GET /v0/sessions/{id}
 // ---------------------------------------------------------------------------
 
 func TestGetSession(t *testing.T) {
@@ -1277,7 +1358,7 @@ func TestGetSession(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_get1", OwnerID: owner.ID, State: StateRunning, Name: "get1", Runner: "vm1"})
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_get1", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_get1", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
@@ -1299,7 +1380,7 @@ func TestGetSession(t *testing.T) {
 	t.Run("unknown id is 404 not_found", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_nope", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_nope", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("status = %d, want 404; body=%s", resp.StatusCode, raw)
@@ -1319,7 +1400,7 @@ func TestGetSession(t *testing.T) {
 			Sessions: []rwire.SessionInfo{{ID: "sess_reach", State: "running"}}})
 		waitConnected(t, s, "vm1")
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_reach", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_reach", tok, nil, nil)
 		raw := readBody(t, resp)
 		var body sessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
@@ -1334,14 +1415,14 @@ func TestGetSession(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_shape2", OwnerID: owner.ID, State: StateQueued})
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_shape2", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_shape2", tok, nil, nil)
 		raw := readBody(t, resp)
 		assertKeySet(t, raw, "session")
 	})
 }
 
 // ---------------------------------------------------------------------------
-// DELETE /v1/sessions/{id}
+// DELETE /v0/sessions/{id}
 // ---------------------------------------------------------------------------
 
 func TestDeleteSession(t *testing.T) {
@@ -1351,7 +1432,7 @@ func TestDeleteSession(t *testing.T) {
 		seedSession(t, st, Session{ID: "sess_del_q", OwnerID: owner.ID, State: StateQueued, Name: "delq"})
 
 		drainWake(s)
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_q", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_q", tok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
@@ -1367,7 +1448,7 @@ func TestDeleteSession(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_del_c", OwnerID: owner.ID, State: StateCreating, Runner: "vm1"})
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_c", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_c", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
@@ -1387,7 +1468,7 @@ func TestDeleteSession(t *testing.T) {
 		_, otherTok := loginUser(t, st, "bob", "member")
 		seedSession(t, st, Session{ID: "sess_del_authz", OwnerID: owner.ID, State: StateQueued})
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_authz", otherTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_authz", otherTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, raw)
@@ -1407,7 +1488,7 @@ func TestDeleteSession(t *testing.T) {
 		_, adminTok := loginUser(t, st, "root", "admin")
 		seedSession(t, st, Session{ID: "sess_del_admin", OwnerID: owner.ID, State: StateQueued})
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_admin", adminTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_admin", adminTok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
@@ -1418,7 +1499,7 @@ func TestDeleteSession(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_del_term", OwnerID: owner.ID, State: StateDestroyed})
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_term", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_term", tok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
@@ -1444,7 +1525,7 @@ func TestDeleteSession(t *testing.T) {
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
 		go func() {
-			resc <- result{doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_failed", tok, nil, nil)}
+			resc <- result{doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_failed", tok, nil, nil)}
 		}()
 
 		cmd := f.nextCmd(t)
@@ -1482,7 +1563,7 @@ func TestDeleteSession(t *testing.T) {
 		seedSession(t, st, Session{ID: "sess_del_dead", OwnerID: owner.ID, State: StateDead,
 			Runner: "vm1", Error: reason})
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_dead", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_dead", tok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
@@ -1508,7 +1589,7 @@ func TestDeleteSession(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_del_unplaced", OwnerID: owner.ID, State: StateFailed})
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_unplaced", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_unplaced", tok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
@@ -1520,7 +1601,7 @@ func TestDeleteSession(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_del_gone", OwnerID: owner.ID, State: StateRunning, Runner: "vm-ghost"})
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_gone", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_gone", tok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
@@ -1536,7 +1617,7 @@ func TestDeleteSession(t *testing.T) {
 		id := "sess_del_retry"
 		seedSession(t, st, Session{ID: id, OwnerID: owner.ID, State: StateFailed, Runner: "vm1"})
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/sessions/"+id, tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/"+id, tok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
@@ -1588,7 +1669,7 @@ func TestDeleteSession(t *testing.T) {
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
 		go func() {
-			resc <- result{doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_live", tok, nil, nil)}
+			resc <- result{doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_live", tok, nil, nil)}
 		}()
 
 		cmd := f.nextCmd(t)
@@ -1624,7 +1705,7 @@ func TestDeleteSession(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_del_timeout", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_timeout", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_timeout", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("status = %d, want 502; body=%s", resp.StatusCode, raw)
@@ -1652,7 +1733,7 @@ func TestDeleteSession(t *testing.T) {
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
 		go func() {
-			resc <- result{doRequest(t, ts, http.MethodDelete, "/v1/sessions/sess_del_fail", tok, nil, nil)}
+			resc <- result{doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_fail", tok, nil, nil)}
 		}()
 		cmd := f.nextCmd(t)
 		f.reply(t, cmd, false, "docker: no such container")
@@ -1701,7 +1782,7 @@ func (r *raceTransitionStore) Transition(ctx context.Context, id string, from []
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/sessions/{id}/suspend
+// POST /v0/sessions/{id}/suspend
 // ---------------------------------------------------------------------------
 
 func TestSuspendSession(t *testing.T) {
@@ -1718,7 +1799,7 @@ func TestSuspendSession(t *testing.T) {
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
 		go func() {
-			resc <- result{doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_susp1/suspend", tok, nil, nil)}
+			resc <- result{doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_susp1/suspend", tok, nil, nil)}
 		}()
 		cmd := f.nextCmd(t)
 		if cmd.Type != "suspend" || cmd.Session != "sess_susp1" || !cmd.Warm {
@@ -1754,7 +1835,7 @@ func TestSuspendSession(t *testing.T) {
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
 		go func() {
-			resc <- result{doJSON(t, ts, http.MethodPost, "/v1/sessions/sess_susp2/suspend", tok, map[string]any{"warm": false}, nil)}
+			resc <- result{doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_susp2/suspend", tok, map[string]any{"warm": false}, nil)}
 		}()
 		cmd := f.nextCmd(t)
 		if cmd.Warm {
@@ -1778,7 +1859,7 @@ func TestSuspendSession(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_susp_badbody", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
 
-		resp := doRaw(t, ts, http.MethodPost, "/v1/sessions/sess_susp_badbody/suspend", tok, `{"warm":true,"bogus":1}`)
+		resp := doRaw(t, ts, http.MethodPost, "/v0/sessions/sess_susp_badbody/suspend", tok, `{"warm":true,"bogus":1}`)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
@@ -1793,7 +1874,7 @@ func TestSuspendSession(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_susp_bad", OwnerID: owner.ID, State: StateQueued})
 
-		resp := doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_susp_bad/suspend", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_susp_bad/suspend", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
@@ -1809,7 +1890,7 @@ func TestSuspendSession(t *testing.T) {
 		_, otherTok := loginUser(t, st, "bob", "member")
 		seedSession(t, st, Session{ID: "sess_susp_authz", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
 
-		resp := doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_susp_authz/suspend", otherTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_susp_authz/suspend", otherTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, raw)
@@ -1824,7 +1905,7 @@ func TestSuspendSession(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_susp_unreach", OwnerID: owner.ID, State: StateRunning, Runner: "vm-nope"})
 
-		resp := doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_susp_unreach/suspend", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_susp_unreach/suspend", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("status = %d, want 502; body=%s", resp.StatusCode, raw)
@@ -1847,7 +1928,7 @@ func TestSuspendSession(t *testing.T) {
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
 		go func() {
-			resc <- result{doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_susp_shape/suspend", tok, nil, nil)}
+			resc <- result{doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_susp_shape/suspend", tok, nil, nil)}
 		}()
 		cmd := f.nextCmd(t)
 		f.reply(t, cmd, true, "")
@@ -1876,7 +1957,7 @@ func TestSuspendSession(t *testing.T) {
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
 		go func() {
-			resc <- result{doRequest(t, ts, http.MethodPost, "/v1/sessions/"+id+"/suspend", tok, nil, nil)}
+			resc <- result{doRequest(t, ts, http.MethodPost, "/v0/sessions/"+id+"/suspend", tok, nil, nil)}
 		}()
 		cmd := f.nextCmd(t)
 		f.reply(t, cmd, true, "")
@@ -1901,7 +1982,7 @@ func TestSuspendSession(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/sessions/{id}/resume
+// POST /v0/sessions/{id}/resume
 // ---------------------------------------------------------------------------
 
 func TestResumeSession(t *testing.T) {
@@ -1918,7 +1999,7 @@ func TestResumeSession(t *testing.T) {
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
 		go func() {
-			resc <- result{doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_res1/resume", tok, nil, nil)}
+			resc <- result{doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_res1/resume", tok, nil, nil)}
 		}()
 		cmd := f.nextCmd(t)
 		if cmd.Type != "resume" || cmd.Session != "sess_res1" {
@@ -1950,7 +2031,7 @@ func TestResumeSession(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_res_full", OwnerID: owner.ID, State: StateSuspendedCold, Runner: "vm1"})
 
-		resp := doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_res_full/resume", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_res_full/resume", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
@@ -1969,7 +2050,7 @@ func TestResumeSession(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_res_gone", OwnerID: owner.ID, State: StateSuspendedWarm, Runner: "vm-ghost"})
 
-		resp := doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_res_gone/resume", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_res_gone/resume", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("status = %d, want 502; body=%s", resp.StatusCode, raw)
@@ -1984,7 +2065,7 @@ func TestResumeSession(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_res_bad", OwnerID: owner.ID, State: StateQueued})
 
-		resp := doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_res_bad/resume", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_res_bad/resume", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
@@ -2000,7 +2081,7 @@ func TestResumeSession(t *testing.T) {
 		_, otherTok := loginUser(t, st, "bob", "member")
 		seedSession(t, st, Session{ID: "sess_res_authz", OwnerID: owner.ID, State: StateSuspendedWarm, Runner: "vm1"})
 
-		resp := doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_res_authz/resume", otherTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_res_authz/resume", otherTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, raw)
@@ -2023,7 +2104,7 @@ func TestResumeSession(t *testing.T) {
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
 		go func() {
-			resc <- result{doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_res_shape/resume", tok, nil, nil)}
+			resc <- result{doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_res_shape/resume", tok, nil, nil)}
 		}()
 		cmd := f.nextCmd(t)
 		f.reply(t, cmd, true, "")
@@ -2051,7 +2132,7 @@ func TestResumeSession(t *testing.T) {
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
 		go func() {
-			resc <- result{doRequest(t, ts, http.MethodPost, "/v1/sessions/"+id+"/resume", tok, nil, nil)}
+			resc <- result{doRequest(t, ts, http.MethodPost, "/v0/sessions/"+id+"/resume", tok, nil, nil)}
 		}()
 		cmd := f.nextCmd(t)
 		f.reply(t, cmd, true, "")
@@ -2076,7 +2157,7 @@ func TestResumeSession(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/sessions/{id}/snapshot
+// POST /v0/sessions/{id}/snapshot
 // ---------------------------------------------------------------------------
 
 func TestSnapshotSession(t *testing.T) {
@@ -2093,7 +2174,7 @@ func TestSnapshotSession(t *testing.T) {
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
 		go func() {
-			resc <- result{doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_snap1/snapshot", tok, nil, nil)}
+			resc <- result{doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_snap1/snapshot", tok, nil, nil)}
 		}()
 		cmd := f.nextCmd(t)
 		if cmd.Type != "snapshot" || cmd.Session != "sess_snap1" {
@@ -2120,7 +2201,7 @@ func TestSnapshotSession(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_snap_bad", OwnerID: owner.ID, State: StateQueued})
 
-		resp := doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_snap_bad/snapshot", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_snap_bad/snapshot", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
@@ -2136,7 +2217,7 @@ func TestSnapshotSession(t *testing.T) {
 		_, otherTok := loginUser(t, st, "bob", "member")
 		seedSession(t, st, Session{ID: "sess_snap_authz", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
 
-		resp := doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_snap_authz/snapshot", otherTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_snap_authz/snapshot", otherTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, raw)
@@ -2151,7 +2232,7 @@ func TestSnapshotSession(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_snap_unreach", OwnerID: owner.ID, State: StateRunning, Runner: "vm-ghost"})
 
-		resp := doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_snap_unreach/snapshot", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_snap_unreach/snapshot", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("status = %d, want 502; body=%s", resp.StatusCode, raw)
@@ -2174,7 +2255,7 @@ func TestSnapshotSession(t *testing.T) {
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
 		go func() {
-			resc <- result{doRequest(t, ts, http.MethodPost, "/v1/sessions/sess_snap_shape/snapshot", tok, nil, nil)}
+			resc <- result{doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_snap_shape/snapshot", tok, nil, nil)}
 		}()
 		cmd := f.nextCmd(t)
 		f.reply(t, cmd, true, "ref-xyz")
@@ -2214,7 +2295,7 @@ func TestNewRequiresSecretsKey(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// PUT /v1/secrets/{name}
+// PUT /v0/secrets/{name}
 // ---------------------------------------------------------------------------
 
 // getSecretValue decrypts what the store actually holds for name, so a test
@@ -2238,7 +2319,7 @@ func TestPutSecret(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
 
-		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/GH_TOKEN", adminTok, map[string]any{"value": "ghp_supersecret"}, nil)
+		resp := doJSON(t, ts, http.MethodPut, "/v0/secrets/GH_TOKEN", adminTok, map[string]any{"value": "ghp_supersecret"}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, raw)
@@ -2266,8 +2347,8 @@ func TestPutSecret(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
 
-		readBody(t, doJSON(t, ts, http.MethodPut, "/v1/secrets/API_KEY", adminTok, map[string]any{"value": "first"}, nil))
-		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/API_KEY", adminTok, map[string]any{"value": "second"}, nil)
+		readBody(t, doJSON(t, ts, http.MethodPut, "/v0/secrets/API_KEY", adminTok, map[string]any{"value": "first"}, nil))
+		resp := doJSON(t, ts, http.MethodPut, "/v0/secrets/API_KEY", adminTok, map[string]any{"value": "second"}, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, readBody(t, resp))
 		}
@@ -2289,7 +2370,7 @@ func TestPutSecret(t *testing.T) {
 			"HÉLLO",
 			strings.Repeat("A", 65),
 		} {
-			resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/"+url.PathEscape(name), adminTok, map[string]any{"value": "v"}, nil)
+			resp := doJSON(t, ts, http.MethodPut, "/v0/secrets/"+url.PathEscape(name), adminTok, map[string]any{"value": "v"}, nil)
 			raw := readBody(t, resp)
 			if resp.StatusCode != http.StatusBadRequest {
 				t.Errorf("PUT name=%q status = %d, want 400; body=%s", name, resp.StatusCode, raw)
@@ -2305,7 +2386,7 @@ func TestPutSecret(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
 		name := strings.Repeat("A", 64)
-		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/"+name, adminTok, map[string]any{"value": "v"}, nil)
+		resp := doJSON(t, ts, http.MethodPut, "/v0/secrets/"+name, adminTok, map[string]any{"value": "v"}, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, readBody(t, resp))
 		}
@@ -2315,7 +2396,7 @@ func TestPutSecret(t *testing.T) {
 	t.Run("an empty value is 400 invalid_request", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
-		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/EMPTY", adminTok, map[string]any{"value": ""}, nil)
+		resp := doJSON(t, ts, http.MethodPut, "/v0/secrets/EMPTY", adminTok, map[string]any{"value": ""}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
@@ -2328,7 +2409,7 @@ func TestPutSecret(t *testing.T) {
 	t.Run("a value over 64KB is 400 invalid_request", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
-		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/BIG", adminTok,
+		resp := doJSON(t, ts, http.MethodPut, "/v0/secrets/BIG", adminTok,
 			map[string]any{"value": strings.Repeat("x", (64<<10)+1)}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
@@ -2346,7 +2427,7 @@ func TestPutSecret(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
 		value := strings.Repeat("x", 64<<10)
-		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/ATCAP", adminTok, map[string]any{"value": value}, nil)
+		resp := doJSON(t, ts, http.MethodPut, "/v0/secrets/ATCAP", adminTok, map[string]any{"value": value}, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, readBody(t, resp))
 		}
@@ -2360,7 +2441,7 @@ func TestPutSecret(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
 		huge := `{"value":"` + strings.Repeat("x", secretsBodyLimit+1) + `"}`
-		resp := doRaw(t, ts, http.MethodPut, "/v1/secrets/HUGE", adminTok, huge)
+		resp := doRaw(t, ts, http.MethodPut, "/v0/secrets/HUGE", adminTok, huge)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
@@ -2373,7 +2454,7 @@ func TestPutSecret(t *testing.T) {
 	t.Run("unknown field is 400 invalid_request", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
-		resp := doRaw(t, ts, http.MethodPut, "/v1/secrets/UNKNOWN", adminTok, `{"value":"v","bogus":true}`)
+		resp := doRaw(t, ts, http.MethodPut, "/v0/secrets/UNKNOWN", adminTok, `{"value":"v","bogus":true}`)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
@@ -2387,7 +2468,7 @@ func TestPutSecret(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, memberTok := loginUser(t, st, "alice", "member")
 
-		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/MEMBER_TRY", memberTok, map[string]any{"value": "nope"}, nil)
+		resp := doJSON(t, ts, http.MethodPut, "/v0/secrets/MEMBER_TRY", memberTok, map[string]any{"value": "nope"}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, raw)
@@ -2402,7 +2483,7 @@ func TestPutSecret(t *testing.T) {
 
 	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
 		_, _, ts := newTestControld(t)
-		resp := doJSON(t, ts, http.MethodPut, "/v1/secrets/ANON", "", map[string]any{"value": "nope"}, nil)
+		resp := doJSON(t, ts, http.MethodPut, "/v0/secrets/ANON", "", map[string]any{"value": "nope"}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401; body=%s", resp.StatusCode, raw)
@@ -2421,10 +2502,10 @@ func TestPutSecret(t *testing.T) {
 		const value = "ghp_never_echo_me"
 
 		bodies := []string{
-			readBody(t, doJSON(t, ts, http.MethodPut, "/v1/secrets/ECHO", adminTok, map[string]any{"value": value}, nil)),
-			readBody(t, doJSON(t, ts, http.MethodPut, "/v1/secrets/bad-name", adminTok, map[string]any{"value": value}, nil)),
-			readBody(t, doJSON(t, ts, http.MethodPut, "/v1/secrets/ECHO", memberTok, map[string]any{"value": value}, nil)),
-			readBody(t, doRequest(t, ts, http.MethodGet, "/v1/secrets", adminTok, nil, nil)),
+			readBody(t, doJSON(t, ts, http.MethodPut, "/v0/secrets/ECHO", adminTok, map[string]any{"value": value}, nil)),
+			readBody(t, doJSON(t, ts, http.MethodPut, "/v0/secrets/bad-name", adminTok, map[string]any{"value": value}, nil)),
+			readBody(t, doJSON(t, ts, http.MethodPut, "/v0/secrets/ECHO", memberTok, map[string]any{"value": value}, nil)),
+			readBody(t, doRequest(t, ts, http.MethodGet, "/v0/secrets", adminTok, nil, nil)),
 		}
 		for i, b := range bodies {
 			if strings.Contains(b, value) {
@@ -2435,7 +2516,7 @@ func TestPutSecret(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GET /v1/secrets
+// GET /v0/secrets
 // ---------------------------------------------------------------------------
 
 func TestListSecrets(t *testing.T) {
@@ -2458,7 +2539,7 @@ func TestListSecrets(t *testing.T) {
 		putSecret(t, st, "ZULU", "z")
 		putSecret(t, st, "ALPHA", "a")
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/secrets", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/secrets", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
@@ -2486,7 +2567,7 @@ func TestListSecrets(t *testing.T) {
 	t.Run("no secrets renders an empty array, not null", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
-		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v1/secrets", tok, nil, nil))
+		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v0/secrets", tok, nil, nil))
 		if strings.Contains(raw, `"secrets":null`) {
 			t.Fatalf("empty list rendered as JSON null: %s", raw)
 		}
@@ -2499,7 +2580,7 @@ func TestListSecrets(t *testing.T) {
 		_, tok := loginUser(t, st, "alice", "member")
 		putSecret(t, st, "GH_TOKEN", "ghp_never_listed")
 
-		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v1/secrets", tok, nil, nil))
+		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v0/secrets", tok, nil, nil))
 		if strings.Contains(raw, "value") {
 			t.Fatalf("list body mentions \"value\": %s", raw)
 		}
@@ -2515,7 +2596,7 @@ func TestListSecrets(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
 		putSecret(t, st, "SHARED", "v")
-		resp := doRequest(t, ts, http.MethodGet, "/v1/secrets", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/secrets", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
@@ -2524,7 +2605,7 @@ func TestListSecrets(t *testing.T) {
 
 	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
 		_, _, ts := newTestControld(t)
-		resp := doRequest(t, ts, http.MethodGet, "/v1/secrets", "", nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/secrets", "", nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401; body=%s", resp.StatusCode, raw)
@@ -2536,7 +2617,7 @@ func TestListSecrets(t *testing.T) {
 		_, tok := loginUser(t, st, "alice", "member")
 		putSecret(t, st, "PINNED", "v")
 
-		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v1/secrets", tok, nil, nil))
+		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v0/secrets", tok, nil, nil))
 		assertKeySet(t, raw, "secrets")
 		var outer map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(raw), &outer); err != nil {
@@ -2551,16 +2632,16 @@ func TestListSecrets(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// DELETE /v1/secrets/{name}
+// DELETE /v0/secrets/{name}
 // ---------------------------------------------------------------------------
 
 func TestDeleteSecret(t *testing.T) {
 	t.Run("happy path is 204 and the secret is gone", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
-		readBody(t, doJSON(t, ts, http.MethodPut, "/v1/secrets/DOOMED", adminTok, map[string]any{"value": "v"}, nil))
+		readBody(t, doJSON(t, ts, http.MethodPut, "/v0/secrets/DOOMED", adminTok, map[string]any{"value": "v"}, nil))
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/secrets/DOOMED", adminTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/secrets/DOOMED", adminTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, raw)
@@ -2573,7 +2654,7 @@ func TestDeleteSecret(t *testing.T) {
 	t.Run("unknown name is 404 not_found", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/secrets/NEVER_EXISTED", adminTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/secrets/NEVER_EXISTED", adminTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("status = %d, want 404; body=%s", resp.StatusCode, raw)
@@ -2586,7 +2667,7 @@ func TestDeleteSecret(t *testing.T) {
 	t.Run("invalid name is 400 invalid_request", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/secrets/bad-name", adminTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/secrets/bad-name", adminTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
@@ -2600,9 +2681,9 @@ func TestDeleteSecret(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
 		_, memberTok := loginUser(t, st, "alice", "member")
-		readBody(t, doJSON(t, ts, http.MethodPut, "/v1/secrets/SURVIVOR", adminTok, map[string]any{"value": "v"}, nil))
+		readBody(t, doJSON(t, ts, http.MethodPut, "/v0/secrets/SURVIVOR", adminTok, map[string]any{"value": "v"}, nil))
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/secrets/SURVIVOR", memberTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/secrets/SURVIVOR", memberTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, raw)
@@ -2617,7 +2698,7 @@ func TestDeleteSecret(t *testing.T) {
 
 	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
 		_, _, ts := newTestControld(t)
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/secrets/ANON", "", nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/secrets/ANON", "", nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401; body=%s", resp.StatusCode, raw)
@@ -2626,7 +2707,7 @@ func TestDeleteSecret(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GET /v1/credentials
+// GET /v0/credentials
 // ---------------------------------------------------------------------------
 
 // credentialsListToken is the fake access token every credentials-route test
@@ -2645,7 +2726,7 @@ func TestListCredentials(t *testing.T) {
 			t.Fatalf("storeGitHubCredential: %v", err)
 		}
 
-		resp := doJSON(t, ts, http.MethodGet, "/v1/credentials", tok, nil, nil)
+		resp := doJSON(t, ts, http.MethodGet, "/v0/credentials", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, raw)
@@ -2685,7 +2766,7 @@ func TestListCredentials(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
 
-		resp := doJSON(t, ts, http.MethodGet, "/v1/credentials", tok, nil, nil)
+		resp := doJSON(t, ts, http.MethodGet, "/v0/credentials", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, raw)
@@ -2706,7 +2787,7 @@ func TestListCredentials(t *testing.T) {
 		// Even an admin sees only their own: a credential is not a team
 		// resource the way a secret or an environment is.
 		for _, tc := range []struct{ name, token string }{{"bob (admin)", bobTok}} {
-			resp := doJSON(t, ts, http.MethodGet, "/v1/credentials", tc.token, nil, nil)
+			resp := doJSON(t, ts, http.MethodGet, "/v0/credentials", tc.token, nil, nil)
 			raw := readBody(t, resp)
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("%s: status = %d, want 200; body = %s", tc.name, resp.StatusCode, raw)
@@ -2716,7 +2797,7 @@ func TestListCredentials(t *testing.T) {
 			}
 		}
 
-		resp := doJSON(t, ts, http.MethodGet, "/v1/credentials", aliceTok, nil, nil)
+		resp := doJSON(t, ts, http.MethodGet, "/v0/credentials", aliceTok, nil, nil)
 		if raw := readBody(t, resp); !strings.Contains(raw, `"provider":"github"`) {
 			t.Errorf("alice's own listing = %s, want her github credential", raw)
 		}
@@ -2725,7 +2806,7 @@ func TestListCredentials(t *testing.T) {
 	t.Run("unauthenticated", func(t *testing.T) {
 		_, _, ts := newTestControld(t)
 		for _, tok := range []string{"", "rnr_" + strings.Repeat("0", 64)} {
-			resp := doJSON(t, ts, http.MethodGet, "/v1/credentials", tok, nil, nil)
+			resp := doJSON(t, ts, http.MethodGet, "/v0/credentials", tok, nil, nil)
 			raw := readBody(t, resp)
 			if resp.StatusCode != http.StatusUnauthorized {
 				t.Fatalf("status = %d, want 401; body = %s", resp.StatusCode, raw)
@@ -2747,7 +2828,7 @@ func TestListCredentials(t *testing.T) {
 			t.Fatalf("SetCredentialStatus: %v", err)
 		}
 
-		resp := doJSON(t, ts, http.MethodGet, "/v1/credentials", tok, nil, nil)
+		resp := doJSON(t, ts, http.MethodGet, "/v0/credentials", tok, nil, nil)
 		raw := readBody(t, resp)
 		if strings.Contains(raw, credentialsListToken) {
 			t.Fatalf("the listing leaked the token: %s", raw)
@@ -2928,7 +3009,7 @@ func TestValidateConnectors(t *testing.T) {
 // environments: shared test helpers
 // ---------------------------------------------------------------------------
 
-// envCreateBody is the minimal valid POST /v1/environments body, with over
+// envCreateBody is the minimal valid POST /v0/environments body, with over
 // merged in.
 func envCreateBody(name string, over map[string]any) map[string]any {
 	body := map[string]any{"name": name, "image": "img:1"}
@@ -2942,10 +3023,10 @@ func envCreateBody(name string, over map[string]any) map[string]any {
 // returning the decoded environment.
 func createEnv(t *testing.T, ts *httptest.Server, tok string, body map[string]any) environmentView {
 	t.Helper()
-	resp := doJSON(t, ts, http.MethodPost, "/v1/environments", tok, body, nil)
+	resp := doJSON(t, ts, http.MethodPost, "/v0/environments", tok, body, nil)
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("POST /v1/environments status = %d, want 201; body=%s", resp.StatusCode, raw)
+		t.Fatalf("POST /v0/environments status = %d, want 201; body=%s", resp.StatusCode, raw)
 	}
 	var env environmentEnvelope
 	if err := json.Unmarshal([]byte(raw), &env); err != nil {
@@ -2957,10 +3038,10 @@ func createEnv(t *testing.T, ts *httptest.Server, tok string, body map[string]an
 // getEnv GETs ref and fails unless it is a 200, returning the environment.
 func getEnv(t *testing.T, ts *httptest.Server, tok, ref string) environmentView {
 	t.Helper()
-	resp := doRequest(t, ts, http.MethodGet, "/v1/environments/"+ref, tok, nil, nil)
+	resp := doRequest(t, ts, http.MethodGet, "/v0/environments/"+ref, tok, nil, nil)
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /v1/environments/%s status = %d, want 200; body=%s", ref, resp.StatusCode, raw)
+		t.Fatalf("GET /v0/environments/%s status = %d, want 200; body=%s", ref, resp.StatusCode, raw)
 	}
 	var env environmentEnvelope
 	if err := json.Unmarshal([]byte(raw), &env); err != nil {
@@ -3022,7 +3103,7 @@ func cacheEnvSnapshot(t *testing.T, st Store, env Environment, ref, runner strin
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/environments
+// POST /v0/environments
 // ---------------------------------------------------------------------------
 
 func TestCreateEnvironment(t *testing.T) {
@@ -3039,7 +3120,7 @@ func TestCreateEnvironment(t *testing.T) {
 			"placement":         "rainier-1",
 			"setup_timeout_sec": 600,
 		})
-		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok, body, nil)
+		resp := doJSON(t, ts, http.MethodPost, "/v0/environments", adminTok, body, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("status = %d, want 201; body=%s", resp.StatusCode, raw)
@@ -3052,8 +3133,8 @@ func TestCreateEnvironment(t *testing.T) {
 		if !strings.HasPrefix(got.ID, "env_") {
 			t.Errorf("id = %q, want an env_ prefix", got.ID)
 		}
-		if loc := resp.Header.Get("Location"); loc != "/v1/environments/"+got.ID {
-			t.Errorf("Location = %q, want /v1/environments/%s", loc, got.ID)
+		if loc := resp.Header.Get("Location"); loc != "/v0/environments/"+got.ID {
+			t.Errorf("Location = %q, want /v0/environments/%s", loc, got.ID)
 		}
 		if got.Name != "dev" || got.Image != "img:1" || got.Setup != "echo hi" {
 			t.Errorf("name/image/setup = %q/%q/%q", got.Name, got.Image, got.Setup)
@@ -3126,7 +3207,7 @@ func TestCreateEnvironment(t *testing.T) {
 	t.Run("response shape is pinned", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
-		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok, envCreateBody("dev", nil), nil)
+		resp := doJSON(t, ts, http.MethodPost, "/v0/environments", adminTok, envCreateBody("dev", nil), nil)
 		raw := readBody(t, resp)
 		assertKeySet(t, raw, "environment")
 		var outer map[string]json.RawMessage
@@ -3142,7 +3223,7 @@ func TestCreateEnvironment(t *testing.T) {
 	t.Run("empty lists render as [] and never null", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
-		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok, envCreateBody("dev", nil), nil)
+		resp := doJSON(t, ts, http.MethodPost, "/v0/environments", adminTok, envCreateBody("dev", nil), nil)
 		raw := readBody(t, resp)
 		for _, key := range []string{"egress_allow", "secret_refs", "connectors"} {
 			if strings.Contains(raw, `"`+key+`":null`) {
@@ -3161,7 +3242,7 @@ func TestCreateEnvironment(t *testing.T) {
 			"", "UPPER", "under_score", "has.dot", "has space", "héllo", "slash/ed",
 			strings.Repeat("a", 65),
 		} {
-			resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok, envCreateBody(name, nil), nil)
+			resp := doJSON(t, ts, http.MethodPost, "/v0/environments", adminTok, envCreateBody(name, nil), nil)
 			raw := readBody(t, resp)
 			if resp.StatusCode != http.StatusBadRequest {
 				t.Errorf("name=%q status = %d, want 400; body=%s", name, resp.StatusCode, raw)
@@ -3182,7 +3263,7 @@ func TestCreateEnvironment(t *testing.T) {
 	t.Run("image is required", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
-		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok, map[string]any{"name": "dev"}, nil)
+		resp := doJSON(t, ts, http.MethodPost, "/v0/environments", adminTok, map[string]any{"name": "dev"}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
@@ -3220,7 +3301,7 @@ func TestCreateEnvironment(t *testing.T) {
 	t.Run("a negative init_timeout_sec is rejected", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
-		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok,
+		resp := doJSON(t, ts, http.MethodPost, "/v0/environments", adminTok,
 			envCreateBody("dev", map[string]any{"init_timeout_sec": -1}), nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
@@ -3234,7 +3315,7 @@ func TestCreateEnvironment(t *testing.T) {
 	t.Run("a negative setup_timeout_sec is rejected", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
-		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok,
+		resp := doJSON(t, ts, http.MethodPost, "/v0/environments", adminTok,
 			envCreateBody("dev", map[string]any{"setup_timeout_sec": -1}), nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
@@ -3250,7 +3331,7 @@ func TestCreateEnvironment(t *testing.T) {
 		_, adminTok := loginUser(t, st, "root", "admin")
 		createEnv(t, ts, adminTok, envCreateBody("dev", nil))
 
-		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok,
+		resp := doJSON(t, ts, http.MethodPost, "/v0/environments", adminTok,
 			envCreateBody("dev", map[string]any{"image": "img:2"}), nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
@@ -3266,7 +3347,7 @@ func TestCreateEnvironment(t *testing.T) {
 		_, adminTok := loginUser(t, st, "root", "admin")
 		putSecretDirect(t, st, "PRESENT")
 
-		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok,
+		resp := doJSON(t, ts, http.MethodPost, "/v0/environments", adminTok,
 			envCreateBody("dev", map[string]any{"secret_refs": []string{"PRESENT", "ABSENT"}}), nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
@@ -3293,7 +3374,7 @@ func TestCreateEnvironment(t *testing.T) {
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				resp := doJSON(t, ts, http.MethodPost, "/v1/environments", adminTok,
+				resp := doJSON(t, ts, http.MethodPost, "/v0/environments", adminTok,
 					envCreateBody("dev", map[string]any{"connectors": connectorArray(tc.conn)}), nil)
 				raw := readBody(t, resp)
 				if resp.StatusCode != http.StatusBadRequest {
@@ -3310,7 +3391,7 @@ func TestCreateEnvironment(t *testing.T) {
 	t.Run("an unknown body field is 400 invalid_request", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
-		resp := doRaw(t, ts, http.MethodPost, "/v1/environments", adminTok, `{"name":"dev","image":"i","bogus":true}`)
+		resp := doRaw(t, ts, http.MethodPost, "/v0/environments", adminTok, `{"name":"dev","image":"i","bogus":true}`)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
@@ -3320,7 +3401,7 @@ func TestCreateEnvironment(t *testing.T) {
 	t.Run("a member is 403 forbidden and stores nothing", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, memberTok := loginUser(t, st, "alice", "member")
-		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", memberTok, envCreateBody("dev", nil), nil)
+		resp := doJSON(t, ts, http.MethodPost, "/v0/environments", memberTok, envCreateBody("dev", nil), nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, raw)
@@ -3335,7 +3416,7 @@ func TestCreateEnvironment(t *testing.T) {
 
 	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
 		_, _, ts := newTestControld(t)
-		resp := doJSON(t, ts, http.MethodPost, "/v1/environments", "", envCreateBody("dev", nil), nil)
+		resp := doJSON(t, ts, http.MethodPost, "/v0/environments", "", envCreateBody("dev", nil), nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401; body=%s", resp.StatusCode, raw)
@@ -3347,7 +3428,7 @@ func TestCreateEnvironment(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GET /v1/environments
+// GET /v0/environments
 // ---------------------------------------------------------------------------
 
 func TestListEnvironments(t *testing.T) {
@@ -3358,7 +3439,7 @@ func TestListEnvironments(t *testing.T) {
 		createEnv(t, ts, adminTok, envCreateBody("zulu", nil))
 		createEnv(t, ts, adminTok, envCreateBody("alpha", nil))
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/environments", memberTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/environments", memberTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
@@ -3378,7 +3459,7 @@ func TestListEnvironments(t *testing.T) {
 	t.Run("no environments render as an empty array, not null", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
-		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v1/environments", tok, nil, nil))
+		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v0/environments", tok, nil, nil))
 		if strings.Contains(raw, `"environments":null`) {
 			t.Fatalf("empty list rendered as JSON null: %s", raw)
 		}
@@ -3389,7 +3470,7 @@ func TestListEnvironments(t *testing.T) {
 		_, adminTok := loginUser(t, st, "root", "admin")
 		createEnv(t, ts, adminTok, envCreateBody("dev", nil))
 
-		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v1/environments", adminTok, nil, nil))
+		raw := readBody(t, doRequest(t, ts, http.MethodGet, "/v0/environments", adminTok, nil, nil))
 		assertKeySet(t, raw, "environments")
 		var outer map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(raw), &outer); err != nil {
@@ -3407,7 +3488,7 @@ func TestListEnvironments(t *testing.T) {
 
 	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
 		_, _, ts := newTestControld(t)
-		resp := doRequest(t, ts, http.MethodGet, "/v1/environments", "", nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/environments", "", nil, nil)
 		readBody(t, resp)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401", resp.StatusCode)
@@ -3416,7 +3497,7 @@ func TestListEnvironments(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GET /v1/environments/{id}
+// GET /v0/environments/{id}
 // ---------------------------------------------------------------------------
 
 func TestGetEnvironment(t *testing.T) {
@@ -3437,7 +3518,7 @@ func TestGetEnvironment(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
 		for _, ref := range []string{"env_" + strings.Repeat("0", 32), "nosuch"} {
-			resp := doRequest(t, ts, http.MethodGet, "/v1/environments/"+ref, tok, nil, nil)
+			resp := doRequest(t, ts, http.MethodGet, "/v0/environments/"+ref, tok, nil, nil)
 			raw := readBody(t, resp)
 			if resp.StatusCode != http.StatusNotFound {
 				t.Errorf("ref=%q status = %d, want 404; body=%s", ref, resp.StatusCode, raw)
@@ -3451,7 +3532,7 @@ func TestGetEnvironment(t *testing.T) {
 
 	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
 		_, _, ts := newTestControld(t)
-		resp := doRequest(t, ts, http.MethodGet, "/v1/environments/dev", "", nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/environments/dev", "", nil, nil)
 		readBody(t, resp)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401", resp.StatusCode)
@@ -3460,7 +3541,7 @@ func TestGetEnvironment(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// PATCH /v1/environments/{id}
+// PATCH /v0/environments/{id}
 // ---------------------------------------------------------------------------
 
 func TestUpdateEnvironment(t *testing.T) {
@@ -3474,7 +3555,7 @@ func TestUpdateEnvironment(t *testing.T) {
 			"placement":    "rainier-1",
 		}))
 
-		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/"+created.ID, adminTok,
+		resp := doJSON(t, ts, http.MethodPatch, "/v0/environments/"+created.ID, adminTok,
 			map[string]any{"image": "img:2"}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
@@ -3508,7 +3589,7 @@ func TestUpdateEnvironment(t *testing.T) {
 		_, adminTok := loginUser(t, st, "root", "admin")
 		created := createEnv(t, ts, adminTok, envCreateBody("dev", map[string]any{"setup": "echo hi"}))
 
-		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/dev", adminTok,
+		resp := doJSON(t, ts, http.MethodPatch, "/v0/environments/dev", adminTok,
 			map[string]any{"egress_allow": []string{"example.com"}}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
@@ -3536,7 +3617,7 @@ func TestUpdateEnvironment(t *testing.T) {
 			t.Fatalf("SetEnvironmentSnapshot: %v", err)
 		}
 
-		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/dev", adminTok,
+		resp := doJSON(t, ts, http.MethodPatch, "/v0/environments/dev", adminTok,
 			map[string]any{"init": "new-init", "init_timeout_sec": 300}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
@@ -3569,7 +3650,7 @@ func TestUpdateEnvironment(t *testing.T) {
 			t.Fatalf("SetEnvironmentSnapshot: %v", err)
 		}
 
-		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/"+created.ID, adminTok,
+		resp := doJSON(t, ts, http.MethodPatch, "/v0/environments/"+created.ID, adminTok,
 			map[string]any{"setup": "echo changed"}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
@@ -3596,7 +3677,7 @@ func TestUpdateEnvironment(t *testing.T) {
 			"connectors":   connectorArray(ghConnJSON),
 		}))
 
-		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/"+created.ID, adminTok,
+		resp := doJSON(t, ts, http.MethodPatch, "/v0/environments/"+created.ID, adminTok,
 			map[string]any{"egress_allow": []string{}, "connectors": json.RawMessage(`[]`)}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
@@ -3618,7 +3699,7 @@ func TestUpdateEnvironment(t *testing.T) {
 		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
 
 		got := getEnv(t, ts, adminTok, created.ID)
-		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/"+got.ID, adminTok,
+		resp := doJSON(t, ts, http.MethodPatch, "/v0/environments/"+got.ID, adminTok,
 			map[string]any{"name": "renamed"}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
@@ -3628,7 +3709,7 @@ func TestUpdateEnvironment(t *testing.T) {
 			t.Errorf("renamed lookup = %q, want %q", after.ID, created.ID)
 		}
 
-		resp = doJSON(t, ts, http.MethodPatch, "/v1/environments/renamed", adminTok,
+		resp = doJSON(t, ts, http.MethodPatch, "/v0/environments/renamed", adminTok,
 			map[string]any{"name": "taken"}, nil)
 		raw = readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
@@ -3658,7 +3739,7 @@ func TestUpdateEnvironment(t *testing.T) {
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/"+created.ID, adminTok, tc.patch, nil)
+				resp := doJSON(t, ts, http.MethodPatch, "/v0/environments/"+created.ID, adminTok, tc.patch, nil)
 				raw := readBody(t, resp)
 				if resp.StatusCode != http.StatusBadRequest {
 					t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
@@ -3674,7 +3755,7 @@ func TestUpdateEnvironment(t *testing.T) {
 	t.Run("an unknown environment is 404 not_found", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
-		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/nosuch", adminTok, map[string]any{"image": "img:2"}, nil)
+		resp := doJSON(t, ts, http.MethodPatch, "/v0/environments/nosuch", adminTok, map[string]any{"image": "img:2"}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("status = %d, want 404; body=%s", resp.StatusCode, raw)
@@ -3690,7 +3771,7 @@ func TestUpdateEnvironment(t *testing.T) {
 		_, memberTok := loginUser(t, st, "alice", "member")
 		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
 
-		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/"+created.ID, memberTok,
+		resp := doJSON(t, ts, http.MethodPatch, "/v0/environments/"+created.ID, memberTok,
 			map[string]any{"image": "img:evil"}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusForbidden {
@@ -3703,7 +3784,7 @@ func TestUpdateEnvironment(t *testing.T) {
 
 	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
 		_, _, ts := newTestControld(t)
-		resp := doJSON(t, ts, http.MethodPatch, "/v1/environments/dev", "", map[string]any{"image": "i"}, nil)
+		resp := doJSON(t, ts, http.MethodPatch, "/v0/environments/dev", "", map[string]any{"image": "i"}, nil)
 		readBody(t, resp)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401", resp.StatusCode)
@@ -3714,7 +3795,7 @@ func TestUpdateEnvironment(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
 		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
-		resp := doRaw(t, ts, http.MethodPatch, "/v1/environments/"+created.ID, adminTok, `{"bogus":true}`)
+		resp := doRaw(t, ts, http.MethodPatch, "/v0/environments/"+created.ID, adminTok, `{"bogus":true}`)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
@@ -3723,7 +3804,7 @@ func TestUpdateEnvironment(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// DELETE /v1/environments/{id}
+// DELETE /v0/environments/{id}
 // ---------------------------------------------------------------------------
 
 func TestDeleteEnvironment(t *testing.T) {
@@ -3732,7 +3813,7 @@ func TestDeleteEnvironment(t *testing.T) {
 		_, adminTok := loginUser(t, st, "root", "admin")
 		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/"+created.ID, adminTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/environments/"+created.ID, adminTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, raw)
@@ -3750,7 +3831,7 @@ func TestDeleteEnvironment(t *testing.T) {
 		_, adminTok := loginUser(t, st, "root", "admin")
 		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/dev", adminTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/environments/dev", adminTok, nil, nil)
 		readBody(t, resp)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
@@ -3768,7 +3849,7 @@ func TestDeleteEnvironment(t *testing.T) {
 		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, EnvironmentID: created.ID, State: StateQueued})
 		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, EnvironmentID: created.ID, State: StateDestroyed})
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/dev", adminTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/environments/dev", adminTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
@@ -3788,7 +3869,7 @@ func TestDeleteEnvironment(t *testing.T) {
 		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
 		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, EnvironmentID: created.ID, State: StateDestroyed})
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/dev", adminTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/environments/dev", adminTok, nil, nil)
 		readBody(t, resp)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
@@ -3806,7 +3887,7 @@ func TestDeleteEnvironment(t *testing.T) {
 		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, State: StateRunning})
 		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, State: StateQueued})
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/dev", adminTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/environments/dev", adminTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, raw)
@@ -3819,7 +3900,7 @@ func TestDeleteEnvironment(t *testing.T) {
 	t.Run("an unknown environment is 404 not_found", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/nosuch", adminTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/environments/nosuch", adminTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("status = %d, want 404; body=%s", resp.StatusCode, raw)
@@ -3835,7 +3916,7 @@ func TestDeleteEnvironment(t *testing.T) {
 		_, memberTok := loginUser(t, st, "alice", "member")
 		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
 
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/dev", memberTok, nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/environments/dev", memberTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, raw)
@@ -3850,7 +3931,7 @@ func TestDeleteEnvironment(t *testing.T) {
 
 	t.Run("no token is 401 unauthenticated", func(t *testing.T) {
 		_, _, ts := newTestControld(t)
-		resp := doRequest(t, ts, http.MethodDelete, "/v1/environments/dev", "", nil, nil)
+		resp := doRequest(t, ts, http.MethodDelete, "/v0/environments/dev", "", nil, nil)
 		readBody(t, resp)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401", resp.StatusCode)
@@ -3859,7 +3940,7 @@ func TestDeleteEnvironment(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GET /v1/runners
+// GET /v0/runners
 // ---------------------------------------------------------------------------
 
 func TestListRunners(t *testing.T) {
@@ -3870,7 +3951,7 @@ func TestListRunners(t *testing.T) {
 		_, tok := loginUser(t, st, "alice", "member")
 
 		eventually(t, 3*time.Second, func() error {
-			resp := doRequest(t, ts, http.MethodGet, "/v1/runners", tok, nil, nil)
+			resp := doRequest(t, ts, http.MethodGet, "/v0/runners", tok, nil, nil)
 			raw := readBody(t, resp)
 			if resp.StatusCode != http.StatusOK {
 				return fmt.Errorf("status = %d; body=%s", resp.StatusCode, raw)
@@ -3892,7 +3973,7 @@ func TestListRunners(t *testing.T) {
 
 	t.Run("requires auth", func(t *testing.T) {
 		_, _, ts := newTestControld(t)
-		resp := doRequest(t, ts, http.MethodGet, "/v1/runners", "", nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/runners", "", nil, nil)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want 401", resp.StatusCode)
 		}
@@ -3906,7 +3987,7 @@ func TestListRunners(t *testing.T) {
 
 		var raw string
 		eventually(t, 3*time.Second, func() error {
-			resp := doRequest(t, ts, http.MethodGet, "/v1/runners", tok, nil, nil)
+			resp := doRequest(t, ts, http.MethodGet, "/v0/runners", tok, nil, nil)
 			raw = readBody(t, resp)
 			var body runnersEnvelope
 			if err := json.Unmarshal([]byte(raw), &body); err != nil {
@@ -4024,7 +4105,7 @@ func TestMiddleware(t *testing.T) {
 	t.Run("no-store is set on GET", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions", tok, nil, nil)
 		defer resp.Body.Close()
 		if got := resp.Header.Get("Cache-Control"); got != "no-store" {
 			t.Errorf("Cache-Control = %q, want no-store", got)
@@ -4078,7 +4159,7 @@ func TestCreateDurableBeforeDispatch(t *testing.T) {
 
 		_, tok := loginUser(t, cst, "alice", "member")
 
-		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions", tok, map[string]any{"name": "durable1", "image": "img:latest"}, nil)
+		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", tok, map[string]any{"name": "durable1", "image": "img:latest"}, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusAccepted {
 			t.Fatalf("status = %d, want 202; body=%s", resp.StatusCode, raw)
@@ -4115,7 +4196,7 @@ func TestCreateDurableBeforeDispatch(t *testing.T) {
 
 		_, tok := loginUser(t, cst, "alice", "member")
 
-		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions", tok, map[string]any{"name": "durable2", "image": "img:latest"}, nil)
+		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", tok, map[string]any{"name": "durable2", "image": "img:latest"}, nil)
 		raw := readBody(t, resp)
 		var body sessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {

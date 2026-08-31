@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Environments deliver code with working git — clone-at-boot on session branches, an in-sandbox credential helper minting from a lifecycle-aware vault, the `init` hook, bounded push/pull, the diff endpoint — plus the durability riders (crash-preserves-workspace, `child_exited`) and the `--since`/`/v1/me` fixes.
+**Goal:** Environments deliver code with working git — clone-at-boot on session branches, an in-sandbox credential helper minting from a lifecycle-aware vault, the `init` hook, bounded push/pull, the diff endpoint — plus the durability riders (crash-preserves-workspace, `child_exited`) and the `--since`/`/v0/me` fixes.
 
 **Architecture:** One new primitive carries everything: the control channel becomes a bidirectional **session RPC** (request/response with correlation, initiated from either end). Credential mint (sandbox→controld), diff and push/pull (controld→sandbox) are methods on it. The vault stores per-user provider credentials sealed under the existing secrets key, mints optimistically, and flips to `needs_refresh` on observed auth failure — never a GitHub call on the hot path.
 
@@ -31,7 +31,7 @@ internal/relay/frame.go, session_side.go, runnerd_side.go     RPC envelope, Send
 internal/rwire/rwire.go                                        session_rpc/session_req + RPCEnvelope (T1)
 internal/controld/{store.go,memstore.go,storetest,pgstore}     credentials + init + child_exit_code (T2)
 internal/controld/vault.go (+_test)                            mint decision, status transitions (T3)
-internal/controld/{auth.go,api.go,controld.go}                 login stores creds; /v1/credentials; routes (T3)
+internal/controld/{auth.go,api.go,controld.go}                 login stores creds; /v0/credentials; routes (T3)
 cmd/rainier/main.go, internal/cli                              creds, login --refresh, push/pull, diff (T3,T9)
 internal/driver/{driver.go,docker.go,fake.go,contract.go}      DestroyContainer/RemoveWorkspace; RAINIER_REPOS/INIT (T4,T6)
 internal/runnerd/{runnerd.go,agent.go}                         crash keeps volume; RPC forwarding both ways (T4,T5)
@@ -142,11 +142,11 @@ ALTER TABLE sessions ADD COLUMN child_exit_code int;
 
 ---
 
-### Task 3: Vault behavior — login stores, /v1/credentials, creds CLI, refresh
+### Task 3: Vault behavior — login stores, /v0/credentials, creds CLI, refresh
 
 **Files:**
 - Create: `internal/controld/vault.go`, `vault_test.go`
-- Modify: `internal/controld/auth.go` (exchange stores; scope header), `api.go` (+`GET /v1/credentials`), `controld.go` (route), `cmd/rainier/main.go` + `internal/cli` (`creds`, `login --refresh <provider>`), api_test/auth_test extensions
+- Modify: `internal/controld/auth.go` (exchange stores; scope header), `api.go` (+`GET /v0/credentials`), `controld.go` (route), `cmd/rainier/main.go` + `internal/cli` (`creds`, `login --refresh <provider>`), api_test/auth_test extensions
 
 **Interfaces:**
 
@@ -159,11 +159,11 @@ var ErrCredentialNeedsRefresh = errors.New(`github credential needs refresh — 
 var ErrCredentialMissing = errors.New(`no github credential — run: rainier login`)
 ```
 
-- `POST /v1/auth/github`: after the existing verify, read `X-OAuth-Scopes` from the SAME `/user` response; `storeGitHubCredential`; response gains `"scopes"` and, when `repo` absent, `"warning": "token lacks repo scope; git operations will require rainier login --refresh github"` (CLI prints it). Device flow (`githubDeviceFlow`) requests `scope=repo read:user` (currently `read:user` — check the existing request body and change it).
-- `GET /v1/credentials` (requireUser): caller's rows as `{provider, status, scopes, obtained_at, last_verified_at, last_used_at}` — NO value fields in the view type (secrets discipline).
+- `POST /v0/auth/github`: after the existing verify, read `X-OAuth-Scopes` from the SAME `/user` response; `storeGitHubCredential`; response gains `"scopes"` and, when `repo` absent, `"warning": "token lacks repo scope; git operations will require rainier login --refresh github"` (CLI prints it). Device flow (`githubDeviceFlow`) requests `scope=repo read:user` (currently `read:user` — check the existing request body and change it).
+- `GET /v0/credentials` (requireUser): caller's rows as `{provider, status, scopes, obtained_at, last_verified_at, last_used_at}` — NO value fields in the view type (secrets discipline).
 - CLI: `rainier creds` (tabwriter PROVIDER STATUS SCOPES LAST_VERIFIED LAST_USED); `rainier login --refresh github` = the existing acquisition paths then the exchange (server upserts — no new endpoint); help text explains when to use it.
 
-- [ ] **Step 1: Failing tests.** vault_test: mint on valid returns the token + touches last_used (memstore-backed, real Seal/Open); mint on needs_refresh → ErrCredentialNeedsRefresh (errors.Is); mint with no row → ErrCredentialMissing; rejectCredential flips status. auth_test: exchange stores a credential (assert via store; ciphertext ≠ token bytes; Open round-trips); scope warning surfaces when the fake GitHub omits repo from X-OAuth-Scopes; /v1/credentials four-kind route tests + a raw-JSON no-token-material assertion; a second user's creds invisible.
+- [ ] **Step 1: Failing tests.** vault_test: mint on valid returns the token + touches last_used (memstore-backed, real Seal/Open); mint on needs_refresh → ErrCredentialNeedsRefresh (errors.Is); mint with no row → ErrCredentialMissing; rejectCredential flips status. auth_test: exchange stores a credential (assert via store; ciphertext ≠ token bytes; Open round-trips); scope warning surfaces when the fake GitHub omits repo from X-OAuth-Scopes; /v0/credentials four-kind route tests + a raw-JSON no-token-material assertion; a second user's creds invisible.
 - [ ] **Step 2:** Run → FAIL. **Step 3:** Implement (fake GitHub fixture gains the X-OAuth-Scopes header — it's `newTestControld`'s fixture; extend, reuse everywhere). **Step 4:** controld suite `-race`; cli smoke extension (`creds` renders). Full suite. **Step 5:** Commit `feat: credential vault — login stores, status lifecycle, creds CLI`.
 
 ---
@@ -250,7 +250,7 @@ type RepoSpec struct {
     Dir string `json:"dir"`
 }
 // rwire.Spec += Repos []RepoSpec, Init string, InitTimeoutSec int, GitAuthorName, GitAuthorEmail string (all omitempty)
-// POST /v1/sessions body += `repos: [{repo:"owner/name", base_branch?}]` — overrides env github connectors; explicit [] = none
+// POST /v0/sessions body += `repos: [{repo:"owner/name", base_branch?}]` — overrides env github connectors; explicit [] = none
 //   (pointer-slice semantics exactly like egress_allow's nil-vs-empty).
 // Resolution rules (createSpec/handleCreateSession):
 //   repos = session override if non-nil, else env's github connectors (decode stored Raw via the T4-Plan4 strict decoder);
@@ -324,7 +324,7 @@ helper.go: `sessiond git-credential-helper get` — reads git's key=value stdin;
 ### Task 9: diff endpoint + push/pull
 
 **Files:**
-- Modify: `internal/controld/api.go` (+`GET /v1/sessions/{id}/diff`, `POST /v1/sessions/{id}/files` upload + `GET .../files?path=` download — chunked RPC bridging), `srpc.go` (methods), `cmd/sessiond/rpc.go` (diff/push/pull handlers), `cmd/rainier/main.go` + `internal/cli` (`push`/`pull`/`diff` subcommands)
+- Modify: `internal/controld/api.go` (+`GET /v0/sessions/{id}/diff`, `POST /v0/sessions/{id}/files` upload + `GET .../files?path=` download — chunked RPC bridging), `srpc.go` (methods), `cmd/sessiond/rpc.go` (diff/push/pull handlers), `cmd/rainier/main.go` + `internal/cli` (`push`/`pull`/`diff` subcommands)
 
 **Contract:**
 - Diff: REST → `sessionRPC("diff")` → sessiond per repo: `git -C <dir> fetch -q origin <base>` then `git -C <dir> diff --stat origin/<base>...HEAD`, 30s+64KB caps per repo → `{"repos":[{repo, base_branch, session_branch, stat}]}`; no repos → `{"repos":[]}`; session not running → 503 session_not_ready. CLI `rainier diff <session>` renders.
@@ -334,14 +334,14 @@ helper.go: `sessiond git-credential-helper get` — reads git's key=value stdin;
 
 ---
 
-### Task 10: Riders B — --since replay fix, /v1/me id, owner-preference
+### Task 10: Riders B — --since replay fix, /v0/me id, owner-preference
 
 **Files:**
-- Investigate + Modify: the `--since` path (`cmd/rainier/main.go` attach URL building, `internal/attachio`, `internal/controld/attach.go` since forwarding into dial_attach — find the actual break: acceptance showed the server log intact but the viewer receiving screen-only); Modify: `internal/controld/auth.go` (userView + id), `cmd/rainier/main.go` (owner-preference reads /v1/me at login; drop the Config.OwnerID cache-from-new)
+- Investigate + Modify: the `--since` path (`cmd/rainier/main.go` attach URL building, `internal/attachio`, `internal/controld/attach.go` since forwarding into dial_attach — find the actual break: acceptance showed the server log intact but the viewer receiving screen-only); Modify: `internal/controld/auth.go` (userView + id), `cmd/rainier/main.go` (owner-preference reads /v0/me at login; drop the Config.OwnerID cache-from-new)
 
 - [ ] **Step 1: Reproduce first** — an e2e scene: session with 50 scripted output events → detach → reattach `--since 0` → assert all 50 arrive (this test FAILS today; it is the bug's pin). Diagnose from the failing test (the suspects, in order: CLI not putting since into the ws URL; controld's attach handler not parsing it; dial_attach not carrying it; sessiond's Attach(since) fine — Plan 1 tests prove it).
-- [ ] **Step 2:** Fix minimally at the actual break; scene green `-count=5`. **Step 3:** `/v1/me` gains `"id"`; shape pins updated; CLI login stores it; `resolveSessionID` owner-preference uses it (delete the `new`-response cache path + its limitation doc); ambiguity tests updated.
-- [ ] **Step 4:** Full suite. **Step 5:** Commit `fix: full-history replay reaches the viewer; owner id from /v1/me`.
+- [ ] **Step 2:** Fix minimally at the actual break; scene green `-count=5`. **Step 3:** `/v0/me` gains `"id"`; shape pins updated; CLI login stores it; `resolveSessionID` owner-preference uses it (delete the `new`-response cache path + its limitation doc); ambiguity tests updated.
+- [ ] **Step 4:** Full suite. **Step 5:** Commit `fix: full-history replay reaches the viewer; owner id from /v0/me`.
 
 ---
 
@@ -359,7 +359,7 @@ helper.go: `sessiond git-credential-helper get` — reads git's key=value stdin;
 
 ## Coverage ledger (self-review against the design)
 
-- §4.1 RPC primitive both directions + correlation at edges → T1 (envelope), T5 (plumbing; separate ID spaces per initiator; runnerd pure-forwarder with TTL'd pending). §4.2 vault (schema T2, behavior T3, optimistic mint + lazy flip T3/T8, scope upgrade + warning T3). §4.3 connector execution (resolution/attribution/egress/gate T6; boot chain/gitconfig/helper T7; branch + dedupe rules T6/T7). §4.4 init (schema T2, dispatch T6, execution T7, every-session-incl-cache-hit pinned T6). §4.5 push/pull caps + path safety → T9. §4.6 diff → T9. §4.7 riders → T4 (crash volume + child_exited), T10 (--since, /v1/me). §5 edge cases: no-credential gate (T6, needs_refresh-passes documented), revoked-mid-clone (T7 detection + T8 flip + e2e), helper non-github fallthrough (T7), path escapes (T9), RPC-vs-PTY contention (T1's shared writer + T9's ack pacing), admin-as-owner note (docs T11). §7 verification map → tasks as listed; rehearsal real-git phase T11.
+- §4.1 RPC primitive both directions + correlation at edges → T1 (envelope), T5 (plumbing; separate ID spaces per initiator; runnerd pure-forwarder with TTL'd pending). §4.2 vault (schema T2, behavior T3, optimistic mint + lazy flip T3/T8, scope upgrade + warning T3). §4.3 connector execution (resolution/attribution/egress/gate T6; boot chain/gitconfig/helper T7; branch + dedupe rules T6/T7). §4.4 init (schema T2, dispatch T6, execution T7, every-session-incl-cache-hit pinned T6). §4.5 push/pull caps + path safety → T9. §4.6 diff → T9. §4.7 riders → T4 (crash volume + child_exited), T10 (--since, /v0/me). §5 edge cases: no-credential gate (T6, needs_refresh-passes documented), revoked-mid-clone (T7 detection + T8 flip + e2e), helper non-github fallthrough (T7), path escapes (T9), RPC-vs-PTY contention (T1's shared writer + T9's ack pacing), admin-as-owner note (docs T11). §7 verification map → tasks as listed; rehearsal real-git phase T11.
 - Deferred per design (do NOT build): auto-push (P6), App mode, GitLab abstraction, PR API, streaming transfer, per-repo minting.
 - Type consistency check (done): `RPCEnvelope` identical T1/T5/T8; `RepoSpec` identical rwire/driver T6/T7; `Credential` fields T2/T3; event kinds/stage strings T1/T4/T7/T8; named-action strings defined ONCE (vault.go errors) and asserted verbatim in T3/T8/e2e.
 - Placeholder scan (done): none of the banned patterns; canonical-file references name exact existing files.

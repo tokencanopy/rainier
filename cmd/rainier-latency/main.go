@@ -352,7 +352,7 @@ func ensureNameAvailable(ctx context.Context, client *cli.Client, name string, t
 			q.Set("cursor", cursor)
 		}
 		var resp sessionsEnvelope
-		if err := client.DoContext(requestCtx, http.MethodGet, "/v1/sessions?"+q.Encode(), nil, &resp); err != nil {
+		if err := client.DoContext(requestCtx, http.MethodGet, "/v0/sessions?"+q.Encode(), nil, &resp); err != nil {
 			return err
 		}
 		for _, row := range resp.Sessions {
@@ -372,7 +372,7 @@ func waitRunning(ctx context.Context, client *cli.Client, id string, timeout tim
 	defer cancel()
 	for {
 		var resp sessionEnvelope
-		if err := client.DoContext(pollCtx, http.MethodGet, "/v1/sessions/"+id, nil, &resp); err != nil {
+		if err := client.DoContext(pollCtx, http.MethodGet, "/v0/sessions/"+id, nil, &resp); err != nil {
 			if pollCtx.Err() != nil {
 				return time.Time{}, pollCtx.Err()
 			}

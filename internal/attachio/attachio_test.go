@@ -101,9 +101,9 @@ func TestRunDialsWithTheCursor(t *testing.T) {
 		since uint64
 		want  string
 	}{
-		{"resume cursor", func(b string) string { return b + "/v1/sessions/sess_1/attach" }, 7, "since=7"},
-		{"no cursor", func(b string) string { return b + "/v1/sessions/sess_1/attach" }, 0, "since=0"},
-		{"whole log", func(b string) string { return b + "/v1/sessions/sess_1/attach" },
+		{"resume cursor", func(b string) string { return b + "/v0/sessions/sess_1/attach" }, 7, "since=7"},
+		{"no cursor", func(b string) string { return b + "/v0/sessions/sess_1/attach" }, 0, "since=0"},
+		{"whole log", func(b string) string { return b + "/v0/sessions/sess_1/attach" },
 			wire.SinceAll, "since=" + strconv.FormatUint(wire.SinceAll, 10)},
 		// A URL that already carries a query (rattach's --session) must get
 		// the cursor appended, not a second '?' that swallows it.

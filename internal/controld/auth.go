@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	// githubExchangeBodyLimit caps the /v1/auth/github request body; the
+	// githubExchangeBodyLimit caps the /v0/auth/github request body; the
 	// only field it carries is a GitHub access token, so 4KB is generous.
 	githubExchangeBodyLimit = 4 << 10
 	// githubUserBodyLimit caps how much of GitHub's /user response we will
@@ -67,8 +67,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 // userView is the client-facing rendering of a User: who the caller is and
 // what they may do. Never the GitHub id, and never anyone else's identity —
-// this view renders only the authenticated caller, on POST /v1/auth/github
-// and GET /v1/me.
+// this view renders only the authenticated caller, on POST /v0/auth/github
+// and GET /v0/me.
 //
 // ID is controld's own user id. It is the same value every session row
 // already carries as owner_id, so publishing it here reveals nothing new; it
@@ -87,7 +87,7 @@ func userJSON(u User) userView {
 	return userView{ID: u.ID, Login: u.Login, Role: u.Role}
 }
 
-// authResponse is the body of a successful POST /v1/auth/github. Token is
+// authResponse is the body of a successful POST /v0/auth/github. Token is
 // controld's own opaque bearer — never the GitHub token, which this API
 // takes in and never gives back.
 //
@@ -101,7 +101,7 @@ type authResponse struct {
 	Warning string   `json:"warning,omitempty"`
 }
 
-// meResponse is the body of a successful GET /v1/me.
+// meResponse is the body of a successful GET /v0/me.
 type meResponse struct {
 	User userView `json:"user"`
 }
@@ -133,10 +133,10 @@ func (s *Server) roleFor(login string) (role string, ok bool) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/auth/github
+// POST /v0/auth/github
 // ---------------------------------------------------------------------------
 
-// githubAuthRequest is the decoded body of POST /v1/auth/github.
+// githubAuthRequest is the decoded body of POST /v0/auth/github.
 type githubAuthRequest struct {
 	AccessToken string `json:"access_token"`
 }
@@ -166,7 +166,7 @@ const githubScopesHeader = "X-OAuth-Scopes"
 // here.
 const gitScope = "repo"
 
-// githubRepoScopeWarning is the exact text POST /v1/auth/github returns (and
+// githubRepoScopeWarning is the exact text POST /v0/auth/github returns (and
 // the CLI prints) when the presented token has no `repo` scope. The login
 // still succeeds and the credential is still stored: the token is a perfectly
 // good identity, it just can't do git yet, and saying so at login beats an
@@ -191,7 +191,7 @@ func hasGitScope(scopes string) bool {
 	return false
 }
 
-// handleGitHubAuth serves POST /v1/auth/github: the one unauthenticated
+// handleGitHubAuth serves POST /v0/auth/github: the one unauthenticated
 // endpoint on this API by design. It exchanges a caller-supplied GitHub
 // access token for controld's own opaque bearer token, gated by the
 // configured admin/member allowlists.
@@ -327,7 +327,7 @@ func (s *Server) fetchGitHubUser(ctx context.Context, token string) (githubUser,
 }
 
 // ---------------------------------------------------------------------------
-// bearer middleware + GET /v1/me
+// bearer middleware + GET /v0/me
 // ---------------------------------------------------------------------------
 
 // requireUser wraps next behind bearer authentication: it parses
@@ -380,7 +380,7 @@ func (s *Server) requireAdmin(next func(http.ResponseWriter, *http.Request, User
 	})
 }
 
-// handleMe serves GET /v1/me: the caller's own id, login and role — the one
+// handleMe serves GET /v0/me: the caller's own id, login and role — the one
 // route that answers "who am I" for a client holding nothing but a token.
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, u User) {
 	writeJSON(w, http.StatusOK, meResponse{User: userJSON(u)})

@@ -62,7 +62,7 @@ func pushLimited(c *Client, sessionID, localDir, remotePath string, progress fun
 	// push from any other, and what makes a re-sent chunk recognizable as a
 	// repeat rather than as a new transfer.
 	id := RandHex(headerIDBytes)
-	path := "/v1/sessions/" + sessionID + "/files"
+	path := "/v0/sessions/" + sessionID + "/files"
 	buf := make([]byte, xfer.ChunkBytes)
 
 	var sent int64
@@ -132,7 +132,7 @@ func pullLimited(c *Client, sessionID, remotePath, localDir string, progress fun
 	if err := xfer.ValidatePath(remotePath); err != nil {
 		return fmt.Errorf("source: %w", err)
 	}
-	path := "/v1/sessions/" + sessionID + "/files?path=" + url.QueryEscape(remotePath)
+	path := "/v0/sessions/" + sessionID + "/files?path=" + url.QueryEscape(remotePath)
 	body, err := c.Open(http.MethodGet, path)
 	if err != nil {
 		return err

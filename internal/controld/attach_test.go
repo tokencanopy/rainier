@@ -75,7 +75,7 @@ func dialAttach(t *testing.T, ts *httptest.Server, id, query, token string) (*we
 	if token != "" {
 		hdr.Set("Authorization", "Bearer "+token)
 	}
-	return websocket.Dial(ctx, wsBase(ts)+"/v1/sessions/"+id+"/attach"+query,
+	return websocket.Dial(ctx, wsBase(ts)+"/v0/sessions/"+id+"/attach"+query,
 		&websocket.DialOptions{HTTPHeader: hdr})
 }
 
@@ -89,7 +89,7 @@ func dialAttachBack(t *testing.T, ts *httptest.Server, attachID, token string) (
 	if token != "" {
 		hdr.Set("Authorization", "Bearer "+token)
 	}
-	return websocket.Dial(ctx, wsBase(ts)+"/v1/runners/attach-back?attach_id="+attachID,
+	return websocket.Dial(ctx, wsBase(ts)+"/v0/runners/attach-back?attach_id="+attachID,
 		&websocket.DialOptions{HTTPHeader: hdr})
 }
 
@@ -801,7 +801,7 @@ func TestPairingTTL(t *testing.T) {
 	if at.Since != 3 || at.Cols != 100 || at.Rows != 30 {
 		t.Fatalf("attach = since:%d cols:%d rows:%d, want since:3 cols:100 rows:30", at.Since, at.Cols, at.Rows)
 	}
-	want := wsBase(ts) + "/v1/runners/attach-back?attach_id=" + at.AttachID
+	want := wsBase(ts) + "/v0/runners/attach-back?attach_id=" + at.AttachID
 	if at.TargetURL != want {
 		t.Fatalf("target_url = %q, want %q", at.TargetURL, want)
 	}

@@ -72,11 +72,11 @@ func TestReadSecretFromStdin(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // resolveSessionID — review round 1, finding 3: names are unique only
-// per-owner, but GET /v1/sessions is team-visible, so two teammates can
+// per-owner, but GET /v0/sessions is team-visible, so two teammates can
 // share a name.
 // ---------------------------------------------------------------------------
 
-// pagedSessions serves GET /v1/sessions from a fixed set of pages, keyed by
+// pagedSessions serves GET /v0/sessions from a fixed set of pages, keyed by
 // the "cursor" query param ("" for the first page). Every test in this file
 // uses it so the fixture stays in one place.
 func pagedSessions(t *testing.T, pages map[string]sessionsEnvelope) *httptest.Server {
@@ -255,7 +255,7 @@ func TestRmResolvesALoneFailedSessionByName(t *testing.T) {
 			json.NewEncoder(w).Encode(sessionsEnvelope{Sessions: []session{{
 				ID: "sess_failed", Name: "broken", OwnerID: "usr_alice", State: "failed",
 			}}})
-		case r.Method == http.MethodDelete && r.URL.Path == "/v1/sessions/sess_failed":
+		case r.Method == http.MethodDelete && r.URL.Path == "/v0/sessions/sess_failed":
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			json.NewEncoder(w).Encode(sessionsEnvelope{})
@@ -275,7 +275,7 @@ func TestRmResolvesALoneFailedSessionByName(t *testing.T) {
 	if !strings.Contains(out, "removed sess_failed") {
 		t.Fatalf("rm output = %q, want removed sess_failed", out)
 	}
-	if len(paths) != 2 || paths[0] != "/v1/sessions?all=true&name=broken" || paths[1] != "/v1/sessions/sess_failed" {
+	if len(paths) != 2 || paths[0] != "/v0/sessions?all=true&name=broken" || paths[1] != "/v0/sessions/sess_failed" {
 		t.Fatalf("requests = %v, want terminal lookup then delete", paths)
 	}
 }
@@ -307,7 +307,7 @@ func TestRmNamePrefersAnActiveSessionOverTerminalHistory(t *testing.T) {
 	if _, err := captureStdout(t, func() error { return runRm([]string{"box"}) }); err != nil {
 		t.Fatalf("rm current session by reused name: %v", err)
 	}
-	if deleted != "/v1/sessions/sess_current" {
+	if deleted != "/v0/sessions/sess_current" {
 		t.Fatalf("deleted %q, want the active session", deleted)
 	}
 }
@@ -340,7 +340,7 @@ func TestRmNamePrefersMyTerminalSessionOverATeammatesActiveSession(t *testing.T)
 	if _, err := captureStdout(t, func() error { return runRm([]string{"shared"}) }); err != nil {
 		t.Fatalf("rm my failed session by shared name: %v", err)
 	}
-	if deleted != "/v1/sessions/sess_mine" {
+	if deleted != "/v0/sessions/sess_mine" {
 		t.Fatalf("deleted %q, want my terminal session", deleted)
 	}
 }
@@ -408,7 +408,7 @@ func TestLsHintsWhenFailedSessionsAreHidden(t *testing.T) {
 	if !strings.Contains(out, "rainier ls --all") {
 		t.Fatalf("ls output = %q, want a --all hint", out)
 	}
-	if len(paths) != 2 || paths[0] != "/v1/sessions" || paths[1] != "/v1/sessions?all=true&limit=1&state=failed" {
+	if len(paths) != 2 || paths[0] != "/v0/sessions" || paths[1] != "/v0/sessions?all=true&limit=1&state=failed" {
 		t.Fatalf("requests = %v, want default list then bounded failed-session probe", paths)
 	}
 }
@@ -927,7 +927,7 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 	return out, runErr
 }
 
-// credsServer serves GET /v1/credentials with the given body and records the
+// credsServer serves GET /v0/credentials with the given body and records the
 // path it was asked for.
 func credsServer(t *testing.T, body string) (*httptest.Server, *string) {
 	t.Helper()
@@ -957,8 +957,8 @@ func TestCredsRendersTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("creds: %v", err)
 	}
-	if *gotPath != "/v1/credentials" {
-		t.Errorf("requested %q, want /v1/credentials", *gotPath)
+	if *gotPath != "/v0/credentials" {
+		t.Errorf("requested %q, want /v0/credentials", *gotPath)
 	}
 	for _, want := range []string{"PROVIDER", "STATUS", "SCOPES", "LAST_VERIFIED", "LAST_USED", "github", "needs_refresh", "repo, read:user"} {
 		if !strings.Contains(out, want) {
@@ -1046,7 +1046,7 @@ func TestLoginRefreshPostsTheExchangeAndPrintsTheWarning(t *testing.T) {
 
 // TestLoginStoresTheOwnerID pins where owner-preference now gets its answer:
 // controld returns the caller's own id with the exchange (the same identity
-// GET /v1/me serves), and login caches it, so the very next command can tell
+// GET /v0/me serves), and login caches it, so the very next command can tell
 // this user's sessions from a teammate's. It used to come only from a `new`
 // response, which meant a fresh login could not break an ambiguous name at
 // all until a session had been created with this CLI.
@@ -1198,9 +1198,9 @@ func TestPrepareAttach(t *testing.T) {
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				switch {
-				case r.Method == http.MethodGet && r.URL.Path == "/v1/sessions/sess_attach":
+				case r.Method == http.MethodGet && r.URL.Path == "/v0/sessions/sess_attach":
 					json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: state}})
-				case r.Method == http.MethodPost && r.URL.Path == "/v1/sessions/sess_attach/resume":
+				case r.Method == http.MethodPost && r.URL.Path == "/v0/sessions/sess_attach/resume":
 					resumes++
 					json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: "running"}})
 				default:
@@ -1224,9 +1224,9 @@ func TestPrepareAttach(t *testing.T) {
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				switch {
-				case r.Method == http.MethodGet && r.URL.Path == "/v1/sessions/sess_attach":
+				case r.Method == http.MethodGet && r.URL.Path == "/v0/sessions/sess_attach":
 					json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: state}})
-				case r.Method == http.MethodPost && r.URL.Path == "/v1/sessions/sess_attach/resume":
+				case r.Method == http.MethodPost && r.URL.Path == "/v0/sessions/sess_attach/resume":
 					resumes++
 					json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: "running"}})
 				default:
