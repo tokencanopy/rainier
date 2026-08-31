@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tokencanopy/rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // runnerView is one connected runner's placement-relevant state: just
@@ -243,19 +243,19 @@ func (s *Server) freeCapacity(ctx context.Context) ([]runnerView, error) {
 // The caller's own ctx being canceled (process shutdown) is left alone for
 // the same reason — the row stays `creating` and the next announce
 // reconciles it.
-func (s *Server) dispatchCreate(ctx context.Context, row Session, runner string, env *Environment) {
+func (s *Server) dispatchCreate(ctx context.Context, row Session, runnerName string, env *Environment) {
 	spec, fail := s.createSpec(ctx, row, env)
 	if fail != "" {
 		// Nothing was sent, so there is no container anywhere to reconcile
 		// against: the session is simply not startable as described.
-		log.Printf("controld: create %s on %s: %s", row.ID, runner, fail)
+		log.Printf("controld: create %s on %s: %s", row.ID, runnerName, fail)
 		s.failCreate(ctx, row.ID, fail)
 		return
 	}
 	if !s.pinSetupHash(ctx, row, spec) {
 		return
 	}
-	res, err := s.dispatch(ctx, runner, rwire.ToRunner{
+	res, err := s.dispatch(ctx, runnerName, runner.ToRunner{
 		Type:    "create",
 		Session: row.ID,
 		Spec:    spec,
@@ -263,13 +263,13 @@ func (s *Server) dispatchCreate(ctx context.Context, row Session, runner string,
 	switch {
 	case errors.Is(err, ErrDispatchTimeout):
 		log.Printf("controld: create %s on %s: no result before the op timeout; leaving it creating for the runner's event or next announce to settle: %v",
-			row.ID, runner, err)
+			row.ID, runnerName, err)
 	case errors.Is(err, ErrRunnerUnreachable):
 		none := ""
 		s.transitionQuiet(ctx, row.ID, []SessionState{StateCreating}, StateQueued, TransitionOpts{Runner: &none})
 		s.wakeScheduler()
 	case err != nil:
-		log.Printf("controld: dispatch create %s to %s: %v", row.ID, runner, err)
+		log.Printf("controld: dispatch create %s to %s: %v", row.ID, runnerName, err)
 	case !res.OK:
 		s.failCreate(ctx, row.ID, res.Detail)
 	}
@@ -292,7 +292,7 @@ func (s *Server) dispatchCreate(ctx context.Context, row Session, runner string,
 // dispatching anyway: a container whose provenance cannot be recorded must not
 // be allowed to run a cacheable setup, and failing loudly costs one session
 // where guessing would cost the environment.
-func (s *Server) pinSetupHash(ctx context.Context, row Session, spec *rwire.Spec) bool {
+func (s *Server) pinSetupHash(ctx context.Context, row Session, spec *runner.Spec) bool {
 	if spec.Setup == "" {
 		return true
 	}
@@ -326,8 +326,8 @@ func (s *Server) failCreate(ctx context.Context, id, reason string) {
 // everything that can go wrong here fails the session and the text lands in
 // the row's error column, which the API hands straight back to the caller.
 // Internal detail is logged instead, and a secret VALUE appears in neither.
-func (s *Server) createSpec(ctx context.Context, row Session, env *Environment) (*rwire.Spec, string) {
-	spec := &rwire.Spec{
+func (s *Server) createSpec(ctx context.Context, row Session, env *Environment) (*runner.Spec, string) {
+	spec := &runner.Spec{
 		Name:        row.Name,
 		Image:       row.effectiveImage(),
 		Cmd:         row.Cmd,
@@ -451,7 +451,7 @@ func sessionRepoRefs(row Session, env *Environment) ([]RepoRef, error) {
 // allowlist was written without (dispatch reads the environment as it stands
 // now, design §4.6). A clone the control plane just ordered must not be one
 // its own proxy refuses.
-func (s *Server) applyRepos(ctx context.Context, row Session, env *Environment, spec *rwire.Spec) string {
+func (s *Server) applyRepos(ctx context.Context, row Session, env *Environment, spec *runner.Spec) string {
 	refs, err := sessionRepoRefs(row, env)
 	if err != nil {
 		log.Printf("controld: create %s: resolving the repositories of environment %s: %v", row.ID, envID(env), err)
@@ -490,20 +490,20 @@ func noreplyEmail(u User) string {
 // expandRepos turns refs into the clone instructions a sandbox executes,
 // resolving the two names a repository reference does not carry: the branch
 // the session works on, and the directory it lands in.
-func expandRepos(row Session, refs []RepoRef) []rwire.RepoSpec {
+func expandRepos(row Session, refs []RepoRef) []runner.RepoSpec {
 	if len(refs) == 0 {
 		return nil
 	}
 	branch := sessionBranch(row)
 	dirs := make(map[string]bool, len(refs))
-	out := make([]rwire.RepoSpec, 0, len(refs))
+	out := make([]runner.RepoSpec, 0, len(refs))
 	for _, ref := range refs {
 		owner, name, _ := strings.Cut(ref.Repo, "/")
 		base := ref.BaseBranch
 		if base == "" {
 			base = defaultBaseBranch
 		}
-		out = append(out, rwire.RepoSpec{
+		out = append(out, runner.RepoSpec{
 			Owner: owner, Name: name, BaseBranch: base,
 			SessionBranch: branch,
 			Dir:           uniqueDir(dirs, owner, name),

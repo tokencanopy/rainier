@@ -19,7 +19,7 @@ import (
 	"github.com/creack/pty"
 	"golang.org/x/sys/unix"
 
-	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 // TestAttachURL is moved from cmd/rattach/main_test.go's TestAttachURL
@@ -70,16 +70,16 @@ func TestCursor(t *testing.T) {
 	if got := Cursor(false, 0); got != 0 {
 		t.Errorf("Cursor(not given) = %d, want 0 (no cursor: snapshot then live)", got)
 	}
-	if got := Cursor(true, 0); got != wire.SinceAll {
-		t.Errorf("Cursor(--since 0) = %d, want wire.SinceAll (%d)", got, wire.SinceAll)
+	if got := Cursor(true, 0); got != terminal.SinceAll {
+		t.Errorf("Cursor(--since 0) = %d, want terminal.SinceAll (%d)", got, terminal.SinceAll)
 	}
 	if got := Cursor(true, 19); got != 19 {
 		t.Errorf("Cursor(--since 19) = %d, want 19", got)
 	}
 	// A flag value that happens to equal the sentinel is still the sentinel;
 	// there is no cursor above it to confuse it with.
-	if got := Cursor(true, wire.SinceAll); got != wire.SinceAll {
-		t.Errorf("Cursor(--since SinceAll) = %d, want %d", got, wire.SinceAll)
+	if got := Cursor(true, terminal.SinceAll); got != terminal.SinceAll {
+		t.Errorf("Cursor(--since SinceAll) = %d, want %d", got, terminal.SinceAll)
 	}
 }
 
@@ -104,7 +104,7 @@ func TestRunDialsWithTheCursor(t *testing.T) {
 		{"resume cursor", func(b string) string { return b + "/v0/sessions/sess_1/attach" }, 7, "since=7"},
 		{"no cursor", func(b string) string { return b + "/v0/sessions/sess_1/attach" }, 0, "since=0"},
 		{"whole log", func(b string) string { return b + "/v0/sessions/sess_1/attach" },
-			wire.SinceAll, "since=" + strconv.FormatUint(wire.SinceAll, 10)},
+			terminal.SinceAll, "since=" + strconv.FormatUint(terminal.SinceAll, 10)},
 		// A URL that already carries a query (rattach's --session) must get
 		// the cursor appended, not a second '?' that swallows it.
 		{"url already has a query", func(b string) string { return b + "/attach?session=sess-7" }, 3, "since=3"},
@@ -194,7 +194,7 @@ func TestRunNoRaceOnFloodedOutputDuringDetach(t *testing.T) {
 		ctx := r.Context()
 
 		// The resize-first contract's required first message.
-		var first wire.ClientMsg
+		var first terminal.ClientMessage
 		if err := wsjson.Read(ctx, c, &first); err != nil {
 			return
 		}
@@ -206,7 +206,7 @@ func TestRunNoRaceOnFloodedOutputDuringDetach(t *testing.T) {
 		go func() {
 			defer close(stop)
 			for {
-				var m wire.ClientMsg
+				var m terminal.ClientMessage
 				if err := wsjson.Read(ctx, c, &m); err != nil {
 					return
 				}
@@ -222,7 +222,7 @@ func TestRunNoRaceOnFloodedOutputDuringDetach(t *testing.T) {
 				return
 			default:
 			}
-			if err := wsjson.Write(ctx, c, wire.ServerMsg{Type: "output", Seq: seq, Data: []byte("x")}); err != nil {
+			if err := wsjson.Write(ctx, c, terminal.ServerMessage{Type: "output", Seq: seq, Data: []byte("x")}); err != nil {
 				return
 			}
 		}
@@ -384,11 +384,11 @@ func TestRunReportsDisconnectCursor(t *testing.T) {
 			return
 		}
 		defer c.CloseNow()
-		var first wire.ClientMsg
+		var first terminal.ClientMessage
 		if err := wsjson.Read(r.Context(), c, &first); err != nil {
 			return
 		}
-		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "snapshot", Seq: 17, Data: []byte("ready")})
+		wsjson.Write(r.Context(), c, terminal.ServerMessage{Type: "snapshot", Seq: 17, Data: []byte("ready")})
 		c.Close(websocket.StatusGoingAway, "synthetic network interruption")
 	}))
 	defer ts.Close()
@@ -430,7 +430,7 @@ func TestRunReportsDisconnectCursor(t *testing.T) {
 			return
 		}
 		defer c.CloseNow()
-		var first wire.ClientMsg
+		var first terminal.ClientMessage
 		if err := wsjson.Read(r.Context(), c, &first); err != nil {
 			return
 		}
@@ -451,11 +451,11 @@ func TestRunReportsDisconnectCursor(t *testing.T) {
 			return
 		}
 		defer c.CloseNow()
-		var first wire.ClientMsg
+		var first terminal.ClientMessage
 		if err := wsjson.Read(r.Context(), c, &first); err != nil {
 			return
 		}
-		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "exit", ExitCode: 7})
+		wsjson.Write(r.Context(), c, terminal.ServerMessage{Type: "exit", ExitCode: 7})
 	}))
 	defer exitServer.Close()
 	outcome, err = Run(context.Background(), "ws"+strings.TrimPrefix(exitServer.URL, "http")+"/attach", nil, 23)
@@ -477,7 +477,7 @@ func TestRunPreservesSinceAllBeforeFirstFrame(t *testing.T) {
 			return
 		}
 		defer c.CloseNow()
-		var first wire.ClientMsg
+		var first terminal.ClientMessage
 		if err := wsjson.Read(r.Context(), c, &first); err != nil {
 			return
 		}
@@ -491,11 +491,11 @@ func TestRunPreservesSinceAllBeforeFirstFrame(t *testing.T) {
 	}
 	defer stdinR.Close()
 	defer stdinW.Close()
-	outcome, err := runWithIO(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, wire.SinceAll, stdinR, io.Discard)
+	outcome, err := runWithIO(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, terminal.SinceAll, stdinR, io.Discard)
 	if err != nil {
 		t.Fatalf("runWithIO: %v", err)
 	}
-	if outcome.Reason != Disconnected || outcome.LastSeq != wire.SinceAll {
+	if outcome.Reason != Disconnected || outcome.LastSeq != terminal.SinceAll {
 		t.Fatalf("outcome = %+v, want disconnected at SinceAll", outcome)
 	}
 }
@@ -507,7 +507,7 @@ func TestRunRejectsPermanentWebSocketClose(t *testing.T) {
 			return
 		}
 		defer c.CloseNow()
-		var first wire.ClientMsg
+		var first terminal.ClientMessage
 		if err := wsjson.Read(r.Context(), c, &first); err != nil {
 			return
 		}
@@ -542,11 +542,11 @@ func TestRunRejectsUnknownServerMessage(t *testing.T) {
 			return
 		}
 		defer c.CloseNow()
-		var first wire.ClientMsg
+		var first terminal.ClientMessage
 		if err := wsjson.Read(r.Context(), c, &first); err != nil {
 			return
 		}
-		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "synthetic-unknown"})
+		wsjson.Write(r.Context(), c, terminal.ServerMessage{Type: "synthetic-unknown"})
 		<-r.Context().Done()
 	}))
 	defer ts.Close()
@@ -571,11 +571,11 @@ func TestRunDoesNotAdvanceCursorAfterShortOutputWrite(t *testing.T) {
 			return
 		}
 		defer c.CloseNow()
-		var first wire.ClientMsg
+		var first terminal.ClientMessage
 		if err := wsjson.Read(r.Context(), c, &first); err != nil {
 			return
 		}
-		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "output", Seq: 17, Data: []byte("render-me")})
+		wsjson.Write(r.Context(), c, terminal.ServerMessage{Type: "output", Seq: 17, Data: []byte("render-me")})
 		<-r.Context().Done()
 	}))
 	defer ts.Close()
@@ -651,16 +651,16 @@ func TestRunDiscardsTTYInputQueuedDuringDial(t *testing.T) {
 			return
 		}
 		defer c.CloseNow()
-		var resize wire.ClientMsg
+		var resize terminal.ClientMessage
 		if err := wsjson.Read(r.Context(), c, &resize); err != nil {
 			return
 		}
 		readCtx, cancel := context.WithTimeout(r.Context(), 150*time.Millisecond)
 		defer cancel()
-		var next wire.ClientMsg
+		var next terminal.ClientMessage
 		err = wsjson.Read(readCtx, c, &next)
 		receivedInput <- err == nil && next.Type == "stdin" && len(next.Data) > 0
-		wsjson.Write(r.Context(), c, wire.ServerMsg{Type: "exit", ExitCode: 0})
+		wsjson.Write(r.Context(), c, terminal.ServerMessage{Type: "exit", ExitCode: 0})
 	}))
 	defer ts.Close()
 

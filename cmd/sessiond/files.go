@@ -13,13 +13,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 // This file is the sandbox end of the workspace-inspection RPCs: the session
 // diff, and the bounded push/pull file transfer. controld drives all three
 // from the outside (internal/controld/api.go); the shapes on the wire belong
-// to internal/xfer, which both ends import so there is one definition of each.
+// to protocol/workspace, which both ends import so there is one definition of each.
 //
 // Everything here runs on the RPC dispatcher's per-frame goroutines (rpc.go),
 // which means three things it would be easy to forget:
@@ -52,14 +52,14 @@ func registerFileHandlers(rpc *rpcDispatcher, env bootEnv) {
 	if env.git() {
 		gitConfig = setupDir + "/" + gitConfigName
 	}
-	rpc.RegisterRPCHandler(xfer.MethodDiff, newDiffer(workspaceRoot, repos, err, gitConfig).handle)
+	rpc.RegisterRPCHandler(workspace.MethodDiff, newDiffer(workspaceRoot, repos, err, gitConfig).handle)
 
 	// One table for the whole process: transfers are keyed by the id their
 	// client chose, and they have to outlive the single request that started
 	// them (that is what makes chunking work at all).
 	ft := newFileTransfers(workspaceRoot, prepareTransferStaging(transferStagingDir))
-	rpc.RegisterRPCHandler(xfer.MethodPushFiles, ft.handlePush)
-	rpc.RegisterRPCHandler(xfer.MethodPullFiles, ft.handlePull)
+	rpc.RegisterRPCHandler(workspace.MethodPushFiles, ft.handlePush)
+	rpc.RegisterRPCHandler(workspace.MethodPullFiles, ft.handlePull)
 }
 
 // sessionRepos decodes the repository list, treating an ABSENT variable as no
@@ -126,7 +126,7 @@ func newDiffer(root string, repos []repoSpec, reposErr error, gitConfig string) 
 		gitConfig: gitConfig,
 		timeout:   diffTimeoutPerRepo,
 		waitDelay: diffWaitDelay,
-		statCap:   xfer.StatBytes,
+		statCap:   workspace.StatBytes,
 	}
 }
 
@@ -137,13 +137,13 @@ func (d *differ) handle([]byte) (any, error) {
 	if d.reposErr != nil {
 		return nil, fmt.Errorf("this session's repository list could not be read: %w", d.reposErr)
 	}
-	out := xfer.DiffAnswer{Repos: make([]xfer.RepoDiff, 0, len(d.repos))}
+	out := workspace.DiffAnswer{Repos: make([]workspace.RepoDiff, 0, len(d.repos))}
 	for _, r := range d.repos {
 		stat, err := d.repoStat(r)
 		if err != nil {
 			return nil, err
 		}
-		out.Repos = append(out.Repos, xfer.RepoDiff{
+		out.Repos = append(out.Repos, workspace.RepoDiff{
 			Repo:          r.Owner + "/" + r.Name,
 			BaseBranch:    r.BaseBranch,
 			SessionBranch: r.SessionBranch,
@@ -277,7 +277,7 @@ const transferIdleTTL = 15 * time.Minute
 // It is on the WORKSPACE VOLUME, not in /tmp, and the difference is host RAM.
 // The driver mounts the container's /tmp as a tmpfs with no size option
 // (internal/driver/docker.go), so an archive staged there is resident memory —
-// up to xfer.MaxBytes (256MiB) per direction per session, on a runner already
+// up to workspace.MaxBytes (256MiB) per direction per session, on a runner already
 // hosting N of them, with no container memory limit above it. On the volume it
 // is ordinary disk, bounded by the disk, and `docker commit` excludes volumes
 // so nothing staged here can reach a cached environment image either.
@@ -316,7 +316,7 @@ func prepareTransferStaging(dir string) string {
 //
 // The staging file is why a transfer has state at all. A push is assembled
 // whole before ANY of it is extracted (a tar is only safe to trust once its
-// last entry has been read — see xfer.UntarGz), and a pull is tarred once and
+// last entry has been read — see workspace.UntarGz), and a pull is tarred once and
 // then served by offset, so the bytes a client reassembles are one consistent
 // snapshot rather than a directory read live underneath it.
 type fileTransfers struct {
@@ -333,7 +333,7 @@ func newFileTransfers(root, tmp string) *fileTransfers {
 	return &fileTransfers{
 		root:   root,
 		tmp:    tmp,
-		max:    xfer.MaxBytes,
+		max:    workspace.MaxBytes,
 		pushes: map[string]*pushXfer{},
 		pulls:  map[string]*pullXfer{},
 	}
@@ -370,18 +370,18 @@ type pullXfer struct {
 // pairing and dial-back for a bidirectional byte stream, and a transfer would
 // ride it as one more attachment rather than as a request per megabyte.
 func (t *fileTransfers) handlePush(payload []byte) (any, error) {
-	var c xfer.PushChunk
+	var c workspace.PushChunk
 	if err := json.Unmarshal(payload, &c); err != nil {
 		return nil, fmt.Errorf("reading the push chunk: %w", err)
 	}
 	if c.Xfer == "" {
 		return nil, errors.New("the push chunk names no transfer")
 	}
-	if len(c.Data) > xfer.ChunkBytes {
+	if len(c.Data) > workspace.ChunkBytes {
 		return nil, fmt.Errorf("push chunk %d is %s; the limit is %s",
-			c.Seq, xfer.HumanBytes(int64(len(c.Data))), xfer.HumanBytes(xfer.ChunkBytes))
+			c.Seq, workspace.HumanBytes(int64(len(c.Data))), workspace.HumanBytes(workspace.ChunkBytes))
 	}
-	dest, err := xfer.Resolve(t.root, c.Path)
+	dest, err := workspace.Resolve(t.root, c.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -416,14 +416,14 @@ func (t *fileTransfers) handlePush(payload []byte) (any, error) {
 		// The chunk just accepted, sent again: the ack was lost, not the data.
 		// Re-ack without appending — the alternative is a transfer that can
 		// never recover from one dropped response.
-		return xfer.PushAck{Seq: c.Seq}, nil
+		return workspace.PushAck{Seq: c.Seq}, nil
 	case c.Seq != x.next:
 		t.abandonPush(c.Xfer, x)
 		return nil, fmt.Errorf("push chunk %d arrived out of order; expected %d", c.Seq, x.next)
 	}
 	if x.bytes+int64(len(c.Data)) > t.max {
 		t.abandonPush(c.Xfer, x)
-		return nil, fmt.Errorf("the push is larger than the %s transfer limit", xfer.HumanBytes(t.max))
+		return nil, fmt.Errorf("the push is larger than the %s transfer limit", workspace.HumanBytes(t.max))
 	}
 	if _, err := x.f.Write(c.Data); err != nil {
 		t.abandonPush(c.Xfer, x)
@@ -435,7 +435,7 @@ func (t *fileTransfers) handlePush(payload []byte) (any, error) {
 	// fsync every SyncEvery chunks and on the last one, and say so in the ack:
 	// that flag is the only durability claim this protocol makes, so it has to
 	// be made after the data is actually on the disk rather than before.
-	synced := c.Done || x.next%xfer.SyncEvery == 0
+	synced := c.Done || x.next%workspace.SyncEvery == 0
 	if synced {
 		if err := x.f.Sync(); err != nil {
 			t.abandonPush(c.Xfer, x)
@@ -443,7 +443,7 @@ func (t *fileTransfers) handlePush(payload []byte) (any, error) {
 		}
 	}
 	if !c.Done {
-		return xfer.PushAck{Seq: c.Seq, Synced: synced}, nil
+		return workspace.PushAck{Seq: c.Seq, Synced: synced}, nil
 	}
 
 	// The last chunk. Everything from here removes the staging file whatever
@@ -454,17 +454,17 @@ func (t *fileTransfers) handlePush(payload []byte) (any, error) {
 		return nil, fmt.Errorf("staging the push: %w", err)
 	}
 	x.f = nil
-	if err := xfer.UntarGz(x.staging, x.dest, xfer.MaxExtractBytes); err != nil {
+	if err := workspace.UntarGz(x.staging, x.dest, workspace.MaxExtractBytes); err != nil {
 		return nil, fmt.Errorf("unpacking into %s: %w", x.path, err)
 	}
-	return xfer.PushAck{Seq: c.Seq, Synced: true}, nil
+	return workspace.PushAck{Seq: c.Seq, Synced: true}, nil
 }
 
 // handlePull serves one pull_files chunk. Seq 0 makes the archive; every
 // sequence number after it is an offset into that file, which is what lets a
 // chunk whose response was lost simply be asked for again.
 func (t *fileTransfers) handlePull(payload []byte) (any, error) {
-	var req xfer.PullRequest
+	var req workspace.PullRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return nil, fmt.Errorf("reading the pull request: %w", err)
 	}
@@ -474,7 +474,7 @@ func (t *fileTransfers) handlePull(payload []byte) (any, error) {
 	if req.Seq < 0 {
 		return nil, fmt.Errorf("pull chunk %d is not a sequence number", req.Seq)
 	}
-	src, err := xfer.Resolve(t.root, req.Path)
+	src, err := workspace.Resolve(t.root, req.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -499,12 +499,12 @@ func (t *fileTransfers) handlePull(payload []byte) (any, error) {
 	}
 	x.touched = time.Now()
 
-	off := int64(req.Seq) * xfer.ChunkBytes
+	off := int64(req.Seq) * workspace.ChunkBytes
 	if off > x.size {
 		t.abandonPull(req.Xfer, x)
 		return nil, fmt.Errorf("pull chunk %d is past the end of the archive", req.Seq)
 	}
-	buf := make([]byte, min(int64(xfer.ChunkBytes), x.size-off))
+	buf := make([]byte, min(int64(workspace.ChunkBytes), x.size-off))
 	if _, err := x.f.ReadAt(buf, off); err != nil && err != io.EOF {
 		t.abandonPull(req.Xfer, x)
 		return nil, fmt.Errorf("reading the staged archive: %w", err)
@@ -513,7 +513,7 @@ func (t *fileTransfers) handlePull(payload []byte) (any, error) {
 	if done {
 		t.abandonPull(req.Xfer, x)
 	}
-	return xfer.PullChunk{Seq: req.Seq, Data: buf, Done: done}, nil
+	return workspace.PullChunk{Seq: req.Seq, Data: buf, Done: done}, nil
 }
 
 // stagePull tars src into a staging file. Called with the table locked: the
@@ -531,7 +531,7 @@ func (t *fileTransfers) stagePull(path, src string) (*pullXfer, error) {
 		return nil, fmt.Errorf("staging the pull: %w", err)
 	}
 	x := &pullXfer{path: path, staging: f.Name(), f: f, touched: time.Now()}
-	n, err := xfer.TarGz(f, src, t.max)
+	n, err := workspace.TarGz(f, src, t.max)
 	if err != nil {
 		t.closePull(x)
 		return nil, fmt.Errorf("archiving %s: %w", path, err)

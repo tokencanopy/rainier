@@ -20,8 +20,8 @@ import (
 
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/relay"
-	"github.com/tokencanopy/rainier/internal/rwire"
-	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 type Server struct {
@@ -80,7 +80,7 @@ type Server struct {
 	// unconfigured one: an HTTP-only runner, or one whose controld connection
 	// is down, has nowhere to forward a request to — see routeControl, which
 	// answers the sandbox itself rather than leaving it waiting.
-	onSessionRPC atomic.Pointer[func(sessionID string, env rwire.RPCEnvelope)]
+	onSessionRPC atomic.Pointer[func(sessionID string, env runner.RPCEnvelope)]
 	// hubWait is how long waitHub gives a session to register (see
 	// defaultHubWait, which New sets it to). It is a field rather than a
 	// constant so a test can shorten it — the paths that answer "this session
@@ -117,7 +117,7 @@ func (s *Server) fireEventDetail(sessionID, state, detail string) {
 // SetOnSessionRPC installs f as the sink for session-RPC envelopes coming up
 // out of a sandbox (nil clears it). The agent installs one per controld
 // connection; see the onSessionRPC field.
-func (s *Server) SetOnSessionRPC(f func(sessionID string, env rwire.RPCEnvelope)) {
+func (s *Server) SetOnSessionRPC(f func(sessionID string, env runner.RPCEnvelope)) {
 	if f == nil {
 		s.onSessionRPC.Store(nil)
 		return
@@ -129,7 +129,7 @@ func (s *Server) SetOnSessionRPC(f func(sessionID string, env rwire.RPCEnvelope)
 // anywhere to hand it to. Callers act on false: there is no queue behind this,
 // deliberately — a request nobody can forward is answered here and now, not
 // held for a connection that may be minutes away (see routeControl).
-func (s *Server) fireSessionRPC(sessionID string, env rwire.RPCEnvelope) bool {
+func (s *Server) fireSessionRPC(sessionID string, env runner.RPCEnvelope) bool {
 	p := s.onSessionRPC.Load()
 	if p == nil {
 		return false
@@ -288,7 +288,7 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 //
 // spec's SessionID/DialURL/ProxyURL are set here, not by the caller: they're
 // this server's own concerns (the id parameter, s.dialBase, s.proxyURL), not
-// anything a caller — HTTP body or rwire.Spec — should be trusted to supply.
+// anything a caller — HTTP body or runner.Spec — should be trusted to supply.
 func (s *Server) CreateWithID(ctx context.Context, id string, spec driver.Spec, allow []string) error {
 	// The env KEYS are captured here, at the claim, because this is the last
 	// moment the Spec exists: a snapshot minutes later has to name them so the
@@ -500,7 +500,7 @@ func envKeys(env map[string]string) []string {
 // Op runs suspend/resume against a session's current driver handle. Both
 // fronts (sessionOp's HTTP handler and the agent's execute) drive this same
 // sequence; warm is pre-parsed by the caller (HTTP's `?warm=` query, or the
-// agent's rwire.ToRunner.Warm) since query-string parsing is an HTTP concern
+// agent's runner.ToRunner.Warm) since query-string parsing is an HTTP concern
 // this function has no business knowing about. Snapshot has its own entry
 // point — see OpSnapshot.
 func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
@@ -583,7 +583,7 @@ func (s *Server) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// Announce snapshots the registry in rwire's session-state vocabulary, for
+// Announce snapshots the registry in runner's session-state vocabulary, for
 // the agent's announce message (and reconnect re-announces).
 //
 // "starting" entries are skipped — they're mid-CreateWithID, and that call's
@@ -608,19 +608,19 @@ func (s *Server) Delete(ctx context.Context, id string) error {
 // heals itself on the next announce; only omission does not — so nothing
 // runnerd doesn't know for certain is dead, dead, or gone should ever be
 // omitted here.
-func (s *Server) Announce() []rwire.SessionInfo {
-	var out []rwire.SessionInfo
+func (s *Server) Announce() []runner.SessionInfo {
+	var out []runner.SessionInfo
 	for _, e := range s.reg.list() {
 		state, ok := announceState(e)
 		if !ok {
 			continue
 		}
-		out = append(out, rwire.SessionInfo{ID: e.id, State: state})
+		out = append(out, runner.SessionInfo{ID: e.id, State: state})
 	}
 	return out
 }
 
-// announceState renders one registry entry in rwire's session-state
+// announceState renders one registry entry in runner's session-state
 // vocabulary, reporting false for an entry that must not be announced at all
 // ("starting" — see Announce's doc comment). It takes a value copy, never a
 // live *sessionEntry, because it reads both mutable fields (state, hub); the
@@ -781,7 +781,7 @@ func (s *Server) RemoveWorkspace(ctx context.Context, id string) error {
 // EVENTS are the runner's half of the setup pipeline and the child's exit:
 // sessiond watches the outcome inside the container and reports it here, and
 // controld's orchestration (snapshot the image on success, fail the session on
-// failure, record the exit code) acts on the resulting rwire event.
+// failure, record the exit code) acts on the resulting runner event.
 //
 // SESSION-RPC messages — a request the sandbox originated, or its response to
 // one controld sent down — are forwarded upstream verbatim instead. This runner
@@ -860,7 +860,7 @@ func (s *Server) routeControl(id string, payload []byte) {
 			log.Printf("session %s: control response with no id; dropping", id)
 			return
 		}
-		if !s.fireSessionRPC(id, rwire.RPCEnvelope{ID: ev.ID, Method: "resp", OK: ev.OK, Payload: ev.Payload}) {
+		if !s.fireSessionRPC(id, runner.RPCEnvelope{ID: ev.ID, Method: "resp", OK: ev.OK, Payload: ev.Payload}) {
 			// Nothing to report to and nothing to answer: answering an answer
 			// is meaningless, and whoever asked has already given up (its
 			// pending entry died with the connection this would have gone out
@@ -873,7 +873,7 @@ func (s *Server) routeControl(id string, payload []byte) {
 			log.Printf("session %s: unknown control kind %q", id, ev.Kind)
 			return
 		}
-		if s.fireSessionRPC(id, rwire.RPCEnvelope{ID: ev.ID, Method: method, Payload: ev.Payload}) {
+		if s.fireSessionRPC(id, runner.RPCEnvelope{ID: ev.ID, Method: method, Payload: ev.Payload}) {
 			return
 		}
 		// This runner has no controld connection to forward the request to.
@@ -882,7 +882,7 @@ func (s *Server) routeControl(id string, payload []byte) {
 		// turns a wait for its whole timeout into an immediate, explainable
 		// failure the user can retry.
 		log.Printf("session %s: no controld connection for %q; refusing it locally", id, method)
-		if err := s.sendSessionRPC(id, rwire.RPCEnvelope{ID: ev.ID, Method: "resp",
+		if err := s.sendSessionRPC(id, runner.RPCEnvelope{ID: ev.ID, Method: "resp",
 			Payload: rpcErrorPayload("this runner has no controld connection")}); err != nil {
 			log.Printf("session %s: refusing %q locally: %v", id, method, err)
 		}
@@ -899,7 +899,7 @@ func (s *Server) routeControl(id string, payload []byte) {
 // callers run on a goroutine of their own (one command per goroutine in the
 // agent's execute; one frame per goroutine out of the hub's read loop), so the
 // wait blocks nothing that matters.
-func (s *Server) sendSessionRPC(id string, env rwire.RPCEnvelope) error {
+func (s *Server) sendSessionRPC(id string, env runner.RPCEnvelope) error {
 	ev := relay.ControlEvent{Kind: "req:" + env.Method, ID: env.ID, Payload: env.Payload}
 	if env.Method == "resp" {
 		ev = relay.ControlEvent{Kind: "resp", ID: env.ID, OK: env.OK, Payload: env.Payload}
@@ -931,7 +931,7 @@ func rpcErrorPayload(msg string) json.RawMessage {
 	return b
 }
 
-// setupFailedDetail composes the one string an rwire event has room for out
+// setupFailedDetail composes the one string a runner event has room for out
 // of the two things a setup failure has to say: the script's exit code (-1
 // when it was killed at its timeout) and the tail of what it printed.
 //
@@ -950,7 +950,7 @@ func setupFailedDetail(rc int, tail string) string {
 // stageFailedDetail is the same string for a stage that is not setup, with the
 // stage's name in front of it: "clone: rc 128: fatal: Authentication failed".
 //
-// The stage has to ride in the detail because an rwire event has exactly one
+// The stage has to ride in the detail because a runner event has exactly one
 // free-text field, and it goes FIRST so controld can read it back off the front
 // (split at the first ": ") and compose the sentence it writes into the
 // session's error column — "clone failed: rc 128: …", the same shape the setup
@@ -1007,7 +1007,7 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 	}
 	defer c.CloseNow()
 	c.SetReadLimit(16 << 20)
-	// The client speaks wire.ClientMsg/ServerMsg; the hub forwards raw payloads.
+	// The client speaks terminal.ClientMessage/ServerMsg; the hub forwards raw payloads.
 	// The relay expects the first client frame to be a resize (like Plan 1 serve);
 	// rattach sends it. cols/rows for the FrameOpen come from that first message.
 	first, err := readFirstResize(r.Context(), c)
@@ -1018,7 +1018,7 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 	hub.AttachClient(r.Context(), relay.WSConn(c), since, first.Cols, first.Rows)
 }
 
-// readFirstResize reads exactly one wire.ClientMsg off a freshly attached
+// readFirstResize reads exactly one terminal.ClientMessage off a freshly attached
 // client's websocket and requires it to be a "resize" — mirroring Plan 1's
 // resize-first contract (internal/server/server.go's serve()) so a client
 // relayed through runnerd and one attached directly to sessiond behave
@@ -1030,13 +1030,13 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 // FrameOpen already conveys the size, and re-sending it would double-deliver
 // the same resize. Every resize after this first one flows normally, as a
 // FrameClient carrying a "resize" ClientMsg.
-func readFirstResize(ctx context.Context, c *websocket.Conn) (wire.ClientMsg, error) {
-	var m wire.ClientMsg
+func readFirstResize(ctx context.Context, c *websocket.Conn) (terminal.ClientMessage, error) {
+	var m terminal.ClientMessage
 	if err := wsjson.Read(ctx, c, &m); err != nil {
-		return wire.ClientMsg{}, err
+		return terminal.ClientMessage{}, err
 	}
 	if m.Type != "resize" {
-		return wire.ClientMsg{}, fmt.Errorf("first attach message must be resize, got %q", m.Type)
+		return terminal.ClientMessage{}, fmt.Errorf("first attach message must be resize, got %q", m.Type)
 	}
 	return m, nil
 }

@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/tokencanopy/rainier/internal/rwire"
-	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 // The session RPC is controld's request/response channel to the inside of a
@@ -48,18 +48,18 @@ type srpcTable struct {
 	seq atomic.Uint64
 
 	mu      sync.Mutex
-	pending map[uint64]chan rwire.RPCEnvelope
+	pending map[uint64]chan runner.RPCEnvelope
 }
 
 func newSRPCTable() *srpcTable {
-	return &srpcTable{pending: map[uint64]chan rwire.RPCEnvelope{}}
+	return &srpcTable{pending: map[uint64]chan runner.RPCEnvelope{}}
 }
 
 // add registers a pending call and returns the channel its answer will arrive
 // on. Buffered by one, so deliver never blocks the connection's reader even if
 // the caller has already stopped waiting.
-func (t *srpcTable) add(id uint64) chan rwire.RPCEnvelope {
-	ch := make(chan rwire.RPCEnvelope, 1)
+func (t *srpcTable) add(id uint64) chan runner.RPCEnvelope {
+	ch := make(chan runner.RPCEnvelope, 1)
 	t.mu.Lock()
 	t.pending[id] = ch
 	t.mu.Unlock()
@@ -76,7 +76,7 @@ func (t *srpcTable) remove(id uint64) {
 // anyone was. A duplicate response for the same id is dropped rather than
 // stalling the reader (the channel is buffered by one and the caller always
 // removes its own entry).
-func (t *srpcTable) deliver(env rwire.RPCEnvelope) bool {
+func (t *srpcTable) deliver(env runner.RPCEnvelope) bool {
 	t.mu.Lock()
 	ch, ok := t.pending[env.ID]
 	t.mu.Unlock()
@@ -164,8 +164,8 @@ func (s *Server) sessionRPC(ctx context.Context, sessionID, method string, paylo
 	// entry is always the one that removes it.
 	defer rc.srpc.remove(id)
 
-	if err := rc.enqueue(rwire.ToRunner{Type: "session_rpc", Session: row.ID,
-		RPC: &rwire.RPCEnvelope{ID: id, Method: method, Payload: raw}}); err != nil {
+	if err := rc.enqueue(runner.ToRunner{Type: "session_rpc", Session: row.ID,
+		RPC: &runner.RPCEnvelope{ID: id, Method: method, Payload: raw}}); err != nil {
 		return fmt.Errorf("session rpc %s for %s: %w", method, row.ID, err)
 	}
 
@@ -207,19 +207,19 @@ func (s *Server) sessionRPC(ctx context.Context, sessionID, method string, paylo
 	}
 }
 
-func drainRPC(ch chan rwire.RPCEnvelope) (rwire.RPCEnvelope, bool) {
+func drainRPC(ch chan runner.RPCEnvelope) (runner.RPCEnvelope, bool) {
 	select {
 	case env := <-ch:
 		return env, true
 	default:
-		return rwire.RPCEnvelope{}, false
+		return runner.RPCEnvelope{}, false
 	}
 }
 
 // decodeRPCAnswer turns one response envelope into this call's result: a
 // refusal into a sandboxError carrying the far end's own words, a success into
 // out.
-func decodeRPCAnswer(sessionID, method string, env rwire.RPCEnvelope, out any) error {
+func decodeRPCAnswer(sessionID, method string, env runner.RPCEnvelope, out any) error {
 	if !env.OK {
 		return &sandboxError{Session: sessionID, Method: method, Msg: rpcErrorText(env.Payload)}
 	}
@@ -254,7 +254,7 @@ func rpcErrorText(payload json.RawMessage) string {
 // rpcPayload encodes a request or response body. A nil payload (and anything
 // that encodes to JSON null) travels as no payload at all rather than the
 // four bytes "null", which keeps a method with no arguments off the wire
-// entirely — see rwire's session_req round-trip pin.
+// entirely — see runner's session_req round-trip pin.
 func rpcPayload(v any) (json.RawMessage, error) {
 	switch p := v.(type) {
 	case nil:
@@ -299,10 +299,10 @@ func rpcPayload(v any) (json.RawMessage, error) {
 const maxDiffRepos = 64
 
 // sessionDiff asks a sandbox for its per-repository diff.
-func (s *Server) sessionDiff(ctx context.Context, sessionID string) (xfer.DiffAnswer, error) {
-	var ans xfer.DiffAnswer
-	if err := s.sessionRPC(ctx, sessionID, xfer.MethodDiff, nil, &ans); err != nil {
-		return xfer.DiffAnswer{}, err
+func (s *Server) sessionDiff(ctx context.Context, sessionID string) (workspace.DiffAnswer, error) {
+	var ans workspace.DiffAnswer
+	if err := s.sessionRPC(ctx, sessionID, workspace.MethodDiff, nil, &ans); err != nil {
+		return workspace.DiffAnswer{}, err
 	}
 	return boundDiff(ans), nil
 }
@@ -314,7 +314,7 @@ func (s *Server) sessionDiff(ctx context.Context, sessionID string) (xfer.DiffAn
 const maxDiffLabel = 256
 
 // boundDiff cuts an answer down to what this API is willing to relay.
-func boundDiff(ans xfer.DiffAnswer) xfer.DiffAnswer {
+func boundDiff(ans workspace.DiffAnswer) workspace.DiffAnswer {
 	if len(ans.Repos) > maxDiffRepos {
 		ans.Repos = ans.Repos[:maxDiffRepos]
 	}
@@ -323,7 +323,7 @@ func boundDiff(ans xfer.DiffAnswer) xfer.DiffAnswer {
 		r.Repo = clipTo(r.Repo, maxDiffLabel)
 		r.BaseBranch = clipTo(r.BaseBranch, maxDiffLabel)
 		r.SessionBranch = clipTo(r.SessionBranch, maxDiffLabel)
-		r.Stat = clipTo(r.Stat, xfer.StatBytes)
+		r.Stat = clipTo(r.Stat, workspace.StatBytes)
 	}
 	return ans
 }
@@ -340,41 +340,41 @@ func clipTo(s string, max int) string {
 
 // sessionPushChunk hands one chunk of an upload to a sandbox and returns its
 // ack.
-func (s *Server) sessionPushChunk(ctx context.Context, sessionID string, chunk xfer.PushChunk) (xfer.PushAck, error) {
-	var ack xfer.PushAck
-	if err := s.sessionRPC(ctx, sessionID, xfer.MethodPushFiles, chunk, &ack); err != nil {
-		return xfer.PushAck{}, err
+func (s *Server) sessionPushChunk(ctx context.Context, sessionID string, chunk workspace.PushChunk) (workspace.PushAck, error) {
+	var ack workspace.PushAck
+	if err := s.sessionRPC(ctx, sessionID, workspace.MethodPushFiles, chunk, &ack); err != nil {
+		return workspace.PushAck{}, err
 	}
 	// The ack's sequence number is the client's correlation, and a sandbox
 	// that answered about a different chunk would have the client believing a
 	// chunk landed that never did.
 	if ack.Seq != chunk.Seq {
-		return xfer.PushAck{}, fmt.Errorf("session %s acked chunk %d for a request about chunk %d",
+		return workspace.PushAck{}, fmt.Errorf("session %s acked chunk %d for a request about chunk %d",
 			sessionID, ack.Seq, chunk.Seq)
 	}
 	return ack, nil
 }
 
 // sessionPullChunk asks a sandbox for one chunk of a download.
-func (s *Server) sessionPullChunk(ctx context.Context, sessionID string, req xfer.PullRequest) (xfer.PullChunk, error) {
-	var chunk xfer.PullChunk
-	if err := s.sessionRPC(ctx, sessionID, xfer.MethodPullFiles, req, &chunk); err != nil {
-		return xfer.PullChunk{}, err
+func (s *Server) sessionPullChunk(ctx context.Context, sessionID string, req workspace.PullRequest) (workspace.PullChunk, error) {
+	var chunk workspace.PullChunk
+	if err := s.sessionRPC(ctx, sessionID, workspace.MethodPullFiles, req, &chunk); err != nil {
+		return workspace.PullChunk{}, err
 	}
 	if chunk.Seq != req.Seq {
-		return xfer.PullChunk{}, fmt.Errorf("session %s answered chunk %d for a request about chunk %d",
+		return workspace.PullChunk{}, fmt.Errorf("session %s answered chunk %d for a request about chunk %d",
 			sessionID, chunk.Seq, req.Seq)
 	}
-	if len(chunk.Data) > xfer.ChunkBytes {
-		return xfer.PullChunk{}, fmt.Errorf("session %s answered a %d-byte chunk; the limit is %d",
-			sessionID, len(chunk.Data), xfer.ChunkBytes)
+	if len(chunk.Data) > workspace.ChunkBytes {
+		return workspace.PullChunk{}, fmt.Errorf("session %s answered a %d-byte chunk; the limit is %d",
+			sessionID, len(chunk.Data), workspace.ChunkBytes)
 	}
 	if len(chunk.Data) == 0 && !chunk.Done {
 		// A chunk that carries nothing and does not end the transfer makes no
 		// progress, and a sandbox answering those forever would spin the pull
 		// loop without ever reaching the byte cap — the cap counts bytes, and
 		// there are none. Only the LAST chunk may be empty.
-		return xfer.PullChunk{}, fmt.Errorf("session %s answered chunk %d with no data and no end",
+		return workspace.PullChunk{}, fmt.Errorf("session %s answered chunk %d with no data and no end",
 			sessionID, chunk.Seq)
 	}
 	return chunk, nil
@@ -394,7 +394,7 @@ func (s *Server) sessionPullChunk(ctx context.Context, sessionID string, req xfe
 // event that runner sends. Anything unroutable is logged and dropped — this
 // message crossed a container boundary, and a malformed one must not be able
 // to end the connection every session on that runner depends on.
-func (s *Server) routeSessionReq(ctx context.Context, rc *runnerConn, m rwire.FromRunner) {
+func (s *Server) routeSessionReq(ctx context.Context, rc *runnerConn, m runner.FromRunner) {
 	if m.RPC == nil {
 		log.Printf("controld: runner %s: session_req for %s carried no envelope", rc.name, clip(m.Session))
 		return
@@ -432,19 +432,19 @@ func (s *Server) routeSessionReq(ctx context.Context, rc *runnerConn, m rwire.Fr
 // method runs — the same guard applyEvent applies to the events that end a
 // session, and for the same reason: a stale or misbehaving runner must not be
 // able to act on a session that is not its.
-func (s *Server) answerSessionRequest(ctx context.Context, rc *runnerConn, sessionID string, env rwire.RPCEnvelope) {
+func (s *Server) answerSessionRequest(ctx context.Context, rc *runnerConn, sessionID string, env runner.RPCEnvelope) {
 	ans := s.authorizeSessionRequest(ctx, rc.name, sessionID, env)
 	// The id and the method are this layer's to set, never the handler's: the
 	// id is what the sandbox correlates against, and every answer is a "resp".
 	ans.ID = env.ID
 	ans.Method = "resp"
-	if err := rc.enqueue(rwire.ToRunner{Type: "session_rpc", Session: sessionID, RPC: &ans}); err != nil {
+	if err := rc.enqueue(runner.ToRunner{Type: "session_rpc", Session: sessionID, RPC: &ans}); err != nil {
 		log.Printf("controld: answering %s for session %s on runner %s: %v",
 			clip(env.Method), clip(sessionID), rc.name, err)
 	}
 }
 
-func (s *Server) authorizeSessionRequest(ctx context.Context, runner, sessionID string, env rwire.RPCEnvelope) rwire.RPCEnvelope {
+func (s *Server) authorizeSessionRequest(ctx context.Context, runner, sessionID string, env runner.RPCEnvelope) runner.RPCEnvelope {
 	row, err := s.st.GetSession(ctx, sessionID)
 	switch {
 	case errors.Is(err, ErrNotFound):
@@ -471,7 +471,7 @@ func (s *Server) authorizeSessionRequest(ctx context.Context, runner, sessionID 
 // read could see a different row — and the owner every method needs is already
 // on it. Unknown methods are refused by name, which is also what a newer
 // sandbox talking to an older controld gets: a clear answer rather than a hang.
-func (s *Server) handleSessionRequest(ctx context.Context, runner string, row Session, env rwire.RPCEnvelope) rwire.RPCEnvelope {
+func (s *Server) handleSessionRequest(ctx context.Context, runner string, row Session, env runner.RPCEnvelope) runner.RPCEnvelope {
 	switch env.Method {
 	case mintGitCredentialMethod:
 		return s.answerMintGitCredential(ctx, runner, row, env)
@@ -511,13 +511,13 @@ type mintAnswer struct {
 // The token itself appears in exactly one place: the payload below. Not in the
 // log line, not in an error, not in the refusal — see the vault's own note on
 // secret hygiene (vault.go).
-func (s *Server) answerMintGitCredential(ctx context.Context, runner string, row Session, env rwire.RPCEnvelope) rwire.RPCEnvelope {
+func (s *Server) answerMintGitCredential(ctx context.Context, runnerName string, row Session, env runner.RPCEnvelope) runner.RPCEnvelope {
 	if row.OwnerID == "" {
 		// Unreachable through the API (every create records its caller), and
 		// refused rather than looked up anyway: the owner IS the authority
 		// this mint acts with, and a lookup for the empty user is one stray
 		// row away from handing a sandbox a credential nobody granted it.
-		log.Printf("controld: runner %s: session %s has no owner; refusing to mint a credential", runner, row.ID)
+		log.Printf("controld: runner %s: session %s has no owner; refusing to mint a credential", runnerName, row.ID)
 		return rpcRefusal(env.ID, "this session has no owner to mint a github credential for")
 	}
 
@@ -539,14 +539,14 @@ func (s *Server) answerMintGitCredential(ctx context.Context, runner string, row
 		log.Printf("controld: session %s: encoding the github credential answer failed", row.ID)
 		return rpcRefusal(env.ID, "the github credential could not be encoded")
 	}
-	log.Printf("controld: session %s: minted a github credential for user %s on runner %s", row.ID, row.OwnerID, runner)
-	return rwire.RPCEnvelope{ID: env.ID, Method: "resp", OK: true, Payload: body}
+	log.Printf("controld: session %s: minted a github credential for user %s on runner %s", row.ID, row.OwnerID, runnerName)
+	return runner.RPCEnvelope{ID: env.ID, Method: "resp", OK: true, Payload: body}
 }
 
 // rpcRefusal builds an ok:false response carrying msg where every consumer
 // looks for it — the {"error": ...} body sessiond's Call and controld's own
 // sandboxError both read.
-func rpcRefusal(id uint64, msg string) rwire.RPCEnvelope {
+func rpcRefusal(id uint64, msg string) runner.RPCEnvelope {
 	body, err := json.Marshal(struct {
 		Error string `json:"error"`
 	}{msg})
@@ -556,5 +556,5 @@ func rpcRefusal(id uint64, msg string) rwire.RPCEnvelope {
 		log.Printf("controld: encoding an RPC refusal: %v", err)
 		body = nil
 	}
-	return rwire.RPCEnvelope{ID: id, Method: "resp", Payload: body}
+	return runner.RPCEnvelope{ID: id, Method: "resp", Payload: body}
 }

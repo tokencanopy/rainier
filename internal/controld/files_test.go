@@ -18,8 +18,8 @@ import (
 
 	"github.com/coder/websocket/wsjson"
 
-	"github.com/tokencanopy/rainier/internal/rwire"
-	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 // ---------------------------------------------------------------------------
@@ -72,13 +72,13 @@ func startSandbox(t *testing.T, f *fakeRunner, fn sandboxFunc) {
 // answerRPCRaw is answerRPC without the *testing.T: the sandbox goroutine
 // outlives the test's own, and calling t.Fatalf from it would be a data race
 // with the test finishing.
-func (f *fakeRunner) answerRPCRaw(cmd rwire.ToRunner, ok bool, payload json.RawMessage) {
+func (f *fakeRunner) answerRPCRaw(cmd runner.ToRunner, ok bool, payload json.RawMessage) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	f.wmu.Lock()
 	defer f.wmu.Unlock()
-	m := rwire.FromRunner{Type: "session_req", Session: cmd.Session,
-		RPC: &rwire.RPCEnvelope{ID: cmd.RPC.ID, Method: "resp", OK: ok, Payload: payload}}
+	m := runner.FromRunner{Type: "session_req", Session: cmd.Session,
+		RPC: &runner.RPCEnvelope{ID: cmd.RPC.ID, Method: "resp", OK: ok, Payload: payload}}
 	m.Used, m.Total = f.used, f.total
 	// A write failure here means the test is over and the socket is gone;
 	// there is nobody left to tell.
@@ -86,7 +86,9 @@ func (f *fakeRunner) answerRPCRaw(cmd rwire.ToRunner, ok bool, payload json.RawM
 }
 
 // diffAnswerOf builds the answer a sandbox gives to `diff`.
-func diffAnswerOf(repos ...xfer.RepoDiff) xfer.DiffAnswer { return xfer.DiffAnswer{Repos: repos} }
+func diffAnswerOf(repos ...workspace.RepoDiff) workspace.DiffAnswer {
+	return workspace.DiffAnswer{Repos: repos}
+}
 
 // fileStore is a sandbox that remembers what was pushed and serves it back on
 // a pull — enough to prove the bytes survive the whole round trip.
@@ -100,21 +102,21 @@ func newFileStore() *fileStore { return &fileStore{blobs: map[string][]byte{}} }
 
 func (s *fileStore) serve(method string, payload json.RawMessage) (any, error) {
 	switch method {
-	case xfer.MethodPushFiles:
-		var c xfer.PushChunk
+	case workspace.MethodPushFiles:
+		var c workspace.PushChunk
 		if err := json.Unmarshal(payload, &c); err != nil {
 			return nil, err
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.blobs[c.Path] = append(s.blobs[c.Path], c.Data...)
-		synced := c.Done || (len(s.blobs[c.Path])/xfer.ChunkBytes)%xfer.SyncEvery == 0
+		synced := c.Done || (len(s.blobs[c.Path])/workspace.ChunkBytes)%workspace.SyncEvery == 0
 		if synced {
 			s.synced++
 		}
-		return xfer.PushAck{Seq: c.Seq, Synced: synced}, nil
-	case xfer.MethodPullFiles:
-		var req xfer.PullRequest
+		return workspace.PushAck{Seq: c.Seq, Synced: synced}, nil
+	case workspace.MethodPullFiles:
+		var req workspace.PullRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
 			return nil, err
 		}
@@ -124,12 +126,12 @@ func (s *fileStore) serve(method string, payload json.RawMessage) (any, error) {
 		if !ok {
 			return nil, fmt.Errorf("%s does not exist in this session's workspace", req.Path)
 		}
-		off := req.Seq * xfer.ChunkBytes
+		off := req.Seq * workspace.ChunkBytes
 		if off > len(blob) {
 			return nil, fmt.Errorf("pull chunk %d is past the end of the archive", req.Seq)
 		}
-		end := min(off+xfer.ChunkBytes, len(blob))
-		return xfer.PullChunk{Seq: req.Seq, Data: blob[off:end], Done: end >= len(blob)}, nil
+		end := min(off+workspace.ChunkBytes, len(blob))
+		return workspace.PullChunk{Seq: req.Seq, Data: blob[off:end], Done: end >= len(blob)}, nil
 	}
 	return nil, fmt.Errorf("unknown method %q", method)
 }
@@ -156,7 +158,7 @@ func TestSessionDiff(t *testing.T) {
 		var sawMethod string
 		startSandbox(t, f, func(method string, _ json.RawMessage) (any, error) {
 			sawMethod = method
-			return diffAnswerOf(xfer.RepoDiff{
+			return diffAnswerOf(workspace.RepoDiff{
 				Repo: "acme/widget", BaseBranch: "main", SessionBranch: "rainier/x",
 				Stat: " main.go | 2 +-\n",
 			}), nil
@@ -168,11 +170,11 @@ func TestSessionDiff(t *testing.T) {
 			t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, raw)
 		}
 		assertKeySet(t, raw, "repos")
-		if sawMethod != xfer.MethodDiff {
-			t.Fatalf("controld called %q, want %q", sawMethod, xfer.MethodDiff)
+		if sawMethod != workspace.MethodDiff {
+			t.Fatalf("controld called %q, want %q", sawMethod, workspace.MethodDiff)
 		}
 
-		var body xfer.DiffAnswer
+		var body workspace.DiffAnswer
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body = %s", err, raw)
 		}
@@ -208,16 +210,16 @@ func TestSessionDiff(t *testing.T) {
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 		transferSession(t, st, "sess_diff_big", "vm1", u.ID)
 		startSandbox(t, f, func(string, json.RawMessage) (any, error) {
-			return diffAnswerOf(xfer.RepoDiff{Repo: "a/b", Stat: strings.Repeat("x", 512<<10)}), nil
+			return diffAnswerOf(workspace.RepoDiff{Repo: "a/b", Stat: strings.Repeat("x", 512<<10)}), nil
 		})
 
 		resp := doJSON(t, ts, http.MethodGet, "/v0/sessions/sess_diff_big/diff", tok, nil, nil)
 		raw := readBody(t, resp)
-		var body xfer.DiffAnswer
+		var body workspace.DiffAnswer
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
-		if n := len(body.Repos[0].Stat); n > xfer.StatBytes {
+		if n := len(body.Repos[0].Stat); n > workspace.StatBytes {
 			t.Fatalf("stat is %d bytes; controld must bound what a sandbox sends it, not only trust the cap inside", n)
 		}
 	})
@@ -254,7 +256,7 @@ func TestSessionDiff(t *testing.T) {
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 		transferSession(t, st, "sess_diff_teammate", "vm1", u.ID)
 		startSandbox(t, f, func(string, json.RawMessage) (any, error) {
-			return diffAnswerOf(xfer.RepoDiff{
+			return diffAnswerOf(workspace.RepoDiff{
 				Repo: "acme/widget", BaseBranch: "main", SessionBranch: "rainier/x", Stat: " main.go | 2 +-\n"}), nil
 		})
 
@@ -263,7 +265,7 @@ func TestSessionDiff(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200 — the diff is a team-visible read; body = %s", resp.StatusCode, raw)
 		}
-		var body xfer.DiffAnswer
+		var body workspace.DiffAnswer
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body = %s", err, raw)
 		}
@@ -310,18 +312,18 @@ func TestPushFiles(t *testing.T) {
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 		transferSession(t, st, "sess_push_ok", "vm1", u.ID)
 
-		var got xfer.PushChunk
+		var got workspace.PushChunk
 		startSandbox(t, f, func(method string, payload json.RawMessage) (any, error) {
-			if method != xfer.MethodPushFiles {
+			if method != workspace.MethodPushFiles {
 				return nil, fmt.Errorf("unexpected method %q", method)
 			}
 			if err := json.Unmarshal(payload, &got); err != nil {
 				return nil, err
 			}
-			return xfer.PushAck{Seq: got.Seq, Synced: true}, nil
+			return workspace.PushAck{Seq: got.Seq, Synced: true}, nil
 		})
 
-		body := xfer.PushChunk{Xfer: "t1", Path: "widget/vendor", Seq: 0, Data: []byte("hello"), Done: true}
+		body := workspace.PushChunk{Xfer: "t1", Path: "widget/vendor", Seq: 0, Data: []byte("hello"), Done: true}
 		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_push_ok/files", tok, body, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
@@ -329,7 +331,7 @@ func TestPushFiles(t *testing.T) {
 		}
 		assertKeySet(t, raw, "seq", "synced")
 
-		var ack xfer.PushAck
+		var ack workspace.PushAck
 		if err := json.Unmarshal([]byte(raw), &ack); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
@@ -352,14 +354,14 @@ func TestPushFiles(t *testing.T) {
 
 		cases := []struct {
 			name string
-			body xfer.PushChunk
+			body workspace.PushChunk
 		}{
-			{"escaping path", xfer.PushChunk{Xfer: "t", Path: "../etc", Seq: 0, Data: []byte("x")}},
-			{"absolute path outside the workspace", xfer.PushChunk{Xfer: "t", Path: "/etc/cron.d", Data: []byte("x")}},
-			{"no path", xfer.PushChunk{Xfer: "t", Seq: 0, Data: []byte("x")}},
-			{"no transfer id", xfer.PushChunk{Path: "dst", Seq: 0, Data: []byte("x")}},
-			{"negative sequence", xfer.PushChunk{Xfer: "t", Path: "dst", Seq: -1, Data: []byte("x")}},
-			{"oversize chunk", xfer.PushChunk{Xfer: "t", Path: "dst", Data: make([]byte, xfer.ChunkBytes+1)}},
+			{"escaping path", workspace.PushChunk{Xfer: "t", Path: "../etc", Seq: 0, Data: []byte("x")}},
+			{"absolute path outside the workspace", workspace.PushChunk{Xfer: "t", Path: "/etc/cron.d", Data: []byte("x")}},
+			{"no path", workspace.PushChunk{Xfer: "t", Seq: 0, Data: []byte("x")}},
+			{"no transfer id", workspace.PushChunk{Path: "dst", Seq: 0, Data: []byte("x")}},
+			{"negative sequence", workspace.PushChunk{Xfer: "t", Path: "dst", Seq: -1, Data: []byte("x")}},
+			{"oversize chunk", workspace.PushChunk{Xfer: "t", Path: "dst", Data: make([]byte, workspace.ChunkBytes+1)}},
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
@@ -381,7 +383,7 @@ func TestPushFiles(t *testing.T) {
 			return nil, fmt.Errorf("push chunk 3 arrived out of order; expected 1")
 		})
 
-		body := xfer.PushChunk{Xfer: "t", Path: "dst", Seq: 3, Data: []byte("x")}
+		body := workspace.PushChunk{Xfer: "t", Path: "dst", Seq: 3, Data: []byte("x")}
 		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_push_refused/files", tok, body, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
@@ -397,7 +399,7 @@ func TestPushFiles(t *testing.T) {
 		u, tok := loginUser(t, st, "alice", "member")
 		_, otherTok := loginUser(t, st, "bob", "member")
 		joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-		body := xfer.PushChunk{Xfer: "t", Path: "dst", Data: []byte("x")}
+		body := workspace.PushChunk{Xfer: "t", Path: "dst", Data: []byte("x")}
 
 		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_nope/files", tok, body, nil)
 		if resp.StatusCode != http.StatusNotFound {
@@ -508,12 +510,12 @@ func TestPullFiles(t *testing.T) {
 		s.xferMax = 4 << 20
 
 		startSandbox(t, f, func(method string, payload json.RawMessage) (any, error) {
-			var req xfer.PullRequest
+			var req workspace.PullRequest
 			if err := json.Unmarshal(payload, &req); err != nil {
 				return nil, err
 			}
 			// Never done: a compromised sandbox answering an endless stream.
-			return xfer.PullChunk{Seq: req.Seq, Data: make([]byte, xfer.ChunkBytes)}, nil
+			return workspace.PullChunk{Seq: req.Seq, Data: make([]byte, workspace.ChunkBytes)}, nil
 		})
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_pull_flood/files?path=d", tok, nil, nil)
@@ -537,12 +539,12 @@ func TestPullFiles(t *testing.T) {
 
 		var asked atomic.Int64
 		startSandbox(t, f, func(method string, payload json.RawMessage) (any, error) {
-			var req xfer.PullRequest
+			var req workspace.PullRequest
 			if err := json.Unmarshal(payload, &req); err != nil {
 				return nil, err
 			}
 			asked.Add(1)
-			return xfer.PullChunk{Seq: req.Seq}, nil // no data, never done
+			return workspace.PullChunk{Seq: req.Seq}, nil // no data, never done
 		})
 
 		done := make(chan struct{})
@@ -611,15 +613,15 @@ func TestTransferRoundTrip(t *testing.T) {
 	}
 
 	const dest = "widget/vendor"
-	for seq, off := 0, 0; off < len(blob); seq, off = seq+1, off+xfer.ChunkBytes {
-		end := min(off+xfer.ChunkBytes, len(blob))
-		body := xfer.PushChunk{Xfer: "round", Path: dest, Seq: seq, Data: blob[off:end], Done: end >= len(blob)}
+	for seq, off := 0, 0; off < len(blob); seq, off = seq+1, off+workspace.ChunkBytes {
+		end := min(off+workspace.ChunkBytes, len(blob))
+		body := workspace.PushChunk{Xfer: "round", Path: dest, Seq: seq, Data: blob[off:end], Done: end >= len(blob)}
 		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_round/files", tok, body, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("chunk %d status = %d; body = %s", seq, resp.StatusCode, raw)
 		}
-		var ack xfer.PushAck
+		var ack workspace.PushAck
 		if err := json.Unmarshal([]byte(raw), &ack); err != nil {
 			t.Fatalf("decode ack %d: %v", seq, err)
 		}

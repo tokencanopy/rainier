@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 // ---------------------------------------------------------------------------
@@ -88,7 +88,7 @@ func testRepo(dir string) repoSpec {
 
 // runDiff invokes the handler the way the RPC dispatcher does and decodes its
 // answer.
-func runDiff(t *testing.T, d *differ) xfer.DiffAnswer {
+func runDiff(t *testing.T, d *differ) workspace.DiffAnswer {
 	t.Helper()
 	out, err := d.handle(nil)
 	if err != nil {
@@ -98,7 +98,7 @@ func runDiff(t *testing.T, d *differ) xfer.DiffAnswer {
 	if err != nil {
 		t.Fatalf("marshal diff answer: %v", err)
 	}
-	var ans xfer.DiffAnswer
+	var ans workspace.DiffAnswer
 	if err := json.Unmarshal(b, &ans); err != nil {
 		t.Fatalf("decode diff answer: %v; body=%s", err, b)
 	}
@@ -197,8 +197,8 @@ func TestDiffCapsOneRepositorysOutput(t *testing.T) {
 	ans := runDiff(t, d)
 
 	stat := ans.Repos[0].Stat
-	if len(stat) > xfer.StatBytes {
-		t.Fatalf("stat is %d bytes, want at most %d", len(stat), xfer.StatBytes)
+	if len(stat) > workspace.StatBytes {
+		t.Fatalf("stat is %d bytes, want at most %d", len(stat), workspace.StatBytes)
 	}
 	if !strings.Contains(stat, "truncated") {
 		t.Fatalf("a truncated stat must say so; got the last 40 bytes %q", stat[len(stat)-40:])
@@ -329,7 +329,7 @@ func newTestTransfers(t *testing.T, max int64) (*fileTransfers, string) {
 // TestTransferStagingIsOnTheWorkspaceVolume: where a transfer stages is a
 // memory question, not a tidiness one. The container's /tmp is a tmpfs the
 // driver mounts with no size (internal/driver/docker.go), so an archive staged
-// there is HOST RAM — up to xfer.MaxBytes per direction per session, on a
+// there is HOST RAM — up to workspace.MaxBytes per direction per session, on a
 // runner already holding N of them. The workspace volume is disk.
 func TestTransferStagingIsOnTheWorkspaceVolume(t *testing.T) {
 	if !strings.HasPrefix(transferStagingDir, workspaceRoot+"/") {
@@ -384,7 +384,7 @@ func TestPrepareTransferStagingClearsAnEarlierBoot(t *testing.T) {
 }
 
 // call runs one handler the way the dispatcher does: JSON in, value out.
-func callPush(t *testing.T, ft *fileTransfers, c xfer.PushChunk) (xfer.PushAck, error) {
+func callPush(t *testing.T, ft *fileTransfers, c workspace.PushChunk) (workspace.PushAck, error) {
 	t.Helper()
 	b, err := json.Marshal(c)
 	if err != nil {
@@ -392,16 +392,16 @@ func callPush(t *testing.T, ft *fileTransfers, c xfer.PushChunk) (xfer.PushAck, 
 	}
 	out, err := ft.handlePush(b)
 	if err != nil {
-		return xfer.PushAck{}, err
+		return workspace.PushAck{}, err
 	}
-	ack, ok := out.(xfer.PushAck)
+	ack, ok := out.(workspace.PushAck)
 	if !ok {
 		t.Fatalf("push answered %T, want an ack", out)
 	}
 	return ack, nil
 }
 
-func callPull(t *testing.T, ft *fileTransfers, req xfer.PullRequest) (xfer.PullChunk, error) {
+func callPull(t *testing.T, ft *fileTransfers, req workspace.PullRequest) (workspace.PullChunk, error) {
 	t.Helper()
 	b, err := json.Marshal(req)
 	if err != nil {
@@ -409,9 +409,9 @@ func callPull(t *testing.T, ft *fileTransfers, req xfer.PullRequest) (xfer.PullC
 	}
 	out, err := ft.handlePull(b)
 	if err != nil {
-		return xfer.PullChunk{}, err
+		return workspace.PullChunk{}, err
 	}
-	chunk, ok := out.(xfer.PullChunk)
+	chunk, ok := out.(workspace.PullChunk)
 	if !ok {
 		t.Fatalf("pull answered %T, want a chunk", out)
 	}
@@ -422,20 +422,20 @@ func callPull(t *testing.T, ft *fileTransfers, req xfer.PullRequest) (xfer.PullC
 func archiveOf(t *testing.T, dir string) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	if _, err := xfer.TarGz(&buf, dir, xfer.MaxBytes); err != nil {
+	if _, err := workspace.TarGz(&buf, dir, workspace.MaxBytes); err != nil {
 		t.Fatalf("TarGz: %v", err)
 	}
 	return buf.Bytes()
 }
 
 // pushBlob streams blob to dest in chunks of size chunk, returning every ack.
-func pushBlob(t *testing.T, ft *fileTransfers, id, dest string, blob []byte, chunk int) []xfer.PushAck {
+func pushBlob(t *testing.T, ft *fileTransfers, id, dest string, blob []byte, chunk int) []workspace.PushAck {
 	t.Helper()
-	var acks []xfer.PushAck
+	var acks []workspace.PushAck
 	for seq := 0; ; seq++ {
 		lo := seq * chunk
 		hi := min(lo+chunk, len(blob))
-		ack, err := callPush(t, ft, xfer.PushChunk{
+		ack, err := callPush(t, ft, workspace.PushChunk{
 			Xfer: id, Path: dest, Seq: seq, Data: blob[lo:hi], Done: hi >= len(blob)})
 		if err != nil {
 			t.Fatalf("push chunk %d: %v", seq, err)
@@ -496,7 +496,7 @@ func TestPushAcksSyncedEveryEighthChunk(t *testing.T) {
 
 	var synced []int
 	for seq := 0; seq < len(big); seq++ {
-		ack, err := callPush(t, ft, xfer.PushChunk{Xfer: "x2", Path: "dst", Seq: seq, Data: big[seq : seq+1]})
+		ack, err := callPush(t, ft, workspace.PushChunk{Xfer: "x2", Path: "dst", Seq: seq, Data: big[seq : seq+1]})
 		if err != nil {
 			t.Fatalf("chunk %d: %v", seq, err)
 		}
@@ -528,7 +528,7 @@ func TestPushRefusesEscapingDestinations(t *testing.T) {
 		t.Run(dest, func(t *testing.T) {
 			ft, _ := newTestTransfers(t, 0)
 			blob := archiveOf(t, t.TempDir())
-			_, err := callPush(t, ft, xfer.PushChunk{Xfer: "x3", Path: dest, Seq: 0, Data: blob, Done: true})
+			_, err := callPush(t, ft, workspace.PushChunk{Xfer: "x3", Path: dest, Seq: 0, Data: blob, Done: true})
 			if err == nil {
 				t.Fatalf("push to %q was accepted", dest)
 			}
@@ -542,7 +542,7 @@ func TestPushRefusesEscapingDestinations(t *testing.T) {
 // hostileArchive builds a gzipped tar by hand: an innocent file followed by a
 // symlink to an absolute path.
 //
-// It cannot go through xfer.TarGz, which refuses that symlink at PACK time —
+// It cannot go through workspace.TarGz, which refuses that symlink at PACK time —
 // which is the point of this helper. The far end is not trusted to have used
 // our packer, or any packer, so the extract-side rule has to be provable on
 // its own.
@@ -581,7 +581,7 @@ func TestPushRefusesAHostileArchiveWithoutHalfExtracting(t *testing.T) {
 
 	blob := hostileArchive(t)
 
-	_, err := callPush(t, ft, xfer.PushChunk{Xfer: "x4", Path: "dst", Seq: 0, Data: blob, Done: true})
+	_, err := callPush(t, ft, workspace.PushChunk{Xfer: "x4", Path: "dst", Seq: 0, Data: blob, Done: true})
 	if err == nil {
 		t.Fatal("a hostile archive was accepted")
 	}
@@ -601,10 +601,10 @@ func TestPushRefusesAHostileArchiveWithoutHalfExtracting(t *testing.T) {
 // nothing — is what makes one dropped response survivable instead of fatal.
 func TestPushReAcksARepeatedChunk(t *testing.T) {
 	ft, _ := newTestTransfers(t, 0)
-	if _, err := callPush(t, ft, xfer.PushChunk{Xfer: "x5", Path: "dst", Seq: 0, Data: []byte("a")}); err != nil {
+	if _, err := callPush(t, ft, workspace.PushChunk{Xfer: "x5", Path: "dst", Seq: 0, Data: []byte("a")}); err != nil {
 		t.Fatalf("chunk 0: %v", err)
 	}
-	ack, err := callPush(t, ft, xfer.PushChunk{Xfer: "x5", Path: "dst", Seq: 0, Data: []byte("a")})
+	ack, err := callPush(t, ft, workspace.PushChunk{Xfer: "x5", Path: "dst", Seq: 0, Data: []byte("a")})
 	if err != nil {
 		t.Fatalf("re-sent chunk 0: %v", err)
 	}
@@ -624,10 +624,10 @@ func TestPushReAcksARepeatedChunk(t *testing.T) {
 // no honest way to continue — the transfer dies and takes its staging file.
 func TestPushRefusesOutOfOrderChunks(t *testing.T) {
 	ft, _ := newTestTransfers(t, 0)
-	if _, err := callPush(t, ft, xfer.PushChunk{Xfer: "x5", Path: "dst", Seq: 0, Data: []byte("a")}); err != nil {
+	if _, err := callPush(t, ft, workspace.PushChunk{Xfer: "x5", Path: "dst", Seq: 0, Data: []byte("a")}); err != nil {
 		t.Fatalf("chunk 0: %v", err)
 	}
-	if _, err := callPush(t, ft, xfer.PushChunk{Xfer: "x5", Path: "dst", Seq: 2, Data: []byte("c")}); err == nil {
+	if _, err := callPush(t, ft, workspace.PushChunk{Xfer: "x5", Path: "dst", Seq: 2, Data: []byte("c")}); err == nil {
 		t.Fatal("a gap in the sequence was accepted")
 	}
 	if n := ft.open(); n != 0 {
@@ -642,10 +642,10 @@ func TestPushRefusesOutOfOrderChunks(t *testing.T) {
 // chunk, or bytes approved against one path get written to another.
 func TestPushRefusesAChangedDestination(t *testing.T) {
 	ft, _ := newTestTransfers(t, 0)
-	if _, err := callPush(t, ft, xfer.PushChunk{Xfer: "x5b", Path: "dst", Seq: 0, Data: []byte("a")}); err != nil {
+	if _, err := callPush(t, ft, workspace.PushChunk{Xfer: "x5b", Path: "dst", Seq: 0, Data: []byte("a")}); err != nil {
 		t.Fatalf("chunk 0: %v", err)
 	}
-	if _, err := callPush(t, ft, xfer.PushChunk{Xfer: "x5b", Path: "other", Seq: 1, Data: []byte("b")}); err == nil {
+	if _, err := callPush(t, ft, workspace.PushChunk{Xfer: "x5b", Path: "other", Seq: 1, Data: []byte("b")}); err == nil {
 		t.Fatal("a chunk that changed the destination mid-transfer was accepted")
 	}
 	if n := ft.open(); n != 0 {
@@ -658,8 +658,8 @@ func TestPushRefusesAChangedDestination(t *testing.T) {
 // refuses second, but neither is the process writing to the disk.
 func TestPushRefusesAnOversizeChunk(t *testing.T) {
 	ft, _ := newTestTransfers(t, 0)
-	_, err := callPush(t, ft, xfer.PushChunk{
-		Xfer: "x6", Path: "dst", Seq: 0, Data: make([]byte, xfer.ChunkBytes+1)})
+	_, err := callPush(t, ft, workspace.PushChunk{
+		Xfer: "x6", Path: "dst", Seq: 0, Data: make([]byte, workspace.ChunkBytes+1)})
 	if err == nil {
 		t.Fatal("an oversize chunk was accepted")
 	}
@@ -668,13 +668,13 @@ func TestPushRefusesAnOversizeChunk(t *testing.T) {
 func TestPushRefusesPastTheTotalCap(t *testing.T) {
 	ft, _ := newTestTransfers(t, 8<<10)
 	blob := make([]byte, 4<<10)
-	if _, err := callPush(t, ft, xfer.PushChunk{Xfer: "x7", Path: "dst", Seq: 0, Data: blob}); err != nil {
+	if _, err := callPush(t, ft, workspace.PushChunk{Xfer: "x7", Path: "dst", Seq: 0, Data: blob}); err != nil {
 		t.Fatalf("chunk 0: %v", err)
 	}
-	if _, err := callPush(t, ft, xfer.PushChunk{Xfer: "x7", Path: "dst", Seq: 1, Data: blob}); err != nil {
+	if _, err := callPush(t, ft, workspace.PushChunk{Xfer: "x7", Path: "dst", Seq: 1, Data: blob}); err != nil {
 		t.Fatalf("chunk 1: %v", err)
 	}
-	if _, err := callPush(t, ft, xfer.PushChunk{Xfer: "x7", Path: "dst", Seq: 2, Data: blob}); err == nil {
+	if _, err := callPush(t, ft, workspace.PushChunk{Xfer: "x7", Path: "dst", Seq: 2, Data: blob}); err == nil {
 		t.Fatal("a transfer past the cap was accepted")
 	}
 	if files := stagingFiles(t, ft.tmp); len(files) != 0 {
@@ -697,7 +697,7 @@ func TestPullRoundTrip(t *testing.T) {
 
 	var got bytes.Buffer
 	for seq := 0; ; seq++ {
-		chunk, err := callPull(t, ft, xfer.PullRequest{Xfer: "p1", Path: "widget/out", Seq: seq})
+		chunk, err := callPull(t, ft, workspace.PullRequest{Xfer: "p1", Path: "widget/out", Seq: seq})
 		if err != nil {
 			t.Fatalf("pull chunk %d: %v", seq, err)
 		}
@@ -718,7 +718,7 @@ func TestPullRoundTrip(t *testing.T) {
 		t.Fatalf("write archive: %v", err)
 	}
 	dest := t.TempDir()
-	if err := xfer.UntarGz(archive, dest, xfer.MaxExtractBytes); err != nil {
+	if err := workspace.UntarGz(archive, dest, workspace.MaxExtractBytes); err != nil {
 		t.Fatalf("UntarGz what the pull returned: %v", err)
 	}
 	back, err := os.ReadFile(filepath.Join(dest, "report.txt"))
@@ -748,18 +748,18 @@ func TestPullRepeatsAChunk(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	first, err := callPull(t, ft, xfer.PullRequest{Xfer: "p2", Path: "d", Seq: 0})
+	first, err := callPull(t, ft, workspace.PullRequest{Xfer: "p2", Path: "d", Seq: 0})
 	if err != nil {
 		t.Fatalf("chunk 0: %v", err)
 	}
-	again, err := callPull(t, ft, xfer.PullRequest{Xfer: "p2", Path: "d", Seq: 0})
+	again, err := callPull(t, ft, workspace.PullRequest{Xfer: "p2", Path: "d", Seq: 0})
 	if err != nil {
 		t.Fatalf("chunk 0 again: %v", err)
 	}
 	if !bytes.Equal(first.Data, again.Data) {
 		t.Fatal("re-reading a chunk returned different bytes")
 	}
-	if _, err := callPull(t, ft, xfer.PullRequest{Xfer: "p2", Path: "d", Seq: 99}); err == nil {
+	if _, err := callPull(t, ft, workspace.PullRequest{Xfer: "p2", Path: "d", Seq: 99}); err == nil {
 		t.Fatal("a chunk past the end of the archive was served")
 	}
 }
@@ -768,11 +768,11 @@ func TestPullRepeatsAChunk(t *testing.T) {
 func TestPullRefusesEscapingPaths(t *testing.T) {
 	ft, _ := newTestTransfers(t, 0)
 	for _, p := range []string{"../etc", "/etc", "", "d/../../etc"} {
-		if _, err := callPull(t, ft, xfer.PullRequest{Xfer: "p3", Path: p, Seq: 0}); err == nil {
+		if _, err := callPull(t, ft, workspace.PullRequest{Xfer: "p3", Path: p, Seq: 0}); err == nil {
 			t.Errorf("pull of %q was accepted", p)
 		}
 	}
-	if _, err := callPull(t, ft, xfer.PullRequest{Xfer: "p4", Path: "nope", Seq: 0}); err == nil {
+	if _, err := callPull(t, ft, workspace.PullRequest{Xfer: "p4", Path: "nope", Seq: 0}); err == nil {
 		t.Error("pull of a path that does not exist was accepted")
 	}
 	if files := stagingFiles(t, ft.tmp); len(files) != 0 {
@@ -797,7 +797,7 @@ func TestPullRefusesPastTheCap(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "f"), blob, 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if _, err := callPull(t, ft, xfer.PullRequest{Xfer: "p5", Path: "big", Seq: 0}); err == nil {
+	if _, err := callPull(t, ft, workspace.PullRequest{Xfer: "p5", Path: "big", Seq: 0}); err == nil {
 		t.Fatal("a pull past the cap was accepted")
 	}
 	if files := stagingFiles(t, ft.tmp); len(files) != 0 {
@@ -810,7 +810,7 @@ func TestPullRefusesPastTheCap(t *testing.T) {
 // collects those, so the table does.
 func TestTransfersSweepAbandonedStaging(t *testing.T) {
 	ft, _ := newTestTransfers(t, 0)
-	if _, err := callPush(t, ft, xfer.PushChunk{Xfer: "old", Path: "dst", Seq: 0, Data: []byte("a")}); err != nil {
+	if _, err := callPush(t, ft, workspace.PushChunk{Xfer: "old", Path: "dst", Seq: 0, Data: []byte("a")}); err != nil {
 		t.Fatalf("chunk: %v", err)
 	}
 	if files := stagingFiles(t, ft.tmp); len(files) != 1 {

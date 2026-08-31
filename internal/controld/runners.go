@@ -17,7 +17,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
-	"github.com/tokencanopy/rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // ErrRunnerUnreachable is what every dispatch that never produced an answer
@@ -113,10 +113,10 @@ var setupFailedFrom = []SessionState{StateCreating, StateRunning}
 type runnerConn struct {
 	name string
 	ws   *websocket.Conn
-	out  chan rwire.ToRunner
+	out  chan runner.ToRunner
 
 	mu      sync.Mutex
-	pending map[uint64]chan rwire.FromRunner
+	pending map[uint64]chan runner.FromRunner
 
 	seq atomic.Uint64
 	// srpc is the pending table for the session RPCs controld sent INTO the
@@ -132,8 +132,8 @@ func newRunnerConn(name string, ws *websocket.Conn) *runnerConn {
 	return &runnerConn{
 		name:    name,
 		ws:      ws,
-		out:     make(chan rwire.ToRunner, runnerSendQueue),
-		pending: map[uint64]chan rwire.FromRunner{},
+		out:     make(chan runner.ToRunner, runnerSendQueue),
+		pending: map[uint64]chan runner.FromRunner{},
 		srpc:    newSRPCTable(),
 		done:    make(chan struct{}),
 	}
@@ -152,7 +152,7 @@ func (rc *runnerConn) shutdown() {
 
 // enqueue hands m to the writer goroutine without ever blocking the caller:
 // a dead conn or a full backlog is an error, not a wait.
-func (rc *runnerConn) enqueue(m rwire.ToRunner) error {
+func (rc *runnerConn) enqueue(m runner.ToRunner) error {
 	select {
 	case <-rc.done:
 		return fmt.Errorf("runner %s: connection closed: %w", rc.name, ErrRunnerUnreachable)
@@ -172,7 +172,7 @@ func (rc *runnerConn) enqueue(m rwire.ToRunner) error {
 // whether anyone was. The channel is buffered by one and the dispatcher
 // always removes its entry, so this never blocks and a duplicate result for
 // the same id is dropped rather than stalling the reader.
-func (rc *runnerConn) deliver(m rwire.FromRunner) bool {
+func (rc *runnerConn) deliver(m runner.FromRunner) bool {
 	rc.mu.Lock()
 	ch, ok := rc.pending[m.ReqID]
 	rc.mu.Unlock()
@@ -272,27 +272,27 @@ func (s *Server) handleRunnerConnect(w http.ResponseWriter, r *http.Request) {
 // must be an announce in a proto we speak. A rejection closes the socket
 // with a reason naming both versions, so the operator reading runnerd's log
 // learns what to upgrade (design §4.3).
-func readAnnounce(ctx context.Context, c *websocket.Conn) (rwire.FromRunner, bool) {
+func readAnnounce(ctx context.Context, c *websocket.Conn) (runner.FromRunner, bool) {
 	annCtx, cancel := context.WithTimeout(ctx, announceFirstTimeout)
 	defer cancel()
 
-	var ann rwire.FromRunner
+	var ann runner.FromRunner
 	if err := wsjson.Read(annCtx, c, &ann); err != nil {
 		log.Printf("controld: reading runner announce: %v", err)
-		return rwire.FromRunner{}, false
+		return runner.FromRunner{}, false
 	}
 	switch {
 	case ann.Type != "announce":
 		closeRunner(c, websocket.StatusPolicyViolation,
 			fmt.Sprintf("first message must be announce, got %q", clip(ann.Type)))
-		return rwire.FromRunner{}, false
-	case ann.Proto != rwire.Proto:
+		return runner.FromRunner{}, false
+	case ann.Proto != runner.ProtocolVersion:
 		closeRunner(c, websocket.StatusPolicyViolation,
-			fmt.Sprintf("unsupported proto %d, want proto %d", ann.Proto, rwire.Proto))
-		return rwire.FromRunner{}, false
+			fmt.Sprintf("unsupported proto %d, want proto %d", ann.Proto, runner.ProtocolVersion))
+		return runner.FromRunner{}, false
 	case ann.Runner == "":
 		closeRunner(c, websocket.StatusPolicyViolation, "announce is missing a runner name")
-		return rwire.FromRunner{}, false
+		return runner.FromRunner{}, false
 	}
 	return ann, true
 }
@@ -300,7 +300,7 @@ func readAnnounce(ctx context.Context, c *websocket.Conn) (rwire.FromRunner, boo
 // readLoop serves one connection's inbound messages until it dies.
 func (s *Server) readLoop(ctx context.Context, rc *runnerConn) {
 	for {
-		var m rwire.FromRunner
+		var m runner.FromRunner
 		if err := wsjson.Read(ctx, rc.ws, &m); err != nil {
 			log.Printf("controld: runner %s connection ended: %v", rc.name, err)
 			return
@@ -341,7 +341,7 @@ func (s *Server) readLoop(ctx context.Context, rc *runnerConn) {
 // caller stops reading when it isn't. The identity check and the write both
 // happen under the runner's name lock, so a reconnect can neither slip
 // between them nor have its own row write overtaken by this one.
-func (s *Server) touchRunner(ctx context.Context, rc *runnerConn, m rwire.FromRunner) bool {
+func (s *Server) touchRunner(ctx context.Context, rc *runnerConn, m runner.FromRunner) bool {
 	nl := s.nameLock(rc.name)
 	nl.Lock()
 	defer nl.Unlock()
@@ -374,7 +374,7 @@ func (s *Server) touchRunner(ctx context.Context, rc *runnerConn, m rwire.FromRu
 // of a duplicate — the case reconcileUnplaced destroys — could mark a session
 // dead that has since been re-placed and is running fine somewhere else, or
 // (since Plan 5) flip the credential of a user whose work it does not hold.
-func (s *Server) applyEvent(ctx context.Context, runner string, m rwire.FromRunner) {
+func (s *Server) applyEvent(ctx context.Context, runner string, m runner.FromRunner) {
 	if m.Session == "" {
 		log.Printf("controld: runner %s: event with no session", runner)
 		return
@@ -429,7 +429,7 @@ func (s *Server) applyEvent(ctx context.Context, runner string, m rwire.FromRunn
 			return
 		}
 		// One event for every stage of the boot chain. The stage rides at the
-		// FRONT of the detail because an rwire event has exactly one free-text
+		// FRONT of the detail because a runner event has exactly one free-text
 		// field: "clone: rc 128: fatal: Authentication failed" splits at the
 		// first ": " into the stage and the sentence runnerd composed, which
 		// is never parsed further — how a stage failure is described is the
@@ -657,16 +657,16 @@ func (s *Server) snapshotWanted(ctx context.Context, runner string, row Session)
 // Nothing here needs undoing when a step fails: an environment with no
 // snapshot recorded is exactly an environment whose next session runs the
 // setup script again — slower, never wrong.
-func (s *Server) buildSnapshot(ctx context.Context, runner string, row Session, env Environment, hash string) {
+func (s *Server) buildSnapshot(ctx context.Context, runnerName string, row Session, env Environment, hash string) {
 	ref := snapshotRef(env.ID, hash)
-	res, err := s.dispatch(ctx, runner, rwire.ToRunner{Type: "snapshot", Session: row.ID, Ref: ref})
+	res, err := s.dispatch(ctx, runnerName, runner.ToRunner{Type: "snapshot", Session: row.ID, Ref: ref})
 	switch {
 	case err != nil:
-		log.Printf("controld: snapshotting %s for environment %s on %s: %v", row.ID, env.ID, runner, err)
+		log.Printf("controld: snapshotting %s for environment %s on %s: %v", row.ID, env.ID, runnerName, err)
 		return
 	case !res.OK:
 		log.Printf("controld: snapshotting %s for environment %s on %s: runner reported failure: %s",
-			row.ID, env.ID, runner, clip(res.Detail))
+			row.ID, env.ID, runnerName, clip(res.Detail))
 		return
 	case res.Detail != "" && res.Detail != ref:
 		// A runner echoes the ref it was given (the driver contract returns an
@@ -675,7 +675,7 @@ func (s *Server) buildSnapshot(ctx context.Context, runner string, row Session, 
 		// content-addressed name is what every other replica derives
 		// independently and what a later create looks the image up by.
 		log.Printf("controld: runner %s answered the snapshot of environment %s with ref %q, not the %q it was given; recording ours",
-			runner, env.ID, clip(res.Detail), ref)
+			runnerName, env.ID, clip(res.Detail), ref)
 	}
 
 	// Deliberately not under the connection's context: the image exists on the
@@ -684,7 +684,7 @@ func (s *Server) buildSnapshot(ctx context.Context, runner string, row Session, 
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storeCleanupTimeout)
 	defer cancel()
 
-	switch err := s.st.SetEnvironmentSnapshot(wctx, env.ID, hash, ref, runner); {
+	switch err := s.st.SetEnvironmentSnapshot(wctx, env.ID, hash, ref, runnerName); {
 	case errors.Is(err, ErrConflict):
 		// The environment was edited or deleted while the snapshot was
 		// building, so this image is of a setup nobody asked for any more.
@@ -697,21 +697,21 @@ func (s *Server) buildSnapshot(ctx context.Context, runner string, row Session, 
 		log.Printf("controld: recording snapshot %s for environment %s: %v", ref, env.ID, err)
 		return
 	}
-	log.Printf("controld: environment %s cached as %s on %s", env.ID, ref, runner)
+	log.Printf("controld: environment %s cached as %s on %s", env.ID, ref, runnerName)
 
 	// Warm every OTHER connected runner. The holder is excluded: it just built
 	// the image, and with no registry in v0 that ref names something only it
 	// has, so a prepull there could only fail. Fire-and-forget by design — a
 	// prepull is a head start, never a precondition for a create (design §4.3).
-	s.broadcastToRunners(rwire.ToRunner{Type: "prepull", Ref: ref}, runner)
+	s.broadcastToRunners(runner.ToRunner{Type: "prepull", Ref: ref}, runnerName)
 }
 
 // reconcile makes the store agree with the reality a runner just announced
 // (design §4.8). runnerd is truth for liveness, the store is truth for
 // desired state, so each row is settled by which of the two knows something
 // the other doesn't.
-func (s *Server) reconcile(ctx context.Context, name string, announced []rwire.SessionInfo) {
-	byID := make(map[string]rwire.SessionInfo, len(announced))
+func (s *Server) reconcile(ctx context.Context, name string, announced []runner.SessionInfo) {
+	byID := make(map[string]runner.SessionInfo, len(announced))
 	for _, a := range announced {
 		byID[a.ID] = a
 	}
@@ -743,7 +743,7 @@ func (s *Server) reconcile(ctx context.Context, name string, announced []rwire.S
 
 // reconcilePresent settles a row the runner does have: adopt whatever state
 // it reports, and count even agreement as news.
-func (s *Server) reconcilePresent(ctx context.Context, row Session, ann rwire.SessionInfo) {
+func (s *Server) reconcilePresent(ctx context.Context, row Session, ann runner.SessionInfo) {
 	want, ok := announcedState(ann.State)
 	if !ok {
 		log.Printf("controld: runner %s announced %s in unknown state %q; leaving it alone",
@@ -779,7 +779,7 @@ func (s *Server) reconcileMissing(ctx context.Context, name string, row Session)
 // placed on this runner: an unknown or terminal id is an orphan and gets
 // destroyed, while a live row the store still wants is adopted onto the
 // runner that actually has it.
-func (s *Server) reconcileUnplaced(ctx context.Context, name string, ann rwire.SessionInfo) {
+func (s *Server) reconcileUnplaced(ctx context.Context, name string, ann runner.SessionInfo) {
 	row, err := s.st.GetSession(ctx, ann.ID)
 	switch {
 	case errors.Is(err, ErrNotFound):
@@ -827,20 +827,20 @@ func (s *Server) reconcileUnplaced(ctx context.Context, name string, ann rwire.S
 // on runnerd, so retry it on this connection instead of waiting indefinitely
 // for another announce. The series is bounded; reconnect reconciliation
 // starts a fresh one if the orphan is still present.
-func (s *Server) destroyOrphan(ctx context.Context, runner, id string) {
+func (s *Server) destroyOrphan(ctx context.Context, runnerName, id string) {
 	go func() {
 		for attempt := 1; attempt <= orphanDestroyAttempts; attempt++ {
-			res, err := s.dispatch(ctx, runner, rwire.ToRunner{Type: "destroy", Session: id})
+			res, err := s.dispatch(ctx, runnerName, runner.ToRunner{Type: "destroy", Session: id})
 			if err == nil && res.OK {
 				return
 			}
 
 			if err != nil {
 				log.Printf("controld: destroying orphan %s on %s (attempt %d/%d): %v",
-					clip(id), runner, attempt, orphanDestroyAttempts, err)
+					clip(id), runnerName, attempt, orphanDestroyAttempts, err)
 			} else {
 				log.Printf("controld: runner %s failed to destroy orphan %s (attempt %d/%d): %s",
-					runner, clip(id), attempt, orphanDestroyAttempts, clip(res.Detail))
+					runnerName, clip(id), attempt, orphanDestroyAttempts, clip(res.Detail))
 			}
 			if attempt == orphanDestroyAttempts || ctx.Err() != nil {
 				return
@@ -891,15 +891,15 @@ func announcedState(s string) (SessionState, bool) {
 // bare ctx.Err() — the runner is not implicated, and callers that map
 // ErrRunnerUnreachable to a 502 should let that one surface as the client
 // disconnect it is.
-func (s *Server) dispatch(ctx context.Context, runner string, m rwire.ToRunner) (rwire.FromRunner, error) {
-	rc := s.conn(runner)
+func (s *Server) dispatch(ctx context.Context, runnerName string, m runner.ToRunner) (runner.FromRunner, error) {
+	rc := s.conn(runnerName)
 	if rc == nil {
-		return rwire.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: not connected: %w",
-			m.Type, runner, ErrRunnerUnreachable)
+		return runner.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: not connected: %w",
+			m.Type, runnerName, ErrRunnerUnreachable)
 	}
 
 	m.ReqID = rc.seq.Add(1)
-	ch := make(chan rwire.FromRunner, 1)
+	ch := make(chan runner.FromRunner, 1)
 	rc.mu.Lock()
 	rc.pending[m.ReqID] = ch
 	rc.mu.Unlock()
@@ -910,7 +910,7 @@ func (s *Server) dispatch(ctx context.Context, runner string, m rwire.ToRunner) 
 	}()
 
 	if err := rc.enqueue(m); err != nil {
-		return rwire.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: %w", m.Type, runner, err)
+		return runner.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: %w", m.Type, runnerName, err)
 	}
 
 	timer := time.NewTimer(s.cfg.OpTimeout)
@@ -924,8 +924,8 @@ func (s *Server) dispatch(ctx context.Context, runner string, m rwire.ToRunner) 
 		if res, ok := drain(ch); ok {
 			return res, nil
 		}
-		return rwire.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: connection closed before the result: %w",
-			m.Type, runner, ErrRunnerUnreachable)
+		return runner.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: connection closed before the result: %w",
+			m.Type, runnerName, ErrRunnerUnreachable)
 	case <-timer.C:
 		if res, ok := drain(ch); ok {
 			return res, nil
@@ -937,26 +937,26 @@ func (s *Server) dispatch(ctx context.Context, runner string, m rwire.ToRunner) 
 		// contract is "the connection was still live", which callers act on.
 		select {
 		case <-rc.done:
-			return rwire.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: connection closed before the result: %w",
-				m.Type, runner, ErrRunnerUnreachable)
+			return runner.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: connection closed before the result: %w",
+				m.Type, runnerName, ErrRunnerUnreachable)
 		default:
 		}
-		return rwire.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: no result within %s: %w",
-			m.Type, runner, s.cfg.OpTimeout, ErrDispatchTimeout)
+		return runner.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: no result within %s: %w",
+			m.Type, runnerName, s.cfg.OpTimeout, ErrDispatchTimeout)
 	case <-ctx.Done():
 		if res, ok := drain(ch); ok {
 			return res, nil
 		}
-		return rwire.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: %w", m.Type, runner, ctx.Err())
+		return runner.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: %w", m.Type, runnerName, ctx.Err())
 	}
 }
 
-func drain(ch chan rwire.FromRunner) (rwire.FromRunner, bool) {
+func drain(ch chan runner.FromRunner) (runner.FromRunner, bool) {
 	select {
 	case res := <-ch:
 		return res, true
 	default:
-		return rwire.FromRunner{}, false
+		return runner.FromRunner{}, false
 	}
 }
 
@@ -964,7 +964,7 @@ func drain(ch chan rwire.FromRunner) (rwire.FromRunner, bool) {
 // dial-backs and best-effort broadcasts). It reports only whether the command
 // was queued for delivery. Orphan destroys use dispatch instead: a driver
 // failure must be visible so it can be retried without another reconnect.
-func (s *Server) sendToRunner(runner string, m rwire.ToRunner) error {
+func (s *Server) sendToRunner(runner string, m runner.ToRunner) error {
 	rc := s.conn(runner)
 	if rc == nil {
 		return fmt.Errorf("send %s to runner %q: not connected: %w", m.Type, runner, ErrRunnerUnreachable)
@@ -984,7 +984,7 @@ func (s *Server) sendToRunner(runner string, m rwire.ToRunner) error {
 // and a runner that misses the message loses nothing but a head start. The
 // connection set is snapshotted under s.mu and the sends happen after it is
 // released, so one wedged runner never stalls registration for the fleet.
-func (s *Server) broadcastToRunners(m rwire.ToRunner, except string) {
+func (s *Server) broadcastToRunners(m runner.ToRunner, except string) {
 	s.mu.Lock()
 	conns := make([]*runnerConn, 0, len(s.runners))
 	for name, rc := range s.runners {

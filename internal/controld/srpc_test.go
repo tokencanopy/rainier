@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tokencanopy/rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // ---------------------------------------------------------------------------
@@ -35,7 +35,7 @@ func sandboxSession(t *testing.T, st Store, id, runner string) string {
 // the test when it carries no envelope: everything downstream is asserted
 // against the envelope, so a missing one must fail here rather than nil-panic
 // three lines later.
-func nextSessionRPC(t *testing.T, f *fakeRunner) rwire.ToRunner {
+func nextSessionRPC(t *testing.T, f *fakeRunner) runner.ToRunner {
 	t.Helper()
 	cmd := nextOfType(t, f, "session_rpc")
 	if cmd.RPC == nil {
@@ -47,10 +47,10 @@ func nextSessionRPC(t *testing.T, f *fakeRunner) rwire.ToRunner {
 // answerRPC scripts the sandbox's answer to a controld-initiated request. It
 // travels up as a session_req whose envelope Method is "resp", echoing the
 // request's own id — the pass-through correlation runnerd performs verbatim.
-func (f *fakeRunner) answerRPC(t *testing.T, cmd rwire.ToRunner, ok bool, payload string) {
+func (f *fakeRunner) answerRPC(t *testing.T, cmd runner.ToRunner, ok bool, payload string) {
 	t.Helper()
-	f.write(t, rwire.FromRunner{Type: "session_req", Session: cmd.Session,
-		RPC: &rwire.RPCEnvelope{ID: cmd.RPC.ID, Method: "resp", OK: ok, Payload: rawOrNil(payload)}})
+	f.write(t, runner.FromRunner{Type: "session_req", Session: cmd.Session,
+		RPC: &runner.RPCEnvelope{ID: cmd.RPC.ID, Method: "resp", OK: ok, Payload: rawOrNil(payload)}})
 }
 
 // sandboxSessionFor is sandboxSession for a session with an OWNER: the mint
@@ -66,8 +66,8 @@ func sandboxSessionFor(t *testing.T, st Store, id, runner, userID string) string
 // direction the credential mint travels.
 func (f *fakeRunner) sandboxRequest(t *testing.T, session string, id uint64, method, payload string) {
 	t.Helper()
-	f.write(t, rwire.FromRunner{Type: "session_req", Session: session,
-		RPC: &rwire.RPCEnvelope{ID: id, Method: method, Payload: rawOrNil(payload)}})
+	f.write(t, runner.FromRunner{Type: "session_req", Session: session,
+		RPC: &runner.RPCEnvelope{ID: id, Method: method, Payload: rawOrNil(payload)}})
 }
 
 func rawOrNil(s string) json.RawMessage {
@@ -357,10 +357,10 @@ func TestOrphanSessionRPCResponseIsDropped(t *testing.T) {
 	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
 	id := sandboxSession(t, st, "sess_orphan", "vm1")
 
-	f.write(t, rwire.FromRunner{Type: "session_req", Session: id,
-		RPC: &rwire.RPCEnvelope{ID: 999, Method: "resp", OK: true, Payload: json.RawMessage(`{"stale":true}`)}})
+	f.write(t, runner.FromRunner{Type: "session_req", Session: id,
+		RPC: &runner.RPCEnvelope{ID: 999, Method: "resp", OK: true, Payload: json.RawMessage(`{"stale":true}`)}})
 	// A malformed session_req (no envelope at all) is dropped the same way.
-	f.write(t, rwire.FromRunner{Type: "session_req", Session: id})
+	f.write(t, runner.FromRunner{Type: "session_req", Session: id})
 
 	errc := make(chan error, 1)
 	go func() { errc <- s.sessionRPC(context.Background(), id, "ping", nil, nil) }()
@@ -404,7 +404,7 @@ func TestSandboxRequestFromTheWrongRunnerIsRefused(t *testing.T) {
 
 // rpcAnswer reads one answer envelope's two mutually exclusive bodies: the
 // {"token": …} a success carries, and the {"error": …} a refusal does.
-func rpcAnswer(t *testing.T, env *rwire.RPCEnvelope) (token, errText string) {
+func rpcAnswer(t *testing.T, env *runner.RPCEnvelope) (token, errText string) {
 	t.Helper()
 	var body struct {
 		Token string `json:"token"`
@@ -674,7 +674,7 @@ func TestSandboxRequestsDoNotBlockTheRunnerReader(t *testing.T) {
 	// While that handler is wedged, an ordinary dispatch still completes.
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.dispatch(context.Background(), "vm1", rwire.ToRunner{Type: "suspend", Session: id})
+		_, err := s.dispatch(context.Background(), "vm1", runner.ToRunner{Type: "suspend", Session: id})
 		done <- err
 	}()
 	cmd := nextOfType(t, f, "suspend")

@@ -38,7 +38,7 @@ import (
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 
-	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 // detachKey is Ctrl-].
@@ -124,7 +124,7 @@ func AttachURL(base, session string) string {
 //   - not given → 0: no cursor. Snapshot of the current screen, then live —
 //     what a plain `attach` has always done and should keep doing (replaying
 //     a day's raw log to paint a screen is the thing spec §5 forbids).
-//   - `--since 0` → wire.SinceAll: the whole log, first entry onward. "I
+//   - `--since 0` → terminal.SinceAll: the whole log, first entry onward. "I
 //     have seen nothing" is a coherent thing for a user to say, and it is
 //     what the runbook's read-the-failed-setup-log flow means by it.
 //   - `--since N` → N: resume, replaying the entries after N — the value the
@@ -137,7 +137,7 @@ func Cursor(given bool, since uint64) uint64 {
 	case !given:
 		return 0
 	case since == 0:
-		return wire.SinceAll
+		return terminal.SinceAll
 	default:
 		return since
 	}
@@ -263,7 +263,7 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 		sendSize := func() {
 			w, h, err := term.GetSize(fd)
 			if err == nil {
-				wsjson.Write(ctx, c, wire.ClientMsg{Type: "resize", Cols: w, Rows: h})
+				wsjson.Write(ctx, c, terminal.ClientMessage{Type: "resize", Cols: w, Rows: h})
 			}
 		}
 		sendSize() // required first message
@@ -286,7 +286,7 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 	} else {
 		// No tty to size from: announce a fixed default so the server's
 		// resize-first contract is still satisfied.
-		wsjson.Write(ctx, c, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24})
+		wsjson.Write(ctx, c, terminal.ClientMessage{Type: "resize", Cols: 80, Rows: 24})
 	}
 
 	var lastSeq atomic.Uint64
@@ -324,7 +324,7 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 	go func() {
 		defer pumps.Done()
 		for {
-			var m wire.ServerMsg
+			var m terminal.ServerMessage
 			if err := wsjson.Read(ctx, c, &m); err != nil {
 				if !claim() {
 					return
@@ -409,13 +409,13 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 			}
 			detach := ScanDetach(buf[:n])
 			if detach < 0 {
-				wsjson.Write(ctx, c, wire.ClientMsg{Type: "stdin", Data: append([]byte(nil), buf[:n]...)})
+				wsjson.Write(ctx, c, terminal.ClientMessage{Type: "stdin", Data: append([]byte(nil), buf[:n]...)})
 				continue
 			}
 			// Forward whatever preceded the detach key in this chunk before
 			// detaching; anything after it in the same chunk is discarded.
 			if detach > 0 {
-				wsjson.Write(ctx, c, wire.ClientMsg{Type: "stdin", Data: append([]byte(nil), buf[:detach]...)})
+				wsjson.Write(ctx, c, terminal.ClientMessage{Type: "stdin", Data: append([]byte(nil), buf[:detach]...)})
 			}
 			if !claim() {
 				return

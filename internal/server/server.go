@@ -12,7 +12,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"github.com/tokencanopy/rainier/internal/session"
-	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 const defaultPingInterval = 15 * time.Second
@@ -34,7 +34,9 @@ func NewWithKeepalive(s *session.Session, pingInterval time.Duration) http.Handl
 func (h *handler) attach(w http.ResponseWriter, r *http.Request) {
 	since, _ := strconv.ParseUint(r.URL.Query().Get("since"), 10, 64)
 	c, err := websocket.Accept(w, r, nil)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer c.CloseNow()
 	// coder/websocket defaults to a 32KiB/message read limit and closes the
 	// connection with StatusMessageTooBig past it. PTY output frames (and
@@ -49,12 +51,14 @@ func (h *handler) attach(w http.ResponseWriter, r *http.Request) {
 
 func serve(ctx context.Context, c *websocket.Conn, s *session.Session, since uint64, pingInterval time.Duration) {
 	// First message must announce viewer size.
-	var first wire.ClientMsg
+	var first terminal.ClientMessage
 	if err := wsjson.Read(ctx, c, &first); err != nil || first.Type != "resize" {
 		return
 	}
 	att, err := s.Attach(since, session.Size{Cols: first.Cols, Rows: first.Rows})
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer s.Detach(att.ID)
 
 	// Liveness: a viewer whose transport has died (terminal closed, laptop
@@ -94,7 +98,9 @@ func serve(ctx context.Context, c *websocket.Conn, s *session.Session, since uin
 	go func() {
 		defer close(writeDone)
 		for m := range att.Msgs {
-			if wsjson.Write(ctx, c, m) != nil { return }
+			if wsjson.Write(ctx, c, m) != nil {
+				return
+			}
 		}
 		// The writer only drains normally (rather than returning early on a
 		// write error) when att.Msgs closed on its own — i.e. the session
@@ -106,8 +112,10 @@ func serve(ctx context.Context, c *websocket.Conn, s *session.Session, since uin
 
 	// Reader: client → session.
 	for {
-		var m wire.ClientMsg
-		if err := wsjson.Read(ctx, c, &m); err != nil { return }
+		var m terminal.ClientMessage
+		if err := wsjson.Read(ctx, c, &m); err != nil {
+			return
+		}
 		switch m.Type {
 		case "stdin":
 			s.Stdin(m.Data)

@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tokencanopy/rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // ---------------------------------------------------------------------------
@@ -400,7 +400,7 @@ func TestCreateSession(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // POST /v0/sessions with "environment" — the resolution rules (design §4.3,
-// §4.5). The evidence for every rule is the rwire.Spec controld actually
+// §4.5). The evidence for every rule is the runner.Spec controld actually
 // dispatches, captured off a fake runner: that message IS the contract, and a
 // resolution that only looks right in the store would still start the wrong
 // container.
@@ -696,7 +696,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 // connectors, or the session's own `repos`, become the RepoSpecs the create
 // dispatches — plus the git identity they commit as, the three GitHub hosts
 // they need to reach, and the credential gate that refuses a clone nobody can
-// authenticate. Same evidence as the environment rules above: the rwire.Spec
+// authenticate. Same evidence as the environment rules above: the runner.Spec
 // controld actually sent.
 // ---------------------------------------------------------------------------
 
@@ -746,7 +746,7 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "work", "environment": "dev"})
 		spec := nextCreate(t, f).Spec
 
-		want := []rwire.RepoSpec{
+		want := []runner.RepoSpec{
 			{Owner: "acme", Name: "app", BaseBranch: "main", SessionBranch: "rainier/work", Dir: "app"},
 			{Owner: "acme", Name: "infra", BaseBranch: "develop", SessionBranch: "rainier/work", Dir: "infra"},
 		}
@@ -791,7 +791,7 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "over", "environment": "dev",
 			"repos": []map[string]any{{"repo": "other/svc", "base_branch": "develop"}}})
-		want := []rwire.RepoSpec{
+		want := []runner.RepoSpec{
 			{Owner: "other", Name: "svc", BaseBranch: "develop", SessionBranch: "rainier/over", Dir: "svc"},
 		}
 		if got := nextCreate(t, f).Spec.Repos; !slices.Equal(got, want) {
@@ -840,7 +840,7 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 			}})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "multi", "environment": "dev"})
-		want := []rwire.RepoSpec{
+		want := []runner.RepoSpec{
 			{Owner: "acme", Name: "app", BaseBranch: "main", SessionBranch: "rainier/multi", Dir: "app"},
 			{Owner: "other", Name: "app", BaseBranch: "main", SessionBranch: "rainier/multi", Dir: "other__app"},
 		}
@@ -855,7 +855,7 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "solo", "image": "ubuntu:latest",
 			"repos": []map[string]any{{"repo": "acme/app"}}})
 		spec := nextCreate(t, f).Spec
-		want := []rwire.RepoSpec{
+		want := []runner.RepoSpec{
 			{Owner: "acme", Name: "app", BaseBranch: "main", SessionBranch: "rainier/solo", Dir: "app"},
 		}
 		if !slices.Equal(spec.Repos, want) {
@@ -1397,7 +1397,7 @@ func TestGetSession(t *testing.T) {
 		// Announce the row present and agreeing so reconcile doesn't sweep
 		// it (an announce silent on it would mark it dead).
 		startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: "sess_reach", State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: "sess_reach", State: "running"}}})
 		waitConnected(t, s, "vm1")
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_reach", tok, nil, nil)
@@ -1628,7 +1628,7 @@ func TestDeleteSession(t *testing.T) {
 		// transient driver failure must be retried on this same connection;
 		// waiting for another reconnect would leave capacity occupied forever.
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Used: 1, Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: id, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: id, State: "running"}}})
 		first := f.nextCmd(t)
 		if first.Type != "destroy" || first.Session != id || first.ReqID == 0 {
 			t.Fatalf("first command = %+v, want tracked destroy of %s", first, id)
@@ -1659,7 +1659,7 @@ func TestDeleteSession(t *testing.T) {
 	t.Run("placed on a connected runner dispatches destroy", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 
@@ -1698,7 +1698,7 @@ func TestDeleteSession(t *testing.T) {
 	t.Run("runner unreachable is 502 runner_unreachable", func(t *testing.T) {
 		s, st, ts := newTestControld(t, func(c *Config) { c.OpTimeout = 150 * time.Millisecond })
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 
@@ -1723,7 +1723,7 @@ func TestDeleteSession(t *testing.T) {
 	t.Run("runner-reported destroy failure is 500 internal, detail not leaked", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 
@@ -1789,7 +1789,7 @@ func TestSuspendSession(t *testing.T) {
 	t.Run("happy path is warm by default", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 
@@ -1825,7 +1825,7 @@ func TestSuspendSession(t *testing.T) {
 	t.Run("warm:false suspends cold", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 
@@ -1918,7 +1918,7 @@ func TestSuspendSession(t *testing.T) {
 	t.Run("response shape is pinned", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 
@@ -1947,7 +1947,7 @@ func TestSuspendSession(t *testing.T) {
 		race := &raceTransitionStore{Store: NewMemStore(), triggerID: id, raceToState: StateDestroyed}
 		s, ts := newTestControldOver(t, race)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 
@@ -1989,7 +1989,7 @@ func TestResumeSession(t *testing.T) {
 	t.Run("warm resume happy path", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 
@@ -2024,7 +2024,7 @@ func TestResumeSession(t *testing.T) {
 	t.Run("cold resume onto a full runner is 409 no_capacity naming the runner", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 1, Used: 1,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 
@@ -2094,7 +2094,7 @@ func TestResumeSession(t *testing.T) {
 	t.Run("response shape is pinned", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 
@@ -2122,7 +2122,7 @@ func TestResumeSession(t *testing.T) {
 		race := &raceTransitionStore{Store: NewMemStore(), triggerID: id, raceToState: StateDestroyed}
 		s, ts := newTestControldOver(t, race)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 
@@ -2164,7 +2164,7 @@ func TestSnapshotSession(t *testing.T) {
 	t.Run("happy path from running", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 
@@ -2245,7 +2245,7 @@ func TestSnapshotSession(t *testing.T) {
 	t.Run("response shape is pinned", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 

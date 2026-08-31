@@ -1,11 +1,10 @@
-package xfer
+package workspace_test
 
 import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
-	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,114 +12,9 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
-
-// ---------------------------------------------------------------------------
-// path rules
-// ---------------------------------------------------------------------------
-
-// TestValidatePath pins the shape check every hop applies before a transfer
-// path travels any further: the CLI before it sends, controld before it
-// forwards, sessiond before it touches a file. A path that gets past this and
-// still escapes would have to escape Resolve too, which is the point of having
-// both.
-func TestValidatePath(t *testing.T) {
-	ok := []string{
-		"repo",
-		"repo/sub/dir",
-		"./repo",
-		WorkspaceRoot,
-		WorkspaceRoot + "/repo/sub",
-	}
-	for _, p := range ok {
-		if err := ValidatePath(p); err != nil {
-			t.Errorf("ValidatePath(%q) = %v, want nil", p, err)
-		}
-	}
-
-	bad := []string{
-		"",
-		"..",
-		"../etc",
-		"repo/../../etc",
-		"/etc/passwd",
-		"/workspaceother",
-		WorkspaceRoot + "/../etc",
-		"repo\x00/sub",
-	}
-	for _, p := range bad {
-		if err := ValidatePath(p); err == nil {
-			t.Errorf("ValidatePath(%q) = nil, want a refusal", p)
-		}
-	}
-}
-
-// TestResolveStaysUnderRoot is the file-system half of the same rule: whatever
-// a caller sends, the path a transfer actually opens is inside the session's
-// workspace or the transfer does not happen.
-func TestResolveStaysUnderRoot(t *testing.T) {
-	root := t.TempDir()
-
-	got, err := Resolve(root, "repo/sub")
-	if err != nil {
-		t.Fatalf("Resolve: %v", err)
-	}
-	if want := filepath.Join(root, "repo/sub"); got != want {
-		t.Fatalf("Resolve = %q, want %q", got, want)
-	}
-
-	// An absolute path INSIDE the root is honored as given.
-	abs := filepath.Join(root, "repo")
-	if got, err := Resolve(root, abs); err != nil || got != abs {
-		t.Fatalf("Resolve(%q) = %q, %v; want the path back unchanged", abs, got, err)
-	}
-
-	for _, p := range []string{"", "..", "../outside", "repo/../../outside", "/etc/passwd"} {
-		if got, err := Resolve(root, p); err == nil {
-			t.Errorf("Resolve(%q) = %q, want a refusal", p, got)
-		}
-	}
-}
-
-// TestResolveRefusesASymlinkOutOfTheRoot: the lexical rules above say nothing
-// about what a name POINTS at, and a workspace is a directory the session's own
-// agent writes to. `/workspace/vendor -> /etc` would make "vendor/passwd" a
-// perfectly well-formed transfer path that lands outside the workspace.
-func TestResolveRefusesASymlinkOutOfTheRoot(t *testing.T) {
-	root := t.TempDir()
-	outside := t.TempDir()
-	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
-		t.Fatalf("symlink: %v", err)
-	}
-
-	if got, err := Resolve(root, "escape"); err == nil {
-		t.Fatalf("Resolve of a symlink out of the root = %q, want a refusal", got)
-	}
-	// And through it, at a path that does not exist yet — the push case, where
-	// the destination is about to be created.
-	if got, err := Resolve(root, "escape/newdir"); err == nil {
-		t.Fatalf("Resolve through a symlink out of the root = %q, want a refusal", got)
-	}
-	// A symlink that stays inside is fine: this is a containment rule, not a
-	// ban on symlinks.
-	if err := os.MkdirAll(filepath.Join(root, "real"), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.Symlink("real", filepath.Join(root, "inside")); err != nil {
-		t.Fatalf("symlink: %v", err)
-	}
-	if _, err := Resolve(root, "inside/sub"); err != nil {
-		t.Fatalf("Resolve of a symlink that stays inside the root: %v", err)
-	}
-	// A destination that simply does not exist yet is the ordinary push case.
-	if _, err := Resolve(root, "brand/new/dir"); err != nil {
-		t.Fatalf("Resolve of a path that does not exist yet: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// archive round trip
-// ---------------------------------------------------------------------------
 
 // writeTree lays out a small but representative source tree: nested
 // directories, an executable, an empty file, and a relative symlink of the
@@ -212,7 +106,7 @@ func TestTarGzUntarGzRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create archive: %v", err)
 	}
-	n, err := TarGz(f, src, MaxBytes)
+	n, err := workspace.TarGz(f, src, workspace.MaxBytes)
 	if err != nil {
 		t.Fatalf("TarGz: %v", err)
 	}
@@ -231,7 +125,7 @@ func TestTarGzUntarGzRoundTrip(t *testing.T) {
 	}
 
 	dest := t.TempDir()
-	if err := UntarGz(archive, dest, MaxExtractBytes); err != nil {
+	if err := workspace.UntarGz(archive, dest, workspace.MaxExtractBytes); err != nil {
 		t.Fatalf("UntarGz: %v", err)
 	}
 
@@ -261,7 +155,7 @@ func TestTarGzRefusesOverTheLimit(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	_, err := TarGz(&buf, src, 64<<10)
+	_, err := workspace.TarGz(&buf, src, 64<<10)
 	if err == nil {
 		t.Fatal("TarGz over the limit returned nil")
 	}
@@ -283,7 +177,7 @@ func TestTarGzRefusesIrregularFiles(t *testing.T) {
 		t.Skipf("mkfifo unavailable: %v", err)
 	}
 	var buf bytes.Buffer
-	if _, err := TarGz(&buf, src, MaxBytes); err == nil {
+	if _, err := workspace.TarGz(&buf, src, workspace.MaxBytes); err == nil {
 		t.Fatal("TarGz of a tree containing a fifo returned nil")
 	}
 }
@@ -312,7 +206,7 @@ func TestTarGzRefusesEscapingSymlinksBeforeAnyBytesMove(t *testing.T) {
 				t.Fatalf("symlink: %v", err)
 			}
 			var buf bytes.Buffer
-			if _, err := TarGz(&buf, src, MaxBytes); err == nil {
+			if _, err := workspace.TarGz(&buf, src, workspace.MaxBytes); err == nil {
 				t.Fatal("TarGz packed a symlink the far end is going to refuse")
 			} else if !strings.Contains(err.Error(), "vendor/node") {
 				t.Fatalf("TarGz error = %v, want it to name the offending file", err)
@@ -326,7 +220,7 @@ func TestTarGzRefusesEscapingSymlinksBeforeAnyBytesMove(t *testing.T) {
 		src := t.TempDir()
 		writeTree(t, src)
 		var buf bytes.Buffer
-		if _, err := TarGz(&buf, src, MaxBytes); err != nil {
+		if _, err := workspace.TarGz(&buf, src, workspace.MaxBytes); err != nil {
 			t.Fatalf("TarGz refused an ordinary relative symlink: %v", err)
 		}
 	})
@@ -426,7 +320,7 @@ func TestUntarGzRefusesEscapingEntries(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			archive := buildTar(t, tc.entries, tc.bodies)
 			dest := filepath.Join(t.TempDir(), "dest")
-			err := UntarGz(archive, dest, MaxExtractBytes)
+			err := workspace.UntarGz(archive, dest, workspace.MaxExtractBytes)
 			if err == nil {
 				t.Fatal("UntarGz accepted a hostile archive")
 			}
@@ -450,7 +344,7 @@ func TestUntarGzRefusesADecompressionBomb(t *testing.T) {
 		[]tar.Header{{Name: "big", Mode: 0o644, Typeflag: tar.TypeReg}},
 		[]string{strings.Repeat("a", 8<<10)})
 	dest := filepath.Join(t.TempDir(), "dest")
-	err := UntarGz(archive, dest, 1<<10)
+	err := workspace.UntarGz(archive, dest, 1<<10)
 	if err == nil {
 		t.Fatal("UntarGz extracted past its limit")
 	}
@@ -466,53 +360,7 @@ func TestUntarGzRefusesGarbage(t *testing.T) {
 	if err := os.WriteFile(path, []byte("not a gzip stream at all"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if err := UntarGz(path, filepath.Join(t.TempDir(), "dest"), MaxExtractBytes); err == nil {
+	if err := workspace.UntarGz(path, filepath.Join(t.TempDir(), "dest"), workspace.MaxExtractBytes); err == nil {
 		t.Fatal("UntarGz accepted garbage")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// wire shapes
-// ---------------------------------------------------------------------------
-
-// TestChunkWireShape pins the JSON three programs exchange. Data is []byte so
-// it rides as base64 with no hand-rolled encoding at any hop — the field a
-// renamed tag would silently empty.
-func TestChunkWireShape(t *testing.T) {
-	b, err := json.Marshal(PushChunk{Xfer: "abc", Path: "repo", Seq: 3, Data: []byte("hi"), Done: true})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	const want = `{"xfer":"abc","path":"repo","seq":3,"data":"aGk=","done":true}`
-	if string(b) != want {
-		t.Fatalf("PushChunk = %s, want %s", b, want)
-	}
-
-	var back PushChunk
-	if err := json.Unmarshal(b, &back); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if string(back.Data) != "hi" || back.Seq != 3 || !back.Done || back.Path != "repo" || back.Xfer != "abc" {
-		t.Fatalf("round trip = %+v", back)
-	}
-
-	if b, err := json.Marshal(PushAck{Seq: 7, Synced: true}); err != nil || string(b) != `{"seq":7,"synced":true}` {
-		t.Fatalf("PushAck = %s, %v", b, err)
-	}
-	if b, err := json.Marshal(PullRequest{Xfer: "abc", Path: "repo", Seq: 0}); err != nil ||
-		string(b) != `{"xfer":"abc","path":"repo","seq":0}` {
-		t.Fatalf("PullRequest = %s, %v", b, err)
-	}
-	if b, err := json.Marshal(PullChunk{Seq: 0, Data: []byte("hi")}); err != nil ||
-		string(b) != `{"seq":0,"data":"aGk="}` {
-		t.Fatalf("PullChunk = %s, %v", b, err)
-	}
-	if b, err := json.Marshal(DiffAnswer{}); err != nil || string(b) != `{"repos":[]}` {
-		t.Fatalf("empty DiffAnswer = %s, %v; a session with no repos answers an empty array, never null", b, err)
-	}
-	if b, err := json.Marshal(DiffAnswer{Repos: []RepoDiff{{
-		Repo: "o/n", BaseBranch: "main", SessionBranch: "rainier/x", Stat: " f | 1 +\n"}}}); err != nil ||
-		string(b) != `{"repos":[{"repo":"o/n","base_branch":"main","session_branch":"rainier/x","stat":" f | 1 +\n"}]}` {
-		t.Fatalf("DiffAnswer = %s, %v", b, err)
 	}
 }

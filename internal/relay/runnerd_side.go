@@ -90,7 +90,7 @@ func (h *Hub) readLoop() {
 		if client == nil { continue }
 		switch f.Type {
 		case FrameServer:
-			// Forward the wire.ServerMsg payload verbatim to the client.
+			// Forward the terminal.ServerMessage payload verbatim to the client.
 			if client.Write(h.ctx, f.Payload) != nil {
 				h.mu.Lock(); delete(h.clients, f.AttachID); h.mu.Unlock()
 				client.Close()

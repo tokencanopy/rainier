@@ -13,7 +13,7 @@ import (
 
 	"github.com/coder/websocket/wsjson"
 
-	"github.com/tokencanopy/rainier/internal/rwire"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // ---------------------------------------------------------------------------
@@ -67,13 +67,13 @@ func sameSet(a, b []string) bool {
 // writer, without going through fakeRunner.reply — that helper calls
 // t.Fatalf, which only the goroutine running the test may do (here we're
 // answering from a background goroutine that outlives any single assertion).
-func ackCreate(t *testing.T, f *fakeRunner, cmd rwire.ToRunner, ok bool, detail string) {
+func ackCreate(t *testing.T, f *fakeRunner, cmd runner.ToRunner, ok bool, detail string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	f.wmu.Lock()
 	defer f.wmu.Unlock()
-	m := rwire.FromRunner{Type: "result", ReqID: cmd.ReqID, OK: ok, Detail: detail, Used: f.used, Total: f.total}
+	m := runner.FromRunner{Type: "result", ReqID: cmd.ReqID, OK: ok, Detail: detail, Used: f.used, Total: f.total}
 	if err := wsjson.Write(ctx, f.c, m); err != nil {
 		t.Logf("ackCreate: write: %v", err)
 	}
@@ -395,7 +395,7 @@ func TestCacheTiebreakPrefersTheSnapshotHolder(t *testing.T) {
 func TestSchedulerFIFOPlacementAndCapacityFrees(t *testing.T) {
 	s, st, ts := newTestControld(t)
 	f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 2,
-		Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+		Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 	waitConnected(t, s, "vm1")
 	awaitReconciled(t, f)
 
@@ -487,7 +487,7 @@ func TestCreateDispatchFailureRequeues(t *testing.T) {
 	t.Run("ok false fails the session with the runner's detail", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 2,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 
@@ -519,7 +519,7 @@ func TestCreateDispatchFailureRequeues(t *testing.T) {
 	t.Run("connection death requeues with runner cleared", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 2,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f) // reconcile must finish before we seed, or it can requeue our row itself
 
@@ -559,7 +559,7 @@ func TestCreateDispatchFailureRequeues(t *testing.T) {
 	t.Run("timeout on a live connection leaves the row creating", func(t *testing.T) {
 		s, st, ts := newTestControld(t, func(c *Config) { c.OpTimeout = 150 * time.Millisecond })
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 2,
-			Sessions: []rwire.SessionInfo{{ID: ghostSession, State: "running"}}})
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
 		waitConnected(t, s, "vm1")
 		awaitReconciled(t, f)
 
@@ -728,7 +728,7 @@ func TestCreateSpecExpandsRepos(t *testing.T) {
 		if fail != "" {
 			t.Fatalf("createSpec failed: %s", fail)
 		}
-		want := []rwire.RepoSpec{
+		want := []runner.RepoSpec{
 			{Owner: "other", Name: "svc", BaseBranch: "develop", SessionBranch: "rainier/work", Dir: "svc"},
 		}
 		if !slices.Equal(spec.Repos, want) {

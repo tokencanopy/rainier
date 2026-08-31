@@ -7,7 +7,7 @@ import (
 	"sync"
 
 	"github.com/tokencanopy/rainier/internal/session"
-	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 // connWriter is the single-writer discipline for one relay conn. Every frame
@@ -30,7 +30,9 @@ func newConnWriter(ctx context.Context, conn Conn) *connWriter {
 
 func (w *connWriter) write(f Frame) error {
 	b, err := Encode(f)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.conn.Write(w.ctx, b)
@@ -61,7 +63,7 @@ func (c *ControlSender) Send(payload []byte) error {
 // already-established outbound conn to runnerd) and demultiplexes them onto
 // s by AttachID — FrameOpen calls s.Attach and starts a per-attachment
 // goroutine pumping s's ServerMsgs back as FrameServer; FrameClient carries a
-// raw wire.ClientMsg into s.Stdin/s.SetSize; FrameClose calls s.Detach.
+// raw terminal.ClientMessage into s.Stdin/s.SetSize; FrameClose calls s.Detach.
 // Returns when conn.Read errors (conn closed).
 func ServeSession(ctx context.Context, conn Conn, s *session.Session) error {
 	return serveSession(ctx, conn, s, newConnWriter(ctx, conn), nil)
@@ -117,18 +119,27 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 			// forwarder goroutine (ranging att.Msgs) exits and the session
 			// stops clamping/serving a viewer that can no longer be reached.
 			mu.Lock()
-			for _, att := range atts { s.Detach(att.ID) }
+			for _, att := range atts {
+				s.Detach(att.ID)
+			}
 			atts = map[uint64]*session.Attachment{}
 			mu.Unlock()
 			return err
 		}
 		f, err := Decode(raw)
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		switch f.Type {
 		case FrameOpen:
 			att, err := s.Attach(f.Since, session.Size{Cols: f.Cols, Rows: f.Rows})
-			if err != nil { write(Frame{Type: FrameClose, AttachID: f.AttachID}); continue }
-			mu.Lock(); atts[f.AttachID] = att; mu.Unlock()
+			if err != nil {
+				write(Frame{Type: FrameClose, AttachID: f.AttachID})
+				continue
+			}
+			mu.Lock()
+			atts[f.AttachID] = att
+			mu.Unlock()
 			go func(id uint64, a *session.Attachment) {
 				for msg := range a.Msgs {
 					p, _ := json.Marshal(msg)
@@ -139,26 +150,43 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 						// own conn-death cleanup above may race this and
 						// detach the same id too — s.Detach is idempotent,
 						// so that's safe, not a bug.
-						mu.Lock(); delete(atts, id); mu.Unlock()
+						mu.Lock()
+						delete(atts, id)
+						mu.Unlock()
 						s.Detach(a.ID)
 						return
 					}
 				}
 				write(Frame{Type: FrameClose, AttachID: id})
-				mu.Lock(); delete(atts, id); mu.Unlock()
+				mu.Lock()
+				delete(atts, id)
+				mu.Unlock()
 			}(f.AttachID, att)
 		case FrameClient:
-			var cm wire.ClientMsg
-			if json.Unmarshal(f.Payload, &cm) != nil { continue }
-			mu.Lock(); att := atts[f.AttachID]; mu.Unlock()
-			if att == nil { continue }
+			var cm terminal.ClientMessage
+			if json.Unmarshal(f.Payload, &cm) != nil {
+				continue
+			}
+			mu.Lock()
+			att := atts[f.AttachID]
+			mu.Unlock()
+			if att == nil {
+				continue
+			}
 			switch cm.Type {
-			case "stdin": s.Stdin(cm.Data)
-			case "resize": s.SetSize(att.ID, session.Size{Cols: cm.Cols, Rows: cm.Rows})
+			case "stdin":
+				s.Stdin(cm.Data)
+			case "resize":
+				s.SetSize(att.ID, session.Size{Cols: cm.Cols, Rows: cm.Rows})
 			}
 		case FrameClose:
-			mu.Lock(); att := atts[f.AttachID]; delete(atts, f.AttachID); mu.Unlock()
-			if att != nil { s.Detach(att.ID) }
+			mu.Lock()
+			att := atts[f.AttachID]
+			delete(atts, f.AttachID)
+			mu.Unlock()
+			if att != nil {
+				s.Detach(att.ID)
+			}
 		case FrameControl:
 			// Its own case, never the attachment demux: a control frame
 			// carries AttachID 0, which no attachment ever has. The payload is
@@ -168,7 +196,9 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 			// (running a diff, reading files) cannot stall the terminal
 			// traffic multiplexed over this same conn — see
 			// ServeSessionWithControl for what that costs the handler.
-			if onControl != nil { go onControl(f.Payload) }
+			if onControl != nil {
+				go onControl(f.Payload)
+			}
 		}
 	}
 }

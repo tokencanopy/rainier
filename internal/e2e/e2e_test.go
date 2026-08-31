@@ -77,8 +77,8 @@ import (
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/internal/runnerd"
-	"github.com/tokencanopy/rainier/internal/wire"
-	"github.com/tokencanopy/rainier/internal/xfer"
+	"github.com/tokencanopy/rainier/protocol/terminal"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 const (
@@ -563,25 +563,25 @@ func (ss *scriptedSessiond) cursors() []uint64 {
 }
 
 // openFrames is what an attach opens with, mirroring session.Attach's rule
-// (whose own tests pin the real one): the whole log for wire.SinceAll, the
+// (whose own tests pin the real one): the whole log for terminal.SinceAll, the
 // entries after a resume cursor, and the snapshot for everything else —
 // including a cursor the log cannot answer.
-func (ss *scriptedSessiond) openFrames(since uint64) []wire.ServerMsg {
+func (ss *scriptedSessiond) openFrames(since uint64) []terminal.ServerMessage {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	ss.opens = append(ss.opens, since)
 
 	last := uint64(len(ss.log))
 	from := since
-	if since == wire.SinceAll {
+	if since == terminal.SinceAll {
 		from = 0
 	}
-	if last == 0 || (since != wire.SinceAll && (since == 0 || since > last)) {
-		return []wire.ServerMsg{{Type: "snapshot", Seq: 1, Data: []byte(snapshotFor(ss.id))}}
+	if last == 0 || (since != terminal.SinceAll && (since == 0 || since > last)) {
+		return []terminal.ServerMessage{{Type: "snapshot", Seq: 1, Data: []byte(snapshotFor(ss.id))}}
 	}
-	out := make([]wire.ServerMsg, 0, last-from)
+	out := make([]terminal.ServerMessage, 0, last-from)
 	for i := from; i < last; i++ {
-		out = append(out, wire.ServerMsg{Type: "output", Seq: i + 1, Data: ss.log[i]})
+		out = append(out, terminal.ServerMessage{Type: "output", Seq: i + 1, Data: ss.log[i]})
 	}
 	return out
 }
@@ -631,12 +631,12 @@ func (ss *scriptedSessiond) serve() {
 				ss.send(ctx, f.AttachID, m)
 			}
 		case relay.FrameClient:
-			var m wire.ClientMsg
+			var m terminal.ClientMessage
 			if json.Unmarshal(f.Payload, &m) != nil {
 				continue
 			}
 			if m.Type == "stdin" {
-				ss.send(ctx, f.AttachID, wire.ServerMsg{Type: "output", Seq: 2, Data: m.Data})
+				ss.send(ctx, f.AttachID, terminal.ServerMessage{Type: "output", Seq: 2, Data: m.Data})
 			}
 		case relay.FrameControl:
 			ss.onControl(f.Payload)
@@ -644,7 +644,7 @@ func (ss *scriptedSessiond) serve() {
 	}
 }
 
-func (ss *scriptedSessiond) send(ctx context.Context, attachID uint64, m wire.ServerMsg) {
+func (ss *scriptedSessiond) send(ctx context.Context, attachID uint64, m terminal.ServerMessage) {
 	payload, err := json.Marshal(m)
 	if err != nil {
 		return
@@ -880,7 +880,7 @@ func rpcErrorText(payload json.RawMessage) string {
 // offset — cmd/sessiond's protocol without cmd/sessiond's transfer table.
 //
 // It is a stand-in, not a second implementation of the rules: every archive it
-// writes or reads goes through internal/xfer, the same package the real client
+// writes or reads goes through protocol/workspace, the same package the real client
 // and the real sandbox both import, so what this scene proves about a directory
 // arriving intact is a fact about the shared code and the wire, not about a
 // tar written twice.
@@ -918,8 +918,8 @@ func (ss *scriptedSessiond) serveFiles(t *testing.T) *sandboxFiles {
 			t.Fatalf("preparing the sandbox's stand-in workspace: %v", err)
 		}
 	}
-	ss.handle(xfer.MethodPushFiles, sf.push)
-	ss.handle(xfer.MethodPullFiles, sf.pull)
+	ss.handle(workspace.MethodPushFiles, sf.push)
+	ss.handle(workspace.MethodPullFiles, sf.pull)
 	return sf
 }
 
@@ -929,23 +929,23 @@ func (ss *scriptedSessiond) serveFiles(t *testing.T) *sandboxFiles {
 // The prefix strip is the ONE thing here a real sandbox does not do:
 // /workspace is a mount point inside a container and a temporary directory on
 // a test machine. Everything after it — the `..` rule, the symlink rule, the
-// absolute-path rule — is xfer.Resolve, unchanged, so a path that would escape
+// absolute-path rule — is workspace.Resolve, unchanged, so a path that would escape
 // still escapes nothing.
 func (sf *sandboxFiles) resolve(p string) (string, error) {
 	rel := p
 	switch {
-	case rel == xfer.WorkspaceRoot:
+	case rel == workspace.WorkspaceRoot:
 		rel = "."
-	case strings.HasPrefix(rel, xfer.WorkspaceRoot+"/"):
-		rel = strings.TrimPrefix(rel, xfer.WorkspaceRoot+"/")
+	case strings.HasPrefix(rel, workspace.WorkspaceRoot+"/"):
+		rel = strings.TrimPrefix(rel, workspace.WorkspaceRoot+"/")
 	}
-	return xfer.Resolve(sf.root, rel)
+	return workspace.Resolve(sf.root, rel)
 }
 
 // push appends one chunk to a transfer's staging archive and, on the last one,
 // extracts the whole thing into the destination the FIRST chunk named.
 func (sf *sandboxFiles) push(payload json.RawMessage) (any, error) {
-	var c xfer.PushChunk
+	var c workspace.PushChunk
 	if err := json.Unmarshal(payload, &c); err != nil {
 		return nil, fmt.Errorf("reading the push chunk: %w", err)
 	}
@@ -979,7 +979,7 @@ func (sf *sandboxFiles) push(payload json.RawMessage) (any, error) {
 	}
 	x.next++
 	if !c.Done {
-		return xfer.PushAck{Seq: c.Seq}, nil
+		return workspace.PushAck{Seq: c.Seq}, nil
 	}
 
 	delete(sf.pushes, c.Xfer)
@@ -988,16 +988,16 @@ func (sf *sandboxFiles) push(payload json.RawMessage) (any, error) {
 	if err := x.f.Close(); err != nil {
 		return nil, fmt.Errorf("staging the push: %w", err)
 	}
-	if err := xfer.UntarGz(name, x.dest, xfer.MaxExtractBytes); err != nil {
+	if err := workspace.UntarGz(name, x.dest, workspace.MaxExtractBytes); err != nil {
 		return nil, fmt.Errorf("unpacking into %s: %w", c.Path, err)
 	}
-	return xfer.PushAck{Seq: c.Seq, Synced: true}, nil
+	return workspace.PushAck{Seq: c.Seq, Synced: true}, nil
 }
 
 // pull tars the path on chunk 0 and serves slices of that one archive
 // afterwards, so what a client reassembles is a consistent snapshot.
 func (sf *sandboxFiles) pull(payload json.RawMessage) (any, error) {
-	var req xfer.PullRequest
+	var req workspace.PullRequest
 	if err := json.Unmarshal(payload, &req); err != nil {
 		return nil, fmt.Errorf("reading the pull request: %w", err)
 	}
@@ -1020,23 +1020,23 @@ func (sf *sandboxFiles) pull(payload json.RawMessage) (any, error) {
 			return nil, fmt.Errorf("%s does not exist in this session's workspace", req.Path)
 		}
 		var buf bytes.Buffer
-		if _, err := xfer.TarGz(&buf, src, xfer.MaxBytes); err != nil {
+		if _, err := workspace.TarGz(&buf, src, workspace.MaxBytes); err != nil {
 			return nil, fmt.Errorf("archiving %s: %w", req.Path, err)
 		}
 		data = buf.Bytes()
 		sf.pulls[req.Xfer] = data
 	}
 
-	off := req.Seq * xfer.ChunkBytes
+	off := req.Seq * workspace.ChunkBytes
 	if off > len(data) {
 		return nil, fmt.Errorf("pull chunk %d is past the end of the archive", req.Seq)
 	}
-	end := min(off+xfer.ChunkBytes, len(data))
+	end := min(off+workspace.ChunkBytes, len(data))
 	done := end >= len(data)
 	if done {
 		delete(sf.pulls, req.Xfer)
 	}
-	return xfer.PullChunk{Seq: req.Seq, Data: data[off:end], Done: done}, nil
+	return workspace.PullChunk{Seq: req.Seq, Data: data[off:end], Done: done}, nil
 }
 
 // boot starts a scripted sessiond for every placed session that doesn't have
@@ -1463,9 +1463,9 @@ func (f *fleet) waitCredential(provider, status string, timeout time.Duration) a
 
 // diff reads GET /v0/sessions/{id}/diff — the answer the sandbox gave, as the
 // API renders it.
-func (f *fleet) diff(id string) xfer.DiffAnswer {
+func (f *fleet) diff(id string) workspace.DiffAnswer {
 	f.t.Helper()
-	var ans xfer.DiffAnswer
+	var ans workspace.DiffAnswer
 	if err := f.client().Do(http.MethodGet, "/v0/sessions/"+id+"/diff", nil, &ans); err != nil {
 		f.t.Fatalf("GET /v0/sessions/%s/diff: %v", id, err)
 	}
@@ -1477,7 +1477,7 @@ func (f *fleet) diff(id string) xfer.DiffAnswer {
 // ---------------------------------------------------------------------------
 
 // attachConn is a client attached through controld's attach plane, speaking
-// the same wire.ClientMsg/ServerMsg protocol `rainier attach` speaks.
+// the same terminal.ClientMessage/ServerMsg protocol `rainier attach` speaks.
 type attachConn struct {
 	t      *testing.T
 	c      *websocket.Conn
@@ -1508,7 +1508,7 @@ func (f *fleet) attach(id string, since uint64) *attachConn {
 			f.t.Cleanup(a.close)
 			wctx, wcancel := context.WithTimeout(ctx, 10*time.Second)
 			defer wcancel()
-			if err := wsjson.Write(wctx, c, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24}); err != nil {
+			if err := wsjson.Write(wctx, c, terminal.ClientMessage{Type: "resize", Cols: 80, Rows: 24}); err != nil {
 				f.t.Fatalf("attach %s: sending the first resize: %v", id, err)
 			}
 			return a
@@ -1522,7 +1522,7 @@ func (f *fleet) attach(id string, since uint64) *attachConn {
 }
 
 // read takes the next server message, failing the test if none arrives.
-func (a *attachConn) read() wire.ServerMsg {
+func (a *attachConn) read() terminal.ServerMessage {
 	a.t.Helper()
 	m, err := a.readErr(10 * time.Second)
 	if err != nil {
@@ -1533,10 +1533,10 @@ func (a *attachConn) read() wire.ServerMsg {
 
 // readErr is read without the assertion — for the scene that wants to prove
 // the attach DID die.
-func (a *attachConn) readErr(timeout time.Duration) (wire.ServerMsg, error) {
+func (a *attachConn) readErr(timeout time.Duration) (terminal.ServerMessage, error) {
 	ctx, cancel := context.WithTimeout(a.ctx, timeout)
 	defer cancel()
-	var m wire.ServerMsg
+	var m terminal.ServerMessage
 	err := wsjson.Read(ctx, a.c, &m)
 	return m, err
 }
@@ -1546,7 +1546,7 @@ func (a *attachConn) stdin(s string) {
 	a.t.Helper()
 	ctx, cancel := context.WithTimeout(a.ctx, 10*time.Second)
 	defer cancel()
-	if err := wsjson.Write(ctx, a.c, wire.ClientMsg{Type: "stdin", Data: []byte(s)}); err != nil {
+	if err := wsjson.Write(ctx, a.c, terminal.ClientMessage{Type: "stdin", Data: []byte(s)}); err != nil {
 		a.t.Fatalf("attach write: %v", err)
 	}
 }
@@ -2036,9 +2036,9 @@ func TestFullReplayReachesTheViewer(t *testing.T) {
 	// CLI spelled — the assertion that would have caught the omitempty hop
 	// eating it, or controld dropping it out of dial_attach.
 	got := ss.cursors()
-	if len(got) != 2 || got[0] != 0 || got[1] != wire.SinceAll {
+	if len(got) != 2 || got[0] != 0 || got[1] != terminal.SinceAll {
 		t.Fatalf("cursors the session was attached with = %v, want [0 %d] (plain attach, then --since 0)",
-			got, wire.SinceAll)
+			got, terminal.SinceAll)
 	}
 }
 
@@ -2527,14 +2527,14 @@ func TestConnectorSessionMintsAndReportsDiff(t *testing.T) {
 
 	// --- the diff. The sandbox answers it; the REST API renders that answer.
 	stat := " README.md | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n"
-	ss.handle(xfer.MethodDiff, func(payload json.RawMessage) (any, error) {
+	ss.handle(workspace.MethodDiff, func(payload json.RawMessage) (any, error) {
 		// The method takes no arguments — what to diff is the session's own
 		// repository list, which controld already resolved. A payload here
 		// would mean a caller had been allowed to name a directory.
 		if len(payload) != 0 {
 			return nil, fmt.Errorf("diff carried a payload (%s); it takes no arguments", payload)
 		}
-		return xfer.DiffAnswer{Repos: []xfer.RepoDiff{{
+		return workspace.DiffAnswer{Repos: []workspace.RepoDiff{{
 			Repo: "acme/app", BaseBranch: "main", SessionBranch: "rainier/clones", Stat: stat,
 		}}}, nil
 	})
@@ -2547,8 +2547,8 @@ func TestConnectorSessionMintsAndReportsDiff(t *testing.T) {
 	if got.Repo != "acme/app" || got.BaseBranch != "main" || got.SessionBranch != "rainier/clones" || got.Stat != stat {
 		t.Fatalf("GET /diff rendered %+v, want the sandbox's own answer verbatim (stat %q)", got, stat)
 	}
-	if served := ss.methodsServed(); !slices.Equal(served, []string{xfer.MethodDiff}) {
-		t.Fatalf("the sandbox was asked for %v, want exactly one %q", served, xfer.MethodDiff)
+	if served := ss.methodsServed(); !slices.Equal(served, []string{workspace.MethodDiff}) {
+		t.Fatalf("the sandbox was asked for %v, want exactly one %q", served, workspace.MethodDiff)
 	}
 }
 
@@ -2715,7 +2715,7 @@ func TestStageFailedClone(t *testing.T) {
 // archive the way cmd/sessiond does. What that buys over either end's own tests
 // is the whole path in one piece: a chunked upload whose acks are correlated
 // per chunk, a download reassembled from chunks controld counted as they
-// arrived, and the same internal/xfer rules applied by three processes.
+// arrived, and the same protocol/workspace rules applied by three processes.
 //
 // The tree is deliberately awkward — nested directories, an empty one, a
 // non-ASCII name, a file whose bytes are not text, an executable bit — because
@@ -2751,7 +2751,7 @@ func TestPushPullRoundTrip(t *testing.T) {
 	}
 
 	// --- push it in. The path is spelled the way a user spells it.
-	const remote = xfer.WorkspaceRoot + "/incoming"
+	const remote = workspace.WorkspaceRoot + "/incoming"
 	if err := cli.Push(f.client(), created.ID, src, remote, nil); err != nil {
 		t.Fatalf("rainier push %s %s:%s: %v", src, created.ID, remote, err)
 	}
@@ -2779,7 +2779,7 @@ func TestPushPullRoundTrip(t *testing.T) {
 	// A pull of something that is not there is a refusal from inside the
 	// sandbox, and it reaches the client as the sandbox's own sentence rather
 	// than as a truncated archive.
-	err = cli.Pull(f.client(), created.ID, xfer.WorkspaceRoot+"/nothing-here", t.TempDir(), nil)
+	err = cli.Pull(f.client(), created.ID, workspace.WorkspaceRoot+"/nothing-here", t.TempDir(), nil)
 	if err == nil {
 		t.Fatal("pulling a path the session does not have succeeded")
 	}

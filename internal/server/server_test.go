@@ -15,7 +15,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 
 	"github.com/tokencanopy/rainier/internal/session"
-	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 func startBash(t *testing.T) *session.Session {
@@ -24,7 +24,9 @@ func startBash(t *testing.T) *session.Session {
 		session.Config{Argv: []string{"sh", "-i"}, Cols: 80, Rows: 24, LogPath: filepath.Join(t.TempDir(), "s.log")},
 		session.StartProc,
 	)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	return s
 }
 
@@ -33,12 +35,14 @@ func dial(t *testing.T, url string, since string) *websocket.Conn {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	c, _, err := websocket.Dial(ctx, strings.Replace(url, "http", "ws", 1)+"/attach?since="+since, nil)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Match the real client fix (cmd/rattach): raise the default 32KiB
 	// per-message read limit so an oversized PTY-output frame doesn't close
 	// the test connection with StatusMessageTooBig.
 	c.SetReadLimit(16 << 20)
-	wsjson.Write(ctx, c, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24})
+	wsjson.Write(ctx, c, terminal.ClientMessage{Type: "resize", Cols: 80, Rows: 24})
 	return c
 }
 
@@ -47,12 +51,14 @@ func dialSize(t *testing.T, url string, cols, rows int) *websocket.Conn {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	c, _, err := websocket.Dial(ctx, strings.Replace(url, "http", "ws", 1)+"/attach?since=0", nil)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Match the real client fix (cmd/rattach): raise the default 32KiB
 	// per-message read limit so an oversized PTY-output frame doesn't close
 	// the test connection with StatusMessageTooBig.
 	c.SetReadLimit(16 << 20)
-	wsjson.Write(ctx, c, wire.ClientMsg{Type: "resize", Cols: cols, Rows: rows})
+	wsjson.Write(ctx, c, terminal.ClientMessage{Type: "resize", Cols: cols, Rows: rows})
 	return c
 }
 
@@ -62,12 +68,14 @@ func readUntil(t *testing.T, c *websocket.Conn, want string) {
 	defer cancel()
 	var all strings.Builder
 	for {
-		var m wire.ServerMsg
+		var m terminal.ServerMessage
 		if err := wsjson.Read(ctx, c, &m); err != nil {
 			t.Fatalf("read: %v (so far: %q)", err, all.String())
 		}
 		all.Write(m.Data)
-		if strings.Contains(all.String(), want) { return }
+		if strings.Contains(all.String(), want) {
+			return
+		}
 	}
 }
 
@@ -89,7 +97,7 @@ func readUntil(t *testing.T, c *websocket.Conn, want string) {
 // single goroutine per connection — coder/websocket only guarantees Read is
 // safe to call from one goroutine at a time.
 type connPump struct {
-	msgs chan wire.ServerMsg
+	msgs chan terminal.ServerMessage
 	err  chan error
 }
 
@@ -101,12 +109,14 @@ var (
 func pumpFor(c *websocket.Conn) *connPump {
 	connPumpsMu.Lock()
 	defer connPumpsMu.Unlock()
-	if p, ok := connPumps[c]; ok { return p }
-	p := &connPump{msgs: make(chan wire.ServerMsg, 256), err: make(chan error, 1)}
+	if p, ok := connPumps[c]; ok {
+		return p
+	}
+	p := &connPump{msgs: make(chan terminal.ServerMessage, 256), err: make(chan error, 1)}
 	connPumps[c] = p
 	go func() {
 		for {
-			var m wire.ServerMsg
+			var m terminal.ServerMessage
 			if err := wsjson.Read(context.Background(), c, &m); err != nil {
 				p.err <- err
 				close(p.msgs)
@@ -132,9 +142,13 @@ func readUntilOrTimeout(t *testing.T, c *websocket.Conn, want string, timeout ti
 	for {
 		select {
 		case m, ok := <-p.msgs:
-			if !ok { return false } // connection's read loop ended (err on p.err)
+			if !ok {
+				return false
+			} // connection's read loop ended (err on p.err)
 			all.Write(m.Data)
-			if strings.Contains(all.String(), want) { return true }
+			if strings.Contains(all.String(), want) {
+				return true
+			}
 		case <-deadline:
 			return false
 		}
@@ -146,11 +160,13 @@ func readUntilOrTimeout(t *testing.T, c *websocket.Conn, want string, timeout ti
 func readUntilExit(t *testing.T, ctx context.Context, c *websocket.Conn) {
 	t.Helper()
 	for {
-		var m wire.ServerMsg
+		var m terminal.ServerMessage
 		if err := wsjson.Read(ctx, c, &m); err != nil {
 			t.Fatalf("read: %v (exit message never observed)", err)
 		}
-		if m.Type == "exit" { return }
+		if m.Type == "exit" {
+			return
+		}
 	}
 }
 
@@ -174,7 +190,7 @@ func TestSessionExitClosesSocket(t *testing.T) {
 	defer cancel()
 
 	// Make the child exit: sh -i reads "exit\n" from stdin and terminates.
-	if err := wsjson.Write(ctx, c, wire.ClientMsg{Type: "stdin", Data: []byte("exit\n")}); err != nil {
+	if err := wsjson.Write(ctx, c, terminal.ClientMessage{Type: "stdin", Data: []byte("exit\n")}); err != nil {
 		t.Fatalf("write stdin: %v", err)
 	}
 
@@ -184,7 +200,7 @@ func TestSessionExitClosesSocket(t *testing.T) {
 	// (2) THEN — not before — the read loop must terminate: the very next
 	// read must fail because serve() closed the socket after draining
 	// att.Msgs, rather than hang until the shared 5s deadline expires.
-	var m wire.ServerMsg
+	var m terminal.ServerMessage
 	err := wsjson.Read(ctx, c, &m)
 	if err == nil {
 		t.Fatalf("expected the read loop to terminate with an error after exit, got another message: %+v", m)
@@ -201,7 +217,7 @@ func TestAttachTypeReattach(t *testing.T) {
 
 	c1 := dial(t, srv.URL, "0")
 	ctx := context.Background()
-	wsjson.Write(ctx, c1, wire.ClientMsg{Type: "stdin", Data: []byte("echo marker-123\n")})
+	wsjson.Write(ctx, c1, terminal.ClientMessage{Type: "stdin", Data: []byte("echo marker-123\n")})
 	readUntil(t, c1, "marker-123")
 	c1.Close(websocket.StatusNormalClosure, "detach") // client vanishes; session lives
 
@@ -225,9 +241,9 @@ func TestAttachTypeReattach(t *testing.T) {
 type burstProc struct{ done chan struct{} }
 
 func (p *burstProc) Write(b []byte) (int, error) { return len(b), nil }
-func (p *burstProc) Resize(cols, rows int) error  { return nil }
-func (p *burstProc) Wait() int                    { <-p.done; return 0 }
-func (p *burstProc) Stop()                        {}
+func (p *burstProc) Resize(cols, rows int) error { return nil }
+func (p *burstProc) Wait() int                   { <-p.done; return 0 }
+func (p *burstProc) Stop()                       {}
 
 // startBurst scripts: a small "start" marker (giving a since=1 reattach
 // something to resume after), a pause (so a test client can be attached and
@@ -253,13 +269,15 @@ func startBurst(argv []string, cols, rows int, onOutput func([]byte)) (session.P
 func TestOversizedFrameSurvivesLiveAndReplay(t *testing.T) {
 	s, err := session.New(
 		session.Config{
-			Argv:    []string{"fake-burst"},
-			Cols:    80, Rows: 24,
+			Argv: []string{"fake-burst"},
+			Cols: 80, Rows: 24,
 			LogPath: filepath.Join(t.TempDir(), "s.log"),
 		},
 		startBurst,
 	)
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv := httptest.NewServer(New(s))
 	defer srv.Close()
 

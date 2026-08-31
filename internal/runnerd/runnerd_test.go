@@ -21,7 +21,7 @@ import (
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/internal/session"
-	"github.com/tokencanopy/rainier/internal/wire"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 // This test wires the real relay end-to-end without Docker: create a session
@@ -46,10 +46,10 @@ func TestRunnerdCreateRegisterAttach(t *testing.T) {
 		t.Fatal(err)
 	}
 	cli.SetReadLimit(16 << 20)
-	wsjson.Write(ctx, cli, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24})
+	wsjson.Write(ctx, cli, terminal.ClientMessage{Type: "resize", Cols: 80, Rows: 24})
 
 	// Expect snapshot then echoed marker.
-	wsjson.Write(ctx, cli, wire.ClientMsg{Type: "stdin", Data: []byte("echo runnerd-marker\n")})
+	wsjson.Write(ctx, cli, terminal.ClientMessage{Type: "stdin", Data: []byte("echo runnerd-marker\n")})
 	deadline := time.After(5 * time.Second)
 	for {
 		select {
@@ -57,7 +57,7 @@ func TestRunnerdCreateRegisterAttach(t *testing.T) {
 			t.Fatal("no runnerd-marker through runnerd relay")
 		default:
 		}
-		var m wire.ServerMsg
+		var m terminal.ServerMessage
 		if err := wsjson.Read(ctx, cli, &m); err != nil {
 			t.Fatal(err)
 		}
@@ -358,8 +358,8 @@ func TestRegisterCleansUpOnSessionConnDeath(t *testing.T) {
 		t.Fatal(err)
 	}
 	cli.SetReadLimit(16 << 20)
-	wsjson.Write(ctx, cli, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24})
-	wsjson.Write(ctx, cli, wire.ClientMsg{Type: "stdin", Data: []byte("echo pre-death-marker\n")})
+	wsjson.Write(ctx, cli, terminal.ClientMessage{Type: "resize", Cols: 80, Rows: 24})
+	wsjson.Write(ctx, cli, terminal.ClientMessage{Type: "stdin", Data: []byte("echo pre-death-marker\n")})
 	found := false
 	echoDeadline := time.After(5 * time.Second)
 	for !found {
@@ -368,7 +368,7 @@ func TestRegisterCleansUpOnSessionConnDeath(t *testing.T) {
 			t.Fatal("no pre-death-marker before killing the sessiond conn")
 		default:
 		}
-		var m wire.ServerMsg
+		var m terminal.ServerMessage
 		if err := wsjson.Read(ctx, cli, &m); err != nil {
 			t.Fatal(err)
 		}
@@ -415,8 +415,8 @@ func attachAndAssertEcho(t *testing.T, ctx context.Context, base, id, marker str
 	}
 	defer cli.CloseNow()
 	cli.SetReadLimit(16 << 20)
-	wsjson.Write(ctx, cli, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24})
-	wsjson.Write(ctx, cli, wire.ClientMsg{Type: "stdin", Data: []byte("echo " + marker + "\n")})
+	wsjson.Write(ctx, cli, terminal.ClientMessage{Type: "resize", Cols: 80, Rows: 24})
+	wsjson.Write(ctx, cli, terminal.ClientMessage{Type: "stdin", Data: []byte("echo " + marker + "\n")})
 	deadline := time.After(5 * time.Second)
 	for {
 		select {
@@ -424,7 +424,7 @@ func attachAndAssertEcho(t *testing.T, ctx context.Context, base, id, marker str
 			t.Fatalf("no %s through the relay", marker)
 		default:
 		}
-		var m wire.ServerMsg
+		var m terminal.ServerMessage
 		if err := wsjson.Read(ctx, cli, &m); err != nil {
 			t.Fatal(err)
 		}
@@ -1555,7 +1555,7 @@ func TestControlHandlerDoesNotBlockTheHubReadLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cli.CloseNow()
-	if err := wsjson.Write(ctx, cli, wire.ClientMsg{Type: "resize", Cols: 80, Rows: 24}); err != nil {
+	if err := wsjson.Write(ctx, cli, terminal.ClientMessage{Type: "resize", Cols: 80, Rows: 24}); err != nil {
 		t.Fatal(err)
 	}
 	// Read the FrameOpen the hub sends us, so we know the attach id.
@@ -1579,14 +1579,14 @@ func TestControlHandlerDoesNotBlockTheHubReadLoop(t *testing.T) {
 		t.Fatal("the control event never reached the callback")
 	}
 
-	msg, _ := json.Marshal(wire.ServerMsg{Type: "output", Seq: 1, Data: []byte("still alive")})
+	msg, _ := json.Marshal(terminal.ServerMessage{Type: "output", Seq: 1, Data: []byte("still alive")})
 	out, _ := relay.Encode(relay.Frame{Type: relay.FrameServer, AttachID: open.AttachID, Payload: msg})
 	if err := sessConn.Write(ctx, websocket.MessageText, out); err != nil {
 		t.Fatal(err)
 	}
 	readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	var got wire.ServerMsg
+	var got terminal.ServerMessage
 	if err := wsjson.Read(readCtx, cli, &got); err != nil {
 		t.Fatalf("client read while a control handler is wedged: %v (the hub read loop is blocked)", err)
 	}
