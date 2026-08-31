@@ -76,7 +76,7 @@ func newTestControldOver(t *testing.T, st Store, opts ...func(*Config)) (*Server
 }
 
 func runnerWSURL(ts *httptest.Server) string {
-	return "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/runners/connect"
+	return "ws" + strings.TrimPrefix(ts.URL, "http") + "/v0/runners/connect"
 }
 
 // dialRunner performs the raw websocket dial with the given bearer token
@@ -104,7 +104,7 @@ type runnerScript struct {
 	Total    int
 }
 
-// fakeRunner is a scripted runnerd: it dials /v1/runners/connect, writes one
+// fakeRunner is a scripted runnerd: it dials /v0/runners/connect, writes one
 // announce, then records every ToRunner controld sends and answers only when
 // the test tells it to. Its reader runs in its own goroutine, so a test never
 // has to interleave reads with the assertions it wants to make.
@@ -1726,12 +1726,12 @@ func TestSetupDoneSnapshotFailureRecordsNothing(t *testing.T) {
 
 // TestUnroutedPathIs404 pins Handler()'s shape: a path no route claims 404s
 // even once every task's routes are registered. (Task 10 claimed
-// /v1/sessions itself, so this now probes a path nothing will ever claim.)
+// /v0/sessions itself, so this now probes a path nothing will ever claim.)
 func TestUnroutedPathIs404(t *testing.T) {
 	_, _, ts := newTestControld(t)
-	resp, err := http.Get(ts.URL + "/v1/bogus")
+	resp, err := http.Get(ts.URL + "/v0/bogus")
 	if err != nil {
-		t.Fatalf("GET /v1/bogus: %v", err)
+		t.Fatalf("GET /v0/bogus: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {

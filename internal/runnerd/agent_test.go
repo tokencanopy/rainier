@@ -52,7 +52,7 @@ func (f *createTrackingFake) createCalls() []driver.Spec {
 	return out
 }
 
-// fakeControld stands up a bare-bones /v1/runners/connect endpoint: it
+// fakeControld stands up a bare-bones /v0/runners/connect endpoint: it
 // checks the dial's bearer token, accepts the websocket, and hands the
 // resulting conn to the test over a channel — one per dial, so a test can
 // observe reconnects as additional values.
@@ -70,7 +70,7 @@ func newFakeControld(t *testing.T, token string) *fakeControld {
 	t.Helper()
 	fc := &fakeControld{conns: make(chan *fakeConn, 8)}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/runners/connect", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v0/runners/connect", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
@@ -380,7 +380,7 @@ func TestDialAttachBackChecksTargetOrigin(t *testing.T) {
 		rd := New(driver.NewFake(4), "", "", "")
 		msg := rwire.ToRunner{Type: "dial_attach", Session: "sess_x", Attach: &rwire.Attach{
 			AttachID: "0123456789abcdef", Cols: 80, Rows: 24,
-			TargetURL: probeWS + "/v1/runners/attach-back?attach_id=0123456789abcdef",
+			TargetURL: probeWS + "/v0/runners/attach-back?attach_id=0123456789abcdef",
 		}}
 		rd.dialAttachBack(context.Background(), msg, AgentConfig{ControldURL: controldURL, Token: testToken})
 		return hits.Load()
@@ -409,8 +409,8 @@ func TestSameControld(t *testing.T) {
 		controld, target string
 		want             bool
 	}{
-		{"identical", "ws://c:9090", "ws://c:9090/v1/runners/attach-back?attach_id=a", true},
-		{"http external url", "wss://c.example", "wss://c.example/v1/runners/attach-back", true},
+		{"identical", "ws://c:9090", "ws://c:9090/v0/runners/attach-back?attach_id=a", true},
+		{"http external url", "wss://c.example", "wss://c.example/v0/runners/attach-back", true},
 		{"default port implied", "wss://c.example:443", "wss://c.example/x", true},
 		{"http vs ws scheme alias", "ws://c:80", "http://c/x", true},
 		{"foreign host", "ws://c:9090", "ws://evil.example:9090/x", false},

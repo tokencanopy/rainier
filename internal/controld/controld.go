@@ -35,7 +35,7 @@ const (
 // SecretsKey are required; the rest default.
 type Config struct {
 	// RunnerToken is the fleet-wide bearer every runnerd presents on
-	// /v1/runners/connect (and, later, on the attach-back dial).
+	// /v0/runners/connect (and, later, on the attach-back dial).
 	RunnerToken string
 	// SecretsKey is the AES-256 key team secrets are sealed under at rest
 	// (seal.go), parsed from RAINIER_SECRETS_KEY by ParseSecretsKey. It is
@@ -56,7 +56,7 @@ type Config struct {
 	ExternalURL string
 	// OpTimeout is the budget for one dispatch round-trip to a runner.
 	OpTimeout time.Duration
-	// AttachWait bounds how long WS /v1/sessions/{id}/attach waits for the
+	// AttachWait bounds how long WS /v0/sessions/{id}/attach waits for the
 	// session to reach `running` before answering 503 session_not_ready.
 	// Zero means defaultAttachWait; tests shorten it.
 	AttachWait time.Duration
@@ -157,50 +157,50 @@ func New(st Store, cfg Config) (*Server, error) {
 // claims 404.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/runners/connect", s.handleRunnerConnect)
-	mux.HandleFunc("GET /v1/runners/attach-back", s.handleAttachBack)
-	mux.HandleFunc("POST /v1/auth/github", s.handleGitHubAuth)
-	mux.HandleFunc("GET /v1/me", s.requireUser(s.handleMe))
+	mux.HandleFunc("GET /v0/runners/connect", s.handleRunnerConnect)
+	mux.HandleFunc("GET /v0/runners/attach-back", s.handleAttachBack)
+	mux.HandleFunc("POST /v0/auth/github", s.handleGitHubAuth)
+	mux.HandleFunc("GET /v0/me", s.requireUser(s.handleMe))
 
-	mux.HandleFunc("POST /v1/sessions", s.requireUser(s.handleCreateSession))
-	mux.HandleFunc("GET /v1/sessions", s.requireUser(s.handleListSessions))
-	mux.HandleFunc("GET /v1/sessions/{id}", s.requireUser(s.handleGetSession))
-	mux.HandleFunc("DELETE /v1/sessions/{id}", s.requireUser(s.handleDeleteSession))
-	mux.HandleFunc("POST /v1/sessions/{id}/suspend", s.requireUser(s.handleSuspendSession))
-	mux.HandleFunc("POST /v1/sessions/{id}/resume", s.requireUser(s.handleResumeSession))
-	mux.HandleFunc("POST /v1/sessions/{id}/snapshot", s.requireUser(s.handleSnapshotSession))
-	mux.HandleFunc("GET /v1/sessions/{id}/attach", s.requireUser(s.handleClientAttach))
+	mux.HandleFunc("POST /v0/sessions", s.requireUser(s.handleCreateSession))
+	mux.HandleFunc("GET /v0/sessions", s.requireUser(s.handleListSessions))
+	mux.HandleFunc("GET /v0/sessions/{id}", s.requireUser(s.handleGetSession))
+	mux.HandleFunc("DELETE /v0/sessions/{id}", s.requireUser(s.handleDeleteSession))
+	mux.HandleFunc("POST /v0/sessions/{id}/suspend", s.requireUser(s.handleSuspendSession))
+	mux.HandleFunc("POST /v0/sessions/{id}/resume", s.requireUser(s.handleResumeSession))
+	mux.HandleFunc("POST /v0/sessions/{id}/snapshot", s.requireUser(s.handleSnapshotSession))
+	mux.HandleFunc("GET /v0/sessions/{id}/attach", s.requireUser(s.handleClientAttach))
 
 	// Workspace inspection — the session's working tree, read and written
 	// from outside. The diff is team-visible like the other session reads
 	// (design §4.6): `--stat` is metadata, file paths and churn counts. The
 	// two file routes are owner-or-admin like attach, because they carry the
 	// tree itself — bytes out, and writes in (§4.4; api.go, sessionForRPC).
-	mux.HandleFunc("GET /v1/sessions/{id}/diff", s.requireUser(s.handleSessionDiff))
-	mux.HandleFunc("POST /v1/sessions/{id}/files", s.requireUser(s.handlePushFiles))
-	mux.HandleFunc("GET /v1/sessions/{id}/files", s.requireUser(s.handlePullFiles))
+	mux.HandleFunc("GET /v0/sessions/{id}/diff", s.requireUser(s.handleSessionDiff))
+	mux.HandleFunc("POST /v0/sessions/{id}/files", s.requireUser(s.handlePushFiles))
+	mux.HandleFunc("GET /v0/sessions/{id}/files", s.requireUser(s.handlePullFiles))
 
-	mux.HandleFunc("GET /v1/runners", s.requireUser(s.handleListRunners))
+	mux.HandleFunc("GET /v0/runners", s.requireUser(s.handleListRunners))
 
 	// Secrets: writes are admin-only, the listing is team-visible (names and
 	// timestamps only — values are write-only at this API, design §4.5).
-	mux.HandleFunc("PUT /v1/secrets/{name}", s.requireAdmin(s.handlePutSecret))
-	mux.HandleFunc("GET /v1/secrets", s.requireUser(s.handleListSecrets))
-	mux.HandleFunc("DELETE /v1/secrets/{name}", s.requireAdmin(s.handleDeleteSecret))
+	mux.HandleFunc("PUT /v0/secrets/{name}", s.requireAdmin(s.handlePutSecret))
+	mux.HandleFunc("GET /v0/secrets", s.requireUser(s.handleListSecrets))
+	mux.HandleFunc("DELETE /v0/secrets/{name}", s.requireAdmin(s.handleDeleteSecret))
 
 	// Credentials are per-user, not per-team: the listing is the caller's
 	// own rows and nobody else's (not even an admin's view of them), and
 	// there is no write route at all — a credential is stored by logging in.
-	mux.HandleFunc("GET /v1/credentials", s.requireUser(s.handleListCredentials))
+	mux.HandleFunc("GET /v0/credentials", s.requireUser(s.handleListCredentials))
 
 	// Environments belong to the whole team, so like secrets they have no
 	// owner to fall back on: mutations are admin-only, reads team-visible
 	// (design §4.5). The {id} routes take an id or a name.
-	mux.HandleFunc("POST /v1/environments", s.requireAdmin(s.handleCreateEnvironment))
-	mux.HandleFunc("GET /v1/environments", s.requireUser(s.handleListEnvironments))
-	mux.HandleFunc("GET /v1/environments/{id}", s.requireUser(s.handleGetEnvironment))
-	mux.HandleFunc("PATCH /v1/environments/{id}", s.requireAdmin(s.handleUpdateEnvironment))
-	mux.HandleFunc("DELETE /v1/environments/{id}", s.requireAdmin(s.handleDeleteEnvironment))
+	mux.HandleFunc("POST /v0/environments", s.requireAdmin(s.handleCreateEnvironment))
+	mux.HandleFunc("GET /v0/environments", s.requireUser(s.handleListEnvironments))
+	mux.HandleFunc("GET /v0/environments/{id}", s.requireUser(s.handleGetEnvironment))
+	mux.HandleFunc("PATCH /v0/environments/{id}", s.requireAdmin(s.handleUpdateEnvironment))
+	mux.HandleFunc("DELETE /v0/environments/{id}", s.requireAdmin(s.handleDeleteEnvironment))
 
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 

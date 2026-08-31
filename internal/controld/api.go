@@ -25,7 +25,7 @@ import (
 // adversary) from streaming an unbounded body at the decoder.
 const sessionsBodyLimit = 64 << 10
 
-// defaultListLimit and maxListLimit bound GET /v1/sessions's page size: a
+// defaultListLimit and maxListLimit bound GET /v0/sessions's page size: a
 // caller who names no limit gets defaultListLimit rows; one who asks for
 // more than maxListLimit is silently capped rather than rejected (a big
 // number is not malformed, just optimistic).
@@ -268,7 +268,7 @@ type snapshotResponse struct {
 // request bodies
 // ---------------------------------------------------------------------------
 
-// createSessionRequest is POST /v1/sessions's body. Environment names the
+// createSessionRequest is POST /v0/sessions's body. Environment names the
 // environment this session starts from, by name or by id; omitting it is a
 // scratch session, exactly as before environments existed. Image and
 // EgressAllow are overrides when it is present — see resolveEnvironment.
@@ -341,7 +341,7 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, v any) bool {
 }
 
 // decodeJSONBodyLimit is decodeJSONBody with an explicit byte cap, for the
-// one body that isn't a small fixed-shape object: PUT /v1/secrets/{name}
+// one body that isn't a small fixed-shape object: PUT /v0/secrets/{name}
 // carries a value up to maxSecretValueBytes, which JSON escaping can inflate
 // well past the sessions limit.
 func decodeJSONBodyLimit(w http.ResponseWriter, r *http.Request, v any, limit int64) bool {
@@ -367,10 +367,10 @@ func authorizeOwnerOrAdmin(u User, row Session) bool {
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/sessions
+// POST /v0/sessions
 // ---------------------------------------------------------------------------
 
-// handleCreateSession serves POST /v1/sessions. The row commits to the
+// handleCreateSession serves POST /v0/sessions. The row commits to the
 // store before wakeScheduler and before the 202 is written — a client that
 // gets a response, or a controld that crashes right after this call, always
 // has a durable row to show for it (design §4.6, "create is write-ahead
@@ -625,7 +625,7 @@ func missingSecretMessage(env Environment, name string) string {
 }
 
 func (s *Server) writeSessionCreated(w http.ResponseWriter, r *http.Request, row Session) {
-	w.Header().Set("Location", "/v1/sessions/"+row.ID)
+	w.Header().Set("Location", "/v0/sessions/"+row.ID)
 	writeJSON(w, http.StatusAccepted, sessionEnvelope{Session: s.renderer(r.Context()).view(row)})
 }
 
@@ -651,10 +651,10 @@ func (s *Server) writeCurrentSession(w http.ResponseWriter, r *http.Request, id 
 }
 
 // ---------------------------------------------------------------------------
-// GET /v1/sessions
+// GET /v0/sessions
 // ---------------------------------------------------------------------------
 
-// handleListSessions serves GET /v1/sessions: team-visible, cursor-paginated,
+// handleListSessions serves GET /v0/sessions: team-visible, cursor-paginated,
 // terminal states hidden unless all=true. name is an optional exact filter;
 // the CLI uses it to resolve one resource without paging through team history.
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request, u User) {
@@ -711,7 +711,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request, u Us
 }
 
 // ---------------------------------------------------------------------------
-// GET /v1/sessions/{id}
+// GET /v0/sessions/{id}
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request, u User) {
@@ -730,10 +730,10 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request, u User
 }
 
 // ---------------------------------------------------------------------------
-// DELETE /v1/sessions/{id}
+// DELETE /v0/sessions/{id}
 // ---------------------------------------------------------------------------
 
-// handleDeleteSession serves DELETE /v1/sessions/{id} per the route table:
+// handleDeleteSession serves DELETE /v0/sessions/{id} per the route table:
 // queued cancels outright; creating is rejected (409, nothing to destroy
 // yet, dispatch may already be in flight); a placed session is destroyed on
 // its runner if that runner is connected, or marked destroyed directly if
@@ -877,7 +877,7 @@ func (s *Server) reclaimWorkspace(row Session) {
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/sessions/{id}/suspend
+// POST /v0/sessions/{id}/suspend
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleSuspendSession(w http.ResponseWriter, r *http.Request, u User) {
@@ -951,7 +951,7 @@ func (s *Server) handleSuspendSession(w http.ResponseWriter, r *http.Request, u 
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/sessions/{id}/resume
+// POST /v0/sessions/{id}/resume
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request, u User) {
@@ -1038,7 +1038,7 @@ func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request, u U
 }
 
 // ---------------------------------------------------------------------------
-// POST /v1/sessions/{id}/snapshot
+// POST /v0/sessions/{id}/snapshot
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleSnapshotSession(w http.ResponseWriter, r *http.Request, u User) {
@@ -1084,7 +1084,7 @@ func (s *Server) handleSnapshotSession(w http.ResponseWriter, r *http.Request, u
 }
 
 // ---------------------------------------------------------------------------
-// GET /v1/runners
+// GET /v0/runners
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleListRunners(w http.ResponseWriter, r *http.Request, u User) {
@@ -1108,7 +1108,7 @@ func (s *Server) handleListRunners(w http.ResponseWriter, r *http.Request, u Use
 }
 
 // ---------------------------------------------------------------------------
-// secrets: PUT/GET/DELETE /v1/secrets
+// secrets: PUT/GET/DELETE /v0/secrets
 // ---------------------------------------------------------------------------
 
 const (
@@ -1144,14 +1144,14 @@ type secretsEnvelope struct {
 	Secrets []secretView `json:"secrets"`
 }
 
-// putSecretRequest is the decoded body of PUT /v1/secrets/{name}. Value is
+// putSecretRequest is the decoded body of PUT /v0/secrets/{name}. Value is
 // never logged and never echoed — not in a success response, not in an
 // error.
 type putSecretRequest struct {
 	Value string `json:"value"`
 }
 
-// handlePutSecret serves PUT /v1/secrets/{name} (admin): seal the value
+// handlePutSecret serves PUT /v0/secrets/{name} (admin): seal the value
 // under the fleet's secrets key and upsert it. The response is a bare 204 —
 // there is nothing to return that the caller doesn't already have, and a
 // body echoing the name is one refactor away from echoing the value.
@@ -1192,7 +1192,7 @@ func (s *Server) handlePutSecret(w http.ResponseWriter, r *http.Request, u User)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleListSecrets serves GET /v1/secrets: every secret's name and
+// handleListSecrets serves GET /v0/secrets: every secret's name and
 // timestamps, name ascending. Team-visible like every other read on this
 // API — knowing which names exist is what lets a member write an
 // environment that references them; the values stay unreadable.
@@ -1214,8 +1214,8 @@ func (s *Server) handleListSecrets(w http.ResponseWriter, r *http.Request, u Use
 	writeJSON(w, http.StatusOK, secretsEnvelope{Secrets: out})
 }
 
-// handleDeleteSecret serves DELETE /v1/secrets/{name} (admin). Unlike
-// DELETE /v1/sessions/{id}, this one is not idempotent: an unknown name is
+// handleDeleteSecret serves DELETE /v0/secrets/{name} (admin). Unlike
+// DELETE /v0/sessions/{id}, this one is not idempotent: an unknown name is
 // 404, because deleting the wrong secret and deleting a nonexistent one look
 // identical to the caller otherwise, and there is no "already gone" state to
 // report the way a terminal session has.
@@ -1238,7 +1238,7 @@ func (s *Server) handleDeleteSecret(w http.ResponseWriter, r *http.Request, u Us
 }
 
 // ---------------------------------------------------------------------------
-// credentials: GET /v1/credentials
+// credentials: GET /v0/credentials
 // ---------------------------------------------------------------------------
 
 // credentialView is the client-facing rendering of a Credential: what the
@@ -1259,7 +1259,7 @@ type credentialsEnvelope struct {
 	Credentials []credentialView `json:"credentials"`
 }
 
-// handleListCredentials serves GET /v1/credentials: the CALLER's own
+// handleListCredentials serves GET /v0/credentials: the CALLER's own
 // credentials, provider ascending.
 //
 // This is the one listing on this API that is not team-visible, and the
@@ -1290,7 +1290,7 @@ func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request, u
 }
 
 // ---------------------------------------------------------------------------
-// environments: POST/GET /v1/environments, GET/PATCH/DELETE /v1/environments/{id}
+// environments: POST/GET /v0/environments, GET/PATCH/DELETE /v0/environments/{id}
 // ---------------------------------------------------------------------------
 
 // environmentsBodyLimit caps every environment request body. It is larger
@@ -1700,7 +1700,7 @@ func (s *Server) environmentByRef(ctx context.Context, ref string) (Environment,
 	return s.st.GetEnvironmentByName(ctx, ref)
 }
 
-// handleCreateEnvironment serves POST /v1/environments (admin): validate the
+// handleCreateEnvironment serves POST /v0/environments (admin): validate the
 // whole body, then commit. Nothing is stored until every check has passed —
 // a rejected create leaves no half-built environment behind.
 func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request, u User) {
@@ -1752,11 +1752,11 @@ func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	w.Header().Set("Location", "/v1/environments/"+created.ID)
+	w.Header().Set("Location", "/v0/environments/"+created.ID)
 	writeJSON(w, http.StatusCreated, environmentEnvelope{Environment: environmentJSON(created)})
 }
 
-// handleListEnvironments serves GET /v1/environments: every environment, name
+// handleListEnvironments serves GET /v0/environments: every environment, name
 // ascending. Team-visible like every other read on this API — a member has to
 // see the environments to start a session from one. There are few
 // environments per deployment, so this page is the whole table (no cursor).
@@ -1774,7 +1774,7 @@ func (s *Server) handleListEnvironments(w http.ResponseWriter, r *http.Request, 
 	writeJSON(w, http.StatusOK, environmentsEnvelope{Environments: out})
 }
 
-// handleGetEnvironment serves GET /v1/environments/{id}, by id or by name.
+// handleGetEnvironment serves GET /v0/environments/{id}, by id or by name.
 func (s *Server) handleGetEnvironment(w http.ResponseWriter, r *http.Request, u User) {
 	ref := r.PathValue("id")
 	row, err := s.environmentByRef(r.Context(), ref)
@@ -1797,7 +1797,7 @@ func writeEnvironmentLookupErr(w http.ResponseWriter, ref string, err error, msg
 	writeErr(w, http.StatusInternalServerError, "internal", msg)
 }
 
-// handleUpdateEnvironment serves PATCH /v1/environments/{id} (admin): a
+// handleUpdateEnvironment serves PATCH /v0/environments/{id} (admin): a
 // partial update of the create fields, applied to the row as it stands. The
 // store owns setup_hash (recomputed from the merged image+setup) and the
 // three snapshot columns — an edit that moves the hash deliberately leaves
@@ -1889,7 +1889,7 @@ func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request,
 	writeJSON(w, http.StatusOK, environmentEnvelope{Environment: environmentJSON(updated)})
 }
 
-// handleDeleteEnvironment serves DELETE /v1/environments/{id} (admin). An
+// handleDeleteEnvironment serves DELETE /v0/environments/{id} (admin). An
 // environment that live sessions still came from is not deleted: those
 // sessions pin their own resolved_image and would survive, but the
 // environment is how an operator reasons about them, so removing it out from
@@ -1932,9 +1932,9 @@ func (s *Server) handleDeleteEnvironment(w http.ResponseWriter, r *http.Request,
 
 // ---------------------------------------------------------------------------
 // workspace inspection:
-//   GET  /v1/sessions/{id}/diff
-//   POST /v1/sessions/{id}/files        one chunk of an upload
-//   GET  /v1/sessions/{id}/files?path=  the whole download, streamed
+//   GET  /v0/sessions/{id}/diff
+//   POST /v0/sessions/{id}/files        one chunk of an upload
+//   GET  /v0/sessions/{id}/files?path=  the whole download, streamed
 //
 // All three are the same shape: check the session is reachable (and, for the
 // two that carry files, that this caller owns it), then drive a session RPC
@@ -1964,7 +1964,7 @@ func (s *Server) handleDeleteEnvironment(w http.ResponseWriter, r *http.Request,
 // payload cap (plan §Global Constraints) — the body is about to become one.
 const filesBodyLimit = 2 << 20
 
-// handleSessionDiff serves GET /v1/sessions/{id}/diff: one `--stat` per
+// handleSessionDiff serves GET /v0/sessions/{id}/diff: one `--stat` per
 // repository the session cloned, straight from the sandbox.
 //
 // Team-visible, like the other session reads — nil owner below, deliberately
@@ -1983,7 +1983,7 @@ func (s *Server) handleSessionDiff(w http.ResponseWriter, r *http.Request, u Use
 	writeJSON(w, http.StatusOK, ans)
 }
 
-// handlePushFiles serves POST /v1/sessions/{id}/files: one chunk, forwarded to
+// handlePushFiles serves POST /v0/sessions/{id}/files: one chunk, forwarded to
 // the sandbox, answered with the sandbox's ack.
 //
 // controld holds NO per-transfer state, and must not: a session's replica is
@@ -2050,7 +2050,7 @@ func validatePushChunk(c xfer.PushChunk) string {
 // own choosing), but it does reach log lines and error messages.
 const maxXferIDLen = 64
 
-// handlePullFiles serves GET /v1/sessions/{id}/files?path=…: the sandbox's
+// handlePullFiles serves GET /v0/sessions/{id}/files?path=…: the sandbox's
 // archive of that path, streamed out chunk by chunk as it arrives.
 //
 // Errors have two eras. Before the first byte, a failure is an ordinary JSON
@@ -2220,7 +2220,7 @@ func sandboxMessage(s string) string {
 // ---------------------------------------------------------------------------
 
 // handleHealthz serves GET /healthz: the one other unauthenticated route
-// besides POST /v1/auth/github. Plain "ok", no internals, ever.
+// besides POST /v0/auth/github. Plain "ok", no internals, ever.
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

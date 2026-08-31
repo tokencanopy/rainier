@@ -14,7 +14,7 @@ import (
 // controld server to talk to, and the bearer token to talk to it with.
 //
 // OwnerID is the caller's own user id, learned at login from the identity
-// controld returns (the same one GET /v1/me answers with) and cached here so
+// controld returns (the same one GET /v0/me answers with) and cached here so
 // every later command has it without a round trip. It is the string a
 // session row carries as owner_id, and it is used to break ties when a
 // session name resolves to more than one session; see cmd/rainier's

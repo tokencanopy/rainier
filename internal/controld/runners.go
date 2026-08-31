@@ -210,7 +210,7 @@ func (rc *runnerConn) writeLoop(ctx context.Context) {
 	}
 }
 
-// handleRunnerConnect serves GET /v1/runners/connect: authenticate, upgrade,
+// handleRunnerConnect serves GET /v0/runners/connect: authenticate, upgrade,
 // take the announce, reconcile against it, then serve the connection until
 // it dies.
 func (s *Server) handleRunnerConnect(w http.ResponseWriter, r *http.Request) {

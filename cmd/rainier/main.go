@@ -192,7 +192,7 @@ type snapshotResponse struct {
 }
 
 // userView mirrors controld's own: the caller's identity, as returned by
-// both POST /v1/auth/github and GET /v1/me. ID is the caller's own user id —
+// both POST /v0/auth/github and GET /v0/me. ID is the caller's own user id —
 // the same string their sessions carry as owner_id, which is what makes
 // owner-preference possible (see resolveSessionID).
 type userView struct {
@@ -211,7 +211,7 @@ type authResponse struct {
 	Warning string `json:"warning"`
 }
 
-// credential mirrors one element of GET /v1/credentials. As with `secret`,
+// credential mirrors one element of GET /v0/credentials. As with `secret`,
 // there is no value field here for the same reason there is none
 // server-side: the API never returns one.
 type credential struct {
@@ -239,7 +239,7 @@ type suspendRequest struct {
 	Warm *bool `json:"warm,omitempty"`
 }
 
-// secret mirrors one element of GET /v1/secrets. There is no value field
+// secret mirrors one element of GET /v0/secrets. There is no value field
 // here for the same reason there is none server-side: the API never returns
 // one.
 type secret struct {
@@ -366,12 +366,12 @@ func runLogin(args []string) error {
 	// There is no second endpoint to call and nothing extra to send.
 	c := &cli.Client{Base: serverURL}
 	var resp authResponse
-	if err := c.Do(http.MethodPost, "/v1/auth/github", map[string]string{"access_token": ghToken}, &resp); err != nil {
+	if err := c.Do(http.MethodPost, "/v0/auth/github", map[string]string{"access_token": ghToken}, &resp); err != nil {
 		return err
 	}
 
 	// Login is where this CLI learns who it is. The identity in the exchange
-	// response is the same one GET /v1/me answers with — id, login, role —
+	// response is the same one GET /v0/me answers with — id, login, role —
 	// and its id is what resolveSessionID compares against a session's
 	// owner_id, so caching it here is what makes owner-preference work from
 	// the first command after a login rather than only after a `new`.
@@ -408,7 +408,7 @@ func runLogin(args []string) error {
 // creds
 // ---------------------------------------------------------------------------
 
-// runCreds renders GET /v1/credentials: what the server's vault holds for
+// runCreds renders GET /v0/credentials: what the server's vault holds for
 // the caller, and nothing about anyone else. There is no value in the
 // response and none in this table by construction — a credential is
 // write-only at that API exactly like a secret.
@@ -423,7 +423,7 @@ func runCreds(args []string) error {
 	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
 
 	var resp credentialsEnvelope
-	if err := c.Do(http.MethodGet, "/v1/credentials", nil, &resp); err != nil {
+	if err := c.Do(http.MethodGet, "/v0/credentials", nil, &resp); err != nil {
 		return err
 	}
 
@@ -587,7 +587,7 @@ func runNew(args []string) error {
 	if key == "" {
 		key = cli.RandHex(8)
 	}
-	if err := c.Do(http.MethodPost, "/v1/sessions", body, &resp, cli.IdempotencyKey(key)); err != nil {
+	if err := c.Do(http.MethodPost, "/v0/sessions", body, &resp, cli.IdempotencyKey(key)); err != nil {
 		return err
 	}
 	fmt.Println(resp.Session.ID)
@@ -719,7 +719,7 @@ func runLs(args []string) error {
 		if cursor != "" {
 			q.Set("cursor", cursor)
 		}
-		path := "/v1/sessions"
+		path := "/v0/sessions"
 		if enc := q.Encode(); enc != "" {
 			path += "?" + enc
 		}
@@ -742,7 +742,7 @@ func runLs(args []string) error {
 
 	if !*all {
 		var failed sessionsEnvelope
-		if err := c.Do(http.MethodGet, "/v1/sessions?all=true&limit=1&state=failed", nil, &failed); err == nil && len(failed.Sessions) > 0 {
+		if err := c.Do(http.MethodGet, "/v0/sessions?all=true&limit=1&state=failed", nil, &failed); err == nil && len(failed.Sessions) > 0 {
 			fmt.Println("hint: failed sessions are hidden; run `rainier ls --all` to inspect or remove them")
 		}
 	}
@@ -840,7 +840,7 @@ func prepareAttach(c *cli.Client, id string) error {
 		return nil
 	case "suspended_warm", "suspended_cold":
 		var resumed sessionEnvelope
-		resumeErr := c.Do(http.MethodPost, "/v1/sessions/"+id+"/resume", nil, &resumed)
+		resumeErr := c.Do(http.MethodPost, "/v0/sessions/"+id+"/resume", nil, &resumed)
 		if resumeErr == nil {
 			return nil
 		}
@@ -887,7 +887,7 @@ func getSession(c *cli.Client, id string) (session, error) {
 
 func getSessionContext(ctx context.Context, c *cli.Client, id string) (session, error) {
 	var resp sessionEnvelope
-	if err := c.DoContext(ctx, http.MethodGet, "/v1/sessions/"+id, nil, &resp); err != nil {
+	if err := c.DoContext(ctx, http.MethodGet, "/v0/sessions/"+id, nil, &resp); err != nil {
 		return session{}, err
 	}
 	return resp.Session, nil
@@ -927,7 +927,7 @@ func runSuspend(args []string) error {
 		req.Warm = &warm
 	}
 	var resp sessionEnvelope
-	if err := c.Do(http.MethodPost, "/v1/sessions/"+id+"/suspend", req, &resp); err != nil {
+	if err := c.Do(http.MethodPost, "/v0/sessions/"+id+"/suspend", req, &resp); err != nil {
 		return err
 	}
 	fmt.Printf("%s -> %s\n", resp.Session.ID, resp.Session.State)
@@ -944,7 +944,7 @@ func runResume(args []string) error {
 		return err
 	}
 	var resp sessionEnvelope
-	if err := c.Do(http.MethodPost, "/v1/sessions/"+id+"/resume", nil, &resp); err != nil {
+	if err := c.Do(http.MethodPost, "/v0/sessions/"+id+"/resume", nil, &resp); err != nil {
 		return err
 	}
 	fmt.Printf("%s -> %s\n", resp.Session.ID, resp.Session.State)
@@ -961,7 +961,7 @@ func runSnapshot(args []string) error {
 		return err
 	}
 	var resp snapshotResponse
-	if err := c.Do(http.MethodPost, "/v1/sessions/"+id+"/snapshot", nil, &resp); err != nil {
+	if err := c.Do(http.MethodPost, "/v0/sessions/"+id+"/snapshot", nil, &resp); err != nil {
 		return err
 	}
 	fmt.Println(resp.Ref)
@@ -977,7 +977,7 @@ func runRm(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := c.Do(http.MethodDelete, "/v1/sessions/"+id, nil, nil); err != nil {
+	if err := c.Do(http.MethodDelete, "/v0/sessions/"+id, nil, nil); err != nil {
 		return err
 	}
 	fmt.Println("removed", id)
@@ -1003,7 +1003,7 @@ func runDiff(args []string) error {
 		return err
 	}
 	var ans xfer.DiffAnswer
-	if err := c.Do(http.MethodGet, "/v1/sessions/"+id+"/diff", nil, &ans); err != nil {
+	if err := c.Do(http.MethodGet, "/v0/sessions/"+id+"/diff", nil, &ans); err != nil {
 		return err
 	}
 	renderDiff(os.Stdout, ans)
@@ -1175,7 +1175,7 @@ func runSecretSet(args []string) error {
 	}
 
 	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
-	if err := c.Do(http.MethodPut, "/v1/secrets/"+url.PathEscape(name), putSecretRequest{Value: v}, nil); err != nil {
+	if err := c.Do(http.MethodPut, "/v0/secrets/"+url.PathEscape(name), putSecretRequest{Value: v}, nil); err != nil {
 		return err
 	}
 	// The name, never the value — this line can land in a terminal recording
@@ -1216,7 +1216,7 @@ func runSecretLs(args []string) error {
 	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
 
 	var resp secretsEnvelope
-	if err := c.Do(http.MethodGet, "/v1/secrets", nil, &resp); err != nil {
+	if err := c.Do(http.MethodGet, "/v0/secrets", nil, &resp); err != nil {
 		return err
 	}
 
@@ -1238,7 +1238,7 @@ func runSecretRm(args []string) error {
 		return err
 	}
 	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
-	if err := c.Do(http.MethodDelete, "/v1/secrets/"+url.PathEscape(name), nil, nil); err != nil {
+	if err := c.Do(http.MethodDelete, "/v0/secrets/"+url.PathEscape(name), nil, nil); err != nil {
 		return err
 	}
 	fmt.Println("removed", name)
@@ -1417,7 +1417,7 @@ func runEnvCreate(args []string) error {
 		SetupTimeoutSec: *f.timeout,
 	}
 	var resp environmentEnvelope
-	if err := c.Do(http.MethodPost, "/v1/environments", body, &resp); err != nil {
+	if err := c.Do(http.MethodPost, "/v0/environments", body, &resp); err != nil {
 		return err
 	}
 	fmt.Println(resp.Environment.ID)
@@ -1435,7 +1435,7 @@ func runEnvLs(args []string) error {
 	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
 
 	var resp environmentsEnvelope
-	if err := c.Do(http.MethodGet, "/v1/environments", nil, &resp); err != nil {
+	if err := c.Do(http.MethodGet, "/v0/environments", nil, &resp); err != nil {
 		return err
 	}
 
@@ -1475,7 +1475,7 @@ func runEnvShow(args []string) error {
 	var resp struct {
 		Environment json.RawMessage `json:"environment"`
 	}
-	if err := c.Do(http.MethodGet, "/v1/environments/"+url.PathEscape(ref), nil, &resp); err != nil {
+	if err := c.Do(http.MethodGet, "/v0/environments/"+url.PathEscape(ref), nil, &resp); err != nil {
 		return err
 	}
 	var pretty bytes.Buffer
@@ -1550,7 +1550,7 @@ func runEnvUpdate(args []string) error {
 	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
 
 	var resp environmentEnvelope
-	if err := c.Do(http.MethodPatch, "/v1/environments/"+url.PathEscape(ref), patch, &resp); err != nil {
+	if err := c.Do(http.MethodPatch, "/v0/environments/"+url.PathEscape(ref), patch, &resp); err != nil {
 		return err
 	}
 	fmt.Println(resp.Environment.ID)
@@ -1567,7 +1567,7 @@ func runEnvRm(args []string) error {
 		return err
 	}
 	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
-	if err := c.Do(http.MethodDelete, "/v1/environments/"+url.PathEscape(ref), nil, nil); err != nil {
+	if err := c.Do(http.MethodDelete, "/v0/environments/"+url.PathEscape(ref), nil, nil); err != nil {
 		return err
 	}
 	fmt.Println("removed", ref)
@@ -1853,7 +1853,7 @@ func resolveClientAndIDWithScope(ref string, scope sessionResolveScope) (cli.Con
 
 // resolveSessionID resolves ref to a session id: a "sess_" prefix is
 // already an id, verbatim; anything else is looked up through the exact-name
-// filter on paginated GET /v1/sessions. The CLI still makes the ambiguity
+// filter on paginated GET /v0/sessions. The CLI still makes the ambiguity
 // decision because that collection is team-visible. The default resolver sees
 // only non-terminal sessions. rm's variant opts into terminal rows because a
 // failed create can still own a live container. The caller's own rows take
@@ -1861,7 +1861,7 @@ func resolveClientAndIDWithScope(ref string, scope sessionResolveScope) (cli.Con
 // row that reused a terminal row's name wins and the historical one requires
 // its id.
 //
-// Session names are unique only per owner (design), while GET /v1/sessions
+// Session names are unique only per owner (design), while GET /v0/sessions
 // is team-visible — two teammates can each have a session named e.g.
 // "dev-box". Every exact-name match is collected across every page
 // before deciding anything (a match on page 1 does not short-circuit the
@@ -1877,7 +1877,7 @@ func resolveClientAndIDWithScope(ref string, scope sessionResolveScope) (cli.Con
 //
 // myOwnerID is the caller's own user id, cached in cli.Config.OwnerID by
 // `rainier login` from the identity controld returns (the same one GET
-// /v1/me answers with). It is the same string a session row carries as
+// /v0/me answers with). It is the same string a session row carries as
 // owner_id, which is the whole reason this comparison is possible. Empty
 // only for a config written before logins carried it — owner-preference is
 // then unavailable and an ambiguous name errors, exactly as it did.
@@ -1921,7 +1921,7 @@ func resolveSessionIDWithScope(c *cli.Client, myOwnerID, ref string, scope sessi
 		if cursor != "" {
 			q.Set("cursor", cursor)
 		}
-		path := "/v1/sessions"
+		path := "/v0/sessions"
 		if enc := q.Encode(); enc != "" {
 			path += "?" + enc
 		}
@@ -1944,7 +1944,7 @@ func resolveSessionIDWithScope(c *cli.Client, myOwnerID, ref string, scope sessi
 		}
 		cursor = page.NextCursor
 	}
-	// GET /v1/sessions is team-visible, but lifecycle commands should operate
+	// GET /v0/sessions is team-visible, but lifecycle commands should operate
 	// on the caller's own same-name row whenever one exists. Do this before
 	// active-history preference: my failed row is still my cleanup target even
 	// if a teammate currently has an active session with the same name.
@@ -2022,7 +2022,7 @@ func wsURLFor(serverURL, id string) string {
 	case strings.HasPrefix(ws, "http://"):
 		ws = "ws://" + strings.TrimPrefix(ws, "http://")
 	}
-	return strings.TrimRight(ws, "/") + "/v1/sessions/" + id + "/attach"
+	return strings.TrimRight(ws, "/") + "/v0/sessions/" + id + "/attach"
 }
 
 // requireRef pulls the positional <id|name> argument every lifecycle

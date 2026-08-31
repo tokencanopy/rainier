@@ -37,7 +37,7 @@ type Client struct {
 type Option func(*http.Request)
 
 // IdempotencyKey sets the Idempotency-Key header for one Do call. Callers
-// that need one (POST /v1/sessions) generate a fresh key per invocation —
+// that need one (POST /v0/sessions) generate a fresh key per invocation —
 // Do itself never invents one, since only the caller knows which calls are
 // retries of the same intent and which are new.
 func IdempotencyKey(key string) Option {
@@ -108,7 +108,7 @@ func (c *Client) DoContext(ctx context.Context, method, path string, in, out any
 
 // Open is Do for a response that is NOT JSON: it returns the successful
 // response's body for the caller to read and close. The one such response on
-// this API is a pull's archive (GET /v1/sessions/{id}/files), which is
+// this API is a pull's archive (GET /v0/sessions/{id}/files), which is
 // streamed and may be hundreds of megabytes — decoding it into memory the way
 // Do does would defeat the point of streaming it.
 //

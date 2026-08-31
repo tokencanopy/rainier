@@ -97,7 +97,7 @@ const (
 	e2eGitHubID     = 1001
 	e2eNoreplyEmail = "1001+alice@users.noreply.github.com"
 	// e2eRunnerToken is the fleet-wide bearer every runnerd in these scenes
-	// presents on /v1/runners/connect.
+	// presents on /v0/runners/connect.
 	e2eRunnerToken = "rnr_e2e_fleet_token"
 	// e2eSecretsKeyHex is the AES-256 key these scenes' controld seals team
 	// secrets under; controld.New requires one (fail closed).
@@ -246,7 +246,7 @@ func (f *fleet) client() *cli.Client {
 }
 
 // login exchanges the fake GitHub token for a controld bearer through the
-// real POST /v1/auth/github handler.
+// real POST /v0/auth/github handler.
 func (f *fleet) login() string {
 	f.t.Helper()
 	anon := &cli.Client{Base: f.baseURL(), HTTP: &http.Client{Timeout: 20 * time.Second}}
@@ -257,8 +257,8 @@ func (f *fleet) login() string {
 			Role  string `json:"role"`
 		} `json:"user"`
 	}
-	if err := anon.Do(http.MethodPost, "/v1/auth/github", map[string]string{"access_token": e2eGHToken}, &resp); err != nil {
-		f.t.Fatalf("POST /v1/auth/github: %v", err)
+	if err := anon.Do(http.MethodPost, "/v0/auth/github", map[string]string{"access_token": e2eGHToken}, &resp); err != nil {
+		f.t.Fatalf("POST /v0/auth/github: %v", err)
 	}
 	if resp.Token == "" || resp.User.Login != e2eLogin || resp.User.Role != "admin" {
 		f.t.Fatalf("login response = %+v, want a token for admin %q", resp, e2eLogin)
@@ -1133,9 +1133,9 @@ func (f *fleet) create(name string) apiSession {
 	f.t.Helper()
 	var resp sessionEnvelope
 	body := map[string]any{"name": name, "image": "e2e-image"}
-	err := f.client().Do(http.MethodPost, "/v1/sessions", body, &resp, cli.IdempotencyKey(cli.RandHex(8)))
+	err := f.client().Do(http.MethodPost, "/v0/sessions", body, &resp, cli.IdempotencyKey(cli.RandHex(8)))
 	if err != nil {
-		f.t.Fatalf("POST /v1/sessions (%s): %v", name, err)
+		f.t.Fatalf("POST /v0/sessions (%s): %v", name, err)
 	}
 	if resp.Session.State != "queued" {
 		f.t.Fatalf("created session %s state = %q, want queued", name, resp.Session.State)
@@ -1143,7 +1143,7 @@ func (f *fleet) create(name string) apiSession {
 	return resp.Session
 }
 
-// list pages GET /v1/sessions?all=true and returns every session by id —
+// list pages GET /v0/sessions?all=true and returns every session by id —
 // terminal ones included, since half of what these scenes assert is what a
 // session ended up as.
 func (f *fleet) list() map[string]apiSession {
@@ -1152,7 +1152,7 @@ func (f *fleet) list() map[string]apiSession {
 	c := f.client()
 	cursor := ""
 	for {
-		path := "/v1/sessions?all=true&limit=100"
+		path := "/v0/sessions?all=true&limit=100"
 		if cursor != "" {
 			path += "&cursor=" + url.QueryEscape(cursor)
 		}
@@ -1178,9 +1178,9 @@ func (f *fleet) createFrom(name, envRef string) apiSession {
 	f.t.Helper()
 	var resp sessionEnvelope
 	body := map[string]any{"name": name, "environment": envRef}
-	err := f.client().Do(http.MethodPost, "/v1/sessions", body, &resp, cli.IdempotencyKey(cli.RandHex(8)))
+	err := f.client().Do(http.MethodPost, "/v0/sessions", body, &resp, cli.IdempotencyKey(cli.RandHex(8)))
 	if err != nil {
-		f.t.Fatalf("POST /v1/sessions (%s from environment %s): %v", name, envRef, err)
+		f.t.Fatalf("POST /v0/sessions (%s from environment %s): %v", name, envRef, err)
 	}
 	if resp.Session.State != "queued" {
 		f.t.Fatalf("created session %s state = %q, want queued", name, resp.Session.State)
@@ -1191,8 +1191,8 @@ func (f *fleet) createFrom(name, envRef string) apiSession {
 // delete removes a session exactly as `rainier rm` does.
 func (f *fleet) delete(id string) {
 	f.t.Helper()
-	if err := f.client().Do(http.MethodDelete, "/v1/sessions/"+id, nil, nil); err != nil {
-		f.t.Fatalf("DELETE /v1/sessions/%s: %v", id, err)
+	if err := f.client().Do(http.MethodDelete, "/v0/sessions/"+id, nil, nil); err != nil {
+		f.t.Fatalf("DELETE /v0/sessions/%s: %v", id, err)
 	}
 }
 
@@ -1205,14 +1205,14 @@ type runnersEnvelope struct {
 	} `json:"runners"`
 }
 
-// waitRunner polls GET /v1/runners until name's connected flag matches want.
+// waitRunner polls GET /v0/runners until name's connected flag matches want.
 func (f *fleet) waitRunner(name string, want bool, timeout time.Duration) {
 	f.t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
 		var resp runnersEnvelope
-		if err := f.client().Do(http.MethodGet, "/v1/runners", nil, &resp); err != nil {
-			f.t.Fatalf("GET /v1/runners: %v", err)
+		if err := f.client().Do(http.MethodGet, "/v0/runners", nil, &resp); err != nil {
+			f.t.Fatalf("GET /v0/runners: %v", err)
 		}
 		for _, r := range resp.Runners {
 			if r.Name == name && r.Connected == want {
@@ -1355,8 +1355,8 @@ func snapshotRefFor(t *testing.T, env apiEnvironment) string {
 func (f *fleet) createEnv(body map[string]any) apiEnvironment {
 	f.t.Helper()
 	var resp environmentEnvelope
-	if err := f.client().Do(http.MethodPost, "/v1/environments", body, &resp); err != nil {
-		f.t.Fatalf("POST /v1/environments (%v): %v", body["name"], err)
+	if err := f.client().Do(http.MethodPost, "/v0/environments", body, &resp); err != nil {
+		f.t.Fatalf("POST /v0/environments (%v): %v", body["name"], err)
 	}
 	return resp.Environment
 }
@@ -1365,8 +1365,8 @@ func (f *fleet) createEnv(body map[string]any) apiEnvironment {
 func (f *fleet) getEnv(ref string) apiEnvironment {
 	f.t.Helper()
 	var resp environmentEnvelope
-	if err := f.client().Do(http.MethodGet, "/v1/environments/"+ref, nil, &resp); err != nil {
-		f.t.Fatalf("GET /v1/environments/%s: %v", ref, err)
+	if err := f.client().Do(http.MethodGet, "/v0/environments/"+ref, nil, &resp); err != nil {
+		f.t.Fatalf("GET /v0/environments/%s: %v", ref, err)
 	}
 	return resp.Environment
 }
@@ -1375,8 +1375,8 @@ func (f *fleet) getEnv(ref string) apiEnvironment {
 func (f *fleet) patchEnv(ref string, patch map[string]any) apiEnvironment {
 	f.t.Helper()
 	var resp environmentEnvelope
-	if err := f.client().Do(http.MethodPatch, "/v1/environments/"+ref, patch, &resp); err != nil {
-		f.t.Fatalf("PATCH /v1/environments/%s (%v): %v", ref, patch, err)
+	if err := f.client().Do(http.MethodPatch, "/v0/environments/"+ref, patch, &resp); err != nil {
+		f.t.Fatalf("PATCH /v0/environments/%s (%v): %v", ref, patch, err)
 	}
 	return resp.Environment
 }
@@ -1402,8 +1402,8 @@ func (f *fleet) waitEnv(ref string, timeout time.Duration, what string, cond fun
 // putSecret stores a team secret as `rainier secret set` does.
 func (f *fleet) putSecret(name, value string) {
 	f.t.Helper()
-	if err := f.client().Do(http.MethodPut, "/v1/secrets/"+name, map[string]string{"value": value}, nil); err != nil {
-		f.t.Fatalf("PUT /v1/secrets/%s: %v", name, err)
+	if err := f.client().Do(http.MethodPut, "/v0/secrets/"+name, map[string]string{"value": value}, nil); err != nil {
+		f.t.Fatalf("PUT /v0/secrets/%s: %v", name, err)
 	}
 }
 
@@ -1421,20 +1421,20 @@ type apiCredential struct {
 	LastUsedAt string `json:"last_used_at"`
 }
 
-// credentials reads GET /v1/credentials — the caller's own, exactly as
+// credentials reads GET /v0/credentials — the caller's own, exactly as
 // `rainier creds` renders it — and also returns the raw body, so a scene can
 // assert on what is NOT in it.
 func (f *fleet) credentials() ([]apiCredential, string) {
 	f.t.Helper()
 	var raw json.RawMessage
-	if err := f.client().Do(http.MethodGet, "/v1/credentials", nil, &raw); err != nil {
-		f.t.Fatalf("GET /v1/credentials: %v", err)
+	if err := f.client().Do(http.MethodGet, "/v0/credentials", nil, &raw); err != nil {
+		f.t.Fatalf("GET /v0/credentials: %v", err)
 	}
 	var envelope struct {
 		Credentials []apiCredential `json:"credentials"`
 	}
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		f.t.Fatalf("GET /v1/credentials: decoding %s: %v", raw, err)
+		f.t.Fatalf("GET /v0/credentials: decoding %s: %v", raw, err)
 	}
 	return envelope.Credentials, string(raw)
 }
@@ -1461,13 +1461,13 @@ func (f *fleet) waitCredential(provider, status string, timeout time.Duration) a
 	}
 }
 
-// diff reads GET /v1/sessions/{id}/diff — the answer the sandbox gave, as the
+// diff reads GET /v0/sessions/{id}/diff — the answer the sandbox gave, as the
 // API renders it.
 func (f *fleet) diff(id string) xfer.DiffAnswer {
 	f.t.Helper()
 	var ans xfer.DiffAnswer
-	if err := f.client().Do(http.MethodGet, "/v1/sessions/"+id+"/diff", nil, &ans); err != nil {
-		f.t.Fatalf("GET /v1/sessions/%s/diff: %v", id, err)
+	if err := f.client().Do(http.MethodGet, "/v0/sessions/"+id+"/diff", nil, &ans); err != nil {
+		f.t.Fatalf("GET /v0/sessions/%s/diff: %v", id, err)
 	}
 	return ans
 }
@@ -1486,7 +1486,7 @@ type attachConn struct {
 	once   sync.Once
 }
 
-// attach opens WS /v1/sessions/{id}/attach and completes the resize-first
+// attach opens WS /v0/sessions/{id}/attach and completes the resize-first
 // contract. It retries the dial briefly: a session that just became reachable
 // can still answer 503 session_not_ready for a beat, exactly as `rainier new`
 // expects (attachio.ErrSessionNotReady).
@@ -1496,7 +1496,7 @@ func (f *fleet) attach(id string, since uint64) *attachConn {
 	// connection when its request context is canceled, so a short-lived dial
 	// context would take the attach down with it.
 	ctx, cancel := context.WithCancel(f.ctx)
-	u := f.wsBase() + "/v1/sessions/" + id + "/attach?since=" + strconv.FormatUint(since, 10)
+	u := f.wsBase() + "/v0/sessions/" + id + "/attach?since=" + strconv.FormatUint(since, 10)
 	hdr := http.Header{"Authorization": {"Bearer " + f.token}}
 
 	deadline := time.Now().Add(30 * time.Second)
@@ -2372,8 +2372,8 @@ func TestSecretsReachSpec(t *testing.T) {
 	}
 
 	var body json.RawMessage
-	if err := f.client().Do(http.MethodGet, "/v1/secrets", nil, &body); err != nil {
-		t.Fatalf("GET /v1/secrets: %v", err)
+	if err := f.client().Do(http.MethodGet, "/v0/secrets", nil, &body); err != nil {
+		t.Fatalf("GET /v0/secrets: %v", err)
 	}
 	if !strings.Contains(string(body), secretName) {
 		t.Fatalf("the secret listing does not name %s: %s", secretName, body)

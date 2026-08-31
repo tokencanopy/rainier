@@ -1,5 +1,5 @@
 // internal/controld/files_test.go — the workspace-inspection routes in
-// api.go: GET /v1/sessions/{id}/diff and the push/pull file transfer.
+// api.go: GET /v0/sessions/{id}/diff and the push/pull file transfer.
 package controld
 
 import (
@@ -141,7 +141,7 @@ func transferSession(t *testing.T, st Store, id, runner, userID string) {
 }
 
 // ---------------------------------------------------------------------------
-// GET /v1/sessions/{id}/diff
+// GET /v0/sessions/{id}/diff
 // ---------------------------------------------------------------------------
 
 // TestSessionDiff covers the four kinds this house tests every route with —
@@ -162,7 +162,7 @@ func TestSessionDiff(t *testing.T) {
 			}), nil
 		})
 
-		resp := doJSON(t, ts, http.MethodGet, "/v1/sessions/sess_diff_ok/diff", tok, nil, nil)
+		resp := doJSON(t, ts, http.MethodGet, "/v0/sessions/sess_diff_ok/diff", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, raw)
@@ -192,7 +192,7 @@ func TestSessionDiff(t *testing.T) {
 		transferSession(t, st, "sess_diff_empty", "vm1", u.ID)
 		startSandbox(t, f, func(string, json.RawMessage) (any, error) { return diffAnswerOf(), nil })
 
-		resp := doJSON(t, ts, http.MethodGet, "/v1/sessions/sess_diff_empty/diff", tok, nil, nil)
+		resp := doJSON(t, ts, http.MethodGet, "/v0/sessions/sess_diff_empty/diff", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, raw)
@@ -211,7 +211,7 @@ func TestSessionDiff(t *testing.T) {
 			return diffAnswerOf(xfer.RepoDiff{Repo: "a/b", Stat: strings.Repeat("x", 512<<10)}), nil
 		})
 
-		resp := doJSON(t, ts, http.MethodGet, "/v1/sessions/sess_diff_big/diff", tok, nil, nil)
+		resp := doJSON(t, ts, http.MethodGet, "/v0/sessions/sess_diff_big/diff", tok, nil, nil)
 		raw := readBody(t, resp)
 		var body xfer.DiffAnswer
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
@@ -231,7 +231,7 @@ func TestSessionDiff(t *testing.T) {
 			return nil, fmt.Errorf("acme/widget: fetching origin/main: fatal: couldn't find remote ref main")
 		})
 
-		resp := doJSON(t, ts, http.MethodGet, "/v1/sessions/sess_diff_fail/diff", tok, nil, nil)
+		resp := doJSON(t, ts, http.MethodGet, "/v0/sessions/sess_diff_fail/diff", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409; body = %s", resp.StatusCode, raw)
@@ -243,7 +243,7 @@ func TestSessionDiff(t *testing.T) {
 
 	// TEAM-VISIBLE, deliberately: `--stat` is metadata — file paths and churn
 	// counts, no content — and design §4.6 puts it on the read side of §4.4's
-	// line, where GET /v1/sessions/{id} already sits. A teammate reading which
+	// line, where GET /v0/sessions/{id} already sits. A teammate reading which
 	// files another member's branch touched is the endpoint working, not a
 	// leak: this fleet's posture already lets an admin attach to any session
 	// and push as its owner.
@@ -258,7 +258,7 @@ func TestSessionDiff(t *testing.T) {
 				Repo: "acme/widget", BaseBranch: "main", SessionBranch: "rainier/x", Stat: " main.go | 2 +-\n"}), nil
 		})
 
-		resp := doJSON(t, ts, http.MethodGet, "/v1/sessions/sess_diff_teammate/diff", otherTok, nil, nil)
+		resp := doJSON(t, ts, http.MethodGet, "/v0/sessions/sess_diff_teammate/diff", otherTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200 — the diff is a team-visible read; body = %s", resp.StatusCode, raw)
@@ -277,21 +277,21 @@ func TestSessionDiff(t *testing.T) {
 		u, tok := loginUser(t, st, "alice", "member")
 		joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 
-		resp := doJSON(t, ts, http.MethodGet, "/v1/sessions/sess_nope/diff", tok, nil, nil)
+		resp := doJSON(t, ts, http.MethodGet, "/v0/sessions/sess_nope/diff", tok, nil, nil)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("unknown session status = %d, want 404", resp.StatusCode)
 		}
 		assertErrCode(t, resp, "not_found")
 
 		seedSession(t, st, Session{ID: "sess_diff_queued", State: StateQueued, OwnerID: u.ID})
-		resp = doJSON(t, ts, http.MethodGet, "/v1/sessions/sess_diff_queued/diff", tok, nil, nil)
+		resp = doJSON(t, ts, http.MethodGet, "/v0/sessions/sess_diff_queued/diff", tok, nil, nil)
 		if resp.StatusCode != http.StatusServiceUnavailable {
 			t.Fatalf("queued session status = %d, want 503", resp.StatusCode)
 		}
 		assertErrCode(t, resp, "session_not_ready")
 
 		transferSession(t, st, "sess_diff_gone", "vm-gone", u.ID)
-		resp = doJSON(t, ts, http.MethodGet, "/v1/sessions/sess_diff_gone/diff", tok, nil, nil)
+		resp = doJSON(t, ts, http.MethodGet, "/v0/sessions/sess_diff_gone/diff", tok, nil, nil)
 		if resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("disconnected runner status = %d, want 502", resp.StatusCode)
 		}
@@ -300,7 +300,7 @@ func TestSessionDiff(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// POST/GET /v1/sessions/{id}/files
+// POST/GET /v0/sessions/{id}/files
 // ---------------------------------------------------------------------------
 
 func TestPushFiles(t *testing.T) {
@@ -322,7 +322,7 @@ func TestPushFiles(t *testing.T) {
 		})
 
 		body := xfer.PushChunk{Xfer: "t1", Path: "widget/vendor", Seq: 0, Data: []byte("hello"), Done: true}
-		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions/sess_push_ok/files", tok, body, nil)
+		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_push_ok/files", tok, body, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, raw)
@@ -363,7 +363,7 @@ func TestPushFiles(t *testing.T) {
 		}
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
-				resp := doJSON(t, ts, http.MethodPost, "/v1/sessions/sess_push_bad/files", tok, tc.body, nil)
+				resp := doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_push_bad/files", tok, tc.body, nil)
 				if resp.StatusCode != http.StatusBadRequest {
 					t.Fatalf("status = %d, want 400; body = %s", resp.StatusCode, readBody(t, resp))
 				}
@@ -382,7 +382,7 @@ func TestPushFiles(t *testing.T) {
 		})
 
 		body := xfer.PushChunk{Xfer: "t", Path: "dst", Seq: 3, Data: []byte("x")}
-		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions/sess_push_refused/files", tok, body, nil)
+		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_push_refused/files", tok, body, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409; body = %s", resp.StatusCode, raw)
@@ -399,7 +399,7 @@ func TestPushFiles(t *testing.T) {
 		joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 		body := xfer.PushChunk{Xfer: "t", Path: "dst", Data: []byte("x")}
 
-		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions/sess_nope/files", tok, body, nil)
+		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_nope/files", tok, body, nil)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("unknown session status = %d, want 404", resp.StatusCode)
 		}
@@ -407,7 +407,7 @@ func TestPushFiles(t *testing.T) {
 		// OWNER-OR-ADMIN, unlike the diff above: a push writes into somebody
 		// else's working tree, which is the attach side of §4.4's line.
 		transferSession(t, st, "sess_push_authz", "vm1", u.ID)
-		resp = doJSON(t, ts, http.MethodPost, "/v1/sessions/sess_push_authz/files", otherTok, body, nil)
+		resp = doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_push_authz/files", otherTok, body, nil)
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("pushing into another member's session status = %d, want 403", resp.StatusCode)
 		}
@@ -415,20 +415,20 @@ func TestPushFiles(t *testing.T) {
 
 		// An admin may, which is the same trust-your-team rule attach takes.
 		_, adminTok := loginUser(t, st, "root", "admin")
-		resp = doJSON(t, ts, http.MethodPost, "/v1/sessions/sess_push_authz/files", adminTok, body, nil)
+		resp = doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_push_authz/files", adminTok, body, nil)
 		if resp.StatusCode == http.StatusForbidden {
 			t.Fatal("an admin was refused a push; admins reach every session")
 		}
 
 		seedSession(t, st, Session{ID: "sess_push_queued", State: StateQueued, OwnerID: u.ID})
-		resp = doJSON(t, ts, http.MethodPost, "/v1/sessions/sess_push_queued/files", tok, body, nil)
+		resp = doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_push_queued/files", tok, body, nil)
 		if resp.StatusCode != http.StatusServiceUnavailable {
 			t.Fatalf("queued session status = %d, want 503", resp.StatusCode)
 		}
 		assertErrCode(t, resp, "session_not_ready")
 
 		transferSession(t, st, "sess_push_gone", "vm-gone", u.ID)
-		resp = doJSON(t, ts, http.MethodPost, "/v1/sessions/sess_push_gone/files", tok, body, nil)
+		resp = doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_push_gone/files", tok, body, nil)
 		if resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("disconnected runner status = %d, want 502", resp.StatusCode)
 		}
@@ -446,7 +446,7 @@ func TestPullFiles(t *testing.T) {
 		store.blobs["widget/out"] = []byte("an archive, more or less")
 		startSandbox(t, f, store.serve)
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_pull_ok/files?path=widget/out", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_pull_ok/files?path=widget/out", tok, nil, nil)
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body = %s", resp.StatusCode, readBody(t, resp))
@@ -473,7 +473,7 @@ func TestPullFiles(t *testing.T) {
 		})
 
 		for _, q := range []string{"", "?path=", "?path=../etc", "?path=/etc/passwd", "?path=a/../../b"} {
-			resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_pull_bad/files"+q, tok, nil, nil)
+			resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_pull_bad/files"+q, tok, nil, nil)
 			if resp.StatusCode != http.StatusBadRequest {
 				t.Fatalf("path %q status = %d, want 400", q, resp.StatusCode)
 			}
@@ -488,7 +488,7 @@ func TestPullFiles(t *testing.T) {
 		transferSession(t, st, "sess_pull_missing", "vm1", u.ID)
 		startSandbox(t, f, newFileStore().serve)
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_pull_missing/files?path=nope", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_pull_missing/files?path=nope", tok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409; body = %s", resp.StatusCode, raw)
@@ -516,7 +516,7 @@ func TestPullFiles(t *testing.T) {
 			return xfer.PullChunk{Seq: req.Seq, Data: make([]byte, xfer.ChunkBytes)}, nil
 		})
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_pull_flood/files?path=d", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_pull_flood/files?path=d", tok, nil, nil)
 		defer resp.Body.Close()
 		got, _ := io.ReadAll(resp.Body)
 		if int64(len(got)) > s.xferMax {
@@ -548,7 +548,7 @@ func TestPullFiles(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_pull_empty/files?path=d", tok, nil, nil)
+			resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_pull_empty/files?path=d", tok, nil, nil)
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 		}()
@@ -565,7 +565,7 @@ func TestPullFiles(t *testing.T) {
 		_, otherTok := loginUser(t, st, "bob", "member")
 		joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 
-		resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_nope/files?path=d", tok, nil, nil)
+		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_nope/files?path=d", tok, nil, nil)
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("unknown session status = %d, want 404", resp.StatusCode)
 		}
@@ -573,20 +573,20 @@ func TestPullFiles(t *testing.T) {
 		// OWNER-OR-ADMIN, unlike the diff: a pull carries the working tree's
 		// raw bytes out, not the metadata `--stat` reports.
 		transferSession(t, st, "sess_pull_authz", "vm1", u.ID)
-		resp = doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_pull_authz/files?path=d", otherTok, nil, nil)
+		resp = doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_pull_authz/files?path=d", otherTok, nil, nil)
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("pulling from another member's session status = %d, want 403", resp.StatusCode)
 		}
 		assertErrCode(t, resp, "forbidden")
 
 		seedSession(t, st, Session{ID: "sess_pull_queued", State: StateQueued, OwnerID: u.ID})
-		resp = doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_pull_queued/files?path=d", tok, nil, nil)
+		resp = doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_pull_queued/files?path=d", tok, nil, nil)
 		if resp.StatusCode != http.StatusServiceUnavailable {
 			t.Fatalf("queued session status = %d, want 503", resp.StatusCode)
 		}
 
 		transferSession(t, st, "sess_pull_gone", "vm-gone", u.ID)
-		resp = doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_pull_gone/files?path=d", tok, nil, nil)
+		resp = doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_pull_gone/files?path=d", tok, nil, nil)
 		if resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("disconnected runner status = %d, want 502", resp.StatusCode)
 		}
@@ -614,7 +614,7 @@ func TestTransferRoundTrip(t *testing.T) {
 	for seq, off := 0, 0; off < len(blob); seq, off = seq+1, off+xfer.ChunkBytes {
 		end := min(off+xfer.ChunkBytes, len(blob))
 		body := xfer.PushChunk{Xfer: "round", Path: dest, Seq: seq, Data: blob[off:end], Done: end >= len(blob)}
-		resp := doJSON(t, ts, http.MethodPost, "/v1/sessions/sess_round/files", tok, body, nil)
+		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_round/files", tok, body, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("chunk %d status = %d; body = %s", seq, resp.StatusCode, raw)
@@ -635,7 +635,7 @@ func TestTransferRoundTrip(t *testing.T) {
 		t.Fatalf("the sandbox holds %d bytes, want %d", pushed, len(blob))
 	}
 
-	resp := doRequest(t, ts, http.MethodGet, "/v1/sessions/sess_round/files?path="+dest, tok, nil, nil)
+	resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_round/files?path="+dest, tok, nil, nil)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("pull status = %d; body = %s", resp.StatusCode, readBody(t, resp))

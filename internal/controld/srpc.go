@@ -278,7 +278,7 @@ func rpcPayload(v any) (json.RawMessage, error) {
 // ---------------------------------------------------------------------------
 // controld-initiated: workspace inspection
 //
-// The three methods behind GET /v1/sessions/{id}/diff and the push/pull file
+// The three methods behind GET /v0/sessions/{id}/diff and the push/pull file
 // transfer. Each is a thin wrapper on sessionRPC that does one thing the
 // handler must not have to remember: BOUND WHAT THE SANDBOX SENT BACK.
 //

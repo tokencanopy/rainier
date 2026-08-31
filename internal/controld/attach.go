@@ -113,7 +113,7 @@ func (t *attachTable) has(id string) bool {
 }
 
 // ---------------------------------------------------------------------------
-// WS GET /v1/sessions/{id}/attach?since=
+// WS GET /v0/sessions/{id}/attach?since=
 // ---------------------------------------------------------------------------
 
 // handleClientAttach serves the client half of the dial-back attach plane
@@ -355,11 +355,11 @@ func (s *Server) attachBackURL(attachID string) string {
 	case strings.HasPrefix(base, "http://"):
 		base = "ws://" + strings.TrimPrefix(base, "http://")
 	}
-	return base + "/v1/runners/attach-back?attach_id=" + attachID
+	return base + "/v0/runners/attach-back?attach_id=" + attachID
 }
 
 // ---------------------------------------------------------------------------
-// WS GET /v1/runners/attach-back?attach_id=
+// WS GET /v0/runners/attach-back?attach_id=
 // ---------------------------------------------------------------------------
 
 // handleAttachBack serves the runner half of the pairing: runnerd dials this
