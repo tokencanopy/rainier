@@ -7,6 +7,13 @@ package runner
 
 import "encoding/json"
 
+// ProtocolVersion is the wire version a runner announces and controld checks
+// before it accepts any command from that connection. It is fixed at 1:
+// capability negotiation and a rolling-version window are deferred to a
+// later plan, so version 1 does not itself negotiate anything. An announce
+// whose value controld does not speak is fatal to the connection: controld
+// closes it with a close reason naming both the announced and the expected
+// version.
 const ProtocolVersion = 1
 
 // RPCEnvelope is one message of the session RPC — the bidirectional
@@ -72,6 +79,13 @@ type FromRunner struct {
 	RPC *RPCEnvelope `json:"rpc,omitempty"`
 }
 
+// SessionInfo is one session's line in a FromRunner "announce": the stable
+// session ID every later command addresses, plus the runner's current
+// lifecycle state for it. It carries no payload and no history — the point
+// of an announce is to reconcile controld's view of the runner after a
+// (re)connect, so the list is complete in one message and a session still
+// "starting" is omitted rather than given a provisional state. State is one
+// of "running", "suspended_warm", or "suspended_cold".
 type SessionInfo struct {
 	ID    string `json:"id"`
 	State string `json:"state"` // "running"|"suspended_warm"|"suspended_cold"
@@ -122,6 +136,15 @@ type RepoSpec struct {
 	Dir           string `json:"dir"`
 }
 
+// Spec is the create block of a ToRunner "create": everything controld has
+// resolved about a session's environment before the runner may start it. The
+// runner trusts it whole and invents none of it — the image to boot, the
+// command to run, the egress allow-list, the repositories to clone with
+// their fully-resolved branches and directories, the environment setup
+// script and per-boot init hook with their timeouts, the git author
+// identity, and the env map. Every field is omitempty because a create
+// passes only the pieces that apply; Env values are secrets as often as not
+// and never logged verbatim.
 type Spec struct {
 	Name        string   `json:"name,omitempty"`
 	Image       string   `json:"image,omitempty"`
@@ -160,6 +183,16 @@ type Spec struct {
 	Env map[string]string `json:"env,omitempty"`
 }
 
+// Attach is the dial_attach block of a ToRunner: controld tells the runner
+// how to take over a terminal viewer it has parked. AttachID names the
+// parked client pairing (16 hex characters from crypto/rand); Since is the
+// attach cursor the viewer asked for, interpreted by the session exactly as
+// in a relay FrameOpen — 0 for a snapshot of the current screen, the maximum
+// uint64 for the whole log, otherwise the seq to replay from; Cols and Rows
+// seed the terminal size; and TargetURL is this controld replica's
+// attach-back WebSocket URL, which the runner must verify names its own
+// controld origin before dialing it, because that dial carries the fleet
+// runner token.
 type Attach struct {
 	AttachID  string `json:"attach_id"`
 	Since     uint64 `json:"since"`
