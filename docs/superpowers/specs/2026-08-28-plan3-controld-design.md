@@ -153,7 +153,7 @@ surface; nothing user-facing depends on it after this plan.
 ### 4.2 Runner protocol: control connection + dial-back attach
 
 runnerd maintains **one outbound WSS control connection** to
-`/v1/runners/connect` (runner token auth), with reconnect + jittered backoff.
+`/v0/runners/connect` (runner token auth), with reconnect + jittered backoff.
 On (re)connect it **announces**: runner name, capacity, and every live session
 (id, state) — rebuilt from container labels if runnerd itself just restarted.
 
@@ -166,10 +166,10 @@ Over the control connection (JSON messages, `internal/rwire`):
   `event{session_id, state}` (registered/died/suspended/resumed) ·
   `capacity{used, total}` (on change) · heartbeat.
 
-**Attach path:** client opens WSS `/v1/sessions/{id}/attach?since=` at controld →
+**Attach path:** client opens WSS `/v0/sessions/{id}/attach?since=` at controld →
 controld parks the socket under a fresh `attach_id`, sends `dial_attach` down the
 owning runner's control conn → runnerd dials `target_url`
-(`/v1/runners/attach-back?attach_id=`) outbound and feeds that socket straight
+(`/v0/runners/attach-back?attach_id=`) outbound and feeds that socket straight
 into its existing `hub.AttachClient` (the ws is a `relay.Conn`; since/cols/rows
 come from the message) → controld splices the two sockets as a dumb byte pipe.
 The client speaks `wire.ClientMsg/ServerMsg` end to end — identical bytes to
@@ -191,7 +191,9 @@ runner VMs). Not viable.
 
 ### 4.3 Wire/versioning stance
 
-- Client REST/WS surface: `/v1/...`, additive-only evolution; pre-GA status noted
+The repository made a clean pre-GA path cut to `/v0/` after Plan 6; there is no `/v1/` compatibility surface.
+
+- Client REST/WS surface: `/v0/...`, additive-only evolution; pre-GA status noted
   in the API doc (licenses field additions without ceremony, not renames).
 - `rwire` carries `proto: 1` in the announce; controld rejects unknown majors
   with a close reason naming both versions. runnerd and controld ship from one
@@ -209,17 +211,17 @@ generated/returned and attached to logs. `Cache-Control: no-store` on all GETs
 
 | Endpoint | Notes |
 |---|---|
-| `POST /v1/auth/github` | Unauthenticated (the explicit exception). Body `{access_token}` → controld calls GitHub `/user`, checks allowlist, mints opaque bearer `rnr_…` (hash stored). Returns `{token, user}`. |
-| `GET /v1/me` | Identity + role. |
-| `POST /v1/sessions` | `{name?, image?, cmd?, egress_allow?}` → **202** `{session}` + `Location`. Accepts `Idempotency-Key` (CLI always sends one; unique index makes retries safe). 202, not 201: creation is asynchronous by design — the row is `queued`/`creating`; readiness arrives via state. |
-| `GET /v1/sessions` | Exact filters `name=`, `state=`, `runner=`; cursor pagination (`limit` capped at 100), stable sort `created_at desc, id`. Team-visible (spec: trust-your-team). Terminal states hidden unless `all=true`. |
-| `GET /v1/sessions/{id}` | Full row incl. `state`, `runner`, `reachable`, `last_event_at`. |
-| `DELETE /v1/sessions/{id}` | Destroy; on `queued` it cancels before dispatch. A `failed` row may retain an attachable container, so DELETE destroys it and advances the row to `destroyed` while retaining the diagnostic error. 204. Owner or admin. |
-| `POST /v1/sessions/{id}/suspend` | `{warm}` (default true). 409 `conflict` while `creating`. |
-| `POST /v1/sessions/{id}/resume` | 409 `no_capacity` if the pinned runner is full (§4.7). |
-| `POST /v1/sessions/{id}/snapshot` | Synchronous, bounded timeout → `{ref}`. |
-| `GET /v1/runners` | Fleet capacity view: name, connected, used/total, last_seen. |
-| `WS /v1/sessions/{id}/attach?since=` | Terminal plane. Bearer in header. |
+| `POST /v0/auth/github` | Unauthenticated (the explicit exception). Body `{access_token}` → controld calls GitHub `/user`, checks allowlist, mints opaque bearer `rnr_…` (hash stored). Returns `{token, user}`. |
+| `GET /v0/me` | Identity + role. |
+| `POST /v0/sessions` | `{name?, image?, cmd?, egress_allow?}` → **202** `{session}` + `Location`. Accepts `Idempotency-Key` (CLI always sends one; unique index makes retries safe). 202, not 201: creation is asynchronous by design — the row is `queued`/`creating`; readiness arrives via state. |
+| `GET /v0/sessions` | Exact filters `name=`, `state=`, `runner=`; cursor pagination (`limit` capped at 100), stable sort `created_at desc, id`. Team-visible (spec: trust-your-team). Terminal states hidden unless `all=true`. |
+| `GET /v0/sessions/{id}` | Full row incl. `state`, `runner`, `reachable`, `last_event_at`. |
+| `DELETE /v0/sessions/{id}` | Destroy; on `queued` it cancels before dispatch. A `failed` row may retain an attachable container, so DELETE destroys it and advances the row to `destroyed` while retaining the diagnostic error. 204. Owner or admin. |
+| `POST /v0/sessions/{id}/suspend` | `{warm}` (default true). 409 `conflict` while `creating`. |
+| `POST /v0/sessions/{id}/resume` | 409 `no_capacity` if the pinned runner is full (§4.7). |
+| `POST /v0/sessions/{id}/snapshot` | Synchronous, bounded timeout → `{ref}`. |
+| `GET /v0/runners` | Fleet capacity view: name, connected, used/total, last_seen. |
+| `WS /v0/sessions/{id}/attach?since=` | Terminal plane. Bearer in header. |
 | `GET /healthz` | Unauthenticated liveness, no internals. |
 
 Session ids are opaque and non-enumerable: `sess_<128-bit random hex>`, minted
@@ -262,7 +264,7 @@ Tables (embedded SQL migrations, version-tracked):
   state, runner_id nullable, idempotency_key unique nullable, error text,
   created_at, updated_at, last_event_at)`
 - `runners(id, name unique, capacity_used, capacity_total, connected bool,
-  last_seen_at)` — a *cache* of announced fact for `GET /v1/runners`; truth is
+  last_seen_at)` — a *cache* of announced fact for `GET /v0/runners`; truth is
   the live connection set, reconciled on every (dis)connect.
 
 Lifecycle state machine (single `state` column; every transition is one guarded
@@ -289,7 +291,7 @@ runner's connectedness — a disconnected runner makes its sessions
 and honest: controld genuinely doesn't know more than "last event said running;
 runner currently away."
 
-**Create is write-ahead durable (invariant).** `POST /v1/sessions` commits the
+**Create is write-ahead durable (invariant).** `POST /v0/sessions` commits the
 row (state `queued`) before the 202 is written and before any dispatch. A
 successful create therefore always exists in Postgres, whatever happens next:
 controld dies pre-dispatch ⇒ the scheduler re-picks `queued` rows on startup;
@@ -451,7 +453,7 @@ plane replica-safe for later:**
 
 **Extensibility seams this design leaves clean:** `Store` (pg/fake), `Driver`
 (unchanged — K8s driver lands under runnerd with zero controld changes),
-`rwire` versioned proto, `/v1` additive REST, placement isolated in one
+`rwire` versioned proto, `/v0` additive REST, placement isolated in one
 function (environment/affinity constraints slot in at Plan 4+), CLI client
 package reusable by the dashboard's dev proxy later.
 

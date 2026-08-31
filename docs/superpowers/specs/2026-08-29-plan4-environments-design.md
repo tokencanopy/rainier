@@ -32,7 +32,7 @@ into the vocabulary now and built in Plans 6–7.
 
 - Environment object: name, base image, setup script, egress allowlist,
   secret refs, connector list (vocabulary only, see §4.2), placement hint.
-- Env CRUD: REST (`/v1/environments`), store schema, CLI (`rainier env
+- Env CRUD: REST (`/v0/environments`), store schema, CLI (`rainier env
   create/ls/show/update/rm`).
 - Setup pipeline: first-session setup streamed to the terminal → driver
   `Snapshot()` caches the env image → later sessions boot the cache; cache
@@ -125,7 +125,7 @@ environments (Postgres):
 secrets (Postgres):
   name text pk, ciphertext bytea, nonce bytea, created_at
   -- AES-256-GCM, key = RAINIER_SECRETS_KEY (32B, controld config).
-  -- API: PUT /v1/secrets/{name} (admin), names listable, values never returned.
+  -- API: PUT /v0/secrets/{name} (admin), names listable, values never returned.
 ```
 
 Sessions gain `environment_id` (nullable — scratch sessions keep working) and
@@ -190,11 +190,11 @@ gone.
 REST (all following the Plan 3 envelope/authZ conventions — mutations
 admin-only for envs and secrets, reads team-visible):
 
-- `POST/GET /v1/environments`, `GET/PATCH/DELETE /v1/environments/{id}`
+- `POST/GET /v0/environments`, `GET/PATCH/DELETE /v0/environments/{id}`
   (DELETE refuses while non-terminal sessions reference it — 409).
-- `PUT /v1/secrets/{name}` (admin; value write-only), `GET /v1/secrets`
-  (names + timestamps only), `DELETE /v1/secrets/{name}`.
-- `POST /v1/sessions` gains `environment` (name or id) — resolved server-side;
+- `PUT /v0/secrets/{name}` (admin; value write-only), `GET /v0/secrets`
+  (names + timestamps only), `DELETE /v0/secrets/{name}`.
+- `POST /v0/sessions` gains `environment` (name or id) — resolved server-side;
   explicit `image`/`egress_allow` on the session still win (overrides).
 
 CLI: `rainier env create|ls|show|update|rm`, `rainier secret set|ls|rm`,

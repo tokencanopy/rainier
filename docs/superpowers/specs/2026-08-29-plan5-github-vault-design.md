@@ -35,11 +35,11 @@ the sandbox.
    attached viewer; a cache-hit session runs `init` but not `setup`.
 6. `rainier push <dir> <session>:<path>` and `pull` round-trip a directory
    laptop↔session (bounded size, v0).
-7. `GET /v1/sessions/{id}/diff` returns per-repo `--stat` vs the merge-base
+7. `GET /v0/sessions/{id}/diff` returns per-repo `--stat` vs the merge-base
    with the base branch.
 8. Riders land: a container crash preserves the workspace volume (salvage
    until `rm`); `child_exited` is visible in `ls`; `attach --since 0`
-   full-history replay actually reaches the viewer; `/v1/me` exposes the
+   full-history replay actually reaches the viewer; `/v0/me` exposes the
    user id (and the CLI's owner-preference uses it).
 9. All of the above pass in the e2e suite and in a live fleet-rehearsal
    phase (real clone/push against a throwaway GitHub repo when `gh` is
@@ -85,7 +85,7 @@ riders; docs + rehearsal + acceptance.
   state rule exists to prevent; the application-level-encryption pattern is
   what Coder/Grafana/GitLab ship; the upgrade ladder (instance key → KMS
   envelope → external vault) is additive and documented, not built.
-- **Login today:** `POST /v1/auth/github` verifies via `GET /user` with
+- **Login today:** `POST /v0/auth/github` verifies via `GET /user` with
   scope `read:user` and discards the token. Git needs scope `repo`.
   `gh auth token` (the `--from-gh` path) normally carries `repo` already;
   the device flow must request `repo read:user`, and the exchange endpoint
@@ -156,7 +156,7 @@ credentials (migration 0004):
   obtained_at, expires_at NULL, last_verified_at, last_used_at, updated_at
 ```
 
-- **Login stores instead of discarding:** `POST /v1/auth/github` upserts the
+- **Login stores instead of discarding:** `POST /v0/auth/github` upserts the
   credential (sealed), records scopes, sets `valid`. Device flow requests
   `repo read:user`; missing `repo` → stored anyway + response carries a
   warning field the CLI prints ("git operations will prompt for refresh").
@@ -173,7 +173,7 @@ credentials (migration 0004):
 - **Refresh UX:** `rainier login --refresh github` re-runs the token
   acquisition (`--from-gh`/`--token`/device flow) and upserts; `rainier
   creds` lists provider/status/scopes/last_verified/last_used. API:
-  `GET /v1/credentials` returns the CALLER's rows only (metadata, never
+  `GET /v0/credentials` returns the CALLER's rows only (metadata, never
   values — same write-only discipline as secrets).
 - **TokenSource semantics** are internal shape, not a new dependency:
   the vault read + status check is our TokenSource; refresh-token flow
@@ -230,7 +230,7 @@ hurts; the RPC chunking is 200 lines, the streaming plane is a task-week.
 
 ### 4.6 Diff endpoint
 
-`GET /v1/sessions/{id}/diff` (auth: team-visible like other reads) →
+`GET /v0/sessions/{id}/diff` (auth: team-visible like other reads) →
 controld session-RPC `diff` → sessiond runs, per repo,
 `git -C <dir> fetch -q origin <base> && git -C <dir> diff --stat
 origin/<base>...HEAD` (bounded 30s, output capped 64KB) → aggregated
@@ -255,7 +255,7 @@ sessions → `{repos: []}`. No fleet-chip work in v0 (adapters plan).
 - **`--since` replay fix:** diagnose and fix the client-side forwarding
   (found in acceptance: server log intact, viewer receives screen only);
   regression test = e2e attach with since=0 asserting pre-restart history.
-- **`/v1/me` id:** additive `id` field; CLI owner-preference reads it at
+- **`/v0/me` id:** additive `id` field; CLI owner-preference reads it at
   login instead of the `new`-response cache.
 
 ## 5. Edge cases and failure handling

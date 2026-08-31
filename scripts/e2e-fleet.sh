@@ -757,7 +757,7 @@ case "$GH_SID" in sess_*) ;; *) fail "new --env printed \"$GH_SID\", want a sess
 # session's own error column — `rainier ls` has no room for it.
 BEARER=$(sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RAINIER_CONFIG")
 session_error() {
-  curl -sf -H "Authorization: Bearer $BEARER" "$CONTROLD_HTTP/v1/sessions/$1" \
+  curl -sf -H "Authorization: Bearer $BEARER" "$CONTROLD_HTTP/v0/sessions/$1" \
     | sed -n 's/.*"error":[[:space:]]*"\([^"]*\)".*/\1/p'
 }
 
@@ -940,7 +940,7 @@ GH_STALE_SECS=$(( $(date +%s) - GH_STALE_START ))
 # Grepped out of the raw body rather than the extracted error: the error
 # column carries a 2KB tail of the session's own output, quotes and newlines
 # included, and session_error's sed stops at the first of either.
-GH_STALE_BODY=$(curl -sf -H "Authorization: Bearer $BEARER" "$CONTROLD_HTTP/v1/sessions/$GH_SID2")
+GH_STALE_BODY=$(curl -sf -H "Authorization: Bearer $BEARER" "$CONTROLD_HTTP/v0/sessions/$GH_SID2")
 case "$GH_STALE_BODY" in
   *"rainier login --refresh github"*) ;;
   *) fail "the failed session's error does not name the action to run — the sentence must survive every hop verbatim: $(session_error "$GH_SID2")" ;;

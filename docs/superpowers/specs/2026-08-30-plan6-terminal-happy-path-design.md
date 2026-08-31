@@ -63,8 +63,8 @@ unit tests: CI scheduling noise is not a product latency measurement.
 
 ## 3. Relevant context and constraints
 
-- The control plane already exposes `GET /v1/sessions/{id}` and
-  `POST /v1/sessions/{id}/resume`. The CLI should compose them rather than add
+- The control plane already exposes `GET /v0/sessions/{id}` and
+  `POST /v0/sessions/{id}/resume`. The CLI should compose them rather than add
   a convenience endpoint whose only consumer is the CLI.
 - Attach authorization remains owner-or-admin and is enforced by controld.
   The state read is team-visible under the existing v0 trust model; it does

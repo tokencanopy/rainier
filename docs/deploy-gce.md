@@ -429,7 +429,7 @@ quietly mangled into a branch you did not ask for.
 
 **Multiple repositories** are sibling directories under `/workspace`, one per
 connector, named after the repo (a collision is disambiguated with the owner).
-One session can override that list: `POST /v1/sessions` takes a `repos` array
+One session can override that list: `POST /v0/sessions` takes a `repos` array
 of `{"repo": "owner/name", "base_branch": "…"}`, where **absent** inherits the
 environment's connectors and an **explicit `[]`** means clone nothing — scratch
 semantics under an environment that normally clones. v0 has no CLI flag for it;
@@ -580,7 +580,7 @@ ticking the box.
     cached; second create → running in **2s**, zero setup output in its full
     history, toolchain (`acc-tool`) present from the cached image.
   - C3 ✓ `/workspace` marker survived warm suspend AND cold park + resume.
-  - C4 ✓ secret injected (len 21 read in-session); raw `/v1/secrets` listing
+  - C4 ✓ secret injected (len 21 read in-session); raw `/v0/secrets` listing
     carries names+timestamps only — no value anywhere.
   - C5 ✓ env pinned to a nonexistent runner → `queued (waiting for runner
     ghost-runner)` visible in ls and `queue_reason` in the API.
@@ -678,8 +678,8 @@ runs against one. Record what actually happened in the Result column.
 | 4 | Session `repos` overrides beat env connector defaults; explicit `[]` means no clone (scratch semantics preserved); multi-repo clones land as sibling directories. | Covered by `go test ./internal/e2e/ -run TestConnectorSessionMintsAndReportsDiff` (two connectors → two sibling directories, each on the session branch) and controld's `repoOverrides`/`sessionRepoRefs` tests. | ☑ | Automated: green under `-race -count=5`. |
 | 5 | The cacheable/per-session split holds: `setup` (pre-clone, cached) and `init` (post-clone, every session, never cached) both stream to an attached viewer; a cache-hit session runs `init` but not `setup`. | Step 8's table, on the VM: an environment with both scripts, two sessions, `rainier attach --since 0` on each. The rehearsal proves the ordering half (its init hook reads the cloned repo's git log, which no cached image could contain). | ☑ | Setup created its cached marker before clone; init then read the cloned repository's git log. The second session booted from the environment snapshot, ran init, and did not rerun setup. |
 | 6 | `rainier push <dir> <session>:<path>` and `pull` round-trip a directory laptop↔session (bounded size, v0). | `go test ./internal/e2e/ -run TestPushPullRoundTrip`; the rehearsal repeats it against a real container. | ☑ | Automated: green — nested directories, an empty one, binary content, a non-ASCII name and an executable bit all survive both directions. |
-| 7 | `GET /v1/sessions/{id}/diff` returns per-repo `--stat` vs the merge-base with the base branch. | `go test ./internal/e2e/ -run TestConnectorSessionMintsAndReportsDiff`; `rainier diff <id>` on the VM against a real commit. | ☑ | On the VM, `rainier diff` reported the acceptance file against the real merge-base; the automated transport test remained green. |
-| 8 | Riders land: a container crash preserves the workspace volume (salvage until `rm`); `child_exited` is visible in `ls`; `attach --since 0` full-history replay actually reaches the viewer; `/v1/me` exposes the user id (and the CLI's owner-preference uses it). | `go test ./internal/e2e/ -run 'TestCrashKeepsTheWorkspaceAndRmReclaimsIt|TestEnvSetupStreamsAndCaches|TestFullReplayReachesTheViewer'`. On the VM, the `--since 0` half is the one Plan 3's overnight run found broken — re-run it there. | ☑ | `attach --since 0` replayed the full boot output on rainier-1; the other riders passed their automated scenes. The pre-existing `gce-1` session also survived the full-stack Plan 5 redeploy without a container restart. |
+| 7 | `GET /v0/sessions/{id}/diff` returns per-repo `--stat` vs the merge-base with the base branch. | `go test ./internal/e2e/ -run TestConnectorSessionMintsAndReportsDiff`; `rainier diff <id>` on the VM against a real commit. | ☑ | On the VM, `rainier diff` reported the acceptance file against the real merge-base; the automated transport test remained green. |
+| 8 | Riders land: a container crash preserves the workspace volume (salvage until `rm`); `child_exited` is visible in `ls`; `attach --since 0` full-history replay actually reaches the viewer; `/v0/me` exposes the user id (and the CLI's owner-preference uses it). | `go test ./internal/e2e/ -run 'TestCrashKeepsTheWorkspaceAndRmReclaimsIt|TestEnvSetupStreamsAndCaches|TestFullReplayReachesTheViewer'`. On the VM, the `--since 0` half is the one Plan 3's overnight run found broken — re-run it there. | ☑ | `attach --since 0` replayed the full boot output on rainier-1; the other riders passed their automated scenes. The pre-existing `gce-1` session also survived the full-stack Plan 5 redeploy without a container restart. |
 | 9 | All of the above pass in the e2e suite and in a live fleet-rehearsal phase (real clone/push against a throwaway GitHub repo when `gh` is available); GCE acceptance recorded in the runbook. | `go test ./... -race`, then `./scripts/e2e-fleet.sh`, then this table filled in from the VM. | ☑ | Local fleet rehearsal: 35/35 checks. GCE main run: 13/13; the separate stale-credential run: 7/7. Cleanup restored rainier-1 to its single durable session, removed the throwaway repository, and removed the temporary plaintext credential from the VM. |
 
 **Where each criterion can go wrong, so you know what you're looking at:**
