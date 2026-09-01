@@ -95,7 +95,7 @@ func (s *SessionService) CreateSession(ctx context.Context, scope control.Scope,
 		existing, err := s.sessions.SessionByIDem(ctx, scope.WorkspaceID, scope.Actor.ID, cmd.IdempotencyKey)
 		switch {
 		case err == nil:
-			return cloneSession(existing), nil
+			return sessionCloneSession(existing), nil
 		case errors.Is(err, control.ErrNotFound):
 			// Continue to create; this is a fresh key.
 		default:
@@ -160,7 +160,7 @@ func (s *SessionService) CreateSession(ctx context.Context, scope control.Scope,
 		return control.Session{}, err
 	}
 	s.wake(stored.PoolID)
-	return cloneSession(stored), nil
+	return sessionCloneSession(stored), nil
 }
 
 // selectPool chooses the eligible pool with the greatest free capacity
@@ -245,7 +245,7 @@ func (s *SessionService) GetSession(ctx context.Context, scope control.Scope, id
 	if err := s.auth.Authorize(ctx, scope, control.ActionGet, sessionResource(row)); err != nil {
 		return control.Session{}, control.ErrDenied
 	}
-	return cloneSession(row), nil
+	return sessionCloneSession(row), nil
 }
 
 // ListSessions authorizes the list against a workspace-scoped empty-ID session
@@ -266,7 +266,7 @@ func (s *SessionService) ListSessions(ctx context.Context, scope control.Scope, 
 	}
 	out := make([]control.Session, len(rows))
 	for i, row := range rows {
-		out[i] = cloneSession(row)
+		out[i] = sessionCloneSession(row)
 	}
 	return control.SessionPage{Sessions: out, NextCursor: next}, nil
 }
@@ -302,9 +302,9 @@ func recordEvent(ctx context.Context, ids control.IDGenerator, events control.Ev
 	return nil
 }
 
-// cloneSession returns a deep copy of s so returned sessions can never mutate
-// stored slices or pointer fields.
-func cloneSession(s control.Session) control.Session {
+// sessionCloneSession returns a deep copy of s so returned sessions can never
+// mutate stored slices or pointer fields.
+func sessionCloneSession(s control.Session) control.Session {
 	out := s
 	out.Spec = clonePortableSpec(s.Spec)
 	if s.ChildExitCode != nil {
@@ -364,7 +364,7 @@ func (s *SessionService) authoritative(ctx context.Context, ws control.Workspace
 		}
 		return control.Session{}, control.ErrUnavailable
 	}
-	return cloneSession(row), nil
+	return sessionCloneSession(row), nil
 }
 
 // reclaimWorkspace tells the runner holding row to remove its workspace volume

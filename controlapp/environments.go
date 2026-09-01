@@ -111,7 +111,7 @@ func (s *EnvironmentService) CreateEnvironment(ctx context.Context, scope contro
 	if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionCreate, environmentResource(stored)); err != nil {
 		return control.Environment{}, err
 	}
-	return cloneEnvironment(stored), nil
+	return sessionCloneEnvironment(stored), nil
 }
 
 // GetEnvironment reads by (workspace, id), authorizes ActionGet, and returns a
@@ -130,7 +130,7 @@ func (s *EnvironmentService) GetEnvironment(ctx context.Context, scope control.S
 	if err := s.auth.Authorize(ctx, scope, control.ActionGet, environmentResource(row)); err != nil {
 		return control.Environment{}, control.ErrDenied
 	}
-	return cloneEnvironment(row), nil
+	return sessionCloneEnvironment(row), nil
 }
 
 // ListEnvironments authorizes before repository access and normalizes an empty
@@ -150,7 +150,7 @@ func (s *EnvironmentService) ListEnvironments(ctx context.Context, scope control
 	}
 	out := make([]control.Environment, len(rows))
 	for i, row := range rows {
-		out[i] = cloneEnvironment(row)
+		out[i] = sessionCloneEnvironment(row)
 	}
 	return control.EnvironmentPage{Environments: out, NextCursor: next}, nil
 }
@@ -174,7 +174,7 @@ func (s *EnvironmentService) UpdateEnvironment(ctx context.Context, scope contro
 		return control.Environment{}, control.ErrDenied
 	}
 
-	next := cloneEnvironment(cur)
+	next := sessionCloneEnvironment(cur)
 	if cmd.Name != nil {
 		next.Name = *cmd.Name
 	}
@@ -226,7 +226,7 @@ func (s *EnvironmentService) UpdateEnvironment(ctx context.Context, scope contro
 	if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionUpdate, environmentResource(stored)); err != nil {
 		return control.Environment{}, err
 	}
-	return cloneEnvironment(stored), nil
+	return sessionCloneEnvironment(stored), nil
 }
 
 // DeleteEnvironment reads and authorizes the environment, then refuses the
@@ -304,9 +304,9 @@ func validateEnvironment(name, image string, setupTimeout, initTimeout int, req 
 	return nil
 }
 
-// cloneEnvironment returns a deep copy of e so returned environments can never
-// mutate stored slices or connector bytes.
-func cloneEnvironment(e control.Environment) control.Environment {
+// sessionCloneEnvironment returns a deep copy of e so returned environments
+// can never mutate stored slices or connector bytes.
+func sessionCloneEnvironment(e control.Environment) control.Environment {
 	out := e
 	out.EgressAllow = cloneStrings(e.EgressAllow)
 	out.SecretRefs = cloneStrings(e.SecretRefs)
