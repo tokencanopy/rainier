@@ -34,6 +34,11 @@ type FleetOptions struct {
 	Clock          control.Clock
 	IDs            control.IDGenerator
 	SafetyInterval time.Duration
+
+	// LaunchMaterial resolves sensitive launch material (repositories, git
+	// attribution, secret environment) at dispatch time. It is the one real
+	// adapter seam this extraction introduces.
+	LaunchMaterial LaunchMaterialResolver
 }
 
 // FleetService implements control.Fleet and owns runner registration,
@@ -50,6 +55,9 @@ type FleetService struct {
 	clock          control.Clock
 	ids            control.IDGenerator
 	safetyInterval time.Duration
+
+	// launchMaterial resolves sensitive launch material at dispatch time.
+	launchMaterial LaunchMaterialResolver
 
 	// wake carries pool IDs that need a placement pass. It is buffered so
 	// Wake never blocks a caller; Run drains it.
@@ -73,6 +81,9 @@ func NewFleetService(opts FleetOptions) (*FleetService, error) {
 	if opts.SafetyInterval <= 0 {
 		return nil, control.ErrInvalid
 	}
+	if opts.LaunchMaterial == nil {
+		return nil, control.ErrInvalid
+	}
 	return &FleetService{
 		auth:           opts.Authorizer,
 		sessions:       opts.Sessions,
@@ -84,6 +95,7 @@ func NewFleetService(opts FleetOptions) (*FleetService, error) {
 		clock:          opts.Clock,
 		ids:            opts.IDs,
 		safetyInterval: opts.SafetyInterval,
+		launchMaterial: opts.LaunchMaterial,
 		wake:           make(chan control.PoolID, 64),
 		known:          make(map[control.PoolID]struct{}),
 	}, nil
@@ -594,6 +606,7 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 	switch {
 	case err == nil:
 		s.recordLifecycleEvent(ctx, event, row)
+		s.Wake(event.PoolID)
 		return nil
 	case errors.Is(err, control.ErrConflict):
 		// A conflict because an identical event already applied is success;

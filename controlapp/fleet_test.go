@@ -64,6 +64,23 @@ func containsState(states []control.SessionState, s control.SessionState) bool {
 	return false
 }
 
+// sameSet reports whether a and b contain the same elements, ignoring order.
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]bool, len(a))
+	for _, s := range a {
+		set[s] = true
+	}
+	for _, s := range b {
+		if !set[s] {
+			return false
+		}
+	}
+	return true
+}
+
 func (st *fakeStore) seedSession(s control.Session) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -453,6 +470,23 @@ func (f *fakeIDs) NewEventID() control.EventID {
 	return control.EventID(fmt.Sprintf("evt_%d", f.n))
 }
 
+type fakeResolver struct {
+	mu       sync.Mutex
+	calls    int
+	material LaunchMaterial
+	err      error
+}
+
+func (f *fakeResolver) ResolveLaunchMaterial(_ context.Context, _ control.Session, _ *control.Environment) (LaunchMaterial, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	if f.err != nil {
+		return LaunchMaterial{}, f.err
+	}
+	return f.material, nil
+}
+
 // ---------------------------------------------------------------------------
 // fixture
 // ---------------------------------------------------------------------------
@@ -469,9 +503,10 @@ type fleetFixture struct {
 	clock     *fakeClock
 	ids       *fakeIDs
 	st        *fakeStore
+	resolver  *fakeResolver
 }
 
-func newFleetFixture(t *testing.T) *fleetFixture {
+func newFleetFixtureWithResolver(t *testing.T, resolver LaunchMaterialResolver) *fleetFixture {
 	t.Helper()
 	st := newFakeStore()
 	auth := &fakeAuthorizer{}
@@ -483,6 +518,14 @@ func newFleetFixture(t *testing.T) *fleetFixture {
 	events := &fakeEvents{}
 	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
 	ids := &fakeIDs{}
+	r := resolver
+	if r == nil {
+		r = &fakeResolver{}
+	}
+	fr, ok := r.(*fakeResolver)
+	if !ok {
+		fr = &fakeResolver{}
+	}
 	svc, err := NewFleetService(FleetOptions{
 		Authorizer:     auth,
 		Sessions:       sessions,
@@ -494,6 +537,7 @@ func newFleetFixture(t *testing.T) *fleetFixture {
 		Clock:          clock,
 		IDs:            ids,
 		SafetyInterval: time.Second,
+		LaunchMaterial: r,
 	})
 	if err != nil {
 		t.Fatalf("NewFleetService: %v", err)
@@ -501,7 +545,13 @@ func newFleetFixture(t *testing.T) *fleetFixture {
 	return &fleetFixture{
 		service: svc, auth: auth, sessions: sessions, envs: envs, fleet: fleet,
 		pools: pools, transport: transport, events: events, clock: clock, ids: ids, st: st,
+		resolver: fr,
 	}
+}
+
+func newFleetFixture(t *testing.T) *fleetFixture {
+	t.Helper()
+	return newFleetFixtureWithResolver(t, nil)
 }
 
 // wakePools drains every currently-buffered wake and returns the pool IDs in
@@ -555,21 +605,23 @@ func TestNewFleetServiceRequiresEveryPort(t *testing.T) {
 			Clock:          &fakeClock{now: time.Now()},
 			IDs:            &fakeIDs{},
 			SafetyInterval: time.Second,
+			LaunchMaterial: &fakeResolver{},
 		}
 	}
 	if _, err := NewFleetService(base()); err != nil {
 		t.Fatalf("complete options rejected: %v", err)
 	}
 	for name, zero := range map[string]func(*FleetOptions){
-		"authorizer":   func(o *FleetOptions) { o.Authorizer = nil },
-		"sessions":     func(o *FleetOptions) { o.Sessions = nil },
-		"environments": func(o *FleetOptions) { o.Environments = nil },
-		"fleet":        func(o *FleetOptions) { o.Fleet = nil },
-		"pools":        func(o *FleetOptions) { o.Pools = nil },
-		"transport":    func(o *FleetOptions) { o.Transport = nil },
-		"events":       func(o *FleetOptions) { o.Events = nil },
-		"clock":        func(o *FleetOptions) { o.Clock = nil },
-		"ids":          func(o *FleetOptions) { o.IDs = nil },
+		"authorizer":      func(o *FleetOptions) { o.Authorizer = nil },
+		"sessions":        func(o *FleetOptions) { o.Sessions = nil },
+		"environments":    func(o *FleetOptions) { o.Environments = nil },
+		"fleet":           func(o *FleetOptions) { o.Fleet = nil },
+		"pools":           func(o *FleetOptions) { o.Pools = nil },
+		"transport":       func(o *FleetOptions) { o.Transport = nil },
+		"events":          func(o *FleetOptions) { o.Events = nil },
+		"clock":           func(o *FleetOptions) { o.Clock = nil },
+		"ids":             func(o *FleetOptions) { o.IDs = nil },
+		"launch material": func(o *FleetOptions) { o.LaunchMaterial = nil },
 	} {
 		o := base()
 		zero(&o)
