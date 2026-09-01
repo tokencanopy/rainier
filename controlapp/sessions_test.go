@@ -295,7 +295,7 @@ func (r *stubEnvironmentRepo) GetEnvironment(ctx context.Context, ws control.Wor
 		return control.Environment{}, r.getErr
 	}
 	e, ok := r.rows[id]
-	if !ok {
+	if !ok || e.WorkspaceID != ws {
 		return control.Environment{}, control.ErrNotFound
 	}
 	return e, nil
@@ -308,6 +308,9 @@ func (r *stubEnvironmentRepo) ListEnvironments(ctx context.Context, ws control.W
 	}
 	rows := make([]control.Environment, 0, len(r.rows))
 	for _, e := range r.rows {
+		if e.WorkspaceID != ws {
+			continue
+		}
 		rows = append(rows, e)
 	}
 	sort.Slice(rows, func(i, j int) bool {
@@ -324,6 +327,9 @@ func (r *stubEnvironmentRepo) UpdateEnvironment(ctx context.Context, ws control.
 	if r.updateErr != nil {
 		return control.Environment{}, r.updateErr
 	}
+	if cur, ok := r.rows[e.ID]; !ok || cur.WorkspaceID != ws {
+		return control.Environment{}, control.ErrNotFound
+	}
 	r.put(e)
 	return e, nil
 }
@@ -333,7 +339,8 @@ func (r *stubEnvironmentRepo) DeleteEnvironment(ctx context.Context, ws control.
 	if r.deleteErr != nil {
 		return r.deleteErr
 	}
-	if _, ok := r.rows[id]; !ok {
+	e, ok := r.rows[id]
+	if !ok || e.WorkspaceID != ws {
 		return control.ErrNotFound
 	}
 	delete(r.rows, id)
