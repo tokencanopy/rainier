@@ -16,7 +16,7 @@ import (
 // contract, from outside the package.
 var _ control.Fleet = (*controlapp.FleetService)(nil)
 
-func externalFleetOptions() controlapp.FleetOptions {
+func fleetExternalOptions() controlapp.FleetOptions {
 	return controlapp.FleetOptions{
 		Authorizer:     fleetExtAuthorizer{},
 		Sessions:       fleetExtSessions{},
@@ -32,9 +32,9 @@ func externalFleetOptions() controlapp.FleetOptions {
 	}
 }
 
-func constructFleet(t *testing.T) control.Fleet {
+func fleetConstructService(t *testing.T) control.Fleet {
 	t.Helper()
-	svc, err := controlapp.NewFleetService(externalFleetOptions())
+	svc, err := controlapp.NewFleetService(fleetExternalOptions())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func constructFleet(t *testing.T) control.Fleet {
 }
 
 func TestFleetApplicationSeam(t *testing.T) {
-	fleet := constructFleet(t)
+	fleet := fleetConstructService(t)
 	svc := fleet.(*controlapp.FleetService)
 
 	// Registration through the frozen interface.

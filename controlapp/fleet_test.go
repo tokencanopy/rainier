@@ -606,12 +606,12 @@ var fleetCtx = context.Background()
 // Task 1: constructor + registration + listing
 // ---------------------------------------------------------------------------
 
-type runnerRegistrationAndListing interface {
+type fleetRunnerRegistrationAndListing interface {
 	RegisterRunner(context.Context, control.RunnerRegistration) (control.RunnerRegistrationResult, error)
 	ListRunners(context.Context, control.Scope, control.RunnerQuery) (control.RunnerPage, error)
 }
 
-var _ runnerRegistrationAndListing = (*FleetService)(nil)
+var _ fleetRunnerRegistrationAndListing = (*FleetService)(nil)
 
 func TestNewFleetServiceRequiresEveryPort(t *testing.T) {
 	base := func() FleetOptions {
