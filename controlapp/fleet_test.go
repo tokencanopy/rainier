@@ -439,13 +439,17 @@ func (f *fleetFakeTransport) dispatchedCommands() []runner.ToRunner {
 }
 
 type fleetFakeEvents struct {
-	mu     sync.Mutex
-	events []control.Event
+	mu        sync.Mutex
+	events    []control.Event
+	recordErr error
 }
 
 func (f *fleetFakeEvents) Record(_ context.Context, e control.Event) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.recordErr != nil {
+		return f.recordErr
+	}
 	f.events = append(f.events, e)
 	return nil
 }
@@ -461,8 +465,9 @@ type fleetFakeClock struct{ now time.Time }
 func (f *fleetFakeClock) Now() time.Time { return f.now }
 
 type fleetFakeIDs struct {
-	mu sync.Mutex
-	n  int
+	mu           sync.Mutex
+	n            int
+	emptyEventID bool
 }
 
 func (f *fleetFakeIDs) NewSessionID() control.SessionID {
@@ -481,6 +486,9 @@ func (f *fleetFakeIDs) NewEventID() control.EventID {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.n++
+	if f.emptyEventID {
+		return ""
+	}
 	return control.EventID(fmt.Sprintf("evt_%d", f.n))
 }
 
@@ -1538,5 +1546,108 @@ func TestApplyRunnerEventDetailNeverEntersEvent(t *testing.T) {
 	}
 	if got := fmt.Sprintf("%+v", recorded[0]); strings.Contains(got, detail) {
 		t.Fatal("runner detail leaked into the recorded control.Event")
+	}
+}
+
+func TestApplyRunnerEventChildExitIdempotentAndConflict(t *testing.T) {
+	t.Run("duplicate identical child exit is idempotent", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		fx.st.seedRunner(fleetEventRunner(1))
+		code := 7
+		fx.st.seedSession(control.Session{
+			ID: "sess_example", WorkspaceID: "ws_example", State: control.StateRunning,
+			PoolID: "pool_example", RunnerID: "runner_example", ChildExitCode: &code,
+		})
+		event := control.RunnerEvent{
+			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+			Generation: 1, SessionID: "sess_example", State: control.StateRunning,
+			ChildExitCode: &code,
+		}
+		if err := fx.service.ApplyRunnerEvent(fleetCtx, event); err != nil {
+			t.Fatalf("duplicate child exit: got %v, want nil (idempotent)", err)
+		}
+		if fx.st.childExitCalls != 0 {
+			t.Fatalf("childExitCalls = %d, want 0 (idempotent)", fx.st.childExitCalls)
+		}
+		if len(fx.events.recorded()) != 0 {
+			t.Fatalf("recorded %d events, want 0 (idempotent)", len(fx.events.recorded()))
+		}
+	})
+
+	t.Run("different exit code conflicts", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		fx.st.seedRunner(fleetEventRunner(1))
+		stored := 7
+		fx.st.seedSession(control.Session{
+			ID: "sess_example", WorkspaceID: "ws_example", State: control.StateRunning,
+			PoolID: "pool_example", RunnerID: "runner_example", ChildExitCode: &stored,
+		})
+		other := 9
+		event := control.RunnerEvent{
+			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+			Generation: 1, SessionID: "sess_example", State: control.StateRunning,
+			ChildExitCode: &other,
+		}
+		if err := fx.service.ApplyRunnerEvent(fleetCtx, event); !errors.Is(err, control.ErrConflict) {
+			t.Fatalf("different exit code: got %v, want ErrConflict", err)
+		}
+		if fx.st.childExitCalls != 0 {
+			t.Fatalf("childExitCalls = %d, want 0 (conflict)", fx.st.childExitCalls)
+		}
+		if len(fx.events.recorded()) != 0 {
+			t.Fatalf("recorded %d events, want 0 (conflict)", len(fx.events.recorded()))
+		}
+		row := fleetGetSessionState(t, fx, "ws_example", "sess_example")
+		if row.ChildExitCode == nil || *row.ChildExitCode != 7 {
+			t.Fatalf("child exit code = %v, want unchanged 7", row.ChildExitCode)
+		}
+	})
+}
+
+func TestApplyRunnerEventEmptyEventIDRejectedBeforeMutation(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.st.seedRunner(fleetEventRunner(1))
+	fx.st.seedSession(control.Session{
+		ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
+		PoolID: "pool_example", RunnerID: "runner_example",
+	})
+	fx.ids.emptyEventID = true
+	event := control.RunnerEvent{
+		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+		Generation: 1, SessionID: "sess_example", State: control.StateRunning,
+	}
+	if err := fx.service.ApplyRunnerEvent(fleetCtx, event); !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("got %v, want ErrInvalid", err)
+	}
+	if fx.st.transitionCalls != 0 {
+		t.Fatalf("transitionCalls = %d, want 0 (no mutation)", fx.st.transitionCalls)
+	}
+	if len(fx.events.recorded()) != 0 {
+		t.Fatalf("recorded %d events, want 0", len(fx.events.recorded()))
+	}
+}
+
+func TestApplyRunnerEventRecordFailureIsUnavailable(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.st.seedRunner(fleetEventRunner(1))
+	fx.st.seedSession(control.Session{
+		ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
+		PoolID: "pool_example", RunnerID: "runner_example",
+	})
+	fx.events.recordErr = errors.New("outbox unavailable")
+	event := control.RunnerEvent{
+		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+		Generation: 1, SessionID: "sess_example", State: control.StateRunning,
+	}
+	if err := fx.service.ApplyRunnerEvent(fleetCtx, event); !errors.Is(err, control.ErrUnavailable) {
+		t.Fatalf("got %v, want ErrUnavailable", err)
+	}
+	// The accepted mutation still landed; only the event record failed.
+	row := fleetGetSessionState(t, fx, "ws_example", "sess_example")
+	if row.State != control.StateRunning {
+		t.Fatalf("state = %q, want running (mutation persisted)", row.State)
+	}
+	if len(fx.events.recorded()) != 0 {
+		t.Fatalf("recorded %d events, want 0", len(fx.events.recorded()))
 	}
 }

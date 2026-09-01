@@ -615,15 +615,29 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 		return control.ErrStale
 	}
 
+	// Mint and validate the event identity before any mutation: a broken ID
+	// generator must fail the call instead of mutating silently.
+	eventID := s.ids.NewEventID()
+	if eventID == "" {
+		return control.ErrInvalid
+	}
+
 	if event.ChildExitCode != nil {
+		if row.ChildExitCode != nil {
+			if *row.ChildExitCode == *event.ChildExitCode {
+				// An identical child exit already applied; idempotent success.
+				return nil
+			}
+			// A different exit code contradicts the recorded one.
+			return control.ErrConflict
+		}
 		if err := s.sessions.SetChildExitCode(ctx, event.WorkspaceID, event.SessionID, *event.ChildExitCode); err != nil {
 			if errors.Is(err, control.ErrNotFound) {
 				return control.ErrStale
 			}
 			return err
 		}
-		s.recordLifecycleEvent(ctx, event, row)
-		return nil
+		return s.recordLifecycleEvent(ctx, event, row, eventID)
 	}
 
 	target := event.State
@@ -642,9 +656,8 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 	err = s.sessions.Transition(ctx, event.WorkspaceID, event.SessionID, eventTransitions[target], target, opts)
 	switch {
 	case err == nil:
-		s.recordLifecycleEvent(ctx, event, row)
 		s.Wake(event.PoolID)
-		return nil
+		return s.recordLifecycleEvent(ctx, event, row, eventID)
 	case errors.Is(err, control.ErrConflict):
 		// A conflict because an identical event already applied is success;
 		// any other conflict remains ErrConflict.
@@ -662,10 +675,12 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 
 // recordLifecycleEvent records one provider-neutral service fact after an
 // accepted mutation. The runner's free text never reaches an Event: it is
-// bounded into the session's own error column only.
-func (s *FleetService) recordLifecycleEvent(ctx context.Context, event control.RunnerEvent, row control.Session) {
-	_ = s.events.Record(ctx, control.Event{
-		ID:          s.ids.NewEventID(),
+// bounded into the session's own error column only. A recorder that fails
+// surfaces ErrUnavailable rather than silently discarding the accepted
+// mutation's event.
+func (s *FleetService) recordLifecycleEvent(ctx context.Context, event control.RunnerEvent, row control.Session, eventID control.EventID) error {
+	if err := s.events.Record(ctx, control.Event{
+		ID:          eventID,
 		WorkspaceID: event.WorkspaceID,
 		ActorID:     control.ActorID(event.RunnerID),
 		Action:      control.ActionUpdate,
@@ -676,7 +691,10 @@ func (s *FleetService) recordLifecycleEvent(ctx context.Context, event control.R
 			CreatorID:   row.CreatorID,
 		},
 		At: s.clock.Now(),
-	})
+	}); err != nil {
+		return control.ErrUnavailable
+	}
+	return nil
 }
 
 // boundDetail clips free text to maxDetailBytes valid UTF-8 bytes, cutting on
