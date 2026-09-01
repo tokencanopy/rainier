@@ -22,24 +22,24 @@ func expectedSetupHash(image, setup string) string {
 
 type environmentFixture struct {
 	svc    *EnvironmentService
-	repo   *stubEnvironmentRepo
-	auth   *stubAuthorizer
-	events *stubEventRecorder
-	log    *callLog
+	repo   *sessionStubEnvironmentRepo
+	auth   *sessionStubAuthorizer
+	events *sessionStubEventRecorder
+	log    *sessionCallLog
 }
 
 func newEnvironmentFixture(t *testing.T) *environmentFixture {
 	t.Helper()
-	log := &callLog{}
-	repo := newStubEnvironmentRepo(log)
-	auth := &stubAuthorizer{log: log}
-	events := &stubEventRecorder{log: log}
+	log := &sessionCallLog{}
+	repo := newSessionStubEnvironmentRepo(log)
+	auth := &sessionStubAuthorizer{log: log}
+	events := &sessionStubEventRecorder{log: log}
 	svc, err := NewEnvironmentService(EnvironmentOptions{
 		Authorizer:   auth,
 		Environments: repo,
 		Events:       events,
-		Clock:        stubClock{now: fixedNow},
-		IDs:          &stubIDs{log: log, sessionID: "sess_example", envID: "env_example", eventID: "evt_example"},
+		Clock:        sessionStubClock{now: sessionFixedNow},
+		IDs:          &sessionStubIDs{log: log, sessionID: "sess_example", envID: "env_example", eventID: "evt_example"},
 	})
 	if err != nil {
 		t.Fatalf("NewEnvironmentService: %v", err)
@@ -49,11 +49,11 @@ func newEnvironmentFixture(t *testing.T) *environmentFixture {
 
 func validEnvironmentOptions() EnvironmentOptions {
 	return EnvironmentOptions{
-		Authorizer:   &stubAuthorizer{},
-		Environments: newStubEnvironmentRepo(nil),
-		Events:       &stubEventRecorder{},
-		Clock:        stubClock{now: fixedNow},
-		IDs:          &stubIDs{sessionID: "sess_example", envID: "env_example", eventID: "evt_example"},
+		Authorizer:   &sessionStubAuthorizer{},
+		Environments: newSessionStubEnvironmentRepo(nil),
+		Events:       &sessionStubEventRecorder{},
+		Clock:        sessionStubClock{now: sessionFixedNow},
+		IDs:          &sessionStubIDs{sessionID: "sess_example", envID: "env_example", eventID: "evt_example"},
 	}
 }
 
@@ -82,7 +82,7 @@ func TestNewEnvironmentServiceRequiresEveryDependency(t *testing.T) {
 
 func TestCreateEnvironmentPinsSetupHash(t *testing.T) {
 	f := newEnvironmentFixture(t)
-	got, err := f.svc.CreateEnvironment(context.Background(), testScope(), control.CreateEnvironment{
+	got, err := f.svc.CreateEnvironment(context.Background(), sessionTestScope(), control.CreateEnvironment{
 		Name: "standard", Image: "registry.example.invalid/rainier@sha256:0000",
 		Setup: "make bootstrap", EgressAllow: []string{"example.com"},
 	})
@@ -98,7 +98,7 @@ func TestCreateEnvironmentPinsSetupHash(t *testing.T) {
 	if !slices.Equal(got.EgressAllow, []string{"example.com"}) {
 		t.Fatalf("egress = %#v", got.EgressAllow)
 	}
-	if !got.CreatedAt.Equal(fixedNow) || !got.UpdatedAt.Equal(fixedNow) {
+	if !got.CreatedAt.Equal(sessionFixedNow) || !got.UpdatedAt.Equal(sessionFixedNow) {
 		t.Fatalf("timestamps = %v/%v", got.CreatedAt, got.UpdatedAt)
 	}
 	if len(f.events.events) != 1 || f.events.events[0].Action != control.ActionCreate {
@@ -142,7 +142,7 @@ func TestCreateEnvironmentInvalidInput(t *testing.T) {
 			f := newEnvironmentFixture(t)
 			cmd := control.CreateEnvironment{Name: "standard", Image: "registry.example.invalid/rainier@sha256:0000"}
 			tt.mut(&cmd)
-			if _, err := f.svc.CreateEnvironment(context.Background(), testScope(), cmd); !errors.Is(err, control.ErrInvalid) {
+			if _, err := f.svc.CreateEnvironment(context.Background(), sessionTestScope(), cmd); !errors.Is(err, control.ErrInvalid) {
 				t.Fatalf("got %v, want ErrInvalid", err)
 			}
 			if len(f.repo.rows) != 0 {
@@ -155,7 +155,7 @@ func TestCreateEnvironmentInvalidInput(t *testing.T) {
 func TestCreateEnvironmentAuthorizesBeforeStorage(t *testing.T) {
 	f := newEnvironmentFixture(t)
 	f.auth.err = control.ErrDenied
-	if _, err := f.svc.CreateEnvironment(context.Background(), testScope(), control.CreateEnvironment{Name: "standard", Image: "registry.example.invalid/rainier@sha256:0000"}); !errors.Is(err, control.ErrDenied) {
+	if _, err := f.svc.CreateEnvironment(context.Background(), sessionTestScope(), control.CreateEnvironment{Name: "standard", Image: "registry.example.invalid/rainier@sha256:0000"}); !errors.Is(err, control.ErrDenied) {
 		t.Fatalf("got %v, want ErrDenied", err)
 	}
 	if len(f.repo.rows) != 0 || f.log.has("environments:create") {
@@ -166,7 +166,7 @@ func TestCreateEnvironmentAuthorizesBeforeStorage(t *testing.T) {
 func TestCreateEnvironmentDuplicateNameConflict(t *testing.T) {
 	f := newEnvironmentFixture(t)
 	f.repo.createErr = control.ErrConflict
-	if _, err := f.svc.CreateEnvironment(context.Background(), testScope(), control.CreateEnvironment{Name: "standard", Image: "registry.example.invalid/rainier@sha256:0000"}); !errors.Is(err, control.ErrConflict) {
+	if _, err := f.svc.CreateEnvironment(context.Background(), sessionTestScope(), control.CreateEnvironment{Name: "standard", Image: "registry.example.invalid/rainier@sha256:0000"}); !errors.Is(err, control.ErrConflict) {
 		t.Fatalf("got %v, want ErrConflict", err)
 	}
 }
@@ -183,7 +183,7 @@ func TestGetListEnvironmentWorkspaceScopedAndCopied(t *testing.T) {
 	}
 	f.repo.put(env)
 
-	got, err := f.svc.GetEnvironment(context.Background(), testScope(), "env_example")
+	got, err := f.svc.GetEnvironment(context.Background(), sessionTestScope(), "env_example")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,14 +202,14 @@ func TestGetListEnvironmentWorkspaceScopedAndCopied(t *testing.T) {
 	}
 
 	// Cross-workspace get is ErrNotFound.
-	other := testScope()
+	other := sessionTestScope()
 	other.WorkspaceID = "ws_other"
 	if _, err := f.svc.GetEnvironment(context.Background(), other, "env_example"); !errors.Is(err, control.ErrNotFound) {
 		t.Fatalf("cross-workspace get: got %v, want ErrNotFound", err)
 	}
 
 	// List is workspace-scoped and an empty page is a non-nil empty slice.
-	page, err := f.svc.ListEnvironments(context.Background(), testScope(), control.EnvironmentQuery{})
+	page, err := f.svc.ListEnvironments(context.Background(), sessionTestScope(), control.EnvironmentQuery{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,7 @@ func TestUpdateEnvironmentOptionalityAndStaleSnapshot(t *testing.T) {
 
 	// An explicit empty slice clears the list; nil leaves it alone.
 	empty := []string{}
-	updated, err := f.svc.UpdateEnvironment(context.Background(), testScope(), control.UpdateEnvironment{
+	updated, err := f.svc.UpdateEnvironment(context.Background(), sessionTestScope(), control.UpdateEnvironment{
 		ID: "env_example", EgressAllow: &empty,
 	})
 	if err != nil {
@@ -252,7 +252,7 @@ func TestUpdateEnvironmentOptionalityAndStaleSnapshot(t *testing.T) {
 
 	// A setup edit changes the hash and leaves the old snapshot visibly stale.
 	newSetup := "make bootstrap v2"
-	updated, err = f.svc.UpdateEnvironment(context.Background(), testScope(), control.UpdateEnvironment{
+	updated, err = f.svc.UpdateEnvironment(context.Background(), sessionTestScope(), control.UpdateEnvironment{
 		ID: "env_example", Setup: &newSetup,
 	})
 	if err != nil {
@@ -280,7 +280,7 @@ func TestDeleteEnvironmentGuard(t *testing.T) {
 
 	// A live non-terminal session refuses the delete.
 	f.repo.liveSessionCount = 1
-	if err := f.svc.DeleteEnvironment(context.Background(), testScope(), control.DeleteEnvironment{ID: "env_example"}); !errors.Is(err, control.ErrConflict) {
+	if err := f.svc.DeleteEnvironment(context.Background(), sessionTestScope(), control.DeleteEnvironment{ID: "env_example"}); !errors.Is(err, control.ErrConflict) {
 		t.Fatalf("delete with live session: got %v, want ErrConflict", err)
 	}
 	if f.log.has("environments:delete") {
@@ -289,7 +289,7 @@ func TestDeleteEnvironmentGuard(t *testing.T) {
 
 	// No live session deletes and records an event.
 	f.repo.liveSessionCount = 0
-	if err := f.svc.DeleteEnvironment(context.Background(), testScope(), control.DeleteEnvironment{ID: "env_example"}); err != nil {
+	if err := f.svc.DeleteEnvironment(context.Background(), sessionTestScope(), control.DeleteEnvironment{ID: "env_example"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := f.repo.rows["env_example"]; ok {

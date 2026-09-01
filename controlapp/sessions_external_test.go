@@ -15,13 +15,13 @@ import (
 // control interfaces without importing any Rainier internal package.
 
 var (
-	_ control.Sessions     = mustSessions()
-	_ control.Environments = mustEnvironments()
+	_ control.Sessions     = sessionMustSessions()
+	_ control.Environments = sessionMustEnvironments()
 )
 
-var extNow = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+var sessionExtNow = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
-func extScope() control.Scope {
+func sessionExtScope() control.Scope {
 	return control.Scope{
 		WorkspaceID: "ws_example",
 		Actor:       control.Actor{ID: "act_example", Kind: control.ActorUser},
@@ -33,18 +33,18 @@ func extScope() control.Scope {
 	}
 }
 
-func mustSessions() control.Sessions {
+func sessionMustSessions() control.Sessions {
 	svc, err := controlapp.NewSessionService(controlapp.SessionOptions{
-		Authorizer:   allowAllAuthorizer{},
-		Sessions:     extSessionRepo{},
-		Environments: extEnvironmentRepo{},
-		Pools:        extPoolResolver{},
-		Events:       extEventRecorder{},
-		Clock:        extClock{now: extNow},
-		IDs:          extIDs{},
+		Authorizer:   sessionAllowAllAuthorizer{},
+		Sessions:     sessionExtSessionRepo{},
+		Environments: sessionExtEnvironmentRepo{},
+		Pools:        sessionExtPoolResolver{},
+		Events:       sessionExtEventRecorder{},
+		Clock:        sessionExtClock{now: sessionExtNow},
+		IDs:          sessionExtIDs{},
 		Wake:         func(control.PoolID) {},
-		Fleet:        extFleet{},
-		Transport:    extTransport{},
+		Fleet:        sessionExtFleet{},
+		Transport:    sessionExtTransport{},
 	})
 	if err != nil {
 		panic(err)
@@ -52,13 +52,13 @@ func mustSessions() control.Sessions {
 	return svc
 }
 
-func mustEnvironments() control.Environments {
+func sessionMustEnvironments() control.Environments {
 	svc, err := controlapp.NewEnvironmentService(controlapp.EnvironmentOptions{
-		Authorizer:   allowAllAuthorizer{},
-		Environments: extEnvironmentRepo{},
-		Events:       extEventRecorder{},
-		Clock:        extClock{now: extNow},
-		IDs:          extIDs{},
+		Authorizer:   sessionAllowAllAuthorizer{},
+		Environments: sessionExtEnvironmentRepo{},
+		Events:       sessionExtEventRecorder{},
+		Clock:        sessionExtClock{now: sessionExtNow},
+		IDs:          sessionExtIDs{},
 	})
 	if err != nil {
 		panic(err)
@@ -66,109 +66,111 @@ func mustEnvironments() control.Environments {
 	return svc
 }
 
-type allowAllAuthorizer struct{}
+type sessionAllowAllAuthorizer struct{}
 
-func (allowAllAuthorizer) Authorize(context.Context, control.Scope, control.Action, control.Resource) error {
+func (sessionAllowAllAuthorizer) Authorize(context.Context, control.Scope, control.Action, control.Resource) error {
 	return nil
 }
 
-type extSessionRepo struct{}
+type sessionExtSessionRepo struct{}
 
-func (extSessionRepo) CreateSession(ctx context.Context, ws control.WorkspaceID, s control.Session) (control.Session, error) {
+func (sessionExtSessionRepo) CreateSession(ctx context.Context, ws control.WorkspaceID, s control.Session) (control.Session, error) {
 	return s, nil
 }
-func (extSessionRepo) GetSession(context.Context, control.WorkspaceID, control.SessionID) (control.Session, error) {
+func (sessionExtSessionRepo) GetSession(context.Context, control.WorkspaceID, control.SessionID) (control.Session, error) {
 	return control.Session{}, control.ErrNotFound
 }
-func (extSessionRepo) SessionByIDem(context.Context, control.WorkspaceID, control.ActorID, string) (control.Session, error) {
+func (sessionExtSessionRepo) SessionByIDem(context.Context, control.WorkspaceID, control.ActorID, string) (control.Session, error) {
 	return control.Session{}, control.ErrNotFound
 }
-func (extSessionRepo) ListSessions(context.Context, control.WorkspaceID, control.SessionQuery) ([]control.Session, string, error) {
+func (sessionExtSessionRepo) ListSessions(context.Context, control.WorkspaceID, control.SessionQuery) ([]control.Session, string, error) {
 	return nil, "", nil
 }
-func (extSessionRepo) Transition(context.Context, control.WorkspaceID, control.SessionID, []control.SessionState, control.SessionState, control.TransitionOpts) error {
+func (sessionExtSessionRepo) Transition(context.Context, control.WorkspaceID, control.SessionID, []control.SessionState, control.SessionState, control.TransitionOpts) error {
 	return nil
 }
-func (extSessionRepo) SetSessionSetupHash(context.Context, control.WorkspaceID, control.SessionID, string) error {
+func (sessionExtSessionRepo) SetSessionSetupHash(context.Context, control.WorkspaceID, control.SessionID, string) error {
 	return nil
 }
-func (extSessionRepo) SetChildExitCode(context.Context, control.WorkspaceID, control.SessionID, int) error {
+func (sessionExtSessionRepo) SetChildExitCode(context.Context, control.WorkspaceID, control.SessionID, int) error {
 	return nil
 }
 
-type extEnvironmentRepo struct{}
+type sessionExtEnvironmentRepo struct{}
 
-func (extEnvironmentRepo) CreateEnvironment(ctx context.Context, ws control.WorkspaceID, e control.Environment) (control.Environment, error) {
+func (sessionExtEnvironmentRepo) CreateEnvironment(ctx context.Context, ws control.WorkspaceID, e control.Environment) (control.Environment, error) {
 	return e, nil
 }
-func (extEnvironmentRepo) GetEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID) (control.Environment, error) {
+func (sessionExtEnvironmentRepo) GetEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID) (control.Environment, error) {
 	return control.Environment{}, control.ErrNotFound
 }
-func (extEnvironmentRepo) ListEnvironments(context.Context, control.WorkspaceID, control.EnvironmentQuery) ([]control.Environment, string, error) {
+func (sessionExtEnvironmentRepo) ListEnvironments(context.Context, control.WorkspaceID, control.EnvironmentQuery) ([]control.Environment, string, error) {
 	return nil, "", nil
 }
-func (extEnvironmentRepo) UpdateEnvironment(context.Context, control.WorkspaceID, control.Environment) (control.Environment, error) {
+func (sessionExtEnvironmentRepo) UpdateEnvironment(context.Context, control.WorkspaceID, control.Environment) (control.Environment, error) {
 	return control.Environment{}, control.ErrNotFound
 }
-func (extEnvironmentRepo) DeleteEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID) error {
+func (sessionExtEnvironmentRepo) DeleteEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID) error {
 	return nil
 }
-func (extEnvironmentRepo) CountSessionsByEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID, []control.SessionState) (int, error) {
+func (sessionExtEnvironmentRepo) CountSessionsByEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID, []control.SessionState) (int, error) {
 	return 0, nil
 }
-func (extEnvironmentRepo) SetEnvironmentSnapshot(context.Context, control.WorkspaceID, control.EnvironmentID, string, string, control.RunnerID) error {
+func (sessionExtEnvironmentRepo) SetEnvironmentSnapshot(context.Context, control.WorkspaceID, control.EnvironmentID, string, string, control.RunnerID) error {
 	return nil
 }
 
-type extPoolResolver struct{}
+type sessionExtPoolResolver struct{}
 
-func (extPoolResolver) EligiblePools(context.Context, control.Scope, control.Requirements) ([]control.Pool, error) {
+func (sessionExtPoolResolver) EligiblePools(context.Context, control.Scope, control.Requirements) ([]control.Pool, error) {
 	return []control.Pool{{ID: "pool_example", CapacityTotal: 2, CapacityUsed: 0}}, nil
 }
 
-type extEventRecorder struct{}
+type sessionExtEventRecorder struct{}
 
-func (extEventRecorder) Record(context.Context, control.Event) error { return nil }
+func (sessionExtEventRecorder) Record(context.Context, control.Event) error { return nil }
 
-type extClock struct {
+type sessionExtClock struct {
 	now time.Time
 }
 
-func (c extClock) Now() time.Time { return c.now }
+func (c sessionExtClock) Now() time.Time { return c.now }
 
-type extIDs struct{}
+type sessionExtIDs struct{}
 
-func (extIDs) NewSessionID() control.SessionID         { return "sess_example" }
-func (extIDs) NewEnvironmentID() control.EnvironmentID { return "env_example" }
-func (extIDs) NewEventID() control.EventID             { return "evt_example" }
+func (sessionExtIDs) NewSessionID() control.SessionID         { return "sess_example" }
+func (sessionExtIDs) NewEnvironmentID() control.EnvironmentID { return "env_example" }
+func (sessionExtIDs) NewEventID() control.EventID             { return "evt_example" }
 
-type extFleet struct{}
+type sessionExtFleet struct{}
 
-func (extFleet) UpsertRunner(context.Context, control.PoolID, control.Runner) error { return nil }
-func (extFleet) SetRunnerConnected(context.Context, control.PoolID, control.RunnerID, bool) error {
+func (sessionExtFleet) UpsertRunner(context.Context, control.PoolID, control.Runner) error {
 	return nil
 }
-func (extFleet) ListRunners(context.Context, control.PoolID) ([]control.Runner, error) {
+func (sessionExtFleet) SetRunnerConnected(context.Context, control.PoolID, control.RunnerID, bool) error {
+	return nil
+}
+func (sessionExtFleet) ListRunners(context.Context, control.PoolID) ([]control.Runner, error) {
 	return nil, nil
 }
-func (extFleet) SessionsOnRunner(context.Context, control.PoolID, control.RunnerID, []control.SessionState) ([]control.Session, error) {
+func (sessionExtFleet) SessionsOnRunner(context.Context, control.PoolID, control.RunnerID, []control.SessionState) ([]control.Session, error) {
 	return nil, nil
 }
-func (extFleet) OldestQueued(context.Context, control.PoolID) ([]control.Session, error) {
+func (sessionExtFleet) OldestQueued(context.Context, control.PoolID) ([]control.Session, error) {
 	return nil, nil
 }
 
-type extTransport struct{}
+type sessionExtTransport struct{}
 
-func (extTransport) Dispatch(context.Context, control.PoolID, control.RunnerID, runner.ToRunner) (runner.FromRunner, error) {
+func (sessionExtTransport) Dispatch(context.Context, control.PoolID, control.RunnerID, runner.ToRunner) (runner.FromRunner, error) {
 	return runner.FromRunner{OK: true}, nil
 }
-func (extTransport) Connected(control.PoolID, control.RunnerID) bool { return true }
+func (sessionExtTransport) Connected(control.PoolID, control.RunnerID) bool { return true }
 
 func TestExternalPackageConsumesTheSeam(t *testing.T) {
 	ctx := context.Background()
 
-	sess, err := mustSessions().CreateSession(ctx, extScope(), control.CreateSession{
+	sess, err := sessionMustSessions().CreateSession(ctx, sessionExtScope(), control.CreateSession{
 		Name: "scratch",
 		Spec: control.PortableSpec{Image: "registry.example.invalid/agent@sha256:0000", Cmd: []string{"bash"}},
 	})
@@ -179,7 +181,7 @@ func TestExternalPackageConsumesTheSeam(t *testing.T) {
 		t.Fatalf("session = %+v", sess)
 	}
 
-	env, err := mustEnvironments().CreateEnvironment(ctx, extScope(), control.CreateEnvironment{
+	env, err := sessionMustEnvironments().CreateEnvironment(ctx, sessionExtScope(), control.CreateEnvironment{
 		Name: "standard", Image: "registry.example.invalid/rainier@sha256:0000", Setup: "make bootstrap",
 	})
 	if err != nil {

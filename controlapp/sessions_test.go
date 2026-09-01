@@ -13,31 +13,31 @@ import (
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
-var fixedNow = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+var sessionFixedNow = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 
 // ---------------------------------------------------------------------------
 // call log — proves authorization and durability order across fakes.
 // ---------------------------------------------------------------------------
 
-type callLog struct {
+type sessionCallLog struct {
 	steps []string
 }
 
-func (c *callLog) add(step string) {
+func (c *sessionCallLog) add(step string) {
 	if c == nil {
 		return
 	}
 	c.steps = append(c.steps, step)
 }
 
-func (c *callLog) snapshot() []string {
+func (c *sessionCallLog) snapshot() []string {
 	if c == nil {
 		return nil
 	}
 	return slices.Clone(c.steps)
 }
 
-func (c *callLog) has(step string) bool {
+func (c *sessionCallLog) has(step string) bool {
 	for _, s := range c.snapshot() {
 		if s == step {
 			return true
@@ -46,7 +46,7 @@ func (c *callLog) has(step string) bool {
 	return false
 }
 
-func (c *callLog) hasPrefix(prefix string) bool {
+func (c *sessionCallLog) hasPrefix(prefix string) bool {
 	for _, s := range c.snapshot() {
 		if strings.HasPrefix(s, prefix) {
 			return true
@@ -55,9 +55,9 @@ func (c *callLog) hasPrefix(prefix string) bool {
 	return false
 }
 
-// ordered reports that every want step appears in the given order (not
+// sessionOrdered reports that every want step appears in the given order (not
 // necessarily adjacent to one another).
-func ordered(t *testing.T, steps []string, want ...string) {
+func sessionOrdered(t *testing.T, steps []string, want ...string) {
 	t.Helper()
 	pos := -1
 	for _, w := range want {
@@ -75,7 +75,7 @@ func ordered(t *testing.T, steps []string, want ...string) {
 	}
 }
 
-func testScope() control.Scope {
+func sessionTestScope() control.Scope {
 	return control.Scope{
 		WorkspaceID: "ws_example",
 		Actor:       control.Actor{ID: "act_example", Kind: control.ActorUser},
@@ -91,46 +91,46 @@ func testScope() control.Scope {
 // fakes
 // ---------------------------------------------------------------------------
 
-type stubClock struct {
+type sessionStubClock struct {
 	now time.Time
 }
 
-func (c stubClock) Now() time.Time { return c.now }
+func (c sessionStubClock) Now() time.Time { return c.now }
 
-type stubIDs struct {
-	log       *callLog
+type sessionStubIDs struct {
+	log       *sessionCallLog
 	sessionID control.SessionID
 	envID     control.EnvironmentID
 	eventID   control.EventID
 }
 
-func (g *stubIDs) NewSessionID() control.SessionID {
+func (g *sessionStubIDs) NewSessionID() control.SessionID {
 	g.log.add("id:session")
 	return g.sessionID
 }
 
-func (g *stubIDs) NewEnvironmentID() control.EnvironmentID {
+func (g *sessionStubIDs) NewEnvironmentID() control.EnvironmentID {
 	g.log.add("id:environment")
 	return g.envID
 }
 
-func (g *stubIDs) NewEventID() control.EventID {
+func (g *sessionStubIDs) NewEventID() control.EventID {
 	g.log.add("id:event")
 	return g.eventID
 }
 
-type stubAuthorizer struct {
-	log *callLog
+type sessionStubAuthorizer struct {
+	log *sessionCallLog
 	err error
 }
 
-func (a *stubAuthorizer) Authorize(ctx context.Context, sc control.Scope, act control.Action, r control.Resource) error {
+func (a *sessionStubAuthorizer) Authorize(ctx context.Context, sc control.Scope, act control.Action, r control.Resource) error {
 	a.log.add("auth:" + string(act) + ":" + string(r.Kind))
 	return a.err
 }
 
-type stubSessionRepo struct {
-	log *callLog
+type sessionStubSessionRepo struct {
+	log *sessionCallLog
 
 	rows map[control.SessionID]control.Session
 	idem map[string]control.Session
@@ -145,26 +145,26 @@ type stubSessionRepo struct {
 	lastListQuery control.SessionQuery
 }
 
-func newStubSessionRepo(log *callLog) *stubSessionRepo {
-	return &stubSessionRepo{
+func newSessionStubSessionRepo(log *sessionCallLog) *sessionStubSessionRepo {
+	return &sessionStubSessionRepo{
 		log:  log,
 		rows: map[control.SessionID]control.Session{},
 		idem: map[string]control.Session{},
 	}
 }
 
-func (r *stubSessionRepo) put(s control.Session) {
+func (r *sessionStubSessionRepo) put(s control.Session) {
 	r.rows[s.ID] = s
 	if s.IdempotencyKey != "" {
-		r.idem[idemKey(s.WorkspaceID, s.CreatorID, s.IdempotencyKey)] = s
+		r.idem[sessionIdemKey(s.WorkspaceID, s.CreatorID, s.IdempotencyKey)] = s
 	}
 }
 
-func idemKey(ws control.WorkspaceID, creator control.ActorID, key string) string {
+func sessionIdemKey(ws control.WorkspaceID, creator control.ActorID, key string) string {
 	return string(ws) + "\x00" + string(creator) + "\x00" + key
 }
 
-func (r *stubSessionRepo) CreateSession(ctx context.Context, ws control.WorkspaceID, s control.Session) (control.Session, error) {
+func (r *sessionStubSessionRepo) CreateSession(ctx context.Context, ws control.WorkspaceID, s control.Session) (control.Session, error) {
 	r.log.add("sessions:create")
 	if r.createErr != nil {
 		return control.Session{}, r.createErr
@@ -173,19 +173,19 @@ func (r *stubSessionRepo) CreateSession(ctx context.Context, ws control.Workspac
 	return s, nil
 }
 
-func (r *stubSessionRepo) SessionByIDem(ctx context.Context, ws control.WorkspaceID, creator control.ActorID, key string) (control.Session, error) {
+func (r *sessionStubSessionRepo) SessionByIDem(ctx context.Context, ws control.WorkspaceID, creator control.ActorID, key string) (control.Session, error) {
 	r.log.add("sessions:byidem")
 	if r.idemErr != nil {
 		return control.Session{}, r.idemErr
 	}
-	s, ok := r.idem[idemKey(ws, creator, key)]
+	s, ok := r.idem[sessionIdemKey(ws, creator, key)]
 	if !ok {
 		return control.Session{}, control.ErrNotFound
 	}
 	return s, nil
 }
 
-func (r *stubSessionRepo) GetSession(ctx context.Context, ws control.WorkspaceID, id control.SessionID) (control.Session, error) {
+func (r *sessionStubSessionRepo) GetSession(ctx context.Context, ws control.WorkspaceID, id control.SessionID) (control.Session, error) {
 	r.log.add("sessions:get")
 	if r.getErr != nil {
 		return control.Session{}, r.getErr
@@ -197,7 +197,7 @@ func (r *stubSessionRepo) GetSession(ctx context.Context, ws control.WorkspaceID
 	return s, nil
 }
 
-func (r *stubSessionRepo) ListSessions(ctx context.Context, ws control.WorkspaceID, q control.SessionQuery) ([]control.Session, string, error) {
+func (r *sessionStubSessionRepo) ListSessions(ctx context.Context, ws control.WorkspaceID, q control.SessionQuery) ([]control.Session, string, error) {
 	r.log.add("sessions:list")
 	r.lastListWS = ws
 	r.lastListQuery = q
@@ -220,7 +220,7 @@ func (r *stubSessionRepo) ListSessions(ctx context.Context, ws control.Workspace
 	return rows, "", nil
 }
 
-func (r *stubSessionRepo) Transition(ctx context.Context, ws control.WorkspaceID, id control.SessionID, from []control.SessionState, to control.SessionState, opts control.TransitionOpts) error {
+func (r *sessionStubSessionRepo) Transition(ctx context.Context, ws control.WorkspaceID, id control.SessionID, from []control.SessionState, to control.SessionState, opts control.TransitionOpts) error {
 	r.log.add("sessions:transition:" + string(to))
 	if r.transitionErr != nil {
 		return r.transitionErr
@@ -243,18 +243,18 @@ func (r *stubSessionRepo) Transition(ctx context.Context, ws control.WorkspaceID
 	return nil
 }
 
-func (r *stubSessionRepo) SetSessionSetupHash(ctx context.Context, ws control.WorkspaceID, id control.SessionID, hash string) error {
+func (r *sessionStubSessionRepo) SetSessionSetupHash(ctx context.Context, ws control.WorkspaceID, id control.SessionID, hash string) error {
 	r.log.add("sessions:set-setup-hash")
 	return nil
 }
 
-func (r *stubSessionRepo) SetChildExitCode(ctx context.Context, ws control.WorkspaceID, id control.SessionID, code int) error {
+func (r *sessionStubSessionRepo) SetChildExitCode(ctx context.Context, ws control.WorkspaceID, id control.SessionID, code int) error {
 	r.log.add("sessions:set-child-exit-code")
 	return nil
 }
 
-type stubEnvironmentRepo struct {
-	log *callLog
+type sessionStubEnvironmentRepo struct {
+	log *sessionCallLog
 
 	rows map[control.EnvironmentID]control.Environment
 
@@ -269,18 +269,18 @@ type stubEnvironmentRepo struct {
 	lastCountStates  []control.SessionState
 }
 
-func newStubEnvironmentRepo(log *callLog) *stubEnvironmentRepo {
-	return &stubEnvironmentRepo{
+func newSessionStubEnvironmentRepo(log *sessionCallLog) *sessionStubEnvironmentRepo {
+	return &sessionStubEnvironmentRepo{
 		log:  log,
 		rows: map[control.EnvironmentID]control.Environment{},
 	}
 }
 
-func (r *stubEnvironmentRepo) put(e control.Environment) {
+func (r *sessionStubEnvironmentRepo) put(e control.Environment) {
 	r.rows[e.ID] = e
 }
 
-func (r *stubEnvironmentRepo) CreateEnvironment(ctx context.Context, ws control.WorkspaceID, e control.Environment) (control.Environment, error) {
+func (r *sessionStubEnvironmentRepo) CreateEnvironment(ctx context.Context, ws control.WorkspaceID, e control.Environment) (control.Environment, error) {
 	r.log.add("environments:create")
 	if r.createErr != nil {
 		return control.Environment{}, r.createErr
@@ -289,7 +289,7 @@ func (r *stubEnvironmentRepo) CreateEnvironment(ctx context.Context, ws control.
 	return e, nil
 }
 
-func (r *stubEnvironmentRepo) GetEnvironment(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID) (control.Environment, error) {
+func (r *sessionStubEnvironmentRepo) GetEnvironment(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID) (control.Environment, error) {
 	r.log.add("environments:get")
 	if r.getErr != nil {
 		return control.Environment{}, r.getErr
@@ -301,7 +301,7 @@ func (r *stubEnvironmentRepo) GetEnvironment(ctx context.Context, ws control.Wor
 	return e, nil
 }
 
-func (r *stubEnvironmentRepo) ListEnvironments(ctx context.Context, ws control.WorkspaceID, q control.EnvironmentQuery) ([]control.Environment, string, error) {
+func (r *sessionStubEnvironmentRepo) ListEnvironments(ctx context.Context, ws control.WorkspaceID, q control.EnvironmentQuery) ([]control.Environment, string, error) {
 	r.log.add("environments:list")
 	if r.listErr != nil {
 		return nil, "", r.listErr
@@ -322,7 +322,7 @@ func (r *stubEnvironmentRepo) ListEnvironments(ctx context.Context, ws control.W
 	return rows, "", nil
 }
 
-func (r *stubEnvironmentRepo) UpdateEnvironment(ctx context.Context, ws control.WorkspaceID, e control.Environment) (control.Environment, error) {
+func (r *sessionStubEnvironmentRepo) UpdateEnvironment(ctx context.Context, ws control.WorkspaceID, e control.Environment) (control.Environment, error) {
 	r.log.add("environments:update")
 	if r.updateErr != nil {
 		return control.Environment{}, r.updateErr
@@ -334,7 +334,7 @@ func (r *stubEnvironmentRepo) UpdateEnvironment(ctx context.Context, ws control.
 	return e, nil
 }
 
-func (r *stubEnvironmentRepo) DeleteEnvironment(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID) error {
+func (r *sessionStubEnvironmentRepo) DeleteEnvironment(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID) error {
 	r.log.add("environments:delete")
 	if r.deleteErr != nil {
 		return r.deleteErr
@@ -347,7 +347,7 @@ func (r *stubEnvironmentRepo) DeleteEnvironment(ctx context.Context, ws control.
 	return nil
 }
 
-func (r *stubEnvironmentRepo) CountSessionsByEnvironment(ctx context.Context, ws control.WorkspaceID, envID control.EnvironmentID, states []control.SessionState) (int, error) {
+func (r *sessionStubEnvironmentRepo) CountSessionsByEnvironment(ctx context.Context, ws control.WorkspaceID, envID control.EnvironmentID, states []control.SessionState) (int, error) {
 	r.log.add("environments:count")
 	r.lastCountStates = states
 	if r.countErr != nil {
@@ -356,20 +356,20 @@ func (r *stubEnvironmentRepo) CountSessionsByEnvironment(ctx context.Context, ws
 	return r.liveSessionCount, nil
 }
 
-func (r *stubEnvironmentRepo) SetEnvironmentSnapshot(ctx context.Context, ws control.WorkspaceID, envID control.EnvironmentID, expectHash, ref string, runnerID control.RunnerID) error {
+func (r *sessionStubEnvironmentRepo) SetEnvironmentSnapshot(ctx context.Context, ws control.WorkspaceID, envID control.EnvironmentID, expectHash, ref string, runnerID control.RunnerID) error {
 	r.log.add("environments:set-snapshot")
 	return nil
 }
 
-type stubPoolResolver struct {
-	log *callLog
+type sessionStubPoolResolver struct {
+	log *sessionCallLog
 
 	pools           []control.Pool
 	err             error
 	gotRequirements control.Requirements
 }
 
-func (p *stubPoolResolver) EligiblePools(ctx context.Context, sc control.Scope, req control.Requirements) ([]control.Pool, error) {
+func (p *sessionStubPoolResolver) EligiblePools(ctx context.Context, sc control.Scope, req control.Requirements) ([]control.Pool, error) {
 	p.log.add("pools:eligible")
 	if p.err != nil {
 		return nil, p.err
@@ -378,13 +378,13 @@ func (p *stubPoolResolver) EligiblePools(ctx context.Context, sc control.Scope, 
 	return p.pools, nil
 }
 
-type stubEventRecorder struct {
-	log    *callLog
+type sessionStubEventRecorder struct {
+	log    *sessionCallLog
 	err    error
 	events []control.Event
 }
 
-func (r *stubEventRecorder) Record(ctx context.Context, e control.Event) error {
+func (r *sessionStubEventRecorder) Record(ctx context.Context, e control.Event) error {
 	r.log.add("events:record")
 	if r.err != nil {
 		return r.err
@@ -393,15 +393,15 @@ func (r *stubEventRecorder) Record(ctx context.Context, e control.Event) error {
 	return nil
 }
 
-type stubTransport struct {
-	log          *callLog
+type sessionStubTransport struct {
+	log          *sessionCallLog
 	res          runner.FromRunner
 	err          error
 	connectedMap map[string]bool
 	dispatched   []runner.ToRunner
 }
 
-func (t *stubTransport) Dispatch(ctx context.Context, pool control.PoolID, id control.RunnerID, m runner.ToRunner) (runner.FromRunner, error) {
+func (t *sessionStubTransport) Dispatch(ctx context.Context, pool control.PoolID, id control.RunnerID, m runner.ToRunner) (runner.FromRunner, error) {
 	t.log.add("transport:dispatch:" + m.Type)
 	if t.err != nil {
 		return runner.FromRunner{}, t.err
@@ -410,7 +410,7 @@ func (t *stubTransport) Dispatch(ctx context.Context, pool control.PoolID, id co
 	return t.res, nil
 }
 
-func (t *stubTransport) Connected(pool control.PoolID, id control.RunnerID) bool {
+func (t *sessionStubTransport) Connected(pool control.PoolID, id control.RunnerID) bool {
 	t.log.add("transport:connected:" + string(id))
 	if t.connectedMap == nil {
 		return true
@@ -418,7 +418,7 @@ func (t *stubTransport) Connected(pool control.PoolID, id control.RunnerID) bool
 	return t.connectedMap[string(pool)+"\x00"+string(id)]
 }
 
-func (t *stubTransport) dispatchedType(typ string) bool {
+func (t *sessionStubTransport) dispatchedType(typ string) bool {
 	for _, m := range t.dispatched {
 		if m.Type == typ {
 			return true
@@ -427,8 +427,8 @@ func (t *stubTransport) dispatchedType(typ string) bool {
 	return false
 }
 
-type stubFleet struct {
-	log *callLog
+type sessionStubFleet struct {
+	log *sessionCallLog
 
 	runners []control.Runner
 	listErr error
@@ -437,17 +437,17 @@ type stubFleet struct {
 	sessionsOnRunnerErr error
 }
 
-func (f *stubFleet) UpsertRunner(ctx context.Context, pool control.PoolID, r control.Runner) error {
+func (f *sessionStubFleet) UpsertRunner(ctx context.Context, pool control.PoolID, r control.Runner) error {
 	f.log.add("fleet:upsert")
 	return nil
 }
 
-func (f *stubFleet) SetRunnerConnected(ctx context.Context, pool control.PoolID, id control.RunnerID, connected bool) error {
+func (f *sessionStubFleet) SetRunnerConnected(ctx context.Context, pool control.PoolID, id control.RunnerID, connected bool) error {
 	f.log.add("fleet:set-connected")
 	return nil
 }
 
-func (f *stubFleet) ListRunners(ctx context.Context, pool control.PoolID) ([]control.Runner, error) {
+func (f *sessionStubFleet) ListRunners(ctx context.Context, pool control.PoolID) ([]control.Runner, error) {
 	f.log.add("fleet:list-runners")
 	if f.listErr != nil {
 		return nil, f.listErr
@@ -455,7 +455,7 @@ func (f *stubFleet) ListRunners(ctx context.Context, pool control.PoolID) ([]con
 	return f.runners, nil
 }
 
-func (f *stubFleet) SessionsOnRunner(ctx context.Context, pool control.PoolID, id control.RunnerID, states []control.SessionState) ([]control.Session, error) {
+func (f *sessionStubFleet) SessionsOnRunner(ctx context.Context, pool control.PoolID, id control.RunnerID, states []control.SessionState) ([]control.Session, error) {
 	f.log.add("fleet:sessions-on-runner")
 	if f.sessionsOnRunnerErr != nil {
 		return nil, f.sessionsOnRunnerErr
@@ -463,7 +463,7 @@ func (f *stubFleet) SessionsOnRunner(ctx context.Context, pool control.PoolID, i
 	return f.creatingOnRunner[string(pool)+"\x00"+string(id)], nil
 }
 
-func (f *stubFleet) OldestQueued(ctx context.Context, pool control.PoolID) ([]control.Session, error) {
+func (f *sessionStubFleet) OldestQueued(ctx context.Context, pool control.PoolID) ([]control.Session, error) {
 	f.log.add("fleet:oldest-queued")
 	return nil, nil
 }
@@ -483,16 +483,16 @@ var _ control.Sessions = (*SessionService)(nil)
 
 func validSessionOptions() SessionOptions {
 	return SessionOptions{
-		Authorizer:   &stubAuthorizer{},
-		Sessions:     newStubSessionRepo(nil),
-		Environments: newStubEnvironmentRepo(nil),
-		Pools:        &stubPoolResolver{},
-		Events:       &stubEventRecorder{},
-		Clock:        stubClock{now: fixedNow},
-		IDs:          &stubIDs{sessionID: "sess_example", envID: "env_example", eventID: "evt_example"},
+		Authorizer:   &sessionStubAuthorizer{},
+		Sessions:     newSessionStubSessionRepo(nil),
+		Environments: newSessionStubEnvironmentRepo(nil),
+		Pools:        &sessionStubPoolResolver{},
+		Events:       &sessionStubEventRecorder{},
+		Clock:        sessionStubClock{now: sessionFixedNow},
+		IDs:          &sessionStubIDs{sessionID: "sess_example", envID: "env_example", eventID: "evt_example"},
 		Wake:         func(control.PoolID) {},
-		Fleet:        &stubFleet{},
-		Transport:    &stubTransport{},
+		Fleet:        &sessionStubFleet{},
+		Transport:    &sessionStubTransport{},
 	}
 }
 
@@ -528,34 +528,34 @@ func TestNewSessionServiceRequiresEveryDependency(t *testing.T) {
 // prove authorization and durability order.
 type sessionFixture struct {
 	svc       *SessionService
-	repo      *stubSessionRepo
-	envRepo   *stubEnvironmentRepo
-	pools     *stubPoolResolver
-	events    *stubEventRecorder
-	auth      *stubAuthorizer
-	transport *stubTransport
-	fleet     *stubFleet
-	log       *callLog
+	repo      *sessionStubSessionRepo
+	envRepo   *sessionStubEnvironmentRepo
+	pools     *sessionStubPoolResolver
+	events    *sessionStubEventRecorder
+	auth      *sessionStubAuthorizer
+	transport *sessionStubTransport
+	fleet     *sessionStubFleet
+	log       *sessionCallLog
 }
 
 func newSessionFixtureFull(t *testing.T) *sessionFixture {
 	t.Helper()
-	log := &callLog{}
-	repo := newStubSessionRepo(log)
-	envRepo := newStubEnvironmentRepo(log)
-	pools := &stubPoolResolver{log: log}
-	events := &stubEventRecorder{log: log}
-	auth := &stubAuthorizer{log: log}
-	transport := &stubTransport{log: log, res: runner.FromRunner{OK: true}}
-	fleet := &stubFleet{log: log}
+	log := &sessionCallLog{}
+	repo := newSessionStubSessionRepo(log)
+	envRepo := newSessionStubEnvironmentRepo(log)
+	pools := &sessionStubPoolResolver{log: log}
+	events := &sessionStubEventRecorder{log: log}
+	auth := &sessionStubAuthorizer{log: log}
+	transport := &sessionStubTransport{log: log, res: runner.FromRunner{OK: true}}
+	fleet := &sessionStubFleet{log: log}
 	svc, err := NewSessionService(SessionOptions{
 		Authorizer:   auth,
 		Sessions:     repo,
 		Environments: envRepo,
 		Pools:        pools,
 		Events:       events,
-		Clock:        stubClock{now: fixedNow},
-		IDs:          &stubIDs{log: log, sessionID: "sess_example", envID: "env_example", eventID: "evt_example"},
+		Clock:        sessionStubClock{now: sessionFixedNow},
+		IDs:          &sessionStubIDs{log: log, sessionID: "sess_example", envID: "env_example", eventID: "evt_example"},
 		Wake:         func(p control.PoolID) { log.add("wake:" + string(p)) },
 		Fleet:        fleet,
 		Transport:    transport,
@@ -570,12 +570,12 @@ func newSessionFixtureFull(t *testing.T) *sessionFixture {
 }
 
 // newSessionFixture keeps the pre-lifecycle call shape for Task 1 tests.
-func newSessionFixture(t *testing.T) (*SessionService, *stubSessionRepo, *stubEnvironmentRepo, *stubPoolResolver, *stubEventRecorder, *stubAuthorizer, *callLog) {
+func newSessionFixture(t *testing.T) (*SessionService, *sessionStubSessionRepo, *sessionStubEnvironmentRepo, *sessionStubPoolResolver, *sessionStubEventRecorder, *sessionStubAuthorizer, *sessionCallLog) {
 	f := newSessionFixtureFull(t)
 	return f.svc, f.repo, f.envRepo, f.pools, f.events, f.auth, f.log
 }
 
-func exampleEnvironment() control.Environment {
+func sessionExampleEnvironment() control.Environment {
 	return control.Environment{
 		ID:           "env_example",
 		WorkspaceID:  "ws_example",
@@ -587,8 +587,8 @@ func exampleEnvironment() control.Environment {
 		Requirements: control.Requirements{Capabilities: []string{"gpu"}, MinCPU: 2},
 		Snapshot:     control.Checkpoint{},
 		SnapshotHash: "",
-		CreatedAt:    fixedNow,
-		UpdatedAt:    fixedNow,
+		CreatedAt:    sessionFixedNow,
+		UpdatedAt:    sessionFixedNow,
 	}
 }
 
@@ -598,13 +598,13 @@ func exampleEnvironment() control.Environment {
 
 func TestCreateSessionCore(t *testing.T) {
 	svc, _, envRepo, pools, _, _, _ := newSessionFixture(t)
-	envRepo.put(exampleEnvironment())
+	envRepo.put(sessionExampleEnvironment())
 	pools.pools = []control.Pool{
 		{ID: "pool_b", CapacityTotal: 5, CapacityUsed: 0},
 		{ID: "pool_a", CapacityTotal: 10, CapacityUsed: 2},
 	}
 
-	got, err := svc.CreateSession(context.Background(), testScope(), control.CreateSession{
+	got, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{
 		Name: "investigate", EnvironmentID: "env_example",
 		Repos: []control.RepoRef{}, IdempotencyKey: "idem_example",
 	})
@@ -631,14 +631,14 @@ func TestCreateSessionCore(t *testing.T) {
 	if got.SetupHash != "" {
 		t.Fatalf("setup hash = %q, want empty (dispatch is the Fleet lane's job)", got.SetupHash)
 	}
-	if !got.CreatedAt.Equal(fixedNow) || !got.UpdatedAt.Equal(fixedNow) || !got.LastEventAt.Equal(fixedNow) {
+	if !got.CreatedAt.Equal(sessionFixedNow) || !got.UpdatedAt.Equal(sessionFixedNow) || !got.LastEventAt.Equal(sessionFixedNow) {
 		t.Fatalf("timestamps = %v/%v/%v, want fixed now", got.CreatedAt, got.UpdatedAt, got.LastEventAt)
 	}
 }
 
 func TestCreateSessionInvalidInput(t *testing.T) {
 	svc, repo, envRepo, _, _, _, log := newSessionFixture(t)
-	envRepo.put(exampleEnvironment())
+	envRepo.put(sessionExampleEnvironment())
 	ctx := context.Background()
 
 	// Invalid scope touches no port.
@@ -651,7 +651,7 @@ func TestCreateSessionInvalidInput(t *testing.T) {
 
 	// Contradictory environment/scratch input touches no port.
 	bad := control.CreateSession{Name: "x", EnvironmentID: "env_example", Spec: control.PortableSpec{Image: "img.example.invalid"}}
-	if _, err := svc.CreateSession(ctx, testScope(), bad); !errors.Is(err, control.ErrInvalid) {
+	if _, err := svc.CreateSession(ctx, sessionTestScope(), bad); !errors.Is(err, control.ErrInvalid) {
 		t.Fatalf("contradictory create: got %v, want ErrInvalid", err)
 	}
 	if len(log.snapshot()) != 0 {
@@ -662,10 +662,10 @@ func TestCreateSessionInvalidInput(t *testing.T) {
 
 func TestCreateSessionRejectsMissingTarget(t *testing.T) {
 	svc, _, envRepo, pools, _, _, log := newSessionFixture(t)
-	envRepo.put(exampleEnvironment())
+	envRepo.put(sessionExampleEnvironment())
 	pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 1, CapacityUsed: 0}}
 
-	_, err := svc.CreateSession(context.Background(), testScope(), control.CreateSession{Name: "nowhere"})
+	_, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{Name: "nowhere"})
 	if !errors.Is(err, control.ErrInvalid) {
 		t.Fatalf("got %v, want ErrInvalid", err)
 	}
@@ -676,11 +676,11 @@ func TestCreateSessionRejectsMissingTarget(t *testing.T) {
 
 func TestCreateSessionAuthorizesBeforeLookupAndStorage(t *testing.T) {
 	svc, repo, envRepo, pools, _, auth, log := newSessionFixture(t)
-	envRepo.put(exampleEnvironment())
+	envRepo.put(sessionExampleEnvironment())
 	pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 1, CapacityUsed: 0}}
 	auth.err = control.ErrDenied
 
-	_, err := svc.CreateSession(context.Background(), testScope(), control.CreateSession{
+	_, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{
 		Name: "investigate", EnvironmentID: "env_example", IdempotencyKey: "idem_example",
 	})
 	if !errors.Is(err, control.ErrDenied) {
@@ -696,7 +696,7 @@ func TestCreateSessionAuthorizesBeforeLookupAndStorage(t *testing.T) {
 
 func TestCreateSessionIdempotentReplay(t *testing.T) {
 	svc, repo, envRepo, pools, events, _, log := newSessionFixture(t)
-	envRepo.put(exampleEnvironment())
+	envRepo.put(sessionExampleEnvironment())
 	pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 1, CapacityUsed: 0}}
 
 	existing := control.Session{
@@ -704,11 +704,11 @@ func TestCreateSessionIdempotentReplay(t *testing.T) {
 		Name: "investigate", State: control.StateQueued, EnvironmentID: "env_example",
 		Spec: control.PortableSpec{Image: "registry.example.invalid/rainier@sha256:0000",
 			EgressAllow: []string{"example.com"}, Repos: []control.RepoRef{}},
-		IdempotencyKey: "idem_example", CreatedAt: fixedNow, UpdatedAt: fixedNow, LastEventAt: fixedNow,
+		IdempotencyKey: "idem_example", CreatedAt: sessionFixedNow, UpdatedAt: sessionFixedNow, LastEventAt: sessionFixedNow,
 	}
-	repo.idem[idemKey("ws_example", "act_example", "idem_example")] = existing
+	repo.idem[sessionIdemKey("ws_example", "act_example", "idem_example")] = existing
 
-	got, err := svc.CreateSession(context.Background(), testScope(), control.CreateSession{
+	got, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{
 		Name: "investigate", EnvironmentID: "env_example", IdempotencyKey: "idem_example",
 	})
 	if err != nil {
@@ -733,7 +733,7 @@ func TestCreateSessionEnvironmentNotFound(t *testing.T) {
 	svc, repo, envRepo, pools, _, _, log := newSessionFixture(t)
 	pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 1, CapacityUsed: 0}}
 
-	_, err := svc.CreateSession(context.Background(), testScope(), control.CreateSession{
+	_, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{
 		Name: "investigate", EnvironmentID: "env_missing",
 	})
 	if !errors.Is(err, control.ErrNotFound) {
@@ -748,10 +748,10 @@ func TestCreateSessionEnvironmentNotFound(t *testing.T) {
 
 func TestCreateSessionReposOptionality(t *testing.T) {
 	svc, _, envRepo, pools, _, _, _ := newSessionFixture(t)
-	envRepo.put(exampleEnvironment())
+	envRepo.put(sessionExampleEnvironment())
 	pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 1, CapacityUsed: 0}}
 
-	nilRepos, err := svc.CreateSession(context.Background(), testScope(), control.CreateSession{
+	nilRepos, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{
 		Name: "a", EnvironmentID: "env_example",
 	})
 	if err != nil {
@@ -761,7 +761,7 @@ func TestCreateSessionReposOptionality(t *testing.T) {
 		t.Fatalf("nil repos became %#v", nilRepos.Spec.Repos)
 	}
 
-	emptyRepos, err := svc.CreateSession(context.Background(), testScope(), control.CreateSession{
+	emptyRepos, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{
 		Name: "b", EnvironmentID: "env_example", Repos: []control.RepoRef{},
 	})
 	if err != nil {
@@ -775,14 +775,14 @@ func TestCreateSessionReposOptionality(t *testing.T) {
 func TestCreateSessionResolvesEnvironmentWithoutAliasing(t *testing.T) {
 	svc, repo, envRepo, pools, _, _, _ := newSessionFixture(t)
 	egress := []string{"example.com"}
-	env := exampleEnvironment()
+	env := sessionExampleEnvironment()
 	env.EgressAllow = egress
 	env.Snapshot = control.Checkpoint{Ref: "registry.example.invalid/rainier@sha256:cafe", Format: "rainier-runner-v0", Capabilities: []string{"workspace"}}
 	env.SnapshotHash = env.SetupHash // current snapshot
 	envRepo.put(env)
 	pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 1, CapacityUsed: 0}}
 
-	got, err := svc.CreateSession(context.Background(), testScope(), control.CreateSession{
+	got, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{
 		Name: "investigate", EnvironmentID: "env_example", Repos: nil,
 	})
 	if err != nil {
@@ -810,7 +810,7 @@ func TestCreateSessionScratchRequirementsAreZero(t *testing.T) {
 	svc, _, _, pools, _, _, _ := newSessionFixture(t)
 	pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 1, CapacityUsed: 0}}
 
-	got, err := svc.CreateSession(context.Background(), testScope(), control.CreateSession{
+	got, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{
 		Name: "scratch", Spec: control.PortableSpec{
 			Image: "registry.example.invalid/agent@sha256:0000", Cmd: []string{"bash"},
 		},
@@ -835,7 +835,7 @@ func TestCreateSessionScratchRequirementsAreZero(t *testing.T) {
 
 func TestCreateSessionPoolSelection(t *testing.T) {
 	svc, _, envRepo, pools, _, _, _ := newSessionFixture(t)
-	envRepo.put(exampleEnvironment())
+	envRepo.put(sessionExampleEnvironment())
 	ctx := context.Background()
 
 	tests := []struct {
@@ -861,7 +861,7 @@ func TestCreateSessionPoolSelection(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			pools.pools = tt.pools
-			got, err := svc.CreateSession(ctx, testScope(), control.CreateSession{Name: "investigate", EnvironmentID: "env_example"})
+			got, err := svc.CreateSession(ctx, sessionTestScope(), control.CreateSession{Name: "investigate", EnvironmentID: "env_example"})
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("got %v, want %v", err, tt.wantErr)
 			}
@@ -877,15 +877,15 @@ func TestCreateSessionPoolSelection(t *testing.T) {
 
 func TestCreateSessionOrdering(t *testing.T) {
 	svc, _, envRepo, pools, _, _, log := newSessionFixture(t)
-	envRepo.put(exampleEnvironment())
+	envRepo.put(sessionExampleEnvironment())
 	pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 1, CapacityUsed: 0}}
 
-	if _, err := svc.CreateSession(context.Background(), testScope(), control.CreateSession{
+	if _, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{
 		Name: "investigate", EnvironmentID: "env_example",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	ordered(t, log.snapshot(),
+	sessionOrdered(t, log.snapshot(),
 		"auth:create:session", "environments:get", "pools:eligible",
 		"id:session", "sessions:create", "id:event", "events:record", "wake:pool_a")
 }
@@ -902,7 +902,7 @@ func TestGetSessionScopedAndCopied(t *testing.T) {
 		Spec: control.PortableSpec{Repos: []control.RepoRef{{Repo: "acme/app"}}},
 	})
 
-	got, err := svc.GetSession(context.Background(), testScope(), "sess_example")
+	got, err := svc.GetSession(context.Background(), sessionTestScope(), "sess_example")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -918,12 +918,12 @@ func TestGetSessionScopedAndCopied(t *testing.T) {
 
 	// A denied caller receives no row.
 	auth.err = control.ErrDenied
-	if _, err := svc.GetSession(context.Background(), testScope(), "sess_example"); !errors.Is(err, control.ErrDenied) {
+	if _, err := svc.GetSession(context.Background(), sessionTestScope(), "sess_example"); !errors.Is(err, control.ErrDenied) {
 		t.Fatalf("denied get: got %v, want ErrDenied", err)
 	}
 
 	// A cross-workspace miss is ErrNotFound, not ErrDenied or ErrInvalid.
-	other := testScope()
+	other := sessionTestScope()
 	other.WorkspaceID = "ws_other"
 	auth.err = nil
 	if _, err := svc.GetSession(context.Background(), other, "sess_example"); !errors.Is(err, control.ErrNotFound) {
@@ -935,11 +935,11 @@ func TestListSessionsAuthorizesBeforeRepository(t *testing.T) {
 	svc, repo, _, _, _, auth, log := newSessionFixture(t)
 	repo.put(control.Session{
 		ID: "sess_example", WorkspaceID: "ws_example", CreatorID: "act_example",
-		State: control.StateQueued, CreatedAt: fixedNow,
+		State: control.StateQueued, CreatedAt: sessionFixedNow,
 	})
 	auth.err = control.ErrDenied
 
-	page, err := svc.ListSessions(context.Background(), testScope(), control.SessionQuery{Limit: 10})
+	page, err := svc.ListSessions(context.Background(), sessionTestScope(), control.SessionQuery{Limit: 10})
 	if !errors.Is(err, control.ErrDenied) {
 		t.Fatalf("got %v, want ErrDenied", err)
 	}
@@ -955,13 +955,13 @@ func TestListSessionsPassthroughAndCopies(t *testing.T) {
 	svc, repo, _, _, _, _, _ := newSessionFixture(t)
 	repo.put(control.Session{
 		ID: "sess_example", WorkspaceID: "ws_example", CreatorID: "act_example",
-		State: control.StateQueued, CreatedAt: fixedNow,
+		State: control.StateQueued, CreatedAt: sessionFixedNow,
 		Spec: control.PortableSpec{Repos: []control.RepoRef{{Repo: "acme/app"}}},
 	})
 
 	// Invalid limits/cursors are the repository's concern: they pass through.
 	q := control.SessionQuery{Limit: -5, Cursor: "bogus_cursor", IncludeTerminal: true}
-	page, err := svc.ListSessions(context.Background(), testScope(), q)
+	page, err := svc.ListSessions(context.Background(), sessionTestScope(), q)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -983,7 +983,7 @@ func TestListSessionsPassthroughAndCopies(t *testing.T) {
 
 	// An empty page is a non-nil empty slice.
 	repo.rows = map[control.SessionID]control.Session{}
-	empty, err := svc.ListSessions(context.Background(), testScope(), control.SessionQuery{})
+	empty, err := svc.ListSessions(context.Background(), sessionTestScope(), control.SessionQuery{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1007,9 +1007,9 @@ func sessionInState(state control.SessionState) control.Session {
 		PoolID:              "pool_a",
 		RunnerID:            "runner_a",
 		PlacementGeneration: 1,
-		CreatedAt:           fixedNow,
-		UpdatedAt:           fixedNow,
-		LastEventAt:         fixedNow,
+		CreatedAt:           sessionFixedNow,
+		UpdatedAt:           sessionFixedNow,
+		LastEventAt:         sessionFixedNow,
 	}
 	if state == control.StateQueued {
 		row.RunnerID = ""
@@ -1036,7 +1036,7 @@ func TestDeleteSessionStateTable(t *testing.T) {
 			f := newSessionFixtureFull(t)
 			f.repo.put(sessionInState(tt.state))
 
-			err := f.svc.DeleteSession(context.Background(), testScope(), control.DeleteSession{ID: "sess_example"})
+			err := f.svc.DeleteSession(context.Background(), sessionTestScope(), control.DeleteSession{ID: "sess_example"})
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("got %v, want %v", err, tt.wantErr)
 			}
@@ -1082,7 +1082,7 @@ func TestSuspendSession(t *testing.T) {
 			f := newSessionFixtureFull(t)
 			f.repo.put(sessionInState(tt.state))
 
-			got, err := f.svc.SuspendSession(context.Background(), testScope(), control.SuspendSession{ID: "sess_example", Warm: tt.warm})
+			got, err := f.svc.SuspendSession(context.Background(), sessionTestScope(), control.SuspendSession{ID: "sess_example", Warm: tt.warm})
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("got %v, want %v", err, tt.wantErr)
 			}
@@ -1110,7 +1110,7 @@ func TestSuspendSession(t *testing.T) {
 			if row.State != tt.wantTo {
 				t.Fatalf("stored state = %q, want %q", row.State, tt.wantTo)
 			}
-			ordered(t, f.log.snapshot(),
+			sessionOrdered(t, f.log.snapshot(),
 				"auth:suspend:session",
 				"transport:dispatch:suspend",
 				"sessions:transition:"+string(tt.wantTo),
@@ -1137,7 +1137,7 @@ func TestResumeSession(t *testing.T) {
 			f.fleet.creatingOnRunner = map[string][]control.Session{}
 			f.repo.put(sessionInState(tt.state))
 
-			got, err := f.svc.ResumeSession(context.Background(), testScope(), control.ResumeSession{ID: "sess_example"})
+			got, err := f.svc.ResumeSession(context.Background(), sessionTestScope(), control.ResumeSession{ID: "sess_example"})
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("got %v, want %v", err, tt.wantErr)
 			}
@@ -1170,7 +1170,7 @@ func TestResumeColdRequiresFreeCapacity(t *testing.T) {
 		}
 		f.repo.put(sessionInState(control.StateSuspendedCold))
 
-		if _, err := f.svc.ResumeSession(ctx, testScope(), control.ResumeSession{ID: "sess_example"}); !errors.Is(err, control.ErrConflict) {
+		if _, err := f.svc.ResumeSession(ctx, sessionTestScope(), control.ResumeSession{ID: "sess_example"}); !errors.Is(err, control.ErrConflict) {
 			t.Fatalf("got %v, want ErrConflict", err)
 		}
 		if f.transport.dispatchedType("resume") {
@@ -1186,7 +1186,7 @@ func TestResumeColdRequiresFreeCapacity(t *testing.T) {
 		}
 		f.repo.put(sessionInState(control.StateSuspendedCold))
 
-		got, err := f.svc.ResumeSession(ctx, testScope(), control.ResumeSession{ID: "sess_example"})
+		got, err := f.svc.ResumeSession(ctx, sessionTestScope(), control.ResumeSession{ID: "sess_example"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1205,7 +1205,7 @@ func TestSnapshotSession(t *testing.T) {
 			f.transport.res = runner.FromRunner{OK: true, Detail: "snap_ref_example"}
 			f.repo.put(sessionInState(state))
 
-			got, err := f.svc.SnapshotSession(ctx, testScope(), control.SnapshotSession{ID: "sess_example"})
+			got, err := f.svc.SnapshotSession(ctx, sessionTestScope(), control.SnapshotSession{ID: "sess_example"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1221,7 +1221,7 @@ func TestSnapshotSession(t *testing.T) {
 	t.Run("conflicting state", func(t *testing.T) {
 		f := newSessionFixtureFull(t)
 		f.repo.put(sessionInState(control.StateQueued))
-		if _, err := f.svc.SnapshotSession(ctx, testScope(), control.SnapshotSession{ID: "sess_example"}); !errors.Is(err, control.ErrConflict) {
+		if _, err := f.svc.SnapshotSession(ctx, sessionTestScope(), control.SnapshotSession{ID: "sess_example"}); !errors.Is(err, control.ErrConflict) {
 			t.Fatalf("got %v, want ErrConflict", err)
 		}
 	})
@@ -1230,7 +1230,7 @@ func TestSnapshotSession(t *testing.T) {
 		f := newSessionFixtureFull(t)
 		f.transport.res = runner.FromRunner{OK: true, Detail: ""}
 		f.repo.put(sessionInState(control.StateRunning))
-		if _, err := f.svc.SnapshotSession(ctx, testScope(), control.SnapshotSession{ID: "sess_example"}); !errors.Is(err, control.ErrUnavailable) {
+		if _, err := f.svc.SnapshotSession(ctx, sessionTestScope(), control.SnapshotSession{ID: "sess_example"}); !errors.Is(err, control.ErrUnavailable) {
 			t.Fatalf("got %v, want ErrUnavailable", err)
 		}
 	})
@@ -1239,7 +1239,7 @@ func TestSnapshotSession(t *testing.T) {
 		f := newSessionFixtureFull(t)
 		f.transport.res = runner.FromRunner{OK: false, Detail: "secret runner detail"}
 		f.repo.put(sessionInState(control.StateRunning))
-		_, err := f.svc.SnapshotSession(ctx, testScope(), control.SnapshotSession{ID: "sess_example"})
+		_, err := f.svc.SnapshotSession(ctx, sessionTestScope(), control.SnapshotSession{ID: "sess_example"})
 		if !errors.Is(err, control.ErrUnavailable) {
 			t.Fatalf("got %v, want ErrUnavailable", err)
 		}
@@ -1255,16 +1255,16 @@ func TestLifecycleDenialPreventsDispatchAndTransition(t *testing.T) {
 	f.auth.err = control.ErrDenied
 	f.repo.put(sessionInState(control.StateRunning))
 
-	if err := f.svc.DeleteSession(ctx, testScope(), control.DeleteSession{ID: "sess_example"}); !errors.Is(err, control.ErrDenied) {
+	if err := f.svc.DeleteSession(ctx, sessionTestScope(), control.DeleteSession{ID: "sess_example"}); !errors.Is(err, control.ErrDenied) {
 		t.Fatalf("delete: got %v, want ErrDenied", err)
 	}
-	if _, err := f.svc.SuspendSession(ctx, testScope(), control.SuspendSession{ID: "sess_example", Warm: true}); !errors.Is(err, control.ErrDenied) {
+	if _, err := f.svc.SuspendSession(ctx, sessionTestScope(), control.SuspendSession{ID: "sess_example", Warm: true}); !errors.Is(err, control.ErrDenied) {
 		t.Fatalf("suspend: got %v, want ErrDenied", err)
 	}
-	if _, err := f.svc.ResumeSession(ctx, testScope(), control.ResumeSession{ID: "sess_example"}); !errors.Is(err, control.ErrDenied) {
+	if _, err := f.svc.ResumeSession(ctx, sessionTestScope(), control.ResumeSession{ID: "sess_example"}); !errors.Is(err, control.ErrDenied) {
 		t.Fatalf("resume: got %v, want ErrDenied", err)
 	}
-	if _, err := f.svc.SnapshotSession(ctx, testScope(), control.SnapshotSession{ID: "sess_example"}); !errors.Is(err, control.ErrDenied) {
+	if _, err := f.svc.SnapshotSession(ctx, sessionTestScope(), control.SnapshotSession{ID: "sess_example"}); !errors.Is(err, control.ErrDenied) {
 		t.Fatalf("snapshot: got %v, want ErrDenied", err)
 	}
 
@@ -1280,7 +1280,7 @@ func TestLifecycleRunnerUnavailable(t *testing.T) {
 	f.transport.connectedMap = map[string]bool{}
 	f.repo.put(sessionInState(control.StateRunning))
 
-	if err := f.svc.DeleteSession(context.Background(), testScope(), control.DeleteSession{ID: "sess_example"}); !errors.Is(err, control.ErrUnavailable) {
+	if err := f.svc.DeleteSession(context.Background(), sessionTestScope(), control.DeleteSession{ID: "sess_example"}); !errors.Is(err, control.ErrUnavailable) {
 		t.Fatalf("got %v, want ErrUnavailable", err)
 	}
 	if f.log.hasPrefix("sessions:transition") {
@@ -1293,7 +1293,7 @@ func TestSuspendConflictAfterDispatchRereadsAuthoritative(t *testing.T) {
 	f.repo.put(sessionInState(control.StateRunning))
 	f.repo.transitionErr = control.ErrConflict
 
-	got, err := f.svc.SuspendSession(context.Background(), testScope(), control.SuspendSession{ID: "sess_example", Warm: true})
+	got, err := f.svc.SuspendSession(context.Background(), sessionTestScope(), control.SuspendSession{ID: "sess_example", Warm: true})
 	if err != nil {
 		t.Fatalf("suspend after dispatched side effect: %v", err)
 	}
@@ -1310,7 +1310,7 @@ func TestResumeConflictAfterDispatchRereadsAuthoritative(t *testing.T) {
 	f.repo.put(sessionInState(control.StateSuspendedWarm))
 	f.repo.transitionErr = control.ErrConflict
 
-	got, err := f.svc.ResumeSession(context.Background(), testScope(), control.ResumeSession{ID: "sess_example"})
+	got, err := f.svc.ResumeSession(context.Background(), sessionTestScope(), control.ResumeSession{ID: "sess_example"})
 	if err != nil {
 		t.Fatalf("resume after dispatched side effect: %v", err)
 	}
