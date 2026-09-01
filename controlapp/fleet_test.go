@@ -848,3 +848,260 @@ func TestListRunnersCopiesCapabilities(t *testing.T) {
 		t.Fatalf("stored capabilities = %v, want [gpu arm]", stored.Capabilities)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Task 2: generation-fenced reconciliation
+// ---------------------------------------------------------------------------
+
+func reconcileRunnerRow() control.Runner {
+	return control.Runner{ID: "runner_example", PoolID: "pool_example", Generation: 1, CapacityTotal: 4, Connected: true}
+}
+
+func getSessionState(t *testing.T, fx *fleetFixture, ws control.WorkspaceID, id control.SessionID) control.Session {
+	t.Helper()
+	s, err := fx.st.getSession(ws, id)
+	if err != nil {
+		t.Fatalf("get session %s: %v", id, err)
+	}
+	return s
+}
+
+func TestReconcileRunnerMatrix(t *testing.T) {
+	tests := []struct {
+		name        string
+		stored      control.SessionState
+		reported    *control.RunnerSession
+		want        control.SessionState
+		wantDestroy bool
+	}{
+		{"creating adopted running", control.StateCreating, &control.RunnerSession{SessionID: "sess_example", State: control.StateRunning}, control.StateRunning, false},
+		{"running missing becomes dead", control.StateRunning, nil, control.StateDead, false},
+		{"creating missing requeues", control.StateCreating, nil, control.StateQueued, false},
+		{"terminal announced is orphan", control.StateDestroyed, &control.RunnerSession{SessionID: "sess_example", State: control.StateRunning}, control.StateDestroyed, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFleetFixture(t)
+			fx.st.seedRunner(reconcileRunnerRow())
+			fx.st.seedSession(control.Session{
+				ID: "sess_example", WorkspaceID: "ws_example",
+				State: tc.stored, PoolID: "pool_example", RunnerID: "runner_example",
+			})
+
+			snap := control.RunnerSnapshot{
+				WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+				Generation: 1, CapacityTotal: 4,
+			}
+			if tc.reported != nil {
+				snap.Sessions = []control.RunnerSession{*tc.reported}
+			}
+
+			got, err := fx.service.ReconcileRunner(ctx, snap)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Fenced {
+				t.Fatalf("fenced unexpectedly: %+v", got)
+			}
+			if got.Generation != 1 {
+				t.Fatalf("generation = %d, want 1", got.Generation)
+			}
+			if tc.wantDestroy {
+				if len(got.Destroy) != 1 || got.Destroy[0] != "sess_example" {
+					t.Fatalf("destroy = %v, want [sess_example]", got.Destroy)
+				}
+			} else if len(got.Destroy) != 0 {
+				t.Fatalf("destroy = %v, want empty", got.Destroy)
+			}
+			row := getSessionState(t, fx, "ws_example", "sess_example")
+			if row.State != tc.want {
+				t.Fatalf("state = %q, want %q", row.State, tc.want)
+			}
+			if tc.stored == control.StateCreating && tc.reported == nil && row.RunnerID != "" {
+				t.Fatalf("requeued session still carries runner %q", row.RunnerID)
+			}
+		})
+	}
+}
+
+func TestReconcileRunnerFencesLowerGeneration(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.st.seedRunner(control.Runner{
+		ID: "runner_example", PoolID: "pool_example", Generation: 8, CapacityTotal: 4, Connected: true,
+	})
+	// A live session exists, but the fence must return before reading it.
+	fx.st.seedSession(control.Session{
+		ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
+		PoolID: "pool_example", RunnerID: "runner_example",
+	})
+
+	got, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+		Generation: 7, CapacityTotal: 4,
+		Sessions: []control.RunnerSession{{SessionID: "sess_example", State: control.StateRunning}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Fenced || got.Generation != 8 {
+		t.Fatalf("result = %+v, want fenced at generation 8", got)
+	}
+	if fx.st.sessionsOnRunnerCalls != 0 || fx.st.getSessionCalls != 0 || fx.st.transitionCalls != 0 {
+		t.Fatal("fenced snapshot read or mutated sessions")
+	}
+}
+
+func TestReconcileRunnerNewerGenerationUpsertsThenReconciles(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.st.seedRunner(control.Runner{
+		ID: "runner_example", PoolID: "pool_example", Generation: 3, CapacityTotal: 4, Connected: true,
+	})
+	fx.st.seedSession(control.Session{
+		ID: "sess_example", WorkspaceID: "ws_example", State: control.StateRunning,
+		PoolID: "pool_example", RunnerID: "runner_example",
+	})
+
+	got, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+		Generation: 4, CapacityUsed: 2, CapacityTotal: 8,
+		Sessions: []control.RunnerSession{{SessionID: "sess_example", State: control.StateSuspendedWarm}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Fenced || got.Generation != 4 {
+		t.Fatalf("result = %+v, want unfenced at generation 4", got)
+	}
+	stored := fx.st.runners["pool_example"]["runner_example"]
+	if stored.Generation != 4 || stored.CapacityTotal != 8 || stored.CapacityUsed != 2 {
+		t.Fatalf("stored runner = %+v, want generation 4 capacity 2/8", stored)
+	}
+	row := getSessionState(t, fx, "ws_example", "sess_example")
+	if row.State != control.StateSuspendedWarm {
+		t.Fatalf("session = %q, want suspended_warm after adoption", row.State)
+	}
+}
+
+func TestReconcileRunnerOrphans(t *testing.T) {
+	t.Run("unknown announced session is destroyed", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		fx.st.seedRunner(reconcileRunnerRow())
+		got, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+			Generation: 1, CapacityTotal: 4,
+			Sessions: []control.RunnerSession{{SessionID: "sess_ghost", State: control.StateRunning}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Destroy) != 1 || got.Destroy[0] != "sess_ghost" {
+			t.Fatalf("destroy = %v, want [sess_ghost]", got.Destroy)
+		}
+	})
+
+	t.Run("duplicate announced ids are ErrInvalid", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		fx.st.seedRunner(reconcileRunnerRow())
+		_, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+			Generation: 1, CapacityTotal: 4,
+			Sessions: []control.RunnerSession{
+				{SessionID: "sess_x", State: control.StateRunning},
+				{SessionID: "sess_x", State: control.StateRunning},
+			},
+		})
+		if !errors.Is(err, control.ErrInvalid) {
+			t.Fatalf("got %v, want ErrInvalid", err)
+		}
+		if fx.st.transitionCalls != 0 {
+			t.Fatal("duplicate snapshot mutated sessions")
+		}
+	})
+
+	t.Run("a session from another workspace is destroyed without mutation", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		fx.st.seedRunner(reconcileRunnerRow())
+		fx.st.seedSession(control.Session{
+			ID: "sess_other", WorkspaceID: "ws_other", State: control.StateRunning,
+			PoolID: "pool_example", RunnerID: "runner_example",
+		})
+		got, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+			Generation: 1, CapacityTotal: 4,
+			Sessions: []control.RunnerSession{{SessionID: "sess_other", State: control.StateRunning}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Destroy) != 1 || got.Destroy[0] != "sess_other" {
+			t.Fatalf("destroy = %v, want [sess_other]", got.Destroy)
+		}
+		other := getSessionState(t, fx, "ws_other", "sess_other")
+		if other.State != control.StateRunning {
+			t.Fatalf("other workspace's session mutated to %q", other.State)
+		}
+	})
+
+	t.Run("mismatched pool or runner is destroyed without mutation", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		fx.st.seedRunner(reconcileRunnerRow())
+		fx.st.seedSession(control.Session{
+			ID: "sess_dup", WorkspaceID: "ws_example", State: control.StateRunning,
+			PoolID: "pool_other", RunnerID: "runner_other",
+		})
+		got, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+			Generation: 1, CapacityTotal: 4,
+			Sessions: []control.RunnerSession{{SessionID: "sess_dup", State: control.StateRunning}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Destroy) != 1 || got.Destroy[0] != "sess_dup" {
+			t.Fatalf("destroy = %v, want [sess_dup]", got.Destroy)
+		}
+		dup := getSessionState(t, fx, "ws_example", "sess_dup")
+		if dup.State != control.StateRunning || dup.RunnerID != "runner_other" {
+			t.Fatalf("mismatched session mutated to %q on %q", dup.State, dup.RunnerID)
+		}
+	})
+
+	t.Run("destroy output is deterministic and sorted", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		fx.st.seedRunner(reconcileRunnerRow())
+		got, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+			Generation: 1, CapacityTotal: 4,
+			Sessions: []control.RunnerSession{
+				{SessionID: "sess_z", State: control.StateRunning},
+				{SessionID: "sess_a", State: control.StateRunning},
+				{SessionID: "sess_m", State: control.StateRunning},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []control.SessionID{"sess_a", "sess_m", "sess_z"}
+		if !slices.Equal(got.Destroy, want) {
+			t.Fatalf("destroy = %v, want %v", got.Destroy, want)
+		}
+
+		// Idempotent: the same snapshot yields the same destroy list with no
+		// additional state mutation.
+		again, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+			Generation: 1, CapacityTotal: 4,
+			Sessions: []control.RunnerSession{
+				{SessionID: "sess_z", State: control.StateRunning},
+				{SessionID: "sess_a", State: control.StateRunning},
+				{SessionID: "sess_m", State: control.StateRunning},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(again.Destroy, want) {
+			t.Fatalf("second destroy = %v, want %v", again.Destroy, want)
+		}
+	})
+}

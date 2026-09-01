@@ -291,3 +291,207 @@ func decodeRunnerCursor(s string) (string, string, error) {
 	}
 	return c.Runner, c.Pool, nil
 }
+
+// lostAtAnnounce is the safe reason recorded when a runner announces without
+// a session the store still believed it held alive.
+const lostAtAnnounce = "lost at announce"
+
+// ReconcileRunner makes the store agree with a runner's authoritative
+// current-state report. A snapshot older than the store's runner generation
+// is fenced without any session read; a newer one first records the new
+// authoritative generation; the result's generation is always the
+// store-authoritative one, never merely the generation the caller sent.
+func (s *FleetService) ReconcileRunner(ctx context.Context, snap control.RunnerSnapshot) (control.ReconcileResult, error) {
+	if err := validateSnapshot(snap); err != nil {
+		return control.ReconcileResult{}, err
+	}
+	runners, err := s.fleet.ListRunners(ctx, snap.PoolID)
+	if err != nil {
+		return control.ReconcileResult{}, err
+	}
+	var current *control.Runner
+	for i := range runners {
+		if runners[i].ID == snap.RunnerID {
+			current = &runners[i]
+			break
+		}
+	}
+
+	authoritative := snap.Generation
+	switch {
+	case current != nil && snap.Generation < current.Generation:
+		return control.ReconcileResult{Generation: current.Generation, Fenced: true}, nil
+	case current != nil && snap.Generation > current.Generation:
+		if err := s.upsertSnapshotRunner(ctx, snap, current); err != nil {
+			return control.ReconcileResult{}, err
+		}
+		s.Wake(snap.PoolID)
+	case current != nil:
+		authoritative = current.Generation
+	case current == nil:
+		if err := s.upsertSnapshotRunner(ctx, snap, nil); err != nil {
+			return control.ReconcileResult{}, err
+		}
+		s.Wake(snap.PoolID)
+	}
+
+	destroy, err := s.reconcileSessions(ctx, snap)
+	if err != nil {
+		return control.ReconcileResult{}, err
+	}
+	return control.ReconcileResult{Generation: authoritative, Destroy: destroy}, nil
+}
+
+// validateSnapshot rejects a malformed snapshot, including one that names a
+// session twice, before any port is touched.
+func validateSnapshot(snap control.RunnerSnapshot) error {
+	if snap.WorkspaceID == "" || snap.PoolID == "" || snap.RunnerID == "" || snap.Generation == 0 {
+		return control.ErrInvalid
+	}
+	if snap.CapacityUsed < 0 || snap.CapacityTotal < 0 || snap.CapacityUsed > snap.CapacityTotal {
+		return control.ErrInvalid
+	}
+	seen := make(map[control.SessionID]struct{}, len(snap.Sessions))
+	for _, s := range snap.Sessions {
+		if s.SessionID == "" {
+			return control.ErrInvalid
+		}
+		if _, dup := seen[s.SessionID]; dup {
+			return control.ErrInvalid
+		}
+		seen[s.SessionID] = struct{}{}
+	}
+	return nil
+}
+
+// upsertSnapshotRunner records snap as the runner's authoritative generation,
+// preserving capabilities the snapshot does not carry.
+func (s *FleetService) upsertSnapshotRunner(ctx context.Context, snap control.RunnerSnapshot, existing *control.Runner) error {
+	var caps []string
+	if existing != nil {
+		caps = slices.Clone(existing.Capabilities)
+	}
+	return s.fleet.UpsertRunner(ctx, snap.PoolID, control.Runner{
+		ID:            snap.RunnerID,
+		PoolID:        snap.PoolID,
+		CapacityUsed:  snap.CapacityUsed,
+		CapacityTotal: snap.CapacityTotal,
+		Connected:     true,
+		Generation:    snap.Generation,
+		Capabilities:  caps,
+		LastSeenAt:    s.clock.Now(),
+	})
+}
+
+// reconcileSessions settles the stored live sessions against the reported set
+// and collects orphans for teardown. It is idempotent: repeat calls with the
+// same snapshot produce the same Destroy list and no additional mutation.
+func (s *FleetService) reconcileSessions(ctx context.Context, snap control.RunnerSnapshot) ([]control.SessionID, error) {
+	states := []control.SessionState{
+		control.StateCreating, control.StateRunning,
+		control.StateSuspendedWarm, control.StateSuspendedCold,
+	}
+	stored, err := s.fleet.SessionsOnRunner(ctx, snap.PoolID, snap.RunnerID, states)
+	if err != nil {
+		return nil, err
+	}
+
+	storedByID := make(map[control.SessionID]control.Session, len(stored))
+	reportedByID := make(map[control.SessionID]control.RunnerSession, len(snap.Sessions))
+	for _, row := range stored {
+		storedByID[row.ID] = row
+	}
+	for _, r := range snap.Sessions {
+		reportedByID[r.SessionID] = r
+	}
+
+	var destroy []control.SessionID
+
+	for _, row := range stored {
+		reported, present := reportedByID[row.ID]
+		if row.WorkspaceID != snap.WorkspaceID {
+			// A session another workspace still owns, held on this runner. When
+			// this snapshot reports it, it is an orphan here; either way this
+			// snapshot is not authoritative for it, so it is never mutated.
+			if present {
+				destroy = append(destroy, row.ID)
+			}
+			continue
+		}
+		if !present {
+			if row.State == control.StateCreating {
+				// A create that never landed goes back on the queue.
+				empty := control.RunnerID("")
+				if err := s.transitionQuiet(ctx, row.WorkspaceID, row.ID,
+					[]control.SessionState{control.StateCreating}, control.StateQueued,
+					control.TransitionOpts{RunnerID: &empty}); err != nil {
+					return nil, err
+				}
+			} else {
+				reason := lostAtAnnounce
+				if err := s.transitionQuiet(ctx, row.WorkspaceID, row.ID,
+					control.NonTerminal, control.StateDead,
+					control.TransitionOpts{Error: &reason}); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		want, ok := announcedState(reported.State)
+		if !ok || want == row.State {
+			continue
+		}
+		if err := s.transitionQuiet(ctx, row.WorkspaceID, row.ID, control.NonTerminal, want, control.TransitionOpts{}); err != nil {
+			return nil, err
+		}
+	}
+
+	for _, reported := range snap.Sessions {
+		if _, isStored := storedByID[reported.SessionID]; isStored {
+			continue
+		}
+		row, err := s.sessions.GetSession(ctx, snap.WorkspaceID, reported.SessionID)
+		switch {
+		case errors.Is(err, control.ErrNotFound):
+			destroy = append(destroy, reported.SessionID)
+		case err != nil:
+			return nil, err
+		case row.State.Terminal():
+			destroy = append(destroy, reported.SessionID)
+		case row.WorkspaceID != snap.WorkspaceID || row.PoolID != snap.PoolID || row.RunnerID != snap.RunnerID:
+			// A duplicate held by a stale holder, or a row from another
+			// workspace; the runner must tear it down as an orphan.
+			destroy = append(destroy, reported.SessionID)
+		default:
+			// A live session the store still wants on this exact runner but
+			// that SessionsOnRunner did not return; leave it alone rather than
+			// destroying something the store still wants.
+		}
+	}
+
+	sort.Slice(destroy, func(i, j int) bool { return string(destroy[i]) < string(destroy[j]) })
+	destroy = slices.Compact(destroy)
+	return destroy, nil
+}
+
+// announcedState maps a reported session state onto the closed vocabulary a
+// runner may announce.
+func announcedState(s control.SessionState) (control.SessionState, bool) {
+	switch s {
+	case control.StateRunning, control.StateSuspendedWarm, control.StateSuspendedCold:
+		return s, true
+	}
+	return "", false
+}
+
+// transitionQuiet applies a guarded transition, swallowing exactly the two
+// races reconciliation and events produce by racing each other: ErrConflict
+// (the row moved on) and ErrNotFound (it is gone). Any other error is a real
+// store problem the caller decides how to handle.
+func (s *FleetService) transitionQuiet(ctx context.Context, ws control.WorkspaceID, id control.SessionID, from []control.SessionState, to control.SessionState, opts control.TransitionOpts) error {
+	err := s.sessions.Transition(ctx, ws, id, from, to, opts)
+	if err == nil || errors.Is(err, control.ErrConflict) || errors.Is(err, control.ErrNotFound) {
+		return nil
+	}
+	return err
+}
