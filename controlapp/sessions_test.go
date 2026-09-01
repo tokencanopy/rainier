@@ -660,6 +660,20 @@ func TestCreateSessionInvalidInput(t *testing.T) {
 	_ = repo
 }
 
+func TestCreateSessionRejectsMissingTarget(t *testing.T) {
+	svc, _, envRepo, pools, _, _, log := newSessionFixture(t)
+	envRepo.put(exampleEnvironment())
+	pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 1, CapacityUsed: 0}}
+
+	_, err := svc.CreateSession(context.Background(), testScope(), control.CreateSession{Name: "nowhere"})
+	if !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("got %v, want ErrInvalid", err)
+	}
+	if len(log.snapshot()) != 0 {
+		t.Fatalf("missing target touched ports: %v", log.snapshot())
+	}
+}
+
 func TestCreateSessionAuthorizesBeforeLookupAndStorage(t *testing.T) {
 	svc, repo, envRepo, pools, _, auth, log := newSessionFixture(t)
 	envRepo.put(exampleEnvironment())

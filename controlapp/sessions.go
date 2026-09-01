@@ -79,6 +79,9 @@ func (s *SessionService) CreateSession(ctx context.Context, scope control.Scope,
 	if err := cmd.Validate(); err != nil {
 		return control.Session{}, control.ErrInvalid
 	}
+	if cmd.EnvironmentID == "" && portableSpecIsZero(cmd.Spec) {
+		return control.Session{}, control.ErrInvalid
+	}
 	createResource := control.Resource{
 		Kind:        control.ResourceSession,
 		WorkspaceID: scope.WorkspaceID,
@@ -186,6 +189,13 @@ func (s *SessionService) selectPool(ctx context.Context, scope control.Scope, re
 		return "", control.ErrUnavailable
 	}
 	return copied[best].ID, nil
+}
+
+// portableSpecIsZero reports whether spec carries no execution description at
+// all, mirroring the frozen PortableSpec emptiness test the control package
+// keeps private. A session must name an environment or carry a scratch spec.
+func portableSpecIsZero(s control.PortableSpec) bool {
+	return s.Image == "" && s.Cmd == nil && s.EgressAllow == nil && s.Repos == nil
 }
 
 // portableSpecFor resolves the stored execution description of a session. An
