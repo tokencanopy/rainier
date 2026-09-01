@@ -1,4 +1,4 @@
-.PHONY: test build demo e2e verify module-path protocols
+.PHONY: test build demo e2e verify module-path protocols control
 test:
 	go test ./...
 build:
@@ -18,5 +18,8 @@ module-path:
 protocols:
 	./scripts/check-public-protocols.sh
 
-verify: module-path protocols test build
+control:
+	./scripts/check-public-control.sh
+
+verify: module-path protocols control test build
 	go vet ./...
