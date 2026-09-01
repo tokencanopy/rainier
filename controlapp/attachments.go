@@ -212,17 +212,17 @@ func (s *AttachmentService) grantGeneration(ws control.WorkspaceID, id control.S
 // logs, or persists a stream message.
 func (s *AttachmentService) AttachTerminal(ctx context.Context, scope control.Scope,
 	cmd control.AttachTerminal, stream control.TerminalStream) error {
-	if stream == nil {
-		return control.ErrInvalid
+	row, err := s.authorizedSession(ctx, scope, cmd.SessionID, control.ActionAttach)
+	if err != nil {
+		return err
 	}
 	switch cmd.Mode {
 	case control.AttachmentViewer, control.AttachmentController:
 	default:
 		return control.ErrInvalid
 	}
-	row, err := s.authorizedSession(ctx, scope, cmd.SessionID, control.ActionAttach)
-	if err != nil {
-		return err
+	if stream == nil {
+		return control.ErrInvalid
 	}
 	resource := control.Resource{Kind: control.ResourceSession, WorkspaceID: row.WorkspaceID,
 		ID: string(row.ID), CreatorID: row.CreatorID}

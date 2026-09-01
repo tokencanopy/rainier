@@ -184,15 +184,15 @@ func clipTo(s string, max int) string {
 // archive. The total compressed bytes and every chunk are bounded before any
 // byte crosses the runner seam.
 func (s *AttachmentService) PushWorkspace(ctx context.Context, scope control.Scope, cmd control.PushWorkspace) error {
+	row, err := s.authorizedSession(ctx, scope, cmd.SessionID, control.ActionPush)
+	if err != nil {
+		return err
+	}
 	if cmd.Body == nil {
 		return control.ErrInvalid
 	}
 	if err := workspace.ValidatePath(cmd.Path); err != nil {
 		return control.ErrInvalid
-	}
-	row, err := s.authorizedSession(ctx, scope, cmd.SessionID, control.ActionPush)
-	if err != nil {
-		return err
 	}
 	if row.State != control.StateRunning {
 		return control.ErrConflict
@@ -252,15 +252,15 @@ func (s *AttachmentService) PushWorkspace(ctx context.Context, scope control.Sco
 // workspace into Body, one bounded chunk per RPC, counting the compressed
 // bytes as they arrive and refusing to write past workspace.MaxBytes.
 func (s *AttachmentService) PullWorkspace(ctx context.Context, scope control.Scope, cmd control.PullWorkspace) error {
+	row, err := s.authorizedSession(ctx, scope, cmd.SessionID, control.ActionPull)
+	if err != nil {
+		return err
+	}
 	if cmd.Body == nil {
 		return control.ErrInvalid
 	}
 	if err := workspace.ValidatePath(cmd.Path); err != nil {
 		return control.ErrInvalid
-	}
-	row, err := s.authorizedSession(ctx, scope, cmd.SessionID, control.ActionPull)
-	if err != nil {
-		return err
 	}
 	if row.State != control.StateRunning {
 		return control.ErrConflict
