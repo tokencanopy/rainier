@@ -201,6 +201,10 @@ func (s *AttachmentService) PushWorkspace(ctx context.Context, scope control.Sco
 	if err != nil {
 		return control.ErrUnavailable
 	}
+	eventID, err := s.newEvent()
+	if err != nil {
+		return err
+	}
 
 	r := bufio.NewReader(cmd.Body)
 	var total int64
@@ -241,10 +245,12 @@ func (s *AttachmentService) PushWorkspace(ctx context.Context, scope control.Sco
 			break
 		}
 	}
-	s.record(ctx, scope, control.ActionPush, control.Resource{
+	if err := s.record(ctx, eventID, scope, control.ActionPush, control.Resource{
 		Kind: control.ResourceSession, WorkspaceID: row.WorkspaceID,
 		ID: string(row.ID), CreatorID: row.CreatorID,
-	})
+	}); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -268,6 +274,10 @@ func (s *AttachmentService) PullWorkspace(ctx context.Context, scope control.Sco
 	xfer, err := newTransferID()
 	if err != nil {
 		return control.ErrUnavailable
+	}
+	eventID, err := s.newEvent()
+	if err != nil {
+		return err
 	}
 
 	var total int64
@@ -297,18 +307,25 @@ func (s *AttachmentService) PullWorkspace(ctx context.Context, scope control.Sco
 			break
 		}
 	}
-	s.record(ctx, scope, control.ActionPull, control.Resource{
+	if err := s.record(ctx, eventID, scope, control.ActionPull, control.Resource{
 		Kind: control.ResourceSession, WorkspaceID: row.WorkspaceID,
 		ID: string(row.ID), CreatorID: row.CreatorID,
-	})
+	}); err != nil {
+		return err
+	}
 	return nil
 }
 
 // writeAll writes data to w, looping around a permitted short write so it
 // makes progress; a zero-byte write with a nil error becomes io.ErrShortWrite.
+// A writer violating the io.Writer count contract (n < 0 or n > len(p)) is
+// rejected as control.ErrInvalid before the slice so it cannot panic.
 func writeAll(w io.Writer, data []byte) error {
 	for len(data) > 0 {
 		n, err := w.Write(data)
+		if n < 0 || n > len(data) {
+			return control.ErrInvalid
+		}
 		data = data[n:]
 		if err != nil {
 			return err

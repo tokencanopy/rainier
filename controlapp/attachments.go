@@ -232,6 +232,10 @@ func (s *AttachmentService) AttachTerminal(ctx context.Context, scope control.Sc
 	if !s.attachable(row) {
 		return control.ErrConflict
 	}
+	eventID, err := s.newEvent()
+	if err != nil {
+		return err
+	}
 	generation, err := s.grantGeneration(row.WorkspaceID, row.ID, cmd.Mode)
 	if err != nil {
 		return err
@@ -248,20 +252,41 @@ func (s *AttachmentService) AttachTerminal(ctx context.Context, scope control.Sc
 		_ = stream.Close(control.ErrUnavailable)
 		return control.ErrUnavailable
 	}
-	s.record(ctx, scope, control.ActionAttach, resource)
+	if err := s.record(ctx, eventID, scope, control.ActionAttach, resource); err != nil {
+		return err
+	}
 	return nil
 }
 
-// record writes one provider-neutral event without terminal or workspace
-// content. Recording is best-effort: the operation's outcome does not depend
-// on the event outbox, which a later persistence plan makes atomic.
-func (s *AttachmentService) record(ctx context.Context, scope control.Scope, action control.Action, resource control.Resource) {
-	_ = s.events.Record(ctx, control.Event{
-		ID:          s.ids.NewEventID(),
+// newEvent mints and validates an event ID before any external effect. An
+// empty generated ID fails the operation closed (ErrUnavailable) before a
+// terminal, runner, reader, or writer seam is touched, honoring the
+// IDGenerator contract that returned IDs are non-empty.
+func (s *AttachmentService) newEvent() (control.EventID, error) {
+	id := s.ids.NewEventID()
+	if id == "" {
+		return "", control.ErrUnavailable
+	}
+	return id, nil
+}
+
+// record writes one provider-neutral event for an already-accepted operation
+// using an ID minted before the operation ran. Recording is not yet atomic
+// with the attach/push/pull effect: a recorder failure surfaces as
+// control.ErrUnavailable after the effect is accepted, and until the
+// transactional-outbox plan lands a crash between the effect and the recorded
+// event can still lose the event. Events and errors never carry terminal,
+// workspace, or path content.
+func (s *AttachmentService) record(ctx context.Context, id control.EventID, scope control.Scope, action control.Action, resource control.Resource) error {
+	if err := s.events.Record(ctx, control.Event{
+		ID:          id,
 		WorkspaceID: scope.WorkspaceID,
 		ActorID:     scope.Actor.ID,
 		Action:      action,
 		Resource:    resource,
 		At:          s.clock.Now(),
-	})
+	}); err != nil {
+		return control.ErrUnavailable
+	}
+	return nil
 }

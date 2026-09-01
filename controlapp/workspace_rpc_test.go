@@ -46,7 +46,7 @@ func TestSessionRPCSuccess(t *testing.T) {
 		return rpcOKReply(m.RPC.ID, rpcProbe{N: 42})
 	}
 	var out rpcProbe
-	if err := fx.svc.sessionRPC(context.Background(), runningSession(), workspace.MethodDiff, nil, &out); err != nil {
+	if err := fx.svc.sessionRPC(context.Background(), attachmentRunningSession(), workspace.MethodDiff, nil, &out); err != nil {
 		t.Fatalf("sessionRPC: %v", err)
 	}
 	if out.N != 42 {
@@ -91,7 +91,7 @@ func TestSessionRPCHostileResponses(t *testing.T) {
 			fx := newAttachmentFixture(t)
 			fx.transport.replies = []runner.FromRunner{tt.reply}
 			var out rpcProbe
-			err := fx.svc.sessionRPC(context.Background(), runningSession(), workspace.MethodDiff, nil, &out)
+			err := fx.svc.sessionRPC(context.Background(), attachmentRunningSession(), workspace.MethodDiff, nil, &out)
 			if !errors.Is(err, control.ErrUnavailable) {
 				t.Fatalf("got %v, want ErrUnavailable", err)
 			}
@@ -105,7 +105,7 @@ func TestSessionRPCNilOutAcceptsAbsentPayload(t *testing.T) {
 		Type: "session_req", Session: "sess_example",
 		RPC: &runner.RPCEnvelope{ID: 1, Method: "resp", OK: true},
 	}}
-	if err := fx.svc.sessionRPC(context.Background(), runningSession(), workspace.MethodDiff, nil, nil); err != nil {
+	if err := fx.svc.sessionRPC(context.Background(), attachmentRunningSession(), workspace.MethodDiff, nil, nil); err != nil {
 		t.Fatalf("nil out with absent payload: %v", err)
 	}
 }
@@ -113,7 +113,7 @@ func TestSessionRPCNilOutAcceptsAbsentPayload(t *testing.T) {
 func TestSessionRPCDisconnectedRunner(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.transport.dispatchErr = control.ErrUnavailable
-	err := fx.svc.sessionRPC(context.Background(), runningSession(), workspace.MethodDiff, nil, &rpcProbe{})
+	err := fx.svc.sessionRPC(context.Background(), attachmentRunningSession(), workspace.MethodDiff, nil, &rpcProbe{})
 	if !errors.Is(err, control.ErrUnavailable) {
 		t.Fatalf("got %v, want ErrUnavailable", err)
 	}
@@ -123,7 +123,7 @@ func TestSessionRPCContextCancellation(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := fx.svc.sessionRPC(ctx, runningSession(), workspace.MethodDiff, nil, &rpcProbe{})
+	err := fx.svc.sessionRPC(ctx, attachmentRunningSession(), workspace.MethodDiff, nil, &rpcProbe{})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("got %v, want context.Canceled", err)
 	}
@@ -131,7 +131,7 @@ func TestSessionRPCContextCancellation(t *testing.T) {
 
 func TestSessionRPCInvalidRawMessage(t *testing.T) {
 	fx := newAttachmentFixture(t)
-	err := fx.svc.sessionRPC(context.Background(), runningSession(), workspace.MethodDiff,
+	err := fx.svc.sessionRPC(context.Background(), attachmentRunningSession(), workspace.MethodDiff,
 		json.RawMessage("{not json"), &rpcProbe{})
 	if !errors.Is(err, control.ErrInvalid) {
 		t.Fatalf("got %v, want ErrInvalid", err)
@@ -157,7 +157,7 @@ func TestWorkspaceDiffBounds(t *testing.T) {
 	fx.transport.replyFn = func(m runner.ToRunner) runner.FromRunner {
 		return rpcOKReply(m.RPC.ID, workspace.DiffAnswer{Repos: repos})
 	}
-	ans, err := fx.svc.WorkspaceDiff(context.Background(), testScope(), control.WorkspaceDiff{SessionID: "sess_example"})
+	ans, err := fx.svc.WorkspaceDiff(context.Background(), attachmentTestScope(), control.WorkspaceDiff{SessionID: "sess_example"})
 	if err != nil {
 		t.Fatalf("diff: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestWorkspaceDiffEmptySerializesAsArray(t *testing.T) {
 	fx.transport.replyFn = func(m runner.ToRunner) runner.FromRunner {
 		return rpcOKReply(m.RPC.ID, workspace.DiffAnswer{})
 	}
-	ans, err := fx.svc.WorkspaceDiff(context.Background(), testScope(), control.WorkspaceDiff{SessionID: "sess_example"})
+	ans, err := fx.svc.WorkspaceDiff(context.Background(), attachmentTestScope(), control.WorkspaceDiff{SessionID: "sess_example"})
 	if err != nil {
 		t.Fatalf("diff: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestWorkspaceDiffAuthorizesActionDiff(t *testing.T) {
 	fx.transport.replyFn = func(m runner.ToRunner) runner.FromRunner {
 		return rpcOKReply(m.RPC.ID, workspace.DiffAnswer{})
 	}
-	if _, err := fx.svc.WorkspaceDiff(context.Background(), testScope(), control.WorkspaceDiff{SessionID: "sess_example"}); err != nil {
+	if _, err := fx.svc.WorkspaceDiff(context.Background(), attachmentTestScope(), control.WorkspaceDiff{SessionID: "sess_example"}); err != nil {
 		t.Fatalf("diff: %v", err)
 	}
 	if fx.auth.lastAction != control.ActionDiff {
@@ -214,7 +214,7 @@ func TestWorkspaceDiffAuthorizesActionDiff(t *testing.T) {
 func TestWorkspaceDiffDeniedBeforeRPC(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.auth.err = control.ErrDenied
-	_, err := fx.svc.WorkspaceDiff(context.Background(), testScope(), control.WorkspaceDiff{SessionID: "sess_example"})
+	_, err := fx.svc.WorkspaceDiff(context.Background(), attachmentTestScope(), control.WorkspaceDiff{SessionID: "sess_example"})
 	if !errors.Is(err, control.ErrDenied) {
 		t.Fatalf("got %v, want ErrDenied", err)
 	}
@@ -226,7 +226,7 @@ func TestWorkspaceDiffDeniedBeforeRPC(t *testing.T) {
 func TestWorkspaceDiffRequiresRunning(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.sessions.row.State = control.StateSuspendedCold
-	_, err := fx.svc.WorkspaceDiff(context.Background(), testScope(), control.WorkspaceDiff{SessionID: "sess_example"})
+	_, err := fx.svc.WorkspaceDiff(context.Background(), attachmentTestScope(), control.WorkspaceDiff{SessionID: "sess_example"})
 	if !errors.Is(err, control.ErrConflict) {
 		t.Fatalf("got %v, want ErrConflict", err)
 	}
@@ -253,7 +253,7 @@ func defaultPushAck(m runner.ToRunner) runner.FromRunner {
 	return rpcOKReply(m.RPC.ID, workspace.PushAck{Seq: meta.Seq, Synced: meta.Done})
 }
 
-func dispatchedPushChunks(t *testing.T, fx *attachFixture) []workspace.PushChunk {
+func dispatchedPushChunks(t *testing.T, fx *attachmentFixture) []workspace.PushChunk {
 	t.Helper()
 	var out []workspace.PushChunk
 	for _, m := range fx.transport.dispatched() {
@@ -301,16 +301,16 @@ type errorReader struct{}
 
 func (errorReader) Read([]byte) (int, error) { return 0, errors.New("synthetic reader failure") }
 
-func newPushFixture(t *testing.T) *attachFixture {
+func newPushFixture(t *testing.T) *attachmentFixture {
 	t.Helper()
 	fx := newAttachmentFixture(t)
 	fx.transport.replyFn = defaultPushAck
 	return fx
 }
 
-func push(t *testing.T, fx *attachFixture, body io.Reader, path string) ([]workspace.PushChunk, error) {
+func push(t *testing.T, fx *attachmentFixture, body io.Reader, path string) ([]workspace.PushChunk, error) {
 	t.Helper()
-	err := fx.svc.PushWorkspace(context.Background(), testScope(), control.PushWorkspace{
+	err := fx.svc.PushWorkspace(context.Background(), attachmentTestScope(), control.PushWorkspace{
 		SessionID: "sess_example", Path: path, Body: body,
 	})
 	return dispatchedPushChunks(t, fx), err
@@ -318,7 +318,7 @@ func push(t *testing.T, fx *attachFixture, body io.Reader, path string) ([]works
 
 func TestPushWorkspaceUnsafePath(t *testing.T) {
 	fx := newPushFixture(t)
-	err := fx.svc.PushWorkspace(context.Background(), testScope(), control.PushWorkspace{
+	err := fx.svc.PushWorkspace(context.Background(), attachmentTestScope(), control.PushWorkspace{
 		SessionID: "sess_example", Path: "../etc", Body: strings.NewReader("x"),
 	})
 	if !errors.Is(err, control.ErrInvalid) {
@@ -331,7 +331,7 @@ func TestPushWorkspaceUnsafePath(t *testing.T) {
 
 func TestPushWorkspaceNilBody(t *testing.T) {
 	fx := newPushFixture(t)
-	err := fx.svc.PushWorkspace(context.Background(), testScope(), control.PushWorkspace{
+	err := fx.svc.PushWorkspace(context.Background(), attachmentTestScope(), control.PushWorkspace{
 		SessionID: "sess_example", Path: "dst",
 	})
 	if !errors.Is(err, control.ErrInvalid) {
@@ -416,7 +416,7 @@ func TestPushWorkspaceExactlyMaxBytes(t *testing.T) {
 	fx := newPushFixture(t)
 	acker := &blindAck{}
 	fx.transport.replyFn = acker.ack
-	err := fx.svc.PushWorkspace(context.Background(), testScope(), control.PushWorkspace{
+	err := fx.svc.PushWorkspace(context.Background(), attachmentTestScope(), control.PushWorkspace{
 		SessionID: "sess_example", Path: "dst", Body: newRepeatReader('z', workspace.MaxBytes),
 	})
 	if err != nil {
@@ -438,7 +438,7 @@ func TestPushWorkspaceOverMaxBytes(t *testing.T) {
 	fx := newPushFixture(t)
 	acker := &blindAck{}
 	fx.transport.replyFn = acker.ack
-	err := fx.svc.PushWorkspace(context.Background(), testScope(), control.PushWorkspace{
+	err := fx.svc.PushWorkspace(context.Background(), attachmentTestScope(), control.PushWorkspace{
 		SessionID: "sess_example", Path: "dst", Body: newRepeatReader('z', workspace.MaxBytes+1),
 	})
 	if !errors.Is(err, control.ErrInvalid) {
@@ -459,7 +459,7 @@ func TestPushWorkspaceWrongAckSequence(t *testing.T) {
 		_ = json.Unmarshal(m.RPC.Payload, &meta)
 		return rpcOKReply(m.RPC.ID, workspace.PushAck{Seq: meta.Seq + 1, Synced: true})
 	}
-	err := fx.svc.PushWorkspace(context.Background(), testScope(), control.PushWorkspace{
+	err := fx.svc.PushWorkspace(context.Background(), attachmentTestScope(), control.PushWorkspace{
 		SessionID: "sess_example", Path: "dst", Body: strings.NewReader("hello"),
 	})
 	if !errors.Is(err, control.ErrUnavailable) {
@@ -474,7 +474,7 @@ func TestPushWorkspaceUnsyncedFinalAck(t *testing.T) {
 		_ = json.Unmarshal(m.RPC.Payload, &meta)
 		return rpcOKReply(m.RPC.ID, workspace.PushAck{Seq: meta.Seq, Synced: false})
 	}
-	err := fx.svc.PushWorkspace(context.Background(), testScope(), control.PushWorkspace{
+	err := fx.svc.PushWorkspace(context.Background(), attachmentTestScope(), control.PushWorkspace{
 		SessionID: "sess_example", Path: "dst", Body: strings.NewReader("hello"),
 	})
 	if !errors.Is(err, control.ErrUnavailable) {
@@ -484,7 +484,7 @@ func TestPushWorkspaceUnsyncedFinalAck(t *testing.T) {
 
 func TestPushWorkspaceReaderError(t *testing.T) {
 	fx := newPushFixture(t)
-	err := fx.svc.PushWorkspace(context.Background(), testScope(), control.PushWorkspace{
+	err := fx.svc.PushWorkspace(context.Background(), attachmentTestScope(), control.PushWorkspace{
 		SessionID: "sess_example", Path: "dst", Body: errorReader{},
 	})
 	if !errors.Is(err, control.ErrInvalid) {
@@ -496,7 +496,7 @@ func TestPushWorkspaceContextCancellation(t *testing.T) {
 	fx := newPushFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := fx.svc.PushWorkspace(ctx, testScope(), control.PushWorkspace{
+	err := fx.svc.PushWorkspace(ctx, attachmentTestScope(), control.PushWorkspace{
 		SessionID: "sess_example", Path: "dst", Body: strings.NewReader("hello"),
 	})
 	if !errors.Is(err, context.Canceled) {
@@ -515,6 +515,34 @@ func TestPushWorkspaceRecordsEventAfterFinalAck(t *testing.T) {
 	}
 	if evs[0].Action != control.ActionPush || evs[0].Resource.ID != "sess_example" {
 		t.Fatalf("event = %+v", evs[0])
+	}
+}
+
+func TestPushWorkspaceRecorderFailureReturnsUnavailable(t *testing.T) {
+	fx := newPushFixture(t)
+	fx.events.err = errors.New("synthetic recorder failure")
+	err := fx.svc.PushWorkspace(context.Background(), attachmentTestScope(), control.PushWorkspace{
+		SessionID: "sess_example", Path: "dst", Body: strings.NewReader("hello"),
+	})
+	if err != control.ErrUnavailable {
+		t.Fatalf("got %v, want the closed ErrUnavailable sentinel", err)
+	}
+	if got := len(fx.transport.dispatched()); got != 1 {
+		t.Fatalf("dispatched %d chunks, want 1", got)
+	}
+}
+
+func TestPushWorkspaceEmptyEventIDPreventsRPC(t *testing.T) {
+	fx := newPushFixture(t)
+	fx.ids.eventID = ""
+	err := fx.svc.PushWorkspace(context.Background(), attachmentTestScope(), control.PushWorkspace{
+		SessionID: "sess_example", Path: "dst", Body: strings.NewReader("hello"),
+	})
+	if !errors.Is(err, control.ErrUnavailable) {
+		t.Fatalf("got %v, want ErrUnavailable", err)
+	}
+	if got := len(fx.transport.dispatched()); got != 0 {
+		t.Fatalf("empty event ID push dispatched %d chunks, want 0", got)
 	}
 }
 
@@ -555,6 +583,13 @@ func (w *recordingWriter) total() (bytes, calls int) {
 	defer w.mu.Unlock()
 	return w.bytes, w.calls
 }
+
+// countWriter returns a fixed count regardless of p. Counts outside
+// [0, len(p)] violate the io.Writer contract, and writeAll must reject them
+// with a closed error instead of panicking while slicing.
+type countWriter struct{ n int }
+
+func (w countWriter) Write(p []byte) (int, error) { return w.n, nil }
 
 // servePull serves the configured chunks by request sequence, ending the
 // transfer once the list is exhausted.
@@ -599,16 +634,16 @@ func pullBoundaryResponder(chunkCount int) func(runner.ToRunner) runner.FromRunn
 	}
 }
 
-func pullTo(t *testing.T, fx *attachFixture, w *recordingWriter, path string) error {
+func pullTo(t *testing.T, fx *attachmentFixture, w io.Writer, path string) error {
 	t.Helper()
-	return fx.svc.PullWorkspace(context.Background(), testScope(), control.PullWorkspace{
+	return fx.svc.PullWorkspace(context.Background(), attachmentTestScope(), control.PullWorkspace{
 		SessionID: "sess_example", Path: path, Body: w,
 	})
 }
 
 func TestPullWorkspaceUnsafePath(t *testing.T) {
 	fx := newAttachmentFixture(t)
-	err := fx.svc.PullWorkspace(context.Background(), testScope(), control.PullWorkspace{
+	err := fx.svc.PullWorkspace(context.Background(), attachmentTestScope(), control.PullWorkspace{
 		SessionID: "sess_example", Path: "../etc", Body: &recordingWriter{},
 	})
 	if !errors.Is(err, control.ErrInvalid) {
@@ -621,7 +656,7 @@ func TestPullWorkspaceUnsafePath(t *testing.T) {
 
 func TestPullWorkspaceNilWriter(t *testing.T) {
 	fx := newAttachmentFixture(t)
-	err := fx.svc.PullWorkspace(context.Background(), testScope(), control.PullWorkspace{
+	err := fx.svc.PullWorkspace(context.Background(), attachmentTestScope(), control.PullWorkspace{
 		SessionID: "sess_example", Path: "src",
 	})
 	if !errors.Is(err, control.ErrInvalid) {
@@ -776,6 +811,54 @@ func TestPullWorkspaceZeroWriteShortWrite(t *testing.T) {
 	}
 }
 
+func TestWriteAllRejectsMalformedCounts(t *testing.T) {
+	tests := []struct {
+		name string
+		n    int
+	}{
+		{"negative", -1},
+		{"oversized", 4}, // len("abc") == 3
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := writeAll(countWriter{n: tt.n}, []byte("abc"))
+			if !errors.Is(err, control.ErrInvalid) {
+				t.Fatalf("got %v, want ErrInvalid", err)
+			}
+		})
+	}
+}
+
+func TestWriteAllPartialWrites(t *testing.T) {
+	w := &recordingWriter{shortMax: 1}
+	if err := writeAll(w, []byte("hello")); err != nil {
+		t.Fatalf("writeAll: %v", err)
+	}
+	if got, calls := w.total(); got != 5 || calls != 5 {
+		t.Fatalf("wrote %d bytes in %d calls, want 5/5", got, calls)
+	}
+}
+
+func TestPullWorkspaceMaliciousWriterCount(t *testing.T) {
+	tests := []struct {
+		name string
+		n    int
+	}{
+		{"negative", -1},
+		{"oversized", 6}, // chunk is "hello" (5 bytes)
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fx := newAttachmentFixture(t)
+			fx.transport.replyFn = servePull([]workspace.PullChunk{{Seq: 0, Data: []byte("hello"), Done: true}})
+			err := pullTo(t, fx, countWriter{n: tt.n}, "src")
+			if !errors.Is(err, control.ErrInvalid) {
+				t.Fatalf("got %v, want ErrInvalid", err)
+			}
+		})
+	}
+}
+
 func TestPullWorkspaceDuplicateFinalResponse(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	// Always answer done: a second request would be a duplicate final chunk.
@@ -800,7 +883,7 @@ func TestPullWorkspaceContextCancellation(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := fx.svc.PullWorkspace(ctx, testScope(), control.PullWorkspace{
+	err := fx.svc.PullWorkspace(ctx, attachmentTestScope(), control.PullWorkspace{
 		SessionID: "sess_example", Path: "src", Body: &recordingWriter{},
 	})
 	if !errors.Is(err, context.Canceled) {
@@ -823,6 +906,32 @@ func TestPullWorkspaceRecordsEvent(t *testing.T) {
 	}
 }
 
+func TestPullWorkspaceRecorderFailureReturnsUnavailable(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.transport.replyFn = servePull([]workspace.PullChunk{{Seq: 0, Data: []byte("x"), Done: true}})
+	fx.events.err = errors.New("synthetic recorder failure")
+	err := pullTo(t, fx, &recordingWriter{}, "src")
+	if err != control.ErrUnavailable {
+		t.Fatalf("got %v, want the closed ErrUnavailable sentinel", err)
+	}
+	if got := len(fx.transport.dispatched()); got != 1 {
+		t.Fatalf("dispatched %d requests, want 1", got)
+	}
+}
+
+func TestPullWorkspaceEmptyEventIDPreventsRPC(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.transport.replyFn = servePull([]workspace.PullChunk{{Seq: 0, Data: []byte("x"), Done: true}})
+	fx.ids.eventID = ""
+	err := pullTo(t, fx, &recordingWriter{}, "src")
+	if !errors.Is(err, control.ErrUnavailable) {
+		t.Fatalf("got %v, want ErrUnavailable", err)
+	}
+	if got := len(fx.transport.dispatched()); got != 0 {
+		t.Fatalf("empty event ID pull dispatched %d requests, want 0", got)
+	}
+}
+
 func TestSessionRPCConcurrentOutOfOrder(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.transport.replyFn = func(m runner.ToRunner) runner.FromRunner {
@@ -836,7 +945,7 @@ func TestSessionRPCConcurrentOutOfOrder(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			var out rpcProbe
-			errs[i] = fx.svc.sessionRPC(context.Background(), runningSession(), workspace.MethodDiff, nil, &out)
+			errs[i] = fx.svc.sessionRPC(context.Background(), attachmentRunningSession(), workspace.MethodDiff, nil, &out)
 		}(i)
 	}
 	wg.Wait()

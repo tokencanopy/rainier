@@ -12,22 +12,22 @@ import (
 	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
-// terminalAttachment is the single-method contract AttachmentService must
+// attachmentTerminalPort is the single-method contract AttachmentService must
 // satisfy for terminal attach; the full control.Attachments assertion lives in
 // the external-package test once all four methods exist.
-type terminalAttachment interface {
+type attachmentTerminalPort interface {
 	AttachTerminal(context.Context, control.Scope, control.AttachTerminal, control.TerminalStream) error
 }
 
-var _ terminalAttachment = (*AttachmentService)(nil)
+var _ attachmentTerminalPort = (*AttachmentService)(nil)
 
 func TestAttachAuthorizesBeforeBroker(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.auth.err = control.ErrDenied
-	err := fx.svc.AttachTerminal(context.Background(), testScope(), control.AttachTerminal{
+	err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
 		SessionID: "sess_example", Since: terminal.SinceAll,
 		Mode: control.AttachmentViewer,
-	}, &recordingTerminalStream{})
+	}, &attachmentRecordingTerminalStream{})
 	if !errors.Is(err, control.ErrDenied) {
 		t.Fatalf("got %v", err)
 	}
@@ -38,14 +38,14 @@ func TestAttachAuthorizesBeforeBroker(t *testing.T) {
 
 func TestNewAttachmentServiceRejectsMissingDependency(t *testing.T) {
 	base := AttachmentOptions{
-		Authorizer: &fakeAuthorizer{},
-		Policy:     &fakePolicy{},
-		Sessions:   &fakeSessions{},
-		Transport:  &fakeTransport{},
-		Broker:     &fakeBroker{},
-		Events:     &fakeEvents{},
-		Clock:      fakeClock(func() time.Time { return time.Unix(0, 0) }),
-		IDs:        fakeIDs{},
+		Authorizer: &attachmentFakeAuthorizer{},
+		Policy:     &attachmentFakePolicy{},
+		Sessions:   &attachmentFakeSessions{},
+		Transport:  &attachmentFakeTransport{},
+		Broker:     &attachmentFakeBroker{},
+		Events:     &attachmentFakeEvents{},
+		Clock:      attachmentFakeClock(func() time.Time { return time.Unix(0, 0) }),
+		IDs:        attachmentFakeIDs{eventID: "evt_example"},
 	}
 	tests := []struct {
 		name   string
@@ -77,59 +77,59 @@ func TestNewAttachmentServiceRejectsMissingDependency(t *testing.T) {
 func TestAttachTerminalRejections(t *testing.T) {
 	tests := []struct {
 		name   string
-		mutate func(*attachFixture, *control.Scope, *control.AttachTerminal)
+		mutate func(*attachmentFixture, *control.Scope, *control.AttachTerminal)
 		want   error
 	}{
 		{
 			name:   "invalid scope",
-			mutate: func(_ *attachFixture, sc *control.Scope, _ *control.AttachTerminal) { sc.WorkspaceID = "" },
+			mutate: func(_ *attachmentFixture, sc *control.Scope, _ *control.AttachTerminal) { sc.WorkspaceID = "" },
 			want:   control.ErrInvalid,
 		},
 		{
 			name: "nil stream",
-			mutate: func(_ *attachFixture, _ *control.Scope, cmd *control.AttachTerminal) {
+			mutate: func(_ *attachmentFixture, _ *control.Scope, cmd *control.AttachTerminal) {
 				cmd.Mode = control.AttachmentViewer
 			},
 			want: control.ErrInvalid,
 		},
 		{
 			name: "unknown mode",
-			mutate: func(_ *attachFixture, _ *control.Scope, cmd *control.AttachTerminal) {
+			mutate: func(_ *attachmentFixture, _ *control.Scope, cmd *control.AttachTerminal) {
 				cmd.Mode = control.AttachmentMode("admin")
 			},
 			want: control.ErrInvalid,
 		},
 		{
 			name: "cross-workspace not found",
-			mutate: func(fx *attachFixture, _ *control.Scope, _ *control.AttachTerminal) {
+			mutate: func(fx *attachmentFixture, _ *control.Scope, _ *control.AttachTerminal) {
 				fx.sessions.found = false
 			},
 			want: control.ErrNotFound,
 		},
 		{
 			name: "queued session",
-			mutate: func(fx *attachFixture, _ *control.Scope, _ *control.AttachTerminal) {
+			mutate: func(fx *attachmentFixture, _ *control.Scope, _ *control.AttachTerminal) {
 				fx.sessions.row.State = control.StateQueued
 			},
 			want: control.ErrConflict,
 		},
 		{
 			name: "suspended session",
-			mutate: func(fx *attachFixture, _ *control.Scope, _ *control.AttachTerminal) {
+			mutate: func(fx *attachmentFixture, _ *control.Scope, _ *control.AttachTerminal) {
 				fx.sessions.row.State = control.StateSuspendedWarm
 			},
 			want: control.ErrConflict,
 		},
 		{
 			name: "dead session",
-			mutate: func(fx *attachFixture, _ *control.Scope, _ *control.AttachTerminal) {
+			mutate: func(fx *attachmentFixture, _ *control.Scope, _ *control.AttachTerminal) {
 				fx.sessions.row.State = control.StateDead
 			},
 			want: control.ErrConflict,
 		},
 		{
 			name: "failed session with disconnected runner",
-			mutate: func(fx *attachFixture, _ *control.Scope, _ *control.AttachTerminal) {
+			mutate: func(fx *attachmentFixture, _ *control.Scope, _ *control.AttachTerminal) {
 				fx.sessions.row.State = control.StateFailed
 				fx.transport.connected = false
 			},
@@ -137,14 +137,14 @@ func TestAttachTerminalRejections(t *testing.T) {
 		},
 		{
 			name: "authorizer denied",
-			mutate: func(fx *attachFixture, _ *control.Scope, _ *control.AttachTerminal) {
+			mutate: func(fx *attachmentFixture, _ *control.Scope, _ *control.AttachTerminal) {
 				fx.auth.err = control.ErrDenied
 			},
 			want: control.ErrDenied,
 		},
 		{
 			name: "policy denied",
-			mutate: func(fx *attachFixture, _ *control.Scope, _ *control.AttachTerminal) {
+			mutate: func(fx *attachmentFixture, _ *control.Scope, _ *control.AttachTerminal) {
 				fx.policy.err = control.ErrDenied
 			},
 			want: control.ErrDenied,
@@ -154,10 +154,10 @@ func TestAttachTerminalRejections(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			fx := newAttachmentFixture(t)
 			fx.sessions.found = true
-			fx.sessions.row = runningSession()
-			scope := testScope()
+			fx.sessions.row = attachmentRunningSession()
+			scope := attachmentTestScope()
 			cmd := control.AttachTerminal{SessionID: "sess_example", Since: terminal.SinceAll, Mode: control.AttachmentViewer}
-			var stream control.TerminalStream = &recordingTerminalStream{}
+			var stream control.TerminalStream = &attachmentRecordingTerminalStream{}
 			if tt.name == "nil stream" {
 				stream = nil
 			}
@@ -176,9 +176,9 @@ func TestAttachTerminalRejections(t *testing.T) {
 func TestAttachTerminalRunning(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.sessions.found = true
-	fx.sessions.row = runningSession()
-	stream := &recordingTerminalStream{}
-	if err := fx.svc.AttachTerminal(context.Background(), testScope(), control.AttachTerminal{
+	fx.sessions.row = attachmentRunningSession()
+	stream := &attachmentRecordingTerminalStream{}
+	if err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
 		SessionID: "sess_example", Since: terminal.SinceAll, Mode: control.AttachmentViewer,
 	}, stream); err != nil {
 		t.Fatalf("attach: %v", err)
@@ -200,12 +200,12 @@ func TestAttachTerminalRunning(t *testing.T) {
 func TestAttachTerminalFailedButConnected(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.sessions.found = true
-	fx.sessions.row = runningSession()
+	fx.sessions.row = attachmentRunningSession()
 	fx.sessions.row.State = control.StateFailed
 	fx.transport.connected = true
-	if err := fx.svc.AttachTerminal(context.Background(), testScope(), control.AttachTerminal{
+	if err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
 		SessionID: "sess_example", Mode: control.AttachmentViewer,
-	}, &recordingTerminalStream{}); err != nil {
+	}, &attachmentRecordingTerminalStream{}); err != nil {
 		t.Fatalf("failed-but-connected attach: %v", err)
 	}
 	if fx.broker.calls != 1 {
@@ -216,15 +216,15 @@ func TestAttachTerminalFailedButConnected(t *testing.T) {
 func TestAttachControllerGenerations(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.sessions.found = true
-	fx.sessions.row = runningSession()
+	fx.sessions.row = attachmentRunningSession()
 	ctx := context.Background()
-	scope := testScope()
+	scope := attachmentTestScope()
 
 	attach := func(mode control.AttachmentMode) {
 		t.Helper()
 		if err := fx.svc.AttachTerminal(ctx, scope, control.AttachTerminal{
 			SessionID: "sess_example", Mode: mode,
-		}, &recordingTerminalStream{}); err != nil {
+		}, &attachmentRecordingTerminalStream{}); err != nil {
 			t.Fatalf("%s attach: %v", mode, err)
 		}
 	}
@@ -250,9 +250,9 @@ func TestAttachControllerGenerations(t *testing.T) {
 func TestAttachConcurrentControllersDistinct(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.sessions.found = true
-	fx.sessions.row = runningSession()
+	fx.sessions.row = attachmentRunningSession()
 	ctx := context.Background()
-	scope := testScope()
+	scope := attachmentTestScope()
 
 	const n = 8
 	var wg sync.WaitGroup
@@ -262,7 +262,7 @@ func TestAttachConcurrentControllersDistinct(t *testing.T) {
 			defer wg.Done()
 			if err := fx.svc.AttachTerminal(ctx, scope, control.AttachTerminal{
 				SessionID: "sess_example", Mode: control.AttachmentController,
-			}, &recordingTerminalStream{}); err != nil {
+			}, &attachmentRecordingTerminalStream{}); err != nil {
 				t.Errorf("controller attach: %v", err)
 			}
 		}()
@@ -288,10 +288,10 @@ func TestAttachConcurrentControllersDistinct(t *testing.T) {
 func TestAttachBrokerErrorClosesStream(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.sessions.found = true
-	fx.sessions.row = runningSession()
+	fx.sessions.row = attachmentRunningSession()
 	fx.broker.err = errors.New("synthetic broker failure")
-	stream := &recordingTerminalStream{}
-	err := fx.svc.AttachTerminal(context.Background(), testScope(), control.AttachTerminal{
+	stream := &attachmentRecordingTerminalStream{}
+	err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
 		SessionID: "sess_example", Mode: control.AttachmentViewer,
 	}, stream)
 	if !errors.Is(err, control.ErrUnavailable) {
@@ -308,9 +308,9 @@ func TestAttachBrokerErrorClosesStream(t *testing.T) {
 func TestAttachRecordsEventAndNeverReadsStream(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.sessions.found = true
-	fx.sessions.row = runningSession()
-	stream := &recordingTerminalStream{}
-	if err := fx.svc.AttachTerminal(context.Background(), testScope(), control.AttachTerminal{
+	fx.sessions.row = attachmentRunningSession()
+	stream := &attachmentRecordingTerminalStream{}
+	if err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
 		SessionID: "sess_example", Mode: control.AttachmentViewer,
 	}, stream); err != nil {
 		t.Fatalf("attach: %v", err)
@@ -329,22 +329,57 @@ func TestAttachRecordsEventAndNeverReadsStream(t *testing.T) {
 	}
 }
 
+func TestAttachRecorderFailureReturnsUnavailable(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.sessions.found = true
+	fx.sessions.row = attachmentRunningSession()
+	fx.events.err = errors.New("synthetic recorder failure")
+	err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
+		SessionID: "sess_example", Mode: control.AttachmentViewer,
+	}, &attachmentRecordingTerminalStream{})
+	if err != control.ErrUnavailable {
+		t.Fatalf("got %v, want the closed ErrUnavailable sentinel", err)
+	}
+	if fx.broker.calls != 1 {
+		t.Fatalf("broker called %d times, want 1", fx.broker.calls)
+	}
+	if fx.events.calls != 1 {
+		t.Fatalf("recorder called %d times, want 1", fx.events.calls)
+	}
+}
+
+func TestAttachEmptyEventIDPreventsBroker(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.sessions.found = true
+	fx.sessions.row = attachmentRunningSession()
+	fx.ids.eventID = ""
+	err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
+		SessionID: "sess_example", Mode: control.AttachmentViewer,
+	}, &attachmentRecordingTerminalStream{})
+	if !errors.Is(err, control.ErrUnavailable) {
+		t.Fatalf("got %v, want ErrUnavailable", err)
+	}
+	if fx.broker.calls != 0 {
+		t.Fatalf("empty event ID attach reached broker %d times", fx.broker.calls)
+	}
+}
+
 func TestAttachPolicyViewGrant(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.sessions.found = true
-	fx.sessions.row = runningSession()
+	fx.sessions.row = attachmentRunningSession()
 	fx.policy.deny = map[control.AttachmentMode]bool{control.AttachmentController: true}
 	ctx := context.Background()
-	scope := testScope()
+	scope := attachmentTestScope()
 
 	if err := fx.svc.AttachTerminal(ctx, scope, control.AttachTerminal{
 		SessionID: "sess_example", Mode: control.AttachmentViewer,
-	}, &recordingTerminalStream{}); err != nil {
+	}, &attachmentRecordingTerminalStream{}); err != nil {
 		t.Fatalf("viewer under view grant: %v", err)
 	}
 	err := fx.svc.AttachTerminal(ctx, scope, control.AttachTerminal{
 		SessionID: "sess_example", Mode: control.AttachmentController,
-	}, &recordingTerminalStream{})
+	}, &attachmentRecordingTerminalStream{})
 	if !errors.Is(err, control.ErrDenied) {
 		t.Fatalf("controller under view grant = %v, want ErrDenied", err)
 	}
@@ -353,18 +388,18 @@ func TestAttachPolicyViewGrant(t *testing.T) {
 func TestAttachPolicyControlGrant(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.sessions.found = true
-	fx.sessions.row = runningSession()
+	fx.sessions.row = attachmentRunningSession()
 	ctx := context.Background()
-	scope := testScope()
+	scope := attachmentTestScope()
 
 	if err := fx.svc.AttachTerminal(ctx, scope, control.AttachTerminal{
 		SessionID: "sess_example", Mode: control.AttachmentViewer,
-	}, &recordingTerminalStream{}); err != nil {
+	}, &attachmentRecordingTerminalStream{}); err != nil {
 		t.Fatalf("viewer under control grant: %v", err)
 	}
 	if err := fx.svc.AttachTerminal(ctx, scope, control.AttachTerminal{
 		SessionID: "sess_example", Mode: control.AttachmentController,
-	}, &recordingTerminalStream{}); err != nil {
+	}, &attachmentRecordingTerminalStream{}); err != nil {
 		t.Fatalf("controller under control grant: %v", err)
 	}
 }
@@ -372,11 +407,11 @@ func TestAttachPolicyControlGrant(t *testing.T) {
 func TestAttachActionDenialPrecedesPolicy(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.sessions.found = true
-	fx.sessions.row = runningSession()
+	fx.sessions.row = attachmentRunningSession()
 	fx.auth.err = control.ErrDenied
-	err := fx.svc.AttachTerminal(context.Background(), testScope(), control.AttachTerminal{
+	err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
 		SessionID: "sess_example", Mode: control.AttachmentController,
-	}, &recordingTerminalStream{})
+	}, &attachmentRecordingTerminalStream{})
 	if !errors.Is(err, control.ErrDenied) {
 		t.Fatalf("got %v, want ErrDenied", err)
 	}
@@ -392,7 +427,7 @@ func TestAttachActionDenialPrecedesPolicy(t *testing.T) {
 // shared fakes
 // ---------------------------------------------------------------------------
 
-func testScope() control.Scope {
+func attachmentTestScope() control.Scope {
 	return control.Scope{
 		WorkspaceID: "ws_example",
 		Actor:       control.Actor{ID: "act_example", Kind: control.ActorUser},
@@ -402,7 +437,7 @@ func testScope() control.Scope {
 	}
 }
 
-func runningSession() control.Session {
+func attachmentRunningSession() control.Session {
 	return control.Session{
 		ID:                  "sess_example",
 		WorkspaceID:         "ws_example",
@@ -420,25 +455,27 @@ func runningSession() control.Session {
 	}
 }
 
-type attachFixture struct {
+type attachmentFixture struct {
 	svc       *AttachmentService
-	auth      *fakeAuthorizer
-	policy    *fakePolicy
-	sessions  *fakeSessions
-	transport *fakeTransport
-	broker    *fakeBroker
-	events    *fakeEvents
+	auth      *attachmentFakeAuthorizer
+	policy    *attachmentFakePolicy
+	sessions  *attachmentFakeSessions
+	transport *attachmentFakeTransport
+	broker    *attachmentFakeBroker
+	events    *attachmentFakeEvents
+	ids       *attachmentFakeIDs
 }
 
-func newAttachmentFixture(t *testing.T) *attachFixture {
+func newAttachmentFixture(t *testing.T) *attachmentFixture {
 	t.Helper()
-	fx := &attachFixture{
-		auth:      &fakeAuthorizer{},
-		policy:    &fakePolicy{},
-		sessions:  &fakeSessions{found: true, row: runningSession()},
-		transport: &fakeTransport{},
-		broker:    &fakeBroker{},
-		events:    &fakeEvents{},
+	fx := &attachmentFixture{
+		auth:      &attachmentFakeAuthorizer{},
+		policy:    &attachmentFakePolicy{},
+		sessions:  &attachmentFakeSessions{found: true, row: attachmentRunningSession()},
+		transport: &attachmentFakeTransport{},
+		broker:    &attachmentFakeBroker{},
+		events:    &attachmentFakeEvents{},
+		ids:       &attachmentFakeIDs{eventID: "evt_example"},
 	}
 	svc, err := NewAttachmentService(AttachmentOptions{
 		Authorizer: fx.auth,
@@ -447,8 +484,8 @@ func newAttachmentFixture(t *testing.T) *attachFixture {
 		Transport:  fx.transport,
 		Broker:     fx.broker,
 		Events:     fx.events,
-		Clock:      fakeClock(func() time.Time { return time.Unix(0, 0) }),
-		IDs:        fakeIDs{},
+		Clock:      attachmentFakeClock(func() time.Time { return time.Unix(0, 0) }),
+		IDs:        fx.ids,
 	})
 	if err != nil {
 		t.Fatalf("NewAttachmentService: %v", err)
@@ -457,7 +494,7 @@ func newAttachmentFixture(t *testing.T) *attachFixture {
 	return fx
 }
 
-type fakeAuthorizer struct {
+type attachmentFakeAuthorizer struct {
 	mu           sync.Mutex
 	err          error
 	calls        int
@@ -466,7 +503,7 @@ type fakeAuthorizer struct {
 	lastResource control.Resource
 }
 
-func (f *fakeAuthorizer) Authorize(_ context.Context, sc control.Scope, a control.Action, r control.Resource) error {
+func (f *attachmentFakeAuthorizer) Authorize(_ context.Context, sc control.Scope, a control.Action, r control.Resource) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -474,7 +511,7 @@ func (f *fakeAuthorizer) Authorize(_ context.Context, sc control.Scope, a contro
 	return f.err
 }
 
-type fakePolicy struct {
+type attachmentFakePolicy struct {
 	mu       sync.Mutex
 	err      error
 	deny     map[control.AttachmentMode]bool
@@ -482,7 +519,7 @@ type fakePolicy struct {
 	lastMode control.AttachmentMode
 }
 
-func (f *fakePolicy) AuthorizeAttachment(_ context.Context, _ control.Scope, _ control.Resource, mode control.AttachmentMode) error {
+func (f *attachmentFakePolicy) AuthorizeAttachment(_ context.Context, _ control.Scope, _ control.Resource, mode control.AttachmentMode) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -493,7 +530,7 @@ func (f *fakePolicy) AuthorizeAttachment(_ context.Context, _ control.Scope, _ c
 	return f.err
 }
 
-type fakeSessions struct {
+type attachmentFakeSessions struct {
 	mu     sync.Mutex
 	found  bool
 	row    control.Session
@@ -503,7 +540,7 @@ type fakeSessions struct {
 	lastID control.SessionID
 }
 
-func (f *fakeSessions) GetSession(_ context.Context, ws control.WorkspaceID, id control.SessionID) (control.Session, error) {
+func (f *attachmentFakeSessions) GetSession(_ context.Context, ws control.WorkspaceID, id control.SessionID) (control.Session, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -517,26 +554,26 @@ func (f *fakeSessions) GetSession(_ context.Context, ws control.WorkspaceID, id 
 	return f.row, nil
 }
 
-func (f *fakeSessions) CreateSession(context.Context, control.WorkspaceID, control.Session) (control.Session, error) {
+func (f *attachmentFakeSessions) CreateSession(context.Context, control.WorkspaceID, control.Session) (control.Session, error) {
 	return control.Session{}, nil
 }
-func (f *fakeSessions) SessionByIDem(context.Context, control.WorkspaceID, control.ActorID, string) (control.Session, error) {
+func (f *attachmentFakeSessions) SessionByIDem(context.Context, control.WorkspaceID, control.ActorID, string) (control.Session, error) {
 	return control.Session{}, nil
 }
-func (f *fakeSessions) ListSessions(context.Context, control.WorkspaceID, control.SessionQuery) ([]control.Session, string, error) {
+func (f *attachmentFakeSessions) ListSessions(context.Context, control.WorkspaceID, control.SessionQuery) ([]control.Session, string, error) {
 	return nil, "", nil
 }
-func (f *fakeSessions) Transition(context.Context, control.WorkspaceID, control.SessionID, []control.SessionState, control.SessionState, control.TransitionOpts) error {
+func (f *attachmentFakeSessions) Transition(context.Context, control.WorkspaceID, control.SessionID, []control.SessionState, control.SessionState, control.TransitionOpts) error {
 	return nil
 }
-func (f *fakeSessions) SetSessionSetupHash(context.Context, control.WorkspaceID, control.SessionID, string) error {
+func (f *attachmentFakeSessions) SetSessionSetupHash(context.Context, control.WorkspaceID, control.SessionID, string) error {
 	return nil
 }
-func (f *fakeSessions) SetChildExitCode(context.Context, control.WorkspaceID, control.SessionID, int) error {
+func (f *attachmentFakeSessions) SetChildExitCode(context.Context, control.WorkspaceID, control.SessionID, int) error {
 	return nil
 }
 
-type fakeTransport struct {
+type attachmentFakeTransport struct {
 	mu             sync.Mutex
 	connected      bool
 	dispatchErr    error
@@ -548,14 +585,14 @@ type fakeTransport struct {
 	connectedCalls int
 }
 
-func (f *fakeTransport) Connected(control.PoolID, control.RunnerID) bool {
+func (f *attachmentFakeTransport) Connected(control.PoolID, control.RunnerID) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.connectedCalls++
 	return f.connected
 }
 
-func (f *fakeTransport) Dispatch(ctx context.Context, pool control.PoolID, rid control.RunnerID, m runner.ToRunner) (runner.FromRunner, error) {
+func (f *attachmentFakeTransport) Dispatch(ctx context.Context, pool control.PoolID, rid control.RunnerID, m runner.ToRunner) (runner.FromRunner, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.got = append(f.got, m)
@@ -578,13 +615,13 @@ func (f *fakeTransport) Dispatch(ctx context.Context, pool control.PoolID, rid c
 	return r, nil
 }
 
-func (f *fakeTransport) dispatched() []runner.ToRunner {
+func (f *attachmentFakeTransport) dispatched() []runner.ToRunner {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]runner.ToRunner(nil), f.got...)
 }
 
-type fakeBroker struct {
+type attachmentFakeBroker struct {
 	mu         sync.Mutex
 	err        error
 	calls      int
@@ -592,7 +629,7 @@ type fakeBroker struct {
 	targets    []control.AttachTarget
 }
 
-func (f *fakeBroker) Attach(_ context.Context, target control.AttachTarget, _ control.TerminalStream) error {
+func (f *attachmentFakeBroker) Attach(_ context.Context, target control.AttachTarget, _ control.TerminalStream) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -601,7 +638,7 @@ func (f *fakeBroker) Attach(_ context.Context, target control.AttachTarget, _ co
 	return f.err
 }
 
-func (f *fakeBroker) targetGenerations() []uint64 {
+func (f *attachmentFakeBroker) targetGenerations() []uint64 {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]uint64, 0, len(f.targets))
@@ -611,37 +648,41 @@ func (f *fakeBroker) targetGenerations() []uint64 {
 	return out
 }
 
-type fakeEvents struct {
+type attachmentFakeEvents struct {
 	mu    sync.Mutex
 	got   []control.Event
 	calls int
+	err   error
 }
 
-func (f *fakeEvents) Record(_ context.Context, e control.Event) error {
+func (f *attachmentFakeEvents) Record(_ context.Context, e control.Event) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
+	if f.err != nil {
+		return f.err
+	}
 	f.got = append(f.got, e)
 	return nil
 }
 
-func (f *fakeEvents) snapshot() []control.Event {
+func (f *attachmentFakeEvents) snapshot() []control.Event {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]control.Event(nil), f.got...)
 }
 
-type fakeClock func() time.Time
+type attachmentFakeClock func() time.Time
 
-func (f fakeClock) Now() time.Time { return f() }
+func (f attachmentFakeClock) Now() time.Time { return f() }
 
-type fakeIDs struct{}
+type attachmentFakeIDs struct{ eventID control.EventID }
 
-func (fakeIDs) NewSessionID() control.SessionID         { return "sess_example" }
-func (fakeIDs) NewEnvironmentID() control.EnvironmentID { return "env_example" }
-func (fakeIDs) NewEventID() control.EventID             { return "evt_example" }
+func (f attachmentFakeIDs) NewSessionID() control.SessionID         { return "sess_example" }
+func (f attachmentFakeIDs) NewEnvironmentID() control.EnvironmentID { return "env_example" }
+func (f attachmentFakeIDs) NewEventID() control.EventID             { return f.eventID }
 
-type recordingTerminalStream struct {
+type attachmentRecordingTerminalStream struct {
 	mu        sync.Mutex
 	closed    bool
 	closeErr  error
@@ -649,21 +690,21 @@ type recordingTerminalStream struct {
 	sendCalls int
 }
 
-func (r *recordingTerminalStream) Receive(context.Context) (terminal.ClientMessage, error) {
+func (r *attachmentRecordingTerminalStream) Receive(context.Context) (terminal.ClientMessage, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.recvCalls++
 	return terminal.ClientMessage{}, nil
 }
 
-func (r *recordingTerminalStream) Send(context.Context, terminal.ServerMessage) error {
+func (r *attachmentRecordingTerminalStream) Send(context.Context, terminal.ServerMessage) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.sendCalls++
 	return nil
 }
 
-func (r *recordingTerminalStream) Close(err error) error {
+func (r *attachmentRecordingTerminalStream) Close(err error) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.closed = true
