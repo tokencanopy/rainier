@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1104,4 +1105,270 @@ func TestReconcileRunnerOrphans(t *testing.T) {
 			t.Fatalf("second destroy = %v, want %v", again.Destroy, want)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: stale-safe runner events
+// ---------------------------------------------------------------------------
+
+func eventRunner(gen uint64) control.Runner {
+	return control.Runner{ID: "runner_example", PoolID: "pool_example", Generation: gen, CapacityTotal: 4, Connected: true}
+}
+
+func TestApplyRunnerEventLifecycle(t *testing.T) {
+	code := 7
+	tests := []struct {
+		name           string
+		from           control.SessionState
+		event          control.RunnerEvent
+		wantState      control.SessionState
+		wantError      string
+		wantTransition bool
+	}{
+		{
+			name:           "running",
+			from:           control.StateCreating,
+			event:          control.RunnerEvent{State: control.StateRunning},
+			wantState:      control.StateRunning,
+			wantTransition: true,
+		},
+		{
+			name:           "suspended warm",
+			from:           control.StateRunning,
+			event:          control.RunnerEvent{State: control.StateSuspendedWarm},
+			wantState:      control.StateSuspendedWarm,
+			wantTransition: true,
+		},
+		{
+			name:           "suspended cold",
+			from:           control.StateRunning,
+			event:          control.RunnerEvent{State: control.StateSuspendedCold},
+			wantState:      control.StateSuspendedCold,
+			wantTransition: true,
+		},
+		{
+			name:           "failed carries the runner detail",
+			from:           control.StateCreating,
+			event:          control.RunnerEvent{State: control.StateFailed, Detail: "rc 1: boom"},
+			wantState:      control.StateFailed,
+			wantError:      "rc 1: boom",
+			wantTransition: true,
+		},
+		{
+			name:           "dead records a safe reason",
+			from:           control.StateRunning,
+			event:          control.RunnerEvent{State: control.StateDead},
+			wantState:      control.StateDead,
+			wantError:      "runner reported dead",
+			wantTransition: true,
+		},
+		{
+			name:           "child exit does not transition",
+			from:           control.StateRunning,
+			event:          control.RunnerEvent{State: control.StateRunning, ChildExitCode: &code},
+			wantState:      control.StateRunning,
+			wantTransition: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFleetFixture(t)
+			fx.st.seedRunner(eventRunner(1))
+			fx.st.seedSession(control.Session{
+				ID: "sess_example", WorkspaceID: "ws_example", State: tc.from,
+				PoolID: "pool_example", RunnerID: "runner_example",
+			})
+
+			ev := tc.event
+			ev.WorkspaceID = "ws_example"
+			ev.PoolID = "pool_example"
+			ev.RunnerID = "runner_example"
+			ev.Generation = 1
+			ev.SessionID = "sess_example"
+
+			if err := fx.service.ApplyRunnerEvent(ctx, ev); err != nil {
+				t.Fatal(err)
+			}
+			row := getSessionState(t, fx, "ws_example", "sess_example")
+			if row.State != tc.wantState {
+				t.Fatalf("state = %q, want %q", row.State, tc.wantState)
+			}
+			if row.Error != tc.wantError {
+				t.Fatalf("error = %q, want %q", row.Error, tc.wantError)
+			}
+			if tc.wantTransition {
+				if fx.st.transitionCalls == 0 {
+					t.Fatal("expected a transition")
+				}
+			} else if fx.st.transitionCalls != 0 {
+				t.Fatal("child exit must not transition")
+			}
+			if tc.event.ChildExitCode != nil {
+				if fx.st.childExitCalls != 1 {
+					t.Fatalf("childExitCalls = %d, want 1", fx.st.childExitCalls)
+				}
+				if row.ChildExitCode == nil || *row.ChildExitCode != 7 {
+					t.Fatalf("child exit code = %v, want 7", row.ChildExitCode)
+				}
+			}
+			if len(fx.events.recorded()) != 1 {
+				t.Fatalf("recorded %d events, want 1", len(fx.events.recorded()))
+			}
+		})
+	}
+}
+
+func TestApplyRunnerEventRejectsStale(t *testing.T) {
+	// The exact stale-generation case from the plan: the event names a runner
+	// whose authoritative generation has moved on.
+	t.Run("stale generation has no effects", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		fx.st.seedRunner(control.Runner{ID: "runner_old", PoolID: "pool_example", Generation: 7, CapacityTotal: 4, Connected: true})
+		fx.st.seedSession(control.Session{
+			ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
+			PoolID: "pool_example", RunnerID: "runner_old",
+		})
+		event := control.RunnerEvent{
+			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_old",
+			Generation: 6, SessionID: "sess_example", State: control.StateRunning,
+		}
+		if err := fx.service.ApplyRunnerEvent(ctx, event); !errors.Is(err, control.ErrStale) {
+			t.Fatalf("got %v, want ErrStale", err)
+		}
+		if fx.st.transitionCalls != 0 || len(fx.events.recorded()) != 0 {
+			t.Fatal("stale event had effects")
+		}
+	})
+
+	cases := map[string]func(*fleetFixture){
+		"wrong workspace": func(fx *fleetFixture) {
+			fx.st.seedSession(control.Session{
+				ID: "sess_example", WorkspaceID: "ws_other", State: control.StateCreating,
+				PoolID: "pool_example", RunnerID: "runner_example",
+			})
+		},
+		"wrong pool": func(fx *fleetFixture) {
+			fx.st.seedSession(control.Session{
+				ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
+				PoolID: "pool_other", RunnerID: "runner_example",
+			})
+		},
+		"wrong runner": func(fx *fleetFixture) {
+			fx.st.seedSession(control.Session{
+				ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
+				PoolID: "pool_example", RunnerID: "runner_other",
+			})
+		},
+		"unknown session": func(fx *fleetFixture) {},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			fx := newFleetFixture(t)
+			fx.st.seedRunner(eventRunner(1))
+			mutate(fx)
+			event := control.RunnerEvent{
+				WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+				Generation: 1, SessionID: "sess_example", State: control.StateRunning,
+			}
+			if err := fx.service.ApplyRunnerEvent(ctx, event); !errors.Is(err, control.ErrStale) {
+				t.Fatalf("got %v, want ErrStale", err)
+			}
+			if fx.st.transitionCalls != 0 || len(fx.events.recorded()) != 0 {
+				t.Fatal("mismatched event had effects")
+			}
+		})
+	}
+}
+
+func TestApplyRunnerEventDuplicateTerminalIsSuccess(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.st.seedRunner(eventRunner(1))
+	fx.st.seedSession(control.Session{
+		ID: "sess_example", WorkspaceID: "ws_example", State: control.StateRunning,
+		PoolID: "pool_example", RunnerID: "runner_example",
+	})
+	event := control.RunnerEvent{
+		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+		Generation: 1, SessionID: "sess_example", State: control.StateDead,
+	}
+	if err := fx.service.ApplyRunnerEvent(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	if err := fx.service.ApplyRunnerEvent(ctx, event); err != nil {
+		t.Fatalf("duplicate terminal event: got %v, want nil (idempotent success)", err)
+	}
+	if fx.st.transitionCalls != 1 {
+		t.Fatalf("transitionCalls = %d, want 1", fx.st.transitionCalls)
+	}
+	if len(fx.events.recorded()) != 1 {
+		t.Fatalf("recorded %d events, want 1", len(fx.events.recorded()))
+	}
+}
+
+func TestApplyRunnerEventInvalidInput(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.st.seedRunner(eventRunner(1))
+	fx.st.seedSession(control.Session{
+		ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
+		PoolID: "pool_example", RunnerID: "runner_example",
+	})
+	base := control.RunnerEvent{
+		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+		Generation: 1, SessionID: "sess_example", State: control.StateRunning,
+	}
+	cases := map[string]func(*control.RunnerEvent){
+		"invalid state":   func(e *control.RunnerEvent) { e.State = control.StateQueued },
+		"overlong detail": func(e *control.RunnerEvent) { e.Detail = string(make([]byte, 2049)) },
+		"empty session":   func(e *control.RunnerEvent) { e.SessionID = "" },
+		"zero generation": func(e *control.RunnerEvent) { e.Generation = 0 },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			fx := newFleetFixture(t)
+			fx.st.seedRunner(eventRunner(1))
+			fx.st.seedSession(control.Session{
+				ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
+				PoolID: "pool_example", RunnerID: "runner_example",
+			})
+			e := base
+			mutate(&e)
+			if err := fx.service.ApplyRunnerEvent(ctx, e); !errors.Is(err, control.ErrInvalid) {
+				t.Fatalf("got %v, want ErrInvalid", err)
+			}
+			if fx.st.transitionCalls != 0 || len(fx.events.recorded()) != 0 {
+				t.Fatal("invalid event had effects")
+			}
+		})
+	}
+}
+
+func TestApplyRunnerEventDetailNeverEntersEvent(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.st.seedRunner(eventRunner(1))
+	fx.st.seedSession(control.Session{
+		ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
+		PoolID: "pool_example", RunnerID: "runner_example",
+	})
+	const detail = "SENSITIVE_SECRET_TAIL_DO_NOT_LOG"
+	event := control.RunnerEvent{
+		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+		Generation: 1, SessionID: "sess_example", State: control.StateFailed, Detail: detail,
+	}
+	if err := fx.service.ApplyRunnerEvent(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	row := getSessionState(t, fx, "ws_example", "sess_example")
+	if row.Error != detail {
+		t.Fatalf("session error = %q, want the bounded detail in the row", row.Error)
+	}
+	recorded := fx.events.recorded()
+	if len(recorded) != 1 {
+		t.Fatalf("recorded %d events, want 1", len(recorded))
+	}
+	if recorded[0].Resource.ID != "sess_example" {
+		t.Fatalf("event resource = %+v, want session sess_example", recorded[0].Resource)
+	}
+	if got := fmt.Sprintf("%+v", recorded[0]); strings.Contains(got, detail) {
+		t.Fatal("runner detail leaked into the recorded control.Event")
+	}
 }

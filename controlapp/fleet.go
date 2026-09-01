@@ -12,8 +12,10 @@ import (
 	"errors"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tokencanopy/rainier/control"
 )
@@ -494,4 +496,149 @@ func (s *FleetService) transitionQuiet(ctx context.Context, ws control.Workspace
 		return nil
 	}
 	return err
+}
+
+// maxDetailBytes is the bound on runner-supplied free text before it reaches
+// a session error column. It keeps one row of diagnostic text from growing
+// without limit while leaving room for a useful failure tail.
+const maxDetailBytes = 2048
+
+// eventTransitions is the one guarded-transition table for runner lifecycle
+// events: for each target state, the states an event may validly move a
+// session from.
+var eventTransitions = map[control.SessionState][]control.SessionState{
+	control.StateRunning:       {control.StateCreating, control.StateRunning},
+	control.StateSuspendedWarm: {control.StateRunning, control.StateSuspendedWarm},
+	control.StateSuspendedCold: {control.StateRunning, control.StateSuspendedCold},
+	control.StateFailed:        {control.StateCreating, control.StateRunning},
+	control.StateDead:          {control.StateCreating, control.StateRunning, control.StateSuspendedWarm, control.StateSuspendedCold},
+}
+
+// runnerReportedDead is the safe reason recorded when a runner reports a
+// session's container dead.
+const runnerReportedDead = "runner reported dead"
+
+var _ control.Fleet = (*FleetService)(nil)
+
+// ApplyRunnerEvent applies one unsolicited runner lifecycle report. Identity
+// and generation are fenced before any state logic or event record; a
+// mismatch available in this contract returns ErrStale with no effects.
+func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.RunnerEvent) error {
+	if event.WorkspaceID == "" || event.PoolID == "" || event.RunnerID == "" || event.SessionID == "" {
+		return control.ErrInvalid
+	}
+	if event.Generation == 0 {
+		return control.ErrInvalid
+	}
+	if _, ok := eventTransitions[event.State]; !ok {
+		return control.ErrInvalid
+	}
+	if len(event.Detail) > maxDetailBytes || !utf8.ValidString(event.Detail) {
+		return control.ErrInvalid
+	}
+
+	row, err := s.sessions.GetSession(ctx, event.WorkspaceID, event.SessionID)
+	if err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			return control.ErrStale
+		}
+		return err
+	}
+	if row.WorkspaceID != event.WorkspaceID || row.PoolID != event.PoolID || row.RunnerID != event.RunnerID {
+		return control.ErrStale
+	}
+
+	runners, err := s.fleet.ListRunners(ctx, event.PoolID)
+	if err != nil {
+		return err
+	}
+	matched := false
+	for _, r := range runners {
+		if r.ID == event.RunnerID {
+			if r.Generation != event.Generation {
+				return control.ErrStale
+			}
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return control.ErrStale
+	}
+
+	if event.ChildExitCode != nil {
+		if err := s.sessions.SetChildExitCode(ctx, event.WorkspaceID, event.SessionID, *event.ChildExitCode); err != nil {
+			if errors.Is(err, control.ErrNotFound) {
+				return control.ErrStale
+			}
+			return err
+		}
+		s.recordLifecycleEvent(ctx, event, row)
+		return nil
+	}
+
+	target := event.State
+	if row.State == target {
+		// Already-applied identical event; idempotent success, no record.
+		return nil
+	}
+	var opts control.TransitionOpts
+	if target == control.StateFailed {
+		detail := boundDetail(event.Detail)
+		opts.Error = &detail
+	} else if target == control.StateDead {
+		reason := runnerReportedDead
+		opts.Error = &reason
+	}
+	err = s.sessions.Transition(ctx, event.WorkspaceID, event.SessionID, eventTransitions[target], target, opts)
+	switch {
+	case err == nil:
+		s.recordLifecycleEvent(ctx, event, row)
+		return nil
+	case errors.Is(err, control.ErrConflict):
+		// A conflict because an identical event already applied is success;
+		// any other conflict remains ErrConflict.
+		cur, gerr := s.sessions.GetSession(ctx, event.WorkspaceID, event.SessionID)
+		if gerr == nil && cur.State == target {
+			return nil
+		}
+		return control.ErrConflict
+	case errors.Is(err, control.ErrNotFound):
+		return control.ErrStale
+	default:
+		return err
+	}
+}
+
+// recordLifecycleEvent records one provider-neutral service fact after an
+// accepted mutation. The runner's free text never reaches an Event: it is
+// bounded into the session's own error column only.
+func (s *FleetService) recordLifecycleEvent(ctx context.Context, event control.RunnerEvent, row control.Session) {
+	_ = s.events.Record(ctx, control.Event{
+		ID:          s.ids.NewEventID(),
+		WorkspaceID: event.WorkspaceID,
+		ActorID:     control.ActorID(event.RunnerID),
+		Action:      control.ActionUpdate,
+		Resource: control.Resource{
+			Kind:        control.ResourceSession,
+			WorkspaceID: event.WorkspaceID,
+			ID:          string(event.SessionID),
+			CreatorID:   row.CreatorID,
+		},
+		At: s.clock.Now(),
+	})
+}
+
+// boundDetail clips free text to maxDetailBytes valid UTF-8 bytes, cutting on
+// a rune boundary.
+func boundDetail(s string) string {
+	s = strings.ToValidUTF8(s, "")
+	if len(s) <= maxDetailBytes {
+		return s
+	}
+	for len(s) > maxDetailBytes {
+		_, size := utf8.DecodeLastRuneInString(s)
+		s = s[:len(s)-size]
+	}
+	return s
 }
