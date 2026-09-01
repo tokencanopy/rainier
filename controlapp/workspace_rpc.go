@@ -1,14 +1,20 @@
 package controlapp
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
+	"strings"
 
 	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 // sessionRPC asks the sandbox running row to perform method and waits for its
@@ -90,5 +96,154 @@ func decodeRPCAnswer(payload json.RawMessage, out any) error {
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 		return control.ErrUnavailable
 	}
+	return nil
+}
+
+// callerIOError normalizes a failure from the caller-supplied archive reader
+// or writer to the closed sentinel vocabulary. Context cancellation and
+// deadline propagation are preserved (the caller went away), and a permitted
+// short write that made no progress stays io.ErrShortWrite; every other caller
+// I/O failure is control.ErrInvalid so no filesystem path or free-form text
+// from the caller's own transport reaches the answer.
+func callerIOError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.ErrShortWrite) {
+		return err
+	}
+	return control.ErrInvalid
+}
+
+// newTransferID mints a 128-bit lowercase-hex transfer id from crypto/rand. It
+// is an opaque correlation token, never a filename.
+func newTransferID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
+}
+
+// maxDiffRepos bounds how many repositories one diff answer may describe; a
+// session's repository list is resolved at create and is small, so a sandbox
+// answering about more is answering about a session it was not asked about.
+const maxDiffRepos = 64
+
+// maxDiffLabel bounds the three short diff fields — a repository slug and two
+// branch names. They come from the session's own row by way of the sandbox,
+// but "by way of the sandbox" is the part that matters: nothing on a rendered
+// answer is trusted to be the length it should be.
+const maxDiffLabel = 256
+
+// WorkspaceDiff asks a running sandbox for its per-repository diff and bounds
+// the untrusted answer before returning it.
+func (s *AttachmentService) WorkspaceDiff(ctx context.Context, scope control.Scope, cmd control.WorkspaceDiff) (workspace.DiffAnswer, error) {
+	row, err := s.authorizedSession(ctx, scope, cmd.SessionID, control.ActionDiff)
+	if err != nil {
+		return workspace.DiffAnswer{}, err
+	}
+	if row.State != control.StateRunning {
+		return workspace.DiffAnswer{}, control.ErrConflict
+	}
+	var ans workspace.DiffAnswer
+	if err := s.sessionRPC(ctx, row, workspace.MethodDiff, nil, &ans); err != nil {
+		return workspace.DiffAnswer{}, err
+	}
+	return boundDiff(ans), nil
+}
+
+// boundDiff cuts an answer down to what this API is willing to relay, copying
+// before clipping so the decoded transport object cannot alias the returned
+// value.
+func boundDiff(ans workspace.DiffAnswer) workspace.DiffAnswer {
+	if len(ans.Repos) > maxDiffRepos {
+		ans.Repos = ans.Repos[:maxDiffRepos]
+	}
+	out := workspace.DiffAnswer{Repos: make([]workspace.RepoDiff, 0, len(ans.Repos))}
+	for _, r := range ans.Repos {
+		out.Repos = append(out.Repos, workspace.RepoDiff{
+			Repo:          clipTo(r.Repo, maxDiffLabel),
+			BaseBranch:    clipTo(r.BaseBranch, maxDiffLabel),
+			SessionBranch: clipTo(r.SessionBranch, maxDiffLabel),
+			Stat:          clipTo(r.Stat, workspace.StatBytes),
+		})
+	}
+	return out
+}
+
+// clipTo truncates s to max bytes, keeping the result valid UTF-8 — the cut
+// lands mid-rune as often as not, and every one of these strings is about to
+// be JSON-encoded into somebody's terminal.
+func clipTo(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return strings.ToValidUTF8(s[:max], "")
+}
+
+// PushWorkspace streams the gzipped tar archive at Body into Path inside the
+// session's workspace, one bounded chunk per RPC, without buffering the whole
+// archive. The total compressed bytes and every chunk are bounded before any
+// byte crosses the runner seam.
+func (s *AttachmentService) PushWorkspace(ctx context.Context, scope control.Scope, cmd control.PushWorkspace) error {
+	if cmd.Body == nil {
+		return control.ErrInvalid
+	}
+	if err := workspace.ValidatePath(cmd.Path); err != nil {
+		return control.ErrInvalid
+	}
+	row, err := s.authorizedSession(ctx, scope, cmd.SessionID, control.ActionPush)
+	if err != nil {
+		return err
+	}
+	if row.State != control.StateRunning {
+		return control.ErrConflict
+	}
+	xfer, err := newTransferID()
+	if err != nil {
+		return control.ErrUnavailable
+	}
+
+	r := bufio.NewReader(cmd.Body)
+	var total int64
+	for seq := 0; ; seq++ {
+		data := make([]byte, workspace.ChunkBytes)
+		n, rerr := io.ReadFull(r, data)
+		if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+			return callerIOError(rerr)
+		}
+		data = data[:n]
+		done := rerr != nil
+		if rerr == nil {
+			// A full chunk read: peek one byte to learn whether this is the
+			// last chunk without ever sending a spurious empty one.
+			if _, perr := r.Peek(1); perr == io.EOF {
+				done = true
+			} else if perr != nil {
+				return callerIOError(perr)
+			}
+		}
+		total += int64(len(data))
+		if total > workspace.MaxBytes {
+			return control.ErrInvalid
+		}
+		chunk := workspace.PushChunk{Xfer: xfer, Path: cmd.Path,
+			Seq: seq, Data: slices.Clone(data), Done: done}
+		var ack workspace.PushAck
+		if err := s.sessionRPC(ctx, row, workspace.MethodPushFiles, chunk, &ack); err != nil {
+			return err
+		}
+		if ack.Seq != chunk.Seq {
+			return control.ErrUnavailable
+		}
+		if done {
+			if !ack.Synced {
+				return control.ErrUnavailable
+			}
+			break
+		}
+	}
+	s.record(ctx, scope, control.ActionPush, control.Resource{
+		Kind: control.ResourceSession, WorkspaceID: row.WorkspaceID,
+		ID: string(row.ID), CreatorID: row.CreatorID,
+	})
 	return nil
 }
