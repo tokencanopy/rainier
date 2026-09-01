@@ -364,7 +364,21 @@ func (s *FleetService) ReconcileRunner(ctx context.Context, snap control.RunnerS
 		}
 		s.Wake(snap.PoolID)
 	case current != nil:
+		// Same generation: refresh the runner's authoritative capacity,
+		// connection, and last-seen without weakening the fence. A concurrent
+		// higher-generation write still wins and fences this snapshot.
 		authoritative = current.Generation
+		if err := s.upsertSnapshotRunner(ctx, snap, current); err != nil {
+			if errors.Is(err, control.ErrStale) {
+				gen, rerr := s.authoritativeGeneration(ctx, snap.PoolID, snap.RunnerID)
+				if rerr != nil {
+					return control.ReconcileResult{}, rerr
+				}
+				return control.ReconcileResult{Generation: gen, Fenced: true}, nil
+			}
+			return control.ReconcileResult{}, err
+		}
+		s.Wake(snap.PoolID)
 	case current == nil:
 		if err := s.upsertSnapshotRunner(ctx, snap, nil); err != nil {
 			return control.ReconcileResult{}, err

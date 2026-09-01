@@ -1113,6 +1113,44 @@ func TestReconcileRunnerNewerGenerationUpsertsThenReconciles(t *testing.T) {
 	}
 }
 
+func TestReconcileRunnerSameGenerationRefreshesAuthority(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.st.seedRunner(control.Runner{
+		ID: "runner_example", PoolID: "pool_example", Generation: 5,
+		CapacityUsed: 1, CapacityTotal: 4, Connected: false,
+		Capabilities: []string{"gpu"}, LastSeenAt: time.Unix(1, 0),
+	})
+	// Advance the clock so a refreshed LastSeenAt is observable.
+	fx.clock.now = time.Unix(1_800_000_000, 0)
+
+	got, err := fx.service.ReconcileRunner(fleetCtx, control.RunnerSnapshot{
+		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+		Generation: 5, CapacityUsed: 2, CapacityTotal: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Fenced || got.Generation != 5 {
+		t.Fatalf("result = %+v, want unfenced at generation 5", got)
+	}
+	stored := fx.st.runners["pool_example"]["runner_example"]
+	if stored.Generation != 5 {
+		t.Fatalf("generation = %d, want 5", stored.Generation)
+	}
+	if stored.CapacityUsed != 2 || stored.CapacityTotal != 8 {
+		t.Fatalf("capacity = %d/%d, want 2/8", stored.CapacityUsed, stored.CapacityTotal)
+	}
+	if !stored.Connected {
+		t.Fatal("connected was not refreshed to true")
+	}
+	if !stored.LastSeenAt.Equal(time.Unix(1_800_000_000, 0)) {
+		t.Fatalf("LastSeenAt = %v, want refreshed to the clock", stored.LastSeenAt)
+	}
+	if !slices.Equal(stored.Capabilities, []string{"gpu"}) {
+		t.Fatalf("capabilities = %v, want [gpu] preserved", stored.Capabilities)
+	}
+}
+
 func TestReconcileRunnerOrphans(t *testing.T) {
 	t.Run("unknown announced session is destroyed", func(t *testing.T) {
 		fx := newFleetFixture(t)
