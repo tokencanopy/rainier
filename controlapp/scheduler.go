@@ -273,7 +273,7 @@ func (s *FleetService) pinSetupHash(ctx context.Context, row control.Session, sp
 	if spec.Setup == "" {
 		return true
 	}
-	if err := s.sessions.SetSessionSetupHash(ctx, row.WorkspaceID, row.ID, setupHash(spec.Image, spec.Setup)); err != nil {
+	if err := s.sessions.SetSessionSetupHash(ctx, row.WorkspaceID, row.ID, dispatchSetupHash(spec.Image, spec.Setup)); err != nil {
 		s.failCreate(ctx, row, "could not record the setup this session runs")
 		return false
 	}
@@ -290,8 +290,8 @@ func (s *FleetService) failCreate(ctx context.Context, row control.Session, reas
 	s.Wake(row.PoolID)
 }
 
-// setupHash is the identity of a session's dispatched setup inputs.
-func setupHash(image, setup string) string {
+// dispatchSetupHash is the identity of a session's dispatched setup inputs.
+func dispatchSetupHash(image, setup string) string {
 	h := sha256.Sum256([]byte(image + "\x00" + setup))
 	return hex.EncodeToString(h[:])
 }

@@ -23,7 +23,7 @@ import (
 // OldestQueued, exactly as a real persistence layer would make it.
 // ---------------------------------------------------------------------------
 
-type fakeStore struct {
+type fleetFakeStore struct {
 	mu sync.Mutex
 
 	sessions map[control.WorkspaceID]map[control.SessionID]control.Session
@@ -47,15 +47,15 @@ type fakeStore struct {
 	transitionErr  error
 }
 
-func newFakeStore() *fakeStore {
-	return &fakeStore{
+func newFleetFakeStore() *fleetFakeStore {
+	return &fleetFakeStore{
 		sessions: map[control.WorkspaceID]map[control.SessionID]control.Session{},
 		runners:  map[control.PoolID]map[control.RunnerID]control.Runner{},
 		envs:     map[control.WorkspaceID]map[control.EnvironmentID]control.Environment{},
 	}
 }
 
-func containsState(states []control.SessionState, s control.SessionState) bool {
+func fleetContainsState(states []control.SessionState, s control.SessionState) bool {
 	for _, want := range states {
 		if want == s {
 			return true
@@ -64,8 +64,8 @@ func containsState(states []control.SessionState, s control.SessionState) bool {
 	return false
 }
 
-// sameSet reports whether a and b contain the same elements, ignoring order.
-func sameSet(a, b []string) bool {
+// fleetSameSet reports whether a and b contain the same elements, ignoring order.
+func fleetSameSet(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -81,7 +81,7 @@ func sameSet(a, b []string) bool {
 	return true
 }
 
-func (st *fakeStore) seedSession(s control.Session) {
+func (st *fleetFakeStore) seedSession(s control.Session) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	m := st.sessions[s.WorkspaceID]
@@ -92,7 +92,7 @@ func (st *fakeStore) seedSession(s control.Session) {
 	m[s.ID] = s
 }
 
-func (st *fakeStore) seedRunner(r control.Runner) {
+func (st *fleetFakeStore) seedRunner(r control.Runner) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	m := st.runners[r.PoolID]
@@ -103,7 +103,7 @@ func (st *fakeStore) seedRunner(r control.Runner) {
 	m[r.ID] = r
 }
 
-func (st *fakeStore) seedEnv(e control.Environment) {
+func (st *fleetFakeStore) seedEnv(e control.Environment) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	m := st.envs[e.WorkspaceID]
@@ -114,7 +114,7 @@ func (st *fakeStore) seedEnv(e control.Environment) {
 	m[e.ID] = e
 }
 
-func (st *fakeStore) getSession(ws control.WorkspaceID, id control.SessionID) (control.Session, error) {
+func (st *fleetFakeStore) getSession(ws control.WorkspaceID, id control.SessionID) (control.Session, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.getSessionCalls++
@@ -129,7 +129,7 @@ func (st *fakeStore) getSession(ws control.WorkspaceID, id control.SessionID) (c
 	return s, nil
 }
 
-func (st *fakeStore) transition(ws control.WorkspaceID, id control.SessionID, from []control.SessionState, to control.SessionState, opts control.TransitionOpts) error {
+func (st *fleetFakeStore) transition(ws control.WorkspaceID, id control.SessionID, from []control.SessionState, to control.SessionState, opts control.TransitionOpts) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.transitionCalls++
@@ -141,7 +141,7 @@ func (st *fakeStore) transition(ws control.WorkspaceID, id control.SessionID, fr
 	if !ok {
 		return control.ErrNotFound
 	}
-	if !containsState(from, s.State) {
+	if !fleetContainsState(from, s.State) {
 		return control.ErrConflict
 	}
 	s.State = to
@@ -155,7 +155,7 @@ func (st *fakeStore) transition(ws control.WorkspaceID, id control.SessionID, fr
 	return nil
 }
 
-func (st *fakeStore) setSessionSetupHash(ws control.WorkspaceID, id control.SessionID, hash string) error {
+func (st *fleetFakeStore) setSessionSetupHash(ws control.WorkspaceID, id control.SessionID, hash string) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.setupHashCalls++
@@ -169,7 +169,7 @@ func (st *fakeStore) setSessionSetupHash(ws control.WorkspaceID, id control.Sess
 	return nil
 }
 
-func (st *fakeStore) setChildExitCode(ws control.WorkspaceID, id control.SessionID, code int) error {
+func (st *fleetFakeStore) setChildExitCode(ws control.WorkspaceID, id control.SessionID, code int) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.childExitCalls++
@@ -184,7 +184,7 @@ func (st *fakeStore) setChildExitCode(ws control.WorkspaceID, id control.Session
 	return nil
 }
 
-func (st *fakeStore) upsertRunner(pool control.PoolID, r control.Runner) error {
+func (st *fleetFakeStore) upsertRunner(pool control.PoolID, r control.Runner) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.upsertCalls++
@@ -200,7 +200,7 @@ func (st *fakeStore) upsertRunner(pool control.PoolID, r control.Runner) error {
 	return nil
 }
 
-func (st *fakeStore) listRunners(pool control.PoolID) ([]control.Runner, error) {
+func (st *fleetFakeStore) listRunners(pool control.PoolID) ([]control.Runner, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.listRunnersCalls++
@@ -216,14 +216,14 @@ func (st *fakeStore) listRunners(pool control.PoolID) ([]control.Runner, error) 
 	return out, nil
 }
 
-func (st *fakeStore) sessionsOnRunner(pool control.PoolID, id control.RunnerID, states []control.SessionState) ([]control.Session, error) {
+func (st *fleetFakeStore) sessionsOnRunner(pool control.PoolID, id control.RunnerID, states []control.SessionState) ([]control.Session, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.sessionsOnRunnerCalls++
 	var out []control.Session
 	for _, m := range st.sessions {
 		for _, s := range m {
-			if s.PoolID == pool && s.RunnerID == id && containsState(states, s.State) {
+			if s.PoolID == pool && s.RunnerID == id && fleetContainsState(states, s.State) {
 				out = append(out, s)
 			}
 		}
@@ -232,7 +232,7 @@ func (st *fakeStore) sessionsOnRunner(pool control.PoolID, id control.RunnerID, 
 	return out, nil
 }
 
-func (st *fakeStore) oldestQueued(pool control.PoolID) ([]control.Session, error) {
+func (st *fleetFakeStore) oldestQueued(pool control.PoolID) ([]control.Session, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.oldestQueuedCalls++
@@ -253,7 +253,7 @@ func (st *fakeStore) oldestQueued(pool control.PoolID) ([]control.Session, error
 	return out, nil
 }
 
-func (st *fakeStore) getEnv(ws control.WorkspaceID, id control.EnvironmentID) (control.Environment, error) {
+func (st *fleetFakeStore) getEnv(ws control.WorkspaceID, id control.EnvironmentID) (control.Environment, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	m := st.envs[ws]
@@ -268,7 +268,7 @@ func (st *fakeStore) getEnv(ws control.WorkspaceID, id control.EnvironmentID) (c
 // port fakes
 // ---------------------------------------------------------------------------
 
-type fakeAuthorizer struct {
+type fleetFakeAuthorizer struct {
 	mu        sync.Mutex
 	calls     int
 	deny      error
@@ -276,7 +276,7 @@ type fakeAuthorizer struct {
 	resources []control.Resource
 }
 
-func (f *fakeAuthorizer) Authorize(_ context.Context, _ control.Scope, a control.Action, r control.Resource) error {
+func (f *fleetFakeAuthorizer) Authorize(_ context.Context, _ control.Scope, a control.Action, r control.Resource) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -285,60 +285,60 @@ func (f *fakeAuthorizer) Authorize(_ context.Context, _ control.Scope, a control
 	return f.deny
 }
 
-type fakeSessions struct{ st *fakeStore }
+type fleetFakeSessions struct{ st *fleetFakeStore }
 
-func (f *fakeSessions) CreateSession(context.Context, control.WorkspaceID, control.Session) (control.Session, error) {
+func (f *fleetFakeSessions) CreateSession(context.Context, control.WorkspaceID, control.Session) (control.Session, error) {
 	return control.Session{}, control.ErrUnsupported
 }
-func (f *fakeSessions) GetSession(_ context.Context, ws control.WorkspaceID, id control.SessionID) (control.Session, error) {
+func (f *fleetFakeSessions) GetSession(_ context.Context, ws control.WorkspaceID, id control.SessionID) (control.Session, error) {
 	return f.st.getSession(ws, id)
 }
-func (f *fakeSessions) SessionByIDem(context.Context, control.WorkspaceID, control.ActorID, string) (control.Session, error) {
+func (f *fleetFakeSessions) SessionByIDem(context.Context, control.WorkspaceID, control.ActorID, string) (control.Session, error) {
 	return control.Session{}, control.ErrNotFound
 }
-func (f *fakeSessions) ListSessions(context.Context, control.WorkspaceID, control.SessionQuery) ([]control.Session, string, error) {
+func (f *fleetFakeSessions) ListSessions(context.Context, control.WorkspaceID, control.SessionQuery) ([]control.Session, string, error) {
 	return nil, "", nil
 }
-func (f *fakeSessions) Transition(_ context.Context, ws control.WorkspaceID, id control.SessionID, from []control.SessionState, to control.SessionState, opts control.TransitionOpts) error {
+func (f *fleetFakeSessions) Transition(_ context.Context, ws control.WorkspaceID, id control.SessionID, from []control.SessionState, to control.SessionState, opts control.TransitionOpts) error {
 	return f.st.transition(ws, id, from, to, opts)
 }
-func (f *fakeSessions) SetSessionSetupHash(_ context.Context, ws control.WorkspaceID, id control.SessionID, hash string) error {
+func (f *fleetFakeSessions) SetSessionSetupHash(_ context.Context, ws control.WorkspaceID, id control.SessionID, hash string) error {
 	return f.st.setSessionSetupHash(ws, id, hash)
 }
-func (f *fakeSessions) SetChildExitCode(_ context.Context, ws control.WorkspaceID, id control.SessionID, code int) error {
+func (f *fleetFakeSessions) SetChildExitCode(_ context.Context, ws control.WorkspaceID, id control.SessionID, code int) error {
 	return f.st.setChildExitCode(ws, id, code)
 }
 
-type fakeEnvironments struct{ st *fakeStore }
+type fleetFakeEnvironments struct{ st *fleetFakeStore }
 
-func (f *fakeEnvironments) CreateEnvironment(context.Context, control.WorkspaceID, control.Environment) (control.Environment, error) {
+func (f *fleetFakeEnvironments) CreateEnvironment(context.Context, control.WorkspaceID, control.Environment) (control.Environment, error) {
 	return control.Environment{}, control.ErrUnsupported
 }
-func (f *fakeEnvironments) GetEnvironment(_ context.Context, ws control.WorkspaceID, id control.EnvironmentID) (control.Environment, error) {
+func (f *fleetFakeEnvironments) GetEnvironment(_ context.Context, ws control.WorkspaceID, id control.EnvironmentID) (control.Environment, error) {
 	return f.st.getEnv(ws, id)
 }
-func (f *fakeEnvironments) ListEnvironments(context.Context, control.WorkspaceID, control.EnvironmentQuery) ([]control.Environment, string, error) {
+func (f *fleetFakeEnvironments) ListEnvironments(context.Context, control.WorkspaceID, control.EnvironmentQuery) ([]control.Environment, string, error) {
 	return nil, "", nil
 }
-func (f *fakeEnvironments) UpdateEnvironment(context.Context, control.WorkspaceID, control.Environment) (control.Environment, error) {
+func (f *fleetFakeEnvironments) UpdateEnvironment(context.Context, control.WorkspaceID, control.Environment) (control.Environment, error) {
 	return control.Environment{}, control.ErrUnsupported
 }
-func (f *fakeEnvironments) DeleteEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID) error {
+func (f *fleetFakeEnvironments) DeleteEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID) error {
 	return control.ErrUnsupported
 }
-func (f *fakeEnvironments) CountSessionsByEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID, []control.SessionState) (int, error) {
+func (f *fleetFakeEnvironments) CountSessionsByEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID, []control.SessionState) (int, error) {
 	return 0, nil
 }
-func (f *fakeEnvironments) SetEnvironmentSnapshot(context.Context, control.WorkspaceID, control.EnvironmentID, string, string, control.RunnerID) error {
+func (f *fleetFakeEnvironments) SetEnvironmentSnapshot(context.Context, control.WorkspaceID, control.EnvironmentID, string, string, control.RunnerID) error {
 	return control.ErrUnsupported
 }
 
-type fakeFleet struct{ st *fakeStore }
+type fleetFakeFleet struct{ st *fleetFakeStore }
 
-func (f *fakeFleet) UpsertRunner(_ context.Context, pool control.PoolID, r control.Runner) error {
+func (f *fleetFakeFleet) UpsertRunner(_ context.Context, pool control.PoolID, r control.Runner) error {
 	return f.st.upsertRunner(pool, r)
 }
-func (f *fakeFleet) SetRunnerConnected(_ context.Context, pool control.PoolID, id control.RunnerID, connected bool) error {
+func (f *fleetFakeFleet) SetRunnerConnected(_ context.Context, pool control.PoolID, id control.RunnerID, connected bool) error {
 	f.st.mu.Lock()
 	defer f.st.mu.Unlock()
 	m := f.st.runners[pool]
@@ -350,24 +350,24 @@ func (f *fakeFleet) SetRunnerConnected(_ context.Context, pool control.PoolID, i
 	m[id] = r
 	return nil
 }
-func (f *fakeFleet) ListRunners(_ context.Context, pool control.PoolID) ([]control.Runner, error) {
+func (f *fleetFakeFleet) ListRunners(_ context.Context, pool control.PoolID) ([]control.Runner, error) {
 	return f.st.listRunners(pool)
 }
-func (f *fakeFleet) SessionsOnRunner(_ context.Context, pool control.PoolID, id control.RunnerID, states []control.SessionState) ([]control.Session, error) {
+func (f *fleetFakeFleet) SessionsOnRunner(_ context.Context, pool control.PoolID, id control.RunnerID, states []control.SessionState) ([]control.Session, error) {
 	return f.st.sessionsOnRunner(pool, id, states)
 }
-func (f *fakeFleet) OldestQueued(_ context.Context, pool control.PoolID) ([]control.Session, error) {
+func (f *fleetFakeFleet) OldestQueued(_ context.Context, pool control.PoolID) ([]control.Session, error) {
 	return f.st.oldestQueued(pool)
 }
 
-type fakePools struct {
+type fleetFakePools struct {
 	mu    sync.Mutex
 	calls int
 	deny  error
 	pools []control.Pool
 }
 
-func (f *fakePools) EligiblePools(_ context.Context, _ control.Scope, _ control.Requirements) ([]control.Pool, error) {
+func (f *fleetFakePools) EligiblePools(_ context.Context, _ control.Scope, _ control.Requirements) ([]control.Pool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -377,7 +377,7 @@ func (f *fakePools) EligiblePools(_ context.Context, _ control.Scope, _ control.
 	return slices.Clone(f.pools), nil
 }
 
-type fakeTransport struct {
+type fleetFakeTransport struct {
 	mu                 sync.Mutex
 	dispatched         []runner.ToRunner
 	dispatchErr        error
@@ -386,15 +386,15 @@ type fakeTransport struct {
 	connectedOverrides map[string]bool
 }
 
-func newFakeTransport() *fakeTransport {
-	return &fakeTransport{connectedDefault: true, connectedOverrides: map[string]bool{}}
+func newFleetFakeTransport() *fleetFakeTransport {
+	return &fleetFakeTransport{connectedDefault: true, connectedOverrides: map[string]bool{}}
 }
 
-func poolRunnerKey(pool control.PoolID, id control.RunnerID) string {
+func fleetPoolRunnerKey(pool control.PoolID, id control.RunnerID) string {
 	return string(pool) + "/" + string(id)
 }
 
-func (f *fakeTransport) Dispatch(_ context.Context, _ control.PoolID, _ control.RunnerID, m runner.ToRunner) (runner.FromRunner, error) {
+func (f *fleetFakeTransport) Dispatch(_ context.Context, _ control.PoolID, _ control.RunnerID, m runner.ToRunner) (runner.FromRunner, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.dispatched = append(f.dispatched, m)
@@ -409,75 +409,75 @@ func (f *fakeTransport) Dispatch(_ context.Context, _ control.PoolID, _ control.
 	return runner.FromRunner{OK: true}, nil
 }
 
-func (f *fakeTransport) Connected(pool control.PoolID, id control.RunnerID) bool {
+func (f *fleetFakeTransport) Connected(pool control.PoolID, id control.RunnerID) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if v, ok := f.connectedOverrides[poolRunnerKey(pool, id)]; ok {
+	if v, ok := f.connectedOverrides[fleetPoolRunnerKey(pool, id)]; ok {
 		return v
 	}
 	return f.connectedDefault
 }
 
-func (f *fakeTransport) dispatchedCommands() []runner.ToRunner {
+func (f *fleetFakeTransport) dispatchedCommands() []runner.ToRunner {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.dispatched)
 }
 
-type fakeEvents struct {
+type fleetFakeEvents struct {
 	mu     sync.Mutex
 	events []control.Event
 }
 
-func (f *fakeEvents) Record(_ context.Context, e control.Event) error {
+func (f *fleetFakeEvents) Record(_ context.Context, e control.Event) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.events = append(f.events, e)
 	return nil
 }
 
-func (f *fakeEvents) recorded() []control.Event {
+func (f *fleetFakeEvents) recorded() []control.Event {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.events)
 }
 
-type fakeClock struct{ now time.Time }
+type fleetFakeClock struct{ now time.Time }
 
-func (f *fakeClock) Now() time.Time { return f.now }
+func (f *fleetFakeClock) Now() time.Time { return f.now }
 
-type fakeIDs struct {
+type fleetFakeIDs struct {
 	mu sync.Mutex
 	n  int
 }
 
-func (f *fakeIDs) NewSessionID() control.SessionID {
+func (f *fleetFakeIDs) NewSessionID() control.SessionID {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.n++
 	return control.SessionID(fmt.Sprintf("sess_%d", f.n))
 }
-func (f *fakeIDs) NewEnvironmentID() control.EnvironmentID {
+func (f *fleetFakeIDs) NewEnvironmentID() control.EnvironmentID {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.n++
 	return control.EnvironmentID(fmt.Sprintf("env_%d", f.n))
 }
-func (f *fakeIDs) NewEventID() control.EventID {
+func (f *fleetFakeIDs) NewEventID() control.EventID {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.n++
 	return control.EventID(fmt.Sprintf("evt_%d", f.n))
 }
 
-type fakeResolver struct {
+type fleetFakeResolver struct {
 	mu       sync.Mutex
 	calls    int
 	material LaunchMaterial
 	err      error
 }
 
-func (f *fakeResolver) ResolveLaunchMaterial(_ context.Context, _ control.Session, _ *control.Environment) (LaunchMaterial, error) {
+func (f *fleetFakeResolver) ResolveLaunchMaterial(_ context.Context, _ control.Session, _ *control.Environment) (LaunchMaterial, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -493,38 +493,38 @@ func (f *fakeResolver) ResolveLaunchMaterial(_ context.Context, _ control.Sessio
 
 type fleetFixture struct {
 	service   *FleetService
-	auth      *fakeAuthorizer
-	sessions  *fakeSessions
-	envs      *fakeEnvironments
-	fleet     *fakeFleet
-	pools     *fakePools
-	transport *fakeTransport
-	events    *fakeEvents
-	clock     *fakeClock
-	ids       *fakeIDs
-	st        *fakeStore
-	resolver  *fakeResolver
+	auth      *fleetFakeAuthorizer
+	sessions  *fleetFakeSessions
+	envs      *fleetFakeEnvironments
+	fleet     *fleetFakeFleet
+	pools     *fleetFakePools
+	transport *fleetFakeTransport
+	events    *fleetFakeEvents
+	clock     *fleetFakeClock
+	ids       *fleetFakeIDs
+	st        *fleetFakeStore
+	resolver  *fleetFakeResolver
 }
 
 func newFleetFixtureWithResolver(t *testing.T, resolver LaunchMaterialResolver) *fleetFixture {
 	t.Helper()
-	st := newFakeStore()
-	auth := &fakeAuthorizer{}
-	sessions := &fakeSessions{st: st}
-	envs := &fakeEnvironments{st: st}
-	fleet := &fakeFleet{st: st}
-	pools := &fakePools{}
-	transport := newFakeTransport()
-	events := &fakeEvents{}
-	clock := &fakeClock{now: time.Unix(1_700_000_000, 0)}
-	ids := &fakeIDs{}
+	st := newFleetFakeStore()
+	auth := &fleetFakeAuthorizer{}
+	sessions := &fleetFakeSessions{st: st}
+	envs := &fleetFakeEnvironments{st: st}
+	fleet := &fleetFakeFleet{st: st}
+	pools := &fleetFakePools{}
+	transport := newFleetFakeTransport()
+	events := &fleetFakeEvents{}
+	clock := &fleetFakeClock{now: time.Unix(1_700_000_000, 0)}
+	ids := &fleetFakeIDs{}
 	r := resolver
 	if r == nil {
-		r = &fakeResolver{}
+		r = &fleetFakeResolver{}
 	}
-	fr, ok := r.(*fakeResolver)
+	fr, ok := r.(*fleetFakeResolver)
 	if !ok {
-		fr = &fakeResolver{}
+		fr = &fleetFakeResolver{}
 	}
 	svc, err := NewFleetService(FleetOptions{
 		Authorizer:     auth,
@@ -554,9 +554,9 @@ func newFleetFixture(t *testing.T) *fleetFixture {
 	return newFleetFixtureWithResolver(t, nil)
 }
 
-// wakePools drains every currently-buffered wake and returns the pool IDs in
+// fleetWakePools drains every currently-buffered wake and returns the pool IDs in
 // arrival order. It never blocks.
-func wakePools(svc *FleetService) []control.PoolID {
+func fleetWakePools(svc *FleetService) []control.PoolID {
 	var out []control.PoolID
 	for {
 		select {
@@ -568,7 +568,7 @@ func wakePools(svc *FleetService) []control.PoolID {
 	}
 }
 
-func validScope() control.Scope {
+func fleetValidScope() control.Scope {
 	return control.Scope{
 		WorkspaceID: "ws_example",
 		Actor:       control.Actor{ID: "act_example", Kind: control.ActorService},
@@ -578,7 +578,7 @@ func validScope() control.Scope {
 	}
 }
 
-var ctx = context.Background()
+var fleetCtx = context.Background()
 
 // ---------------------------------------------------------------------------
 // Task 1: constructor + registration + listing
@@ -593,19 +593,19 @@ var _ runnerRegistrationAndListing = (*FleetService)(nil)
 
 func TestNewFleetServiceRequiresEveryPort(t *testing.T) {
 	base := func() FleetOptions {
-		st := newFakeStore()
+		st := newFleetFakeStore()
 		return FleetOptions{
-			Authorizer:     &fakeAuthorizer{},
-			Sessions:       &fakeSessions{st: st},
-			Environments:   &fakeEnvironments{st: st},
-			Fleet:          &fakeFleet{st: st},
-			Pools:          &fakePools{},
-			Transport:      newFakeTransport(),
-			Events:         &fakeEvents{},
-			Clock:          &fakeClock{now: time.Now()},
-			IDs:            &fakeIDs{},
+			Authorizer:     &fleetFakeAuthorizer{},
+			Sessions:       &fleetFakeSessions{st: st},
+			Environments:   &fleetFakeEnvironments{st: st},
+			Fleet:          &fleetFakeFleet{st: st},
+			Pools:          &fleetFakePools{},
+			Transport:      newFleetFakeTransport(),
+			Events:         &fleetFakeEvents{},
+			Clock:          &fleetFakeClock{now: time.Now()},
+			IDs:            &fleetFakeIDs{},
 			SafetyInterval: time.Second,
-			LaunchMaterial: &fakeResolver{},
+			LaunchMaterial: &fleetFakeResolver{},
 		}
 	}
 	if _, err := NewFleetService(base()); err != nil {
@@ -647,7 +647,7 @@ func TestRegisterRunnerRejectsStaleGeneration(t *testing.T) {
 		ID: "runner_example", PoolID: "pool_example", Generation: 8,
 		CapacityTotal: 4, Connected: true,
 	})
-	got, err := fx.service.RegisterRunner(ctx, control.RunnerRegistration{
+	got, err := fx.service.RegisterRunner(fleetCtx, control.RunnerRegistration{
 		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 		Generation: 7, CapacityTotal: 4,
 	})
@@ -660,7 +660,7 @@ func TestRegisterRunnerRejectsStaleGeneration(t *testing.T) {
 	if fx.st.upsertCalls != 0 {
 		t.Fatal("stale registration mutated the store")
 	}
-	if len(wakePools(fx.service)) != 0 {
+	if len(fleetWakePools(fx.service)) != 0 {
 		t.Fatal("stale registration woke the pool")
 	}
 }
@@ -685,7 +685,7 @@ func TestRegisterRunnerValidation(t *testing.T) {
 			fx := newFleetFixture(t)
 			r := valid
 			mutate(&r)
-			if _, err := fx.service.RegisterRunner(ctx, r); !errors.Is(err, control.ErrInvalid) {
+			if _, err := fx.service.RegisterRunner(fleetCtx, r); !errors.Is(err, control.ErrInvalid) {
 				t.Fatalf("got %v, want ErrInvalid", err)
 			}
 			if fx.st.upsertCalls != 0 {
@@ -702,7 +702,7 @@ func TestRegisterRunnerIdempotentReconnectAndReplacement(t *testing.T) {
 			ID: "runner_example", PoolID: "pool_example", Generation: 3,
 			CapacityTotal: 4, Connected: false,
 		})
-		got, err := fx.service.RegisterRunner(ctx, control.RunnerRegistration{
+		got, err := fx.service.RegisterRunner(fleetCtx, control.RunnerRegistration{
 			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 			Generation: 3, CapacityUsed: 1, CapacityTotal: 4, Capabilities: []string{"gpu"},
 		})
@@ -719,7 +719,7 @@ func TestRegisterRunnerIdempotentReconnectAndReplacement(t *testing.T) {
 		if !r.Connected || r.Generation != 3 || r.CapacityUsed != 1 {
 			t.Fatalf("stored runner = %+v", r)
 		}
-		if len(wakePools(fx.service)) != 1 {
+		if len(fleetWakePools(fx.service)) != 1 {
 			t.Fatal("accepted reconnect did not wake the pool")
 		}
 	})
@@ -730,7 +730,7 @@ func TestRegisterRunnerIdempotentReconnectAndReplacement(t *testing.T) {
 			ID: "runner_example", PoolID: "pool_example", Generation: 3,
 			CapacityTotal: 4, Connected: true, Capabilities: []string{"gpu"},
 		})
-		got, err := fx.service.RegisterRunner(ctx, control.RunnerRegistration{
+		got, err := fx.service.RegisterRunner(fleetCtx, control.RunnerRegistration{
 			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 			Generation: 4, CapacityTotal: 8, Capabilities: []string{"gpu", "arm"},
 		})
@@ -753,7 +753,7 @@ func TestRegisterRunnerIdempotentReconnectAndReplacement(t *testing.T) {
 func TestRegisterRunnerAdapterStale(t *testing.T) {
 	fx := newFleetFixture(t)
 	fx.st.upsertErr = control.ErrStale
-	got, err := fx.service.RegisterRunner(ctx, control.RunnerRegistration{
+	got, err := fx.service.RegisterRunner(fleetCtx, control.RunnerRegistration{
 		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 		Generation: 1, CapacityTotal: 4,
 	})
@@ -766,7 +766,7 @@ func TestRegisterRunnerAdapterStale(t *testing.T) {
 	if fx.st.upsertCalls != 1 {
 		t.Fatalf("upsertCalls = %d, want 1 attempt", fx.st.upsertCalls)
 	}
-	if len(wakePools(fx.service)) != 0 {
+	if len(fleetWakePools(fx.service)) != 0 {
 		t.Fatal("refused registration woke the pool")
 	}
 }
@@ -774,7 +774,7 @@ func TestRegisterRunnerAdapterStale(t *testing.T) {
 func TestRegisterRunnerCopiesCapabilities(t *testing.T) {
 	fx := newFleetFixture(t)
 	caps := []string{"gpu", "arm"}
-	got, err := fx.service.RegisterRunner(ctx, control.RunnerRegistration{
+	got, err := fx.service.RegisterRunner(fleetCtx, control.RunnerRegistration{
 		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 		Generation: 1, CapacityTotal: 4, Capabilities: caps,
 	})
@@ -794,7 +794,7 @@ func TestListRunnersAuthorizesBeforeReads(t *testing.T) {
 	fx := newFleetFixture(t)
 	fx.auth.deny = control.ErrDenied
 	fx.pools.pools = []control.Pool{{ID: "pool_example"}}
-	if _, err := fx.service.ListRunners(ctx, validScope(), control.RunnerQuery{}); !errors.Is(err, control.ErrDenied) {
+	if _, err := fx.service.ListRunners(fleetCtx, fleetValidScope(), control.RunnerQuery{}); !errors.Is(err, control.ErrDenied) {
 		t.Fatalf("got %v, want ErrDenied", err)
 	}
 	if fx.pools.calls != 0 {
@@ -815,7 +815,7 @@ func TestListRunnersMergesSortsAndPaginates(t *testing.T) {
 	fx.st.seedRunner(control.Runner{ID: "runner_a", PoolID: "pool_a", Generation: 1})
 	fx.st.seedRunner(control.Runner{ID: "runner_m", PoolID: "pool_a", Generation: 1})
 
-	page, err := fx.service.ListRunners(ctx, validScope(), control.RunnerQuery{Limit: 2})
+	page, err := fx.service.ListRunners(fleetCtx, fleetValidScope(), control.RunnerQuery{Limit: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -835,7 +835,7 @@ func TestListRunnersMergesSortsAndPaginates(t *testing.T) {
 		t.Fatal("expected a next cursor")
 	}
 
-	page2, err := fx.service.ListRunners(ctx, validScope(), control.RunnerQuery{Limit: 2, Cursor: page.NextCursor})
+	page2, err := fx.service.ListRunners(fleetCtx, fleetValidScope(), control.RunnerQuery{Limit: 2, Cursor: page.NextCursor})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -860,18 +860,18 @@ func TestListRunnersValidation(t *testing.T) {
 	fx := newFleetFixture(t)
 	fx.pools.pools = []control.Pool{{ID: "pool_example"}}
 
-	if _, err := fx.service.ListRunners(ctx, validScope(), control.RunnerQuery{Limit: -1}); !errors.Is(err, control.ErrInvalid) {
+	if _, err := fx.service.ListRunners(fleetCtx, fleetValidScope(), control.RunnerQuery{Limit: -1}); !errors.Is(err, control.ErrInvalid) {
 		t.Fatalf("negative limit: got %v, want ErrInvalid", err)
 	}
-	if _, err := fx.service.ListRunners(ctx, validScope(), control.RunnerQuery{Cursor: "not base64!!"}); !errors.Is(err, control.ErrInvalid) {
+	if _, err := fx.service.ListRunners(fleetCtx, fleetValidScope(), control.RunnerQuery{Cursor: "not base64!!"}); !errors.Is(err, control.ErrInvalid) {
 		t.Fatalf("malformed cursor: got %v, want ErrInvalid", err)
 	}
-	if _, err := fx.service.ListRunners(ctx, validScope(), control.RunnerQuery{Cursor: "c2VjcmV0"}); !errors.Is(err, control.ErrInvalid) {
+	if _, err := fx.service.ListRunners(fleetCtx, fleetValidScope(), control.RunnerQuery{Cursor: "c2VjcmV0"}); !errors.Is(err, control.ErrInvalid) {
 		t.Fatalf("non-JSON cursor: got %v, want ErrInvalid", err)
 	}
 
 	// An empty result is [], never nil.
-	page, err := fx.service.ListRunners(ctx, validScope(), control.RunnerQuery{})
+	page, err := fx.service.ListRunners(fleetCtx, fleetValidScope(), control.RunnerQuery{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -888,7 +888,7 @@ func TestListRunnersCopiesCapabilities(t *testing.T) {
 	fx.pools.pools = []control.Pool{{ID: "pool_example"}}
 	fx.st.seedRunner(control.Runner{ID: "runner_example", PoolID: "pool_example", Generation: 1, Capabilities: []string{"gpu", "arm"}})
 
-	page, err := fx.service.ListRunners(ctx, validScope(), control.RunnerQuery{})
+	page, err := fx.service.ListRunners(fleetCtx, fleetValidScope(), control.RunnerQuery{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -906,11 +906,11 @@ func TestListRunnersCopiesCapabilities(t *testing.T) {
 // Task 2: generation-fenced reconciliation
 // ---------------------------------------------------------------------------
 
-func reconcileRunnerRow() control.Runner {
+func fleetReconcileRunnerRow() control.Runner {
 	return control.Runner{ID: "runner_example", PoolID: "pool_example", Generation: 1, CapacityTotal: 4, Connected: true}
 }
 
-func getSessionState(t *testing.T, fx *fleetFixture, ws control.WorkspaceID, id control.SessionID) control.Session {
+func fleetGetSessionState(t *testing.T, fx *fleetFixture, ws control.WorkspaceID, id control.SessionID) control.Session {
 	t.Helper()
 	s, err := fx.st.getSession(ws, id)
 	if err != nil {
@@ -935,7 +935,7 @@ func TestReconcileRunnerMatrix(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			fx := newFleetFixture(t)
-			fx.st.seedRunner(reconcileRunnerRow())
+			fx.st.seedRunner(fleetReconcileRunnerRow())
 			fx.st.seedSession(control.Session{
 				ID: "sess_example", WorkspaceID: "ws_example",
 				State: tc.stored, PoolID: "pool_example", RunnerID: "runner_example",
@@ -949,7 +949,7 @@ func TestReconcileRunnerMatrix(t *testing.T) {
 				snap.Sessions = []control.RunnerSession{*tc.reported}
 			}
 
-			got, err := fx.service.ReconcileRunner(ctx, snap)
+			got, err := fx.service.ReconcileRunner(fleetCtx, snap)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -966,7 +966,7 @@ func TestReconcileRunnerMatrix(t *testing.T) {
 			} else if len(got.Destroy) != 0 {
 				t.Fatalf("destroy = %v, want empty", got.Destroy)
 			}
-			row := getSessionState(t, fx, "ws_example", "sess_example")
+			row := fleetGetSessionState(t, fx, "ws_example", "sess_example")
 			if row.State != tc.want {
 				t.Fatalf("state = %q, want %q", row.State, tc.want)
 			}
@@ -988,7 +988,7 @@ func TestReconcileRunnerFencesLowerGeneration(t *testing.T) {
 		PoolID: "pool_example", RunnerID: "runner_example",
 	})
 
-	got, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+	got, err := fx.service.ReconcileRunner(fleetCtx, control.RunnerSnapshot{
 		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 		Generation: 7, CapacityTotal: 4,
 		Sessions: []control.RunnerSession{{SessionID: "sess_example", State: control.StateRunning}},
@@ -1014,7 +1014,7 @@ func TestReconcileRunnerNewerGenerationUpsertsThenReconciles(t *testing.T) {
 		PoolID: "pool_example", RunnerID: "runner_example",
 	})
 
-	got, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+	got, err := fx.service.ReconcileRunner(fleetCtx, control.RunnerSnapshot{
 		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 		Generation: 4, CapacityUsed: 2, CapacityTotal: 8,
 		Sessions: []control.RunnerSession{{SessionID: "sess_example", State: control.StateSuspendedWarm}},
@@ -1029,7 +1029,7 @@ func TestReconcileRunnerNewerGenerationUpsertsThenReconciles(t *testing.T) {
 	if stored.Generation != 4 || stored.CapacityTotal != 8 || stored.CapacityUsed != 2 {
 		t.Fatalf("stored runner = %+v, want generation 4 capacity 2/8", stored)
 	}
-	row := getSessionState(t, fx, "ws_example", "sess_example")
+	row := fleetGetSessionState(t, fx, "ws_example", "sess_example")
 	if row.State != control.StateSuspendedWarm {
 		t.Fatalf("session = %q, want suspended_warm after adoption", row.State)
 	}
@@ -1038,8 +1038,8 @@ func TestReconcileRunnerNewerGenerationUpsertsThenReconciles(t *testing.T) {
 func TestReconcileRunnerOrphans(t *testing.T) {
 	t.Run("unknown announced session is destroyed", func(t *testing.T) {
 		fx := newFleetFixture(t)
-		fx.st.seedRunner(reconcileRunnerRow())
-		got, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+		fx.st.seedRunner(fleetReconcileRunnerRow())
+		got, err := fx.service.ReconcileRunner(fleetCtx, control.RunnerSnapshot{
 			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 			Generation: 1, CapacityTotal: 4,
 			Sessions: []control.RunnerSession{{SessionID: "sess_ghost", State: control.StateRunning}},
@@ -1054,8 +1054,8 @@ func TestReconcileRunnerOrphans(t *testing.T) {
 
 	t.Run("duplicate announced ids are ErrInvalid", func(t *testing.T) {
 		fx := newFleetFixture(t)
-		fx.st.seedRunner(reconcileRunnerRow())
-		_, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+		fx.st.seedRunner(fleetReconcileRunnerRow())
+		_, err := fx.service.ReconcileRunner(fleetCtx, control.RunnerSnapshot{
 			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 			Generation: 1, CapacityTotal: 4,
 			Sessions: []control.RunnerSession{
@@ -1073,12 +1073,12 @@ func TestReconcileRunnerOrphans(t *testing.T) {
 
 	t.Run("a session from another workspace is destroyed without mutation", func(t *testing.T) {
 		fx := newFleetFixture(t)
-		fx.st.seedRunner(reconcileRunnerRow())
+		fx.st.seedRunner(fleetReconcileRunnerRow())
 		fx.st.seedSession(control.Session{
 			ID: "sess_other", WorkspaceID: "ws_other", State: control.StateRunning,
 			PoolID: "pool_example", RunnerID: "runner_example",
 		})
-		got, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+		got, err := fx.service.ReconcileRunner(fleetCtx, control.RunnerSnapshot{
 			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 			Generation: 1, CapacityTotal: 4,
 			Sessions: []control.RunnerSession{{SessionID: "sess_other", State: control.StateRunning}},
@@ -1089,7 +1089,7 @@ func TestReconcileRunnerOrphans(t *testing.T) {
 		if len(got.Destroy) != 1 || got.Destroy[0] != "sess_other" {
 			t.Fatalf("destroy = %v, want [sess_other]", got.Destroy)
 		}
-		other := getSessionState(t, fx, "ws_other", "sess_other")
+		other := fleetGetSessionState(t, fx, "ws_other", "sess_other")
 		if other.State != control.StateRunning {
 			t.Fatalf("other workspace's session mutated to %q", other.State)
 		}
@@ -1097,12 +1097,12 @@ func TestReconcileRunnerOrphans(t *testing.T) {
 
 	t.Run("mismatched pool or runner is destroyed without mutation", func(t *testing.T) {
 		fx := newFleetFixture(t)
-		fx.st.seedRunner(reconcileRunnerRow())
+		fx.st.seedRunner(fleetReconcileRunnerRow())
 		fx.st.seedSession(control.Session{
 			ID: "sess_dup", WorkspaceID: "ws_example", State: control.StateRunning,
 			PoolID: "pool_other", RunnerID: "runner_other",
 		})
-		got, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+		got, err := fx.service.ReconcileRunner(fleetCtx, control.RunnerSnapshot{
 			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 			Generation: 1, CapacityTotal: 4,
 			Sessions: []control.RunnerSession{{SessionID: "sess_dup", State: control.StateRunning}},
@@ -1113,7 +1113,7 @@ func TestReconcileRunnerOrphans(t *testing.T) {
 		if len(got.Destroy) != 1 || got.Destroy[0] != "sess_dup" {
 			t.Fatalf("destroy = %v, want [sess_dup]", got.Destroy)
 		}
-		dup := getSessionState(t, fx, "ws_example", "sess_dup")
+		dup := fleetGetSessionState(t, fx, "ws_example", "sess_dup")
 		if dup.State != control.StateRunning || dup.RunnerID != "runner_other" {
 			t.Fatalf("mismatched session mutated to %q on %q", dup.State, dup.RunnerID)
 		}
@@ -1121,8 +1121,8 @@ func TestReconcileRunnerOrphans(t *testing.T) {
 
 	t.Run("destroy output is deterministic and sorted", func(t *testing.T) {
 		fx := newFleetFixture(t)
-		fx.st.seedRunner(reconcileRunnerRow())
-		got, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+		fx.st.seedRunner(fleetReconcileRunnerRow())
+		got, err := fx.service.ReconcileRunner(fleetCtx, control.RunnerSnapshot{
 			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 			Generation: 1, CapacityTotal: 4,
 			Sessions: []control.RunnerSession{
@@ -1141,7 +1141,7 @@ func TestReconcileRunnerOrphans(t *testing.T) {
 
 		// Idempotent: the same snapshot yields the same destroy list with no
 		// additional state mutation.
-		again, err := fx.service.ReconcileRunner(ctx, control.RunnerSnapshot{
+		again, err := fx.service.ReconcileRunner(fleetCtx, control.RunnerSnapshot{
 			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 			Generation: 1, CapacityTotal: 4,
 			Sessions: []control.RunnerSession{
@@ -1163,7 +1163,7 @@ func TestReconcileRunnerOrphans(t *testing.T) {
 // Task 3: stale-safe runner events
 // ---------------------------------------------------------------------------
 
-func eventRunner(gen uint64) control.Runner {
+func fleetEventRunner(gen uint64) control.Runner {
 	return control.Runner{ID: "runner_example", PoolID: "pool_example", Generation: gen, CapacityTotal: 4, Connected: true}
 }
 
@@ -1225,7 +1225,7 @@ func TestApplyRunnerEventLifecycle(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			fx := newFleetFixture(t)
-			fx.st.seedRunner(eventRunner(1))
+			fx.st.seedRunner(fleetEventRunner(1))
 			fx.st.seedSession(control.Session{
 				ID: "sess_example", WorkspaceID: "ws_example", State: tc.from,
 				PoolID: "pool_example", RunnerID: "runner_example",
@@ -1238,10 +1238,10 @@ func TestApplyRunnerEventLifecycle(t *testing.T) {
 			ev.Generation = 1
 			ev.SessionID = "sess_example"
 
-			if err := fx.service.ApplyRunnerEvent(ctx, ev); err != nil {
+			if err := fx.service.ApplyRunnerEvent(fleetCtx, ev); err != nil {
 				t.Fatal(err)
 			}
-			row := getSessionState(t, fx, "ws_example", "sess_example")
+			row := fleetGetSessionState(t, fx, "ws_example", "sess_example")
 			if row.State != tc.wantState {
 				t.Fatalf("state = %q, want %q", row.State, tc.wantState)
 			}
@@ -1284,7 +1284,7 @@ func TestApplyRunnerEventRejectsStale(t *testing.T) {
 			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_old",
 			Generation: 6, SessionID: "sess_example", State: control.StateRunning,
 		}
-		if err := fx.service.ApplyRunnerEvent(ctx, event); !errors.Is(err, control.ErrStale) {
+		if err := fx.service.ApplyRunnerEvent(fleetCtx, event); !errors.Is(err, control.ErrStale) {
 			t.Fatalf("got %v, want ErrStale", err)
 		}
 		if fx.st.transitionCalls != 0 || len(fx.events.recorded()) != 0 {
@@ -1316,13 +1316,13 @@ func TestApplyRunnerEventRejectsStale(t *testing.T) {
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
 			fx := newFleetFixture(t)
-			fx.st.seedRunner(eventRunner(1))
+			fx.st.seedRunner(fleetEventRunner(1))
 			mutate(fx)
 			event := control.RunnerEvent{
 				WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 				Generation: 1, SessionID: "sess_example", State: control.StateRunning,
 			}
-			if err := fx.service.ApplyRunnerEvent(ctx, event); !errors.Is(err, control.ErrStale) {
+			if err := fx.service.ApplyRunnerEvent(fleetCtx, event); !errors.Is(err, control.ErrStale) {
 				t.Fatalf("got %v, want ErrStale", err)
 			}
 			if fx.st.transitionCalls != 0 || len(fx.events.recorded()) != 0 {
@@ -1334,7 +1334,7 @@ func TestApplyRunnerEventRejectsStale(t *testing.T) {
 
 func TestApplyRunnerEventDuplicateTerminalIsSuccess(t *testing.T) {
 	fx := newFleetFixture(t)
-	fx.st.seedRunner(eventRunner(1))
+	fx.st.seedRunner(fleetEventRunner(1))
 	fx.st.seedSession(control.Session{
 		ID: "sess_example", WorkspaceID: "ws_example", State: control.StateRunning,
 		PoolID: "pool_example", RunnerID: "runner_example",
@@ -1343,10 +1343,10 @@ func TestApplyRunnerEventDuplicateTerminalIsSuccess(t *testing.T) {
 		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 		Generation: 1, SessionID: "sess_example", State: control.StateDead,
 	}
-	if err := fx.service.ApplyRunnerEvent(ctx, event); err != nil {
+	if err := fx.service.ApplyRunnerEvent(fleetCtx, event); err != nil {
 		t.Fatal(err)
 	}
-	if err := fx.service.ApplyRunnerEvent(ctx, event); err != nil {
+	if err := fx.service.ApplyRunnerEvent(fleetCtx, event); err != nil {
 		t.Fatalf("duplicate terminal event: got %v, want nil (idempotent success)", err)
 	}
 	if fx.st.transitionCalls != 1 {
@@ -1359,7 +1359,7 @@ func TestApplyRunnerEventDuplicateTerminalIsSuccess(t *testing.T) {
 
 func TestApplyRunnerEventInvalidInput(t *testing.T) {
 	fx := newFleetFixture(t)
-	fx.st.seedRunner(eventRunner(1))
+	fx.st.seedRunner(fleetEventRunner(1))
 	fx.st.seedSession(control.Session{
 		ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
 		PoolID: "pool_example", RunnerID: "runner_example",
@@ -1377,14 +1377,14 @@ func TestApplyRunnerEventInvalidInput(t *testing.T) {
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
 			fx := newFleetFixture(t)
-			fx.st.seedRunner(eventRunner(1))
+			fx.st.seedRunner(fleetEventRunner(1))
 			fx.st.seedSession(control.Session{
 				ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
 				PoolID: "pool_example", RunnerID: "runner_example",
 			})
 			e := base
 			mutate(&e)
-			if err := fx.service.ApplyRunnerEvent(ctx, e); !errors.Is(err, control.ErrInvalid) {
+			if err := fx.service.ApplyRunnerEvent(fleetCtx, e); !errors.Is(err, control.ErrInvalid) {
 				t.Fatalf("got %v, want ErrInvalid", err)
 			}
 			if fx.st.transitionCalls != 0 || len(fx.events.recorded()) != 0 {
@@ -1396,7 +1396,7 @@ func TestApplyRunnerEventInvalidInput(t *testing.T) {
 
 func TestApplyRunnerEventDetailNeverEntersEvent(t *testing.T) {
 	fx := newFleetFixture(t)
-	fx.st.seedRunner(eventRunner(1))
+	fx.st.seedRunner(fleetEventRunner(1))
 	fx.st.seedSession(control.Session{
 		ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
 		PoolID: "pool_example", RunnerID: "runner_example",
@@ -1406,10 +1406,10 @@ func TestApplyRunnerEventDetailNeverEntersEvent(t *testing.T) {
 		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 		Generation: 1, SessionID: "sess_example", State: control.StateFailed, Detail: detail,
 	}
-	if err := fx.service.ApplyRunnerEvent(ctx, event); err != nil {
+	if err := fx.service.ApplyRunnerEvent(fleetCtx, event); err != nil {
 		t.Fatal(err)
 	}
-	row := getSessionState(t, fx, "ws_example", "sess_example")
+	row := fleetGetSessionState(t, fx, "ws_example", "sess_example")
 	if row.Error != detail {
 		t.Fatalf("session error = %q, want the bounded detail in the row", row.Error)
 	}
