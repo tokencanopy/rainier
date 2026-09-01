@@ -247,3 +247,75 @@ func (s *AttachmentService) PushWorkspace(ctx context.Context, scope control.Sco
 	})
 	return nil
 }
+
+// PullWorkspace streams the gzipped tar archive of Path out of the session's
+// workspace into Body, one bounded chunk per RPC, counting the compressed
+// bytes as they arrive and refusing to write past workspace.MaxBytes.
+func (s *AttachmentService) PullWorkspace(ctx context.Context, scope control.Scope, cmd control.PullWorkspace) error {
+	if cmd.Body == nil {
+		return control.ErrInvalid
+	}
+	if err := workspace.ValidatePath(cmd.Path); err != nil {
+		return control.ErrInvalid
+	}
+	row, err := s.authorizedSession(ctx, scope, cmd.SessionID, control.ActionPull)
+	if err != nil {
+		return err
+	}
+	if row.State != control.StateRunning {
+		return control.ErrConflict
+	}
+	xfer, err := newTransferID()
+	if err != nil {
+		return control.ErrUnavailable
+	}
+
+	var total int64
+	for seq := 0; ; seq++ {
+		req := workspace.PullRequest{Xfer: xfer, Path: cmd.Path, Seq: seq}
+		var chunk workspace.PullChunk
+		if err := s.sessionRPC(ctx, row, workspace.MethodPullFiles, req, &chunk); err != nil {
+			return err
+		}
+		if chunk.Seq != req.Seq {
+			return control.ErrUnavailable
+		}
+		if len(chunk.Data) > workspace.ChunkBytes {
+			return control.ErrInvalid
+		}
+		if len(chunk.Data) == 0 && !chunk.Done {
+			return control.ErrUnavailable
+		}
+		if total+int64(len(chunk.Data)) > workspace.MaxBytes {
+			return control.ErrInvalid
+		}
+		if err := writeAll(cmd.Body, chunk.Data); err != nil {
+			return callerIOError(err)
+		}
+		total += int64(len(chunk.Data))
+		if chunk.Done {
+			break
+		}
+	}
+	s.record(ctx, scope, control.ActionPull, control.Resource{
+		Kind: control.ResourceSession, WorkspaceID: row.WorkspaceID,
+		ID: string(row.ID), CreatorID: row.CreatorID,
+	})
+	return nil
+}
+
+// writeAll writes data to w, looping around a permitted short write so it
+// makes progress; a zero-byte write with a nil error becomes io.ErrShortWrite.
+func writeAll(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		data = data[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}

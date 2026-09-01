@@ -3,9 +3,11 @@ package controlapp
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -512,6 +514,311 @@ func TestPushWorkspaceRecordsEventAfterFinalAck(t *testing.T) {
 		t.Fatalf("recorded %d events, want 1", len(evs))
 	}
 	if evs[0].Action != control.ActionPush || evs[0].Resource.ID != "sess_example" {
+		t.Fatalf("event = %+v", evs[0])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// pull
+// ---------------------------------------------------------------------------
+
+type recordingWriter struct {
+	mu       sync.Mutex
+	bytes    int
+	calls    int
+	err      error
+	shortMax int // 0 = full writes; >0 = at most this many bytes per call
+	zeroOnce bool
+}
+
+func (w *recordingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.calls++
+	if w.err != nil {
+		return 0, w.err
+	}
+	if w.zeroOnce {
+		w.zeroOnce = false
+		return 0, nil
+	}
+	n := len(p)
+	if w.shortMax > 0 && n > w.shortMax {
+		n = w.shortMax
+	}
+	w.bytes += n
+	return n, nil
+}
+
+func (w *recordingWriter) total() (bytes, calls int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.bytes, w.calls
+}
+
+// servePull serves the configured chunks by request sequence, ending the
+// transfer once the list is exhausted.
+func servePull(chunks []workspace.PullChunk) func(runner.ToRunner) runner.FromRunner {
+	var mu sync.Mutex
+	return func(m runner.ToRunner) runner.FromRunner {
+		var req workspace.PullRequest
+		_ = json.Unmarshal(m.RPC.Payload, &req)
+		mu.Lock()
+		defer mu.Unlock()
+		if req.Seq < len(chunks) {
+			return rpcOKReply(m.RPC.ID, chunks[req.Seq])
+		}
+		return rpcOKReply(m.RPC.ID, workspace.PullChunk{Seq: req.Seq, Done: true})
+	}
+}
+
+// pullBoundaryResponder serves full ChunkBytes chunks, ending after chunkCount
+// (0 means never ends), building each response around one pre-encoded base64
+// blob so the 256MiB boundary tests encode the payload only once.
+func pullBoundaryResponder(chunkCount int) func(runner.ToRunner) runner.FromRunner {
+	blob := bytes.Repeat([]byte("q"), workspace.ChunkBytes)
+	enc := base64.StdEncoding.EncodeToString(blob)
+	prefix := []byte(`{"seq":`)
+	dataField := []byte(`,"data":"` + enc + `","done":`)
+	doneTrue := []byte(`true}`)
+	doneFalse := []byte(`false}`)
+	return func(m runner.ToRunner) runner.FromRunner {
+		var req workspace.PullRequest
+		_ = json.Unmarshal(m.RPC.Payload, &req)
+		done := chunkCount > 0 && req.Seq == chunkCount-1
+		payload := append([]byte(nil), prefix...)
+		payload = strconv.AppendInt(payload, int64(req.Seq), 10)
+		payload = append(payload, dataField...)
+		if done {
+			payload = append(payload, doneTrue...)
+		} else {
+			payload = append(payload, doneFalse...)
+		}
+		return runner.FromRunner{Type: "session_req", Session: "sess_example",
+			RPC: &runner.RPCEnvelope{ID: m.RPC.ID, Method: "resp", OK: true, Payload: json.RawMessage(payload)}}
+	}
+}
+
+func pullTo(t *testing.T, fx *attachFixture, w *recordingWriter, path string) error {
+	t.Helper()
+	return fx.svc.PullWorkspace(context.Background(), testScope(), control.PullWorkspace{
+		SessionID: "sess_example", Path: path, Body: w,
+	})
+}
+
+func TestPullWorkspaceUnsafePath(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	err := fx.svc.PullWorkspace(context.Background(), testScope(), control.PullWorkspace{
+		SessionID: "sess_example", Path: "../etc", Body: &recordingWriter{},
+	})
+	if !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("got %v, want ErrInvalid", err)
+	}
+	if len(fx.transport.dispatched()) != 0 {
+		t.Fatal("unsafe path reached the runner")
+	}
+}
+
+func TestPullWorkspaceNilWriter(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	err := fx.svc.PullWorkspace(context.Background(), testScope(), control.PullWorkspace{
+		SessionID: "sess_example", Path: "src",
+	})
+	if !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("got %v, want ErrInvalid", err)
+	}
+}
+
+func TestPullWorkspaceEmptyFinalChunk(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.transport.replyFn = servePull([]workspace.PullChunk{{Seq: 0, Done: true}})
+	w := &recordingWriter{}
+	if err := pullTo(t, fx, w, "src"); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	if got, calls := w.total(); got != 0 || calls != 0 {
+		t.Fatalf("wrote %d bytes in %d calls, want 0/0", got, calls)
+	}
+	if got := len(fx.transport.dispatched()); got != 1 {
+		t.Fatalf("dispatched %d requests, want 1", got)
+	}
+}
+
+func TestPullWorkspaceOneChunk(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.transport.replyFn = servePull([]workspace.PullChunk{{Seq: 0, Data: []byte("hello"), Done: true}})
+	w := &recordingWriter{}
+	if err := pullTo(t, fx, w, "src"); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	if got, calls := w.total(); got != 5 || calls != 1 {
+		t.Fatalf("wrote %d bytes in %d calls, want 5/1", got, calls)
+	}
+}
+
+func TestPullWorkspaceMultipleChunks(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.transport.replyFn = servePull([]workspace.PullChunk{
+		{Seq: 0, Data: []byte("aaa"), Done: false},
+		{Seq: 1, Data: []byte("bbbb"), Done: true},
+	})
+	w := &recordingWriter{}
+	if err := pullTo(t, fx, w, "src"); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	if got, _ := w.total(); got != 7 {
+		t.Fatalf("wrote %d bytes, want 7", got)
+	}
+	if got := len(fx.transport.dispatched()); got != 2 {
+		t.Fatalf("dispatched %d requests, want 2", got)
+	}
+}
+
+func TestPullWorkspaceExactlyMaxBytes(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.transport.replyFn = pullBoundaryResponder(int(workspace.MaxBytes / workspace.ChunkBytes))
+	w := &recordingWriter{}
+	if err := pullTo(t, fx, w, "src"); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	if got, _ := w.total(); got != int(workspace.MaxBytes) {
+		t.Fatalf("wrote %d bytes, want %d", got, workspace.MaxBytes)
+	}
+	if got := len(fx.transport.dispatched()); got != int(workspace.MaxBytes/workspace.ChunkBytes) {
+		t.Fatalf("dispatched %d requests, want %d", got, workspace.MaxBytes/workspace.ChunkBytes)
+	}
+}
+
+func TestPullWorkspaceOverflow(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.transport.replyFn = pullBoundaryResponder(0) // never done
+	w := &recordingWriter{}
+	err := pullTo(t, fx, w, "src")
+	if !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("got %v, want ErrInvalid", err)
+	}
+	// The module refuses the chunk that would exceed the cap before writing it:
+	// exactly the cap's worth of bytes landed, and one extra request was made.
+	if got, _ := w.total(); got != int(workspace.MaxBytes) {
+		t.Fatalf("wrote %d bytes, want %d", got, workspace.MaxBytes)
+	}
+	if got := len(fx.transport.dispatched()); got != int(workspace.MaxBytes/workspace.ChunkBytes)+1 {
+		t.Fatalf("dispatched %d requests, want %d", got, workspace.MaxBytes/workspace.ChunkBytes+1)
+	}
+}
+
+func TestPullWorkspaceWrongSequence(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.transport.replyFn = func(m runner.ToRunner) runner.FromRunner {
+		var req workspace.PullRequest
+		_ = json.Unmarshal(m.RPC.Payload, &req)
+		return rpcOKReply(m.RPC.ID, workspace.PullChunk{Seq: req.Seq + 1, Data: []byte("x"), Done: true})
+	}
+	err := pullTo(t, fx, &recordingWriter{}, "src")
+	if !errors.Is(err, control.ErrUnavailable) {
+		t.Fatalf("got %v, want ErrUnavailable", err)
+	}
+}
+
+func TestPullWorkspaceOversizedChunk(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.transport.replyFn = servePull([]workspace.PullChunk{
+		{Seq: 0, Data: make([]byte, workspace.ChunkBytes+1), Done: true},
+	})
+	err := pullTo(t, fx, &recordingWriter{}, "src")
+	if !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("got %v, want ErrInvalid", err)
+	}
+}
+
+func TestPullWorkspaceEmptyNonFinalChunk(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.transport.replyFn = func(m runner.ToRunner) runner.FromRunner {
+		var req workspace.PullRequest
+		_ = json.Unmarshal(m.RPC.Payload, &req)
+		return rpcOKReply(m.RPC.ID, workspace.PullChunk{Seq: req.Seq, Done: false})
+	}
+	err := pullTo(t, fx, &recordingWriter{}, "src")
+	if !errors.Is(err, control.ErrUnavailable) {
+		t.Fatalf("got %v, want ErrUnavailable", err)
+	}
+}
+
+func TestPullWorkspaceWriterShortWrite(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.transport.replyFn = servePull([]workspace.PullChunk{{Seq: 0, Data: []byte("hello"), Done: true}})
+	w := &recordingWriter{shortMax: 1}
+	if err := pullTo(t, fx, w, "src"); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	if got, calls := w.total(); got != 5 || calls != 5 {
+		t.Fatalf("wrote %d bytes in %d calls, want 5/5", got, calls)
+	}
+}
+
+func TestPullWorkspaceWriterError(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.transport.replyFn = servePull([]workspace.PullChunk{{Seq: 0, Data: []byte("hello"), Done: true}})
+	w := &recordingWriter{err: errors.New("synthetic writer failure")}
+	err := pullTo(t, fx, w, "src")
+	if !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("got %v, want ErrInvalid", err)
+	}
+}
+
+func TestPullWorkspaceZeroWriteShortWrite(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.transport.replyFn = servePull([]workspace.PullChunk{{Seq: 0, Data: []byte("hello"), Done: true}})
+	w := &recordingWriter{zeroOnce: true}
+	err := pullTo(t, fx, w, "src")
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("got %v, want io.ErrShortWrite", err)
+	}
+}
+
+func TestPullWorkspaceDuplicateFinalResponse(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	// Always answer done: a second request would be a duplicate final chunk.
+	fx.transport.replyFn = func(m runner.ToRunner) runner.FromRunner {
+		var req workspace.PullRequest
+		_ = json.Unmarshal(m.RPC.Payload, &req)
+		return rpcOKReply(m.RPC.ID, workspace.PullChunk{Seq: req.Seq, Data: []byte("x"), Done: true})
+	}
+	w := &recordingWriter{}
+	if err := pullTo(t, fx, w, "src"); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	if got := len(fx.transport.dispatched()); got != 1 {
+		t.Fatalf("dispatched %d requests, want 1 (no extra RPC after done)", got)
+	}
+	if got, _ := w.total(); got != 1 {
+		t.Fatalf("wrote %d bytes, want 1", got)
+	}
+}
+
+func TestPullWorkspaceContextCancellation(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := fx.svc.PullWorkspace(ctx, testScope(), control.PullWorkspace{
+		SessionID: "sess_example", Path: "src", Body: &recordingWriter{},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+}
+
+func TestPullWorkspaceRecordsEvent(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.transport.replyFn = servePull([]workspace.PullChunk{{Seq: 0, Data: []byte("x"), Done: true}})
+	if err := pullTo(t, fx, &recordingWriter{}, "src"); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+	evs := fx.events.snapshot()
+	if len(evs) != 1 {
+		t.Fatalf("recorded %d events, want 1", len(evs))
+	}
+	if evs[0].Action != control.ActionPull || evs[0].Resource.ID != "sess_example" {
 		t.Fatalf("event = %+v", evs[0])
 	}
 }
