@@ -45,6 +45,12 @@ type fleetFakeStore struct {
 	listRunnersErr error
 	getSessionErr  error
 	transitionErr  error
+
+	// staleBump simulates a concurrent higher-generation write landing
+	// between a pre-read and an upsert: when upsertErr is ErrStale and
+	// staleBump is non-zero, the runner's stored generation is advanced to
+	// staleBump before the stale refusal is returned.
+	staleBump uint64
 }
 
 func newFleetFakeStore() *fleetFakeStore {
@@ -189,6 +195,14 @@ func (st *fleetFakeStore) upsertRunner(pool control.PoolID, r control.Runner) er
 	defer st.mu.Unlock()
 	st.upsertCalls++
 	if st.upsertErr != nil {
+		if errors.Is(st.upsertErr, control.ErrStale) && st.staleBump > 0 {
+			if m := st.runners[pool]; m != nil {
+				if cur, ok := m[r.ID]; ok {
+					cur.Generation = st.staleBump
+					m[r.ID] = cur
+				}
+			}
+		}
 		return st.upsertErr
 	}
 	m := st.runners[pool]
@@ -762,6 +776,38 @@ func TestRegisterRunnerAdapterStale(t *testing.T) {
 	}
 	if got.Accepted {
 		t.Fatalf("result = %+v, want refused", got)
+	}
+	if fx.st.upsertCalls != 1 {
+		t.Fatalf("upsertCalls = %d, want 1 attempt", fx.st.upsertCalls)
+	}
+	if len(fleetWakePools(fx.service)) != 0 {
+		t.Fatal("refused registration woke the pool")
+	}
+}
+
+func TestRegisterRunnerAdapterStaleReportsAuthoritativeGeneration(t *testing.T) {
+	fx := newFleetFixture(t)
+	// A concurrent write advances the store between the service's pre-read and
+	// its upsert; the adapter reports ErrStale and the service must re-read and
+	// return the store-authoritative generation, never the caller's own.
+	fx.st.seedRunner(control.Runner{
+		ID: "runner_example", PoolID: "pool_example", Generation: 1,
+		CapacityTotal: 4, Connected: true,
+	})
+	fx.st.upsertErr = control.ErrStale
+	fx.st.staleBump = 9
+	got, err := fx.service.RegisterRunner(fleetCtx, control.RunnerRegistration{
+		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+		Generation: 1, CapacityTotal: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Accepted {
+		t.Fatalf("result = %+v, want refused", got)
+	}
+	if got.Generation != 9 {
+		t.Fatalf("generation = %d, want the authoritative 9", got.Generation)
 	}
 	if fx.st.upsertCalls != 1 {
 		t.Fatalf("upsertCalls = %d, want 1 attempt", fx.st.upsertCalls)

@@ -167,14 +167,34 @@ func (s *FleetService) RegisterRunner(ctx context.Context, r control.RunnerRegis
 	}
 	if err := s.fleet.UpsertRunner(ctx, r.PoolID, runner); err != nil {
 		if errors.Is(err, control.ErrStale) {
-			// A concurrent higher-generation write won the race; refuse this
-			// claim without disturbing it.
-			return control.RunnerRegistrationResult{Accepted: false, Generation: r.Generation}, nil
+			// A concurrent higher-generation write won the race; re-read and
+			// report the store-authoritative generation, never the caller's.
+			gen, rerr := s.authoritativeGeneration(ctx, r.PoolID, r.RunnerID)
+			if rerr != nil {
+				return control.RunnerRegistrationResult{}, rerr
+			}
+			return control.RunnerRegistrationResult{Accepted: false, Generation: gen}, nil
 		}
 		return control.RunnerRegistrationResult{}, err
 	}
 	s.Wake(r.PoolID)
 	return control.RunnerRegistrationResult{Accepted: true, Generation: r.Generation}, nil
+}
+
+// authoritativeGeneration re-reads a runner's current store generation. It
+// returns 0 when the runner no longer exists, because there is then no
+// authoritative generation to fence against.
+func (s *FleetService) authoritativeGeneration(ctx context.Context, pool control.PoolID, id control.RunnerID) (uint64, error) {
+	runners, err := s.fleet.ListRunners(ctx, pool)
+	if err != nil {
+		return 0, err
+	}
+	for _, existing := range runners {
+		if existing.ID == id {
+			return existing.Generation, nil
+		}
+	}
+	return 0, nil
 }
 
 // validateRegistration rejects a malformed or contradictory claim before any
