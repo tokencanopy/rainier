@@ -74,7 +74,7 @@ func (s *FleetService) drainPool(ctx context.Context, pool control.PoolID) {
 	if err != nil {
 		return
 	}
-	envs := map[control.EnvironmentID]*control.Environment{}
+	envs := map[queuedEnvKey]*control.Environment{}
 	for _, row := range rows {
 		views, err := s.freeCapacity(ctx, pool)
 		if err != nil {
@@ -179,26 +179,61 @@ func hasAllCapabilities(caps, reqs []string) bool {
 	return true
 }
 
+// queuedEnvKey is the composite identity of a queued session's environment.
+// Environments are workspace-scoped, so a bare EnvironmentID is not enough to
+// cache them safely across workspaces sharing one ID.
+type queuedEnvKey struct {
+	ws control.WorkspaceID
+	id control.EnvironmentID
+}
+
 // queuedEnvironment returns the environment row came from, memoized per pass.
 // A scratch session, or one whose environment is gone, resolves to nil. The
-// bool reports whether the lookup could be made at all.
-func (s *FleetService) queuedEnvironment(ctx context.Context, cache map[control.EnvironmentID]*control.Environment, row control.Session) (*control.Environment, bool) {
+// bool reports whether the lookup could be made at all. The returned
+// environment is a deep copy so neither the cache nor the caller aliases the
+// store's backing arrays.
+func (s *FleetService) queuedEnvironment(ctx context.Context, cache map[queuedEnvKey]*control.Environment, row control.Session) (*control.Environment, bool) {
 	if row.EnvironmentID == "" {
 		return nil, true
 	}
-	if env, seen := cache[row.EnvironmentID]; seen {
+	key := queuedEnvKey{ws: row.WorkspaceID, id: row.EnvironmentID}
+	if env, seen := cache[key]; seen {
 		return env, true
 	}
 	env, err := s.environments.GetEnvironment(ctx, row.WorkspaceID, row.EnvironmentID)
 	switch {
 	case errors.Is(err, control.ErrNotFound):
-		cache[row.EnvironmentID] = nil
+		cache[key] = nil
 		return nil, true
 	case err != nil:
 		return nil, false
 	}
-	cache[row.EnvironmentID] = &env
+	env = cloneEnvironment(env)
+	cache[key] = &env
 	return &env, true
+}
+
+// cloneEnvironment deep-copies every collection of an environment so the
+// cache and the resolver each hold their own arrays.
+func cloneEnvironment(e control.Environment) control.Environment {
+	e.EgressAllow = slices.Clone(e.EgressAllow)
+	e.SecretRefs = slices.Clone(e.SecretRefs)
+	e.Connectors = slices.Clone(e.Connectors)
+	for i := range e.Connectors {
+		e.Connectors[i].Raw = slices.Clone(e.Connectors[i].Raw)
+	}
+	e.Requirements.Capabilities = slices.Clone(e.Requirements.Capabilities)
+	e.Snapshot.Capabilities = slices.Clone(e.Snapshot.Capabilities)
+	return e
+}
+
+// cloneSession deep-copies the collections of a session so an adapter that
+// receives it cannot alias the store's backing arrays.
+func cloneSession(s control.Session) control.Session {
+	s.Spec.Cmd = slices.Clone(s.Spec.Cmd)
+	s.Spec.EgressAllow = slices.Clone(s.Spec.EgressAllow)
+	s.Spec.Repos = slices.Clone(s.Spec.Repos)
+	return s
 }
 
 // dispatchCreate builds the create spec, pins setup provenance, dispatches,
@@ -247,6 +282,8 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 		EgressAllow: slices.Clone(row.Spec.EgressAllow),
 	}
 	if env != nil {
+		cloned := cloneEnvironment(*env)
+		env = &cloned
 		if env.Snapshot.Ref != "" && env.SnapshotHash == env.SetupHash {
 			spec.Image = env.Snapshot.Ref
 		} else {
@@ -256,7 +293,7 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 		spec.Init = env.Init
 		spec.InitTimeoutSec = env.InitTimeoutSec
 	}
-	material, err := s.launchMaterial.ResolveLaunchMaterial(ctx, row, env)
+	material, err := s.launchMaterial.ResolveLaunchMaterial(ctx, cloneSession(row), env)
 	if err != nil {
 		return nil, "could not resolve launch material"
 	}

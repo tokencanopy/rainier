@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -477,5 +478,164 @@ func TestWakeNeverBlocks(t *testing.T) {
 	known := fx.service.knownPools()
 	if len(known) != 64 {
 		t.Fatalf("knownPools has %d pools, want 64", len(known))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// queued-environment cache keying and deep copies
+// ---------------------------------------------------------------------------
+
+// fleetEnvRecordingResolver records the environment each session was resolved
+// with and returns material carrying that environment's workspace and image,
+// so a test can prove a session received only its own environment.
+type fleetEnvRecordingResolver struct {
+	mu   sync.Mutex
+	seen map[control.SessionID]control.Environment
+}
+
+func (r *fleetEnvRecordingResolver) ResolveLaunchMaterial(_ context.Context, row control.Session, env *control.Environment) (LaunchMaterial, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.seen == nil {
+		r.seen = map[control.SessionID]control.Environment{}
+	}
+	if env == nil {
+		return LaunchMaterial{Environment: map[string]string{}}, nil
+	}
+	r.seen[row.ID] = control.Environment{ID: env.ID, WorkspaceID: env.WorkspaceID, Image: env.Image}
+	return LaunchMaterial{Environment: map[string]string{
+		"WS":  string(env.WorkspaceID),
+		"IMG": env.Image,
+	}}, nil
+}
+
+func (r *fleetEnvRecordingResolver) environmentFor(id control.SessionID) control.Environment {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.seen[id]
+}
+
+// fleetMutatingResolver mutates every collection of the environment it
+// receives; the scheduler must hand it a copy so nothing else is corrupted.
+type fleetMutatingResolver struct{}
+
+func (fleetMutatingResolver) ResolveLaunchMaterial(_ context.Context, _ control.Session, env *control.Environment) (LaunchMaterial, error) {
+	if env == nil {
+		return LaunchMaterial{}, nil
+	}
+	if len(env.EgressAllow) > 0 {
+		env.EgressAllow[0] = "MUTATED"
+	}
+	if len(env.SecretRefs) > 0 {
+		env.SecretRefs[0] = "MUTATED"
+	}
+	if len(env.Requirements.Capabilities) > 0 {
+		env.Requirements.Capabilities[0] = "MUTATED"
+	}
+	return LaunchMaterial{}, nil
+}
+
+func TestQueuedEnvironmentCacheIsWorkspaceScoped(t *testing.T) {
+	// Two workspaces share one EnvironmentID inside one pool. The cache must
+	// key by (WorkspaceID, EnvironmentID): each session resolves only its own
+	// environment and its own launch material.
+	resolver := &fleetEnvRecordingResolver{}
+	fx := newFleetFixtureWithResolver(t, resolver)
+	fx.st.seedRunner(fleetSeededRunner("vm1", 4, 0, true))
+	fx.st.seedEnv(control.Environment{ID: "env_shared", WorkspaceID: "ws_a", Name: "a", Image: "img:a"})
+	fx.st.seedEnv(control.Environment{ID: "env_shared", WorkspaceID: "ws_b", Name: "b", Image: "img:b"})
+	fx.st.seedSession(control.Session{
+		ID: "sess_a", WorkspaceID: "ws_a", State: control.StateQueued,
+		PoolID: "pool_example", EnvironmentID: "env_shared",
+		Spec:      control.PortableSpec{Image: "img:a"},
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+	})
+	fx.st.seedSession(control.Session{
+		ID: "sess_b", WorkspaceID: "ws_b", State: control.StateQueued,
+		PoolID: "pool_example", EnvironmentID: "env_shared",
+		Spec:      control.PortableSpec{Image: "img:b"},
+		CreatedAt: time.Now().Add(-time.Hour),
+	})
+
+	fleetRunFixture(t, fx)
+	fx.service.Wake("pool_example")
+
+	fleetEventually(t, 2*time.Second, func() error {
+		if n := len(fx.transport.dispatchedCommands()); n != 2 {
+			return fmt.Errorf("dispatched %d commands, want 2", n)
+		}
+		return nil
+	})
+
+	bySession := map[string]runner.ToRunner{}
+	for _, c := range fx.transport.dispatchedCommands() {
+		bySession[c.Session] = c
+	}
+	a, ok := bySession["sess_a"]
+	if !ok {
+		t.Fatal("sess_a was not dispatched")
+	}
+	if a.Spec == nil || a.Spec.Env["WS"] != "ws_a" || a.Spec.Env["IMG"] != "img:a" {
+		t.Fatalf("sess_a resolved %+v, want ws_a/img:a", a.Spec)
+	}
+	b, ok := bySession["sess_b"]
+	if !ok {
+		t.Fatal("sess_b was not dispatched")
+	}
+	if b.Spec == nil || b.Spec.Env["WS"] != "ws_b" || b.Spec.Env["IMG"] != "img:b" {
+		t.Fatalf("sess_b resolved %+v, want ws_b/img:b", b.Spec)
+	}
+	if got := resolver.environmentFor("sess_a"); got.WorkspaceID != "ws_a" || got.Image != "img:a" {
+		t.Fatalf("resolver saw %+v for sess_a, want ws_a/img:a", got)
+	}
+	if got := resolver.environmentFor("sess_b"); got.WorkspaceID != "ws_b" || got.Image != "img:b" {
+		t.Fatalf("resolver saw %+v for sess_b, want ws_b/img:b", got)
+	}
+}
+
+func TestQueuedEnvironmentDeepCopiesBeforeResolver(t *testing.T) {
+	// A resolver that mutates the environment it receives must not corrupt the
+	// store's copy: the scheduler deep-copies before caching and before
+	// handing data to LaunchMaterialResolver.
+	fx := newFleetFixtureWithResolver(t, fleetMutatingResolver{})
+	fx.st.seedRunner(control.Runner{
+		ID: "vm1", PoolID: "pool_example", CapacityTotal: 4, Connected: true,
+		Generation: 1, Capabilities: []string{"gpu"},
+	})
+	fx.st.seedEnv(control.Environment{
+		ID: "env_shared", WorkspaceID: "ws_a", Name: "a", Image: "img:a",
+		EgressAllow:  []string{"h1", "h2"},
+		SecretRefs:   []string{"s1"},
+		Requirements: control.Requirements{Capabilities: []string{"gpu"}},
+	})
+	fx.st.seedSession(control.Session{
+		ID: "sess_a", WorkspaceID: "ws_a", State: control.StateQueued,
+		PoolID: "pool_example", EnvironmentID: "env_shared",
+		Spec:      control.PortableSpec{Image: "img:a"},
+		CreatedAt: time.Now().Add(-time.Hour),
+	})
+
+	fleetRunFixture(t, fx)
+	fx.service.Wake("pool_example")
+
+	fleetEventually(t, 2*time.Second, func() error {
+		if n := len(fx.transport.dispatchedCommands()); n != 1 {
+			return fmt.Errorf("dispatched %d commands, want 1", n)
+		}
+		return nil
+	})
+
+	stored, err := fx.st.getEnv("ws_a", "env_shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(stored.EgressAllow, []string{"h1", "h2"}) {
+		t.Fatalf("stored egress = %v, want [h1 h2]", stored.EgressAllow)
+	}
+	if !slices.Equal(stored.SecretRefs, []string{"s1"}) {
+		t.Fatalf("stored secret refs = %v, want [s1]", stored.SecretRefs)
+	}
+	if !slices.Equal(stored.Requirements.Capabilities, []string{"gpu"}) {
+		t.Fatalf("stored capabilities = %v, want [gpu]", stored.Requirements.Capabilities)
 	}
 }
