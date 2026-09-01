@@ -10,6 +10,7 @@ import (
 	"slices"
 
 	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // SessionOptions carries the host-supplied dependencies of SessionService.
@@ -25,6 +26,8 @@ type SessionOptions struct {
 	Clock        control.Clock
 	IDs          control.IDGenerator
 	Wake         func(control.PoolID)
+	Fleet        control.FleetRepository
+	Transport    control.RunnerTransport
 }
 
 // SessionService owns session creation, authorization, lifecycle dispatch, and
@@ -39,13 +42,16 @@ type SessionService struct {
 	clock        control.Clock
 	ids          control.IDGenerator
 	wake         func(control.PoolID)
+	fleet        control.FleetRepository
+	transport    control.RunnerTransport
 }
 
 // NewSessionService validates that every dependency is present and returns a
 // SessionService with private fields only.
 func NewSessionService(o SessionOptions) (*SessionService, error) {
 	if o.Authorizer == nil || o.Sessions == nil || o.Environments == nil ||
-		o.Pools == nil || o.Events == nil || o.Clock == nil || o.IDs == nil || o.Wake == nil {
+		o.Pools == nil || o.Events == nil || o.Clock == nil || o.IDs == nil || o.Wake == nil ||
+		o.Fleet == nil || o.Transport == nil {
 		return nil, control.ErrInvalid
 	}
 	return &SessionService{
@@ -57,6 +63,8 @@ func NewSessionService(o SessionOptions) (*SessionService, error) {
 		clock:        o.Clock,
 		ids:          o.IDs,
 		wake:         o.Wake,
+		fleet:        o.Fleet,
+		transport:    o.Transport,
 	}, nil
 }
 
@@ -316,4 +324,258 @@ func cloneRepos(in []control.RepoRef) []control.RepoRef {
 		return nil
 	}
 	return slices.Clone(in)
+}
+
+// dispatch sends msg to the runner that holds row, mapping an absent pool,
+// absent runner, missing connection, transport failure, or a false runner
+// result to the closed ErrUnavailable sentinel. The runner's own detail text
+// never leaves this method.
+func (s *SessionService) dispatch(ctx context.Context, row control.Session, msg runner.ToRunner) (runner.FromRunner, error) {
+	if row.PoolID == "" || row.RunnerID == "" || !s.transport.Connected(row.PoolID, row.RunnerID) {
+		return runner.FromRunner{}, control.ErrUnavailable
+	}
+	res, err := s.transport.Dispatch(ctx, row.PoolID, row.RunnerID, msg)
+	if err != nil {
+		return runner.FromRunner{}, control.ErrUnavailable
+	}
+	if !res.OK {
+		return runner.FromRunner{}, control.ErrUnavailable
+	}
+	return res, nil
+}
+
+// authoritative re-reads a row after a runner side effect so callers return
+// persisted state rather than a struct the service hoped to commit.
+func (s *SessionService) authoritative(ctx context.Context, ws control.WorkspaceID, id control.SessionID) (control.Session, error) {
+	row, err := s.sessions.GetSession(ctx, ws, id)
+	if err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			return control.Session{}, control.ErrNotFound
+		}
+		return control.Session{}, control.ErrUnavailable
+	}
+	return cloneSession(row), nil
+}
+
+// reclaimWorkspace tells the runner holding row to remove its workspace volume
+// after an explicit deletion. It is fire-and-forget cleanup: an absent volume
+// is a success, and a reclaim failure never converts an already-successful
+// destroy into an error.
+func (s *SessionService) reclaimWorkspace(ctx context.Context, row control.Session) {
+	if row.PoolID == "" || row.RunnerID == "" || !s.transport.Connected(row.PoolID, row.RunnerID) {
+		return
+	}
+	_, _ = s.transport.Dispatch(ctx, row.PoolID, row.RunnerID, runner.ToRunner{Type: "remove_workspace", Session: string(row.ID)})
+}
+
+// DeleteSession applies the guarded delete state machine: queued cancels
+// outright, creating is refused, a placed session is destroyed on its runner
+// then destroyed in the store, a failed session is destroyed the same way, and
+// any other terminal state is row-idempotent. Every success wakes the row's
+// pool.
+func (s *SessionService) DeleteSession(ctx context.Context, scope control.Scope, cmd control.DeleteSession) error {
+	if err := scope.Validate(); err != nil {
+		return control.ErrInvalid
+	}
+	row, err := s.sessions.GetSession(ctx, scope.WorkspaceID, cmd.ID)
+	if err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			return control.ErrNotFound
+		}
+		return control.ErrUnavailable
+	}
+	if err := s.auth.Authorize(ctx, scope, control.ActionDelete, sessionResource(row)); err != nil {
+		return control.ErrDenied
+	}
+
+	switch {
+	case row.State.Terminal() && row.State != control.StateFailed:
+		s.reclaimWorkspace(ctx, row)
+		s.wake(row.PoolID)
+		return nil
+	case row.State == control.StateCreating:
+		return control.ErrConflict
+	case row.State == control.StateQueued:
+		if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, []control.SessionState{control.StateQueued}, control.StateCanceled, control.TransitionOpts{}); err != nil {
+			if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
+				return control.ErrUnavailable
+			}
+			s.wake(row.PoolID)
+			return nil
+		}
+		if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionDelete, sessionResource(row)); err != nil {
+			return err
+		}
+		s.wake(row.PoolID)
+		return nil
+	}
+
+	if _, err := s.dispatch(ctx, row, runner.ToRunner{Type: "destroy", Session: string(row.ID)}); err != nil {
+		return control.ErrUnavailable
+	}
+	s.reclaimWorkspace(ctx, row)
+	from := control.NonTerminal
+	if row.State == control.StateFailed {
+		from = []control.SessionState{control.StateFailed}
+	}
+	if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, from, control.StateDestroyed, control.TransitionOpts{}); err != nil {
+		if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
+			return control.ErrUnavailable
+		}
+		s.wake(row.PoolID)
+		return nil
+	}
+	if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionDelete, sessionResource(row)); err != nil {
+		return err
+	}
+	s.wake(row.PoolID)
+	return nil
+}
+
+// SuspendSession accepts only a running session, dispatches suspend before the
+// guarded transition to warm/cold, records the event, and returns the
+// authoritative persisted row.
+func (s *SessionService) SuspendSession(ctx context.Context, scope control.Scope, cmd control.SuspendSession) (control.Session, error) {
+	if err := scope.Validate(); err != nil {
+		return control.Session{}, control.ErrInvalid
+	}
+	row, err := s.sessions.GetSession(ctx, scope.WorkspaceID, cmd.ID)
+	if err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			return control.Session{}, control.ErrNotFound
+		}
+		return control.Session{}, control.ErrUnavailable
+	}
+	if err := s.auth.Authorize(ctx, scope, control.ActionSuspend, sessionResource(row)); err != nil {
+		return control.Session{}, control.ErrDenied
+	}
+	if row.State != control.StateRunning {
+		return control.Session{}, control.ErrConflict
+	}
+
+	if _, err := s.dispatch(ctx, row, runner.ToRunner{Type: "suspend", Session: string(row.ID), Warm: cmd.Warm}); err != nil {
+		return control.Session{}, control.ErrUnavailable
+	}
+
+	to := control.StateSuspendedWarm
+	if !cmd.Warm {
+		to = control.StateSuspendedCold
+	}
+	if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, []control.SessionState{control.StateRunning}, to, control.TransitionOpts{}); err != nil {
+		if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
+			return control.Session{}, control.ErrUnavailable
+		}
+		s.wake(row.PoolID)
+		return s.authoritative(ctx, scope.WorkspaceID, cmd.ID)
+	}
+	if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionSuspend, sessionResource(row)); err != nil {
+		return control.Session{}, err
+	}
+	s.wake(row.PoolID)
+	return s.authoritative(ctx, scope.WorkspaceID, cmd.ID)
+}
+
+// ResumeSession accepts only a warm/cold suspended session. A cold resume must
+// fit on the runner already holding the volume; dispatch precedes the guarded
+// transition back to running.
+func (s *SessionService) ResumeSession(ctx context.Context, scope control.Scope, cmd control.ResumeSession) (control.Session, error) {
+	if err := scope.Validate(); err != nil {
+		return control.Session{}, control.ErrInvalid
+	}
+	row, err := s.sessions.GetSession(ctx, scope.WorkspaceID, cmd.ID)
+	if err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			return control.Session{}, control.ErrNotFound
+		}
+		return control.Session{}, control.ErrUnavailable
+	}
+	if err := s.auth.Authorize(ctx, scope, control.ActionResume, sessionResource(row)); err != nil {
+		return control.Session{}, control.ErrDenied
+	}
+	if row.State != control.StateSuspendedWarm && row.State != control.StateSuspendedCold {
+		return control.Session{}, control.ErrConflict
+	}
+
+	if row.State == control.StateSuspendedCold {
+		free, err := s.coldResumeFree(ctx, row)
+		if err != nil {
+			return control.Session{}, control.ErrUnavailable
+		}
+		if free <= 0 {
+			return control.Session{}, control.ErrConflict
+		}
+	}
+
+	if _, err := s.dispatch(ctx, row, runner.ToRunner{Type: "resume", Session: string(row.ID)}); err != nil {
+		return control.Session{}, control.ErrUnavailable
+	}
+	if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, []control.SessionState{row.State}, control.StateRunning, control.TransitionOpts{}); err != nil {
+		if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
+			return control.Session{}, control.ErrUnavailable
+		}
+		s.wake(row.PoolID)
+		return s.authoritative(ctx, scope.WorkspaceID, cmd.ID)
+	}
+	if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionResume, sessionResource(row)); err != nil {
+		return control.Session{}, err
+	}
+	s.wake(row.PoolID)
+	return s.authoritative(ctx, scope.WorkspaceID, cmd.ID)
+}
+
+// coldResumeFree computes free capacity on the runner already holding a cold
+// session's volume: CapacityTotal - CapacityUsed - len(creating). A runner the
+// pool no longer lists yields zero (no slot).
+func (s *SessionService) coldResumeFree(ctx context.Context, row control.Session) (int, error) {
+	runners, err := s.fleet.ListRunners(ctx, row.PoolID)
+	if err != nil {
+		return 0, err
+	}
+	for _, r := range runners {
+		if r.ID != row.RunnerID {
+			continue
+		}
+		creating, err := s.fleet.SessionsOnRunner(ctx, row.PoolID, row.RunnerID, []control.SessionState{control.StateCreating})
+		if err != nil {
+			return 0, err
+		}
+		return r.CapacityTotal - r.CapacityUsed - len(creating), nil
+	}
+	return 0, nil
+}
+
+// SnapshotSession allows snapshots only from running, warm-suspended, or
+// cold-suspended sessions and returns a portable checkpoint. The opaque
+// reference never enters a returned error or an event fact.
+func (s *SessionService) SnapshotSession(ctx context.Context, scope control.Scope, cmd control.SnapshotSession) (control.Checkpoint, error) {
+	if err := scope.Validate(); err != nil {
+		return control.Checkpoint{}, control.ErrInvalid
+	}
+	row, err := s.sessions.GetSession(ctx, scope.WorkspaceID, cmd.ID)
+	if err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			return control.Checkpoint{}, control.ErrNotFound
+		}
+		return control.Checkpoint{}, control.ErrUnavailable
+	}
+	if err := s.auth.Authorize(ctx, scope, control.ActionSnapshot, sessionResource(row)); err != nil {
+		return control.Checkpoint{}, control.ErrDenied
+	}
+	switch row.State {
+	case control.StateRunning, control.StateSuspendedWarm, control.StateSuspendedCold:
+	default:
+		return control.Checkpoint{}, control.ErrConflict
+	}
+
+	res, err := s.dispatch(ctx, row, runner.ToRunner{Type: "snapshot", Session: string(row.ID)})
+	if err != nil {
+		return control.Checkpoint{}, control.ErrUnavailable
+	}
+	if res.Detail == "" {
+		return control.Checkpoint{}, control.ErrUnavailable
+	}
+	if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionSnapshot, sessionResource(row)); err != nil {
+		return control.Checkpoint{}, err
+	}
+	return control.Checkpoint{Ref: res.Detail, Format: "rainier-runner-v0", Capabilities: []string{"workspace"}}, nil
 }
