@@ -199,11 +199,14 @@ func validateRegistration(r control.RunnerRegistration) error {
 // scope, merges those pools' runners, and returns them copied and sorted by
 // (RunnerID, PoolID) with cursor pagination. No provider filter exists.
 func (s *FleetService) ListRunners(ctx context.Context, scope control.Scope, q control.RunnerQuery) (control.RunnerPage, error) {
+	if err := scope.Validate(); err != nil {
+		return control.RunnerPage{}, err
+	}
 	if err := s.auth.Authorize(ctx, scope, control.ActionList, control.Resource{
 		Kind:        control.ResourceRunner,
 		WorkspaceID: scope.WorkspaceID,
 	}); err != nil {
-		return control.RunnerPage{}, err
+		return control.RunnerPage{}, control.ErrDenied
 	}
 
 	limit := q.Limit

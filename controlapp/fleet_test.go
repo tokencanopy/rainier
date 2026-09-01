@@ -805,6 +805,38 @@ func TestListRunnersAuthorizesBeforeReads(t *testing.T) {
 	}
 }
 
+func TestListRunnersRejectsInvalidScopeBeforeAnyPort(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.pools.pools = []control.Pool{{ID: "pool_example"}}
+	if _, err := fx.service.ListRunners(fleetCtx, control.Scope{}, control.RunnerQuery{}); !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("got %v, want ErrInvalid", err)
+	}
+	if fx.auth.calls != 0 {
+		t.Fatal("Authorizer was called for an invalid scope")
+	}
+	if fx.pools.calls != 0 {
+		t.Fatal("EligiblePools was called for an invalid scope")
+	}
+	if fx.st.listRunnersCalls != 0 {
+		t.Fatal("fleet ListRunners was called for an invalid scope")
+	}
+}
+
+func TestListRunnersNormalizesAuthorizerRefusal(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.auth.deny = errors.New("internal policy refused")
+	fx.pools.pools = []control.Pool{{ID: "pool_example"}}
+	if _, err := fx.service.ListRunners(fleetCtx, fleetValidScope(), control.RunnerQuery{}); !errors.Is(err, control.ErrDenied) {
+		t.Fatalf("got %v, want ErrDenied", err)
+	}
+	if fx.pools.calls != 0 {
+		t.Fatal("EligiblePools was called despite refusal")
+	}
+	if fx.st.listRunnersCalls != 0 {
+		t.Fatal("fleet ListRunners was called despite refusal")
+	}
+}
+
 func TestListRunnersMergesSortsAndPaginates(t *testing.T) {
 	fx := newFleetFixture(t)
 	fx.pools.pools = []control.Pool{{ID: "pool_b"}, {ID: "pool_a"}}
