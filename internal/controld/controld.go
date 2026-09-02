@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/controlapp"
+	"github.com/tokencanopy/rainier/protocol/runner"
 	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
@@ -99,10 +101,27 @@ type Server struct {
 	// side has to be the thing that stops reading it.
 	xferMax int64
 
-	// transport is the runner plane behind the control.RunnerTransport port.
-	// It is composed in the recomposition's Task 5; until then it is nil and
-	// unavailableStatus answers 500 for every ErrUnavailable.
+	// The four application services controld is composed from, built by New
+	// over the adapters in adapt_*.go. Handlers reach the store, the runner
+	// plane, and the attach plane only through these (Tasks 4–6 of the
+	// recomposition plan rewire them one surface at a time).
+	sessions     *controlapp.SessionService
+	environments *controlapp.EnvironmentService
+	fleet        *controlapp.FleetService
+	attachments  *controlapp.AttachmentService
+
+	// gens hands out the process-local generation each runner connection
+	// acts under; the fleet repository adapter reads it back.
+	gens *runnerGenerations
+
+	// transport is the runner plane behind the control.RunnerTransport port
+	// and broker the attach pairing behind control.AttachmentBroker. Until
+	// Tasks 5 and 6 compose the real ones they are the notYet placeholders
+	// below, which report nothing connected and refuse every call with
+	// ErrUnavailable, so no handler can reach a runner through the services
+	// before the plane exists.
 	transport control.RunnerTransport
+	broker    control.AttachmentBroker
 
 	// schedWake carries capacity news to the scheduler loop (Task 8). It is
 	// buffered by one and written non-blockingly: the loop only needs to
@@ -145,7 +164,7 @@ func New(st Store, cfg Config) (*Server, error) {
 	if cfg.GitHubAPIBase == "" {
 		cfg.GitHubAPIBase = defaultGitHubAPIBase
 	}
-	return &Server{
+	s := &Server{
 		st:          st,
 		cfg:         cfg,
 		runners:     map[string]*runnerConn{},
@@ -153,7 +172,85 @@ func New(st Store, cfg Config) (*Server, error) {
 		attaches:    newAttachTable(),
 		xferMax:     workspace.MaxBytes,
 		schedWake:   make(chan struct{}, 1),
-	}, nil
+		gens:        &runnerGenerations{},
+		transport:   notYetTransport{},
+		broker:      notYetBroker{},
+	}
+	if err := s.compose(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// fleetSafetyInterval is how often the fleet service re-drains every known
+// pool even when no wake arrived — the same 10s safety tick today's scheduler
+// loop runs on, so a wake that was coalesced away costs at most that long.
+const fleetSafetyInterval = 10 * time.Second
+
+// compose builds the four application services over one adapter set. Every
+// port is one of the adapters in adapt_*.go; nothing here is a second
+// implementation of any behavior the services own. It is the composition
+// root the program plan keeps reviewer-owned.
+func (s *Server) compose() error {
+	var (
+		auth     = ownerOrAdmin{}
+		sessions = storeSessions{st: s.st}
+		envs     = storeEnvironments{st: s.st}
+		fleet    = &storeFleet{st: s.st, gens: s.gens}
+		pools    = installationPools{st: s.st}
+		events   = logRecorder{}
+		clock    = systemClock{}
+		ids      = idGenerator{}
+	)
+	fleetSvc, err := controlapp.NewFleetService(controlapp.FleetOptions{
+		Authorizer: auth, Sessions: sessions, Environments: envs, Fleet: fleet, Pools: pools,
+		Transport: s.transport, Events: events, Clock: clock, IDs: ids,
+		SafetyInterval: fleetSafetyInterval,
+		LaunchMaterial: launchMaterial{st: s.st, key: s.cfg.SecretsKey},
+	})
+	if err != nil {
+		return fmt.Errorf("controld: composing the fleet service: %w", err)
+	}
+	sessionSvc, err := controlapp.NewSessionService(controlapp.SessionOptions{
+		Authorizer: auth, Sessions: sessions, Environments: envs, Pools: pools,
+		Events: events, Clock: clock, IDs: ids, Wake: fleetSvc.Wake,
+		Fleet: fleet, Transport: s.transport,
+	})
+	if err != nil {
+		return fmt.Errorf("controld: composing the session service: %w", err)
+	}
+	envSvc, err := controlapp.NewEnvironmentService(controlapp.EnvironmentOptions{
+		Authorizer: auth, Environments: envs, Events: events, Clock: clock, IDs: ids,
+	})
+	if err != nil {
+		return fmt.Errorf("controld: composing the environment service: %w", err)
+	}
+	attachSvc, err := controlapp.NewAttachmentService(controlapp.AttachmentOptions{
+		Authorizer: auth, Policy: auth, Sessions: sessions, Transport: s.transport,
+		Broker: s.broker, Events: events, Clock: clock, IDs: ids,
+	})
+	if err != nil {
+		return fmt.Errorf("controld: composing the attachment service: %w", err)
+	}
+	s.fleet, s.sessions, s.environments, s.attachments = fleetSvc, sessionSvc, envSvc, attachSvc
+	return nil
+}
+
+// notYetTransport and notYetBroker are the ports' stand-ins until the runner
+// plane (Task 5) and the attach pairing (Task 6) are composed. They make the
+// services constructible and inert: nothing is connected, every call is
+// ErrUnavailable, and no handler calls the services until Task 4 anyway.
+type notYetTransport struct{}
+
+func (notYetTransport) Connected(control.PoolID, control.RunnerID) bool { return false }
+func (notYetTransport) Dispatch(context.Context, control.PoolID, control.RunnerID, runner.ToRunner) (runner.FromRunner, error) {
+	return runner.FromRunner{}, control.ErrUnavailable
+}
+
+type notYetBroker struct{}
+
+func (notYetBroker) Attach(context.Context, control.AttachTarget, control.TerminalStream) error {
+	return control.ErrUnavailable
 }
 
 // Handler returns controld's full HTTP surface: the runner control endpoint
