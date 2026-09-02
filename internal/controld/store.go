@@ -12,7 +12,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
+
+	"github.com/tokencanopy/rainier/control"
 )
 
 // SessionState is a Session's lifecycle state.
@@ -369,6 +372,113 @@ type Store interface {
 	// never another user's. The rows carry sealed bytes like any other read;
 	// stripping them for a client-facing view is the caller's job.
 	ListCredentials(ctx context.Context, userID string) ([]Credential, error)
+}
+
+// HostStore is the persistence the self-hosted host owns beside the control
+// repositories: identity (users, bearer tokens), the vault (secrets,
+// credentials), and four lookups the control ports deliberately have no
+// method for. Like the ports, its four lookups return the control sentinel
+// set and never leak SQL, a DSN, or a row's contents in an error; the
+// identity and vault methods keep the store's own sentinels until the old
+// Store methods go.
+type HostStore interface {
+	// EnsureWorkspace makes ws exist; idempotent. New calls it for the
+	// installation workspace, the repository contract suite for its two.
+	EnsureWorkspace(ctx context.Context, ws control.WorkspaceID) error
+
+	UpsertUser(ctx context.Context, githubID int64, login, role string) (User, error)
+	InsertToken(ctx context.Context, userID, tokenHash string) error
+	UserByToken(ctx context.Context, tokenHash string) (User, error)
+	GetUser(ctx context.Context, id string) (User, error)
+
+	PutSecret(ctx context.Context, name string, ciphertext, nonce []byte) error
+	ListSecrets(ctx context.Context) ([]SecretMeta, error)
+	GetSecret(ctx context.Context, name string) (ciphertext, nonce []byte, err error)
+	DeleteSecret(ctx context.Context, name string) error
+
+	UpsertCredential(ctx context.Context, c Credential) error
+	GetCredential(ctx context.Context, userID, provider string) (Credential, error)
+	SetCredentialStatus(ctx context.Context, userID, provider, status string) error
+	TouchCredentialUsed(ctx context.Context, userID, provider string) error
+	ListCredentials(ctx context.Context, userID string) ([]Credential, error)
+
+	// EnvironmentByName resolves a name inside ws to the id the service is
+	// then asked for. The name index is a locator, never authority: the
+	// caller still fetches through the service, which authorizes.
+	EnvironmentByName(ctx context.Context, ws control.WorkspaceID, name string) (control.EnvironmentID, error)
+	// SnapshotRunner names the runner that built id's cached snapshot, ""
+	// when there is none — stale or not, because the wire has always shown
+	// the column. It decides nothing.
+	SnapshotRunner(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID) (control.RunnerID, error)
+	// NextRunnerGeneration opens a new generation for id in pool and returns
+	// it: 1 for a runner never seen, else one more than stored. It is the
+	// only writer of the generation the fleet repository fences on.
+	NextRunnerGeneration(ctx context.Context, pool control.PoolID, id control.RunnerID) (uint64, error)
+}
+
+// Repositories is the three control repository ports a store offers over its
+// own rows. Each accessor is a view, not a copy: the sessions Sessions()
+// creates are the sessions Fleet() places, which is what makes one store
+// satisfy the whole repository contract (controlapp/repotest).
+type Repositories interface {
+	Sessions() control.SessionRepository
+	Environments() control.EnvironmentRepository
+	Fleet() control.FleetRepository
+}
+
+// MemStore is the shape the in-memory store has today, and the shape Store
+// itself becomes once controld composes over the ports and the twin-typed
+// methods are deleted: the host's own persistence, the three control
+// repositories, and — until then — the old single-tenant surface every
+// handler and test still calls.
+type MemStore interface {
+	Store
+	HostStore
+	Repositories
+}
+
+// snapshotCheckpointFormat is the format every self-hosted environment
+// snapshot has: a runner-built container image reference. control.Checkpoint
+// carries the format so a later provider can add a second one without
+// changing the field.
+const snapshotCheckpointFormat = "rainier-runner-v0"
+
+// snapshotCapabilityPrefix is the self-hosted spelling of a snapshot's
+// affinity to the runner that built it. It lives beside the helpers that
+// write and strip it rather than beside the scope constants, because the
+// stores are what put it on an environment and take it back off.
+const snapshotCapabilityPrefix = "snapshot:"
+
+// SnapshotCheckpoint is the control spelling of a self-hosted environment
+// snapshot: a runner-built image ref, the one format this build has.
+func SnapshotCheckpoint(ref string) control.Checkpoint {
+	return control.Checkpoint{Ref: ref, Format: snapshotCheckpointFormat, Capabilities: []string{"workspace"}}
+}
+
+// SnapshotCapability is the self-hosted spelling of a CURRENT snapshot's
+// affinity to the runner that built it: appended to an environment's
+// requirements on the way out of a store, stripped on the way in. A later
+// plan replaces it with a portable checkpoint locator and deletes it.
+func SnapshotCapability(holder control.RunnerID) string {
+	return snapshotCapabilityPrefix + string(holder)
+}
+
+// StripSnapshotCapabilities returns caps without any snapshot affinity. A
+// store owns that capability the way it owns the cache it describes, so a
+// caller's copy of it — read back out and written straight in again — is
+// dropped rather than persisted.
+func StripSnapshotCapabilities(caps []string) []string {
+	if caps == nil {
+		return nil
+	}
+	out := make([]string, 0, len(caps))
+	for _, c := range caps {
+		if strings.HasPrefix(c, snapshotCapabilityPrefix) {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // randHex returns n random bytes, hex-encoded (2n hex characters), sourced

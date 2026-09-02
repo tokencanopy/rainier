@@ -16,14 +16,12 @@ const (
 	installPool      control.PoolID      = "pool_self_hosted"
 )
 
-// The two capability spellings the store adapter uses to express things
-// control.Environment cannot name directly: an explicit runner pin
-// (environment.placement) and the affinity of a current snapshot to the
-// runner that built it. Runners advertise both for their own name.
-const (
-	placementCapabilityPrefix = "placement:"
-	snapshotCapabilityPrefix  = "snapshot:"
-)
+// placementCapabilityPrefix is the capability spelling of an explicit runner
+// pin (environment.placement), which control.Environment cannot name
+// directly. Its sibling, the affinity of a current snapshot to the runner
+// that built it, lives in store.go beside the helpers that write and strip
+// it. Runners advertise both for their own name.
+const placementCapabilityPrefix = "placement:"
 
 // installPlacement is the documented installation-local placement scope
 // (control/scope.go): not a real cloud region, just the self-hosted values.
