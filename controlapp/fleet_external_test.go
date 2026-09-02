@@ -137,6 +137,9 @@ func (fleetExtSessions) SetSessionSetupHash(context.Context, control.WorkspaceID
 func (fleetExtSessions) SetChildExitCode(context.Context, control.WorkspaceID, control.SessionID, int) error {
 	return nil
 }
+func (fleetExtSessions) NextControllerGeneration(context.Context, control.WorkspaceID, control.SessionID) (uint64, error) {
+	return 1, nil
+}
 
 type fleetExtEnvironments struct{}
 

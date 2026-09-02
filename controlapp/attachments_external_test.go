@@ -128,6 +128,9 @@ func (attachmentExtSessions) SetSessionSetupHash(context.Context, control.Worksp
 func (attachmentExtSessions) SetChildExitCode(context.Context, control.WorkspaceID, control.SessionID, int) error {
 	return nil
 }
+func (attachmentExtSessions) NextControllerGeneration(context.Context, control.WorkspaceID, control.SessionID) (uint64, error) {
+	return 1, nil
+}
 
 type attachmentExtTransport struct{}
 

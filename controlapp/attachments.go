@@ -2,8 +2,8 @@ package controlapp
 
 import (
 	"context"
+	"errors"
 	"slices"
-	"sync"
 	"sync/atomic"
 
 	"github.com/tokencanopy/rainier/control"
@@ -57,23 +57,12 @@ type AttachmentService struct {
 	ids         control.IDGenerator
 	maxTransfer int64
 	rpcSeq      atomic.Uint64
-	leaseMu     sync.Mutex
-	controller  map[attachmentLeaseKey]uint64
-}
-
-// attachmentLeaseKey names one session's controller lease by its authoritative
-// workspace plus session, so two workspaces with colliding session IDs never
-// share a generation.
-type attachmentLeaseKey struct {
-	workspace control.WorkspaceID
-	session   control.SessionID
 }
 
 // NewAttachmentService builds an AttachmentService, rejecting any missing
-// dependency with control.ErrInvalid. It initializes the controller map keyed
-// by authoritative workspace plus session and starts no goroutine. The
-// in-memory lease store is extraction-only and is replaced by durable
-// controller generations in the next sequential scope/generation plan.
+// dependency with control.ErrInvalid. It holds no lease table and starts no
+// goroutine: the controller generation is the session repository's, so it
+// survives a restart and is shared by every replica over the same store.
 func NewAttachmentService(opts AttachmentOptions) (*AttachmentService, error) {
 	switch {
 	case opts.Authorizer == nil,
@@ -101,7 +90,6 @@ func NewAttachmentService(opts AttachmentOptions) (*AttachmentService, error) {
 		clock:       opts.Clock,
 		ids:         opts.IDs,
 		maxTransfer: maxTransfer,
-		controller:  make(map[attachmentLeaseKey]uint64),
 	}, nil
 }
 
@@ -156,23 +144,22 @@ func (s *AttachmentService) attachable(row control.Session) bool {
 	}
 }
 
-// grantGeneration returns the controller generation a target carries. A viewer
-// reads the current value without incrementing it; a controller increments the
-// monotonic generation under the lease mutex, refusing uint64 overflow.
-func (s *AttachmentService) grantGeneration(ws control.WorkspaceID, id control.SessionID, mode control.AttachmentMode) (uint64, error) {
-	s.leaseMu.Lock()
-	defer s.leaseMu.Unlock()
-	key := attachmentLeaseKey{workspace: ws, session: id}
-	cur := s.controller[key]
+// grantGeneration returns the controller generation a target carries: a
+// viewer attaches under the row's current value; a controller asks the
+// repository to advance it. The generation is the repository's — durable,
+// shared by every replica — and this service keeps none of its own.
+func (s *AttachmentService) grantGeneration(ctx context.Context, row control.Session, mode control.AttachmentMode) (uint64, error) {
 	if mode == control.AttachmentViewer {
-		return cur, nil
+		return row.ControllerGeneration, nil
 	}
-	if cur == ^uint64(0) {
-		return 0, control.ErrUnavailable
+	gen, err := s.sessions.NextControllerGeneration(ctx, row.WorkspaceID, row.ID)
+	if err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			return 0, control.ErrNotFound
+		}
+		return 0, portError(err)
 	}
-	cur++
-	s.controller[key] = cur
-	return cur, nil
+	return gen, nil
 }
 
 // AttachTerminal authorizes and fences one terminal attach, then hands the
@@ -204,7 +191,7 @@ func (s *AttachmentService) AttachTerminal(ctx context.Context, scope control.Sc
 	if err != nil {
 		return err
 	}
-	generation, err := s.grantGeneration(row.WorkspaceID, row.ID, cmd.Mode)
+	generation, err := s.grantGeneration(ctx, row, cmd.Mode)
 	if err != nil {
 		return err
 	}

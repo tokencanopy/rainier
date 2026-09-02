@@ -247,6 +247,41 @@ func TestAttachControllerGenerations(t *testing.T) {
 	}
 }
 
+// TestControllerGenerationIsTheRepositorys pins the lease's home: a viewer
+// attaches under the row's current generation, a controller asks the
+// repository for the next one, and the service keeps no generation of its
+// own.
+func TestControllerGenerationIsTheRepositorys(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	row := attachmentRunningSession()
+	row.ControllerGeneration = 4
+	fx.sessions.found, fx.sessions.row = true, row
+	ctx := context.Background()
+	scope := attachmentTestScope()
+
+	if err := fx.svc.AttachTerminal(ctx, scope, control.AttachTerminal{
+		SessionID: "sess_example", Mode: control.AttachmentViewer,
+	}, &attachmentRecordingTerminalStream{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := fx.broker.lastTarget.ControllerGeneration; got != 4 {
+		t.Fatalf("viewer generation = %d, want the row's 4", got)
+	}
+	if fx.sessions.nextCalls != 0 {
+		t.Fatalf("a viewer asked the repository %d times, want 0", fx.sessions.nextCalls)
+	}
+
+	if err := fx.svc.AttachTerminal(ctx, scope, control.AttachTerminal{
+		SessionID: "sess_example", Mode: control.AttachmentController,
+	}, &attachmentRecordingTerminalStream{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := fx.broker.lastTarget.ControllerGeneration; got != 5 || fx.sessions.nextCalls != 1 {
+		t.Fatalf("controller generation = %d (repo calls %d), want 5 from one NextControllerGeneration",
+			got, fx.sessions.nextCalls)
+	}
+}
+
 func TestAttachConcurrentControllersDistinct(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.sessions.found = true
@@ -531,13 +566,14 @@ func (f *attachmentFakePolicy) AuthorizeAttachment(_ context.Context, _ control.
 }
 
 type attachmentFakeSessions struct {
-	mu     sync.Mutex
-	found  bool
-	row    control.Session
-	err    error
-	calls  int
-	lastWS control.WorkspaceID
-	lastID control.SessionID
+	mu        sync.Mutex
+	found     bool
+	row       control.Session
+	err       error
+	calls     int
+	nextCalls int
+	lastWS    control.WorkspaceID
+	lastID    control.SessionID
 }
 
 func (f *attachmentFakeSessions) GetSession(_ context.Context, ws control.WorkspaceID, id control.SessionID) (control.Session, error) {
@@ -569,6 +605,21 @@ func (f *attachmentFakeSessions) Transition(context.Context, control.WorkspaceID
 func (f *attachmentFakeSessions) SetSessionSetupHash(context.Context, control.WorkspaceID, control.SessionID, string) error {
 	return nil
 }
+
+// NextControllerGeneration is the repository's lease: it advances the stored
+// row's generation and returns the new value, counting the calls so a test can
+// assert that only a controller attach asks for one.
+func (f *attachmentFakeSessions) NextControllerGeneration(_ context.Context, ws control.WorkspaceID, id control.SessionID) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextCalls++
+	if !f.found {
+		return 0, control.ErrNotFound
+	}
+	f.row.ControllerGeneration++
+	return f.row.ControllerGeneration, nil
+}
+
 func (f *attachmentFakeSessions) SetChildExitCode(context.Context, control.WorkspaceID, control.SessionID, int) error {
 	return nil
 }

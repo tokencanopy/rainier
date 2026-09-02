@@ -74,6 +74,10 @@ type Authorizer interface {
 //	SetSessionSetupHash  → Store.SetSessionSetupHash
 //	SetChildExitCode     → Store.SetChildExitCode
 //
+// NextControllerGeneration has no Store predecessor: the controller lease was
+// process memory and is now the repository's, so a restart or a second
+// replica cannot hand out the same authority twice.
+//
 // User, token, secret, and credential operations are deliberately absent:
 // they belong to identity and vault adapters, not to the application service.
 type SessionRepository interface {
@@ -89,12 +93,17 @@ type SessionRepository interface {
 	ListSessions(ctx context.Context, ws WorkspaceID, q SessionQuery) ([]Session, string, error)
 	// Transition moves id from any state in from to to, optionally updating
 	// the transition columns. ErrConflict when the current state is not in
-	// from; ErrNotFound when id does not exist.
+	// from; ErrNotFound when id does not exist. When opts.RunnerID names a
+	// runner the repository also advances PlacementGeneration (see Session).
 	Transition(ctx context.Context, ws WorkspaceID, id SessionID, from []SessionState, to SessionState, opts TransitionOpts) error
 	// SetSessionSetupHash records the setup a session was dispatched with.
 	SetSessionSetupHash(ctx context.Context, ws WorkspaceID, id SessionID, hash string) error
 	// SetChildExitCode records the exit status of a session's agent process.
 	SetChildExitCode(ctx context.Context, ws WorkspaceID, id SessionID, code int) error
+	// NextControllerGeneration advances id's controller generation by one and
+	// returns the new value, atomically with respect to every other caller.
+	// ErrNotFound when id does not exist in ws.
+	NextControllerGeneration(ctx context.Context, ws WorkspaceID, id SessionID) (uint64, error)
 }
 
 // EnvironmentRepository is the workspace-keyed environment persistence port,
@@ -118,7 +127,8 @@ type EnvironmentRepository interface {
 	CountSessionsByEnvironment(ctx context.Context, ws WorkspaceID, envID EnvironmentID, states []SessionState) (int, error)
 	// SetEnvironmentSnapshot records a built snapshot against the environment
 	// only while its SetupHash still equals expectHash; otherwise it changes
-	// nothing and reports a stale/conflict outcome.
+	// nothing and reports a stale/conflict outcome. ErrStale when SetupHash no
+	// longer equals expectHash, ErrNotFound when envID does not exist in ws.
 	SetEnvironmentSnapshot(ctx context.Context, ws WorkspaceID, envID EnvironmentID, expectHash, ref string, runnerID RunnerID) error
 }
 
@@ -131,6 +141,8 @@ type EnvironmentRepository interface {
 //	SessionsOnRunner   → Store.SessionsOnRunner (capacity math, reconciliation)
 //	OldestQueued       → Store.OldestQueued (placement pass)
 type FleetRepository interface {
+	// UpsertRunner stores r as pool's view of that runner. ErrStale when
+	// r.Generation is below the runner's stored generation; nothing changes.
 	UpsertRunner(ctx context.Context, pool PoolID, r Runner) error
 	SetRunnerConnected(ctx context.Context, pool PoolID, id RunnerID, connected bool) error
 	ListRunners(ctx context.Context, pool PoolID) ([]Runner, error)

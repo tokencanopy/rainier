@@ -175,6 +175,21 @@ func (st *fleetFakeStore) setSessionSetupHash(ws control.WorkspaceID, id control
 	return nil
 }
 
+// nextControllerGeneration is the store's controller lease: one counter per
+// stored row, advanced on every call.
+func (st *fleetFakeStore) nextControllerGeneration(ws control.WorkspaceID, id control.SessionID) (uint64, error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	m := st.sessions[ws]
+	s, ok := m[id]
+	if !ok {
+		return 0, control.ErrNotFound
+	}
+	s.ControllerGeneration++
+	m[id] = s
+	return s.ControllerGeneration, nil
+}
+
 func (st *fleetFakeStore) setChildExitCode(ws control.WorkspaceID, id control.SessionID, code int) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -321,6 +336,9 @@ func (f *fleetFakeSessions) SetSessionSetupHash(_ context.Context, ws control.Wo
 }
 func (f *fleetFakeSessions) SetChildExitCode(_ context.Context, ws control.WorkspaceID, id control.SessionID, code int) error {
 	return f.st.setChildExitCode(ws, id, code)
+}
+func (f *fleetFakeSessions) NextControllerGeneration(_ context.Context, ws control.WorkspaceID, id control.SessionID) (uint64, error) {
+	return f.st.nextControllerGeneration(ws, id)
 }
 
 type fleetFakeEnvironments struct{ st *fleetFakeStore }

@@ -142,6 +142,11 @@ type Server struct {
 	// acts under; the fleet repository adapter reads it back.
 	gens *runnerGenerations
 
+	// leases hands out the process-local controller generation each terminal
+	// controller acts under; the session repository adapter answers
+	// NextControllerGeneration from it until the store persists it.
+	leases *controllerLeases
+
 	// transport is the runner plane behind the control.RunnerTransport port
 	// (adapt_transport.go, over the connection map below) and broker the
 	// dial-back attach pairing behind control.AttachmentBroker
@@ -191,6 +196,7 @@ func New(st Store, cfg Config) (*Server, error) {
 		runnerLocks: map[string]*sync.Mutex{},
 		attaches:    newAttachTable(),
 		gens:        &runnerGenerations{},
+		leases:      &controllerLeases{},
 	}
 	s.transport = runnerTransport{srv: s}
 	s.broker = attachBroker{srv: s}
@@ -212,7 +218,7 @@ const fleetSafetyInterval = 10 * time.Second
 func (s *Server) compose() error {
 	var (
 		auth     = ownerOrAdmin{}
-		sessions = storeSessions{st: s.st}
+		sessions = storeSessions{st: s.st, leases: s.leases}
 		envs     = storeEnvironments{st: s.st}
 		fleet    = &storeFleet{st: s.st, gens: s.gens}
 		pools    = installationPools{st: s.st}

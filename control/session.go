@@ -114,14 +114,26 @@ type Session struct {
 	RunnerID      RunnerID
 	// PlacementGeneration is the monotonic generation of this session's
 	// current placement. Later hosted fencing rejects a runner event whose
-	// generation does not match, without replacing the event shape.
+	// generation does not match, without replacing the event shape. A
+	// repository advances it by one on every Transition whose RunnerID option
+	// names a runner, and leaves it unchanged otherwise. A generation is one
+	// sandbox on one runner: the scheduler's placement, reconcile's adoption,
+	// and a cold resume — which names the row's own runner, because it starts
+	// a new sandbox there — each open one; a warm resume unpauses the sandbox
+	// it has and opens none.
 	PlacementGeneration uint64
-	IdempotencyKey      string
-	ChildExitCode       *int
-	Error               string
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
-	LastEventAt         time.Time
+	// ControllerGeneration is the monotonic generation of this session's
+	// current terminal controller: 0 until a controller has attached, then
+	// the value NextControllerGeneration last returned. A viewer attaches
+	// under the current value; a controller advances it. Stale input is
+	// fenced against it by the attachment plane.
+	ControllerGeneration uint64
+	IdempotencyKey       string
+	ChildExitCode        *int
+	Error                string
+	CreatedAt            time.Time
+	UpdatedAt            time.Time
+	LastEventAt          time.Time
 }
 
 // CreateSession is the command for CreateSession. EnvironmentID names the
