@@ -639,3 +639,36 @@ func TestQueuedEnvironmentDeepCopiesBeforeResolver(t *testing.T) {
 		t.Fatalf("stored capabilities = %v, want [gpu]", stored.Requirements.Capabilities)
 	}
 }
+
+// TestDispatchCreateUnionsMaterialEgress pins the D6 rule: the session row
+// stores only the egress its caller or environment declared, and the hosts the
+// resolved launch material needs (the source-control hosts a clone reaches)
+// are added at dispatch — in the row's order first, then the new hosts, with
+// no duplicates.
+func TestDispatchCreateUnionsMaterialEgress(t *testing.T) {
+	resolver := &fleetFakeResolver{material: LaunchMaterial{EgressAllow: []string{"github.com", "example.com"}}}
+	fx := newFleetFixtureWithResolver(t, resolver)
+	fx.st.seedRunner(fleetSeededRunner("vm1", 4, 0, true))
+	row := fleetScratchQueued("sess_x", 0)
+	row.Spec.EgressAllow = []string{"example.com", "api.example.com"}
+	fx.st.seedSession(row)
+	fleetRunFixture(t, fx)
+	fx.service.Wake("pool_example")
+
+	want := []string{"example.com", "api.example.com", "github.com"}
+	fleetEventually(t, 2*time.Second, func() error {
+		var spec *runner.Spec
+		for _, cmd := range fx.transport.dispatchedCommands() {
+			if cmd.Type == "create" {
+				spec = cmd.Spec
+			}
+		}
+		if spec == nil {
+			return fmt.Errorf("no create dispatched")
+		}
+		if !slices.Equal(spec.EgressAllow, want) {
+			return fmt.Errorf("egress = %v, want %v", spec.EgressAllow, want)
+		}
+		return nil
+	})
+}

@@ -1452,10 +1452,6 @@ func validRepoSegment(s string) bool {
 	return s != "." && s != ".." && !strings.HasPrefix(s, "-")
 }
 
-// defaultBaseBranch is the branch a github connector clones when it names
-// none.
-const defaultBaseBranch = "main"
-
 // githubConnector is the github connector's v0 shape. BaseBranch is a pointer
 // so an absent base_branch (which means defaultBaseBranch) is distinguishable
 // from an explicit empty one — an empty branch name is a typo, never a
