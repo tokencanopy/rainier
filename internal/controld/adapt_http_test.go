@@ -76,13 +76,13 @@ func TestUnavailableStatusRefinesByRunnerConnectivity(t *testing.T) {
 		t.Fatalf("disconnected runner = %d %s", status, code)
 	}
 	placedOnConnected := control.Session{ID: "sess_example", RunnerID: "runner-a"}
-	if status, code, _ := s.unavailableStatus(placedOnConnected); status != http.StatusInternalServerError || code != "internal" {
-		t.Fatalf("connected runner = %d %s", status, code)
+	if status, code, msg := s.unavailableStatus(placedOnConnected); status != http.StatusBadGateway || code != "runner_unreachable" || msg != "runner did not respond" {
+		t.Fatalf("connected runner that did not answer = %d %s %q", status, code, msg)
 	}
-	if status, _, _ := s.unavailableStatus(control.Session{ID: "sess_example"}); status != http.StatusInternalServerError {
-		t.Fatalf("unplaced = %d", status)
+	if status, code, _ := s.unavailableStatus(control.Session{ID: "sess_example"}); status != http.StatusInternalServerError || code != "internal" {
+		t.Fatalf("unplaced = %d %s", status, code)
 	}
-	if status, _, _ := (&Server{}).unavailableStatus(placedOnDisconnected); status != http.StatusInternalServerError {
-		t.Fatalf("no transport composed yet = %d", status)
+	if status, _, _ := (&Server{}).unavailableStatus(placedOnDisconnected); status != http.StatusBadGateway {
+		t.Fatalf("no transport composed = %d", status)
 	}
 }

@@ -42,6 +42,16 @@ func (t runnerTransport) Dispatch(ctx context.Context, pool control.PoolID, id c
 	if m.Type == "session_rpc" {
 		return t.sessionRPC(ctx, rc, id, m)
 	}
+	if m.Type == "remove_workspace" {
+		// Fire-and-forget on the wire, as it has always been: no ReqID, so
+		// the runner sends no result, and the caller — a delete reclaiming a
+		// volume — is not held for a round trip. An absent volume is a
+		// success there anyway, so the only answer worth having is "sent".
+		if err := rc.enqueue(m); err != nil {
+			return runner.FromRunner{}, unreachable(m.Type, id)
+		}
+		return runner.FromRunner{OK: true}, nil
+	}
 
 	m.ReqID = rc.seq.Add(1)
 	ch := make(chan runner.FromRunner, 1)

@@ -39,16 +39,21 @@ func controlStatus(err error) (status int, code, msg string) {
 	}
 }
 
-// unavailableStatus refines ErrUnavailable for a placed session the way
-// today's handlers do: a runner that holds the session but has no control
-// connection here is 502 runner_unreachable; anything else — a store that
-// cannot answer, a runner that is connected but did not respond — is 500.
-// Before the transport is composed (Task 5) every ErrUnavailable is 500.
+// unavailableStatus refines ErrUnavailable the way today's handlers split it:
+// for a session placed on a runner, the dependency a lifecycle command fails
+// on is the runner — it has no control connection here, or it has one and did
+// not answer within OpTimeout — and both have always been 502
+// runner_unreachable (ErrDispatchTimeout wraps ErrRunnerUnreachable). The
+// message says which. A session placed nowhere has no runner to blame, so its
+// ErrUnavailable is the store's and stays 500.
 func (s *Server) unavailableStatus(row control.Session) (int, string, string) {
-	if s.transport != nil && row.RunnerID != "" && !s.transport.Connected(installPool, row.RunnerID) {
+	if row.RunnerID == "" {
+		return http.StatusInternalServerError, "internal", "internal error"
+	}
+	if s.transport == nil || !s.transport.Connected(installPool, row.RunnerID) {
 		return http.StatusBadGateway, "runner_unreachable", "runner is not connected"
 	}
-	return http.StatusInternalServerError, "internal", "internal error"
+	return http.StatusBadGateway, "runner_unreachable", "runner did not respond"
 }
 
 // writeControlErr answers a service error with controlStatus's fixed

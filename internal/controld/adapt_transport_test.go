@@ -131,3 +131,22 @@ func TestTransportDispatchHonorsCallerCancellation(t *testing.T) {
 		t.Fatalf("got %v after %s", err, time.Since(start))
 	}
 }
+
+func TestTransportRemoveWorkspaceIsFireAndForget(t *testing.T) {
+	s, rc := transportFixture(t, "runner-a")
+	s.cfg.OpTimeout = time.Minute
+	got := make(chan runner.ToRunner, 1)
+	go func() { got <- <-rc.out }()
+	start := time.Now()
+	res, err := runnerTransport{srv: s}.Dispatch(context.Background(), installPool, "runner-a",
+		runner.ToRunner{Type: "remove_workspace", Session: "sess_example"})
+	if err != nil || !res.OK {
+		t.Fatalf("got %+v, %v", res, err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("remove_workspace waited for an answer nobody sends")
+	}
+	if m := <-got; m.ReqID != 0 {
+		t.Fatalf("remove_workspace carried req_id %d, want 0 (fire-and-forget)", m.ReqID)
+	}
+}
