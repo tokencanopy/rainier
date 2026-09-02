@@ -4,11 +4,11 @@
 
 **Goal:** Make every application mutation and the event it produces durable together (the transactional outbox), give the application a portable answer to "where can this checkpoint boot" so a cached snapshot stops pinning sessions to one runner, and let runners announce portable capabilities that the fleet persists, the scheduler matches, and controld acknowledges with the runner's generation — through one coordinated, additive contract amendment.
 
-**Architecture:** Three host ports and two wire fields, each the smallest thing that closes a gap O8 documented. `control.UnitOfWork` lets a service say "these writes commit together" without a transaction type ever crossing the seam: hosts carry their transaction in the context, and the OSS pgstore proves the pattern with an `events` table written inside the same transaction as the row it describes. `control.CheckpointLocator` answers which runners can boot a checkpoint; the scheduler prefers them and falls back to a rebuild elsewhere, which restores the placement behavior O8 traded away as deviation D3, and retires the `snapshot:<runner>` capability spelling the stores derive today. The runner protocol gains an announced `capabilities` list and an `accept` message carrying the runner's generation; protocol version stays 1 because every field is additive and an old runner keeps working with an empty set.
+**Architecture:** Three host ports and two wire fields, each the smallest thing that closes a gap O8 documented. `control.UnitOfWork` lets a service say "these writes commit together" without a transaction type ever crossing the seam: hosts carry their transaction in the context, and the OSS pgstore proves the pattern with an `events` table written inside the same transaction as the row it describes. `control.CheckpointLocator` answers which runners can boot a checkpoint; the scheduler prefers them and falls back to a rebuild elsewhere, which restores the placement behavior O8 traded away as deviation D3, and retires the `snapshot:<runner>` capability spelling the stores derive today. The runner protocol gains an announced `capabilities` list, an `accept` message carrying the runner's generation, and the session's placement generation on the create command, echoed on the runner's events so a report from a stale sandbox is fenced by the session's own authority; protocol version stays 1 because every field is additive and an old runner keeps working with an empty set.
 
 **Tech Stack:** Go 1.25, PostgreSQL 16 via `jackc/pgx/v5`, `control` (amended once, in Task 1), `controlapp`, `protocol/runner`, `internal/runnerd`, `internal/controld`, the `rainier` CLI.
 
-**Spec:** `rainier-cloud/docs/architecture/adr-0001-oss-cloud-composition.md` — "OSS application-service boundary" (host ports include checkpoint storage and event delivery), "Persistence model" ("State changes that feed billing, history, search, or operations write a durable regional outbox in the same transaction as the authoritative lifecycle change"), "Placement composition" (the scheduler selects within a pool using capabilities and artifact affinity), "Versioning and rollout compatibility" (runner protocols negotiate capabilities so a cell can roll runners without a flag day), migration step 6; `rainier-cloud/docs/superpowers/plans/2026-08-30-hosted-implementation-program.md` gate O9, fixed decision 3, Wave 5 ("transactional events, checkpoints, and capability negotiation"); `rainier-cloud/docs/superpowers/plans/2026-08-30-regional-durability.md` (the hosted store writes authoritative state plus its outbox row in one transaction through one private helper — the shape `UnitOfWork` composes with); `docs/superpowers/plans/2026-08-30-self-hosted-recomposition.md` deviation **D3** and "Not in this plan"; `docs/superpowers/plans/2026-08-30-workspace-scope-and-generations.md` (plan 7 — this plan starts from its merged store). OSS plan #8, the last before the tagged release (O10).
+**Spec:** `rainier-cloud/docs/architecture/adr-0001-oss-cloud-composition.md` — "OSS application-service boundary" (host ports include checkpoint storage and event delivery), "Persistence model" ("State changes that feed billing, history, search, or operations write a durable regional outbox in the same transaction as the authoritative lifecycle change"), "Placement composition" (the scheduler selects within a pool using capabilities and artifact affinity), "Versioning and rollout compatibility" (runner protocols negotiate capabilities so a cell can roll runners without a flag day), migration step 6; `rainier-cloud/docs/superpowers/plans/2026-08-30-hosted-implementation-program.md` gate O9, fixed decision 3, Wave 5 ("transactional events, checkpoints, and capability negotiation"); `rainier-cloud/docs/superpowers/plans/2026-08-30-regional-durability.md` (the hosted store writes authoritative state plus its outbox row in one transaction through one private helper — the shape `UnitOfWork` composes with); `rainier-cloud/docs/product/hosted-product-prd.md` §9 ("Runner events, terminal input, credentials, workspace writes, and usage facts carry that generation; stale generations are fenced"; "Metering attributes a session to exactly one placement generation") and §19 (rejection of stale lifecycle events by generation); `docs/superpowers/plans/2026-08-30-self-hosted-recomposition.md` deviation **D3** and "Not in this plan"; `docs/superpowers/plans/2026-08-30-workspace-scope-and-generations.md` (plan 7 — this plan starts from its merged store). OSS plan #8, the last before the tagged release (O10).
 
 ## Global Constraints
 
@@ -28,7 +28,7 @@
 | D16 | A session created from an environment with a current snapshot shows the snapshot ref as its `image` from the moment it is created | It shows the environment's image until it is placed; once placed on a runner that holds the snapshot it shows the snapshot ref, and on any other runner it keeps the environment's image (and runs setup) | The image a session runs is decided at placement, where the holder is known — which is where controld decided it before O8 | `api_test.go` cases asserting `image` on a just-created session from a cached environment |
 | D17 | Such a session is placed only on the snapshot's holder; if that runner is full or away the session stays queued (O8's D3) | It prefers the holder and, when the holder has no room or is not connected, boots the environment's image with setup on any eligible runner that does | Restores the pre-O8 behavior D3 gave up; a cache is a head start, never a pin | the `api_test.go`/`sched_test.go` cases D3 rewrote (restore their pre-O8 assertions) |
 | D18 | `POST/PUT /v0/environments` accept `placement`; the view shows `placement` | They also accept and show `capabilities` (a JSON array of strings, `[]` when none); `placement` is unchanged | An environment can require a portable capability a runner announces | response-shape tests that pin the environment key set (one new key) |
-| D19 | An announce carries `proto`, `runner`, `sessions`, `used`, `total` | It may also carry `capabilities`; controld answers a registered runner with `{"type":"accept","generation":N,"capabilities":[…]}` before any command; later `event`/`result` messages may carry `generation` | Capability negotiation and the runner's generation on the wire (ADR "Versioning and rollout compatibility") | `runners_test.go` fixtures that assert the first message a runner receives is a command (they now skip the `accept`); `internal/runnerd` tests |
+| D19 | An announce carries `proto`, `runner`, `sessions`, `used`, `total`; a create carries `session` and `spec` | It may also carry `capabilities`; controld answers a registered runner with `{"type":"accept","generation":N,"capabilities":[…]}` before any command; a create also carries `placement_generation`; later `event`/`result` messages may carry `generation` and, for a session, `placement_generation` | Capability negotiation and the runner's generation on the wire (ADR "Versioning and rollout compatibility") | `runners_test.go` fixtures that assert the first message a runner receives is a command (they now skip the `accept`); `internal/runnerd` tests |
 
 Everything not in this table is a bug in the task that introduced it.
 
@@ -37,6 +37,7 @@ Everything not in this table is a bug in the task that introduced it.
 ```text
 control/
   ports.go                     Task 1: UnitOfWork, CheckpointLocator, CheckpointLocation; TransitionOpts.Image
+  fleet.go                     Task 1: RunnerEvent.PlacementGeneration, Event.PlacementGeneration
   contract_test.go             Task 1: fakes for the two ports
 controlapp/
   sessions.go environments.go fleet.go attachments.go scheduler.go
@@ -59,8 +60,8 @@ internal/controld/
   controld.go                  Task 3/4: compose the unit of work, the recorder, the locator
   runners.go                   Task 5: announced capabilities validated and unioned; accept sent; generation read
   api.go                       Task 5: environments.capabilities; queue_reason names a missing capability
-protocol/runner/messages.go    Task 5: FromRunner.Capabilities, FromRunner.Generation; ToRunner "accept",
-                               ToRunner.Generation, ToRunner.Capabilities
+protocol/runner/messages.go    Task 5: FromRunner.Capabilities, FromRunner.Generation, FromRunner.PlacementGeneration;
+                               ToRunner "accept", ToRunner.Generation, ToRunner.Capabilities, ToRunner.PlacementGeneration
 internal/runnerd/runnerd.go agent.go   Task 5: Config.Capabilities; announce; accept handling; generation stamping
 cmd/runnerd/main.go            Task 5: --capability (repeatable) / RAINIER_RUNNER_CAPABILITIES
 cmd/rainier/main.go            Task 5: --capability on env create/update
@@ -75,7 +76,7 @@ docs/deploy-gce.md README.md   Task 6
 The one coordinated `control` change of the plan; additive; its own PR before any worker starts. Behavior is unchanged after this task: the new ports are wired with implementations that do exactly what happens today.
 
 **Files:**
-- Modify: `control/ports.go`, `control/session.go` (`TransitionOpts`), `control/contract_test.go`
+- Modify: `control/ports.go`, `control/session.go` (`TransitionOpts`), `control/fleet.go` (`RunnerEvent`, `Event`), `control/contract_test.go`
 - Modify: `controlapp/sessions.go`, `environments.go`, `fleet.go`, `attachments.go` (options and constructors), every `controlapp/*_test.go` constructor call
 - Modify: `internal/controld/controld.go` (`compose`), `adapt_host.go`
 
@@ -119,6 +120,25 @@ type CheckpointLocator interface {
 	// else the environment's own image. Set only by a placement transition.
 	Image *string
 ```
+
+- Produces, in `control/fleet.go`, one field on each of two types (PRD §9: runner events and usage facts carry the execution generation):
+
+```go
+// on RunnerEvent
+	// PlacementGeneration is the session placement generation the runner
+	// was given when the sandbox was created, echoed back so a report from a
+	// stale sandbox is fenced by the session's own authority and not only by
+	// the connection it arrived on. Zero means "not carried" (an old runner)
+	// and fences nothing.
+	PlacementGeneration uint64
+// on Event
+	// PlacementGeneration is the session placement generation an event about
+	// a session happened under, so usage is attributed to exactly one
+	// generation; zero for an event about any other resource.
+	PlacementGeneration uint64
+```
+
+  `FleetService.ApplyRunnerEvent` fences on it in Task 1 already: a non-zero `event.PlacementGeneration` that differs from `row.PlacementGeneration` is `ErrStale` before any effect (one `fleet_test.go` case each for match, mismatch, and zero). Nothing sends a non-zero value until Task 5.
 
 - Produces, in `controlapp`: `SessionOptions.UnitOfWork`, `EnvironmentOptions.UnitOfWork`, `FleetOptions.UnitOfWork`, `FleetOptions.Checkpoints control.CheckpointLocator`, `AttachmentOptions.UnitOfWork` — all required (`control.ErrInvalid` when nil). The services store them; nothing calls them yet.
 - Produces, in `internal/controld/adapt_host.go`: `directUnitOfWork{}` (`Run` calls `fn(ctx)`) and `pinnedCheckpoints{st}` whose `LocateCheckpoint` returns `{Runners: [holder]}` from `HostStore.SnapshotRunner` of the environment whose `Snapshot.Ref` equals `cp.Ref` — until Task 2 adds the direct lookup, it lists the workspace's environments to find it. `compose()` passes both.
@@ -183,6 +203,7 @@ CREATE TABLE events (
   resource_workspace_id text NOT NULL,
   resource_creator_id text NOT NULL DEFAULT '',
   at timestamptz NOT NULL,
+  placement_generation bigint NOT NULL DEFAULT 0,
   cpu_time_seconds double precision NOT NULL DEFAULT 0,
   memory_byte_seconds bigint NOT NULL DEFAULT 0,
   storage_bytes bigint NOT NULL DEFAULT 0,
@@ -335,6 +356,8 @@ The wrapping, method by method (`grep -n "recordEvent\|s\.record(\|recordLifecyc
 | `FleetService.ApplyRunnerEvent` | the `Transition` or `SetChildExitCode` + `recordLifecycleEvent` | `s.Wake(pool)` |
 | `AttachmentService.AttachTerminal` and the workspace RPCs | `s.record` (their only write) | — |
 
+Every event about a session (`sessionResource(row)` sites and `recordLifecycleEvent`) sets `Event.PlacementGeneration` to the row's generation as stored after the mutation — the create's 1, a resume's new value — and the `uow_test.go` cases assert it on the recorded event. Events about environments and runners leave it zero.
+
 Not wrapped, deliberately: `RegisterRunner`, `ReconcileRunner`, and `drainPool`'s placement transition — single writes with no event, retried by the connection or the safety tick.
 
 - [ ] **Step 1: Write the failing test**
@@ -446,7 +469,9 @@ Each asserts the dispatched `runner.ToRunner.Spec.Image`, `Spec.Setup`, and the 
 - Modify: `protocol/runner/messages.go`
 - Modify: `internal/runnerd/runnerd.go` (`Config.Capabilities []string`), `internal/runnerd/agent.go` (announce; `accept` handling; `Generation` on every later `FromRunner`), `internal/runnerd/agent_test.go`
 - Modify: `cmd/runnerd/main.go` (`--capability`, repeatable; `RAINIER_RUNNER_CAPABILITIES` comma-separated)
-- Modify: `internal/controld/runners.go` (`connectRunner`: validate and union; send `accept`; `applyRunnerEvent`: use the message's `Generation` when non-zero), `runners_test.go`
+- Modify: `internal/controld/runners.go` (`connectRunner`: validate and union; send `accept`; `applyRunnerEvent`: use the message's `Generation` when non-zero and copy `PlacementGeneration` onto the `control.RunnerEvent`), `runners_test.go`
+- Modify: `controlapp/scheduler.go` (`dispatchCreate` sets `ToRunner.PlacementGeneration` from the row as placed), `controlapp/scheduler_test.go`
+- Modify: `internal/runnerd/registry.go` (the sandbox entry keeps the placement generation it was created with; `agent.go` puts it on every event about that session)
 - Modify: `internal/controld/api.go` (`createEnvironmentRequest.Capabilities`, `updateEnvironmentRequest.Capabilities *[]string`, `environmentView.Capabilities`, `queueReason`), `api_test.go`
 - Modify: `cmd/rainier/main.go` (`--capability`, repeatable, on the environment create and update subcommands, beside the existing placement flag), `cmd/rainier/main_test.go`, `internal/cli` if the client type carries the environment body
 - Modify: `scripts/e2e-fleet.sh` (the environments scene: one runner started with `--capability e2e.gpu`, an environment requiring it, a session that lands there; a second environment requiring `e2e.none` whose session shows `queue_reason` naming it)
@@ -466,7 +491,15 @@ Each asserts the dispatched `runner.ToRunner.Spec.Image`, `Spec.Setup`, and the 
 	// connection can be fenced by the store rather than by the socket it
 	// arrived on. Zero means "the connection's" (an old runner).
 	Generation uint64 `json:"generation,omitempty"` // event, result
+	// PlacementGeneration echoes, on an event about a session, the value the
+	// create that started its sandbox carried. Zero for an old runner or a
+	// session created before the runner learned it.
+	PlacementGeneration uint64 `json:"placement_generation,omitempty"` // event
 // on ToRunner
+	// PlacementGeneration is the session's placement generation on a create;
+	// the runner keeps it with the sandbox and echoes it on every event about
+	// that session.
+	PlacementGeneration uint64 `json:"placement_generation,omitempty"` // create
 	// "accept" is controld's answer to an announce, sent before any command:
 	// the generation this connection acts under and the announced
 	// capabilities controld will schedule on.
@@ -480,7 +513,7 @@ Each asserts the dispatched `runner.ToRunner.Spec.Image`, `Spec.Setup`, and the 
 
 - [ ] **Step 1: Write the failing tests**
 
-`runners_test.go`: a runner announcing `["gpu", "docker.rootless"]` is registered with `["placement:vm1", "gpu", "docker.rootless"]` (assert via `st.Fleet().ListRunners`) and receives `{"type":"accept","generation":1,"capabilities":["gpu","docker.rootless"]}` as its first message; one announcing `["placement:other"]` or `["GPU"]` is closed with `"registration refused"`; an event carrying `generation: 1` after the store moved to 2 is ignored (`ErrStale` path) while the same event with no generation uses the connection's. `api_test.go`: `capabilities` round-trips on create/get/update, is `[]` when absent, rejects `["GPU"]` with 400, and `queue_reason` for a queued session whose environment requires `gpu` with no such runner connected is `"waiting for a runner with capability gpu"`. `internal/runnerd/agent_test.go`: the announce carries `cfg.Capabilities`; after an `accept` with generation 7, the next event carries `Generation: 7`. `cmd/rainier/main_test.go`: `--capability gpu --capability docker.rootless` sends `"capabilities":["gpu","docker.rootless"]`.
+`runners_test.go`: a runner announcing `["gpu", "docker.rootless"]` is registered with `["placement:vm1", "gpu", "docker.rootless"]` (assert via `st.Fleet().ListRunners`) and receives `{"type":"accept","generation":1,"capabilities":["gpu","docker.rootless"]}` as its first message; one announcing `["placement:other"]` or `["GPU"]` is closed with `"registration refused"`; an event carrying `generation: 1` after the store moved to 2 is ignored (`ErrStale` path) while the same event with no generation uses the connection's; a create dispatched to the fake runner carries `placement_generation` equal to the row's, and an event echoing a stale one (the session was requeued and placed again meanwhile, so the row is at 3 and the event says 2) is ignored while one saying 3 applies. `api_test.go`: `capabilities` round-trips on create/get/update, is `[]` when absent, rejects `["GPU"]` with 400, and `queue_reason` for a queued session whose environment requires `gpu` with no such runner connected is `"waiting for a runner with capability gpu"`. `internal/runnerd/agent_test.go`: the announce carries `cfg.Capabilities`; after an `accept` with generation 7, the next event carries `Generation: 7`. `cmd/rainier/main_test.go`: `--capability gpu --capability docker.rootless` sends `"capabilities":["gpu","docker.rootless"]`.
 
 - [ ] **Step 2: Run to verify they fail** — unknown fields; unknown flag; the first message is a command.
 - [ ] **Step 3: Implement** — protocol fields; runnerd config/flag/announce/accept (`execute`'s switch gains `case "accept"`: store the generation, log `agent: accepted at generation %d with %d capabilities`); controld validation, union, `accept` send right after `registerRunner` succeeds and before reconcile's destroys; `applyRunnerEvent` generation source; the API field with the same validation; the CLI flag; the e2e scene.
@@ -523,4 +556,6 @@ Commit: `docs: capabilities, the events table, and the restored snapshot fallbac
 - A registry for environment snapshots, so a snapshot could be pulled by a non-holder: `prepull` stays advisory; the fallback is a rebuild.
 - Hosted checkpoint storage, encryption, transfer, and relocation: the hosted lifecycle and Dedicated adapter plans.
 - Runner protocol version 2 or a rolling-version window: deferred to the compatibility ADR the ADR names.
+- The relocation commands the hosted migration coordinator drives — quiesce, produce a checkpoint, verify at the destination, advance the placement generation and write lease atomically, fence the source (PRD §4.3, ADR "Relocate execution between providers"). The ADR gives OSS the guarded cutover, so these are `control` application commands; they are the first item of the post-O10 OSS backlog and are not scheduled by any plan yet.
+- A write lease with expiry and renewal on the placement generation (PRD §9 "at most one renewable write lease"): the same backlog item.
 - Controller-lease expiry, handoff, reclaim: the tenancy plan.

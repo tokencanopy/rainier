@@ -8,7 +8,7 @@
 
 **Tech Stack:** Go 1.25, PostgreSQL 16 via `jackc/pgx/v5`, `control` (amended once, in Task 1), `controlapp`, `internal/controld` memstore and pgstore.
 
-**Spec:** `rainier-cloud/docs/architecture/adr-0001-oss-cloud-composition.md` — "Workspace scope and authorization composition" (workspace identity mandatory in store methods; a resource ID or name is never authority; cross-workspace lookups fail without revealing existence), "Persistence model" (shared tables with mandatory workspace keys, composite tenant uniqueness), "Placement composition" (session placement generations distinct from provider eligibility), migration step 5; `rainier-cloud/docs/superpowers/plans/2026-08-30-hosted-implementation-program.md` gate **O8 → O9** ("Mandatory multi-workspace scope changes") and Wave 5 ("workspace scope, persistence expansion, repository enforcement, runner generations … are sequential signature/schema changes"); `rainier-cloud/docs/security/hosted-tenancy-and-security.md` §4 (locators are not authority; workspace-keyed shared tables) and §6.2 (one fenced controller generation per session); `docs/superpowers/plans/2026-08-30-self-hosted-recomposition.md` "Not in this plan" (the items it deferred here). This is OSS plan #7 in the program inventory; plan #8 (`2026-08-30-control-outbox-checkpoint-capabilities.md`) builds on the store shape this plan leaves behind.
+**Spec:** `rainier-cloud/docs/architecture/adr-0001-oss-cloud-composition.md` — "Workspace scope and authorization composition" (workspace identity mandatory in store methods; a resource ID or name is never authority; cross-workspace lookups fail without revealing existence), "Persistence model" (shared tables with mandatory workspace keys, composite tenant uniqueness), "Placement composition" (session placement generations distinct from provider eligibility), migration step 5; `rainier-cloud/docs/superpowers/plans/2026-08-30-hosted-implementation-program.md` gate **O8 → O9** ("Mandatory multi-workspace scope changes") and Wave 5 ("workspace scope, persistence expansion, repository enforcement, runner generations … are sequential signature/schema changes"); `rainier-cloud/docs/product/hosted-product-prd.md` §9 ("every resume, host recovery, or migration creates a monotonic execution generation" — one sandbox, process tree, placement, lease) and §5.1 (exactly one controller generation may send input); `rainier-cloud/docs/security/hosted-tenancy-and-security.md` §4 (locators are not authority; workspace-keyed shared tables) and §6.2 (one fenced controller generation per session); `docs/superpowers/plans/2026-08-30-self-hosted-recomposition.md` "Not in this plan" (the items it deferred here). This is OSS plan #7 in the program inventory; plan #8 (`2026-08-30-control-outbox-checkpoint-capabilities.md`) builds on the store shape this plan leaves behind.
 
 ## Global Constraints
 
@@ -34,7 +34,7 @@ Two things stay deliberately unscoped: users and credentials (identity — the h
 | Generation | Where it lives after this plan | Who advances it | Who fences on it |
 |---|---|---|---|
 | Runner (`control.Runner.Generation`) | `runners.generation` | `HostStore.NextRunnerGeneration`, once per connection, before registration | `FleetRepository.UpsertRunner` (`ErrStale` when lower than stored); `RegisterRunner`/`ReconcileRunner`/`ApplyRunnerEvent` as in O8; **new:** the heartbeat (`touchRunner`) — a superseded connection's heartbeat is refused and the connection ends |
-| Placement (`control.Session.PlacementGeneration`) | `sessions.placement_generation` | the repository, on every `Transition` whose `RunnerID` option names a runner | carried on `AttachTarget`; hosted fencing (later) |
+| Placement (`control.Session.PlacementGeneration`) | `sessions.placement_generation` | the repository, on every `Transition` whose `RunnerID` option names a runner — a placement by the scheduler, an adoption by reconcile, and (Task 1) a cold resume, which names the row's own runner because it starts a new sandbox; a warm resume unpauses the same sandbox and names none | carried on `AttachTarget`; plan 8 puts it on the runner wire and on events |
 | Controller (`control.Session.ControllerGeneration`, new) | `sessions.controller_generation` | `SessionRepository.NextControllerGeneration` (new), called by `AttachmentService` for a controller attach | carried on `AttachTarget`; the relay's controller fencing (later) |
 
 In O8 the runner generation restarted at 1 with every controld process and the controller generation lived in a map inside `controlapp`. Both are now stored, so a restart continues the sequence, and two replicas sharing a store cannot hand out the same authority twice.
@@ -93,6 +93,7 @@ This is the one coordinated `control` change of the plan (the pattern of rainier
 - Modify: `control/ports.go` (`SessionRepository`, `EnvironmentRepository.SetEnvironmentSnapshot` doc, `FleetRepository.UpsertRunner` doc)
 - Modify: `control/contract_test.go` (`fakeSessionRepository`)
 - Modify: `controlapp/attachments.go`, `controlapp/attachments_test.go`, and every `controlapp/*_test.go` fake that implements `control.SessionRepository` (`grep -ln "func (.*) SessionByIDem" controlapp/*_test.go`)
+- Modify: `controlapp/sessions.go` (`ResumeSession`'s cold path), `controlapp/sessions_test.go`
 - Modify: `internal/controld/adapt_store.go` (`storeSessions` gains the method over a process-local table), `internal/controld/controld.go` (`compose` constructs the table)
 
 **Interfaces:**
@@ -105,7 +106,7 @@ This is the one coordinated `control` change of the plan (the pattern of rainier
   // fenced against it by the attachment plane.
   ControllerGeneration uint64
   ```
-  and the `PlacementGeneration` doc gains one sentence: *"A repository advances it by one on every Transition whose RunnerID option names a runner, and leaves it unchanged otherwise — a placement is what a generation counts."*
+  and the `PlacementGeneration` doc gains one sentence: *"A repository advances it by one on every Transition whose RunnerID option names a runner, and leaves it unchanged otherwise. A generation is one sandbox on one runner: the scheduler's placement, reconcile's adoption, and a cold resume — which names the row's own runner, because it starts a new sandbox there — each open one; a warm resume unpauses the sandbox it has and opens none."*
 - Produces, on `control.SessionRepository`:
   ```go
   // NextControllerGeneration advances id's controller generation by one and
@@ -153,6 +154,37 @@ func TestControllerGenerationIsTheRepositorys(t *testing.T) {
 
 The stub's `NextControllerGeneration` increments the stored row's field and counts calls; a missing row returns `control.ErrNotFound`.
 
+In `controlapp/sessions_test.go`, beside the existing resume tests:
+
+```go
+// TestColdResumeOpensANewPlacementGeneration pins PRD §9: a cold resume
+// starts a new sandbox, so it is a placement and names the row's own runner
+// in its transition; a warm resume unpauses the sandbox it has and names
+// none. The stub repository counts a generation per transition that names
+// a runner, exactly as the contract says a store must.
+func TestColdResumeOpensANewPlacementGeneration(t *testing.T) {
+	for _, tc := range []struct {
+		from    control.SessionState
+		wantGen uint64
+	}{
+		{control.StateSuspendedCold, 2},
+		{control.StateSuspendedWarm, 1},
+	} {
+		repo := newSessionStubSessionRepo() // the file's stub, extended to bump PlacementGeneration when opts.RunnerID names a runner
+		repo.rows["sess_example"] = control.Session{ID: "sess_example", WorkspaceID: "ws_alpha", CreatorID: "act_a",
+			State: tc.from, PoolID: "pool_a", RunnerID: "runner_a", PlacementGeneration: 1}
+		svc := newSessionServiceOver(t, repo) // the file's constructor helper, with a transport whose Dispatch answers OK
+		got, err := svc.ResumeSession(ctx, alphaScope(), control.ResumeSession{ID: "sess_example"})
+		if err != nil {
+			t.Fatalf("%s: %v", tc.from, err)
+		}
+		if got.PlacementGeneration != tc.wantGen || got.RunnerID != "runner_a" {
+			t.Fatalf("%s: generation %d on %q, want %d on runner_a", tc.from, got.PlacementGeneration, got.RunnerID, tc.wantGen)
+		}
+	}
+}
+```
+
 - [ ] **Step 2: Run it to verify it fails**
 
 Run: `go test ./controlapp -run TestControllerGenerationIsTheRepositorys`
@@ -184,7 +216,11 @@ func (s *AttachmentService) grantGeneration(ctx context.Context, row control.Ses
 }
 ```
 
-and its one call site passes `ctx, row, cmd.Mode`. Update the package doc sentence in `controlapp/doc.go` ("grants a fenced controller generation" → "grants the repository's next controller generation"). Every `SessionRepository` fake in `controlapp/*_test.go` gains the method (a counter over its rows, `ErrNotFound` when absent).
+and its one call site passes `ctx, row, cmd.Mode`.
+
+`controlapp/sessions.go` `ResumeSession` (the transition at `sessions.go:540` on `main`, `control.TransitionOpts{}` for both suspended states): the cold branch passes `control.TransitionOpts{RunnerID: &row.RunnerID}` — the row's own runner, so the store opens a new placement generation for the new sandbox — and the warm branch stays empty. Add the sentence to `ResumeSession`'s doc comment: *"A cold resume is a placement: it names the session's runner again so the repository opens a new generation for the sandbox it starts; a warm resume unpauses the sandbox it has."*
+
+Update the package doc sentence in `controlapp/doc.go` ("grants a fenced controller generation" → "grants the repository's next controller generation"). Every `SessionRepository` fake in `controlapp/*_test.go` gains the method (a counter over its rows, `ErrNotFound` when absent).
 
 `internal/controld/adapt_store.go`: until Task 2 makes it durable, the self-hosted adapter keeps the lease where it always was — in process memory — but on the host's side of the port:
 
@@ -208,13 +244,13 @@ func (l *controllerLeases) current(id control.SessionID) uint64 { /* lock; retur
 - [ ] **Step 4: Run the gates**
 
 Run: `go test ./control ./controlapp -race -count=3 && go test ./internal/controld/... -race -count=2 && scripts/check-public-control.sh && make verify`
-Expected: all pass; the attach tests in `internal/controld` (`attach_test.go`, `adapt_attach_test.go`) are unchanged and green — the wire never carried the generation.
+Expected: all pass; the attach tests in `internal/controld` (`attach_test.go`, `adapt_attach_test.go`) are unchanged and green — the wire never carried the generation — and the O8 adapter's `Transition` ignores the named runner's effect on a generation it does not yet store (`sessionToControl` still answers 1), which Task 2 makes real.
 
 - [ ] **Step 5: Commit and open the coordinated PR**
 
 ```bash
 git add control controlapp internal/controld/adapt_store.go internal/controld/controld.go
-git commit -m "feat(control): make the controller generation the repository's"
+git commit -m "feat(control): make the controller generation the repository's; a cold resume opens a placement generation"
 ```
 
 PR body names it as the plan's Task 1 and lists the three doc sentences verbatim. Merge before Task 2's worktree is created.
