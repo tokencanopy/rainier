@@ -963,18 +963,6 @@ func closeRunner(c *websocket.Conn, code websocket.StatusCode, reason string) {
 	}
 }
 
-// envID is env's id, or "" for a scratch session's absent environment — so a
-// log line can name the environment without every call site guarding a nil.
-// It travelled here with the rest of sched.go's survivors when the scheduler
-// itself moved into controlapp; its one caller is the create handler's
-// repository preflight.
-func envID(env *Environment) string {
-	if env == nil {
-		return ""
-	}
-	return env.ID
-}
-
 // clip bounds runner-supplied text before it reaches a log line or a
 // websocket close reason (the protocol caps those at 123 bytes), keeping the
 // result valid UTF-8 even when the cut lands mid-rune.

@@ -270,3 +270,14 @@ func uniqueDir(taken map[string]bool, owner, name string) string {
 		}
 	}
 }
+
+// envID names env in a log line, or "" for a scratch session, so a call site
+// can say which environment it was working from without guarding a nil. Its
+// one caller is the create handler's repository preflight; it lives here with
+// the rest of the repository resolution it belongs to.
+func envID(env *Environment) string {
+	if env == nil {
+		return ""
+	}
+	return env.ID
+}

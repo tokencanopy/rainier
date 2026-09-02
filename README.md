@@ -22,6 +22,18 @@ boot and push back as you. Deploying it:
 and
 [`docs/superpowers/specs/2026-08-29-plan5-github-vault-design.md`](docs/superpowers/specs/2026-08-29-plan5-github-vault-design.md).
 
+Since the Wave 4 extraction, `controld` is composed rather than monolithic:
+the portable session lifecycle, in-pool placement, runner reconciliation, and
+attach/workspace orchestration live once, in
+[`controlapp`](controlapp/doc.go), behind the frozen public
+[`control`](control/doc.go) contract. `internal/controld` supplies the
+adapters that contract needs — the store as workspace-keyed repositories,
+GitHub-login roles as the authorizer, the vault as launch material, the runner
+websocket as the transport, dial-back pairing as the attach broker — and keeps
+only what is genuinely host-specific: HTTP/WebSocket handling, GitHub login,
+secrets, and the sandbox's upward credential request. Rainier Cloud composes
+the same `controlapp` with its own adapters.
+
 ## Quickstart
 
 ```bash
