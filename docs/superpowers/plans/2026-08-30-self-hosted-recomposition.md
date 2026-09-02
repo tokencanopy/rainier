@@ -494,7 +494,7 @@ The mapping table (fixed; later tasks call it and never invent a second):
 | `context.Canceled`, `DeadlineExceeded` | — | — | write nothing (client went away) |
 | anything else | 500 | `internal` | `"internal error"` |
 
-Until Task 5 supplies the real transport, `New` wires a `notYetTransport` whose `Connected` returns false and whose `Dispatch` returns `control.ErrUnavailable`; until Task 6, a `notYetBroker` that returns `control.ErrUnavailable`. Nothing calls the services until Task 4, so the server's behavior is unchanged after Task 3. `New` does **not** start `fleet.Run`; Task 5 does.
+Task 3 also provides `runnerTransport` (`adapt_transport.go`, with `adapt_transport_test.go`): today's `dispatch` moved behind `control.RunnerTransport` over the existing connection map, plus the `session_rpc` correlation Task 6 needs. It is composed from the start so Task 4's rewired handlers reach real connections; the old `dispatch` remains until Task 5 deletes it with its last callers. Until Task 6, `New` wires a `notYetBroker` whose `Attach` returns `control.ErrUnavailable`. Nothing calls the services until Task 4, so the server's behavior is unchanged after Task 3. `New` does **not** start `fleet.Run`; Task 5 does.
 
 Gate: `go build ./... && go test ./internal/controld -race -count=1` unchanged-green; `adapt_http_test.go` pins every row of the table.
 
@@ -585,8 +585,7 @@ Report: the diff of passing test names, every modified existing test with the de
 ### Task 5: Runner transport and the fleet service
 
 **Files:**
-- Create: `internal/controld/adapt_transport.go`
-- Create: `internal/controld/adapt_transport_test.go`
+- Consume (provided by Task 3, do not rewrite): `internal/controld/adapt_transport.go`, `internal/controld/adapt_transport_test.go`
 - Modify: `internal/controld/runners.go` — `handleRunnerConnect`, `readLoop`, `touchRunner`, `connectRunner`, `retireRunner` kept and reshaped; **delete** `applyEvent`, `placedExactlyOn`, `reconcile`, `reconcilePresent`, `reconcileMissing`, `reconcileUnplaced`, `destroyOrphan`, `transitionQuiet`, `announcedState`, `dispatch`, `drain`; **keep** `failStage`/`stageFailure` (detail composition), `cacheEnvironment`, `snapshotWanted`, `buildSnapshot`, `snapshotRef`, `rejectCredential`, `runnerConn` and its loops, `sendToRunner`, `broadcastToRunners`, `conn`, `isCurrentConn`, `nameLock`, `registerRunner`, `runnerTokenOK`, `closeRunner`, `clip`
 - Delete: `internal/controld/sched.go` (everything remaining after Task 2's moves)
 - Modify: `internal/controld/sched_test.go` — per the white-box rule
@@ -671,9 +670,9 @@ func (s *Server) applyRunnerEvent(ctx context.Context, name string, m runner.Fro
 
 Delete `sched.go`. For each `sched_test.go` test, apply the white-box rule: `createSpec`/`applyRepos` cases → `adapt_launch_test.go` or already covered by `TestLaunchMaterial*`; `pickRunner`/`pickForSession` → `controlapp` `TestPickRunner*`/`TestPickForEnvironment*`; `dispatchCreate` → `controlapp` `TestDispatchCreate*`; `drainQueue` → `controlapp` `TestDrainPool*`. Placement-pin cases become capability cases (`placement:<name>`) — and the busy-snapshot-runner fallback case is **D3** (delete with the deviation cited).
 
-- [ ] **Step 1: Write the transport tests**
+- [ ] **Step 1: Confirm the transport's tests already cover what this task relies on**
 
-`adapt_transport_test.go`: using the existing websocket test harness from `runners_test.go` (a fake runnerd that answers `result` and `session_req`/`resp`): `Dispatch` of a `destroy` returns the result; `Dispatch` of a `session_rpc` returns a `session_req` `FromRunner` whose `RPC.ID` equals the request's and `Method == "resp"`; a disconnected runner → `ErrUnavailable` with no runner text in the error string; a timeout → `ErrUnavailable`; `Connected` reflects the map.
+`adapt_transport_test.go` (Task 3) pins `result` correlation by `ReqID`, `session_rpc` correlation by envelope ID, `ErrUnavailable` for an unknown runner / foreign pool / timeout / closed connection with no runner text in the error, caller cancellation, and `Connected`. Add a case only if this task needs a behavior those do not pin; report any addition.
 
 - [ ] **Step 2: Write the generation-fencing test**
 
