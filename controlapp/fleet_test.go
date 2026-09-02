@@ -1604,6 +1604,10 @@ func TestApplyRunnerEventChildExitIdempotentAndConflict(t *testing.T) {
 	})
 }
 
+// TestApplyRunnerEventEmptyEventIDRejectedBeforeMutation pins that an ID
+// generator that cannot answer fails the call before any mutation, and that it
+// fails as ErrUnavailable: the runner's event is well-formed, so a runner
+// adapter must be free to retry rather than be told its report was malformed.
 func TestApplyRunnerEventEmptyEventIDRejectedBeforeMutation(t *testing.T) {
 	fx := newFleetFixture(t)
 	fx.st.seedRunner(fleetEventRunner(1))
@@ -1616,8 +1620,8 @@ func TestApplyRunnerEventEmptyEventIDRejectedBeforeMutation(t *testing.T) {
 		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
 		Generation: 1, SessionID: "sess_example", State: control.StateRunning,
 	}
-	if err := fx.service.ApplyRunnerEvent(fleetCtx, event); !errors.Is(err, control.ErrInvalid) {
-		t.Fatalf("got %v, want ErrInvalid", err)
+	if err := fx.service.ApplyRunnerEvent(fleetCtx, event); !errors.Is(err, control.ErrUnavailable) {
+		t.Fatalf("got %v, want ErrUnavailable", err)
 	}
 	if fx.st.transitionCalls != 0 {
 		t.Fatalf("transitionCalls = %d, want 0 (no mutation)", fx.st.transitionCalls)
@@ -1649,5 +1653,226 @@ func TestApplyRunnerEventRecordFailureIsUnavailable(t *testing.T) {
 	}
 	if len(fx.events.recorded()) != 0 {
 		t.Fatalf("recorded %d events, want 0", len(fx.events.recorded()))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// closed-sentinel error model
+// ---------------------------------------------------------------------------
+
+// fleetAdapterErr stands in for the error a real persistence or transport
+// adapter produces. Its text is exactly what must never leave the service: a
+// driver prefix, a table name, and a host and user from a connection string.
+var fleetAdapterErr = errors.New(`pq: relation "runners" does not exist (host=db.internal.invalid user=rainier)`)
+
+// fleetControlSentinels is the closed error set control/errors.go defines.
+var fleetControlSentinels = []error{
+	control.ErrInvalid, control.ErrDenied, control.ErrNotFound, control.ErrConflict,
+	control.ErrStale, control.ErrUnavailable, control.ErrUnsupported,
+}
+
+func fleetIsControlSentinel(err error) bool {
+	for _, s := range fleetControlSentinels {
+		if errors.Is(err, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestFleetPortErrorsNeverLeaveTheService pins the frozen contract's error
+// model on every control.Fleet method: an adapter failure is reported through
+// one of the seven closed sentinels, and the adapter's own text — which may
+// name a table, a host, or a credential — never reaches the caller.
+func TestFleetPortErrorsNeverLeaveTheService(t *testing.T) {
+	cases := []struct {
+		name   string
+		inject func(fx *fleetFixture)
+		call   func(fx *fleetFixture) error
+	}{
+		{
+			name:   "RegisterRunner/ListRunners",
+			inject: func(fx *fleetFixture) { fx.st.listRunnersErr = fleetAdapterErr },
+			call: func(fx *fleetFixture) error {
+				_, err := fx.service.RegisterRunner(fleetCtx, control.RunnerRegistration{
+					WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+					Generation: 1, CapacityTotal: 4,
+				})
+				return err
+			},
+		},
+		{
+			name:   "RegisterRunner/UpsertRunner",
+			inject: func(fx *fleetFixture) { fx.st.upsertErr = fleetAdapterErr },
+			call: func(fx *fleetFixture) error {
+				_, err := fx.service.RegisterRunner(fleetCtx, control.RunnerRegistration{
+					WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+					Generation: 1, CapacityTotal: 4,
+				})
+				return err
+			},
+		},
+		{
+			name:   "ReconcileRunner/ListRunners",
+			inject: func(fx *fleetFixture) { fx.st.listRunnersErr = fleetAdapterErr },
+			call: func(fx *fleetFixture) error {
+				_, err := fx.service.ReconcileRunner(fleetCtx, fleetSnapshotFor(1))
+				return err
+			},
+		},
+		{
+			name:   "ReconcileRunner/UpsertRunner",
+			inject: func(fx *fleetFixture) { fx.st.upsertErr = fleetAdapterErr },
+			call: func(fx *fleetFixture) error {
+				_, err := fx.service.ReconcileRunner(fleetCtx, fleetSnapshotFor(1))
+				return err
+			},
+		},
+		{
+			name: "ReconcileRunner/Transition",
+			inject: func(fx *fleetFixture) {
+				fx.st.seedRunner(fleetEventRunner(1))
+				fx.st.seedSession(control.Session{
+					ID: "sess_example", WorkspaceID: "ws_example", State: control.StateRunning,
+					PoolID: "pool_example", RunnerID: "runner_example",
+				})
+				fx.st.transitionErr = fleetAdapterErr
+			},
+			call: func(fx *fleetFixture) error {
+				// The snapshot reports no sessions, so the stored running row
+				// is lost at announce and must be transitioned to dead.
+				_, err := fx.service.ReconcileRunner(fleetCtx, fleetSnapshotFor(1))
+				return err
+			},
+		},
+		{
+			name:   "ListRunners/EligiblePools",
+			inject: func(fx *fleetFixture) { fx.pools.deny = fleetAdapterErr },
+			call: func(fx *fleetFixture) error {
+				_, err := fx.service.ListRunners(fleetCtx, fleetValidScope(), control.RunnerQuery{})
+				return err
+			},
+		},
+		{
+			name: "ListRunners/fleet.ListRunners",
+			inject: func(fx *fleetFixture) {
+				fx.pools.pools = []control.Pool{{ID: "pool_example", CapacityTotal: 4}}
+				fx.st.listRunnersErr = fleetAdapterErr
+			},
+			call: func(fx *fleetFixture) error {
+				_, err := fx.service.ListRunners(fleetCtx, fleetValidScope(), control.RunnerQuery{})
+				return err
+			},
+		},
+		{
+			name:   "ApplyRunnerEvent/GetSession",
+			inject: func(fx *fleetFixture) { fx.st.getSessionErr = fleetAdapterErr },
+			call: func(fx *fleetFixture) error {
+				return fx.service.ApplyRunnerEvent(fleetCtx, fleetEventFor(1, control.StateRunning))
+			},
+		},
+		{
+			name: "ApplyRunnerEvent/ListRunners",
+			inject: func(fx *fleetFixture) {
+				fx.st.seedSession(control.Session{
+					ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
+					PoolID: "pool_example", RunnerID: "runner_example",
+				})
+				fx.st.listRunnersErr = fleetAdapterErr
+			},
+			call: func(fx *fleetFixture) error {
+				return fx.service.ApplyRunnerEvent(fleetCtx, fleetEventFor(1, control.StateRunning))
+			},
+		},
+		{
+			name: "ApplyRunnerEvent/Transition",
+			inject: func(fx *fleetFixture) {
+				fx.st.seedRunner(fleetEventRunner(1))
+				fx.st.seedSession(control.Session{
+					ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
+					PoolID: "pool_example", RunnerID: "runner_example",
+				})
+				fx.st.transitionErr = fleetAdapterErr
+			},
+			call: func(fx *fleetFixture) error {
+				return fx.service.ApplyRunnerEvent(fleetCtx, fleetEventFor(1, control.StateRunning))
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFleetFixture(t)
+			tc.inject(fx)
+			err := tc.call(fx)
+			if err == nil {
+				t.Fatal("injected adapter failure produced no error")
+			}
+			if !fleetIsControlSentinel(err) {
+				t.Fatalf("error is not a closed control sentinel: %v", err)
+			}
+			if strings.Contains(err.Error(), "db.internal.invalid") ||
+				strings.Contains(err.Error(), "relation") {
+				t.Fatalf("adapter text escaped the service: %v", err)
+			}
+		})
+	}
+}
+
+// fleetSnapshotFor builds a well-formed snapshot at generation gen reporting
+// no sessions.
+func fleetSnapshotFor(gen uint64) control.RunnerSnapshot {
+	return control.RunnerSnapshot{
+		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+		Generation: gen, CapacityUsed: 0, CapacityTotal: 4,
+	}
+}
+
+// fleetEventFor builds a well-formed lifecycle event at generation gen.
+func fleetEventFor(gen uint64, state control.SessionState) control.RunnerEvent {
+	return control.RunnerEvent{
+		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+		Generation: gen, SessionID: "sess_example", State: state,
+	}
+}
+
+// TestReconcileRunnerFencedByConcurrentWriteOnEveryPath pins that all three
+// accepted reconcile paths — a newer generation, the same generation, and an
+// unknown runner — answer a lost race to a concurrent higher-generation write
+// the same way: the store-authoritative generation with Fenced set, so the
+// runner has something to resync to, and no error the caller cannot act on.
+func TestReconcileRunnerFencedByConcurrentWriteOnEveryPath(t *testing.T) {
+	cases := []struct {
+		name        string
+		storedGen   uint64
+		snapshotGen uint64
+	}{
+		{name: "newer generation", storedGen: 1, snapshotGen: 2},
+		{name: "same generation", storedGen: 1, snapshotGen: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFleetFixture(t)
+			fx.st.seedRunner(control.Runner{
+				ID: "runner_example", PoolID: "pool_example",
+				Generation: tc.storedGen, CapacityTotal: 4,
+			})
+			fx.st.upsertErr = control.ErrStale
+			fx.st.staleBump = 9
+
+			got, err := fx.service.ReconcileRunner(fleetCtx, fleetSnapshotFor(tc.snapshotGen))
+			if err != nil {
+				t.Fatalf("a lost race is an answer, not an error: %v", err)
+			}
+			if !got.Fenced {
+				t.Fatalf("result = %+v, want Fenced", got)
+			}
+			if got.Generation != 9 {
+				t.Fatalf("Generation = %d, want the store-authoritative 9", got.Generation)
+			}
+			if len(got.Destroy) != 0 {
+				t.Fatalf("Destroy = %v, want none on a fenced snapshot", got.Destroy)
+			}
+		})
 	}
 }

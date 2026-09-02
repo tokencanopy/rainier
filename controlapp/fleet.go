@@ -140,7 +140,7 @@ func (s *FleetService) RegisterRunner(ctx context.Context, r control.RunnerRegis
 	}
 	runners, err := s.fleet.ListRunners(ctx, r.PoolID)
 	if err != nil {
-		return control.RunnerRegistrationResult{}, err
+		return control.RunnerRegistrationResult{}, fleetPortError(err)
 	}
 	current := uint64(0)
 	found := false
@@ -175,7 +175,7 @@ func (s *FleetService) RegisterRunner(ctx context.Context, r control.RunnerRegis
 			}
 			return control.RunnerRegistrationResult{Accepted: false, Generation: gen}, nil
 		}
-		return control.RunnerRegistrationResult{}, err
+		return control.RunnerRegistrationResult{}, fleetPortError(err)
 	}
 	s.Wake(r.PoolID)
 	return control.RunnerRegistrationResult{Accepted: true, Generation: r.Generation}, nil
@@ -187,7 +187,7 @@ func (s *FleetService) RegisterRunner(ctx context.Context, r control.RunnerRegis
 func (s *FleetService) authoritativeGeneration(ctx context.Context, pool control.PoolID, id control.RunnerID) (uint64, error) {
 	runners, err := s.fleet.ListRunners(ctx, pool)
 	if err != nil {
-		return 0, err
+		return 0, fleetPortError(err)
 	}
 	for _, existing := range runners {
 		if existing.ID == id {
@@ -195,6 +195,43 @@ func (s *FleetService) authoritativeGeneration(ctx context.Context, pool control
 		}
 	}
 	return 0, nil
+}
+
+// fleetPortError normalizes a port error to the closed control sentinel
+// vocabulary, so an adapter's SQL, connection string, or provider text can
+// never leave this service through a control.Fleet method. Context
+// cancellation and deadline propagation are preserved (the caller went away,
+// which is not a dependency failure); a sentinel the port already reported
+// passes through unchanged; every other adapter failure is ErrUnavailable.
+//
+// It is deliberately the same normalization the attach lane applies at its own
+// port boundary; the two collapse into one shared helper once the extraction
+// lanes land together.
+func fleetPortError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	switch {
+	case errors.Is(err, control.ErrInvalid):
+		return control.ErrInvalid
+	case errors.Is(err, control.ErrDenied):
+		return control.ErrDenied
+	case errors.Is(err, control.ErrNotFound):
+		return control.ErrNotFound
+	case errors.Is(err, control.ErrConflict):
+		return control.ErrConflict
+	case errors.Is(err, control.ErrStale):
+		return control.ErrStale
+	case errors.Is(err, control.ErrUnavailable):
+		return control.ErrUnavailable
+	case errors.Is(err, control.ErrUnsupported):
+		return control.ErrUnsupported
+	default:
+		return control.ErrUnavailable
+	}
 }
 
 // validateRegistration rejects a malformed or contradictory claim before any
@@ -250,7 +287,7 @@ func (s *FleetService) ListRunners(ctx context.Context, scope control.Scope, q c
 
 	pools, err := s.pools.EligiblePools(ctx, scope, control.Requirements{})
 	if err != nil {
-		return control.RunnerPage{}, err
+		return control.RunnerPage{}, fleetPortError(err)
 	}
 
 	seenPools := make(map[control.PoolID]struct{}, len(pools))
@@ -262,7 +299,7 @@ func (s *FleetService) ListRunners(ctx context.Context, scope control.Scope, q c
 		seenPools[pool.ID] = struct{}{}
 		runners, err := s.fleet.ListRunners(ctx, pool.ID)
 		if err != nil {
-			return control.RunnerPage{}, err
+			return control.RunnerPage{}, fleetPortError(err)
 		}
 		for _, r := range runners {
 			r.Capabilities = slices.Clone(r.Capabilities)
@@ -344,7 +381,7 @@ func (s *FleetService) ReconcileRunner(ctx context.Context, snap control.RunnerS
 	}
 	runners, err := s.fleet.ListRunners(ctx, snap.PoolID)
 	if err != nil {
-		return control.ReconcileResult{}, err
+		return control.ReconcileResult{}, fleetPortError(err)
 	}
 	var current *control.Runner
 	for i := range runners {
@@ -355,35 +392,25 @@ func (s *FleetService) ReconcileRunner(ctx context.Context, snap control.RunnerS
 	}
 
 	authoritative := snap.Generation
-	switch {
-	case current != nil && snap.Generation < current.Generation:
+	if current != nil && snap.Generation < current.Generation {
 		return control.ReconcileResult{Generation: current.Generation, Fenced: true}, nil
-	case current != nil && snap.Generation > current.Generation:
-		if err := s.upsertSnapshotRunner(ctx, snap, current); err != nil {
-			return control.ReconcileResult{}, err
-		}
-		s.Wake(snap.PoolID)
-	case current != nil:
+	}
+	if current != nil && snap.Generation == current.Generation {
 		// Same generation: refresh the runner's authoritative capacity,
-		// connection, and last-seen without weakening the fence. A concurrent
-		// higher-generation write still wins and fences this snapshot.
+		// connection, and last-seen without weakening the fence.
 		authoritative = current.Generation
-		if err := s.upsertSnapshotRunner(ctx, snap, current); err != nil {
-			if errors.Is(err, control.ErrStale) {
-				gen, rerr := s.authoritativeGeneration(ctx, snap.PoolID, snap.RunnerID)
-				if rerr != nil {
-					return control.ReconcileResult{}, rerr
-				}
-				return control.ReconcileResult{Generation: gen, Fenced: true}, nil
-			}
-			return control.ReconcileResult{}, err
-		}
-		s.Wake(snap.PoolID)
-	case current == nil:
-		if err := s.upsertSnapshotRunner(ctx, snap, nil); err != nil {
-			return control.ReconcileResult{}, err
-		}
-		s.Wake(snap.PoolID)
+	}
+	// A newer snapshot records its generation as the new authority; an unknown
+	// runner is inserted at the generation it claims. All three accepted paths
+	// lose the same way — to a concurrent higher-generation write — so all
+	// three answer it the same way, with the generation the runner must
+	// resync to rather than a bare error it cannot act on.
+	gen, fenced, err := s.recordSnapshotAuthority(ctx, snap, current)
+	if err != nil {
+		return control.ReconcileResult{}, err
+	}
+	if fenced {
+		return control.ReconcileResult{Generation: gen, Fenced: true}, nil
 	}
 
 	destroy, err := s.reconcileSessions(ctx, snap)
@@ -434,6 +461,26 @@ func (s *FleetService) upsertSnapshotRunner(ctx context.Context, snap control.Ru
 	})
 }
 
+// recordSnapshotAuthority records snap as the runner's authoritative
+// generation and wakes the pool. It reports fenced when a concurrent
+// higher-generation write won the race, carrying the store-authoritative
+// generation the runner must resync to; every other port failure is
+// normalized to a closed control sentinel.
+func (s *FleetService) recordSnapshotAuthority(ctx context.Context, snap control.RunnerSnapshot, existing *control.Runner) (uint64, bool, error) {
+	if err := s.upsertSnapshotRunner(ctx, snap, existing); err != nil {
+		if errors.Is(err, control.ErrStale) {
+			gen, rerr := s.authoritativeGeneration(ctx, snap.PoolID, snap.RunnerID)
+			if rerr != nil {
+				return 0, false, rerr
+			}
+			return gen, true, nil
+		}
+		return 0, false, fleetPortError(err)
+	}
+	s.Wake(snap.PoolID)
+	return 0, false, nil
+}
+
 // reconcileSessions settles the stored live sessions against the reported set
 // and collects orphans for teardown. It is idempotent: repeat calls with the
 // same snapshot produce the same Destroy list and no additional mutation.
@@ -444,7 +491,7 @@ func (s *FleetService) reconcileSessions(ctx context.Context, snap control.Runne
 	}
 	stored, err := s.fleet.SessionsOnRunner(ctx, snap.PoolID, snap.RunnerID, states)
 	if err != nil {
-		return nil, err
+		return nil, fleetPortError(err)
 	}
 
 	storedByID := make(map[control.SessionID]control.Session, len(stored))
@@ -506,7 +553,7 @@ func (s *FleetService) reconcileSessions(ctx context.Context, snap control.Runne
 		case errors.Is(err, control.ErrNotFound):
 			destroy = append(destroy, reported.SessionID)
 		case err != nil:
-			return nil, err
+			return nil, fleetPortError(err)
 		case row.State.Terminal():
 			destroy = append(destroy, reported.SessionID)
 		case row.WorkspaceID != snap.WorkspaceID || row.PoolID != snap.PoolID || row.RunnerID != snap.RunnerID:
@@ -544,7 +591,7 @@ func (s *FleetService) transitionQuiet(ctx context.Context, ws control.Workspace
 	if err == nil || errors.Is(err, control.ErrConflict) || errors.Is(err, control.ErrNotFound) {
 		return nil
 	}
-	return err
+	return fleetPortError(err)
 }
 
 // maxDetailBytes is the bound on runner-supplied free text before it reaches
@@ -591,7 +638,7 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 		if errors.Is(err, control.ErrNotFound) {
 			return control.ErrStale
 		}
-		return err
+		return fleetPortError(err)
 	}
 	if row.WorkspaceID != event.WorkspaceID || row.PoolID != event.PoolID || row.RunnerID != event.RunnerID {
 		return control.ErrStale
@@ -599,7 +646,7 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 
 	runners, err := s.fleet.ListRunners(ctx, event.PoolID)
 	if err != nil {
-		return err
+		return fleetPortError(err)
 	}
 	matched := false
 	for _, r := range runners {
@@ -616,10 +663,15 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 	}
 
 	// Mint and validate the event identity before any mutation: a broken ID
-	// generator must fail the call instead of mutating silently.
+	// generator must fail the call instead of mutating silently. It is
+	// ErrUnavailable, not ErrInvalid — the event the runner sent is
+	// well-formed, it is this service's own dependency that cannot answer, and
+	// a runner adapter must be free to retry rather than be told its report
+	// was malformed. The session and attach lanes answer the same condition
+	// the same way.
 	eventID := s.ids.NewEventID()
 	if eventID == "" {
-		return control.ErrInvalid
+		return control.ErrUnavailable
 	}
 
 	if event.ChildExitCode != nil {
@@ -635,7 +687,7 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 			if errors.Is(err, control.ErrNotFound) {
 				return control.ErrStale
 			}
-			return err
+			return fleetPortError(err)
 		}
 		return s.recordLifecycleEvent(ctx, event, row, eventID)
 	}
@@ -669,7 +721,7 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 	case errors.Is(err, control.ErrNotFound):
 		return control.ErrStale
 	default:
-		return err
+		return fleetPortError(err)
 	}
 }
 
