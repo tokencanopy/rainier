@@ -20,7 +20,8 @@ func main() {
 	egressAdmin := flag.String("egress-admin", "http://egressd:3129", "egressd admin URL")
 	slots := flag.Int("slots", 16, "capacity")
 	controld := flag.String("controld", "", "controld URL to dial (ws://host:port); enables agent (dial) mode when set")
-	runnerToken := flag.String("runner-token", "", "bearer token for the controld dial (required when --controld is set)")
+	runnerToken := flag.String("runner-token", envDefault("RAINIER_RUNNER_TOKEN", ""),
+		"bearer token for the controld dial (required when --controld is set; or set RAINIER_RUNNER_TOKEN, which keeps it out of the process list)")
 	hostname, _ := os.Hostname()
 	runnerName := flag.String("runner-name", hostname, "name this runner announces to controld")
 	proxyURL := flag.String("proxy-url", "", "egress proxy URL injected into every session (forwarded to controld dial mode)")
@@ -66,4 +67,15 @@ func main() {
 	}); err != nil {
 		log.Fatalf("agent: %v", err)
 	}
+}
+
+// envDefault returns env's value when it is set and non-empty, else def — the
+// same rule cmd/controld applies to every one of its flags, so a secret can be
+// handed to runnerd through the environment instead of the command line,
+// where every user on the host could read it with ps.
+func envDefault(env, def string) string {
+	if v := os.Getenv(env); v != "" {
+		return v
+	}
+	return def
 }
