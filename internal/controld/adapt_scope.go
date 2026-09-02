@@ -44,16 +44,6 @@ func userScope(u User) control.Scope {
 	}
 }
 
-// serviceScope is the scope the runner plane acts under: a narrowly scoped
-// service principal named for the runner, never a user.
-func serviceScope(runner string) control.Scope {
-	return control.Scope{
-		WorkspaceID: installWorkspace,
-		Actor:       control.Actor{ID: control.ActorID("runner:" + runner), Kind: control.ActorService},
-		Placement:   installPlacement(),
-	}
-}
-
 // userContextKey carries the authenticated User from the request wrapper to
 // the authorization adapter. The Scope deliberately carries no role
 // (control/scope.go), so the adapter reads the role from here and requires

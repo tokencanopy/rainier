@@ -70,7 +70,7 @@ func TestOwnerOrAdminMatrix(t *testing.T) {
 	if err := (ownerOrAdmin{}).Authorize(withUser(context.Background(), other), userScope(owner), control.ActionGet, sess); !errors.Is(err, control.ErrDenied) {
 		t.Fatalf("scope/context disagreement: got %v", err)
 	}
-	if err := (ownerOrAdmin{}).Authorize(withUser(context.Background(), owner), serviceScope("runner-a"), control.ActionGet, sess); !errors.Is(err, control.ErrDenied) {
+	if err := (ownerOrAdmin{}).Authorize(withUser(context.Background(), owner), control.Scope{WorkspaceID: installWorkspace, Actor: control.Actor{ID: "runner:runner-a", Kind: control.ActorService}, Placement: installPlacement()}, control.ActionGet, sess); !errors.Is(err, control.ErrDenied) {
 		t.Fatalf("service scope carrying a user context: got %v", err)
 	}
 }

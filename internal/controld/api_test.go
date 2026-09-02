@@ -113,28 +113,6 @@ func assertKeySet(t *testing.T, raw string, want ...string) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// authorizeOwnerOrAdmin (unit)
-// ---------------------------------------------------------------------------
-
-func TestAuthorizeOwnerOrAdmin(t *testing.T) {
-	admin := User{ID: "usr_admin", Role: "admin"}
-	owner := User{ID: "usr_owner", Role: "member"}
-	other := User{ID: "usr_other", Role: "member"}
-	row := Session{OwnerID: "usr_owner"}
-
-	if !authorizeOwnerOrAdmin(admin, row) {
-		t.Error("admin should be authorized regardless of ownership")
-	}
-	if !authorizeOwnerOrAdmin(owner, row) {
-		t.Error("owner should be authorized")
-	}
-	if authorizeOwnerOrAdmin(other, row) {
-		t.Error("non-owner non-admin should not be authorized")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Handler route vocabulary — the /v0/ cut's contract pin
 // ---------------------------------------------------------------------------
 

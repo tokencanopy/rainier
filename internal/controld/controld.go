@@ -1,4 +1,32 @@
-// internal/controld/controld.go
+// Package controld is the self-hosted Rainier control plane: the HTTP and
+// WebSocket surface, GitHub login, the secrets vault, and the runner plane,
+// composed over the portable application services in
+// github.com/tokencanopy/rainier/controlapp behind the frozen public
+// github.com/tokencanopy/rainier/control contract.
+//
+// The split is deliberate and the tests hold it: session lifecycle, in-pool
+// placement, runner reconciliation and event application, and attach and
+// workspace orchestration live once, in controlapp, and this package reaches
+// them only through the four services New composes. What this package owns is
+// the host side of each port (adapt_*.go) — the single-tenant Store as
+// workspace-keyed repositories under one installation workspace and pool, the
+// GitHub-role rule as the authorizer and attachment policy, the vault and
+// connectors as launch material, the runner websocket as the transport, the
+// dial-back pairing as the attach broker — plus everything with no portable
+// counterpart: request decoding and JSON rendering, GitHub login and tokens,
+// secrets and credentials, the sandbox's upward credential-mint RPC, and the
+// setup_done snapshot arm.
+//
+// The store is read directly, never for a decision, in a handful of places:
+// an environment referenced by name, the missing-secret and
+// missing-credential preflights at create, a pinned runner's free slots for
+// a session's queue_reason, an environment's snapshot runner for its view,
+// the count behind an in-use refusal, the session behind a runner's
+// setup_done or credential_rejected, and the owner check and readiness wait
+// that precede a terminal's WebSocket upgrade. The direct writes that remain
+// are the runner heartbeat and disconnect flags, the environment snapshot
+// after setup_done, credential status, secrets, users, and tokens —
+// transport bookkeeping and host policy, never lifecycle.
 package controld
 
 import (

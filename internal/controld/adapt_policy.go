@@ -10,7 +10,7 @@ import (
 // ownerOrAdmin is the self-hosted authorization adapter, and from here on the
 // single source of truth for the matrix the HTTP handlers used to enforce one
 // route wrapper at a time: reads are team-wide, session mutations are
-// owner-or-admin (api.go's authorizeOwnerOrAdmin), and the fleet-wide writes —
+// owner-or-admin (once api.go's authorizeOwnerOrAdmin), and the fleet-wide writes —
 // environments — are admin-only (auth.go's requireAdmin), because a resource
 // the whole team shares has no owner to fall back on.
 //

@@ -401,13 +401,6 @@ func decodeJSONBodyLimit(w http.ResponseWriter, r *http.Request, v any, limit in
 	return true
 }
 
-// authorizeOwnerOrAdmin reports whether u may mutate row: object-level
-// authorization per design §4.4 — reads are team-wide, mutations are
-// owner-or-admin.
-func authorizeOwnerOrAdmin(u User, row Session) bool {
-	return u.Role == "admin" || u.ID == row.OwnerID
-}
-
 // ---------------------------------------------------------------------------
 // the session service's errors on the wire
 // ---------------------------------------------------------------------------
@@ -515,7 +508,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 
 	var env *control.Environment
 	if req.Environment != "" {
-		resolved, ok := s.createEnvironment(w, ctx, scope, req.Environment)
+		resolved, ok := s.createSessionEnvironment(w, ctx, scope, req.Environment)
 		if !ok {
 			return
 		}
@@ -552,11 +545,11 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 	writeJSON(w, http.StatusAccepted, sessionEnvelope{Session: s.renderer(ctx).view(created)})
 }
 
-// createEnvironment resolves a create body's `environment` to the environment
+// createSessionEnvironment resolves a create body's `environment` to the environment
 // the session starts from. A reference nothing answers to is the caller's
 // mistake, not a missing resource: it is 400 naming the reference, exactly as
 // before, because the thing that was not found is a field of the request.
-func (s *Server) createEnvironment(w http.ResponseWriter, ctx context.Context, scope control.Scope, ref string) (control.Environment, bool) {
+func (s *Server) createSessionEnvironment(w http.ResponseWriter, ctx context.Context, scope control.Scope, ref string) (control.Environment, bool) {
 	env, err := s.environmentRef(ctx, scope, ref)
 	switch {
 	case errors.Is(err, control.ErrNotFound):

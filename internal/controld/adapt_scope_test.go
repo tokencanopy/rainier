@@ -12,14 +12,11 @@ func TestInstallationScopesValidate(t *testing.T) {
 	if err := userScope(u).Validate(); err != nil {
 		t.Fatalf("user scope invalid: %v", err)
 	}
-	if err := serviceScope("runner-a").Validate(); err != nil {
-		t.Fatalf("service scope invalid: %v", err)
-	}
 	if s := userScope(u); s.WorkspaceID != installWorkspace || s.Actor.ID != "usr_example" || s.Actor.Kind != control.ActorUser {
 		t.Fatalf("user scope = %+v", s)
 	}
-	if s := serviceScope("runner-a"); s.Actor.ID != "runner:runner-a" || s.Actor.Kind != control.ActorService || s.Placement.Mode != control.ExecutionSelfHosted {
-		t.Fatalf("service scope = %+v", s)
+	if s := userScope(u); s.Placement.Mode != control.ExecutionSelfHosted || s.Placement.ProductRegion != "self-hosted" || s.Placement.HomeCell != "default" {
+		t.Fatalf("placement = %+v", s.Placement)
 	}
 }
 

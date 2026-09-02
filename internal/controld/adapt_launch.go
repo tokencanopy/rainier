@@ -148,20 +148,6 @@ const defaultBaseBranch = "main"
 // know about — the connector said "acme/app", not "three CDN names".
 var gitEgressHosts = []string{"github.com", "codeload.github.com", "objects.githubusercontent.com"}
 
-// withGitHubHosts returns allow plus every gitEgressHost it does not already
-// contain, in order, leaving allow itself untouched. Deduped because an
-// environment that names github.com explicitly (many do) must not end up with
-// it twice, and the resulting list is what a human reads off the session row.
-func withGitHubHosts(allow []string) []string {
-	out := slices.Clone(allow)
-	for _, h := range gitEgressHosts {
-		if !slices.Contains(out, h) {
-			out = append(out, h)
-		}
-	}
-	return out
-}
-
 // sessionRepoRefs returns the repositories row is to clone: its own stored
 // override when it has one — including an explicit empty one, which means
 // "clone nothing" and must beat any connector — and otherwise the github
