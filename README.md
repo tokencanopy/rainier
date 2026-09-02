@@ -10,17 +10,34 @@ terminal sessions. Sessions survive laptop sleep and network changes; attach
 shows the agent's real TUI from any machine; your subscriptions and your GitHub
 identity stay yours.
 
-Status: **v0 Plan 6 — terminal happy path.** One
-`controld` (Postgres-backed REST + WebSocket API, GitHub identity, least-loaded
-placement, a credential vault) fronts N `runnerd` VMs that dial it outbound, and
-the `rainier` CLI drives the whole fleet. Sessions clone your repositories at
-boot and push back as you. Deploying it:
-[`docs/deploy-gce.md`](docs/deploy-gce.md). Design:
-[`docs/superpowers/specs/2026-08-27-rainier-design.md`](docs/superpowers/specs/2026-08-27-rainier-design.md),
-[`docs/superpowers/specs/2026-08-28-plan3-controld-design.md`](docs/superpowers/specs/2026-08-28-plan3-controld-design.md),
-[`docs/superpowers/specs/2026-08-29-plan4-environments-design.md`](docs/superpowers/specs/2026-08-29-plan4-environments-design.md)
-and
-[`docs/superpowers/specs/2026-08-29-plan5-github-vault-design.md`](docs/superpowers/specs/2026-08-29-plan5-github-vault-design.md).
+> **Active Development & Hosted Cloud Service Coming Soon:** Project Rainier is under active development. Alongside self-hosting, **a fully managed hosted cloud service is launching soon**. We are actively onboarding **pilot users, design partners, and collaborators** — reach out to **[josh@tokencanopy.com](mailto:josh@tokencanopy.com)** for early access.
+
+## The Problem Rainier Solves
+
+Autonomous coding agents (Claude Code, Codex, Gemini CLI, and others) are transforming software engineering, but running them on personal machines introduces significant friction:
+
+- **Laptops sleep, agent runs break:** Long-running agent tasks abort when a developer closes their laptop lid, walks away, or changes Wi-Fi networks.
+- **Remote shouldn't mean headless:** Traditional remote containers or batch jobs strip away the rich interactive terminal UI, making real-time steering and feedback difficult.
+- **Credential sprawl & security risks:** Pasting personal GitHub PATs or cloud keys into `.git/config` or container environments creates security liabilities; unmonitored container networking risks accidental data exfiltration.
+- **Local resource exhaustion:** Running multiple parallel agent sessions pegs CPU/memory, burns battery, and litters local working copies with half-finished branches and scratch files.
+
+**Rainier solves this by providing persistent, secure cloud execution with a local-feeling terminal:**
+
+- **Continuous Sessions:** Agents run on cloud sandboxes that survive laptop sleep, network drops, and machine transitions. Reconnecting instantly restores the interactive TUI.
+- **Zero Credential Exposure:** GitHub tokens and secrets are vaulted in the control plane and minted per-git-operation via an in-sandbox helper — never written to disk or container volumes.
+- **Locked-Down Egress:** Built-in network allowlisting restricts external network calls to approved endpoints and registries.
+- **Parallel Scale:** Offload multiple agent sessions simultaneously without bogging down your workstation.
+
+### Architecture & Status
+
+Rainier is currently at **v0 (terminal happy path)**. One `controld` (Postgres-backed REST + WebSocket API, GitHub identity, least-loaded placement, credential vault) fronts N `runnerd` VMs that dial it outbound, and the `rainier` CLI drives the whole fleet. Sessions clone your repositories at boot and push back as you.
+
+- **Deployment Guide:** [`docs/deploy-gce.md`](docs/deploy-gce.md)
+- **Architecture Specs:**
+  - [Rainier Overview](docs/superpowers/specs/2026-08-27-rainier-design.md)
+  - [Control Plane (`controld`)](docs/superpowers/specs/2026-08-28-plan3-controld-design.md)
+  - [Environments & Snapshots](docs/superpowers/specs/2026-08-29-plan4-environments-design.md)
+  - [GitHub Connector & Credential Vault](docs/superpowers/specs/2026-08-29-plan5-github-vault-design.md)
 
 ## Quickstart
 
@@ -151,4 +168,16 @@ for attach by id, 225 ms by name, and 75 ms for terminal interaction RTT.
 These exclude image pulls, environment setup, agent CLI boot, burst load, and
 geographic network differences; small `--samples` values make p95 directional.
 
-License: [Apache-2.0](LICENSE)
+## Hosted Pilot & Partnerships
+
+A managed hosted cloud service of Project Rainier is launching soon. We are actively welcoming **pilot users, design partners, and collaborators**:
+
+- **Engineering teams** looking to run persistent, off-laptop agent environments.
+- **Developers** running multi-agent workflows across repositories without local resource drain.
+- **Organizations** needing safe agent sandboxes with vaulted credentials and egress filtering.
+
+To join the pilot program or discuss partnerships, email **[josh@tokencanopy.com](mailto:josh@tokencanopy.com)**.
+
+## License
+
+[Apache-2.0](LICENSE)
