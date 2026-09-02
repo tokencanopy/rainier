@@ -481,27 +481,6 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 		writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	// A create names an environment OR carries a scratch spec, never both
-	// (control.CreateSession.Validate). The spec is all three fields, not just
-	// the image: an environment session runs the environment's image, command
-	// and egress allowlist, so a caller who sent any of them beside
-	// `environment` asked for something that cannot happen. Refusing says so;
-	// accepting the create and dropping the field would hand back a session
-	// running an allowlist the caller did not ask for and cannot see they
-	// didn't get.
-	if req.Environment != "" && (req.Image != "" || req.Cmd != nil || req.EgressAllow != nil) {
-		writeErr(w, http.StatusBadRequest, "invalid_request",
-			"an environment session cannot override the image, command, or egress allowlist")
-		return
-	}
-	// The other half of the same rule: a create that names neither an
-	// environment nor anything to run describes no session at all. The
-	// service refuses it too; saying which field is missing is the handler's
-	// job, because the service can only report that the command was invalid.
-	if req.Environment == "" && req.Image == "" && req.Cmd == nil && req.EgressAllow == nil {
-		writeErr(w, http.StatusBadRequest, "invalid_request", "a session must name an environment or an image")
-		return
-	}
 
 	ctx := withUser(r.Context(), u)
 	scope := userScope(u)
@@ -523,14 +502,16 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 		Repos:          reposToControl(repos),
 		IdempotencyKey: r.Header.Get("Idempotency-Key"),
 	}
+	// The session's own spec always travels: for a scratch session it is the
+	// whole description, for an environment session it is layered over the
+	// environment field by field (control.PortableSpec) by the service.
+	cmd.Spec = control.PortableSpec{
+		Image:       req.Image,
+		Cmd:         req.Cmd,
+		EgressAllow: req.EgressAllow,
+	}
 	if env != nil {
 		cmd.EnvironmentID = env.ID
-	} else {
-		cmd.Spec = control.PortableSpec{
-			Image:       req.Image,
-			Cmd:         req.Cmd,
-			EgressAllow: req.EgressAllow,
-		}
 	}
 	created, err := s.sessions.CreateSession(ctx, scope, cmd)
 	if err != nil {
