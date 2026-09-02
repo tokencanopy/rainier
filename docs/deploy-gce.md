@@ -129,11 +129,11 @@ for this replica.
 
 ```bash
 export RAINIER_ADMINS="<your-github-login>"      # fail-closed: empty means nobody can log in
+# RAINIER_DB, RAINIER_RUNNER_TOKEN and RAINIER_SECRETS_KEY are deliberately NOT
+# passed as flags: controld reads each from the environment exported above, so
+# none of the three is readable in `ps` by other users on the box.
 nohup ./bin/controld \
   --listen :9090 \
-  --db "$RAINIER_DB" \
-  --runner-token "$RAINIER_RUNNER_TOKEN" \
-  --secrets-key "$RAINIER_SECRETS_KEY" \
   --external-url http://rainier-1:9090 \
   --admins "$RAINIER_ADMINS" \
   > /tmp/controld.log 2>&1 &
@@ -170,6 +170,9 @@ RUNNER_NAME=rainier-1 \
 
 grep 'connected' /tmp/controld.log     # → controld: runner rainier-1 connected (used 0/16, ...)
 ```
+
+`fleet-up.sh` hands the token to runnerd through the environment, never as a
+flag — runnerd reads `RAINIER_RUNNER_TOKEN` itself — for the same reason.
 
 Adding a second VM later is exactly steps 1, 2 and 5 with a different
 `RUNNER_NAME` and `CONTROLD_URL=ws://rainier-1:9090` — no controld config

@@ -224,6 +224,18 @@ fi
 waitfor "docker exec $PG_CONTAINER pg_isready -U postgres -d $PG_DB" 60 "postgres" \
   || setup_error "postgres never became ready; docker logs $PG_CONTAINER"
 ok "postgres ready"
+# pg_isready is not enough: postgres:16-alpine runs initdb under a temporary
+# server, answers "ready" from it, then restarts, and a connection that lands
+# in that window is reset — controld's store open pings exactly once and
+# dies. Require two real connections two seconds apart before anyone opens it.
+for _i in $(seq 1 30); do
+  if docker exec "$PG_CONTAINER" psql -U postgres -d "$PG_DB" -Atc "select 1" >/dev/null 2>&1; then
+    sleep 2
+    docker exec "$PG_CONTAINER" psql -U postgres -d "$PG_DB" -Atc "select 1" >/dev/null 2>&1 && break
+  fi
+  sleep 1
+done
+ok "postgres accepted two connections two seconds apart"
 
 # ---------------------------------------------------------------------------
 step "identity"
@@ -264,9 +276,11 @@ RUNNER_TOKEN="dev-$(openssl rand -hex 8)"
 # AES-GCM-sealed at rest under it), and a throwaway fleet has no secrets
 # worth carrying across runs.
 SECRETS_KEY="$(openssl rand -hex 32)"
-./bin/controld --listen "${CONTROLD_HOST}:${CONTROLD_PORT}" --db "$DSN" \
-  --runner-token "$RUNNER_TOKEN" --external-url "$CONTROLD_HTTP" \
-  --secrets-key "$SECRETS_KEY" \
+# The DSN, runner token, and secrets key travel in the environment, which
+# controld reads as the default of each flag; on the command line they would
+# be readable in ps by every user on the host.
+RAINIER_DB="$DSN" RAINIER_RUNNER_TOKEN="$RUNNER_TOKEN" RAINIER_SECRETS_KEY="$SECRETS_KEY" \
+./bin/controld --listen "${CONTROLD_HOST}:${CONTROLD_PORT}" --external-url "$CONTROLD_HTTP" \
   --admins "$ADMIN" >"$CONTROLD_LOG" 2>&1 &
 echo $! > "$CONTROLD_PID"
 CONTROLD_STARTED=1
@@ -307,7 +321,9 @@ rm -f "$RAINIER_CONFIG"
 ./bin/rainier login "${GH_TOKEN_ARG[@]}" --server "$CONTROLD_HTTP" \
   || fail "rainier login (is \"$ADMIN\" the login your GitHub token belongs to?)"
 [ -f "$RAINIER_CONFIG" ] || fail "login did not write $RAINIER_CONFIG"
-PERM=$(stat -f '%Lp' "$RAINIER_CONFIG" 2>/dev/null || stat -c '%a' "$RAINIER_CONFIG")
+# GNU stat first: on Linux, `stat -f` SUCCEEDS with filesystem status, so the
+# fallback would never run; on macOS, `stat -c` fails and the BSD form runs.
+PERM=$(stat -c '%a' "$RAINIER_CONFIG" 2>/dev/null || stat -f '%Lp' "$RAINIER_CONFIG")
 [ "$PERM" = "600" ] || fail "config file mode is $PERM, want 600 (it holds a bearer token)"
 ok "logged in; config is 0600"
 
@@ -947,17 +963,19 @@ case "$GH_STALE_BODY" in
 esac
 ok "a session created against a stale credential failed in ${GH_STALE_SECS}s, naming \`rainier login --refresh github\`"
 
-# rm on a session that is ALREADY terminal is an idempotent no-op for the row
-# (it reclaims the workspace volume and answers 204; internal/controld's
-# handleDeleteSession), so the state stays `failed` — it does not become
-# `destroyed` the way rm of a running session does, and it was never in the
-# plain `ls` listing to disappear from. Waiting for it to "go" was therefore
-# vacuously true the instant it was asked. What is worth asserting is that the
-# rm succeeded and left the row's verdict intact: a user who removes a failed
+# rm of a FAILED session is not the terminal no-op (canceled, dead, and
+# destroyed are): the delete carves failed out of that case and destroys it —
+# the container is torn down, the volume reclaimed — exactly as api_test pins
+# ("a failed session still present on its runner is destroyed"). The verdict
+# that must survive the rm is the error column: a user who removes a failed
 # session must not lose the record of why it failed.
 ./bin/rainier rm "$GH_SID2" >/dev/null || fail "rm of the failed session $GH_SID2"
-[ "$(state_all_of "$GH_SID2")" = failed ] \
-  || fail "after rm, $GH_SID2 reads \"$(state_all_of "$GH_SID2")\" under ls --all, want failed — removing a failed session must not erase its verdict"
+[ "$(state_all_of "$GH_SID2")" = destroyed ] \
+  || fail "after rm, $GH_SID2 reads \"$(state_all_of "$GH_SID2")\" under ls --all, want destroyed"
+case "$(session_error "$GH_SID2")" in
+  *"rainier login --refresh github"*) ;;
+  *) fail "after rm, the failed session's error no longer names the action — removing a failed session must not erase its verdict" ;;
+esac
 
 # Put the credential back the way this scene found it: a KEEP=1 stack, and
 # anything after this phase, should see the fleet it started with.

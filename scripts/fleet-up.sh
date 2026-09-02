@@ -195,7 +195,9 @@ if [ -n "${CONTROLD_URL:-}" ]; then
     kill "$(cat /tmp/rainier-egressd.pid)" 2>/dev/null || true
     exit 1
   fi
-  RUNNERD_ARGS+=(--controld "$CONTROLD_URL" --runner-token "$RAINIER_RUNNER_TOKEN" --runner-name "$RUNNER_NAME")
+  # The token is NOT passed as a flag: runnerd reads RAINIER_RUNNER_TOKEN from
+  # its environment (inherited from this shell), so it never appears in ps.
+  RUNNERD_ARGS+=(--controld "$CONTROLD_URL" --runner-name "$RUNNER_NAME")
   echo "runnerd mode: dial — controld $CONTROLD_URL, announcing as \"$RUNNER_NAME\""
 else
   echo "runnerd mode: local HTTP only (set CONTROLD_URL=ws://host:9090 + RAINIER_RUNNER_TOKEN to join a control plane)"
