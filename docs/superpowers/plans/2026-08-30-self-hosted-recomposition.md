@@ -80,14 +80,17 @@ controlapp/
   workspace_rpc.go          uses the injected bound (Task 6)
 ```
 
-Execution order: **Task 1 ‖ Task 2** (disjoint new files; separate worktrees off `origin/main`, cherry-picked onto the integration branch by the reviewer) → **Task 3** (reviewer) → **Task 4** → **Task 5** → **Task 6** → **Task 7** (reviewer). Tasks 3 and 7 touch the composition root and are reviewer-owned per the program; a worker never edits `controld.go` except where Task 5 explicitly grants `Run` and `wakeScheduler`.
+Execution order: **Task 0** (reviewer: `adapt_scope.go`, on which both of the next two depend) → **Task 1 ‖ Task 2** (disjoint files; separate worktrees started from the integration branch head, cherry-picked back by the reviewer) → **Task 3** (reviewer) → **Task 4** → **Task 5** → **Task 6** → **Task 7** (reviewer). Tasks 0, 3, and 7 touch shared foundations or the composition root and are reviewer-owned per the program; a worker never edits `controld.go` except where Task 5 explicitly grants `Run` and `wakeScheduler`.
 
 ---
+
+### Task 0: Installation identity and scopes (reviewer-owned, already landed)
+
+**Files:** `internal/controld/adapt_scope.go`, `internal/controld/adapt_scope_test.go` — the constants `installWorkspace`, `installPool`, `placementCapabilityPrefix`, `snapshotCapabilityPrefix`; `installPlacement()`, `userScope(User)`, `serviceScope(string)`; `withUser`/`userFromContext`. Exactly the signatures listed under Task 1's "Produces"; Tasks 1 and 2 consume them and do not redefine them.
 
 ### Task 1: Store-backed repository, pool, clock, ID, and event adapters
 
 **Files:**
-- Create: `internal/controld/adapt_scope.go`
 - Create: `internal/controld/adapt_store.go`
 - Create: `internal/controld/adapt_store_test.go`
 - Create: `internal/controld/adapt_host.go`
