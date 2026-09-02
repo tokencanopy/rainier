@@ -92,7 +92,7 @@ Execution order: **Task 0** (reviewer: `adapt_scope.go`, on which both of the ne
 
 ### Task 0: Installation identity and scopes (reviewer-owned, already landed)
 
-**Files:** `internal/controld/adapt_scope.go`, `internal/controld/adapt_scope_test.go` — the constants `installWorkspace`, `installPool`, `placementCapabilityPrefix`, `snapshotCapabilityPrefix`; `installPlacement()`, `userScope(User)`, `serviceScope(string)`; `withUser`/`userFromContext`. Exactly the signatures listed under Task 1's "Produces"; Tasks 1 and 2 consume them and do not redefine them.
+**Files:** `internal/controld/adapt_scope.go`, `internal/controld/adapt_scope_test.go` — the constants `installWorkspace`, `installPool`, `placementCapabilityPrefix`, `snapshotCapabilityPrefix`; `installPlacement()`, `userScope(User)`; `withUser`/`userFromContext`. (`serviceScope` was provided too and removed in Task 7: `control.Fleet`'s service-principal methods carry their own bindings and take no `Scope`, so it never had a caller.) Exactly the signatures listed under Task 1's "Produces"; Tasks 1 and 2 consume them and do not redefine them.
 
 ### Task 1: Store-backed repository, pool, clock, ID, and event adapters
 
@@ -780,6 +780,8 @@ Settled during execution: the handler keeps a pre-upgrade owner-or-admin check (
 - Modify: `README.md` — one paragraph: controld is composed from `controlapp`; what remains host-specific
 
 - [ ] **Step 1:** `grep -rn "func (s \*Server)" internal/controld/*.go | grep -v _test` and confirm every remaining method is transport, rendering, auth, vault, upward RPC, or the two adapter arms. Anything else is a leftover.
+
+Settled during execution: a comment-stripped reference scan found three functions dead in code — `authorizeOwnerOrAdmin` (the adapter owns the rule; its test goes with it), `withGitHubHosts` (its job moved to `LaunchMaterial.EgressAllow`), and `serviceScope` — and the create handler's environment-resolution helper was renamed `createSessionEnvironment` so it no longer reads like the environment-create handler. The docker-backed `scripts/e2e-fleet.sh` could not run on the review machine (no docker); the Go `internal/e2e` fake-driver suite ran under `-race` at every task.
 - [ ] **Step 2:** Package doc for `internal/controld` states the split in one paragraph and names the four adapter-owned reads from Task 4 and the direct store writes from the Global Constraints.
 - [ ] **Step 3:** Full gates, serially:
 
