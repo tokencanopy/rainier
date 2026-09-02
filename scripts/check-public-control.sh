@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # check-public-control.sh — guards the public control package.
 #
-# 1. Import hygiene: the control package and its external tests may not
-#    import any internal/ path, HTTP/WebSocket, SQL/pgx, Docker, GitHub SDK,
-#    cloud SDK, billing package, or provider-named package.
+# 1. Import hygiene: the control and controlapp packages and their tests may
+#    not import any internal/ path, HTTP/WebSocket, SQL/pgx, Docker, GitHub
+#    SDK, cloud SDK, billing package, or provider-named package.
 # 2. Duplicate-model inventory: exported identifiers that also exist in
 #    internal/controld are the definitions the extraction lanes will migrate.
 #    They are ALLOWED only while named in the allowlist below (the exact
@@ -18,41 +18,49 @@ test -d control
 test -f control/doc.go
 go list ./control >/dev/null
 
+test -d controlapp
+test -f controlapp/doc.go
+go list ./controlapp >/dev/null
+
 # ---------------------------------------------------------------------------
 # 1. import hygiene
 # ---------------------------------------------------------------------------
+# The same table is applied to every public application package; the failure
+# message names which package pulled the forbidden import in.
 bad_imports=0
-while IFS= read -r imp; do
-  [[ -z "$imp" ]] && continue
-  lower="$(printf '%s' "$imp" | tr '[:upper:]' '[:lower:]')"
-  case "$lower" in
-    *rainier/internal/*)   reason="internal/ path" ;;
-    *net/http*)            reason="HTTP server" ;;
-    *coder/websocket*)     reason="WebSocket" ;;
-    *database/sql*)        reason="SQL" ;;
-    *jackc/pgx*)           reason="pgx" ;;
-    *docker*)              reason="Docker" ;;
-    *go-github*)           reason="GitHub SDK" ;;
-    *cloud.google.com*)    reason="GCP SDK" ;;
-    *github.com/aws*)      reason="AWS SDK" ;;
-    *github.com/azure*)    reason="Azure SDK" ;;
-    *github.com/oracle*)   reason="OCI SDK" ;;
-    *stripe*)              reason="billing" ;;
-    *billing*)             reason="billing" ;;
-    *hetzner*)             reason="provider package" ;;
-    *netcup*)              reason="provider package" ;;
-    *)                     continue ;;
-  esac
-  echo "control imports a forbidden package ($reason): $imp" >&2
-  bad_imports=1
-done < <(go list -f '{{join .Imports "\n"}} {{join .TestImports "\n"}} {{join .XTestImports "\n"}}' ./control)
+for pkg in control controlapp; do
+  while IFS= read -r imp; do
+    [[ -z "$imp" ]] && continue
+    lower="$(printf '%s' "$imp" | tr '[:upper:]' '[:lower:]')"
+    case "$lower" in
+      *rainier/internal/*)   reason="internal/ path" ;;
+      *net/http*)            reason="HTTP server" ;;
+      *coder/websocket*)     reason="WebSocket" ;;
+      *database/sql*)        reason="SQL" ;;
+      *jackc/pgx*)           reason="pgx" ;;
+      *docker*)              reason="Docker" ;;
+      *go-github*)           reason="GitHub SDK" ;;
+      *cloud.google.com*)    reason="GCP SDK" ;;
+      *github.com/aws*)      reason="AWS SDK" ;;
+      *github.com/azure*)    reason="Azure SDK" ;;
+      *github.com/oracle*)   reason="OCI SDK" ;;
+      *stripe*)              reason="billing" ;;
+      *billing*)             reason="billing" ;;
+      *hetzner*)             reason="provider package" ;;
+      *netcup*)              reason="provider package" ;;
+      *)                     continue ;;
+    esac
+    echo "$pkg imports a forbidden package ($reason): $imp" >&2
+    bad_imports=1
+  done < <(go list -f '{{join .Imports "\n"}} {{join .TestImports "\n"}} {{join .XTestImports "\n"}}' "./$pkg")
+done
 
 if [[ "$bad_imports" == "1" ]]; then
   exit 1
 fi
 
 # ---------------------------------------------------------------------------
-# 2. duplicate-model inventory against internal/controld
+# 2. duplicate-model inventory against internal/controld (./control only)
 # ---------------------------------------------------------------------------
 # The exact interface-freeze allowlist: every public control model that still
 # has a private twin in internal/controld, to be removed by the extraction

@@ -1,25 +1,7 @@
-// Package controlapp implements the attach/workspace half of the public
-// control application contract: authorized terminal attachment behind a
-// fenced controller generation, plus bounded workspace diff/push/pull
-// orchestration over the public session RPC.
-//
-// The package is a service, not a transport. It resolves and authorizes a
-// session, grants a fenced controller generation, and delegates terminal
-// transport to an AttachmentBroker, while workspace operations share one
-// private session-RPC implementation over RunnerTransport. It imports no
-// HTTP/WebSocket implementation, SQL, Docker, GitHub or cloud SDK, billing
-// package, or internal/ package; it never parses a socket, logs a terminal
-// message, persists terminal bytes, or duplicates the terminal protocol.
-//
-// Terminal and workspace bytes stay in the already-public protocol packages
-// (github.com/tokencanopy/rainier/protocol/{terminal,runner,workspace}); this
-// package references those contracts and never duplicates their message
-// structs.
 package controlapp
 
 import (
 	"context"
-	"errors"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -122,7 +104,7 @@ func (s *AttachmentService) authorizedSession(ctx context.Context, scope control
 	}
 	row, err := s.sessions.GetSession(ctx, scope.WorkspaceID, id)
 	if err != nil {
-		return control.Session{}, attachmentPortError(err)
+		return control.Session{}, portError(err)
 	}
 	resource := control.Resource{Kind: control.ResourceSession, WorkspaceID: row.WorkspaceID,
 		ID: string(row.ID), CreatorID: row.CreatorID}
@@ -130,34 +112,6 @@ func (s *AttachmentService) authorizedSession(ctx context.Context, scope control
 		return control.Session{}, control.ErrDenied
 	}
 	return cloneAttachmentSession(row), nil
-}
-
-// attachmentPortError normalizes a port error to the closed control sentinel
-// vocabulary. Context cancellation and deadline propagation are preserved
-// (the caller went away, which is not a dependency failure); every other
-// adapter failure maps to control.ErrUnavailable.
-func attachmentPortError(err error) error {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return err
-	}
-	switch {
-	case errors.Is(err, control.ErrInvalid):
-		return control.ErrInvalid
-	case errors.Is(err, control.ErrDenied):
-		return control.ErrDenied
-	case errors.Is(err, control.ErrNotFound):
-		return control.ErrNotFound
-	case errors.Is(err, control.ErrConflict):
-		return control.ErrConflict
-	case errors.Is(err, control.ErrStale):
-		return control.ErrStale
-	case errors.Is(err, control.ErrUnavailable):
-		return control.ErrUnavailable
-	case errors.Is(err, control.ErrUnsupported):
-		return control.ErrUnsupported
-	default:
-		return control.ErrUnavailable
-	}
 }
 
 // cloneAttachmentSession copies the command, egress, repositories, and

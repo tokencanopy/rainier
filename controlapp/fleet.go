@@ -1,8 +1,3 @@
-// Package controlapp implements the provider-neutral fleet application
-// service behind the frozen control.Fleet interface. One deep FleetService
-// module owns fleet truth and within-pool scheduling; injected adapters own
-// connections, persistence, eligible-pool policy, sensitive launch material,
-// and provider execution.
 package controlapp
 
 import (
@@ -140,7 +135,7 @@ func (s *FleetService) RegisterRunner(ctx context.Context, r control.RunnerRegis
 	}
 	runners, err := s.fleet.ListRunners(ctx, r.PoolID)
 	if err != nil {
-		return control.RunnerRegistrationResult{}, fleetPortError(err)
+		return control.RunnerRegistrationResult{}, portError(err)
 	}
 	current := uint64(0)
 	found := false
@@ -175,7 +170,7 @@ func (s *FleetService) RegisterRunner(ctx context.Context, r control.RunnerRegis
 			}
 			return control.RunnerRegistrationResult{Accepted: false, Generation: gen}, nil
 		}
-		return control.RunnerRegistrationResult{}, fleetPortError(err)
+		return control.RunnerRegistrationResult{}, portError(err)
 	}
 	s.Wake(r.PoolID)
 	return control.RunnerRegistrationResult{Accepted: true, Generation: r.Generation}, nil
@@ -187,7 +182,7 @@ func (s *FleetService) RegisterRunner(ctx context.Context, r control.RunnerRegis
 func (s *FleetService) authoritativeGeneration(ctx context.Context, pool control.PoolID, id control.RunnerID) (uint64, error) {
 	runners, err := s.fleet.ListRunners(ctx, pool)
 	if err != nil {
-		return 0, fleetPortError(err)
+		return 0, portError(err)
 	}
 	for _, existing := range runners {
 		if existing.ID == id {
@@ -195,43 +190,6 @@ func (s *FleetService) authoritativeGeneration(ctx context.Context, pool control
 		}
 	}
 	return 0, nil
-}
-
-// fleetPortError normalizes a port error to the closed control sentinel
-// vocabulary, so an adapter's SQL, connection string, or provider text can
-// never leave this service through a control.Fleet method. Context
-// cancellation and deadline propagation are preserved (the caller went away,
-// which is not a dependency failure); a sentinel the port already reported
-// passes through unchanged; every other adapter failure is ErrUnavailable.
-//
-// It is deliberately the same normalization the attach lane applies at its own
-// port boundary; the two collapse into one shared helper once the extraction
-// lanes land together.
-func fleetPortError(err error) error {
-	if err == nil {
-		return nil
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return err
-	}
-	switch {
-	case errors.Is(err, control.ErrInvalid):
-		return control.ErrInvalid
-	case errors.Is(err, control.ErrDenied):
-		return control.ErrDenied
-	case errors.Is(err, control.ErrNotFound):
-		return control.ErrNotFound
-	case errors.Is(err, control.ErrConflict):
-		return control.ErrConflict
-	case errors.Is(err, control.ErrStale):
-		return control.ErrStale
-	case errors.Is(err, control.ErrUnavailable):
-		return control.ErrUnavailable
-	case errors.Is(err, control.ErrUnsupported):
-		return control.ErrUnsupported
-	default:
-		return control.ErrUnavailable
-	}
 }
 
 // validateRegistration rejects a malformed or contradictory claim before any
@@ -287,7 +245,7 @@ func (s *FleetService) ListRunners(ctx context.Context, scope control.Scope, q c
 
 	pools, err := s.pools.EligiblePools(ctx, scope, control.Requirements{})
 	if err != nil {
-		return control.RunnerPage{}, fleetPortError(err)
+		return control.RunnerPage{}, portError(err)
 	}
 
 	seenPools := make(map[control.PoolID]struct{}, len(pools))
@@ -299,7 +257,7 @@ func (s *FleetService) ListRunners(ctx context.Context, scope control.Scope, q c
 		seenPools[pool.ID] = struct{}{}
 		runners, err := s.fleet.ListRunners(ctx, pool.ID)
 		if err != nil {
-			return control.RunnerPage{}, fleetPortError(err)
+			return control.RunnerPage{}, portError(err)
 		}
 		for _, r := range runners {
 			r.Capabilities = slices.Clone(r.Capabilities)
@@ -381,7 +339,7 @@ func (s *FleetService) ReconcileRunner(ctx context.Context, snap control.RunnerS
 	}
 	runners, err := s.fleet.ListRunners(ctx, snap.PoolID)
 	if err != nil {
-		return control.ReconcileResult{}, fleetPortError(err)
+		return control.ReconcileResult{}, portError(err)
 	}
 	var current *control.Runner
 	for i := range runners {
@@ -475,7 +433,7 @@ func (s *FleetService) recordSnapshotAuthority(ctx context.Context, snap control
 			}
 			return gen, true, nil
 		}
-		return 0, false, fleetPortError(err)
+		return 0, false, portError(err)
 	}
 	s.Wake(snap.PoolID)
 	return 0, false, nil
@@ -491,7 +449,7 @@ func (s *FleetService) reconcileSessions(ctx context.Context, snap control.Runne
 	}
 	stored, err := s.fleet.SessionsOnRunner(ctx, snap.PoolID, snap.RunnerID, states)
 	if err != nil {
-		return nil, fleetPortError(err)
+		return nil, portError(err)
 	}
 
 	storedByID := make(map[control.SessionID]control.Session, len(stored))
@@ -553,7 +511,7 @@ func (s *FleetService) reconcileSessions(ctx context.Context, snap control.Runne
 		case errors.Is(err, control.ErrNotFound):
 			destroy = append(destroy, reported.SessionID)
 		case err != nil:
-			return nil, fleetPortError(err)
+			return nil, portError(err)
 		case row.State.Terminal():
 			destroy = append(destroy, reported.SessionID)
 		case row.WorkspaceID != snap.WorkspaceID || row.PoolID != snap.PoolID || row.RunnerID != snap.RunnerID:
@@ -591,7 +549,7 @@ func (s *FleetService) transitionQuiet(ctx context.Context, ws control.Workspace
 	if err == nil || errors.Is(err, control.ErrConflict) || errors.Is(err, control.ErrNotFound) {
 		return nil
 	}
-	return fleetPortError(err)
+	return portError(err)
 }
 
 // maxDetailBytes is the bound on runner-supplied free text before it reaches
@@ -638,7 +596,7 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 		if errors.Is(err, control.ErrNotFound) {
 			return control.ErrStale
 		}
-		return fleetPortError(err)
+		return portError(err)
 	}
 	if row.WorkspaceID != event.WorkspaceID || row.PoolID != event.PoolID || row.RunnerID != event.RunnerID {
 		return control.ErrStale
@@ -646,7 +604,7 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 
 	runners, err := s.fleet.ListRunners(ctx, event.PoolID)
 	if err != nil {
-		return fleetPortError(err)
+		return portError(err)
 	}
 	matched := false
 	for _, r := range runners {
@@ -687,7 +645,7 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 			if errors.Is(err, control.ErrNotFound) {
 				return control.ErrStale
 			}
-			return fleetPortError(err)
+			return portError(err)
 		}
 		return s.recordLifecycleEvent(ctx, event, row, eventID)
 	}
@@ -721,7 +679,7 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 	case errors.Is(err, control.ErrNotFound):
 		return control.ErrStale
 	default:
-		return fleetPortError(err)
+		return portError(err)
 	}
 }
 

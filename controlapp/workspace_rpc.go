@@ -41,7 +41,7 @@ func (s *AttachmentService) sessionRPC(ctx context.Context, row control.Session,
 		RPC: &runner.RPCEnvelope{ID: id, Method: method, Payload: raw}}
 	res, err := s.transport.Dispatch(ctx, row.PoolID, row.RunnerID, msg)
 	if err != nil {
-		return attachmentPortError(err)
+		return portError(err)
 	}
 	if res.Type != "session_req" || res.Session != string(row.ID) || res.RPC == nil ||
 		res.RPC.ID != id || res.RPC.Method != "resp" {

@@ -1,7 +1,3 @@
-// Package controlapp implements the portable application behavior behind the
-// frozen public control contract. It depends only on the control ports and the
-// public runner protocol; HTTP, identity, SQL, Docker, GitHub, provider, and
-// billing behavior remain adapters outside the seam.
 package controlapp
 
 import (
