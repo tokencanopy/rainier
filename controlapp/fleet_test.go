@@ -1876,3 +1876,69 @@ func TestReconcileRunnerFencedByConcurrentWriteOnEveryPath(t *testing.T) {
 		})
 	}
 }
+
+// TestReconcileAgreeingAnnounceTouchesTheRow pins that a snapshot which agrees
+// with the store still makes the same-state transition: it is the one write
+// that records the session as demonstrably alive at this announce.
+func TestReconcileAgreeingAnnounceTouchesTheRow(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.st.seedRunner(fleetEventRunner(1))
+	fx.st.seedSession(control.Session{
+		ID: "sess_example", WorkspaceID: "ws_example", State: control.StateRunning,
+		PoolID: "pool_example", RunnerID: "runner_example",
+	})
+	snap := control.RunnerSnapshot{
+		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+		Generation: 1, CapacityTotal: 4,
+		Sessions: []control.RunnerSession{{SessionID: "sess_example", State: control.StateRunning}},
+	}
+	res, err := fx.service.ReconcileRunner(fleetCtx, snap)
+	if err != nil || len(res.Destroy) != 0 {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if fx.st.transitionCalls != 1 {
+		t.Fatalf("transitionCalls = %d, want 1 (the same-state touch)", fx.st.transitionCalls)
+	}
+	if row := fleetGetSessionState(t, fx, "ws_example", "sess_example"); row.State != control.StateRunning || row.RunnerID != "runner_example" {
+		t.Fatalf("row = %+v, want unchanged", row)
+	}
+}
+
+// TestReconcileAdoptsAnUnplacedLiveRow pins that a live row the store has
+// placed nowhere is adopted onto the runner announcing it, in the announced
+// state, rather than destroyed.
+func TestReconcileAdoptsAnUnplacedLiveRow(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.st.seedRunner(fleetEventRunner(1))
+	fx.st.seedSession(control.Session{
+		ID: "sess_unplaced", WorkspaceID: "ws_example", State: control.StateQueued,
+		PoolID: "pool_example", RunnerID: "",
+	})
+	snap := control.RunnerSnapshot{
+		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+		Generation: 1, CapacityTotal: 4,
+		Sessions: []control.RunnerSession{{SessionID: "sess_unplaced", State: control.StateSuspendedWarm}},
+	}
+	res, err := fx.service.ReconcileRunner(fleetCtx, snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Destroy) != 0 {
+		t.Fatalf("an unplaced live row was destroyed: %v", res.Destroy)
+	}
+	row := fleetGetSessionState(t, fx, "ws_example", "sess_unplaced")
+	if row.State != control.StateSuspendedWarm || row.RunnerID != "runner_example" {
+		t.Fatalf("row = %+v, want adopted as suspended_warm on runner_example", row)
+	}
+
+	// A row placed on a different runner is still a duplicate to destroy.
+	fx.st.seedSession(control.Session{
+		ID: "sess_elsewhere", WorkspaceID: "ws_example", State: control.StateRunning,
+		PoolID: "pool_example", RunnerID: "runner_other",
+	})
+	snap.Sessions = []control.RunnerSession{{SessionID: "sess_elsewhere", State: control.StateRunning}}
+	res, err = fx.service.ReconcileRunner(fleetCtx, snap)
+	if err != nil || len(res.Destroy) != 1 || res.Destroy[0] != "sess_elsewhere" {
+		t.Fatalf("duplicate: res=%+v err=%v", res, err)
+	}
+}

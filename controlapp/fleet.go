@@ -34,6 +34,13 @@ type FleetOptions struct {
 	// attribution, secret environment) at dispatch time. It is the one real
 	// adapter seam this extraction introduces.
 	LaunchMaterial LaunchMaterialResolver
+
+	// DefaultSetupTimeoutSec and DefaultInitTimeoutSec bound a setup or init
+	// hook whose environment declares no bound of its own (zero or negative).
+	// They are host policy the application only applies; zero leaves such a
+	// hook unbounded here and defers to the runner's own default.
+	DefaultSetupTimeoutSec int
+	DefaultInitTimeoutSec  int
 }
 
 // FleetService implements control.Fleet and owns runner registration,
@@ -53,6 +60,11 @@ type FleetService struct {
 
 	// launchMaterial resolves sensitive launch material at dispatch time.
 	launchMaterial LaunchMaterialResolver
+
+	// defaultSetupTimeout and defaultInitTimeout are the host's bounds for a
+	// hook whose environment declares none (FleetOptions).
+	defaultSetupTimeout int
+	defaultInitTimeout  int
 
 	// wake carries pool IDs that need a placement pass. It is buffered so
 	// Wake never blocks a caller; Run drains it.
@@ -80,19 +92,21 @@ func NewFleetService(opts FleetOptions) (*FleetService, error) {
 		return nil, control.ErrInvalid
 	}
 	return &FleetService{
-		auth:           opts.Authorizer,
-		sessions:       opts.Sessions,
-		environments:   opts.Environments,
-		fleet:          opts.Fleet,
-		pools:          opts.Pools,
-		transport:      opts.Transport,
-		events:         opts.Events,
-		clock:          opts.Clock,
-		ids:            opts.IDs,
-		safetyInterval: opts.SafetyInterval,
-		launchMaterial: opts.LaunchMaterial,
-		wake:           make(chan control.PoolID, 64),
-		known:          make(map[control.PoolID]struct{}),
+		auth:                opts.Authorizer,
+		sessions:            opts.Sessions,
+		environments:        opts.Environments,
+		fleet:               opts.Fleet,
+		pools:               opts.Pools,
+		transport:           opts.Transport,
+		events:              opts.Events,
+		clock:               opts.Clock,
+		ids:                 opts.IDs,
+		safetyInterval:      opts.SafetyInterval,
+		launchMaterial:      opts.LaunchMaterial,
+		defaultSetupTimeout: opts.DefaultSetupTimeoutSec,
+		defaultInitTimeout:  opts.DefaultInitTimeoutSec,
+		wake:                make(chan control.PoolID, 64),
+		known:               make(map[control.PoolID]struct{}),
 	}, nil
 }
 
@@ -494,7 +508,16 @@ func (s *FleetService) reconcileSessions(ctx context.Context, snap control.Runne
 			continue
 		}
 		want, ok := announcedState(reported.State)
-		if !ok || want == row.State {
+		if !ok {
+			continue
+		}
+		if want == row.State {
+			// The store already agrees; the transition is still made, from
+			// this state to itself, because it is the one thing that records
+			// the session as demonstrably alive just now (last_event_at).
+			if err := s.transitionQuiet(ctx, row.WorkspaceID, row.ID, []control.SessionState{want}, want, control.TransitionOpts{}); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		if err := s.transitionQuiet(ctx, row.WorkspaceID, row.ID, control.NonTerminal, want, control.TransitionOpts{}); err != nil {
@@ -514,6 +537,20 @@ func (s *FleetService) reconcileSessions(ctx context.Context, snap control.Runne
 			return nil, portError(err)
 		case row.State.Terminal():
 			destroy = append(destroy, reported.SessionID)
+		case row.WorkspaceID == snap.WorkspaceID && row.RunnerID == "" && (row.PoolID == "" || row.PoolID == snap.PoolID):
+			// A live row the store has placed nowhere — requeued while its
+			// runner was away and not placed again since — and the runner that
+			// in fact holds it has just said so. Adopt it there, in the state
+			// the runner reports, as the store would have placed it; destroying
+			// it would tear down live work the store still wants.
+			want, ok := announcedState(reported.State)
+			if !ok {
+				continue
+			}
+			holder := snap.RunnerID
+			if err := s.transitionQuiet(ctx, row.WorkspaceID, row.ID, control.NonTerminal, want, control.TransitionOpts{RunnerID: &holder}); err != nil {
+				return nil, err
+			}
 		case row.WorkspaceID != snap.WorkspaceID || row.PoolID != snap.PoolID || row.RunnerID != snap.RunnerID:
 			// A duplicate held by a stale holder, or a row from another
 			// workspace; the runner must tear it down as an orphan.

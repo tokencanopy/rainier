@@ -286,14 +286,20 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 	if env != nil {
 		cloned := cloneEnvironment(*env)
 		env = &cloned
+		// A hook travels with its bound, and only a hook that will run gets
+		// one: a create carries no setup timeout when the snapshot makes setup
+		// unnecessary, and no init timeout when there is no init hook. A hook
+		// whose environment declared no bound gets the host's default.
 		if env.Snapshot.Ref != "" && env.SnapshotHash == env.SetupHash {
 			spec.Image = env.Snapshot.Ref
-		} else {
+		} else if env.Setup != "" {
 			spec.Setup = env.Setup
-			spec.SetupTimeoutSec = env.SetupTimeoutSec
+			spec.SetupTimeoutSec = boundOr(env.SetupTimeoutSec, s.defaultSetupTimeout)
 		}
-		spec.Init = env.Init
-		spec.InitTimeoutSec = env.InitTimeoutSec
+		if env.Init != "" {
+			spec.Init = env.Init
+			spec.InitTimeoutSec = boundOr(env.InitTimeoutSec, s.defaultInitTimeout)
+		}
 	}
 	material, err := s.launchMaterial.ResolveLaunchMaterial(ctx, cloneSession(row), env)
 	if err != nil {
@@ -347,6 +353,15 @@ func (s *FleetService) failCreate(ctx context.Context, row control.Session, reas
 		[]control.SessionState{control.StateCreating}, control.StateFailed,
 		control.TransitionOpts{Error: &bounded})
 	s.Wake(row.PoolID)
+}
+
+// boundOr returns the environment's own bound when it declared one, else the
+// host's default.
+func boundOr(declared, fallback int) int {
+	if declared > 0 {
+		return declared
+	}
+	return fallback
 }
 
 func cloneMap(m map[string]string) map[string]string {

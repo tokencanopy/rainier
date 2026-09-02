@@ -672,3 +672,45 @@ func TestDispatchCreateUnionsMaterialEgress(t *testing.T) {
 		return nil
 	})
 }
+
+// TestCreateSpecBoundsOnlyTheHooksThatRun pins the host timeout defaults and
+// that a bound travels only with a hook that will run: no setup bound when the
+// snapshot makes setup unnecessary, no init bound without an init hook, the
+// environment's own bound when it declared one, the host's default when not.
+func TestCreateSpecBoundsOnlyTheHooksThatRun(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.service.defaultSetupTimeout = 900
+	fx.service.defaultInitTimeout = 900
+	row := control.Session{ID: "sess_example", WorkspaceID: "ws_example", Name: "investigate", EnvironmentID: "env_example",
+		Spec: control.PortableSpec{Image: "registry.example.invalid/base@sha256:0000"}}
+
+	cases := []struct {
+		name           string
+		env            control.Environment
+		wantSetup      string
+		wantSetupBound int
+		wantInit       string
+		wantInitBound  int
+	}{
+		{"both hooks, no bounds → host defaults", control.Environment{Setup: "apt-get install -y build-essential", Init: "make dev"}, "apt-get install -y build-essential", 900, "make dev", 900},
+		{"declared bounds win", control.Environment{Setup: "s", SetupTimeoutSec: 30, Init: "i", InitTimeoutSec: 60}, "s", 30, "i", 60},
+		{"no init hook → no init bound", control.Environment{Setup: "s", InitTimeoutSec: 60}, "s", 900, "", 0},
+		{"current snapshot → no setup, no setup bound", control.Environment{Setup: "s", SetupHash: "h", SnapshotHash: "h", Snapshot: control.Checkpoint{Ref: "snap:example"}, Init: "i"}, "", 0, "i", 900},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := tc.env
+			env.ID, env.WorkspaceID, env.Image = "env_example", "ws_example", "registry.example.invalid/base@sha256:0000"
+			spec, fail := fx.service.createSpec(fleetCtx, row, &env)
+			if fail != "" {
+				t.Fatalf("createSpec failed: %s", fail)
+			}
+			if spec.Setup != tc.wantSetup || spec.SetupTimeoutSec != tc.wantSetupBound ||
+				spec.Init != tc.wantInit || spec.InitTimeoutSec != tc.wantInitBound {
+				t.Fatalf("setup=%q/%d init=%q/%d, want setup=%q/%d init=%q/%d",
+					spec.Setup, spec.SetupTimeoutSec, spec.Init, spec.InitTimeoutSec,
+					tc.wantSetup, tc.wantSetupBound, tc.wantInit, tc.wantInitBound)
+			}
+		})
+	}
+}
