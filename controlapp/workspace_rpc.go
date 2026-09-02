@@ -25,9 +25,9 @@ import (
 // echoes the request.
 //
 // The sandbox is an untrusted peer, so every answer is validated before it is
-// trusted: wrong session, wrong RPC ID, wrong method, a false verdict, or a
-// malformed body all become control.ErrUnavailable without relaying any
-// sandbox payload text.
+// trusted: wrong session, wrong RPC ID, wrong method, or a malformed body all
+// become control.ErrUnavailable, and a false verdict becomes ErrRunnerRefused
+// (which wraps it) — none of them relaying any sandbox payload text.
 func (s *AttachmentService) sessionRPC(ctx context.Context, row control.Session, method string, payload any, out any) error {
 	id := s.rpcSeq.Add(1)
 	if id == 0 {
@@ -48,7 +48,14 @@ func (s *AttachmentService) sessionRPC(ctx context.Context, row control.Session,
 		return control.ErrUnavailable
 	}
 	if !res.RPC.OK {
-		return control.ErrUnavailable
+		// The sandbox received the request, understood it, and declined —
+		// the same fact about the far end that ErrRunnerRefused already
+		// names for a lifecycle command, and a different one from "nobody
+		// answered". It wraps ErrUnavailable, so a caller that knows only the
+		// closed sentinel set is unaffected; a host that renders "understood
+		// and declined" differently from "unreachable" can ask. The
+		// sandbox's own words stay inside the transport either way.
+		return ErrRunnerRefused
 	}
 	return decodeRPCAnswer(res.RPC.Payload, out)
 }
@@ -181,8 +188,8 @@ func clipTo(s string, max int) string {
 
 // PushWorkspace streams the gzipped tar archive at Body into Path inside the
 // session's workspace, one bounded chunk per RPC, without buffering the whole
-// archive. The total compressed bytes and every chunk are bounded before any
-// byte crosses the runner seam.
+// archive. The total compressed bytes (against the injected transfer bound)
+// and every chunk are bounded before any byte crosses the runner seam.
 func (s *AttachmentService) PushWorkspace(ctx context.Context, scope control.Scope, cmd control.PushWorkspace) error {
 	row, err := s.authorizedSession(ctx, scope, cmd.SessionID, control.ActionPush)
 	if err != nil {
@@ -226,7 +233,7 @@ func (s *AttachmentService) PushWorkspace(ctx context.Context, scope control.Sco
 			}
 		}
 		total += int64(len(data))
-		if total > workspace.MaxBytes {
+		if total > s.maxTransfer {
 			return control.ErrInvalid
 		}
 		chunk := workspace.PushChunk{Xfer: xfer, Path: cmd.Path,
@@ -296,7 +303,7 @@ func (s *AttachmentService) PullWorkspace(ctx context.Context, scope control.Sco
 		if len(chunk.Data) == 0 && !chunk.Done {
 			return control.ErrUnavailable
 		}
-		if total+int64(len(chunk.Data)) > workspace.MaxBytes {
+		if total+int64(len(chunk.Data)) > s.maxTransfer {
 			return control.ErrInvalid
 		}
 		if err := writeAll(cmd.Body, chunk.Data); err != nil {

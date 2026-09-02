@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/tokencanopy/rainier/control"
@@ -967,5 +968,114 @@ func TestSessionRPCConcurrentOutOfOrder(t *testing.T) {
 			t.Fatalf("duplicate request id %d", m.RPC.ID)
 		}
 		seen[m.RPC.ID] = true
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the injected transfer bound
+// ---------------------------------------------------------------------------
+
+// newBoundedAttachmentFixture is newAttachmentFixture with a host-supplied
+// MaxTransferBytes. It is spelled here rather than as an option on the shared
+// fixture so the bound's tests own their construction: every other test in
+// this package means "the default bound", and none of them should have to say
+// so.
+func newBoundedAttachmentFixture(t *testing.T, bound int64) *attachmentFixture {
+	t.Helper()
+	fx := &attachmentFixture{
+		auth:      &attachmentFakeAuthorizer{},
+		policy:    &attachmentFakePolicy{},
+		sessions:  &attachmentFakeSessions{found: true, row: attachmentRunningSession()},
+		transport: &attachmentFakeTransport{},
+		broker:    &attachmentFakeBroker{},
+		events:    &attachmentFakeEvents{},
+		ids:       &attachmentFakeIDs{eventID: "evt_example"},
+	}
+	svc, err := NewAttachmentService(AttachmentOptions{
+		Authorizer:       fx.auth,
+		Policy:           fx.policy,
+		Sessions:         fx.sessions,
+		Transport:        fx.transport,
+		Broker:           fx.broker,
+		Events:           fx.events,
+		Clock:            attachmentFakeClock(func() time.Time { return time.Unix(0, 0) }),
+		IDs:              fx.ids,
+		MaxTransferBytes: bound,
+	})
+	if err != nil {
+		t.Fatalf("NewAttachmentService: %v", err)
+	}
+	fx.svc = svc
+	return fx
+}
+
+// TestPullRefusesBeyondInjectedBound proves the pull cap is the injected one
+// rather than workspace.MaxBytes: with a 3KiB bound a sandbox answering 1KiB
+// chunks forever is cut off at the fourth, before its bytes are written, and
+// the refusal is the closed ErrInvalid the transfer-limit answer maps from.
+func TestPullRefusesBeyondInjectedBound(t *testing.T) {
+	const kib = 1 << 10
+	fx := newBoundedAttachmentFixture(t, 3*kib)
+	fx.transport.replyFn = func(m runner.ToRunner) runner.FromRunner {
+		var req workspace.PullRequest
+		_ = json.Unmarshal(m.RPC.Payload, &req)
+		return rpcOKReply(m.RPC.ID, workspace.PullChunk{Seq: req.Seq, Data: bytes.Repeat([]byte("q"), kib)})
+	}
+	w := &recordingWriter{}
+	if err := pullTo(t, fx, w, "src"); !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("got %v, want ErrInvalid", err)
+	}
+	if got, _ := w.total(); got != 3*kib {
+		t.Fatalf("wrote %d bytes, want exactly the %d-byte bound", got, 3*kib)
+	}
+	if got := len(fx.transport.dispatched()); got != 4 {
+		t.Fatalf("dispatched %d requests, want 4 (the fourth is refused before its write)", got)
+	}
+}
+
+// TestPushRefusesBeyondInjectedBound is the same bound on the other
+// direction: a caller's archive larger than the injected limit is refused
+// mid-stream rather than relayed.
+func TestPushRefusesBeyondInjectedBound(t *testing.T) {
+	fx := newBoundedAttachmentFixture(t, workspace.ChunkBytes)
+	fx.transport.replyFn = func(m runner.ToRunner) runner.FromRunner {
+		var c workspace.PushChunk
+		_ = json.Unmarshal(m.RPC.Payload, &c)
+		return rpcOKReply(m.RPC.ID, workspace.PushAck{Seq: c.Seq, Synced: c.Done})
+	}
+	body := bytes.NewReader(bytes.Repeat([]byte("q"), workspace.ChunkBytes+1))
+	err := fx.svc.PushWorkspace(context.Background(), attachmentTestScope(), control.PushWorkspace{
+		SessionID: "sess_example", Path: "src", Body: body,
+	})
+	if !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("got %v, want ErrInvalid", err)
+	}
+}
+
+// TestNewAttachmentServiceRejectsNegativeBound: zero means the public default,
+// but a negative bound is a host that computed one wrong, and a service that
+// silently relayed nothing (or everything) would hide it.
+func TestNewAttachmentServiceRejectsNegativeBound(t *testing.T) {
+	opts := AttachmentOptions{
+		Authorizer:       &attachmentFakeAuthorizer{},
+		Policy:           &attachmentFakePolicy{},
+		Sessions:         &attachmentFakeSessions{},
+		Transport:        &attachmentFakeTransport{},
+		Broker:           &attachmentFakeBroker{},
+		Events:           &attachmentFakeEvents{},
+		Clock:            attachmentFakeClock(func() time.Time { return time.Unix(0, 0) }),
+		IDs:              attachmentFakeIDs{eventID: "evt_example"},
+		MaxTransferBytes: -1,
+	}
+	if _, err := NewAttachmentService(opts); !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("negative bound: got %v, want ErrInvalid", err)
+	}
+	opts.MaxTransferBytes = 0
+	svc, err := NewAttachmentService(opts)
+	if err != nil {
+		t.Fatalf("zero bound rejected: %v", err)
+	}
+	if svc.maxTransfer != workspace.MaxBytes {
+		t.Fatalf("zero bound became %d, want the public default %d", svc.maxTransfer, workspace.MaxBytes)
 	}
 }
