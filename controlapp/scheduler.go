@@ -286,13 +286,14 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 	if env != nil {
 		cloned := cloneEnvironment(*env)
 		env = &cloned
-		// A hook travels with its bound, and only a hook that will run gets
-		// one: a create carries no setup timeout when the snapshot makes setup
-		// unnecessary, and no init timeout when there is no init hook. A hook
-		// whose environment declared no bound gets the host's default.
-		if env.Snapshot.Ref != "" && env.SnapshotHash == env.SetupHash {
-			spec.Image = env.Snapshot.Ref
-		} else if env.Setup != "" {
+		// The row's image was resolved at create (portableSpecFor): the
+		// snapshot when one was current and the caller did not override the
+		// image, else the image itself. Setup runs exactly when the row does
+		// not boot the snapshot — an override boots its own image and needs
+		// the setup the snapshot would have carried. A hook travels with its
+		// bound, only a hook that will run gets one, and a hook whose
+		// environment declared no bound gets the host's default.
+		if env.Setup != "" && (env.Snapshot.Ref == "" || row.Spec.Image != env.Snapshot.Ref) {
 			spec.Setup = env.Setup
 			spec.SetupTimeoutSec = boundOr(env.SetupTimeoutSec, s.defaultSetupTimeout)
 		}
