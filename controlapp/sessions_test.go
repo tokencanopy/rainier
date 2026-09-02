@@ -852,10 +852,13 @@ func TestCreateSessionPoolSelection(t *testing.T) {
 			{ID: "pool_z", CapacityTotal: 10, CapacityUsed: 5},
 			{ID: "pool_a", CapacityTotal: 10, CapacityUsed: 5},
 		}, "pool_a", nil},
+		// D8/D10: no free capacity is not "no pool". The least-full eligible
+		// pool still wins and the session is queued in it; only an empty
+		// eligible set is ErrUnavailable.
 		{"no positive capacity", []control.Pool{
 			{ID: "pool_full", CapacityTotal: 2, CapacityUsed: 2},
 			{ID: "pool_over", CapacityTotal: 1, CapacityUsed: 3},
-		}, "", control.ErrUnavailable},
+		}, "pool_full", nil},
 		{"no pools", nil, "", control.ErrUnavailable},
 	}
 	for _, tt := range tests {
@@ -1275,17 +1278,64 @@ func TestLifecycleDenialPreventsDispatchAndTransition(t *testing.T) {
 	}
 }
 
+// TestLifecycleRunnerUnavailable is what an unreachable runner means per
+// operation. Suspend, resume and snapshot NEED the runner — there is no
+// answer to give without it — so each refuses and leaves the row alone.
+// Delete does not (D8): the caller's intent is that this session stop
+// existing, and a row nobody can reach is destroyed anyway, with reconcile
+// left to destroy the container as an orphan if the runner ever returns.
 func TestLifecycleRunnerUnavailable(t *testing.T) {
-	f := newSessionFixtureFull(t)
-	f.transport.connectedMap = map[string]bool{}
-	f.repo.put(sessionInState(control.StateRunning))
+	ctx := context.Background()
+	for _, tt := range []struct {
+		name string
+		call func(*sessionFixture) error
+	}{
+		{"suspend", func(f *sessionFixture) error {
+			_, err := f.svc.SuspendSession(ctx, sessionTestScope(), control.SuspendSession{ID: "sess_example", Warm: true})
+			return err
+		}},
+		{"resume", func(f *sessionFixture) error {
+			_, err := f.svc.ResumeSession(ctx, sessionTestScope(), control.ResumeSession{ID: "sess_example"})
+			return err
+		}},
+		{"snapshot", func(f *sessionFixture) error {
+			_, err := f.svc.SnapshotSession(ctx, sessionTestScope(), control.SnapshotSession{ID: "sess_example"})
+			return err
+		}},
+	} {
+		t.Run(tt.name+" refuses", func(t *testing.T) {
+			f := newSessionFixtureFull(t)
+			f.transport.connectedMap = map[string]bool{}
+			state := control.StateRunning
+			if tt.name == "resume" {
+				state = control.StateSuspendedWarm
+			}
+			f.repo.put(sessionInState(state))
 
-	if err := f.svc.DeleteSession(context.Background(), sessionTestScope(), control.DeleteSession{ID: "sess_example"}); !errors.Is(err, control.ErrUnavailable) {
-		t.Fatalf("got %v, want ErrUnavailable", err)
+			if err := tt.call(f); !errors.Is(err, control.ErrUnavailable) {
+				t.Fatalf("got %v, want ErrUnavailable", err)
+			}
+			if f.log.hasPrefix("sessions:transition") {
+				t.Fatalf("unavailable runner still transitioned: %v", f.log.snapshot())
+			}
+		})
 	}
-	if f.log.hasPrefix("sessions:transition") {
-		t.Fatalf("unavailable runner still transitioned: %v", f.log.snapshot())
-	}
+
+	t.Run("delete destroys the row anyway", func(t *testing.T) {
+		f := newSessionFixtureFull(t)
+		f.transport.connectedMap = map[string]bool{}
+		f.repo.put(sessionInState(control.StateRunning))
+
+		if err := f.svc.DeleteSession(ctx, sessionTestScope(), control.DeleteSession{ID: "sess_example"}); err != nil {
+			t.Fatalf("delete on an unreachable runner: %v", err)
+		}
+		if f.transport.dispatchedType("destroy") {
+			t.Fatalf("dispatched destroy with no connection: %+v", f.transport.dispatched)
+		}
+		if !f.log.has("sessions:transition:destroyed") {
+			t.Fatalf("the row was not destroyed: %v", f.log.snapshot())
+		}
+	})
 }
 
 func TestSuspendConflictAfterDispatchRereadsAuthoritative(t *testing.T) {
@@ -1317,4 +1367,114 @@ func TestResumeConflictAfterDispatchRereadsAuthoritative(t *testing.T) {
 	if got.State != control.StateSuspendedWarm {
 		t.Fatalf("authoritative state = %q, want suspended_warm", got.State)
 	}
+}
+
+// TestDeleteSessionOnDisconnectedRunnerDestroysWithoutDispatch pins D8: a
+// delete whose runner has no control connection destroys the row anyway,
+// without dispatching. The container, if there still is one, is reconcile's
+// to destroy as an orphan when that runner comes back; refusing the delete
+// would instead let an unreachable runner pin a row open indefinitely.
+func TestDeleteSessionOnDisconnectedRunnerDestroysWithoutDispatch(t *testing.T) {
+	f := newSessionFixtureFull(t)
+	f.transport.connectedMap = map[string]bool{}
+	f.repo.put(sessionInState(control.StateRunning))
+
+	if err := f.svc.DeleteSession(context.Background(), sessionTestScope(), control.DeleteSession{ID: "sess_example"}); err != nil {
+		t.Fatalf("delete on a disconnected runner: %v", err)
+	}
+	if f.transport.dispatchedType("destroy") {
+		t.Fatalf("dispatched destroy to a runner with no connection: %+v", f.transport.dispatched)
+	}
+	row, err := f.repo.GetSession(context.Background(), "ws_example", "sess_example")
+	if err != nil {
+		t.Fatalf("GetSession after delete: %v", err)
+	}
+	if row.State != control.StateDestroyed {
+		t.Fatalf("state = %q, want destroyed", row.State)
+	}
+}
+
+// TestCreateSessionQueuesWhenThePoolIsFull pins D10: a pool with no free
+// capacity is still the pool the session is created in. Queueing is the
+// contract — a session waits for a runner rather than being refused — and a
+// host that wants admission refusal makes that decision in its pool resolver.
+func TestCreateSessionQueuesWhenThePoolIsFull(t *testing.T) {
+	svc, repo, envRepo, pools, _, _, log := newSessionFixture(t)
+	envRepo.put(sessionExampleEnvironment())
+	pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 2, CapacityUsed: 2}}
+
+	got, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{
+		Name: "investigate", EnvironmentID: "env_example",
+	})
+	if err != nil {
+		t.Fatalf("create against a full pool: %v", err)
+	}
+	if got.State != control.StateQueued || got.PoolID != "pool_a" {
+		t.Fatalf("created %q in %q, want queued in pool_a", got.State, got.PoolID)
+	}
+	row, err := repo.GetSession(context.Background(), "ws_example", got.ID)
+	if err != nil {
+		t.Fatalf("GetSession after create: %v", err)
+	}
+	if row.State != control.StateQueued || row.PoolID != "pool_a" {
+		t.Fatalf("stored %q in %q, want queued in pool_a", row.State, row.PoolID)
+	}
+	if !log.has("wake:pool_a") {
+		t.Fatalf("the full pool was not woken: %v", log.snapshot())
+	}
+}
+
+// TestDispatchDistinguishesARefusalFromASilentRunner pins D12. Both outcomes
+// are control.ErrUnavailable — that is the closed sentinel set, and no caller
+// has to learn a new one — but a runner that ANSWERED "no" is a different
+// dependency failure from one that never answered, and only the host can tell
+// its user which. ErrRunnerRefused is how it asks. The runner's own detail
+// text is in neither.
+func TestDispatchDistinguishesARefusalFromASilentRunner(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a false result is a refusal", func(t *testing.T) {
+		f := newSessionFixtureFull(t)
+		f.transport.res = runner.FromRunner{OK: false, Detail: "sandbox refusal detail"}
+		f.repo.put(sessionInState(control.StateRunning))
+
+		_, err := f.svc.SuspendSession(ctx, sessionTestScope(), control.SuspendSession{ID: "sess_example", Warm: true})
+		if !errors.Is(err, control.ErrUnavailable) {
+			t.Fatalf("got %v, want it to satisfy ErrUnavailable", err)
+		}
+		if !errors.Is(err, ErrRunnerRefused) {
+			t.Fatalf("got %v, want it to satisfy ErrRunnerRefused", err)
+		}
+		if strings.Contains(err.Error(), "sandbox refusal detail") {
+			t.Fatalf("runner detail leaked: %v", err)
+		}
+	})
+
+	t.Run("a transport failure is not a refusal", func(t *testing.T) {
+		f := newSessionFixtureFull(t)
+		f.transport.err = errors.New("socket closed")
+		f.repo.put(sessionInState(control.StateRunning))
+
+		_, err := f.svc.SuspendSession(ctx, sessionTestScope(), control.SuspendSession{ID: "sess_example", Warm: true})
+		if !errors.Is(err, control.ErrUnavailable) {
+			t.Fatalf("got %v, want it to satisfy ErrUnavailable", err)
+		}
+		if errors.Is(err, ErrRunnerRefused) {
+			t.Fatalf("a transport failure reported a refusal: %v", err)
+		}
+	})
+
+	t.Run("a runner with no connection is not a refusal", func(t *testing.T) {
+		f := newSessionFixtureFull(t)
+		f.transport.connectedMap = map[string]bool{}
+		f.repo.put(sessionInState(control.StateRunning))
+
+		_, err := f.svc.SuspendSession(ctx, sessionTestScope(), control.SuspendSession{ID: "sess_example", Warm: true})
+		if !errors.Is(err, control.ErrUnavailable) {
+			t.Fatalf("got %v, want it to satisfy ErrUnavailable", err)
+		}
+		if errors.Is(err, ErrRunnerRefused) {
+			t.Fatalf("an absent connection reported a refusal: %v", err)
+		}
+	})
 }

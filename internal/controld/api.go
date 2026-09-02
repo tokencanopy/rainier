@@ -10,12 +10,14 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/controlapp"
 	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
@@ -127,49 +129,57 @@ func sessionJSON(s Session, d sessionDerived) sessionView {
 // environment or capacity reading that outlived its request would start
 // describing a fleet that has since moved on.
 type sessionRenderer struct {
-	srv *Server
-	ctx context.Context
+	srv   *Server
+	ctx   context.Context
+	scope control.Scope
 
-	// envs maps environment id to its row; a nil value records "already
-	// looked up, and there is nothing there".
-	envs map[string]*Environment
+	// envs maps environment id to the environment the service returned; a nil
+	// value records "already looked up, and there is nothing there".
+	envs map[string]*control.Environment
 	// free maps a connected runner's name to its free slots, computed at most
 	// once per request and only if some queued session's pin asks for it.
 	free     map[string]int
 	freeDone bool
 }
 
-// renderer returns a fresh per-request renderer.
+// renderer returns a fresh per-request renderer. The scope it reads
+// environments under is the one the request already authenticated — the
+// handler put the user in ctx with withUser, so the renderer needs no second
+// argument to stay inside the caller's own authorization.
 func (s *Server) renderer(ctx context.Context) *sessionRenderer {
-	return &sessionRenderer{srv: s, ctx: ctx, envs: map[string]*Environment{}}
+	r := &sessionRenderer{srv: s, ctx: ctx, envs: map[string]*control.Environment{}}
+	if u, ok := userFromContext(ctx); ok {
+		r.scope = userScope(u)
+	}
+	return r
 }
 
 // view renders one session.
-func (r *sessionRenderer) view(row Session) sessionView {
+func (r *sessionRenderer) view(row control.Session) sessionView {
 	d := sessionDerived{Reachable: r.srv.reachable(row)}
-	if env := r.environment(row.EnvironmentID); env != nil {
+	if env := r.environment(string(row.EnvironmentID)); env != nil {
 		d.Environment = env.Name
 		d.QueueReason = r.queueReason(row, *env)
 	}
-	return sessionJSON(row, d)
+	return sessionJSON(sessionFromControl(row), d)
 }
 
-// environment returns the row for id, or nil for a scratch session, an
-// environment that has since been deleted, or a store that could not answer.
-// None of those is worth failing a read over: the environment name is a
-// convenience on a session view, and a session outlives its environment
+// environment returns the environment for id, or nil for a scratch session,
+// an environment that has since been deleted, or a service that could not
+// answer. None of those is worth failing a read over: the environment name is
+// a convenience on a session view, and a session outlives its environment
 // perfectly well — it carries its own resolved image.
-func (r *sessionRenderer) environment(id string) *Environment {
+func (r *sessionRenderer) environment(id string) *control.Environment {
 	if id == "" {
 		return nil
 	}
 	if env, seen := r.envs[id]; seen {
 		return env
 	}
-	var env *Environment
-	row, err := r.srv.st.GetEnvironment(r.ctx, id)
+	var env *control.Environment
+	row, err := r.srv.environments.GetEnvironment(r.ctx, r.scope, control.EnvironmentID(id))
 	switch {
-	case errors.Is(err, ErrNotFound):
+	case errors.Is(err, control.ErrNotFound):
 	case err != nil:
 		log.Printf("controld: rendering a session view: get environment %s: %v", id, err)
 	default:
@@ -185,33 +195,62 @@ func (r *sessionRenderer) environment(id string) *Environment {
 // this session over (design §4.6). Everything else — a session that is not
 // queued, an unpinned environment, a pin that could be honored right now —
 // has no reason to give, and says nothing rather than guessing.
-func (r *sessionRenderer) queueReason(row Session, env Environment) string {
-	if row.State != StateQueued || env.Placement == "" || r.runnerHasRoom(env.Placement) {
+//
+// The pin is read off the environment's portable requirements: control names
+// no runner, so an operator's `placement` is carried as the capability
+// "placement:<runner>" (adapt_store.go).
+func (r *sessionRenderer) queueReason(row control.Session, env control.Environment) string {
+	pin := capabilityValue(env.Requirements.Capabilities, placementCapabilityPrefix)
+	if row.State != control.StateQueued || pin == "" || r.runnerHasRoom(pin) {
 		return ""
 	}
-	return "waiting for runner " + env.Placement
+	return "waiting for runner " + pin
 }
 
 // runnerHasRoom reports whether name is connected to this replica AND has a
 // free slot right now — the same two conditions placement itself applies.
+//
+// This is the one store read the renderer makes for itself. It is view logic
+// and decides nothing: the free-capacity question belongs to the scheduler,
+// and asking it through a service would mean a placement pass per rendered
+// page.
 func (r *sessionRenderer) runnerHasRoom(name string) bool {
 	if !r.freeDone {
 		r.freeDone = true
-		r.free = map[string]int{}
-		views, err := r.srv.freeCapacity(r.ctx)
-		if err != nil {
-			// Without the fleet's capacity the honest answer is "no room known"
-			// — which renders the waiting-for-runner line. That is the safer
-			// way to be wrong: it explains a session that is in fact about to be
-			// placed, rather than silently explaining nothing about one that is
-			// genuinely stuck.
-			log.Printf("controld: rendering a session view: computing free capacity: %v", err)
-		}
-		for _, v := range views {
-			r.free[v.Name] = v.Free
-		}
+		// Without the fleet's capacity the honest answer is "no room known" —
+		// which renders the waiting-for-runner line. That is the safer way to
+		// be wrong: it explains a session that is in fact about to be placed,
+		// rather than silently explaining nothing about one that is genuinely
+		// stuck.
+		r.free = r.freeSlots()
 	}
-	return r.free[name] > 0 && r.srv.runnerConnected(name)
+	return r.free[name] > 0 && r.srv.transport.Connected(installPool, control.RunnerID(name))
+}
+
+// freeSlots is free capacity per connected runner: its reported total less
+// its reported use less the sessions it is currently creating, whose slots
+// the runner has not counted yet. A store that cannot answer any part of it
+// yields an empty map rather than a partial one — half a capacity picture is
+// not a smaller truth, it is a different fleet.
+func (r *sessionRenderer) freeSlots() map[string]int {
+	rows, err := r.srv.st.ListRunners(r.ctx)
+	if err != nil {
+		log.Printf("controld: rendering a session view: listing runners: %v", err)
+		return map[string]int{}
+	}
+	free := make(map[string]int, len(rows))
+	for _, row := range rows {
+		if !row.Connected {
+			continue
+		}
+		creating, err := r.srv.st.SessionsOnRunner(r.ctx, row.Name, []SessionState{StateCreating})
+		if err != nil {
+			log.Printf("controld: rendering a session view: sessions creating on a runner: %v", err)
+			return map[string]int{}
+		}
+		free[row.Name] = row.CapacityTotal - row.CapacityUsed - len(creating)
+	}
+	return free
 }
 
 // emptyIfNil returns ss, or a non-nil empty slice in its place, so
@@ -234,9 +273,11 @@ func copyIntPtr(p *int) *int {
 	return &v
 }
 
-// reachable computes sessionJSON's "reachable" flag for row.
-func (s *Server) reachable(row Session) bool {
-	return row.Runner != "" && s.runnerConnected(row.Runner) && !row.State.Terminal()
+// reachable computes sessionJSON's "reachable" flag for row: a session held
+// by a runner that has a control connection to this replica right now, and is
+// still live enough for that connection to mean anything.
+func (s *Server) reachable(row control.Session) bool {
+	return row.RunnerID != "" && s.transport.Connected(installPool, row.RunnerID) && !row.State.Terminal()
 }
 
 type sessionEnvelope struct {
@@ -367,19 +408,74 @@ func authorizeOwnerOrAdmin(u User, row Session) bool {
 }
 
 // ---------------------------------------------------------------------------
+// the session service's errors on the wire
+// ---------------------------------------------------------------------------
+
+// sessionErrText is the pair of sentences a session handler owns, because the
+// service reports both situations as one sentinel and cannot know which
+// operation was being asked for.
+//
+// Conflict replaces the generic "conflict" where today's handler had a
+// specific refusal. Refused is the "could not <verb> session" a runner that
+// answered NO gets — the operation genuinely failed here, not at an
+// unreachable dependency, so it is 500 rather than 502.
+type sessionErrText struct {
+	Conflict string
+	Refused  string
+}
+
+// writeSessionErr answers a session-service error with controlStatus's fixed
+// mapping (adapt_http.go), with the three refinements every session handler
+// shares.
+//
+// The order matters. A runner that received the command and reported failure
+// (controlapp.ErrRunnerRefused) is checked FIRST: it wraps ErrUnavailable, so
+// the connectivity refinement below would otherwise call it unreachable —
+// which is exactly backwards, since the runner is right here and answering.
+// Everything else that is ErrUnavailable for a placed session IS about the
+// runner, and unavailableStatus says which way (no connection, or no answer)
+// off a re-read of the row. A re-read that fails leaves the fixed 500, the
+// honest answer when we cannot even say whose runner it was.
+func (s *Server) writeSessionErr(w http.ResponseWriter, ctx context.Context, id string, err error, text sessionErrText) {
+	status, code, msg := controlStatus(err)
+	if status == 0 {
+		return // the caller went away; there is nobody to answer
+	}
+	switch {
+	case errors.Is(err, control.ErrConflict) && text.Conflict != "":
+		msg = text.Conflict
+	case errors.Is(err, controlapp.ErrRunnerRefused):
+		// The detail the runner gave is not ours to relay and never reached
+		// us; the log line that has it lives in the runner plane.
+		status, code, msg = http.StatusInternalServerError, "internal", text.Refused
+	case errors.Is(err, control.ErrUnavailable) && id != "":
+		u, ok := userFromContext(ctx)
+		if !ok {
+			break
+		}
+		if row, gErr := s.sessions.GetSession(ctx, userScope(u), control.SessionID(id)); gErr == nil {
+			status, code, msg = s.unavailableStatus(row)
+		}
+	}
+	writeErr(w, status, code, msg)
+}
+
+// ---------------------------------------------------------------------------
 // POST /v0/sessions
 // ---------------------------------------------------------------------------
 
-// handleCreateSession serves POST /v0/sessions. The row commits to the
-// store before wakeScheduler and before the 202 is written — a client that
-// gets a response, or a controld that crashes right after this call, always
-// has a durable row to show for it (design §4.6, "create is write-ahead
-// durable").
+// handleCreateSession serves POST /v0/sessions: decode, run the three host
+// policy preflights the service cannot make for itself, and hand the create
+// to the session service, which owns the row, the pool selection and the
+// wake.
 //
-// Environment resolution runs BEFORE that commit, deliberately: every way it
-// can fail (an environment nobody has heard of, a secret it references that
-// has since been deleted) must leave no session behind at all, so the caller
-// fixes one thing and retries rather than cleaning up a half-built row first.
+// The preflights run BEFORE the create, deliberately: every way they can fail
+// (an environment nobody has heard of, a secret it references that has since
+// been deleted, a clone with no credential to clone with) must leave no
+// session behind at all, so the caller fixes one thing and retries rather
+// than cleaning up a half-built row first. Each is host policy the control
+// contract deliberately does not carry — a name index, a vault, and a
+// per-user GitHub credential.
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u User) {
 	var req createSessionRequest
 	if !decodeJSONBody(w, r, &req) {
@@ -391,136 +487,135 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 		writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-
-	idemKey := r.Header.Get("Idempotency-Key")
-	row := Session{
-		ID:             NewSessionID(),
-		OwnerID:        u.ID,
-		Name:           req.Name,
-		Image:          req.Image,
-		Cmd:            req.Cmd,
-		EgressAllow:    req.EgressAllow,
-		Repos:          repos,
-		State:          StateQueued,
-		IdempotencyKey: idemKey,
+	// A create names an environment OR carries a scratch spec, never both
+	// (control.CreateSession.Validate). The spec is all three fields, not just
+	// the image: an environment session runs the environment's image, command
+	// and egress allowlist, so a caller who sent any of them beside
+	// `environment` asked for something that cannot happen. Refusing says so;
+	// accepting the create and dropping the field would hand back a session
+	// running an allowlist the caller did not ask for and cannot see they
+	// didn't get.
+	if req.Environment != "" && (req.Image != "" || req.Cmd != nil || req.EgressAllow != nil) {
+		writeErr(w, http.StatusBadRequest, "invalid_request",
+			"an environment session cannot override the image, command, or egress allowlist")
+		return
 	}
-	var env *Environment
+	// The other half of the same rule: a create that names neither an
+	// environment nor anything to run describes no session at all. The
+	// service refuses it too; saying which field is missing is the handler's
+	// job, because the service can only report that the command was invalid.
+	if req.Environment == "" && req.Image == "" && req.Cmd == nil && req.EgressAllow == nil {
+		writeErr(w, http.StatusBadRequest, "invalid_request", "a session must name an environment or an image")
+		return
+	}
+
+	ctx := withUser(r.Context(), u)
+	scope := userScope(u)
+
+	var env *control.Environment
 	if req.Environment != "" {
-		resolved, ok := s.resolveEnvironment(w, r, req.Environment, &row)
+		resolved, ok := s.createEnvironment(w, ctx, scope, req.Environment)
 		if !ok {
 			return
 		}
 		env = &resolved
 	}
-	if !s.resolveRepos(w, r, u, &row, env) {
+	if !s.createPreflight(w, ctx, u, repos, env) {
 		return
 	}
 
-	created, err := s.st.CreateSession(r.Context(), row)
-	switch {
-	case errors.Is(err, ErrIdemReplay):
-		existing, gErr := s.st.SessionByIdem(r.Context(), u.ID, idemKey)
-		if gErr != nil {
-			log.Printf("controld: idempotency replay lookup for owner %s: %v", u.ID, gErr)
-			writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
-			return
+	cmd := control.CreateSession{
+		Name:           req.Name,
+		Repos:          reposToControl(repos),
+		IdempotencyKey: r.Header.Get("Idempotency-Key"),
+	}
+	if env != nil {
+		cmd.EnvironmentID = env.ID
+	} else {
+		cmd.Spec = control.PortableSpec{
+			Image:       req.Image,
+			Cmd:         req.Cmd,
+			EgressAllow: req.EgressAllow,
 		}
-		s.writeSessionCreated(w, r, existing)
-		return
-	case errors.Is(err, ErrConflict):
-		writeErr(w, http.StatusConflict, "conflict", "a non-terminal session with that name already exists")
-		return
-	case err != nil:
-		log.Printf("controld: create session: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
+	}
+	created, err := s.sessions.CreateSession(ctx, scope, cmd)
+	if err != nil {
+		s.writeSessionErr(w, ctx, "", err, sessionErrText{
+			Conflict: "a non-terminal session with that name already exists",
+			Refused:  "could not create session",
+		})
 		return
 	}
-
-	// The row is durably committed at this point; only now may the
-	// scheduler learn about it or the client learn it exists.
+	// until Task 5 replaces the scheduler loop, the old loop still needs this wake
 	s.wakeScheduler()
-	s.writeSessionCreated(w, r, created)
+
+	w.Header().Set("Location", "/v0/sessions/"+string(created.ID))
+	writeJSON(w, http.StatusAccepted, sessionEnvelope{Session: s.renderer(ctx).view(created)})
 }
 
-// resolveEnvironment applies the environment named by ref to row: the id it
-// came from, the image it will actually run, and the egress it inherits when
-// the caller named none. It returns the environment it resolved, and writes
-// the client's response and reports false on every failure, so a rejected
-// create never reaches the store.
-//
-// The environment's secrets are resolved here too, and then thrown away: the
-// values belong in exactly one place, the dispatched Spec (see createSpec),
-// and resolving them now is what turns a dangling reference into a refused
-// create instead of a session that starts without the credential its
-// environment promised.
-func (s *Server) resolveEnvironment(w http.ResponseWriter, r *http.Request, ref string, row *Session) (Environment, bool) {
-	env, err := s.environmentByRef(r.Context(), ref)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeErr(w, http.StatusBadRequest, "invalid_request",
-				fmt.Sprintf("environment %q does not exist", ref))
-			return Environment{}, false
-		}
-		log.Printf("controld: create session: get environment %q: %v", ref, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
-		return Environment{}, false
-	}
-
-	_, missing, err := s.secretEnv(r.Context(), env)
+// createEnvironment resolves a create body's `environment` to the environment
+// the session starts from. A reference nothing answers to is the caller's
+// mistake, not a missing resource: it is 400 naming the reference, exactly as
+// before, because the thing that was not found is a field of the request.
+func (s *Server) createEnvironment(w http.ResponseWriter, ctx context.Context, scope control.Scope, ref string) (control.Environment, bool) {
+	env, err := s.environmentRef(ctx, scope, ref)
 	switch {
+	case errors.Is(err, control.ErrNotFound):
+		writeErr(w, http.StatusBadRequest, "invalid_request",
+			fmt.Sprintf("environment %q does not exist", ref))
+		return control.Environment{}, false
 	case err != nil:
-		log.Printf("controld: create session: resolving secrets of environment %s: %v", env.ID, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
-		return Environment{}, false
-	case missing != "":
-		writeErr(w, http.StatusConflict, "conflict", missingSecretMessage(env, missing))
-		return Environment{}, false
-	}
-
-	row.EnvironmentID = env.ID
-	row.ResolvedImage = s.resolveImage(r.Context(), row.Image, env)
-	// A caller who sent egress_allow at all — including an explicit empty
-	// array, which means "no egress" — has answered the question; only its
-	// absence inherits the environment's list.
-	if row.EgressAllow == nil {
-		row.EgressAllow = env.EgressAllow
+		log.Printf("controld: create session: get environment %q: %v", ref, err)
+		writeControlErr(w, err)
+		return control.Environment{}, false
 	}
 	return env, true
 }
 
-// resolveRepos settles what row will clone, before the row exists: it decides
-// whether this session clones at all (its own override, else env's github
-// connectors), refuses the create when it would clone with no credential to
-// clone WITH, and adds the hosts a clone needs to the session's allowlist.
+// createPreflight runs the two host-policy gates a create has to pass and the
+// service cannot: the environment's secret references must all still resolve
+// in the vault, and a session that will clone must have a GitHub credential
+// to clone with.
 //
-// The gate is the reason this runs at create rather than at dispatch. A
-// session that cannot authenticate to GitHub is not a session anyone wants
-// started: it would boot, fail its clone stage, and leave a dead container to
-// explain — where refusing here is one message naming one command, with no row
-// left behind (design §4.3, and the same pre-insert discipline a missing
-// secret_ref gets).
+// Neither answer carries anything sensitive. The secret refusal names the
+// reference (a name, never a value); the credential refusal names the command
+// that fixes it and never reads the credential row it checked for.
 //
 // ANY stored credential passes, valid or needs_refresh. The two differ in
 // whether they can become usable without the user creating this session again:
 // a stale credential is refreshable mid-flight — `rainier login --refresh
 // github` while the session sits there, and the clone that follows works — so
-// the clone, not the create, is the right place for it to say so, with the
-// named action the mint path already carries. A credential that is not there
-// at all never becomes present that way.
-func (s *Server) resolveRepos(w http.ResponseWriter, r *http.Request, u User, row *Session, env *Environment) bool {
-	refs, err := sessionRepoRefs(*row, env)
+// the clone, not the create, is the right place for it to say so. A
+// credential that is not there at all never becomes present that way.
+func (s *Server) createPreflight(w http.ResponseWriter, ctx context.Context, u User, repos []RepoRef, env *control.Environment) bool {
+	var storeEnv *Environment
+	if env != nil {
+		row := environmentFromControl(*env)
+		storeEnv = &row
+		_, missing, err := s.secretEnv(ctx, row)
+		switch {
+		case err != nil:
+			log.Printf("controld: create session: resolving secrets of environment %s: %v", row.ID, err)
+			writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
+			return false
+		case missing != "":
+			writeErr(w, http.StatusConflict, "conflict", missingSecretMessage(row, missing))
+			return false
+		}
+	}
+
+	refs, err := sessionRepoRefs(Session{Repos: repos}, storeEnv)
 	if err != nil {
-		log.Printf("controld: create session: resolving the repositories of environment %s: %v", envID(env), err)
+		log.Printf("controld: create session: resolving the repositories of environment %s: %v", envID(storeEnv), err)
 		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
 		return false
 	}
 	if len(refs) == 0 {
 		return true
 	}
-
 	// The row itself is never read — only its existence is — so no credential
 	// material is loaded, let alone rendered into the response.
-	if _, err := s.st.GetCredential(r.Context(), u.ID, githubProvider); err != nil {
+	if _, err := s.st.GetCredential(ctx, u.ID, githubProvider); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			writeErr(w, http.StatusConflict, "conflict", ErrCredentialMissing.Error())
 			return false
@@ -529,63 +624,7 @@ func (s *Server) resolveRepos(w http.ResponseWriter, r *http.Request, u User, ro
 		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
 		return false
 	}
-
-	// Recorded on the row rather than added at dispatch alone, so the
-	// allowlist a session runs with is visible in the session it belongs to
-	// rather than implied by its connectors.
-	row.EgressAllow = withGitHubHosts(row.EgressAllow)
 	return true
-}
-
-// resolveImage decides the image a session from env actually runs (design
-// §4.3): the caller's own image wins outright, then env's cached snapshot
-// while it is usable, then env's plain image — which is also the case where
-// the setup script still has to run, since nothing has run it yet.
-func (s *Server) resolveImage(ctx context.Context, override string, env Environment) string {
-	switch {
-	case override != "":
-		return override
-	case s.cacheUsable(ctx, env):
-		return env.SnapshotRef
-	default:
-		return env.Image
-	}
-}
-
-// cacheUsable reports whether env's cached snapshot may be dispatched right
-// now. Two conditions, both necessary:
-//
-//   - The cache is current: it was built from the image+setup the environment
-//     still has (SnapshotHash == SetupHash). An edited environment leaves its
-//     old snapshot in place and visibly stale rather than silently adopted.
-//   - The runner that built it is connected to this replica with a free slot.
-//     v0 has no registry: the snapshot exists ONLY in that runner's local
-//     image store, so a create carrying the ref anywhere else would `docker
-//     pull` a tag no daemon can resolve and fail. The scheduler's cache
-//     tiebreak then steers the session to that same runner; this check is what
-//     keeps the two agreeing, and what makes a busy holder mean "rebuild from
-//     the plain image" rather than "fail".
-func (s *Server) cacheUsable(ctx context.Context, env Environment) bool {
-	if env.SnapshotRef == "" || env.SnapshotRunner == "" || env.SnapshotHash != env.SetupHash {
-		return false
-	}
-	if !s.runnerConnected(env.SnapshotRunner) {
-		return false
-	}
-	views, err := s.freeCapacity(ctx)
-	if err != nil {
-		// Without the capacity picture the safe answer is "don't use the
-		// cache": rebuilding from the plain image is slow but always works,
-		// while a misplaced snapshot ref fails the create outright.
-		log.Printf("controld: resolving environment %s: computing free capacity: %v", env.ID, err)
-		return false
-	}
-	for _, v := range views {
-		if v.Name == env.SnapshotRunner {
-			return v.Free > 0
-		}
-	}
-	return false
 }
 
 // secretEnv decrypts every secret env references into the environment map its
@@ -624,32 +663,6 @@ func missingSecretMessage(env Environment, name string) string {
 	return fmt.Sprintf("environment %q references secret %q, which no longer exists", env.Name, name)
 }
 
-func (s *Server) writeSessionCreated(w http.ResponseWriter, r *http.Request, row Session) {
-	w.Header().Set("Location", "/v0/sessions/"+row.ID)
-	writeJSON(w, http.StatusAccepted, sessionEnvelope{Session: s.renderer(r.Context()).view(row)})
-}
-
-// writeCurrentSession re-fetches id and writes it as a 200 session response
-// (404 if it no longer exists). Used when a guarded Transition lost a race
-// against a concurrent mutation after a runner op had already executed: the
-// runner op is real, so the response is still success — it just has to
-// report what the store actually holds now, not the state the handler
-// merely hoped to reach. Never let a caller of this function then serialize
-// its own guessed state instead.
-func (s *Server) writeCurrentSession(w http.ResponseWriter, r *http.Request, id string) {
-	row, err := s.st.GetSession(r.Context(), id)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "not_found", "session not found")
-			return
-		}
-		log.Printf("controld: get session %s: %v", id, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not get session")
-		return
-	}
-	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(r.Context()).view(row)})
-}
-
 // ---------------------------------------------------------------------------
 // GET /v0/sessions
 // ---------------------------------------------------------------------------
@@ -657,6 +670,11 @@ func (s *Server) writeCurrentSession(w http.ResponseWriter, r *http.Request, id 
 // handleListSessions serves GET /v0/sessions: team-visible, cursor-paginated,
 // terminal states hidden unless all=true. name is an optional exact filter;
 // the CLI uses it to resolve one resource without paging through team history.
+//
+// control.SessionQuery carries only the three things pagination needs, so
+// state/name/runner are applied to the page the service returns rather than
+// pushed into the store's query. They are exact-match conveniences for the
+// CLI, not a query language, and the cursor stays the service's.
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request, u User) {
 	q := r.URL.Query()
 
@@ -673,41 +691,56 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request, u Us
 		limit = maxListLimit
 	}
 
-	query := SessionQuery{
-		Name:            q.Get("name"),
-		Runner:          q.Get("runner"),
+	cursor := q.Get("cursor")
+	ctx := withUser(r.Context(), u)
+	page, err := s.sessions.ListSessions(ctx, userScope(u), control.SessionQuery{
 		IncludeTerminal: q.Get("all") == "true",
 		Limit:           limit,
-		Cursor:          q.Get("cursor"),
-	}
-	if st := q.Get("state"); st != "" {
-		query.States = []SessionState{SessionState(st)}
-	}
-
-	rows, next, err := s.st.ListSessions(r.Context(), query)
+		Cursor:          cursor,
+	})
 	if err != nil {
-		// The store's cursor decode error is unsentineled: any ListSessions
-		// error while a (necessarily non-empty) cursor was supplied is
-		// treated as an invalid cursor, per Task 2's ruling. A store error
-		// with no cursor involved is a genuine internal failure.
-		if query.Cursor != "" {
+		// The only per-request failure this query has is a cursor nothing can
+		// decode, and that is the caller's mistake rather than a service that
+		// cannot answer. The store's decode failure is unsentineled and the
+		// service collapses a repository sentinel into ErrUnavailable, so any
+		// failure while a (necessarily non-empty) cursor was supplied is
+		// treated as an invalid cursor — the ruling this handler has always
+		// applied.
+		if cursor != "" && (errors.Is(err, control.ErrInvalid) || errors.Is(err, control.ErrUnavailable)) {
 			writeErr(w, http.StatusBadRequest, "invalid_request", "invalid cursor")
 			return
 		}
-		log.Printf("controld: list sessions: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not list sessions")
+		writeControlErr(w, err)
 		return
 	}
 
 	// One renderer for the whole page: the environment name and queue reason
 	// each row needs come from outside the session table, and this is what
 	// keeps a page of N sessions from repeating those lookups N times.
-	rend := s.renderer(r.Context())
-	views := make([]sessionView, len(rows))
-	for i, row := range rows {
-		views[i] = rend.view(row)
+	rend := s.renderer(ctx)
+	views := make([]sessionView, 0, len(page.Sessions))
+	for _, row := range page.Sessions {
+		if !matchesSessionFilters(row, q) {
+			continue
+		}
+		views = append(views, rend.view(row))
 	}
-	writeJSON(w, http.StatusOK, sessionsEnvelope{Sessions: views, NextCursor: next})
+	writeJSON(w, http.StatusOK, sessionsEnvelope{Sessions: views, NextCursor: page.NextCursor})
+}
+
+// matchesSessionFilters applies the three exact-match query filters to one
+// row of a returned page. An absent filter matches everything.
+func matchesSessionFilters(row control.Session, q url.Values) bool {
+	if state := q.Get("state"); state != "" && string(row.State) != state {
+		return false
+	}
+	if name := q.Get("name"); name != "" && row.Name != name {
+		return false
+	}
+	if runnerName := q.Get("runner"); runnerName != "" && string(row.RunnerID) != runnerName {
+		return false
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------
@@ -716,164 +749,44 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request, u Us
 
 func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request, u User) {
 	id := r.PathValue("id")
-	row, err := s.st.GetSession(r.Context(), id)
+	ctx := withUser(r.Context(), u)
+	row, err := s.sessions.GetSession(ctx, userScope(u), control.SessionID(id))
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "not_found", "session not found")
-			return
-		}
-		log.Printf("controld: get session %s: %v", id, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not get session")
+		s.writeSessionErr(w, ctx, id, err, sessionErrText{Refused: "could not get session"})
 		return
 	}
-	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(r.Context()).view(row)})
+	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(ctx).view(row)})
 }
 
 // ---------------------------------------------------------------------------
 // DELETE /v0/sessions/{id}
 // ---------------------------------------------------------------------------
 
-// handleDeleteSession serves DELETE /v0/sessions/{id} per the route table:
-// queued cancels outright; creating is rejected (409, nothing to destroy
-// yet, dispatch may already be in flight); a placed session is destroyed on
-// its runner if that runner is connected, or marked destroyed directly if
-// not — reconcile's terminal-row-orphan rule cleans the container up later
-// if the runner ever comes back (design §4.8). Most terminal sessions are a
-// no-op 204 (idempotent), but failed is deliberately different: setup/clone
-// failures retain a live container for attach, so rm must destroy it. Every
-// success path wakes the scheduler: even the no-op paths are cheap to wake
-// on, and it keeps the rule simple.
-//
-// Every path that reaches a runner ALSO reclaims the workspace volume (see
-// reclaimWorkspace), and this is the half of the durability rider that keeps
-// the other half honest. Since Plan 5 a crash removes only the container and
-// keeps the session's workspace, so an rm is now the ONLY thing that ever
-// takes one — including for the terminal no-op path, where a crash-dead
-// session's container went long ago and nothing on that runner will ever name
-// its volume again. Without the reclaim there, "a crash preserves the
-// workspace" would read, on a host's disk, as "every crash leaks one".
+// handleDeleteSession serves DELETE /v0/sessions/{id}. The state machine is
+// the session service's: queued cancels outright; creating is rejected (409,
+// nothing to destroy yet, dispatch may already be in flight); a placed
+// session is destroyed on its runner when that runner is connected, and
+// destroyed in the store either way — reconcile's terminal-row-orphan rule
+// cleans the container up later if the runner ever comes back (design §4.8).
+// Most terminal sessions are a no-op 204 (idempotent), but failed is
+// deliberately different: setup/clone failures retain a live container for
+// attach, so rm must destroy it. Every path that can reach a runner also
+// reclaims the session's workspace volume, which is the half of the
+// durability rider that keeps "a crash preserves the workspace" from reading,
+// on a host's disk, as "every crash leaks one".
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request, u User) {
 	id := r.PathValue("id")
-	row, err := s.st.GetSession(r.Context(), id)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "not_found", "session not found")
-			return
-		}
-		log.Printf("controld: get session %s: %v", id, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not delete session")
+	ctx := withUser(r.Context(), u)
+	if err := s.sessions.DeleteSession(ctx, userScope(u), control.DeleteSession{ID: control.SessionID(id)}); err != nil {
+		s.writeSessionErr(w, ctx, id, err, sessionErrText{
+			Conflict: "session is still creating",
+			Refused:  "could not delete session",
+		})
 		return
 	}
-	if !authorizeOwnerOrAdmin(u, row) {
-		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to modify this session")
-		return
-	}
-
-	switch {
-	case row.State.Terminal() && row.State != StateFailed:
-		// Idempotent for the ROW, but not inert on the runner: a dead session
-		// still has the workspace its crash preserved, and this delete is the
-		// user saying they are done with it. A destroyed one has nothing left
-		// to take, and the runner answers ok for an absent volume.
-		s.reclaimWorkspace(row)
-		s.wakeScheduler()
-		w.WriteHeader(http.StatusNoContent)
-		return
-	case row.State == StateCreating:
-		writeErr(w, http.StatusConflict, "conflict", "session is still creating")
-		return
-	case row.State == StateQueued:
-		if err := s.st.Transition(r.Context(), id, []SessionState{StateQueued}, StateCanceled, TransitionOpts{}); err != nil {
-			if !errors.Is(err, ErrConflict) && !errors.Is(err, ErrNotFound) {
-				log.Printf("controld: cancel session %s: %v", id, err)
-				writeErr(w, http.StatusInternalServerError, "internal", "could not delete session")
-				return
-			}
-			// The row moved out of queued between our read and the guarded
-			// update (a placement, or a concurrent delete). Either way the
-			// caller's intent — this session should not exist — is already
-			// being honored by whatever it became; report success.
-		}
-		s.wakeScheduler()
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	// running, suspended_warm, suspended_cold, or failed: destroy it on the
-	// runner that holds it, if that runner is here to ask. Failed is terminal
-	// in the store but may still have a live, attachable container after a
-	// setup/clone/init failure; the runner's destroy is idempotent when it
-	// does not.
-	if row.Runner != "" && s.runnerConnected(row.Runner) {
-		res, err := s.dispatch(r.Context(), row.Runner, runner.ToRunner{Type: "destroy", Session: id})
-		switch {
-		// ErrDispatchTimeout wraps ErrRunnerUnreachable, so it lands here
-		// too — deliberately, here and at the three sibling ops
-		// (suspend/resume/snapshot). Whether the runner never got the
-		// command or got it and didn't answer in time, controld cannot
-		// confirm the op and leaves the row untouched, so `runner_unreachable`
-		// is the honest answer and the caller's retry runs against the same
-		// state it just read.
-		case errors.Is(err, ErrRunnerUnreachable):
-			writeErr(w, http.StatusBadGateway, "runner_unreachable", "runner did not respond")
-			return
-		case err != nil:
-			log.Printf("controld: destroy %s on %s: %v", id, row.Runner, err)
-			writeErr(w, http.StatusInternalServerError, "internal", "could not delete session")
-			return
-		case !res.OK:
-			log.Printf("controld: destroy %s on %s: runner reported failure: %s", id, row.Runner, res.Detail)
-			writeErr(w, http.StatusInternalServerError, "internal", "could not delete session")
-			return
-		}
-	}
-	// Unconditional, covering both branches above: after a destroy that
-	// already took the volume with its container (the reclaim is then a no-op
-	// the runner answers ok for), and after the disconnected branch, where it
-	// finds no runner to ask and says so by doing nothing. The one place a
-	// workspace may outlive its session is a crash — every explicit rm says
-	// that out loud rather than inferring it from which teardown ran.
-	s.reclaimWorkspace(row)
-	from := NonTerminal
-	if row.State == StateFailed {
-		from = []SessionState{StateFailed}
-	}
-	s.transitionQuiet(r.Context(), id, from, StateDestroyed, TransitionOpts{})
+	// until Task 5 replaces the scheduler loop, the old loop still needs this wake
 	s.wakeScheduler()
 	w.WriteHeader(http.StatusNoContent)
-}
-
-// reclaimWorkspace tells the runner holding row to remove its workspace
-// volume. Fire-and-forget: there is no answer worth waiting for (an absent
-// volume is a success, and a failure changes nothing the caller can act on),
-// and a delete must not turn into a 502 over a reclaim when the teardown it
-// was asked for has already happened.
-//
-// A session on no runner, or on one not connected to THIS replica, has nobody
-// to ask, and the two cases end differently:
-//
-//   - the container still exists (an rm while the runner was down). When that
-//     runner reconnects it announces the session, reconcile sees a terminal
-//     row announced present, and destroys it as an orphan — a FULL destroy,
-//     which takes the volume. Nothing leaks.
-//   - the container is already gone (a crash-dead session whose rm found its
-//     runner away). runnerd dropped that session from its registry when it
-//     crashed, so it will never be announced again and reconcile will never
-//     see it: the volume outlives everything that knows its name. That is a
-//     known v0 gap — v0 has no workspace GC — and it is bounded by the
-//     window in which a runner is disconnected while a dead session is
-//     removed.
-//
-// Blocking the delete until the runner returns is not the fix: it would let
-// an unreachable runner pin a row open indefinitely, which is worse than a
-// stray volume.
-func (s *Server) reclaimWorkspace(row Session) {
-	if row.Runner == "" || !s.runnerConnected(row.Runner) {
-		return
-	}
-	if err := s.sendToRunner(row.Runner, runner.ToRunner{Type: "remove_workspace", Session: row.ID}); err != nil {
-		log.Printf("controld: reclaiming the workspace of %s on %s: %v", row.ID, row.Runner, err)
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -882,159 +795,54 @@ func (s *Server) reclaimWorkspace(row Session) {
 
 func (s *Server) handleSuspendSession(w http.ResponseWriter, r *http.Request, u User) {
 	id := r.PathValue("id")
-	row, err := s.st.GetSession(r.Context(), id)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "not_found", "session not found")
-			return
-		}
-		log.Printf("controld: get session %s: %v", id, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not suspend session")
-		return
-	}
-	if !authorizeOwnerOrAdmin(u, row) {
-		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to modify this session")
-		return
-	}
-
 	var req suspendRequest
 	if !decodeJSONBody(w, r, &req) {
 		return
 	}
-	warm := true
-	if req.Warm != nil {
-		warm = *req.Warm
-	}
+	// An absent `warm` is indistinguishable from an explicit true; the
+	// default is true either way.
+	warm := req.Warm == nil || *req.Warm
 
-	if row.State != StateRunning {
-		writeErr(w, http.StatusConflict, "conflict", "session is not running")
+	ctx := withUser(r.Context(), u)
+	row, err := s.sessions.SuspendSession(ctx, userScope(u), control.SuspendSession{
+		ID: control.SessionID(id), Warm: warm,
+	})
+	if err != nil {
+		s.writeSessionErr(w, ctx, id, err, sessionErrText{
+			Conflict: "session is not running",
+			Refused:  "could not suspend session",
+		})
 		return
 	}
-
-	res, err := s.dispatch(r.Context(), row.Runner, runner.ToRunner{Type: "suspend", Session: id, Warm: warm})
-	switch {
-	case errors.Is(err, ErrRunnerUnreachable):
-		writeErr(w, http.StatusBadGateway, "runner_unreachable", "runner did not respond")
-		return
-	case err != nil:
-		log.Printf("controld: suspend %s on %s: %v", id, row.Runner, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not suspend session")
-		return
-	case !res.OK:
-		log.Printf("controld: suspend %s on %s: runner reported failure: %s", id, row.Runner, res.Detail)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not suspend session")
-		return
-	}
-
-	to := StateSuspendedWarm
-	if !warm {
-		to = StateSuspendedCold
-	}
-	if err := s.st.Transition(r.Context(), id, []SessionState{StateRunning}, to, TransitionOpts{}); err != nil {
-		if !errors.Is(err, ErrConflict) && !errors.Is(err, ErrNotFound) {
-			log.Printf("controld: suspend %s: transition: %v", id, err)
-			writeErr(w, http.StatusInternalServerError, "internal", "could not suspend session")
-			return
-		}
-		// The runner op already executed, but the row moved out from under
-		// us before we could record it (e.g. a concurrent DELETE won the
-		// race). The response must tell the truth about persisted state,
-		// not the state we hoped to reach — never fabricate row.State here.
-		s.wakeScheduler()
-		s.writeCurrentSession(w, r, id)
-		return
-	}
+	// until Task 5 replaces the scheduler loop, the old loop still needs this wake
 	s.wakeScheduler()
-
-	row.State = to
-	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(r.Context()).view(row)})
+	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(ctx).view(row)})
 }
 
 // ---------------------------------------------------------------------------
 // POST /v0/sessions/{id}/resume
 // ---------------------------------------------------------------------------
 
+// handleResumeSession serves POST /v0/sessions/{id}/resume. Both ways a
+// resume can be refused — the session is not suspended, or a cold one no
+// longer fits on the runner holding its volume — reach this handler as
+// ErrConflict, so both get one sentence. The capacity answer is the service's
+// and recomputing it here to recover a second slug would be a second
+// placement decision in the one place that must not make any.
 func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request, u User) {
 	id := r.PathValue("id")
-	row, err := s.st.GetSession(r.Context(), id)
+	ctx := withUser(r.Context(), u)
+	row, err := s.sessions.ResumeSession(ctx, userScope(u), control.ResumeSession{ID: control.SessionID(id)})
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "not_found", "session not found")
-			return
-		}
-		log.Printf("controld: get session %s: %v", id, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not resume session")
+		s.writeSessionErr(w, ctx, id, err, sessionErrText{
+			Conflict: "session cannot be resumed right now",
+			Refused:  "could not resume session",
+		})
 		return
 	}
-	if !authorizeOwnerOrAdmin(u, row) {
-		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to modify this session")
-		return
-	}
-
-	if row.State != StateSuspendedWarm && row.State != StateSuspendedCold {
-		writeErr(w, http.StatusConflict, "conflict", "session is not suspended")
-		return
-	}
-
-	// Cold resume pins to (and must fit on) the runner that already holds
-	// the volume; warm sessions already occupy a slot there (OccupiesSlot),
-	// so only cold needs a fresh capacity check before we commit to it.
-	if row.State == StateSuspendedCold {
-		views, err := s.freeCapacity(r.Context())
-		if err != nil {
-			log.Printf("controld: resume %s: computing free capacity: %v", id, err)
-			writeErr(w, http.StatusInternalServerError, "internal", "could not resume session")
-			return
-		}
-		free, connected := 0, false
-		for _, v := range views {
-			if v.Name == row.Runner {
-				free, connected = v.Free, true
-				break
-			}
-		}
-		if !connected {
-			writeErr(w, http.StatusBadGateway, "runner_unreachable", "runner is not connected")
-			return
-		}
-		if free <= 0 {
-			writeErr(w, http.StatusConflict, "no_capacity", fmt.Sprintf("runner %s has no free capacity", row.Runner))
-			return
-		}
-	}
-
-	res, err := s.dispatch(r.Context(), row.Runner, runner.ToRunner{Type: "resume", Session: id})
-	switch {
-	case errors.Is(err, ErrRunnerUnreachable):
-		writeErr(w, http.StatusBadGateway, "runner_unreachable", "runner did not respond")
-		return
-	case err != nil:
-		log.Printf("controld: resume %s on %s: %v", id, row.Runner, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not resume session")
-		return
-	case !res.OK:
-		log.Printf("controld: resume %s on %s: runner reported failure: %s", id, row.Runner, res.Detail)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not resume session")
-		return
-	}
-
-	if err := s.st.Transition(r.Context(), id, []SessionState{row.State}, StateRunning, TransitionOpts{}); err != nil {
-		if !errors.Is(err, ErrConflict) && !errors.Is(err, ErrNotFound) {
-			log.Printf("controld: resume %s: transition: %v", id, err)
-			writeErr(w, http.StatusInternalServerError, "internal", "could not resume session")
-			return
-		}
-		// The runner op already executed, but the row moved out from under
-		// us before we could record it. Report what the store actually
-		// holds now, not the state we hoped to reach.
-		s.wakeScheduler()
-		s.writeCurrentSession(w, r, id)
-		return
-	}
+	// until Task 5 replaces the scheduler loop, the old loop still needs this wake
 	s.wakeScheduler()
-
-	row.State = StateRunning
-	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(r.Context()).view(row)})
+	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(ctx).view(row)})
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,44 +851,16 @@ func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request, u U
 
 func (s *Server) handleSnapshotSession(w http.ResponseWriter, r *http.Request, u User) {
 	id := r.PathValue("id")
-	row, err := s.st.GetSession(r.Context(), id)
+	ctx := withUser(r.Context(), u)
+	ck, err := s.sessions.SnapshotSession(ctx, userScope(u), control.SnapshotSession{ID: control.SessionID(id)})
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "not_found", "session not found")
-			return
-		}
-		log.Printf("controld: get session %s: %v", id, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not snapshot session")
+		s.writeSessionErr(w, ctx, id, err, sessionErrText{
+			Conflict: "session is not running or suspended",
+			Refused:  "could not snapshot session",
+		})
 		return
 	}
-	if !authorizeOwnerOrAdmin(u, row) {
-		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to modify this session")
-		return
-	}
-
-	switch row.State {
-	case StateRunning, StateSuspendedWarm, StateSuspendedCold:
-	default:
-		writeErr(w, http.StatusConflict, "conflict", "session is not running or suspended")
-		return
-	}
-
-	res, err := s.dispatch(r.Context(), row.Runner, runner.ToRunner{Type: "snapshot", Session: id})
-	switch {
-	case errors.Is(err, ErrRunnerUnreachable):
-		writeErr(w, http.StatusBadGateway, "runner_unreachable", "runner did not respond")
-		return
-	case err != nil:
-		log.Printf("controld: snapshot %s on %s: %v", id, row.Runner, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not snapshot session")
-		return
-	case !res.OK:
-		log.Printf("controld: snapshot %s on %s: runner reported failure: %s", id, row.Runner, res.Detail)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not snapshot session")
-		return
-	}
-
-	writeJSON(w, http.StatusOK, snapshotResponse{Ref: res.Detail})
+	writeJSON(w, http.StatusOK, snapshotResponse{Ref: ck.Ref})
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,16 +868,16 @@ func (s *Server) handleSnapshotSession(w http.ResponseWriter, r *http.Request, u
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleListRunners(w http.ResponseWriter, r *http.Request, u User) {
-	rows, err := s.st.ListRunners(r.Context())
+	ctx := withUser(r.Context(), u)
+	page, err := s.fleet.ListRunners(ctx, userScope(u), control.RunnerQuery{Limit: maxListLimit})
 	if err != nil {
-		log.Printf("controld: list runners: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not list runners")
+		writeControlErr(w, err)
 		return
 	}
-	out := make([]runnerSummary, len(rows))
-	for i, row := range rows {
+	out := make([]runnerSummary, len(page.Runners))
+	for i, row := range page.Runners {
 		out[i] = runnerSummary{
-			Name:          row.Name,
+			Name:          string(row.ID),
 			Connected:     row.Connected,
 			CapacityUsed:  row.CapacityUsed,
 			CapacityTotal: row.CapacityTotal,
@@ -1360,9 +1140,15 @@ type environmentsEnvelope struct {
 }
 
 // environmentJSON renders e as its client-facing view.
-func environmentJSON(e Environment) environmentView {
+//
+// Two of the wire's fields have no field of their own on control.Environment,
+// which names no runner: `placement` is carried as the portable capability
+// "placement:<runner>" (adapt_store.go) and read back out of it here, and
+// `snapshot_runner` — which the control model does not carry at all — is
+// passed in by the handler, which read it off the store row for the view.
+func environmentJSON(e control.Environment, snapshotRunner string) environmentView {
 	return environmentView{
-		ID:              e.ID,
+		ID:              string(e.ID),
 		Name:            e.Name,
 		Image:           e.Image,
 		Setup:           e.Setup,
@@ -1371,11 +1157,11 @@ func environmentJSON(e Environment) environmentView {
 		InitTimeoutSec:  e.InitTimeoutSec,
 		EgressAllow:     emptyIfNil(e.EgressAllow),
 		SecretRefs:      emptyIfNil(e.SecretRefs),
-		Connectors:      connectorsJSON(e.Connectors),
-		Placement:       e.Placement,
+		Connectors:      connectorsJSON(connectorsFromControl(e.Connectors)),
+		Placement:       capabilityValue(e.Requirements.Capabilities, placementCapabilityPrefix),
 		SetupTimeoutSec: e.SetupTimeoutSec,
-		SnapshotRef:     e.SnapshotRef,
-		SnapshotRunner:  e.SnapshotRunner,
+		SnapshotRef:     e.Snapshot.Ref,
+		SnapshotRunner:  snapshotRunner,
 		SnapshotHash:    e.SnapshotHash,
 		CreatedAt:       e.CreatedAt.UTC().Format(time.RFC3339),
 		UpdatedAt:       e.UpdatedAt.UTC().Format(time.RFC3339),
@@ -1687,18 +1473,59 @@ func (s *Server) missingSecretRef(ctx context.Context, refs []string) (string, e
 	return "", nil
 }
 
-// environmentByRef resolves ref — an "env_"-prefixed id, or otherwise a name
-// — to its row, the same disambiguation the CLI does for session refs.
-func (s *Server) environmentByRef(ctx context.Context, ref string) (Environment, error) {
-	if strings.HasPrefix(ref, environmentIDPrefix) {
-		return s.st.GetEnvironment(ctx, ref)
+// environmentRef resolves ref — an environment id, or otherwise a name — to
+// the environment the service returns, the same disambiguation the CLI does
+// for session refs.
+//
+// The by-name half is the one lookup the control contract has no query for:
+// EnvironmentRepository is keyed by id, so the name index is read straight
+// from the store and the row it finds is then fetched through the service,
+// which is what authorizes the read.
+func (s *Server) environmentRef(ctx context.Context, scope control.Scope, ref string) (control.Environment, error) {
+	if !strings.HasPrefix(ref, environmentIDPrefix) {
+		row, err := s.st.GetEnvironmentByName(ctx, ref)
+		if err != nil {
+			return control.Environment{}, storeErr(err)
+		}
+		return s.environments.GetEnvironment(ctx, scope, control.EnvironmentID(row.ID))
 	}
-	return s.st.GetEnvironmentByName(ctx, ref)
+	return s.environments.GetEnvironment(ctx, scope, control.EnvironmentID(ref))
+}
+
+// snapshotRunnerOf is the environment view's one store read: the name of the
+// runner holding an environment's cached snapshot. control.Environment names
+// no runner — a snapshot's affinity to its builder is carried as a capability
+// and only while the snapshot is current — but the wire has always shown the
+// column, stale or not, so the view reads the column. It decides nothing; an
+// unreadable row simply shows no runner.
+func (s *Server) snapshotRunnerOf(ctx context.Context, id control.EnvironmentID) string {
+	row, err := s.st.GetEnvironment(ctx, string(id))
+	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			log.Printf("controld: rendering environment %s: reading its snapshot runner: %v", id, err)
+		}
+		return ""
+	}
+	return row.SnapshotRunner
+}
+
+// placementRequirements is the portable spelling of an operator's runner pin:
+// control.Environment names no runner, so `placement` round-trips through the
+// capability "placement:<runner>" (adapt_store.go). An empty placement is no
+// capability at all rather than an empty one.
+func placementRequirements(placement string) control.Requirements {
+	if placement == "" {
+		return control.Requirements{}
+	}
+	return control.Requirements{Capabilities: []string{placementCapabilityPrefix + placement}}
 }
 
 // handleCreateEnvironment serves POST /v0/environments (admin): validate the
 // whole body, then commit. Nothing is stored until every check has passed —
-// a rejected create leaves no half-built environment behind.
+// a rejected create leaves no half-built environment behind. The two checks
+// the service cannot make for itself are the request's own vocabulary (the
+// name pattern, the connector shapes) and the vault's answer about
+// secret_refs.
 func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request, u User) {
 	var req createEnvironmentRequest
 	if !decodeJSONBodyLimit(w, r, &req, environmentsBodyLimit) {
@@ -1713,19 +1540,12 @@ func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request,
 		writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	missing, err := s.missingSecretRef(r.Context(), req.SecretRefs)
-	if err != nil {
-		log.Printf("controld: listing secrets to check secret_refs: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not create environment")
-		return
-	}
-	if missing != "" {
-		writeErr(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("secret_ref %q does not exist", missing))
+	ctx := withUser(r.Context(), u)
+	if !s.secretRefsExist(w, ctx, req.SecretRefs, "could not create environment") {
 		return
 	}
 
-	row := Environment{
-		ID:              NewEnvironmentID(),
+	created, err := s.environments.CreateEnvironment(ctx, userScope(u), control.CreateEnvironment{
 		Name:            req.Name,
 		Image:           req.Image,
 		Setup:           req.Setup,
@@ -1733,23 +1553,42 @@ func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request,
 		InitTimeoutSec:  req.InitTimeoutSec,
 		EgressAllow:     req.EgressAllow,
 		SecretRefs:      req.SecretRefs,
-		Connectors:      conns,
-		Placement:       req.Placement,
+		Connectors:      connectorsToControl(conns),
+		Requirements:    placementRequirements(req.Placement),
 		SetupTimeoutSec: req.SetupTimeoutSec,
-	}
-	created, err := s.st.CreateEnvironment(r.Context(), row)
+	})
 	if err != nil {
-		if errors.Is(err, ErrConflict) {
-			writeErr(w, http.StatusConflict, "conflict", fmt.Sprintf("an environment named %q already exists", req.Name))
+		if errors.Is(err, control.ErrConflict) {
+			writeErr(w, http.StatusConflict, "conflict",
+				fmt.Sprintf("an environment named %q already exists", req.Name))
 			return
 		}
 		log.Printf("controld: create environment %q: %v", req.Name, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not create environment")
+		writeControlErr(w, err)
 		return
 	}
 
-	w.Header().Set("Location", "/v0/environments/"+created.ID)
-	writeJSON(w, http.StatusCreated, environmentEnvelope{Environment: environmentJSON(created)})
+	// A brand-new environment has no cached snapshot, so no runner holds one.
+	w.Header().Set("Location", "/v0/environments/"+string(created.ID))
+	writeJSON(w, http.StatusCreated, environmentEnvelope{Environment: environmentJSON(created, "")})
+}
+
+// secretRefsExist answers the vault question create and patch share: every
+// name in refs must still be a stored secret. It writes the client's response
+// and reports false when it is not, so a caller never stores a reference that
+// would fail its first session create.
+func (s *Server) secretRefsExist(w http.ResponseWriter, ctx context.Context, refs []string, failMsg string) bool {
+	missing, err := s.missingSecretRef(ctx, refs)
+	if err != nil {
+		log.Printf("controld: listing secrets to check secret_refs: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal", failMsg)
+		return false
+	}
+	if missing != "" {
+		writeErr(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("secret_ref %q does not exist", missing))
+		return false
+	}
+	return true
 }
 
 // handleListEnvironments serves GET /v0/environments: every environment, name
@@ -1757,15 +1596,27 @@ func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request,
 // see the environments to start a session from one. There are few
 // environments per deployment, so this page is the whole table (no cursor).
 func (s *Server) handleListEnvironments(w http.ResponseWriter, r *http.Request, u User) {
-	rows, err := s.st.ListEnvironments(r.Context())
+	ctx := withUser(r.Context(), u)
+	page, err := s.environments.ListEnvironments(ctx, userScope(u), control.EnvironmentQuery{})
 	if err != nil {
 		log.Printf("controld: list environments: %v", err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not list environments")
+		writeControlErr(w, err)
 		return
 	}
-	out := make([]environmentView, len(rows))
-	for i, row := range rows {
-		out[i] = environmentJSON(row)
+	// One store read for the whole page rather than one per row: the snapshot
+	// runner is a view-only column (see snapshotRunnerOf) and a listing that
+	// asked for it row by row would read the table twice over.
+	runners := map[string]string{}
+	if rows, err := s.st.ListEnvironments(ctx); err != nil {
+		log.Printf("controld: list environments: reading their snapshot runners: %v", err)
+	} else {
+		for _, row := range rows {
+			runners[row.ID] = row.SnapshotRunner
+		}
+	}
+	out := make([]environmentView, len(page.Environments))
+	for i, row := range page.Environments {
+		out[i] = environmentJSON(row, runners[string(row.ID)])
 	}
 	writeJSON(w, http.StatusOK, environmentsEnvelope{Environments: out})
 }
@@ -1773,37 +1624,40 @@ func (s *Server) handleListEnvironments(w http.ResponseWriter, r *http.Request, 
 // handleGetEnvironment serves GET /v0/environments/{id}, by id or by name.
 func (s *Server) handleGetEnvironment(w http.ResponseWriter, r *http.Request, u User) {
 	ref := r.PathValue("id")
-	row, err := s.environmentByRef(r.Context(), ref)
+	ctx := withUser(r.Context(), u)
+	row, err := s.environmentRef(ctx, userScope(u), ref)
 	if err != nil {
-		writeEnvironmentLookupErr(w, ref, err, "could not get environment")
+		writeEnvironmentLookupErr(w, ref, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, environmentEnvelope{Environment: environmentJSON(row)})
+	writeJSON(w, http.StatusOK, environmentEnvelope{
+		Environment: environmentJSON(row, s.snapshotRunnerOf(ctx, row.ID)),
+	})
 }
 
-// writeEnvironmentLookupErr turns an environmentByRef failure into its
-// response: 404 for a ref nothing answers to, 500 (with the detail logged,
-// never sent) for anything else.
-func writeEnvironmentLookupErr(w http.ResponseWriter, ref string, err error, msg string) {
-	if errors.Is(err, ErrNotFound) {
-		writeErr(w, http.StatusNotFound, "not_found", "environment not found")
-		return
+// writeEnvironmentLookupErr turns an environmentRef failure into its
+// response through the one sentinel mapping, logging anything that is not a
+// plain miss (the detail is never sent).
+func writeEnvironmentLookupErr(w http.ResponseWriter, ref string, err error) {
+	if !errors.Is(err, control.ErrNotFound) {
+		log.Printf("controld: get environment %q: %v", ref, err)
 	}
-	log.Printf("controld: get environment %q: %v", ref, err)
-	writeErr(w, http.StatusInternalServerError, "internal", msg)
+	writeControlErr(w, err)
 }
 
 // handleUpdateEnvironment serves PATCH /v0/environments/{id} (admin): a
 // partial update of the create fields, applied to the row as it stands. The
-// store owns setup_hash (recomputed from the merged image+setup) and the
-// three snapshot columns — an edit that moves the hash deliberately leaves
-// the old snapshot in place and visibly stale, for Task 7's resolution to
-// notice and rebuild.
+// service owns setup_hash (recomputed from the merged image+setup) and the
+// store owns the three snapshot columns — an edit that moves the hash
+// deliberately leaves the old snapshot in place and visibly stale, for the
+// next build to notice and rebuild.
 func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request, u User) {
 	ref := r.PathValue("id")
-	cur, err := s.environmentByRef(r.Context(), ref)
+	ctx := withUser(r.Context(), u)
+	scope := userScope(u)
+	cur, err := s.environmentRef(ctx, scope, ref)
 	if err != nil {
-		writeEnvironmentLookupErr(w, ref, err, "could not update environment")
+		writeEnvironmentLookupErr(w, ref, err)
 		return
 	}
 
@@ -1812,35 +1666,38 @@ func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	next := cur
+	// The four scalars are validated against the MERGED row — a patch that
+	// only sets `image` still has to leave a legal name behind — and the
+	// specific sentence is the handler's, because the service reports every
+	// bad field as one ErrInvalid.
+	name, image := cur.Name, cur.Image
+	setupTimeout, initTimeout := cur.SetupTimeoutSec, cur.InitTimeoutSec
 	if req.Name != nil {
-		next.Name = *req.Name
+		name = *req.Name
 	}
 	if req.Image != nil {
-		next.Image = *req.Image
-	}
-	if req.Setup != nil {
-		next.Setup = *req.Setup
-	}
-	if req.Init != nil {
-		next.Init = *req.Init
-	}
-	if req.InitTimeoutSec != nil {
-		next.InitTimeoutSec = *req.InitTimeoutSec
-	}
-	if req.EgressAllow != nil {
-		next.EgressAllow = *req.EgressAllow
-	}
-	if req.Placement != nil {
-		next.Placement = *req.Placement
+		image = *req.Image
 	}
 	if req.SetupTimeoutSec != nil {
-		next.SetupTimeoutSec = *req.SetupTimeoutSec
+		setupTimeout = *req.SetupTimeoutSec
 	}
-
-	if bad := validateEnvironmentBasics(next.Name, next.Image, next.SetupTimeoutSec, next.InitTimeoutSec); bad != "" {
+	if req.InitTimeoutSec != nil {
+		initTimeout = *req.InitTimeoutSec
+	}
+	if bad := validateEnvironmentBasics(name, image, setupTimeout, initTimeout); bad != "" {
 		writeErr(w, http.StatusBadRequest, "invalid_request", bad)
 		return
+	}
+
+	cmd := control.UpdateEnvironment{
+		ID:              cur.ID,
+		Name:            req.Name,
+		Image:           req.Image,
+		Setup:           req.Setup,
+		Init:            req.Init,
+		InitTimeoutSec:  req.InitTimeoutSec,
+		EgressAllow:     req.EgressAllow,
+		SetupTimeoutSec: req.SetupTimeoutSec,
 	}
 	if req.Connectors != nil {
 		conns, err := validateConnectors(req.Connectors)
@@ -1848,41 +1705,43 @@ func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request,
 			writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 			return
 		}
-		next.Connectors = conns
+		converted := connectorsToControl(conns)
+		cmd.Connectors = &converted
 	}
 	// Only the refs this request supplies are checked for existence: a patch
 	// answers for what it sets, and refs that were valid when they were set
 	// but whose secret has since been deleted are the session create's to
 	// refuse (design §4.5 — it fails loudly there, naming the secret).
 	if req.SecretRefs != nil {
-		next.SecretRefs = *req.SecretRefs
-		missing, err := s.missingSecretRef(r.Context(), next.SecretRefs)
-		if err != nil {
-			log.Printf("controld: listing secrets to check secret_refs: %v", err)
-			writeErr(w, http.StatusInternalServerError, "internal", "could not update environment")
+		if !s.secretRefsExist(w, ctx, *req.SecretRefs, "could not update environment") {
 			return
 		}
-		if missing != "" {
-			writeErr(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("secret_ref %q does not exist", missing))
-			return
-		}
+		cmd.SecretRefs = req.SecretRefs
+	}
+	// The pin is set only when the patch names it; leaving Requirements nil is
+	// what keeps an untouched placement (and the snapshot affinity beside it)
+	// exactly as the store has it.
+	if req.Placement != nil {
+		reqs := placementRequirements(*req.Placement)
+		cmd.Requirements = &reqs
 	}
 
-	updated, err := s.st.UpdateEnvironment(r.Context(), next)
+	updated, err := s.environments.UpdateEnvironment(ctx, scope, cmd)
 	if err != nil {
-		switch {
-		case errors.Is(err, ErrNotFound):
-			// Deleted between our read and this write.
-			writeErr(w, http.StatusNotFound, "not_found", "environment not found")
-		case errors.Is(err, ErrConflict):
-			writeErr(w, http.StatusConflict, "conflict", fmt.Sprintf("an environment named %q already exists", next.Name))
-		default:
-			log.Printf("controld: update environment %s: %v", cur.ID, err)
-			writeErr(w, http.StatusInternalServerError, "internal", "could not update environment")
+		if errors.Is(err, control.ErrConflict) {
+			writeErr(w, http.StatusConflict, "conflict",
+				fmt.Sprintf("an environment named %q already exists", name))
+			return
 		}
+		if !errors.Is(err, control.ErrNotFound) && !errors.Is(err, control.ErrInvalid) {
+			log.Printf("controld: update environment %s: %v", cur.ID, err)
+		}
+		writeControlErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, environmentEnvelope{Environment: environmentJSON(updated)})
+	writeJSON(w, http.StatusOK, environmentEnvelope{
+		Environment: environmentJSON(updated, s.snapshotRunnerOf(ctx, updated.ID)),
+	})
 }
 
 // handleDeleteEnvironment serves DELETE /v0/environments/{id} (admin). An
@@ -1892,38 +1751,41 @@ func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request,
 // under them is refused with the count (design §5).
 func (s *Server) handleDeleteEnvironment(w http.ResponseWriter, r *http.Request, u User) {
 	ref := r.PathValue("id")
-	row, err := s.environmentByRef(r.Context(), ref)
+	ctx := withUser(r.Context(), u)
+	scope := userScope(u)
+	row, err := s.environmentRef(ctx, scope, ref)
 	if err != nil {
-		writeEnvironmentLookupErr(w, ref, err, "could not delete environment")
+		writeEnvironmentLookupErr(w, ref, err)
 		return
 	}
 
-	// The count is keyed by the RESOLVED id, never by the caller's ref: a
-	// scratch session carries environment_id "", so counting against
-	// anything but a real id would sweep in sessions that belong to no
-	// environment at all.
-	n, err := s.st.CountSessionsByEnvironment(r.Context(), row.ID, NonTerminal)
-	if err != nil {
-		log.Printf("controld: counting sessions on environment %s: %v", row.ID, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not delete environment")
-		return
-	}
-	if n > 0 {
-		writeErr(w, http.StatusConflict, "conflict",
-			fmt.Sprintf("environment %q still has %d non-terminal session(s)", row.Name, n))
-		return
-	}
-
-	if err := s.st.DeleteEnvironment(r.Context(), row.ID); err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "not_found", "environment not found")
+	if err := s.environments.DeleteEnvironment(ctx, scope, control.DeleteEnvironment{ID: row.ID}); err != nil {
+		if errors.Is(err, control.ErrConflict) {
+			writeErr(w, http.StatusConflict, "conflict", s.stillInUseMessage(ctx, row))
 			return
 		}
-		log.Printf("controld: delete environment %s: %v", row.ID, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not delete environment")
+		if !errors.Is(err, control.ErrNotFound) {
+			log.Printf("controld: delete environment %s: %v", row.ID, err)
+		}
+		writeControlErr(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// stillInUseMessage is the refusal an operator reads when an environment is
+// still in use. The service has already made the decision; this counts the
+// sessions only to say how many, and falls back to the countless sentence
+// when the store cannot answer. The count is keyed by the RESOLVED id, never
+// by the caller's ref: a scratch session carries environment_id "", so
+// counting against anything but a real id would sweep in sessions that belong
+// to no environment at all.
+func (s *Server) stillInUseMessage(ctx context.Context, env control.Environment) string {
+	n, err := s.st.CountSessionsByEnvironment(ctx, string(env.ID), NonTerminal)
+	if err != nil || n <= 0 {
+		return fmt.Sprintf("environment %q still has non-terminal session(s)", env.Name)
+	}
+	return fmt.Sprintf("environment %q still has %d non-terminal session(s)", env.Name, n)
 }
 
 // ---------------------------------------------------------------------------
