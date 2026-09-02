@@ -69,16 +69,31 @@ type RepoRef struct {
 // session: what image to boot, what command to run, which egress hosts it
 // may reach, and which repositories to clone. It names no VM shape, no size,
 // and no provider resource.
+//
+// On a CreateSession it is the session's own description, layered over the
+// environment the create names, if any. An environment is a template and a
+// session is an instance of it: every field that is set overrides the
+// environment's, and every field that is unset is inherited. Unset is "" for
+// Image and nil for a list; an explicitly empty list means "none".
+//
+//	Image        unset: the environment's image — its current snapshot when
+//	             one is valid — or, on a scratch session, the host's default
+//	             image. Set: this image, and no snapshot reuse for this
+//	             session, because a snapshot is built from the environment's
+//	             own image and setup.
+//	Cmd          unset: the image's default command. Set: this command. An
+//	             environment carries no command; this is how a session from
+//	             one says what to run.
+//	EgressAllow  unset: the environment's list. Set: the environment's list
+//	             extended by these hosts, in order, without duplicates. An
+//	             environment's egress is what it needs to work; a session
+//	             adds to it and never silently removes from it.
+//	Repos        the repository override; see CreateSession.Repos.
 type PortableSpec struct {
 	Image       string
 	Cmd         []string
 	EgressAllow []string
 	Repos       []RepoRef
-}
-
-// isZero reports whether s carries no execution description at all.
-func (s PortableSpec) isZero() bool {
-	return s.Image == "" && s.Cmd == nil && s.EgressAllow == nil && s.Repos == nil
 }
 
 // Session is one coding-agent run as the application service sees it: its
@@ -109,10 +124,15 @@ type Session struct {
 	LastEventAt         time.Time
 }
 
-// CreateSession is the command for CreateSession. It distinguishes a session
-// that starts from an environment (EnvironmentID set) from a scratch session
-// (Spec set). Exactly one may be set: a session that names an environment and
-// a scratch spec together is contradictory and refused.
+// CreateSession is the command for CreateSession. EnvironmentID names the
+// environment the session starts from, or is empty for a scratch session;
+// Spec is the session's own execution description, layered over that
+// environment by the rules on PortableSpec. No combination of the two is
+// contradictory: a session that names an environment may still choose its
+// command, override its image, or reach more hosts, and a scratch session
+// that names no image asks the host for its default one. A host that wants
+// to forbid an override, or require an image, does so in its own policy —
+// this contract says what is possible, not what a given host allows.
 //
 // Repos overrides the repositories the environment's connectors declare.
 // Its nil-vs-empty distinction is load-bearing: nil means "the caller said
@@ -130,11 +150,15 @@ type CreateSession struct {
 	IdempotencyKey string
 }
 
-// Validate reports whether c is a coherent create. It returns ErrInvalid when
-// an environment and a scratch spec are both set.
+// Validate reports whether c is well formed. It returns ErrInvalid for a
+// repository reference that names no repository. No combination of
+// EnvironmentID and Spec is refused, because none is contradictory (see
+// PortableSpec).
 func (c CreateSession) Validate() error {
-	if c.EnvironmentID != "" && !c.Spec.isZero() {
-		return ErrInvalid
+	for _, r := range c.Repos {
+		if r.Repo == "" {
+			return ErrInvalid
+		}
 	}
 	return nil
 }

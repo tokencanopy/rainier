@@ -282,9 +282,12 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 	if env != nil {
 		cloned := cloneEnvironment(*env)
 		env = &cloned
-		if env.Snapshot.Ref != "" && env.SnapshotHash == env.SetupHash {
-			spec.Image = env.Snapshot.Ref
-		} else {
+		// The row's image was resolved at create (portableSpecFor): the
+		// snapshot when one was current and the caller did not override the
+		// image, else the image itself. Setup runs exactly when the row does
+		// not boot the snapshot — an override boots its own image and needs
+		// the setup the snapshot would have carried.
+		if env.Snapshot.Ref == "" || row.Spec.Image != env.Snapshot.Ref {
 			spec.Setup = env.Setup
 			spec.SetupTimeoutSec = env.SetupTimeoutSec
 		}

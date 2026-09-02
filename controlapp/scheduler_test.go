@@ -639,3 +639,38 @@ func TestQueuedEnvironmentDeepCopiesBeforeResolver(t *testing.T) {
 		t.Fatalf("stored capabilities = %v, want [gpu]", stored.Requirements.Capabilities)
 	}
 }
+
+// TestCreateSpecSendsSetupUnlessTheRowBootsTheSnapshot pins the dispatch half
+// of the composition rule: the row's image was resolved at create, and setup
+// runs exactly when that image is not the environment's current snapshot — so
+// an image override, which forgoes the snapshot, gets the setup the snapshot
+// would have carried.
+func TestCreateSpecSendsSetupUnlessTheRowBootsTheSnapshot(t *testing.T) {
+	fx := newFleetFixture(t)
+	env := control.Environment{ID: "env_example", WorkspaceID: "ws_example", Image: "registry.example.invalid/base@sha256:0000",
+		Setup: "apt-get install -y build-essential", SetupHash: "h", SnapshotHash: "h", Snapshot: control.Checkpoint{Ref: "snap:example"}}
+	cases := []struct {
+		name      string
+		rowImage  string
+		wantSetup bool
+	}{
+		{"row boots the snapshot", "snap:example", false},
+		{"row boots an override", "registry.example.invalid/other@sha256:0001", true},
+		{"row boots the plain image (stale snapshot at create)", "registry.example.invalid/base@sha256:0000", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row := control.Session{ID: "sess_example", WorkspaceID: "ws_example", EnvironmentID: "env_example", Spec: control.PortableSpec{Image: tc.rowImage}}
+			spec, fail := fx.service.createSpec(fleetCtx, row, &env)
+			if fail != "" {
+				t.Fatalf("createSpec failed: %s", fail)
+			}
+			if spec.Image != tc.rowImage {
+				t.Fatalf("image = %q, want the row's %q", spec.Image, tc.rowImage)
+			}
+			if (spec.Setup != "") != tc.wantSetup {
+				t.Fatalf("setup sent = %v, want %v", spec.Setup != "", tc.wantSetup)
+			}
+		})
+	}
+}

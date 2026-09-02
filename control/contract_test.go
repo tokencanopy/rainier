@@ -236,12 +236,14 @@ func TestSessionStateVocabulary(t *testing.T) {
 	}
 }
 
-// TestCreateSessionOptionality pins the contradictory-scratch/environment
-// rejection and the nil-vs-empty repository override.
+// TestCreateSessionOptionality pins that an environment and a scratch spec
+// compose rather than conflict, and the nil-vs-empty repository override.
 func TestCreateSessionOptionality(t *testing.T) {
 	both := control.CreateSession{EnvironmentID: "env_example", Spec: control.PortableSpec{Image: "img"}}
-	if err := both.Validate(); !errors.Is(err, control.ErrInvalid) {
-		t.Fatalf("environment + scratch spec: got %v, want ErrInvalid", err)
+	// An environment and a scratch spec compose (PortableSpec): the session
+	// overrides the template field by field, so this is well formed.
+	if err := both.Validate(); err != nil {
+		t.Fatalf("environment + scratch spec: got %v, want nil (they compose)", err)
 	}
 	if err := (control.CreateSession{EnvironmentID: "env_example"}).Validate(); err != nil {
 		t.Fatalf("environment-only create rejected: %v", err)
@@ -672,5 +674,33 @@ func TestVocabularyGuardIsLive(t *testing.T) {
 		if matches != want {
 			t.Errorf("%s: matchesForbidden = %v, want %v", name, matches, want)
 		}
+	}
+}
+
+// TestCreateSessionComposesEnvironmentAndOverrides pins that a create which
+// names an environment may also carry the session's own image, command, or
+// egress hosts — an environment is a template, a session an instance — and
+// that a scratch create with no image is well formed (the host supplies its
+// default). Validate refuses only malformation: a repository reference that
+// names no repository.
+func TestCreateSessionComposesEnvironmentAndOverrides(t *testing.T) {
+	accepted := []control.CreateSession{
+		{Name: "bare"},
+		{Name: "scratch", Spec: control.PortableSpec{Image: "registry.example.invalid/base@sha256:0000"}},
+		{Name: "env", EnvironmentID: "env_example"},
+		{Name: "env+cmd", EnvironmentID: "env_example", Spec: control.PortableSpec{Cmd: []string{"claude"}}},
+		{Name: "env+image", EnvironmentID: "env_example", Spec: control.PortableSpec{Image: "registry.example.invalid/other@sha256:0001"}},
+		{Name: "env+egress", EnvironmentID: "env_example", Spec: control.PortableSpec{EgressAllow: []string{"api.example.com"}}},
+		{Name: "env+repos", EnvironmentID: "env_example", Repos: []control.RepoRef{{Repo: "acme/app"}}},
+		{Name: "env+no-repos", EnvironmentID: "env_example", Repos: []control.RepoRef{}},
+	}
+	for _, c := range accepted {
+		if err := c.Validate(); err != nil {
+			t.Errorf("%s: Validate = %v, want nil", c.Name, err)
+		}
+	}
+	malformed := control.CreateSession{Name: "bad-repo", Repos: []control.RepoRef{{Repo: ""}}}
+	if err := malformed.Validate(); !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("empty repository name: got %v, want ErrInvalid", err)
 	}
 }

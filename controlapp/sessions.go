@@ -75,9 +75,6 @@ func (s *SessionService) CreateSession(ctx context.Context, scope control.Scope,
 	if err := cmd.Validate(); err != nil {
 		return control.Session{}, control.ErrInvalid
 	}
-	if cmd.EnvironmentID == "" && portableSpecIsZero(cmd.Spec) {
-		return control.Session{}, control.ErrInvalid
-	}
 	createResource := control.Resource{
 		Kind:        control.ResourceSession,
 		WorkspaceID: scope.WorkspaceID,
@@ -187,18 +184,12 @@ func (s *SessionService) selectPool(ctx context.Context, scope control.Scope, re
 	return copied[best].ID, nil
 }
 
-// portableSpecIsZero reports whether spec carries no execution description at
-// all, mirroring the frozen PortableSpec emptiness test the control package
-// keeps private. A session must name an environment or carry a scratch spec.
-func portableSpecIsZero(s control.PortableSpec) bool {
-	return s.Image == "" && s.Cmd == nil && s.EgressAllow == nil && s.Repos == nil
-}
-
-// portableSpecFor resolves the stored execution description of a session. An
-// environment session inherits its resolved image (the current snapshot when
-// SnapshotHash == SetupHash, else the plain image) and egress list; a scratch
-// session keeps its own spec. Repos always comes from cmd.Repos so the
-// nil-versus-empty distinction is preserved.
+// portableSpecFor resolves the stored execution description of a session by
+// the layering rule control.PortableSpec documents: the environment is the
+// template and the session's own spec overrides it field by field. A scratch
+// session keeps its spec as sent — an empty image asks the host for its
+// default. Repos always comes from cmd.Repos so the nil-versus-empty
+// distinction is preserved.
 func portableSpecFor(cmd control.CreateSession, env control.Environment) control.PortableSpec {
 	spec := control.PortableSpec{
 		Cmd:   cloneStrings(cmd.Spec.Cmd),
@@ -209,13 +200,30 @@ func portableSpecFor(cmd control.CreateSession, env control.Environment) control
 		spec.EgressAllow = cloneStrings(cmd.Spec.EgressAllow)
 		return spec
 	}
-	if runsCachedSnapshot(env) {
+	switch {
+	case cmd.Spec.Image != "":
+		// An override boots its own image. The snapshot was built from the
+		// environment's image and setup, so it cannot stand in for this one.
+		spec.Image = cmd.Spec.Image
+	case runsCachedSnapshot(env):
 		spec.Image = env.Snapshot.Ref
-	} else {
+	default:
 		spec.Image = env.Image
 	}
-	spec.EgressAllow = cloneStrings(env.EgressAllow)
+	spec.EgressAllow = unionHosts(env.EgressAllow, cmd.Spec.EgressAllow)
 	return spec
+}
+
+// unionHosts returns base plus every host of extra it does not already
+// contain, in order, leaving base itself untouched. Two nil inputs stay nil.
+func unionHosts(base, extra []string) []string {
+	out := slices.Clone(base)
+	for _, h := range extra {
+		if !slices.Contains(out, h) {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // runsCachedSnapshot reports whether env's cached snapshot is current and

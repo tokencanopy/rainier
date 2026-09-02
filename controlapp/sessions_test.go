@@ -3,6 +3,7 @@ package controlapp
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -633,44 +634,6 @@ func TestCreateSessionCore(t *testing.T) {
 	}
 	if !got.CreatedAt.Equal(sessionFixedNow) || !got.UpdatedAt.Equal(sessionFixedNow) || !got.LastEventAt.Equal(sessionFixedNow) {
 		t.Fatalf("timestamps = %v/%v/%v, want fixed now", got.CreatedAt, got.UpdatedAt, got.LastEventAt)
-	}
-}
-
-func TestCreateSessionInvalidInput(t *testing.T) {
-	svc, repo, envRepo, _, _, _, log := newSessionFixture(t)
-	envRepo.put(sessionExampleEnvironment())
-	ctx := context.Background()
-
-	// Invalid scope touches no port.
-	if _, err := svc.CreateSession(ctx, control.Scope{}, control.CreateSession{Name: "x", EnvironmentID: "env_example"}); !errors.Is(err, control.ErrInvalid) {
-		t.Fatalf("invalid scope: got %v, want ErrInvalid", err)
-	}
-	if len(log.snapshot()) != 0 {
-		t.Fatalf("invalid scope touched ports: %v", log.snapshot())
-	}
-
-	// Contradictory environment/scratch input touches no port.
-	bad := control.CreateSession{Name: "x", EnvironmentID: "env_example", Spec: control.PortableSpec{Image: "img.example.invalid"}}
-	if _, err := svc.CreateSession(ctx, sessionTestScope(), bad); !errors.Is(err, control.ErrInvalid) {
-		t.Fatalf("contradictory create: got %v, want ErrInvalid", err)
-	}
-	if len(log.snapshot()) != 0 {
-		t.Fatalf("contradictory create touched ports: %v", log.snapshot())
-	}
-	_ = repo
-}
-
-func TestCreateSessionRejectsMissingTarget(t *testing.T) {
-	svc, _, envRepo, pools, _, _, log := newSessionFixture(t)
-	envRepo.put(sessionExampleEnvironment())
-	pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 1, CapacityUsed: 0}}
-
-	_, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{Name: "nowhere"})
-	if !errors.Is(err, control.ErrInvalid) {
-		t.Fatalf("got %v, want ErrInvalid", err)
-	}
-	if len(log.snapshot()) != 0 {
-		t.Fatalf("missing target touched ports: %v", log.snapshot())
 	}
 }
 
@@ -1316,5 +1279,107 @@ func TestResumeConflictAfterDispatchRereadsAuthoritative(t *testing.T) {
 	}
 	if got.State != control.StateSuspendedWarm {
 		t.Fatalf("authoritative state = %q, want suspended_warm", got.State)
+	}
+}
+
+// TestCreateSessionScratchWithoutImageAsksForTheHostDefault pins that a bare
+// create — no environment, no image — is a well-formed scratch session whose
+// image is left empty for the host to fill with its default, exactly as the
+// self-hosted runner has always done.
+func TestCreateSessionScratchWithoutImageAsksForTheHostDefault(t *testing.T) {
+	svc, repo, _, pools, _, _, _ := newSessionFixture(t)
+	pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 1, CapacityUsed: 0}}
+
+	got, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{Name: "bare"})
+	if err != nil {
+		t.Fatalf("bare create refused: %v", err)
+	}
+	if got.State != control.StateQueued || got.EnvironmentID != "" || got.Spec.Image != "" {
+		t.Fatalf("got %+v, want a queued scratch session with an empty image", got)
+	}
+	if _, ok := repo.rows[got.ID]; !ok {
+		t.Fatal("bare create was not stored")
+	}
+}
+
+// TestCreateSessionLayersOverridesOnTheEnvironment pins the composition rule
+// control.PortableSpec documents, through the service: an environment is the
+// template, the session's own image, command, and egress override it field by
+// field, and an image override forgoes the environment's snapshot.
+func TestCreateSessionLayersOverridesOnTheEnvironment(t *testing.T) {
+	env := sessionExampleEnvironment()
+	env.EgressAllow = []string{"registry.example.invalid"}
+	env.Setup, env.SetupHash = "apt-get install -y build-essential", "h"
+	env.Snapshot, env.SnapshotHash = control.Checkpoint{Ref: "snap:example"}, "h"
+
+	cases := []struct {
+		name       string
+		spec       control.PortableSpec
+		wantImage  string
+		wantCmd    []string
+		wantEgress []string
+	}{
+		{"nothing set: snapshot image, environment egress, default command", control.PortableSpec{},
+			"snap:example", nil, []string{"registry.example.invalid"}},
+		{"command only", control.PortableSpec{Cmd: []string{"claude"}},
+			"snap:example", []string{"claude"}, []string{"registry.example.invalid"}},
+		{"image override forgoes the snapshot", control.PortableSpec{Image: "registry.example.invalid/other@sha256:0001"},
+			"registry.example.invalid/other@sha256:0001", nil, []string{"registry.example.invalid"}},
+		{"egress extends, deduplicated, in order", control.PortableSpec{EgressAllow: []string{"api.example.com", "registry.example.invalid"}},
+			"snap:example", nil, []string{"registry.example.invalid", "api.example.com"}},
+		{"explicitly empty egress adds nothing", control.PortableSpec{EgressAllow: []string{}},
+			"snap:example", nil, []string{"registry.example.invalid"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, envRepo, pools, _, _, _ := newSessionFixture(t)
+			envRepo.put(env)
+			pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 1, CapacityUsed: 0}}
+			got, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{
+				Name: "investigate", EnvironmentID: env.ID, Spec: tc.spec,
+			})
+			if err != nil {
+				t.Fatalf("create refused: %v", err)
+			}
+			if got.Spec.Image != tc.wantImage || !reflect.DeepEqual(got.Spec.Cmd, tc.wantCmd) || !reflect.DeepEqual(got.Spec.EgressAllow, tc.wantEgress) {
+				t.Fatalf("spec = image %q cmd %v egress %v; want %q %v %v",
+					got.Spec.Image, got.Spec.Cmd, got.Spec.EgressAllow, tc.wantImage, tc.wantCmd, tc.wantEgress)
+			}
+		})
+	}
+
+	// A scratch create keeps its own egress and image untouched, nil and all.
+	svc, _, _, pools, _, _, _ := newSessionFixture(t)
+	pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 1, CapacityUsed: 0}}
+	got, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{
+		Name: "scratch", Spec: control.PortableSpec{Image: "registry.example.invalid/base@sha256:0000"},
+	})
+	if err != nil || got.Spec.Image != "registry.example.invalid/base@sha256:0000" || got.Spec.EgressAllow != nil {
+		t.Fatalf("scratch: got %+v err=%v", got.Spec, err)
+	}
+}
+
+// TestCreateSessionInvalidInput pins that malformed input is refused before
+// any port is touched: an invalid scope, and a repository reference that
+// names no repository. (An environment together with a scratch spec is not
+// malformed — see TestCreateSessionLayersOverridesOnTheEnvironment.)
+func TestCreateSessionInvalidInput(t *testing.T) {
+	svc, _, envRepo, _, _, _, log := newSessionFixture(t)
+	envRepo.put(sessionExampleEnvironment())
+	ctx := context.Background()
+
+	if _, err := svc.CreateSession(ctx, control.Scope{}, control.CreateSession{Name: "x", EnvironmentID: "env_example"}); !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("invalid scope: got %v, want ErrInvalid", err)
+	}
+	if len(log.snapshot()) != 0 {
+		t.Fatalf("invalid scope touched ports: %v", log.snapshot())
+	}
+
+	bad := control.CreateSession{Name: "x", EnvironmentID: "env_example", Repos: []control.RepoRef{{Repo: ""}}}
+	if _, err := svc.CreateSession(ctx, sessionTestScope(), bad); !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("empty repository name: got %v, want ErrInvalid", err)
+	}
+	if len(log.snapshot()) != 0 {
+		t.Fatalf("malformed repo touched ports: %v", log.snapshot())
 	}
 }
