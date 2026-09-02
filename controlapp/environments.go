@@ -2,11 +2,8 @@ package controlapp
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io"
 
 	"github.com/tokencanopy/rainier/control"
 )
@@ -43,18 +40,6 @@ func NewEnvironmentService(o EnvironmentOptions) (*EnvironmentService, error) {
 		clock:        o.Clock,
 		ids:          o.IDs,
 	}, nil
-}
-
-// setupHash returns the identity of an environment's build inputs: the
-// hex-encoded SHA-256 of image, a NUL separator, and setup. Init, egress,
-// connectors, secrets, requirements, and timeouts are deliberately excluded:
-// init runs per boot and the snapshot caches only image plus setup.
-func setupHash(image, setup string) string {
-	h := sha256.New()
-	_, _ = io.WriteString(h, image)
-	_, _ = h.Write([]byte{0})
-	_, _ = io.WriteString(h, setup)
-	return hex.EncodeToString(h.Sum(nil))
 }
 
 // CreateEnvironment validates every scalar bound before generating an ID,
