@@ -13,7 +13,6 @@ import (
 
 	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/controlapp"
-	"github.com/tokencanopy/rainier/protocol/runner"
 	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
@@ -115,11 +114,10 @@ type Server struct {
 	gens *runnerGenerations
 
 	// transport is the runner plane behind the control.RunnerTransport port
-	// and broker the attach pairing behind control.AttachmentBroker. Until
-	// Tasks 5 and 6 compose the real ones they are the notYet placeholders
-	// below, which report nothing connected and refuse every call with
-	// ErrUnavailable, so no handler can reach a runner through the services
-	// before the plane exists.
+	// (adapt_transport.go, over the connection map below) and broker the
+	// attach pairing behind control.AttachmentBroker. Until Task 6 composes
+	// the real broker it is the notYetBroker placeholder, which refuses every
+	// attach with ErrUnavailable.
 	transport control.RunnerTransport
 	broker    control.AttachmentBroker
 
@@ -173,9 +171,9 @@ func New(st Store, cfg Config) (*Server, error) {
 		xferMax:     workspace.MaxBytes,
 		schedWake:   make(chan struct{}, 1),
 		gens:        &runnerGenerations{},
-		transport:   notYetTransport{},
 		broker:      notYetBroker{},
 	}
+	s.transport = runnerTransport{srv: s}
 	if err := s.compose(); err != nil {
 		return nil, err
 	}
@@ -236,17 +234,9 @@ func (s *Server) compose() error {
 	return nil
 }
 
-// notYetTransport and notYetBroker are the ports' stand-ins until the runner
-// plane (Task 5) and the attach pairing (Task 6) are composed. They make the
-// services constructible and inert: nothing is connected, every call is
-// ErrUnavailable, and no handler calls the services until Task 4 anyway.
-type notYetTransport struct{}
-
-func (notYetTransport) Connected(control.PoolID, control.RunnerID) bool { return false }
-func (notYetTransport) Dispatch(context.Context, control.PoolID, control.RunnerID, runner.ToRunner) (runner.FromRunner, error) {
-	return runner.FromRunner{}, control.ErrUnavailable
-}
-
+// notYetBroker is the attach port's stand-in until the pairing is composed
+// (Task 6): every attach through the service is ErrUnavailable, and no
+// handler calls the service until then anyway.
 type notYetBroker struct{}
 
 func (notYetBroker) Attach(context.Context, control.AttachTarget, control.TerminalStream) error {

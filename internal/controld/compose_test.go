@@ -21,8 +21,9 @@ func TestNewComposesTheFourServices(t *testing.T) {
 	if s.gens == nil || s.transport == nil || s.broker == nil {
 		t.Fatal("adapter fields not composed")
 	}
-	// Until Task 5, nothing is connected and nothing is dispatchable.
+	// The transport is real from the start: with no runner registered it
+	// reports nothing connected.
 	if s.transport.Connected(installPool, "runner-a") {
-		t.Fatal("placeholder transport reported a connection")
+		t.Fatal("transport reported a connection with no runner registered")
 	}
 }
