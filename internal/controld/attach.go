@@ -3,6 +3,7 @@ package controld
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -13,10 +14,9 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
-	"github.com/coder/websocket/wsjson"
 
+	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/internal/relay"
-	"github.com/tokencanopy/rainier/protocol/runner"
 	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
@@ -52,7 +52,7 @@ var errSessionNotReady = errors.New("session not ready")
 // the client handler. That handler must not return before then: returning
 // runs its deferred close on a socket the splice is still using.
 type pendingAttach struct {
-	client relay.Conn
+	stream control.TerminalStream
 	done   chan struct{}
 }
 
@@ -118,11 +118,12 @@ func (t *attachTable) has(id string) bool {
 
 // handleClientAttach serves the client half of the dial-back attach plane
 // (design §4.2). controld never interprets terminal traffic: it authenticates
-// the caller, waits (bounded) for the session to be attachable, parks the
-// socket under a fresh attach_id, asks the owning runner to dial back, and
-// then splices the two sockets as a dumb byte pipe. The client speaks
-// terminal.ClientMessage/ServerMsg end to end — byte-identical to attaching to
-// runnerd directly.
+// the caller, waits (bounded) for the session to be attachable, and hands the
+// upgraded socket to the attachment service, whose broker parks it under a
+// fresh attach_id, asks the owning runner to dial back, and splices the two.
+// A message is decoded only to be forwarded, and the client speaks
+// terminal.ClientMessage/ServerMsg end to end — indistinguishable from
+// attaching to runnerd directly.
 //
 // Every failure that can be reported as HTTP is reported before the upgrade:
 // once the socket is a websocket, a status code has nowhere to go and the
@@ -140,25 +141,14 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 	// costs a full replay, never an error the client can do anything about.
 	since, _ := strconv.ParseUint(r.URL.Query().Get("since"), 10, 64)
 
-	row, err := s.st.GetSession(r.Context(), id)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "not_found", "session not found")
-			return
-		}
-		log.Printf("controld: attach %s: %v", id, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not attach to session")
-		return
-	}
-	if !authorizeOwnerOrAdmin(u, row) {
-		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to attach to this session")
+	if !s.mayAttach(w, r, u, id) {
 		return
 	}
 
 	// Re-read through the bounded wait: authorization is settled above, and
 	// what this needs now is the state (and placement) as of the moment the
 	// session actually becomes attachable.
-	row, err = s.waitRunning(r.Context(), id)
+	row, err := s.waitRunning(r.Context(), id)
 	switch {
 	case errors.Is(err, ErrNotFound):
 		writeErr(w, http.StatusNotFound, "not_found", "session not found")
@@ -177,7 +167,7 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 	// Running but unreachable: the row says a runner holds this session and
 	// that runner has no control connection here, so there is nothing to
 	// send a dial_attach down.
-	if row.Runner == "" || !s.runnerConnected(row.Runner) {
+	if row.Runner == "" || !s.transport.Connected(installPool, control.RunnerID(row.Runner)) {
 		writeErr(w, http.StatusBadGateway, "runner_unreachable", "runner is not connected")
 		return
 	}
@@ -189,60 +179,52 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 	defer c.CloseNow()
 	c.SetReadLimit(attachReadLimit)
 
-	first, err := readFirstResize(r.Context(), c)
-	if err != nil {
-		closeAttach(c, websocket.StatusPolicyViolation, err.Error())
-		return
-	}
-
-	attachID := randHex(8) // 16 hex characters, crypto/rand
-	pa := &pendingAttach{client: relay.WSConn(c), done: make(chan struct{})}
-	// Park before sending: the runner can dial back the instant it reads the
-	// command, and an entry that isn't there yet would be refused.
-	if !s.attaches.park(attachID, pa) {
-		log.Printf("controld: attach %s: attach id %s is already parked; refusing rather than "+
-			"overwriting another client's pairing", id, attachID)
-		closeAttach(c, websocket.StatusInternalError, "attach id collision")
-		return
-	}
-
-	dial := runner.ToRunner{Type: "dial_attach", Session: id, Attach: &runner.Attach{
-		AttachID:  attachID,
+	// From here the attach belongs to the attachment service: it re-checks
+	// authority and attachability against the authoritative row, fences the
+	// controller generation, and hands the stream to the broker, which parks
+	// it and asks the runner to dial back. Every answer left is a close
+	// reason, so a failure is closed rather than written.
+	stream := newWSTerminalStream(c)
+	ctx := withAttachSince(withUser(r.Context(), u), since)
+	err = s.attachments.AttachTerminal(ctx, userScope(u), control.AttachTerminal{
+		SessionID: control.SessionID(id),
 		Since:     since,
-		Cols:      first.Cols,
-		Rows:      first.Rows,
-		TargetURL: s.attachBackURL(attachID),
-	}}
-	if err := s.sendToRunner(row.Runner, dial); err != nil {
-		// The command never left this process, so no runner can ever claim
-		// this entry: take it back and close the client ourselves. The 502
-		// this would have been is moot post-upgrade — a close reason is all
-		// the client can still be told.
-		s.attaches.claim(attachID)
-		log.Printf("controld: attach %s: %v", id, err)
-		closeAttach(c, websocket.StatusTryAgainLater, "runner unreachable")
-		return
+		Mode:      control.AttachmentController,
+	}, stream)
+	if err != nil {
+		_ = stream.Close(err)
 	}
+}
 
-	// Nobody may hold a parked socket forever. If the dial-back never comes
-	// (the runner died between reading the command and dialing, the command
-	// was lost with a flapping conn), the TTL is what closes the client
-	// rather than leaving it waiting on a terminal that will never speak.
-	ttl := time.AfterFunc(s.cfg.AttachPairTTL, func() {
-		if _, ok := s.attaches.claim(attachID); !ok {
-			return // the dial-back got here first; it owns the socket now
+// mayAttach is the pre-upgrade half of the authorization the attachment
+// service performs again for itself, and it exists for one reason: a 403 is a
+// status code, and a status code has nowhere to go once the socket has been
+// upgraded. Refusing here also keeps an unauthorized caller from occupying a
+// wait slot, or from timing the answer to learn whether a session they may
+// not touch exists and is starting.
+//
+// The decision itself is not a second implementation: it is the same
+// ownerOrAdmin policy adapter, asked the same question about the same
+// resource, and the service's own answer downstream stays authoritative.
+func (s *Server) mayAttach(w http.ResponseWriter, r *http.Request, u User, id string) bool {
+	row, err := s.st.GetSession(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "session not found")
+			return false
 		}
-		log.Printf("controld: attach %s: no dial-back from %s within %s; closing the client",
-			id, row.Runner, s.cfg.AttachPairTTL)
-		closeAttach(c, websocket.StatusTryAgainLater, "runner did not dial back")
-		close(pa.done)
-	})
-	defer ttl.Stop()
-
-	// Hold the handler open for the life of the attach: the socket now
-	// belongs to whoever claims the pairing, and this goroutine's deferred
-	// close must not fire until they are done with it.
-	<-pa.done
+		log.Printf("controld: attach %s: %v", clip(id), err)
+		writeErr(w, http.StatusInternalServerError, "internal", "could not attach to session")
+		return false
+	}
+	resource := control.Resource{Kind: control.ResourceSession, WorkspaceID: installWorkspace,
+		ID: row.ID, CreatorID: control.ActorID(row.OwnerID)}
+	if err := (ownerOrAdmin{}).AuthorizeAttachment(withUser(r.Context(), u), userScope(u),
+		resource, control.AttachmentController); err != nil {
+		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to attach to this session")
+		return false
+	}
+	return true
 }
 
 // waitRunning polls id's row until the session is attachable, bounded by
@@ -318,30 +300,6 @@ func (s *Server) failedButAttachable(row Session) bool {
 	return row.State == StateFailed && row.Runner != "" && s.runnerConnected(row.Runner)
 }
 
-// readFirstResize reads exactly one terminal.ClientMessage off a freshly attached
-// client and requires it to be a "resize" — the same contract runnerd's own
-// readFirstResize enforces, so a client attaching through controld and one
-// attaching to runnerd directly behave identically.
-//
-// Its cols/rows go into dial_attach, which become the FrameOpen's — so this
-// message is consumed here and deliberately NOT forwarded into the splice:
-// the FrameOpen already conveys the size, and forwarding would double-deliver
-// the same resize. Every later resize flows through the splice as ordinary
-// client traffic.
-func readFirstResize(ctx context.Context, c *websocket.Conn) (terminal.ClientMessage, error) {
-	ctx, cancel := context.WithTimeout(ctx, attachFirstMsgTimeout)
-	defer cancel()
-
-	var m terminal.ClientMessage
-	if err := wsjson.Read(ctx, c, &m); err != nil {
-		return terminal.ClientMessage{}, fmt.Errorf("reading the first attach message: %w", err)
-	}
-	if m.Type != "resize" {
-		return terminal.ClientMessage{}, fmt.Errorf("first attach message must be resize, got %q", clip(m.Type))
-	}
-	return m, nil
-}
-
 // attachBackURL renders the dial-back URL for attachID: this replica's own
 // ExternalURL with the scheme switched to ws(s). Naming the replica
 // explicitly is what keeps the pairing correct once more than one controld
@@ -401,30 +359,57 @@ func (s *Server) handleAttachBack(w http.ResponseWriter, r *http.Request) {
 	// Release the client handler once the splice is over, whatever ends it.
 	defer close(pa.done)
 
-	splice(r.Context(), pa.client, relay.WSConn(c))
+	splice(r.Context(), pa.stream, relay.WSConn(c))
 }
 
-// splice pumps text frames both directions until either side dies, then
-// closes both. controld stays a dumb relay: payloads are opaque bytes.
-func splice(ctx context.Context, a, b relay.Conn) {
+// splice pumps one live attach both directions until either side ends, then
+// closes both. The two halves are typed differently and deliberately so: the
+// client speaks whole terminal messages across control.TerminalStream, while
+// the runner's dial-back socket is raw relay frames — and protocol/terminal
+// is the wire format on both, so re-encoding between them is lossless.
+// controld still interprets nothing: a message is decoded to be forwarded and
+// for no other reason, and none of it is logged.
+func splice(ctx context.Context, client control.TerminalStream, runner relay.Conn) {
 	done := make(chan struct{}, 2)
-	pump := func(src, dst relay.Conn) {
+	go func() {
+		defer func() { done <- struct{}{} }()
 		for {
-			m, err := src.Read(ctx)
+			m, err := client.Receive(ctx)
 			if err != nil {
-				break
+				return
 			}
-			if dst.Write(ctx, m) != nil {
-				break
+			raw, err := json.Marshal(m)
+			if err != nil {
+				return
+			}
+			if runner.Write(ctx, raw) != nil {
+				return
 			}
 		}
-		done <- struct{}{}
-	}
-	go pump(a, b)
-	go pump(b, a)
+	}()
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for {
+			raw, err := runner.Read(ctx)
+			if err != nil {
+				return
+			}
+			var m terminal.ServerMessage
+			if json.Unmarshal(raw, &m) != nil {
+				// A frame that is not a server message is the runner half
+				// breaking the protocol; ending the attach says so, where
+				// dropping it would leave a client missing output it has no
+				// way to notice. Nothing about the frame is logged.
+				return
+			}
+			if client.Send(ctx, m) != nil {
+				return
+			}
+		}
+	}()
 	<-done
-	a.Close()
-	b.Close()
+	_ = client.Close(errAttachEnded)
+	runner.Close()
 	<-done // let the second pump exit before returning
 }
 

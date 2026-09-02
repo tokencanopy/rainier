@@ -2781,14 +2781,17 @@ func TestPushPullRoundTrip(t *testing.T) {
 	assertTreesEqual(t, src, dst, "the tree that came back to the laptop")
 
 	// A pull of something that is not there is a refusal from inside the
-	// sandbox, and it reaches the client as the sandbox's own sentence rather
-	// than as a truncated archive.
+	// sandbox, and it reaches the client as a refusal — the API's own
+	// sentence under the status a refusal has always carried — rather than as
+	// a truncated archive. The sandbox's own words stop at the service
+	// boundary (D1).
 	err = cli.Pull(f.client(), created.ID, workspace.WorkspaceRoot+"/nothing-here", t.TempDir(), nil)
 	if err == nil {
 		t.Fatal("pulling a path the session does not have succeeded")
 	}
-	if !strings.Contains(err.Error(), "does not exist in this session's workspace") {
-		t.Fatalf("pulling a missing path failed with %v, want the sandbox's own explanation", err)
+	if !strings.Contains(err.Error(), "conflict") ||
+		!strings.Contains(err.Error(), "refused the file transfer") {
+		t.Fatalf("pulling a missing path failed with %v, want the API's own refusal", err)
 	}
 }
 

@@ -13,7 +13,6 @@ import (
 
 	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/controlapp"
-	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 const (
@@ -66,6 +65,9 @@ type Config struct {
 	// runner's dial-back before controld closes it. Zero means
 	// defaultAttachPairTTL; tests shorten it.
 	AttachPairTTL time.Duration
+	// MaxTransferBytes is the most this replica relays in one file transfer,
+	// either direction; zero means workspace.MaxBytes; tests lower it.
+	MaxTransferBytes int64
 }
 
 // Server is controld: the HTTP/WebSocket surface, the runner plane, and (as
@@ -92,13 +94,12 @@ type Server struct {
 	// the fleet-wide runner map.
 	attaches *attachTable
 
-	// xferMax is the most this replica will relay in ONE file transfer, in
-	// either direction — workspace.MaxBytes in production, lowered by tests. It is
-	// a field rather than the constant used inline because the pull path is
-	// where a sandbox's own bound stops being enough: a compromised one that
-	// never says "done" is answering an endless stream, and something on this
-	// side has to be the thing that stops reading it.
-	xferMax int64
+	// pushes holds the file uploads this replica is relaying, keyed by the
+	// client's own transfer id — one io.Pipe and one PushWorkspace call per
+	// transfer, spanning the many HTTP requests one upload arrives as (see
+	// api.go). Like the pairing table it has its own lock and its own
+	// lifetime, and its zero value is usable.
+	pushes pushTable
 
 	// The four application services controld is composed from, built by New
 	// over the adapters in adapt_*.go. Handlers reach the store, the runner
@@ -115,9 +116,8 @@ type Server struct {
 
 	// transport is the runner plane behind the control.RunnerTransport port
 	// (adapt_transport.go, over the connection map below) and broker the
-	// attach pairing behind control.AttachmentBroker. Until Task 6 composes
-	// the real broker it is the notYetBroker placeholder, which refuses every
-	// attach with ErrUnavailable.
+	// dial-back attach pairing behind control.AttachmentBroker
+	// (adapt_attach.go, over the pairing table above).
 	transport control.RunnerTransport
 	broker    control.AttachmentBroker
 }
@@ -162,11 +162,10 @@ func New(st Store, cfg Config) (*Server, error) {
 		runners:     map[string]*runnerConn{},
 		runnerLocks: map[string]*sync.Mutex{},
 		attaches:    newAttachTable(),
-		xferMax:     workspace.MaxBytes,
 		gens:        &runnerGenerations{},
-		broker:      notYetBroker{},
 	}
 	s.transport = runnerTransport{srv: s}
+	s.broker = attachBroker{srv: s}
 	if err := s.compose(); err != nil {
 		return nil, err
 	}
@@ -223,21 +222,13 @@ func (s *Server) compose() error {
 	attachSvc, err := controlapp.NewAttachmentService(controlapp.AttachmentOptions{
 		Authorizer: auth, Policy: auth, Sessions: sessions, Transport: s.transport,
 		Broker: s.broker, Events: events, Clock: clock, IDs: ids,
+		MaxTransferBytes: s.cfg.MaxTransferBytes,
 	})
 	if err != nil {
 		return fmt.Errorf("controld: composing the attachment service: %w", err)
 	}
 	s.fleet, s.sessions, s.environments, s.attachments = fleetSvc, sessionSvc, envSvc, attachSvc
 	return nil
-}
-
-// notYetBroker is the attach port's stand-in until the pairing is composed
-// (Task 6): every attach through the service is ErrUnavailable, and no
-// handler calls the service until then anyway.
-type notYetBroker struct{}
-
-func (notYetBroker) Attach(context.Context, control.AttachTarget, control.TerminalStream) error {
-	return control.ErrUnavailable
 }
 
 // Handler returns controld's full HTTP surface: the runner control endpoint

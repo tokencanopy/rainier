@@ -238,8 +238,14 @@ func TestSessionDiff(t *testing.T) {
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409; body = %s", resp.StatusCode, raw)
 		}
-		if !strings.Contains(raw, "couldn't find remote ref") {
-			t.Fatalf("body = %s, want git's own words", raw)
+		// D1: "understood and declined" keeps its status, but the sandbox's
+		// own sentence stays inside the container — a provider-neutral
+		// service does not relay a runner's or a sandbox's free text.
+		if strings.Contains(raw, "couldn't find remote ref") {
+			t.Fatalf("body = %s, want the fixed refusal, not git's own words", raw)
+		}
+		if !strings.Contains(raw, "the session refused the diff") {
+			t.Fatalf("body = %s, want the fixed refusal sentence", raw)
 		}
 	})
 
@@ -338,7 +344,12 @@ func TestPushFiles(t *testing.T) {
 		if ack.Seq != 0 || !ack.Synced {
 			t.Fatalf("ack = %+v", ack)
 		}
-		if string(got.Data) != "hello" || got.Path != "widget/vendor" || got.Xfer != "t1" || !got.Done {
+		// The chunk the SANDBOX receives is the service's own: it streams the
+		// archive under a transfer id it mints, independent of the one the
+		// client counts its requests with (controlapp mints and pins it —
+		// TestPushWorkspaceMultipleChunks). What has to survive the bridge is
+		// the destination, the bytes, and the end of the archive.
+		if string(got.Data) != "hello" || got.Path != "widget/vendor" || got.Xfer == "" || !got.Done {
 			t.Fatalf("the sandbox received %+v", got)
 		}
 	})
@@ -383,14 +394,21 @@ func TestPushFiles(t *testing.T) {
 			return nil, fmt.Errorf("push chunk 3 arrived out of order; expected 1")
 		})
 
-		body := workspace.PushChunk{Xfer: "t", Path: "dst", Seq: 3, Data: []byte("x")}
+		// One whole transfer in one chunk: a refusal is reported on the
+		// request that ends the archive, which is the one whose answer a
+		// client acts on. (A chunk in the middle of a longer archive learns
+		// about it on the next chunk, when the closed pipe refuses its
+		// bytes — the transfer is one streamed call now, not one call per
+		// chunk.)
+		body := workspace.PushChunk{Xfer: "t", Path: "dst", Seq: 0, Data: []byte("x"), Done: true}
 		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_push_refused/files", tok, body, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409; body = %s", resp.StatusCode, raw)
 		}
-		if !strings.Contains(raw, "out of order") {
-			t.Fatalf("body = %s, want the sandbox's own sentence", raw)
+		// D1: the sandbox's own sentence no longer travels.
+		if !strings.Contains(raw, "the session refused the file transfer") {
+			t.Fatalf("body = %s, want the fixed refusal sentence", raw)
 		}
 	})
 
@@ -429,8 +447,13 @@ func TestPushFiles(t *testing.T) {
 		}
 		assertErrCode(t, resp, "session_not_ready")
 
+		// Done, unlike the cases above: authorization and readiness are
+		// settled before a byte is read, so they answer the first chunk,
+		// while an unreachable RUNNER is only discovered when the archive is
+		// dispatched — on the chunk that ends it, or on the next one.
 		transferSession(t, st, "sess_push_gone", "vm-gone", u.ID)
-		resp = doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_push_gone/files", tok, body, nil)
+		whole := workspace.PushChunk{Xfer: "t-gone", Path: "dst", Data: []byte("x"), Done: true}
+		resp = doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_push_gone/files", tok, whole, nil)
 		if resp.StatusCode != http.StatusBadGateway {
 			t.Fatalf("disconnected runner status = %d, want 502", resp.StatusCode)
 		}
@@ -495,19 +518,23 @@ func TestPullFiles(t *testing.T) {
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409; body = %s", resp.StatusCode, raw)
 		}
-		if !strings.Contains(raw, "does not exist") {
-			t.Fatalf("body = %s, want the sandbox's own sentence", raw)
+		// D1: the sandbox's own sentence no longer travels; the status the
+		// route has always answered a refusal with does.
+		if !strings.Contains(raw, "the session refused the file transfer") {
+			t.Fatalf("body = %s, want the fixed refusal sentence", raw)
 		}
 	})
 
 	t.Run("stops a sandbox that would stream forever", func(t *testing.T) {
-		s, st, ts := newTestControld(t)
+		// The cap this replica will accept from a sandbox, lowered so the test
+		// does not have to move a quarter of a gigabyte to reach it. It is a
+		// startup bound now, not a field: the attachment service is built
+		// with it (Config.MaxTransferBytes), so it has to be set before New.
+		const xferMax = 4 << 20
+		s, st, ts := newTestControld(t, func(c *Config) { c.MaxTransferBytes = xferMax })
 		u, tok := loginUser(t, st, "alice", "member")
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 		transferSession(t, st, "sess_pull_flood", "vm1", u.ID)
-		// The cap this replica will accept from a sandbox, lowered so the test
-		// does not have to move a quarter of a gigabyte to reach it.
-		s.xferMax = 4 << 20
 
 		startSandbox(t, f, func(method string, payload json.RawMessage) (any, error) {
 			var req workspace.PullRequest
@@ -521,9 +548,9 @@ func TestPullFiles(t *testing.T) {
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_pull_flood/files?path=d", tok, nil, nil)
 		defer resp.Body.Close()
 		got, _ := io.ReadAll(resp.Body)
-		if int64(len(got)) > s.xferMax {
+		if int64(len(got)) > xferMax {
 			t.Fatalf("controld relayed %d bytes; the cap is %d — a sandbox must not be able to stream without end",
-				len(got), s.xferMax)
+				len(got), xferMax)
 		}
 	})
 
@@ -531,11 +558,10 @@ func TestPullFiles(t *testing.T) {
 	// loop forever without ever reaching the byte cap — the cap counts bytes,
 	// and there are none. The request has to end.
 	t.Run("stops a sandbox answering empty chunks", func(t *testing.T) {
-		s, st, ts := newTestControld(t)
+		s, st, ts := newTestControld(t, func(c *Config) { c.MaxTransferBytes = 4 << 20 })
 		u, tok := loginUser(t, st, "alice", "member")
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 		transferSession(t, st, "sess_pull_empty", "vm1", u.ID)
-		s.xferMax = 4 << 20
 
 		var asked atomic.Int64
 		startSandbox(t, f, func(method string, payload json.RawMessage) (any, error) {

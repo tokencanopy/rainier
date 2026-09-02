@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tokencanopy/rainier/control"
@@ -1817,41 +1818,203 @@ const filesBodyLimit = 2 << 20
 // handleSessionDiff serves GET /v0/sessions/{id}/diff: one `--stat` per
 // repository the session cloned, straight from the sandbox.
 //
-// Team-visible, like the other session reads — nil owner below, deliberately
-// (design §4.6; see sessionForRPC for why this route and not the two beneath
-// it).
+// Team-visible, like the other session reads (design §4.6): `git diff --stat`
+// is metadata — file paths and churn counts, no content — and the attachment
+// service enforces that itself, because ActionDiff is where the policy
+// adapter draws §4.4's read/mutate line.
 func (s *Server) handleSessionDiff(w http.ResponseWriter, r *http.Request, u User) {
-	row, ok := s.sessionForRPC(w, r, nil, "inspect")
-	if !ok {
-		return
-	}
-	ans, err := s.sessionDiff(r.Context(), row.ID)
+	id := sessionForRPC(r)
+	ctx := withUser(r.Context(), u)
+	ans, err := s.attachments.WorkspaceDiff(ctx, userScope(u), control.WorkspaceDiff{
+		SessionID: control.SessionID(id),
+	})
 	if err != nil {
-		writeSandboxErr(w, row.ID, "diff", err)
+		s.writeWorkspaceErr(w, ctx, id, err, workspaceErrText{
+			Verb: "inspect", Refused: "the session refused the diff"})
 		return
 	}
 	writeJSON(w, http.StatusOK, ans)
 }
 
-// handlePushFiles serves POST /v0/sessions/{id}/files: one chunk, forwarded to
-// the sandbox, answered with the sandbox's ack.
+// ---------------------------------------------------------------------------
+// the push transfer table
 //
-// controld holds NO per-transfer state, and must not: a session's replica is
-// whichever one the client's request reaches, so state kept here would have to
-// be shared between them. Everything a chunk needs to be understood — the
-// transfer id, the destination, the sequence number — rides on the chunk
-// itself, and the sandbox is the one place that remembers.
+// The wire is one chunk per request under a client-chosen `xfer`; the
+// attachment service streams a whole archive from one io.Reader and mints its
+// own sandbox-side transfer id. A pipe per transfer is what joins the two: the
+// first chunk opens the pipe and starts the one PushWorkspace call, every
+// chunk writes into it — blocking until the service has consumed the bytes,
+// which is exactly the backpressure a chunk-at-a-time client already had —
+// and the last one closes the writer and reports what the service made of the
+// whole archive.
 //
-// That is also why the TOTAL size cap is the sandbox's to enforce on this
-// direction and not this replica's: the sandbox is the only end that sees a
-// whole transfer. What is bounded here is one request — the body limit and the
-// chunk cap — which is all this side ever holds at once, so an oversized push
-// costs the pusher's own session's disk quota and nothing of controld's.
-func (s *Server) handlePushFiles(w http.ResponseWriter, r *http.Request, u User) {
-	row, ok := s.sessionForRPC(w, r, &u, "transfer files to")
-	if !ok {
-		return
+// The sandbox-side chunk numbering is the service's own from here on and is
+// independent of the HTTP `seq` a client counts with. A client only ever sees
+// its own acks, so the wire is unchanged.
+// ---------------------------------------------------------------------------
+
+// maxOpenPushes bounds how many uploads one replica relays at once. Each open
+// transfer pins a goroutine, an io.Pipe and the service's own chunk buffer,
+// and holds a staging file inside a sandbox; 64 is far above what any client
+// produces (the CLI runs one transfer per invocation) and low enough that a
+// client opening transfers it never continues cannot spend this replica.
+//
+// The refusal is 409 rather than 429, deliberately: "understood and declined,
+// try again" is what conflict already means on this API, and a 429 would be a
+// status code the /v0/ wire has never carried.
+const maxOpenPushes = 64
+
+var (
+	// errPushDuplicate is a second chunk 0 under a transfer id already open.
+	// Continuing would interleave two archives into one pipe.
+	errPushDuplicate = errors.New("controld: that transfer is already open")
+	// errPushBusy is maxOpenPushes.
+	errPushBusy = errors.New("controld: too many transfers are open")
+)
+
+// pushKey names one transfer: the session it writes into and the client's own
+// transfer id. Keyed by both, so one session's transfer can never be continued
+// against another's, whatever id a client picks.
+type pushKey struct{ session, xfer string }
+
+// pushTransfer is one upload in flight across many requests.
+//
+// mu serializes the chunks of ONE transfer (a client sends them in order, but
+// nothing on the wire guarantees it), while finish is the one closing step,
+// raced for by the last chunk, a service failure, and the TTL. result is read
+// only inside that Once, so every caller sees the same outcome.
+type pushTransfer struct {
+	path   string
+	pw     *io.PipeWriter
+	done   chan error
+	cancel context.CancelFunc
+	ttl    *time.Timer
+
+	mu   sync.Mutex
+	next int // the seq the next chunk must carry
+
+	finish sync.Once
+	result error
+}
+
+// pushTable holds this replica's open uploads. Its zero value is usable; the
+// map is built on the first transfer.
+type pushTable struct {
+	mu sync.Mutex
+	m  map[pushKey]*pushTransfer
+}
+
+// openPush starts one transfer: a pipe, and the single PushWorkspace call
+// that drains it.
+//
+// The service's context is deliberately NOT the request's. It must outlive
+// this one chunk — every later chunk of the same archive feeds the same call —
+// so it is a background context carrying the caller (the authorization the
+// service performs reads it from there) and bounded by the longest a whole
+// transfer could honestly take: one dispatch budget per chunk of the public
+// maximum, plus slack.
+func (s *Server) openPush(key pushKey, u User, chunk workspace.PushChunk) error {
+	s.pushes.mu.Lock()
+	defer s.pushes.mu.Unlock()
+	if s.pushes.m == nil {
+		s.pushes.m = map[pushKey]*pushTransfer{}
 	}
+	if _, dup := s.pushes.m[key]; dup {
+		return errPushDuplicate
+	}
+	if len(s.pushes.m) >= maxOpenPushes {
+		return errPushBusy
+	}
+
+	pr, pw := io.Pipe()
+	ctx, cancel := context.WithTimeout(withUser(context.Background(), u), s.pushBudget())
+	t := &pushTransfer{path: chunk.Path, pw: pw, done: make(chan error, 1), cancel: cancel}
+	go func() {
+		err := s.attachments.PushWorkspace(ctx, userScope(u), control.PushWorkspace{
+			SessionID: control.SessionID(key.session), Path: chunk.Path, Body: pr,
+		})
+		// Whatever ended the call, the writing half has to learn about it:
+		// a handler blocked in pw.Write is released with this very error, so
+		// a client hears about a failure on its next chunk rather than at the
+		// end of an archive nobody was reading.
+		pr.CloseWithError(err)
+		t.done <- err
+	}()
+	// A transfer nobody continues is closed on the same cadence a parked
+	// attach is: the client that would have finished it is gone, and the
+	// pipe, the goroutine and the sandbox's staging file are not free.
+	t.ttl = time.AfterFunc(s.cfg.AttachPairTTL, func() {
+		s.pushes.remove(key, t)
+		t.end(context.DeadlineExceeded)
+	})
+	s.pushes.m[key] = t
+	return nil
+}
+
+// pushBudget bounds one whole transfer: a dispatch budget per chunk of the
+// public maximum, plus two chunks' slack.
+func (s *Server) pushBudget() time.Duration {
+	return s.cfg.OpTimeout * time.Duration(workspace.MaxBytes/workspace.ChunkBytes+2)
+}
+
+func (t *pushTable) get(key pushKey) (*pushTransfer, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	tr, ok := t.m[key]
+	return tr, ok
+}
+
+// remove deletes key only while it still names this exact transfer, so a
+// late TTL cannot retire a transfer that has already been finished and
+// replaced under the same id.
+func (t *pushTable) remove(key pushKey, tr *pushTransfer) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.m[key] == tr {
+		delete(t.m, key)
+	}
+}
+
+// end closes the writing half and returns what the service made of the whole
+// archive. cause nil ends the archive normally (the client said done);
+// anything else abandons it, and the service's own error still wins, because
+// it is the one that says what actually happened.
+//
+// It deliberately does not take t.mu: the TTL calls it while a chunk handler
+// may be blocked in pw.Write holding that lock, and closing the pipe is what
+// releases that handler.
+func (t *pushTransfer) end(cause error) error {
+	t.finish.Do(func() {
+		t.ttl.Stop()
+		if cause != nil {
+			t.pw.CloseWithError(cause)
+		} else {
+			t.pw.Close()
+		}
+		t.result = <-t.done
+		if t.result == nil && cause != nil {
+			t.result = cause
+		}
+		t.cancel()
+	})
+	return t.result
+}
+
+// pushErrText names the push in a denial and in a sandbox's refusal.
+var pushErrText = workspaceErrText{
+	Verb:    "transfer files to",
+	Refused: "the session refused the file transfer",
+}
+
+// handlePushFiles serves POST /v0/sessions/{id}/files: one chunk of an upload,
+// answered with an ack for that chunk.
+//
+// The ack's `synced` is now this replica's answer rather than the sandbox's:
+// false while the archive is still arriving, true on the chunk that ends it,
+// which is the only one whose answer a client acts on. `seq` is echoed, which
+// is what the CLI correlates against.
+func (s *Server) handlePushFiles(w http.ResponseWriter, r *http.Request, u User) {
+	id := sessionForRPC(r)
 	var chunk workspace.PushChunk
 	if !decodeJSONBodyLimit(w, r, &chunk, filesBodyLimit) {
 		return
@@ -1860,13 +2023,63 @@ func (s *Server) handlePushFiles(w http.ResponseWriter, r *http.Request, u User)
 		writeErr(w, http.StatusBadRequest, "invalid_request", msg)
 		return
 	}
+	ctx := withUser(r.Context(), u)
 
-	ack, err := s.sessionPushChunk(r.Context(), row.ID, chunk)
-	if err != nil {
-		writeSandboxErr(w, row.ID, "push", err)
+	key := pushKey{session: id, xfer: chunk.Xfer}
+	if chunk.Seq == 0 {
+		switch err := s.openPush(key, u, chunk); {
+		case errors.Is(err, errPushDuplicate):
+			writeErr(w, http.StatusConflict, "conflict", "that transfer is already open")
+			return
+		case errors.Is(err, errPushBusy):
+			writeErr(w, http.StatusConflict, "conflict",
+				"too many file transfers are open on this server; retry shortly")
+			return
+		}
+	}
+	t, ok := s.pushes.get(key)
+	if !ok {
+		// Either it was never opened (a client that started mid-archive) or
+		// it expired. Both are "there is no such transfer", and a client's
+		// remedy for both is to start one at chunk 0.
+		writeErr(w, http.StatusNotFound, "not_found", "unknown transfer: a transfer starts at chunk 0")
 		return
 	}
-	writeJSON(w, http.StatusOK, ack)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if chunk.Path != t.path {
+		writeErr(w, http.StatusBadRequest, "invalid_request",
+			"every chunk of one transfer names the same path")
+		return
+	}
+	if chunk.Seq != t.next {
+		writeErr(w, http.StatusBadRequest, "invalid_request",
+			fmt.Sprintf("this transfer expects chunk %d", t.next))
+		return
+	}
+
+	// The write blocks until the service has taken the bytes, which is the
+	// backpressure the chunk-per-request wire has always had. It fails only
+	// when the service has already ended the transfer, and then the error it
+	// fails with IS the service's.
+	if _, err := t.pw.Write(chunk.Data); err != nil {
+		s.pushes.remove(key, t)
+		s.writeWorkspaceErr(w, ctx, id, t.end(err), pushErrText)
+		return
+	}
+	t.next++
+	if chunk.Done {
+		s.pushes.remove(key, t)
+		if err := t.end(nil); err != nil {
+			s.writeWorkspaceErr(w, ctx, id, err, pushErrText)
+			return
+		}
+		writeJSON(w, http.StatusOK, workspace.PushAck{Seq: chunk.Seq, Synced: true})
+		return
+	}
+	t.ttl.Reset(s.cfg.AttachPairTTL)
+	writeJSON(w, http.StatusOK, workspace.PushAck{Seq: chunk.Seq, Synced: false})
 }
 
 // validatePushChunk checks everything about a chunk that can be checked
@@ -1897,11 +2110,11 @@ func validatePushChunk(c workspace.PushChunk) string {
 
 // maxXferIDLen bounds the client-chosen transfer id. It is an opaque
 // correlation token, never a filename (the sandbox stages under a name of its
-// own choosing), but it does reach log lines and error messages.
+// own choosing), but it does reach this replica's transfer table.
 const maxXferIDLen = 64
 
 // handlePullFiles serves GET /v0/sessions/{id}/files?path=…: the sandbox's
-// archive of that path, streamed out chunk by chunk as it arrives.
+// archive of that path, streamed out as the service relays it.
 //
 // Errors have two eras. Before the first byte, a failure is an ordinary JSON
 // envelope like every other route's. After it, the status line is already
@@ -1916,153 +2129,116 @@ func (s *Server) handlePullFiles(w http.ResponseWriter, r *http.Request, u User)
 		writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	row, ok := s.sessionForRPC(w, r, &u, "transfer files from")
-	if !ok {
+	id := sessionForRPC(r)
+	ctx := withUser(r.Context(), u)
+
+	body := &firstWriteHeader{w: w}
+	err := s.attachments.PullWorkspace(ctx, userScope(u), control.PullWorkspace{
+		SessionID: control.SessionID(id), Path: path, Body: body,
+	})
+	switch {
+	case err == nil:
+		// An empty archive still gets its 200: nothing was written, so the
+		// header this writer defers has not gone out yet.
+		body.start()
+	case body.clientGone:
+		// The client hung up mid-body. Nothing to report to anyone.
+		log.Printf("controld: pull from %s: the client stopped reading", clip(id))
+	case body.started:
+		log.Printf("controld: pull from %s failed after the first byte; abandoning the response", clip(id))
+		panic(http.ErrAbortHandler)
+	case errors.Is(err, control.ErrInvalid):
+		// The path validated above, so the only ErrInvalid left from a pull
+		// is the transfer bound: this archive is bigger than this replica
+		// relays. Same status it has always had.
+		writeErr(w, http.StatusConflict, "conflict", "this path is larger than the transfer limit")
+	default:
+		s.writeWorkspaceErr(w, ctx, id, err, workspaceErrText{
+			Verb: "transfer files from", Refused: "the session refused the file transfer"})
+	}
+}
+
+// firstWriteHeader defers the 200 and its Content-Type to the first byte, so
+// everything that can fail before any byte moves still gets to answer with a
+// JSON envelope — which is only possible while the header is unwritten.
+//
+// It also remembers a write that failed, because "the client hung up" and
+// "the service failed mid-archive" are the same sentinel by the time they
+// come back and are not the same event: one is nobody's fault and is not
+// worth abandoning a connection over.
+type firstWriteHeader struct {
+	w          http.ResponseWriter
+	started    bool
+	clientGone bool
+}
+
+func (f *firstWriteHeader) Write(p []byte) (int, error) {
+	f.start()
+	n, err := f.w.Write(p)
+	if err != nil {
+		f.clientGone = true
+		return n, err
+	}
+	// Flushed per chunk so the client sees progress on a slow transfer rather
+	// than a stall followed by everything at once. ResponseController follows
+	// statusWriter's Unwrap to the real writer.
+	http.NewResponseController(f.w).Flush()
+	return n, nil
+}
+
+// start writes the status line once, whether the archive had bytes or not.
+func (f *firstWriteHeader) start() {
+	if f.started {
 		return
 	}
-
-	id := randHex(8)
-	var sent int64
-	var started bool // whether the 200 and its headers have been written
-	// Two chunks of slack over the cap's worth: a transfer within the cap
-	// cannot need more than that unless the far end is sending short chunks,
-	// which nothing honest does. It is the second of the two rules that keep
-	// this loop finite — the first is that only the last chunk may be empty
-	// (sessionPullChunk) — and the belt to that one's braces.
-	maxChunks := int(s.xferMax/workspace.ChunkBytes) + 2
-	for seq := 0; ; seq++ {
-		if seq > maxChunks {
-			log.Printf("controld: pull %s from %s took more than %d chunks; abandoning", path, row.ID, maxChunks)
-			panic(http.ErrAbortHandler)
-		}
-		chunk, err := s.sessionPullChunk(r.Context(), row.ID, workspace.PullRequest{Xfer: id, Path: path, Seq: seq})
-		if err != nil {
-			if !started {
-				writeSandboxErr(w, row.ID, "pull", err)
-				return
-			}
-			log.Printf("controld: pull %s from %s failed after %d bytes: %v", path, row.ID, sent, err)
-			panic(http.ErrAbortHandler)
-		}
-		// The cap is checked BEFORE the write, so the bytes this replica
-		// relays never exceed it even by one chunk. A sandbox that never says
-		// done is the case this exists for: nothing else would stop it.
-		if sent+int64(len(chunk.Data)) > s.xferMax {
-			log.Printf("controld: pull %s from %s exceeded the %s transfer limit; abandoning",
-				path, row.ID, workspace.HumanBytes(s.xferMax))
-			if !started {
-				writeErr(w, http.StatusConflict, "conflict",
-					fmt.Sprintf("this path is larger than the %s transfer limit", workspace.HumanBytes(s.xferMax)))
-				return
-			}
-			panic(http.ErrAbortHandler)
-		}
-		if !started {
-			// Written on the first chunk rather than up front: everything that
-			// can fail before any byte moves gets to answer with a JSON
-			// envelope, which is only possible while the header is unwritten.
-			w.Header().Set("Content-Type", "application/gzip")
-			w.WriteHeader(http.StatusOK)
-			started = true
-		}
-		if _, err := w.Write(chunk.Data); err != nil {
-			// The client hung up. Nothing to report to anyone.
-			log.Printf("controld: pull %s from %s: writing to the client: %v", path, row.ID, err)
-			return
-		}
-		sent += int64(len(chunk.Data))
-		// Flushed per chunk so the client sees progress on a slow transfer
-		// rather than a stall followed by everything at once. ResponseController
-		// follows statusWriter's Unwrap to the real writer.
-		http.NewResponseController(w).Flush()
-		if chunk.Done {
-			return
-		}
-	}
+	f.w.Header().Set("Content-Type", "application/gzip")
+	f.w.WriteHeader(http.StatusOK)
+	f.started = true
 }
 
-// sessionForRPC is the preamble every route above shares: find the session,
-// establish that there is a sandbox to talk to, and — when the route carries
-// files rather than metadata — that this caller may reach into it. It answers
-// the client and reports false on every failure.
-//
-// AUTHORIZATION SPLITS BY WHAT THE ROUTE CARRIES, on the line design §4.4 draws
-// between reads and mutations:
-//
-//   - The DIFF is team-visible, like every other session read (§4.6 says so
-//     explicitly, and handleGetSession takes no ownership check either).
-//     `git diff --stat` is metadata — file paths and churn counts, no content —
-//     and seeing which files a teammate's branch touched is the point of the
-//     endpoint rather than an incidental read. The posture it fits is already
-//     the fleet's: an admin may attach to any session and push as its owner.
-//   - PUSH and PULL are owner-or-admin. They carry the working tree itself —
-//     raw file bytes out, and writes into somebody's checkout — which puts them
-//     on the attach side of that line, not the list-sessions side.
-//
-// owner is the caller to authorize against, or nil for the team-visible read.
-func (s *Server) sessionForRPC(w http.ResponseWriter, r *http.Request, owner *User, verb string) (Session, bool) {
-	id := r.PathValue("id")
-	row, err := s.st.GetSession(r.Context(), id)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			writeErr(w, http.StatusNotFound, "not_found", "session not found")
-			return Session{}, false
-		}
-		log.Printf("controld: get session %s: %v", clip(id), err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not read session")
-		return Session{}, false
-	}
-	if owner != nil && !authorizeOwnerOrAdmin(*owner, row) {
-		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to "+verb+" this session")
-		return Session{}, false
-	}
-	if row.State != StateRunning {
-		// No bounded wait here, unlike attach: these are one-shot requests a
-		// client can simply repeat, and holding one open would tie up a
-		// connection for a session that may be minutes from starting.
-		writeErr(w, http.StatusServiceUnavailable, "session_not_ready",
-			fmt.Sprintf("session is %s, not running", row.State))
-		return Session{}, false
-	}
-	if row.Runner == "" || !s.runnerConnected(row.Runner) {
-		writeErr(w, http.StatusBadGateway, "runner_unreachable", "runner is not connected")
-		return Session{}, false
-	}
-	return row, true
-}
+// sessionForRPC is all these three routes still do for themselves: name the
+// session. Reading it, deciding whether this caller may reach into it, and
+// whether there is a sandbox to reach at all are the attachment service's,
+// which answers all three as one closed sentinel apiece.
+func sessionForRPC(r *http.Request) string { return r.PathValue("id") }
 
-// writeSandboxErr maps a session-RPC failure onto this API's error envelope.
+// writeWorkspaceErr maps an attachment-service error onto this API's error
+// envelope, with the two refinements these three routes own.
 //
-// A *sandboxError is a REFUSAL: the request crossed into the sandbox, was
-// understood, and was declined — a path that does not exist, a git that could
-// not fetch, a chunk out of order. Its message is the sandbox's own and travels
-// verbatim (clipped), because that sentence is usually the only thing that says
-// what to do; `conflict` is this API's code for "understood and declined", the
-// same one a create with no credential gets.
-func writeSandboxErr(w http.ResponseWriter, sessionID, what string, err error) {
-	var sbx *sandboxError
+// ErrConflict is theirs because the service reports "this session is not
+// running" that way and these routes have always answered it 503
+// session_not_ready — a session a client can simply ask again about in a
+// moment, unlike the 409 a create conflict gets. ErrDenied is theirs because
+// the sentence names the operation, and the service cannot know which of the
+// three was asked for. Everything else — including the ErrUnavailable that
+// covers a runner with no connection, one that did not answer, and a sandbox
+// that refused — goes through the session handlers' shared mapping.
+func (s *Server) writeWorkspaceErr(w http.ResponseWriter, ctx context.Context, id string, err error, text workspaceErrText) {
 	switch {
-	case errors.As(err, &sbx):
-		writeErr(w, http.StatusConflict, "conflict", sandboxMessage(sbx.Error()))
-	case errors.Is(err, ErrRunnerUnreachable):
-		writeErr(w, http.StatusBadGateway, "runner_unreachable", "session did not answer")
+	case errors.Is(err, control.ErrDenied):
+		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to "+text.Verb+" this session")
+	case errors.Is(err, control.ErrConflict):
+		writeErr(w, http.StatusServiceUnavailable, "session_not_ready", "session is not running")
+	case errors.Is(err, controlapp.ErrRunnerRefused):
+		// The sandbox received the request and declined it. Checked before
+		// the ErrUnavailable refinement below, which would otherwise call it
+		// unreachable — exactly backwards, since the sandbox is right there
+		// and answering. `conflict` is this API's code for "understood and
+		// declined", the same one this route has always answered with; what
+		// it no longer carries is the sandbox's own sentence.
+		writeErr(w, http.StatusConflict, "conflict", text.Refused)
 	default:
-		log.Printf("controld: %s for %s: %v", what, clip(sessionID), err)
-		writeErr(w, http.StatusInternalServerError, "internal", "could not "+what+" this session")
+		s.writeSessionErr(w, ctx, id, err, sessionErrText{})
 	}
 }
 
-// maxSandboxMessage bounds a sentence that came from inside a container before
-// it reaches a user's terminal. clip() is 48 characters — right for a log line
-// or a websocket close reason, far too short for git's own diagnostics, which
-// are the whole reason these messages are passed through.
-const maxSandboxMessage = 512
-
-func sandboxMessage(s string) string {
-	if len(s) <= maxSandboxMessage {
-		return s
-	}
-	return clipTo(s, maxSandboxMessage) + "..."
+// workspaceErrText is the pair of sentences one workspace route owns: the
+// operation named in a denial, and the refusal a sandbox that answered no
+// gets. The service reports both as one sentinel apiece and cannot know which
+// of the three operations was asked for.
+type workspaceErrText struct {
+	Verb    string
+	Refused string
 }
 
 // ---------------------------------------------------------------------------

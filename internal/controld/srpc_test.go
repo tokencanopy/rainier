@@ -4,7 +4,6 @@ package controld
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log"
 	"strings"
 	"sync"
@@ -91,223 +90,40 @@ func srpcPending(t *testing.T, s *Server, runner string) int {
 }
 
 // ---------------------------------------------------------------------------
-// controld-initiated: sessionRPC
+// controld-initiated: where the downward half's tests went
+//
+// The six tests that drove Server.sessionRPC directly are gone with it. The
+// behavior they pinned did not go anywhere — it moved to the two seams that
+// replaced that method, and each one is named here so the coverage can be
+// followed rather than assumed:
+//
+//   - TestSessionRPCRoundTrip           → controlapp TestSessionRPCSuccess (the
+//     request's shape and the decoded answer) and adapt_transport_test.go
+//     TestTransportDispatchSessionRPCCorrelatesByEnvelopeID (the envelope-ID
+//     correlation over one connection, ReqID left at 0, table cleaned up).
+//   - TestSessionRPCTimesOut            → adapt_transport_test.go
+//     TestTransportDispatchFailuresAreUnavailableWithoutRunnerText, case "no
+//     answer before OpTimeout".
+//   - TestSessionRPCFailsFastOnConnDeath → the same test's "connection closed"
+//     case, plus TestTransportDispatchHonorsCallerCancellation for not waiting
+//     out a budget once the answer can no longer come.
+//   - TestSessionRPCSurfacesSandboxErrors → controlapp
+//     TestSessionRPCHostileResponses, case "false ok" (now ErrRunnerRefused,
+//     which wraps ErrUnavailable); the 409 a refusal renders as on the wire is
+//     pinned by files_test.go's three "refusal" cases. The sandbox's own
+//     sentence is deliberately no longer relayed (D1).
+//   - TestSessionRPCsCorrelateOutOfOrder → controlapp
+//     TestSessionRPCConcurrentOutOfOrder, over the same per-call id.
+//   - TestSessionRPCUnreachable         → "runner is not connected here" is
+//     adapt_transport_test.go's "unknown runner" case; "session is placed
+//     nowhere" and "no such session" are the attachment service's reads now
+//     (controlapp TestWorkspaceDiffRequiresRunning and
+//     TestAttachTerminalRejections), and files_test.go's readiness subtests
+//     pin the 404/503/502 those become on the wire.
+//
+// TestOrphanSessionRPCResponseIsDropped stays, rewritten against the transport
+// adapter: what it is about is this file's own routing, not the caller.
 // ---------------------------------------------------------------------------
-
-// TestSessionRPCRoundTrip is the whole downward path in one test: controld
-// asks a sandbox something, the answer comes back, and the caller gets it
-// decoded into its own type.
-func TestSessionRPCRoundTrip(t *testing.T) {
-	s, st, ts := newTestControld(t)
-	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
-	id := sandboxSession(t, st, "sess_rpc_ok", "vm1")
-
-	type answer struct {
-		Pong string `json:"pong"`
-	}
-	var got answer
-	errc := make(chan error, 1)
-	go func() {
-		errc <- s.sessionRPC(context.Background(), id, "ping", map[string]string{"hello": "world"}, &got)
-	}()
-
-	cmd := nextSessionRPC(t, f)
-	if cmd.Session != id {
-		t.Fatalf("session_rpc.Session = %q, want %q", cmd.Session, id)
-	}
-	if cmd.RPC.Method != "ping" {
-		t.Fatalf("envelope method = %q, want \"ping\"", cmd.RPC.Method)
-	}
-	if cmd.RPC.ID == 0 {
-		t.Fatal("envelope id = 0; a request with no id can never be correlated")
-	}
-	if cmd.ReqID != 0 {
-		t.Fatalf("ReqID = %d, want 0 — session RPC correlates on the envelope's own id, not the runner-dispatch space", cmd.ReqID)
-	}
-	if string(cmd.RPC.Payload) != `{"hello":"world"}` {
-		t.Fatalf("payload = %s, want the caller's own object", cmd.RPC.Payload)
-	}
-
-	f.answerRPC(t, cmd, true, `{"pong":"yes"}`)
-	if err := <-errc; err != nil {
-		t.Fatalf("sessionRPC: %v", err)
-	}
-	if got.Pong != "yes" {
-		t.Fatalf("decoded answer = %+v, want Pong \"yes\"", got)
-	}
-	if n := srpcPending(t, s, "vm1"); n != 0 {
-		t.Fatalf("%d pending entries after the answer landed, want 0", n)
-	}
-}
-
-// TestSessionRPCTimesOut: a sandbox that never answers must not park the
-// caller forever, and the pending entry must go with the call — a timeout is
-// the one exit that has no delivery to clean up after it.
-func TestSessionRPCTimesOut(t *testing.T) {
-	s, st, ts := newTestControld(t, func(c *Config) { c.OpTimeout = 250 * time.Millisecond })
-	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
-	id := sandboxSession(t, st, "sess_rpc_slow", "vm1")
-
-	start := time.Now()
-	err := s.sessionRPC(context.Background(), id, "diff", nil, nil)
-	if err == nil {
-		t.Fatal("sessionRPC with no answer = nil, want a timeout")
-	}
-	if !errors.Is(err, ErrRunnerUnreachable) || !errors.Is(err, ErrDispatchTimeout) {
-		t.Fatalf("err = %v, want it to wrap both ErrRunnerUnreachable and ErrDispatchTimeout", err)
-	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Fatalf("waited %s, want ~the 250ms OpTimeout", elapsed)
-	}
-	if n := srpcPending(t, s, "vm1"); n != 0 {
-		t.Fatalf("%d pending entries after a timeout, want 0", n)
-	}
-	// The command really was sent — the timeout is about the answer, not the
-	// dispatch.
-	if cmd := nextSessionRPC(t, f); cmd.Session != id {
-		t.Fatalf("session_rpc.Session = %q, want %q", cmd.Session, id)
-	}
-}
-
-// TestSessionRPCFailsFastOnConnDeath: when the runner's connection dies there
-// will never be an answer, and waiting out OpTimeout for a fact already known
-// is exactly the stall the conn-death signal exists to prevent.
-func TestSessionRPCFailsFastOnConnDeath(t *testing.T) {
-	s, st, ts := newTestControld(t, func(c *Config) { c.OpTimeout = 30 * time.Second })
-	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
-	id := sandboxSession(t, st, "sess_rpc_dies", "vm1")
-
-	errc := make(chan error, 1)
-	go func() { errc <- s.sessionRPC(context.Background(), id, "diff", nil, nil) }()
-	nextSessionRPC(t, f) // the request is in flight
-	f.close()
-
-	select {
-	case err := <-errc:
-		if !errors.Is(err, ErrRunnerUnreachable) {
-			t.Fatalf("err = %v, want it to wrap ErrRunnerUnreachable", err)
-		}
-		if errors.Is(err, ErrDispatchTimeout) {
-			t.Fatalf("err = %v, want a conn-death error, not a timeout — the connection is known dead", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("sessionRPC did not fail when the connection died (it waited for OpTimeout)")
-	}
-}
-
-// TestSessionRPCSurfacesSandboxErrors: a refusal inside the sandbox is not a
-// transport failure, and its message is the whole point — the named action a
-// user has to run reaches them through this path verbatim.
-func TestSessionRPCSurfacesSandboxErrors(t *testing.T) {
-	s, st, ts := newTestControld(t)
-	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
-	id := sandboxSession(t, st, "sess_rpc_refused", "vm1")
-
-	const msg = "github credentials need a refresh: run `rainier login --refresh github`"
-	errc := make(chan error, 1)
-	go func() { errc <- s.sessionRPC(context.Background(), id, "mint_git_credential", nil, nil) }()
-	cmd := nextSessionRPC(t, f)
-	body, err := json.Marshal(map[string]string{"error": msg})
-	if err != nil {
-		t.Fatal(err)
-	}
-	f.answerRPC(t, cmd, false, string(body))
-
-	err = <-errc
-	var se *sandboxError
-	if !errors.As(err, &se) {
-		t.Fatalf("err = %v (%T), want a *sandboxError", err, err)
-	}
-	if se.Error() != msg {
-		t.Fatalf("error text = %q, want the sandbox's own message %q", se.Error(), msg)
-	}
-	if errors.Is(err, ErrRunnerUnreachable) {
-		t.Fatalf("err = %v, want a sandbox refusal, not an unreachable-runner error", err)
-	}
-	if n := srpcPending(t, s, "vm1"); n != 0 {
-		t.Fatalf("%d pending entries after a refusal, want 0", n)
-	}
-}
-
-// TestSessionRPCsCorrelateOutOfOrder: two calls to the same sandbox are in
-// flight at once and the answers come back in the opposite order. Each caller
-// must get its own answer — this is what the per-call id buys, and reversing
-// the replies is the only way to prove the table is doing the matching rather
-// than arrival order.
-func TestSessionRPCsCorrelateOutOfOrder(t *testing.T) {
-	s, st, ts := newTestControld(t)
-	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
-	id := sandboxSession(t, st, "sess_rpc_concurrent", "vm1")
-
-	type reply struct {
-		Which string `json:"which"`
-	}
-	type outcome struct {
-		got reply
-		err error
-	}
-	results := make(chan outcome, 2)
-	call := func(method string) {
-		var got reply
-		err := s.sessionRPC(context.Background(), id, method, nil, &got)
-		results <- outcome{got, err}
-	}
-	go call("first")
-	go call("second")
-
-	a := nextSessionRPC(t, f)
-	b := nextSessionRPC(t, f)
-	if a.RPC.ID == b.RPC.ID {
-		t.Fatalf("both requests got id %d; concurrent calls must not collide", a.RPC.ID)
-	}
-	// Answered second-then-first, deliberately.
-	f.answerRPC(t, b, true, `{"which":"`+b.RPC.Method+`"}`)
-	f.answerRPC(t, a, true, `{"which":"`+a.RPC.Method+`"}`)
-
-	seen := map[string]bool{}
-	for range 2 {
-		o := <-results
-		if o.err != nil {
-			t.Fatalf("sessionRPC: %v", o.err)
-		}
-		seen[o.got.Which] = true
-	}
-	if !seen["first"] || !seen["second"] {
-		t.Fatalf("answers landed as %v, want each call to receive its own", seen)
-	}
-	if n := srpcPending(t, s, "vm1"); n != 0 {
-		t.Fatalf("%d pending entries after both answers, want 0", n)
-	}
-}
-
-// TestSessionRPCUnreachable covers the three ways a request never reaches a
-// sandbox at all. All three are ErrRunnerUnreachable, exactly as a runner
-// dispatch is: from the caller's side "nobody answered" is one fact.
-func TestSessionRPCUnreachable(t *testing.T) {
-	s, st, ts := newTestControld(t)
-	joinRunner(t, s, ts, runnerScript{Name: "vm1"})
-
-	t.Run("session is placed nowhere", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_unplaced", State: StateQueued})
-		err := s.sessionRPC(context.Background(), "sess_unplaced", "diff", nil, nil)
-		if !errors.Is(err, ErrRunnerUnreachable) {
-			t.Fatalf("err = %v, want ErrRunnerUnreachable", err)
-		}
-	})
-	t.Run("runner is not connected here", func(t *testing.T) {
-		sandboxSession(t, st, "sess_elsewhere", "vm-elsewhere")
-		err := s.sessionRPC(context.Background(), "sess_elsewhere", "diff", nil, nil)
-		if !errors.Is(err, ErrRunnerUnreachable) {
-			t.Fatalf("err = %v, want ErrRunnerUnreachable", err)
-		}
-	})
-	t.Run("no such session", func(t *testing.T) {
-		err := s.sessionRPC(context.Background(), "sess_nope", "diff", nil, nil)
-		if !errors.Is(err, ErrNotFound) {
-			t.Fatalf("err = %v, want ErrNotFound", err)
-		}
-	})
-}
 
 // ---------------------------------------------------------------------------
 // sandbox-initiated: session_req
@@ -362,12 +178,32 @@ func TestOrphanSessionRPCResponseIsDropped(t *testing.T) {
 	// A malformed session_req (no envelope at all) is dropped the same way.
 	f.write(t, runner.FromRunner{Type: "session_req", Session: id})
 
-	errc := make(chan error, 1)
-	go func() { errc <- s.sessionRPC(context.Background(), id, "ping", nil, nil) }()
+	type answer struct {
+		Pong string `json:"pong"`
+	}
+	errc := make(chan runner.FromRunner, 1)
+	go func() {
+		res, err := runnerTransport{srv: s}.Dispatch(context.Background(), installPool, "vm1",
+			runner.ToRunner{Type: "session_rpc", Session: id,
+				RPC: &runner.RPCEnvelope{ID: 7, Method: "ping"}})
+		if err != nil {
+			t.Errorf("dispatch after an orphan response: %v", err)
+		}
+		errc <- res
+	}()
 	cmd := nextSessionRPC(t, f)
-	f.answerRPC(t, cmd, true, "")
-	if err := <-errc; err != nil {
-		t.Fatalf("sessionRPC after an orphan response: %v", err)
+	f.answerRPC(t, cmd, true, `{"pong":"yes"}`)
+
+	res := <-errc
+	if res.Type != "session_req" || res.RPC == nil || res.RPC.ID != 7 || !res.RPC.OK {
+		t.Fatalf("answer = %+v, want the ok resp for envelope 7", res)
+	}
+	var got answer
+	if err := json.Unmarshal(res.RPC.Payload, &got); err != nil || got.Pong != "yes" {
+		t.Fatalf("payload = %s (%v), want the sandbox's own answer", res.RPC.Payload, err)
+	}
+	if n := srpcPending(t, s, "vm1"); n != 0 {
+		t.Fatalf("%d pending entries after the answer landed, want 0", n)
 	}
 }
 
