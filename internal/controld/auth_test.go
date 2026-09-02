@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/tokencanopy/rainier/control"
 )
 
 // ---------------------------------------------------------------------------
@@ -188,7 +190,7 @@ func TestGitHubAuthExchangeSuccess(t *testing.T) {
 func TestMeIDIsTheSessionOwnerID(t *testing.T) {
 	_, st, ts := newTestControld(t)
 	u, tok := loginUser(t, st, "alice", "member")
-	seedSession(t, st, Session{ID: "sess_owned", OwnerID: u.ID, State: StateRunning})
+	seedSession(t, st, control.Session{ID: "sess_owned", CreatorID: control.ActorID(u.ID), State: control.StateRunning})
 
 	raw := readBody(t, getWithBearer(t, ts, "/v0/me", tok))
 	var me meResponse

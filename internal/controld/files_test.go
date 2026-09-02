@@ -18,6 +18,7 @@ import (
 
 	"github.com/coder/websocket/wsjson"
 
+	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/protocol/runner"
 	"github.com/tokencanopy/rainier/protocol/workspace"
 )
@@ -137,9 +138,9 @@ func (s *fileStore) serve(method string, payload json.RawMessage) (any, error) {
 }
 
 // transferSession seeds a running session on runner, owned by userID.
-func transferSession(t *testing.T, st Store, id, runner, userID string) {
+func transferSession(t *testing.T, st MemStore, id, runner, userID string) {
 	t.Helper()
-	seedSession(t, st, Session{ID: id, State: StateRunning, Runner: runner, OwnerID: userID})
+	seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateRunning, RunnerID: control.RunnerID(runner), CreatorID: control.ActorID(userID)})
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +292,7 @@ func TestSessionDiff(t *testing.T) {
 		}
 		assertErrCode(t, resp, "not_found")
 
-		seedSession(t, st, Session{ID: "sess_diff_queued", State: StateQueued, OwnerID: u.ID})
+		seedSession(t, st, control.Session{ID: "sess_diff_queued", State: control.StateQueued, CreatorID: control.ActorID(u.ID)})
 		resp = doJSON(t, ts, http.MethodGet, "/v0/sessions/sess_diff_queued/diff", tok, nil, nil)
 		if resp.StatusCode != http.StatusServiceUnavailable {
 			t.Fatalf("queued session status = %d, want 503", resp.StatusCode)
@@ -440,7 +441,7 @@ func TestPushFiles(t *testing.T) {
 			t.Fatal("an admin was refused a push; admins reach every session")
 		}
 
-		seedSession(t, st, Session{ID: "sess_push_queued", State: StateQueued, OwnerID: u.ID})
+		seedSession(t, st, control.Session{ID: "sess_push_queued", State: control.StateQueued, CreatorID: control.ActorID(u.ID)})
 		resp = doJSON(t, ts, http.MethodPost, "/v0/sessions/sess_push_queued/files", tok, body, nil)
 		if resp.StatusCode != http.StatusServiceUnavailable {
 			t.Fatalf("queued session status = %d, want 503", resp.StatusCode)
@@ -607,7 +608,7 @@ func TestPullFiles(t *testing.T) {
 		}
 		assertErrCode(t, resp, "forbidden")
 
-		seedSession(t, st, Session{ID: "sess_pull_queued", State: StateQueued, OwnerID: u.ID})
+		seedSession(t, st, control.Session{ID: "sess_pull_queued", State: control.StateQueued, CreatorID: control.ActorID(u.ID)})
 		resp = doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_pull_queued/files?path=d", tok, nil, nil)
 		if resp.StatusCode != http.StatusServiceUnavailable {
 			t.Fatalf("queued session status = %d, want 503", resp.StatusCode)
