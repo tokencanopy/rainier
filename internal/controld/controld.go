@@ -120,12 +120,6 @@ type Server struct {
 	// attach with ErrUnavailable.
 	transport control.RunnerTransport
 	broker    control.AttachmentBroker
-
-	// schedWake carries capacity news to the scheduler loop (Task 8). It is
-	// buffered by one and written non-blockingly: the loop only needs to
-	// know that *something* changed, so a pending wake absorbs any number
-	// of further ones.
-	schedWake chan struct{}
 }
 
 // New validates cfg, applies defaults, and returns a Server over st.
@@ -169,7 +163,6 @@ func New(st Store, cfg Config) (*Server, error) {
 		runnerLocks: map[string]*sync.Mutex{},
 		attaches:    newAttachTable(),
 		xferMax:     workspace.MaxBytes,
-		schedWake:   make(chan struct{}, 1),
 		gens:        &runnerGenerations{},
 		broker:      notYetBroker{},
 	}
@@ -205,6 +198,10 @@ func (s *Server) compose() error {
 		Transport: s.transport, Events: events, Clock: clock, IDs: ids,
 		SafetyInterval: fleetSafetyInterval,
 		LaunchMaterial: launchMaterial{st: s.st, key: s.cfg.SecretsKey},
+		// The self-hosted bounds for a hook whose environment declares none,
+		// exactly as the old scheduler applied them (api.go).
+		DefaultSetupTimeoutSec: defaultSetupTimeoutSec,
+		DefaultInitTimeoutSec:  defaultInitTimeoutSec,
 	})
 	if err != nil {
 		return fmt.Errorf("controld: composing the fleet service: %w", err)
@@ -300,19 +297,16 @@ func (s *Server) Handler() http.Handler {
 	return withMiddleware(mux)
 }
 
-// Run hosts controld's background loops and blocks until ctx is done.
-// schedulerLoop already returns on ctx.Done(), so Run needs nothing further
-// of its own to block on.
+// Run hosts controld's background loops and blocks until ctx is done. The
+// scheduler is the fleet service's own loop, which returns ctx.Err() when the
+// context ends — a shutdown, not a failure, so it is deliberately discarded.
 func (s *Server) Run(ctx context.Context) {
-	s.schedulerLoop(ctx)
+	_ = s.fleet.Run(ctx)
 }
 
-// wakeScheduler tells the scheduler loop that capacity or the queue may have
-// changed. It never blocks: a wake already pending means the loop hasn't run
-// yet and will see this change too.
+// wakeScheduler tells the fleet service that capacity or the queue may have
+// changed in the installation pool. It never blocks: the service coalesces
+// wakes and re-drains every known pool on its safety tick regardless.
 func (s *Server) wakeScheduler() {
-	select {
-	case s.schedWake <- struct{}{}:
-	default:
-	}
+	s.fleet.Wake(installPool)
 }

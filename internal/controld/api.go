@@ -546,8 +546,6 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 		})
 		return
 	}
-	// until Task 5 replaces the scheduler loop, the old loop still needs this wake
-	s.wakeScheduler()
 
 	w.Header().Set("Location", "/v0/sessions/"+string(created.ID))
 	writeJSON(w, http.StatusAccepted, sessionEnvelope{Session: s.renderer(ctx).view(created)})
@@ -784,8 +782,6 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request, u U
 		})
 		return
 	}
-	// until Task 5 replaces the scheduler loop, the old loop still needs this wake
-	s.wakeScheduler()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -814,8 +810,6 @@ func (s *Server) handleSuspendSession(w http.ResponseWriter, r *http.Request, u 
 		})
 		return
 	}
-	// until Task 5 replaces the scheduler loop, the old loop still needs this wake
-	s.wakeScheduler()
 	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(ctx).view(row)})
 }
 
@@ -840,8 +834,6 @@ func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request, u U
 		})
 		return
 	}
-	// until Task 5 replaces the scheduler loop, the old loop still needs this wake
-	s.wakeScheduler()
 	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(ctx).view(row)})
 }
 

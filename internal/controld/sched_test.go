@@ -1,11 +1,22 @@
 // internal/controld/sched_test.go
+//
+// sched.go is gone: placement, the FIFO drain, the create dispatch, and the
+// spec it builds are controlapp.FleetService's now. What survives here is the
+// half those tests could only ever prove from the outside — that controld's
+// adapters hand the service a fleet it can actually place on, over real
+// websockets, with the runner pins spelled as the capabilities Task 1 encodes
+// (placement:<name>, snapshot:<name>).
+//
+// Every test that called createSpec, dispatchCreate, pickRunner,
+// pickForSession, or drainQueue directly is either covered by a named
+// controlapp test or rewritten against the adapter that replaced it; the
+// task's report lists each by name.
 package controld
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +24,7 @@ import (
 
 	"github.com/coder/websocket/wsjson"
 
+	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
@@ -135,151 +147,27 @@ func startRun(t *testing.T, s *Server) {
 // tests
 // ---------------------------------------------------------------------------
 
-func TestPickRunner(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		rs   []runnerView
-		want string
-		ok   bool
-	}{
-		{
-			name: "max free wins",
-			rs:   []runnerView{{Name: "a", Free: 2}, {Name: "b", Free: 5}, {Name: "c", Free: 1}},
-			want: "b", ok: true,
-		},
-		{
-			name: "tie breaks to lexicographically smaller name",
-			rs:   []runnerView{{Name: "vm2", Free: 3}, {Name: "vm1", Free: 3}, {Name: "vm3", Free: 3}},
-			want: "vm1", ok: true,
-		},
-		{
-			name: "zero free everywhere",
-			rs:   []runnerView{{Name: "a", Free: 0}, {Name: "b", Free: 0}},
-			want: "", ok: false,
-		},
-		{
-			name: "empty slice",
-			rs:   nil,
-			want: "", ok: false,
-		},
-		{
-			name: "negative free (over-committed) never wins",
-			rs:   []runnerView{{Name: "a", Free: -1}, {Name: "b", Free: 0}},
-			want: "", ok: false,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, ok := pickRunner(tc.rs)
-			if got != tc.want || ok != tc.ok {
-				t.Fatalf("pickRunner(%+v) = (%q, %v), want (%q, %v)", tc.rs, got, ok, tc.want, tc.ok)
-			}
-		})
-	}
-}
-
-// TestPickForSession walks the two rules layered on top of pickRunner's
-// most-free choice: an environment's placement pin narrows the candidate set
-// to exactly one runner, and a session whose resolved image IS its
-// environment's cached snapshot prefers the runner holding that snapshot.
-func TestPickForSession(t *testing.T) {
-	const snapRef = "rainier-env:env_x-0123456789ab"
-	fleet := []runnerView{{Name: "vm1", Free: 3}, {Name: "vm2", Free: 1}, {Name: "vm3", Free: 0}}
-
-	for _, tc := range []struct {
-		name string
-		rs   []runnerView
-		row  Session
-		env  *Environment
-		want string
-		ok   bool
-	}{
-		{
-			name: "no environment is pickRunner's most-free choice",
-			rs:   fleet, row: Session{}, env: nil,
-			want: "vm1", ok: true,
-		},
-		{
-			name: "an environment with no pin and no cache is unchanged",
-			rs:   fleet, row: Session{EnvironmentID: "env_x"}, env: &Environment{ID: "env_x"},
-			want: "vm1", ok: true,
-		},
-		{
-			name: "a pin wins over more free capacity elsewhere",
-			rs:   fleet, row: Session{EnvironmentID: "env_x"}, env: &Environment{ID: "env_x", Placement: "vm2"},
-			want: "vm2", ok: true,
-		},
-		{
-			name: "a pin to a full runner places nothing",
-			rs:   fleet, row: Session{EnvironmentID: "env_x"}, env: &Environment{ID: "env_x", Placement: "vm3"},
-			want: "", ok: false,
-		},
-		{
-			name: "a pin to a runner that is not connected places nothing",
-			rs:   fleet, row: Session{EnvironmentID: "env_x"}, env: &Environment{ID: "env_x", Placement: "vm9"},
-			want: "", ok: false,
-		},
-		{
-			// The whole point of the tiebreak: the snapshot exists only in
-			// vm2's local image store, so vm2 is worth more than vm1's extra
-			// headroom.
-			name: "the snapshot holder wins over a runner with more free capacity",
-			rs:   fleet,
-			row:  Session{EnvironmentID: "env_x", ResolvedImage: snapRef},
-			env:  &Environment{ID: "env_x", SnapshotRef: snapRef, SnapshotRunner: "vm2"},
-			want: "vm2", ok: true,
-		},
-		{
-			name: "the snapshot holder wins a tie it would lose lexicographically",
-			rs:   []runnerView{{Name: "vm1", Free: 2}, {Name: "vm2", Free: 2}},
-			row:  Session{EnvironmentID: "env_x", ResolvedImage: snapRef},
-			env:  &Environment{ID: "env_x", SnapshotRef: snapRef, SnapshotRunner: "vm2"},
-			want: "vm2", ok: true,
-		},
-		{
-			name: "a full snapshot holder falls back to the normal pick",
-			rs:   fleet,
-			row:  Session{EnvironmentID: "env_x", ResolvedImage: snapRef},
-			env:  &Environment{ID: "env_x", SnapshotRef: snapRef, SnapshotRunner: "vm3"},
-			want: "vm1", ok: true,
-		},
-		{
-			name: "a disconnected snapshot holder falls back to the normal pick",
-			rs:   fleet,
-			row:  Session{EnvironmentID: "env_x", ResolvedImage: snapRef},
-			env:  &Environment{ID: "env_x", SnapshotRef: snapRef, SnapshotRunner: "vm9"},
-			want: "vm1", ok: true,
-		},
-		{
-			// The session resolved to the plain image (the cache was stale, or
-			// the holder was full at create): it has no affinity at all.
-			name: "a session not running the snapshot ignores the holder",
-			rs:   fleet,
-			row:  Session{EnvironmentID: "env_x", ResolvedImage: "plain:1"},
-			env:  &Environment{ID: "env_x", SnapshotRef: snapRef, SnapshotRunner: "vm2"},
-			want: "vm1", ok: true,
-		},
-		{
-			name: "the pin outranks the snapshot holder",
-			rs:   fleet,
-			row:  Session{EnvironmentID: "env_x", ResolvedImage: snapRef},
-			env:  &Environment{ID: "env_x", Placement: "vm1", SnapshotRef: snapRef, SnapshotRunner: "vm2"},
-			want: "vm1", ok: true,
-		},
-		{
-			name: "nothing free anywhere places nothing",
-			rs:   []runnerView{{Name: "vm1", Free: 0}},
-			row:  Session{}, env: nil,
-			want: "", ok: false,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, ok := pickForSession(tc.rs, tc.row, tc.env)
-			if got != tc.want || ok != tc.ok {
-				t.Fatalf("pickForSession = (%q, %v), want (%q, %v)", got, ok, tc.want, tc.ok)
-			}
-		})
-	}
-}
+// TestPickRunner and TestPickForSession are deleted, not replaced: the
+// functions they exercised are controlapp's now, and its own tests cover the
+// same table.
+//
+//   - TestPickRunner (max free wins / lexicographic tie / zero free / empty /
+//     negative free) -> controlapp TestPickRunnerCapacityAndTiebreak.
+//   - TestPickForSession's pin rows (a pin wins over more capacity, a pin to a
+//     full or absent runner places nothing, the pin outranks the snapshot
+//     holder) -> controlapp TestSchedulerCapabilityFiltering, which is the same
+//     rule spelled as a capability requirement, plus the two integration tests
+//     below that drive it through a real fleet.
+//   - TestPickForSession's snapshot rows (the holder wins over more capacity,
+//     and wins a lexicographic tie) -> the same capability filter, driven end
+//     to end by TestCacheTiebreakPrefersTheSnapshotHolder below.
+//   - TestPickForSession's two FALLBACK rows ("a full snapshot holder falls
+//     back to the normal pick", "a disconnected snapshot holder falls back to
+//     the normal pick") are DELETED under deviation D3: a snapshot is a local
+//     image, not a registry entry, so the affinity became a pin. Their
+//     replacement is the D3 half of TestCacheTiebreakPrefersTheSnapshotHolder
+//     and the two restored api_test.go cases, which assert the session stays
+//     queued instead.
 
 // TestPlacementPinPlacesOnThePinnedRunner drives the pin through the real
 // scheduler: vm1 has strictly more free capacity, so the session landing on
@@ -508,91 +396,12 @@ func TestCreateDispatchFailureRequeues(t *testing.T) {
 		}
 	})
 
-	// These two call dispatchCreate directly rather than driving it through
-	// Run/schedulerLoop: a requeue also fires wakeScheduler, and since vm1
-	// is the only (still-connected, still-not-answering) runner, the full
-	// loop would immediately re-place and re-dispatch the same row —
-	// correct behavior, but it means the row only sits `queued` for a
-	// flicker between one OpTimeout and the next re-dispatch, which races
-	// any poll trying to observe it. Calling dispatchCreate once, in
-	// isolation, pins the outcome itself without that race.
-	t.Run("connection death requeues with runner cleared", func(t *testing.T) {
-		s, st, ts := newTestControld(t)
-		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 2,
-			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
-		waitConnected(t, s, "vm1")
-		awaitReconciled(t, f) // reconcile must finish before we seed, or it can requeue our row itself
-
-		id := "sess_conn_death"
-		row := seedSession(t, st, Session{ID: id, State: StateCreating, Runner: "vm1", Name: id, Image: "img:latest"})
-
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			s.dispatchCreate(context.Background(), row, "vm1", nil)
-		}()
-
-		cmd := f.nextCmd(t)
-		if cmd.Type != "create" || cmd.Session != id {
-			t.Fatalf("got %+v, want create of %s", cmd, id)
-		}
-		// The runner drops off mid-create: nothing on the other end can
-		// finish it, and nothing will re-announce it either, so this row must
-		// go back on the queue for another runner.
-		f.close()
-
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			t.Fatal("dispatchCreate did not return after the connection died")
-		}
-		got := getSession(t, st, id)
-		if got.State != StateQueued || got.Runner != "" {
-			t.Fatalf("session = %+v, want queued with runner cleared", got)
-		}
-	})
-
-	// The Important finding this wave closes: a create that times out on a
-	// LIVE connection was delivered (a cold image pull routinely outlasts
-	// OpTimeout), so requeuing it would place a second copy elsewhere. The
-	// row must stay `creating` and be settled by the runner's own news.
-	t.Run("timeout on a live connection leaves the row creating", func(t *testing.T) {
-		s, st, ts := newTestControld(t, func(c *Config) { c.OpTimeout = 150 * time.Millisecond })
-		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 2,
-			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
-		waitConnected(t, s, "vm1")
-		awaitReconciled(t, f)
-
-		id := "sess_timeout"
-		row := seedSession(t, st, Session{ID: id, State: StateCreating, Runner: "vm1", Name: id, Image: "img:latest"})
-
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			s.dispatchCreate(context.Background(), row, "vm1", nil)
-		}()
-
-		cmd := f.nextCmd(t)
-		if cmd.Type != "create" || cmd.Session != id {
-			t.Fatalf("got %+v, want create of %s", cmd, id)
-		}
-		// Never answer the dispatch: it must time out with the conn still up.
-
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			t.Fatal("dispatchCreate did not return after OpTimeout elapsed")
-		}
-		got := getSession(t, st, id)
-		if got.State != StateCreating || got.Runner != "vm1" {
-			t.Fatalf("session = %+v, want still creating on vm1 (the create was delivered)", got)
-		}
-
-		// ...and the slow create eventually lands: the runner's own "running"
-		// event settles the row without controld ever having requeued it.
-		f.event(t, id, "running")
-		wantState(t, st, id, StateRunning)
-	})
+	// The two subtests that called dispatchCreate directly are deleted with
+	// it: controlapp owns the uncertain-delivery rule now and pins both halves
+	// in TestDispatchCreateFailureAndUncertainDelivery — "connection death
+	// requeues with runner cleared" and "timeout on a live connection leaves
+	// the row creating", under those exact names, driving its own
+	// dispatchCreate the same way these did.
 }
 
 // pinFailStore fails every SetSessionSetupHash, so a create whose setup
@@ -608,18 +417,25 @@ func (p *pinFailStore) SetSessionSetupHash(ctx context.Context, id, hash string)
 
 // TestSetupPinIsWrittenBeforeTheCreate pins both halves of the provenance
 // write: a create carrying a setup script records the hash of exactly that
-// script BEFORE the command goes out, and a create that cannot record it
-// fails the session instead of running an unattributable setup.
+// script BEFORE the command goes out, and a create that cannot record it fails
+// the session instead of running an unattributable setup.
+//
+// The three cases used to call dispatchCreate directly. They now go through
+// the real scheduler (Run -> the fleet service's drain -> its dispatch -> this
+// adapter's transport and store), because that is what the deletion left worth
+// asserting here: the pin is written by controlapp, but the hash it writes has
+// to be the one THIS store's SetupHash produces, or a cached snapshot is never
+// reused. Nothing else in either package pins that equality end to end.
 func TestSetupPinIsWrittenBeforeTheCreate(t *testing.T) {
 	t.Run("recorded before the command is sent", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 
 		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "make deps"})
-		row := seedSession(t, st, Session{ID: "sess_pin", State: StateCreating, Runner: "vm1",
-			Name: "pin", EnvironmentID: env.ID, ResolvedImage: env.Image})
+		seedSession(t, st, Session{ID: "sess_pin", State: StateQueued, Name: "pin",
+			EnvironmentID: env.ID, ResolvedImage: env.Image, CreatedAt: time.Now().Add(-time.Hour)})
 
-		go s.dispatchCreate(context.Background(), row, "vm1", &env)
+		startRun(t, s)
 
 		cmd := nextCreate(t, f)
 		// The command is out, so the pin — written first — is already there.
@@ -627,16 +443,18 @@ func TestSetupPinIsWrittenBeforeTheCreate(t *testing.T) {
 		if want := SetupHash(env.Image, env.Setup); got.SetupHash != want {
 			t.Fatalf("setup hash = %q, want %q recorded before the create went out", got.SetupHash, want)
 		}
+		if cmd.Spec == nil || cmd.Spec.Setup != env.Setup {
+			t.Fatalf("dispatched spec = %+v, want the environment's setup", cmd.Spec)
+		}
 		f.reply(t, cmd, true, "")
 	})
 
 	t.Run("a scratch create pins nothing", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-		row := seedSession(t, st, Session{ID: "sess_nopin", State: StateCreating, Runner: "vm1",
-			Name: "nopin", Image: "img:latest"})
+		seedQueued(t, st, "sess_nopin", 0)
 
-		go s.dispatchCreate(context.Background(), row, "vm1", nil)
+		startRun(t, s)
 
 		cmd := nextCreate(t, f)
 		f.reply(t, cmd, true, "")
@@ -651,10 +469,10 @@ func TestSetupPinIsWrittenBeforeTheCreate(t *testing.T) {
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 
 		env := seedEnv(t, store, Environment{Name: "dev", Image: "img:1", Setup: "make deps"})
-		row := seedSession(t, store, Session{ID: "sess_pinfail", State: StateCreating, Runner: "vm1",
-			Name: "pinfail", EnvironmentID: env.ID, ResolvedImage: env.Image})
+		seedSession(t, store, Session{ID: "sess_pinfail", State: StateQueued, Name: "pinfail",
+			EnvironmentID: env.ID, ResolvedImage: env.Image, CreatedAt: time.Now().Add(-time.Hour)})
 
-		s.dispatchCreate(context.Background(), row, "vm1", &env)
+		startRun(t, s)
 
 		got := wantState(t, store, "sess_pinfail", StateFailed)
 		if got.Error != "could not record the setup this session runs" {
@@ -664,108 +482,49 @@ func TestSetupPinIsWrittenBeforeTheCreate(t *testing.T) {
 	})
 }
 
-// TestDrainQueueStopsWhenNoRunnerHasCapacity pins the "leave the rest
-// queued" half of drainQueue directly, without needing a live dispatch: no
-// connected runner at all means nothing is even attempted.
-func TestDrainQueueStopsWhenNoRunnerHasCapacity(t *testing.T) {
+// TestDrainQueueStopsWhenNoRunnerHasCapacity is deleted: drainQueue is
+// controlapp's drainPool now, and controlapp/scheduler_test.go carries the
+// same test under the same name over the service's own fixture.
+
+// ---------------------------------------------------------------------------
+// createSpec is gone; launchMaterial (adapt_launch.go) is what resolves the
+// same material at dispatch. Three of TestCreateSpecExpandsRepos's four cases
+// are already covered by name:
+//
+//   - "a connector added after the create still gets the git egress" ->
+//     TestLaunchMaterialResolvesReposAttributionAndSecrets (the resolver
+//     answers gitEgressHosts) plus controlapp TestDispatchCreateUnionsMaterialEgress
+//     (the union onto the session's own allowlist, deviation D6).
+//   - "the session's stored override wins over the environment" and "an
+//     explicit empty override clones nothing even under a connector" ->
+//     TestLaunchMaterialSessionReposOverrideConnectors, which pins both halves
+//     of the nil-vs-empty rule.
+//
+// The fourth has no counterpart, so it is rewritten against the adapter here.
+// ---------------------------------------------------------------------------
+
+// TestLaunchMaterialMissingOwnerFailsTheCreate is the old
+// TestCreateSpecExpandsRepos/"an owner whose row is gone fails the create
+// rather than cloning anonymously", rewritten against launchMaterial.
+// Attribution is not decoration: a commit chain with no author is a mess to
+// untangle after the fact, and the create is cheap to redo. The failure may
+// not name the owner it could not read.
+func TestLaunchMaterialMissingOwnerFailsTheCreate(t *testing.T) {
 	st := NewMemStore()
-	s, err := New(st, Config{RunnerToken: "t", ExternalURL: "http://x:9090", SecretsKey: testSecretsKey})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	env := launchTestEnv(nil, githubConnectorRaw(t, "acme/app", "main"))
+	row := control.Session{
+		ID: "sess_example", WorkspaceID: installWorkspace, CreatorID: "usr_gone",
+		Name: "work", EnvironmentID: "env_example",
 	}
 
-	seedQueued(t, st, "sess_stuck", 0)
-	s.drainQueue(context.Background())
-
-	got := getSession(t, st, "sess_stuck")
-	if got.State != StateQueued {
-		t.Fatalf("state = %q, want still queued (no connected runner)", got.State)
+	m, err := (launchMaterial{st: st, key: testSecretsKey}).ResolveLaunchMaterial(context.Background(), row, &env)
+	if err == nil {
+		t.Fatalf("ResolveLaunchMaterial = %+v, want a failure", m)
 	}
-}
-
-// ---------------------------------------------------------------------------
-// createSpec's repo expansion, asserted directly: the branch and directory
-// rules are pure functions of a row and its environment, and the paths below
-// (an environment edited under a queued session, an owner whose row cannot be
-// read) are hard to stage over HTTP and trivial to state here.
-// ---------------------------------------------------------------------------
-
-func TestCreateSpecExpandsRepos(t *testing.T) {
-	ctx := context.Background()
-
-	t.Run("a connector added after the create still gets the git egress", func(t *testing.T) {
-		// The row's allowlist was written at create, when the environment had
-		// no repos to reach GitHub for. Editing the environment while the
-		// session sat in the queue moves the dispatch (design §4.6), so the
-		// hosts that dispatch now needs are appended here too — a clone the
-		// control plane just ordered must not be one the proxy refuses.
-		s, st := newVaultServer(t)
-		u := seedVaultUser(t, st, 42, "alice")
-		row := Session{ID: "sess_00000000000000000000000000abcdef", OwnerID: u.ID, Name: "late",
-			Image: "img:1", EgressAllow: []string{"pypi.org"}}
-		env := &Environment{ID: "env_1", Image: "img:1",
-			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}}
-
-		spec, fail := s.createSpec(ctx, row, env)
-		if fail != "" {
-			t.Fatalf("createSpec failed: %s", fail)
-		}
-		want := []string{"pypi.org", "github.com", "codeload.github.com", "objects.githubusercontent.com"}
-		if !slices.Equal(spec.EgressAllow, want) {
-			t.Fatalf("spec.EgressAllow = %v, want %v", spec.EgressAllow, want)
-		}
-	})
-
-	t.Run("the session's stored override wins over the environment", func(t *testing.T) {
-		s, st := newVaultServer(t)
-		u := seedVaultUser(t, st, 42, "alice")
-		row := Session{ID: "sess_00000000000000000000000000abcdef", OwnerID: u.ID, Name: "work",
-			Repos: []RepoRef{{Repo: "other/svc", BaseBranch: "develop"}}}
-		env := &Environment{ID: "env_1",
-			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}}
-
-		spec, fail := s.createSpec(ctx, row, env)
-		if fail != "" {
-			t.Fatalf("createSpec failed: %s", fail)
-		}
-		want := []runner.RepoSpec{
-			{Owner: "other", Name: "svc", BaseBranch: "develop", SessionBranch: "rainier/work", Dir: "svc"},
-		}
-		if !slices.Equal(spec.Repos, want) {
-			t.Fatalf("spec.Repos = %+v, want %+v", spec.Repos, want)
-		}
-	})
-
-	t.Run("an explicit empty override clones nothing even under a connector", func(t *testing.T) {
-		s, st := newVaultServer(t)
-		u := seedVaultUser(t, st, 42, "alice")
-		row := Session{ID: "sess_00000000000000000000000000abcdef", OwnerID: u.ID, Name: "work",
-			Repos: []RepoRef{}}
-		env := &Environment{ID: "env_1",
-			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}}
-
-		spec, fail := s.createSpec(ctx, row, env)
-		if fail != "" {
-			t.Fatalf("createSpec failed: %s", fail)
-		}
-		if spec.Repos != nil || spec.GitAuthorName != "" {
-			t.Fatalf("spec = %+v, want no repos and no attribution", spec)
-		}
-	})
-
-	t.Run("an owner whose row is gone fails the create rather than cloning anonymously", func(t *testing.T) {
-		// Attribution is not decoration: a commit chain with no author is a
-		// mess to untangle after the fact, and the create is cheap to redo.
-		s, _ := newVaultServer(t)
-		row := Session{ID: "sess_00000000000000000000000000abcdef", OwnerID: "usr_gone", Name: "work",
-			Repos: []RepoRef{{Repo: "acme/app"}}}
-
-		spec, fail := s.createSpec(ctx, row, nil)
-		if fail == "" {
-			t.Fatalf("createSpec = %+v, want a failure reason", spec)
-		}
-		if strings.Contains(fail, "usr_gone") {
-			t.Fatalf("failure reason %q leaks internal identifiers", fail)
-		}
-	})
+	if strings.Contains(err.Error(), "usr_gone") {
+		t.Fatalf("failure reason %q leaks internal identifiers", err)
+	}
+	if m.GitAuthorName != "" || m.Repos != nil {
+		t.Fatalf("a failed resolve must return no material, got %+v", m)
+	}
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
+	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
@@ -72,12 +73,6 @@ const (
 	// storeCleanupTimeout bounds the store writes done while tearing a
 	// connection down, which must not inherit the dead request's context.
 	storeCleanupTimeout = 5 * time.Second
-	// lostAtAnnounce is the error recorded on a session the store believed
-	// was alive on a runner that just announced without it.
-	lostAtAnnounce = "lost at announce"
-	// deadByRunner is the error recorded when a runner reports a session
-	// dead.
-	deadByRunner = "runner reported dead"
 	// setupStage is the boot stage Plan 4's `setup_failed` event names, and
 	// the stage a `stage_failed` that names none is read as. A session's boot
 	// is a chain — setup, then clone, then init (cmd/sessiond/gitchain.go) —
@@ -94,18 +89,6 @@ const (
 	snapshotRefHashLen = 12
 )
 
-// liveOnRunner is the set of states in which a session is placed on a runner
-// and expected to exist there: the from-list for adopting an announced
-// state, and the filter for "what should this runner be holding".
-var liveOnRunner = []SessionState{StateCreating, StateRunning, StateSuspendedWarm, StateSuspendedCold}
-
-// setupFailedFrom is the from-list of a setup failure. The wrapper only execs
-// the agent on rc 0, so in practice the row is still `creating` when a setup
-// failure lands — but the registration `running` event can outrun the rc
-// write, so both states must be accepted or a failure would silently not
-// apply to exactly the sessions that got furthest.
-var setupFailedFrom = []SessionState{StateCreating, StateRunning}
-
 // runnerConn is one runnerd control connection. Exactly one goroutine reads
 // it (the HTTP handler) and exactly one writes it (the writer goroutine
 // draining out), so the websocket itself needs no lock; mu guards only the
@@ -114,6 +97,12 @@ type runnerConn struct {
 	name string
 	ws   *websocket.Conn
 	out  chan runner.ToRunner
+	// gen is the runner generation THIS connection registered under. Every
+	// event read off this socket is stamped with it rather than with the
+	// runner's current generation, so a message that outlives its own
+	// connection is fenced by the fleet service (ErrStale) instead of being
+	// applied under the generation of the socket that replaced it.
+	gen uint64
 
 	mu      sync.Mutex
 	pending map[uint64]chan runner.FromRunner
@@ -237,7 +226,11 @@ func (s *Server) handleRunnerConnect(w http.ResponseWriter, r *http.Request) {
 	name := ann.Runner
 
 	rc := newRunnerConn(name, c)
-	connErr := s.connectRunner(connCtx, rc, ann.Used, ann.Total)
+	// The generation is minted before anything is registered, so it is the
+	// one this connection acts under for its whole life: registration,
+	// reconciliation, and every event read off the socket.
+	rc.gen = s.gens.next(name)
+	connErr := s.connectRunner(connCtx, rc, ann)
 
 	var writerDone sync.WaitGroup
 	defer func() {
@@ -245,10 +238,11 @@ func (s *Server) handleRunnerConnect(w http.ResponseWriter, r *http.Request) {
 		writerDone.Wait()
 	}()
 	if connErr != nil {
-		// connectRunner registers before it writes, so rc is in the map even
-		// now; the deferred retire above is what takes it back out.
-		log.Printf("controld: upsert runner %s: %v", name, connErr)
-		closeRunner(c, websocket.StatusInternalError, "store unavailable")
+		// connectRunner registers before it calls the service, so rc is in
+		// the map even now; the deferred retire above is what takes it back
+		// out.
+		log.Printf("controld: registering runner %s (generation %d): %v", name, rc.gen, connErr)
+		closeRunner(c, websocket.StatusInternalError, "registration refused")
 		return
 	}
 
@@ -260,12 +254,49 @@ func (s *Server) handleRunnerConnect(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("controld: runner %s connected (used %d/%d, %d announced sessions)",
 		name, ann.Used, ann.Total, len(ann.Sessions))
-	s.reconcile(connCtx, name, ann.Sessions)
-	// One wake covers everything reconcile can free (a dead session, an
+
+	// Reconciliation is the fleet service's: the announce is authoritative
+	// for liveness, the store for desired state, and the service settles the
+	// two and hands back the ids this runner must tear down. The writer is
+	// already running, because tearing an orphan down means dispatching to
+	// this very connection.
+	res, err := s.fleet.ReconcileRunner(connCtx, control.RunnerSnapshot{
+		WorkspaceID: installWorkspace, PoolID: installPool,
+		RunnerID:      control.RunnerID(name),
+		Generation:    rc.gen,
+		CapacityUsed:  ann.Used,
+		CapacityTotal: ann.Total,
+		Sessions:      announcedSessions(ann.Sessions),
+	})
+	if err != nil {
+		log.Printf("controld: reconciling runner %s (generation %d): %v", name, rc.gen, err)
+		closeRunner(c, websocket.StatusInternalError, "reconcile failed")
+		return
+	}
+	for _, id := range res.Destroy {
+		s.destroyOrphan(connCtx, name, string(id))
+	}
+	// One wake covers everything reconciliation can free (a dead session, an
 	// adopted cold suspend) plus the capacity the announce itself reports.
-	s.wakeScheduler()
+	s.fleet.Wake(installPool)
 
 	s.readLoop(connCtx, rc)
+}
+
+// announcedSessions re-spells a runner's announced session list in the
+// control vocabulary the fleet service reconciles against.
+func announcedSessions(in []runner.SessionInfo) []control.RunnerSession {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]control.RunnerSession, 0, len(in))
+	for _, a := range in {
+		out = append(out, control.RunnerSession{
+			SessionID: control.SessionID(a.ID),
+			State:     control.SessionState(a.State),
+		})
+	}
+	return out
 }
 
 // readAnnounce reads and validates the connection's first message, which
@@ -323,7 +354,7 @@ func (s *Server) readLoop(ctx context.Context, rc *runnerConn) {
 				log.Printf("controld: runner %s: result for unknown req_id %d (timed out?)", rc.name, m.ReqID)
 			}
 		case "event":
-			s.applyEvent(ctx, rc.name, m)
+			s.applyRunnerEvent(ctx, rc, m)
 		case "session_req":
 			// One message type, both halves of the session RPC's upward
 			// direction: a sandbox's own request, and the answer to one this
@@ -362,72 +393,50 @@ func (s *Server) touchRunner(ctx context.Context, rc *runnerConn, m runner.FromR
 	return true
 }
 
-// applyEvent applies a runner's unsolicited state report. Events race
-// reconciliation by nature — the announce is truth, an event is news — so a
-// guarded transition that doesn't apply is expected, not an error.
+// applyRunnerEvent hands a runner's unsolicited state report to the fleet
+// service, which owns every session transition an event can cause. This
+// function's whole job is translation: runnerd's event vocabulary into the
+// control one, and the runner's free text into the composed sentence a
+// session's error column carries.
 //
-// A runner may only report on sessions the store places on it, or on ones it
-// places nowhere yet (a "running" event can outrun the create's own
-// queued→creating transition; every other arm tightens that to an exact match
-// — see placedExactlyOn). Without that guard the fleet-wide runner token would
-// let any runner drive any session to a terminal state, and the stale holder
-// of a duplicate — the case reconcileUnplaced destroys — could mark a session
-// dead that has since been re-placed and is running fine somewhere else, or
-// (since Plan 5) flip the credential of a user whose work it does not hold.
-func (s *Server) applyEvent(ctx context.Context, runner string, m runner.FromRunner) {
+// Two arms never reach the service because they are not about the session at
+// all — a finished setup is news about the ENVIRONMENT and a rejected
+// credential is news about its OWNER — so they stay here, in the adapter that
+// owns the vault and the snapshot cache (see applyAdapterArm).
+//
+// The event is stamped with rc.gen, the generation of the connection it
+// arrived on, never the runner's current one: a message that outlived its own
+// socket must be fenced by the service (ErrStale), not applied under the
+// generation of the connection that replaced it. touchRunner already drops
+// such a message on the way in; this is the second lock on the same door.
+func (s *Server) applyRunnerEvent(ctx context.Context, rc *runnerConn, m runner.FromRunner) {
+	name := rc.name
 	if m.Session == "" {
-		log.Printf("controld: runner %s: event with no session", runner)
+		log.Printf("controld: runner %s: event with no session", name)
 		return
 	}
-	row, err := s.st.GetSession(ctx, m.Session)
-	switch {
-	case errors.Is(err, ErrNotFound):
-		log.Printf("controld: runner %s: event for unknown session %s; ignoring", runner, clip(m.Session))
-		return
-	case err != nil:
-		log.Printf("controld: runner %s: event for %s: %v", runner, clip(m.Session), err)
-		return
-	case row.Runner != "" && row.Runner != runner:
-		log.Printf("controld: runner %s reported %s for %s, which the store places on %s; ignoring",
-			runner, clip(m.State), row.ID, row.Runner)
-		return
+	ev := control.RunnerEvent{
+		WorkspaceID: installWorkspace,
+		PoolID:      installPool,
+		RunnerID:    control.RunnerID(name),
+		Generation:  rc.gen,
+		SessionID:   control.SessionID(m.Session),
 	}
-
 	switch m.State {
 	case "running":
-		s.transitionQuiet(ctx, m.Session, liveOnRunner, StateRunning, TransitionOpts{})
-		// A session reaching running frees no slot, but it does change
-		// freeCapacity's math: the row leaves the `creating` count while the
-		// runner's reported Used already includes its container, so the
-		// double-count that was hiding one slot of headroom clears here.
-		// Without this wake that headroom stays invisible until the 10s
-		// safety tick — the burst e2e measured 20s of a queue sitting on
-		// capacity that already existed.
-		s.wakeScheduler()
+		ev.State = control.StateRunning
 	case "dead":
-		if !placedExactlyOn(row, runner, m.State) {
-			return
-		}
-		reason := deadByRunner
-		s.transitionQuiet(ctx, m.Session, NonTerminal, StateDead, TransitionOpts{Error: &reason})
-		s.wakeScheduler() // a dead session frees its slot
+		ev.State = control.StateDead
 	case "setup_failed":
-		if !placedExactlyOn(row, runner, m.State) {
-			return
-		}
 		// Plan 4's name for what is now one stage among three, and one that
 		// stays accepted forever: sessiond ships INSIDE the session image
 		// while runnerd runs on the host, so a session whose image predates
-		// the boot chain still reports its setup failure under this name (and
-		// today's sessiond still SENDS it for the setup stage, so that a Plan
-		// 4 runnerd in the other direction keeps working too). m.Detail is
-		// already the composed "rc N: <tail>" with no stage in front, so it
-		// goes straight to the stage arm as the stage it always meant.
-		s.failStage(ctx, m.Session, setupStage, m.Detail)
+		// the boot chain still reports its setup failure under this name.
+		// m.Detail is already the composed "rc N: <tail>" with no stage in
+		// front, so it goes to the stage arm as the stage it always meant.
+		ev.State = control.StateFailed
+		ev.Detail = stageFailure(setupStage, m.Detail)
 	case "stage_failed":
-		if !placedExactlyOn(row, runner, m.State) {
-			return
-		}
 		// One event for every stage of the boot chain. The stage rides at the
 		// FRONT of the detail because a runner event has exactly one free-text
 		// field: "clone: rc 128: fatal: Authentication failed" splits at the
@@ -438,26 +447,16 @@ func (s *Server) applyEvent(ctx context.Context, runner string, m runner.FromRun
 		if !ok {
 			stage, rest = unnamedStage, m.Detail
 			log.Printf("controld: runner %s: stage_failed for %s named no stage (%q)",
-				runner, row.ID, clip(m.Detail))
+				name, clip(m.Session), clip(m.Detail))
 		}
-		s.failStage(ctx, m.Session, stage, rest)
-	case "setup_done":
-		if !placedExactlyOn(row, runner, m.State) {
-			return
-		}
-		// Deliberately no transition: a finished setup is news about the
-		// ENVIRONMENT, not about the session, whose state the registration
-		// "running" event governs exactly as it does for a scratch session.
-		s.cacheEnvironment(ctx, runner, row)
+		ev.State = control.StateFailed
+		ev.Detail = stageFailure(stage, rest)
 	case "child_exited":
-		if !placedExactlyOn(row, runner, m.State) {
-			return
-		}
 		// An OBSERVATION, not a transition. The agent process ended but the
 		// session did not: sessiond outlives its child so viewers can still
 		// read the scrollback, so the container is up, attachable, and holding
-		// its slot. Recording the code and moving nothing is the whole arm —
-		// no transition, and no scheduler wake, because no capacity changed.
+		// its slot. ApplyRunnerEvent ignores State on a child-exit event;
+		// Running is the state the row is expected to be in.
 		code, err := strconv.Atoi(m.Detail)
 		if err != nil {
 			// Dropped rather than defaulted: Atoi's zero would land in the
@@ -465,16 +464,60 @@ func (s *Server) applyEvent(ctx context.Context, runner string, m runner.FromRun
 			// there is. A number we cannot read is better recorded as no
 			// number at all.
 			log.Printf("controld: runner %s: child_exited for %s carried an unreadable code %q; ignoring",
-				runner, row.ID, clip(m.Detail))
+				name, clip(m.Session), clip(m.Detail))
 			return
 		}
-		if err := s.st.SetChildExitCode(ctx, m.Session, code); err != nil {
-			log.Printf("controld: recording child exit code %d for %s: %v", code, row.ID, err)
-		}
+		ev.State = control.StateRunning
+		ev.ChildExitCode = &code
+	case "setup_done", "credential_rejected":
+		s.applyAdapterArm(ctx, name, m)
+		return
+	default:
+		log.Printf("controld: runner %s: unknown event state %q for %s", name, clip(m.State), clip(m.Session))
+		return
+	}
+	if err := s.fleet.ApplyRunnerEvent(ctx, ev); err != nil {
+		// ErrStale and ErrConflict are the races reconciliation and events
+		// have always had with each other — an event for a session this
+		// runner no longer holds, or one the row has already moved past. They
+		// are expected, not errors, and they are logged exactly where the old
+		// applyEvent logged its own refusals.
+		log.Printf("controld: runner %s: event %s for %s not applied: %v",
+			name, clip(m.State), clip(m.Session), err)
+	}
+}
+
+// applyAdapterArm handles the two events that transition nothing: a finished
+// setup, which is news about the environment's snapshot cache, and a rejected
+// credential, which is news about the owner's stored token. Both are host
+// policy — the image cache and the vault are controld's, not the service's —
+// and both need the session row, which they read directly (one of the direct
+// store reads this composition keeps).
+//
+// Both keep the exact-placement guard. Without it the fleet-wide runner token
+// would let the stale holder of a duplicate publish its own container as an
+// environment's cache, or invalidate the credential of a user whose work it is
+// no longer running.
+func (s *Server) applyAdapterArm(ctx context.Context, name string, m runner.FromRunner) {
+	row, err := s.st.GetSession(ctx, m.Session)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		log.Printf("controld: runner %s: event for unknown session %s; ignoring", name, clip(m.Session))
+		return
+	case err != nil:
+		log.Printf("controld: runner %s: event for %s: %v", name, clip(m.Session), err)
+		return
+	case !placedExactlyOn(row, name, m.State):
+		return
+	}
+
+	switch m.State {
+	case "setup_done":
+		// Deliberately no transition: a finished setup is news about the
+		// ENVIRONMENT, not about the session, whose state the registration
+		// "running" event governs exactly as it does for a scratch session.
+		s.cacheEnvironment(ctx, name, row)
 	case "credential_rejected":
-		if !placedExactlyOn(row, runner, m.State) {
-			return
-		}
 		// A git operation inside the sandbox was refused by GitHub. The vault
 		// mints OPTIMISTICALLY — no GitHub round-trip per mint (design §4.2) —
 		// so an observed refusal is the only signal a stored token has been
@@ -484,35 +527,13 @@ func (s *Server) applyEvent(ctx context.Context, runner string, m runner.FromRun
 		//
 		// The event carries nothing, deliberately: WHOSE credential it was is
 		// the row's own answer, and a token — or anything derived from one —
-		// has no business on this channel. Reading the owner here rather than
-		// trusting a field is also what makes the placement guard above worth
-		// having: a runner can only ever reject the credential of a user whose
-		// session it is actually holding.
-		//
-		// No transition and no scheduler wake: the git operation failed, the
-		// session did not. It is still running, still attachable, still
-		// holding its slot.
+		// has no business on this channel.
 		if row.OwnerID == "" {
-			log.Printf("controld: runner %s: credential_rejected for %s, which has no owner; ignoring", runner, row.ID)
+			log.Printf("controld: runner %s: credential_rejected for %s, which has no owner; ignoring", name, row.ID)
 			return
 		}
 		s.rejectCredential(ctx, row.OwnerID, githubProvider)
-	default:
-		log.Printf("controld: runner %s: unknown event state %q for %s", runner, clip(m.State), clip(m.Session))
 	}
-}
-
-// failStage fails a session whose boot chain stopped at stage, recording the
-// sentence a human reads in `rainier ls`. Both failure events land here: the
-// legacy `setup_failed` with its implied stage, and `stage_failed` with the
-// one it names.
-//
-// A failed stage gives the runner's slot back, so the scheduler is woken —
-// the same reason the setup arm has always woken it.
-func (s *Server) failStage(ctx context.Context, id, stage, detail string) {
-	reason := stageFailure(stage, detail)
-	s.transitionQuiet(ctx, id, setupFailedFrom, StateFailed, TransitionOpts{Error: &reason})
-	s.wakeScheduler()
 }
 
 // stageFailure composes what a failed boot stage reads as in a session's
@@ -659,7 +680,8 @@ func (s *Server) snapshotWanted(ctx context.Context, runner string, row Session)
 // setup script again — slower, never wrong.
 func (s *Server) buildSnapshot(ctx context.Context, runnerName string, row Session, env Environment, hash string) {
 	ref := snapshotRef(env.ID, hash)
-	res, err := s.dispatch(ctx, runnerName, runner.ToRunner{Type: "snapshot", Session: row.ID, Ref: ref})
+	res, err := s.transport.Dispatch(ctx, installPool, control.RunnerID(runnerName),
+		runner.ToRunner{Type: "snapshot", Session: row.ID, Ref: ref})
 	switch {
 	case err != nil:
 		log.Printf("controld: snapshotting %s for environment %s on %s: %v", row.ID, env.ID, runnerName, err)
@@ -706,131 +728,19 @@ func (s *Server) buildSnapshot(ctx context.Context, runnerName string, row Sessi
 	s.broadcastToRunners(runner.ToRunner{Type: "prepull", Ref: ref}, runnerName)
 }
 
-// reconcile makes the store agree with the reality a runner just announced
-// (design §4.8). runnerd is truth for liveness, the store is truth for
-// desired state, so each row is settled by which of the two knows something
-// the other doesn't.
-func (s *Server) reconcile(ctx context.Context, name string, announced []runner.SessionInfo) {
-	byID := make(map[string]runner.SessionInfo, len(announced))
-	for _, a := range announced {
-		byID[a.ID] = a
-	}
-
-	rows, err := s.st.SessionsOnRunner(ctx, name, liveOnRunner)
-	if err != nil {
-		// Without the store's view there is no reconciliation to do; the
-		// runner stays connected and the next announce tries again. Acting
-		// on half the picture would destroy live sessions.
-		log.Printf("controld: reconcile %s: listing sessions: %v", name, err)
-		return
-	}
-
-	placed := make(map[string]bool, len(rows))
-	for _, row := range rows {
-		placed[row.ID] = true
-		if ann, present := byID[row.ID]; present {
-			s.reconcilePresent(ctx, row, ann)
-		} else {
-			s.reconcileMissing(ctx, name, row)
-		}
-	}
-	for _, a := range announced {
-		if !placed[a.ID] {
-			s.reconcileUnplaced(ctx, name, a)
-		}
-	}
-}
-
-// reconcilePresent settles a row the runner does have: adopt whatever state
-// it reports, and count even agreement as news.
-func (s *Server) reconcilePresent(ctx context.Context, row Session, ann runner.SessionInfo) {
-	want, ok := announcedState(ann.State)
-	if !ok {
-		log.Printf("controld: runner %s announced %s in unknown state %q; leaving it alone",
-			row.Runner, row.ID, clip(ann.State))
-		return
-	}
-	if want == row.State {
-		// Same state still means "demonstrably alive just now": the
-		// transition is a no-op except for the last_event_at bump, which is
-		// the whole point.
-		s.transitionQuiet(ctx, row.ID, []SessionState{want}, want, TransitionOpts{})
-		return
-	}
-	s.transitionQuiet(ctx, row.ID, NonTerminal, want, TransitionOpts{})
-}
-
-// reconcileMissing settles a row the runner should have and doesn't: a
-// create that never landed goes back on the queue, anything further along is
-// gone for good.
-func (s *Server) reconcileMissing(ctx context.Context, name string, row Session) {
-	if row.State == StateCreating {
-		none := ""
-		log.Printf("controld: runner %s did not announce creating session %s; requeuing", name, row.ID)
-		s.transitionQuiet(ctx, row.ID, []SessionState{StateCreating}, StateQueued, TransitionOpts{Runner: &none})
-		return
-	}
-	reason := lostAtAnnounce
-	log.Printf("controld: runner %s did not announce %s (%s); marking dead", name, row.ID, row.State)
-	s.transitionQuiet(ctx, row.ID, NonTerminal, StateDead, TransitionOpts{Error: &reason})
-}
-
-// reconcileUnplaced settles an announced session the store does not have
-// placed on this runner: an unknown or terminal id is an orphan and gets
-// destroyed, while a live row the store still wants is adopted onto the
-// runner that actually has it.
-func (s *Server) reconcileUnplaced(ctx context.Context, name string, ann runner.SessionInfo) {
-	row, err := s.st.GetSession(ctx, ann.ID)
-	switch {
-	case errors.Is(err, ErrNotFound):
-		log.Printf("controld: runner %s announced unknown session %s; destroying orphan", name, clip(ann.ID))
-		s.destroyOrphan(ctx, name, ann.ID)
-	case err != nil:
-		log.Printf("controld: reconcile %s: get session %s: %v", name, clip(ann.ID), err)
-	case row.State.Terminal():
-		log.Printf("controld: runner %s announced %s, which the store already finished as %s; destroying orphan",
-			name, row.ID, row.State)
-		s.destroyOrphan(ctx, name, row.ID)
-	case row.Runner != "" && row.Runner != name:
-		// The store has this session placed on a different runner, so this
-		// one is holding a duplicate — the losing half of a requeue that
-		// re-placed elsewhere while this runner was away. Postgres owns
-		// placement (§4.8), so the copy here is an orphan. Adopting it
-		// instead would leave both copies alive and make Runner ping-pong
-		// between the two on every reconnect, with the loser's container
-		// holding a slot for the life of the runner.
-		log.Printf("controld: runner %s announced %s, which the store places on %s; destroying the duplicate",
-			name, row.ID, row.Runner)
-		s.destroyOrphan(ctx, name, row.ID)
-	default:
-		// The store wants this session alive and has it either here or
-		// nowhere (e.g. requeued while the runner was away, never
-		// re-placed). runnerd is truth for liveness: adopt it onto the
-		// runner that actually holds it rather than destroying something
-		// the store still wants.
-		want, ok := announcedState(ann.State)
-		if !ok {
-			log.Printf("controld: runner %s announced %s in unknown state %q; leaving it alone",
-				name, row.ID, clip(ann.State))
-			return
-		}
-		log.Printf("controld: runner %s announced %s, which the store has as %s on %q; adopting onto %s",
-			name, row.ID, row.State, row.Runner, name)
-		runner := name
-		s.transitionQuiet(ctx, row.ID, NonTerminal, want, TransitionOpts{Runner: &runner})
-	}
-}
-
-// destroyOrphan tells a runner to drop a session the store has no live row
-// for. It runs outside the connection reader because dispatch's result must
-// be delivered by that reader. A failed driver teardown remains registered
+// destroyOrphan tells a runner to drop a session the fleet service named in
+// its reconcile result: one the store has no live row for on this runner. It
+// writes nothing — the service already settled the rows — and it runs outside
+// the connection reader because the dispatch's result must be delivered by
+// that reader. A failed driver teardown remains registered
 // on runnerd, so retry it on this connection instead of waiting indefinitely
 // for another announce. The series is bounded; reconnect reconciliation
 // starts a fresh one if the orphan is still present.
 func (s *Server) destroyOrphan(ctx context.Context, runnerName, id string) {
 	go func() {
 		for attempt := 1; attempt <= orphanDestroyAttempts; attempt++ {
-			res, err := s.dispatch(ctx, runnerName, runner.ToRunner{Type: "destroy", Session: id})
+			res, err := s.transport.Dispatch(ctx, installPool, control.RunnerID(runnerName),
+				runner.ToRunner{Type: "destroy", Session: id})
 			if err == nil && res.OK {
 				return
 			}
@@ -855,109 +765,6 @@ func (s *Server) destroyOrphan(ctx context.Context, runnerName, id string) {
 			}
 		}
 	}()
-}
-
-// transitionQuiet applies a guarded transition, swallowing exactly the two
-// outcomes reconciliation and events produce by racing each other:
-// ErrConflict (the row moved on under us) and ErrNotFound (it's gone). The
-// announce is truth and arrives again shortly; anything else is a real
-// store problem worth a log line.
-func (s *Server) transitionQuiet(ctx context.Context, id string, from []SessionState, to SessionState, opts TransitionOpts) {
-	err := s.st.Transition(ctx, id, from, to, opts)
-	if err == nil || errors.Is(err, ErrConflict) || errors.Is(err, ErrNotFound) {
-		return
-	}
-	log.Printf("controld: transition %s -> %s: %v", id, to, err)
-}
-
-// announcedState maps an announced session state onto a SessionState,
-// rejecting anything outside the three a runner may report.
-func announcedState(s string) (SessionState, bool) {
-	switch st := SessionState(s); st {
-	case StateRunning, StateSuspendedWarm, StateSuspendedCold:
-		return st, true
-	}
-	return "", false
-}
-
-// dispatch sends m to a runner and waits for the matching result. It assigns
-// the ReqID (per-connection, so ids never collide across runners) and
-// returns an error wrapping ErrRunnerUnreachable whenever no answer arrives:
-// no connection, a connection that died, or OpTimeout. That last one — and
-// only that one — also wraps ErrDispatchTimeout, because it alone leaves the
-// command delivered and possibly executed (see that error's doc comment).
-//
-// The one exception is the caller's own ctx being canceled, which returns a
-// bare ctx.Err() — the runner is not implicated, and callers that map
-// ErrRunnerUnreachable to a 502 should let that one surface as the client
-// disconnect it is.
-func (s *Server) dispatch(ctx context.Context, runnerName string, m runner.ToRunner) (runner.FromRunner, error) {
-	rc := s.conn(runnerName)
-	if rc == nil {
-		return runner.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: not connected: %w",
-			m.Type, runnerName, ErrRunnerUnreachable)
-	}
-
-	m.ReqID = rc.seq.Add(1)
-	ch := make(chan runner.FromRunner, 1)
-	rc.mu.Lock()
-	rc.pending[m.ReqID] = ch
-	rc.mu.Unlock()
-	defer func() {
-		rc.mu.Lock()
-		delete(rc.pending, m.ReqID)
-		rc.mu.Unlock()
-	}()
-
-	if err := rc.enqueue(m); err != nil {
-		return runner.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: %w", m.Type, runnerName, err)
-	}
-
-	timer := time.NewTimer(s.cfg.OpTimeout)
-	defer timer.Stop()
-	select {
-	case res := <-ch:
-		return res, nil
-	case <-rc.done:
-		// select is random among ready cases: prefer a result that landed
-		// in the same instant the connection died.
-		if res, ok := drain(ch); ok {
-			return res, nil
-		}
-		return runner.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: connection closed before the result: %w",
-			m.Type, runnerName, ErrRunnerUnreachable)
-	case <-timer.C:
-		if res, ok := drain(ch); ok {
-			return res, nil
-		}
-		// select is random among ready cases, so a connection that died at
-		// the same instant the timer fired could surface here as a timeout.
-		// Re-check explicitly: conn death is the stronger fact (the command
-		// is definitively unanswerable now), and ErrDispatchTimeout's whole
-		// contract is "the connection was still live", which callers act on.
-		select {
-		case <-rc.done:
-			return runner.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: connection closed before the result: %w",
-				m.Type, runnerName, ErrRunnerUnreachable)
-		default:
-		}
-		return runner.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: no result within %s: %w",
-			m.Type, runnerName, s.cfg.OpTimeout, ErrDispatchTimeout)
-	case <-ctx.Done():
-		if res, ok := drain(ch); ok {
-			return res, nil
-		}
-		return runner.FromRunner{}, fmt.Errorf("dispatch %s to runner %q: %w", m.Type, runnerName, ctx.Err())
-	}
-}
-
-func drain(ch chan runner.FromRunner) (runner.FromRunner, bool) {
-	select {
-	case res := <-ch:
-		return res, true
-	default:
-		return runner.FromRunner{}, false
-	}
 }
 
 // sendToRunner queues a command whose result nobody waits for (attach
@@ -1043,23 +850,39 @@ func (s *Server) nameLock(name string) *sync.Mutex {
 	return mu
 }
 
+// errRegistrationRefused is what connectRunner reports when the fleet service
+// declines the claim outright — an older generation than the store already
+// holds. It says nothing the runner supplied.
+var errRegistrationRefused = errors.New("registration refused")
+
 // connectRunner installs rc as the live connection for its runner and
-// records the capacity it announced, both under the runner's name lock so
-// that a connection being retired at this same instant either writes its
-// disconnect before us or (seeing itself replaced) not at all.
-func (s *Server) connectRunner(ctx context.Context, rc *runnerConn, used, total int) error {
+// registers the generation it claims with the fleet service, both under the
+// runner's name lock so that a connection being retired at this same instant
+// either writes its disconnect before us or (seeing itself replaced) not at
+// all. The row write itself is the service's; the capabilities a runner
+// advertises are the two synthesized for its own name (adapt_store.go).
+func (s *Server) connectRunner(ctx context.Context, rc *runnerConn, ann runner.FromRunner) error {
 	nl := s.nameLock(rc.name)
 	nl.Lock()
 	defer nl.Unlock()
 
 	s.registerRunner(rc)
-	return s.st.UpsertRunner(ctx, Runner{
-		Name:          rc.name,
-		CapacityUsed:  used,
-		CapacityTotal: total,
-		Connected:     true,
-		LastSeenAt:    time.Now(),
+	reg, err := s.fleet.RegisterRunner(ctx, control.RunnerRegistration{
+		WorkspaceID: installWorkspace, PoolID: installPool,
+		RunnerID:      control.RunnerID(rc.name),
+		Generation:    rc.gen,
+		CapacityUsed:  ann.Used,
+		CapacityTotal: ann.Total,
+		Capabilities:  runnerCapabilities(rc.name),
+		Sessions:      announcedSessions(ann.Sessions),
 	})
+	switch {
+	case err != nil:
+		return err
+	case !reg.Accepted:
+		return fmt.Errorf("%w: the fleet holds generation %d", errRegistrationRefused, reg.Generation)
+	}
+	return nil
 }
 
 // registerRunner installs rc as the live connection for its runner and
@@ -1138,6 +961,18 @@ func closeRunner(c *websocket.Conn, code websocket.StatusCode, reason string) {
 	if err := c.Close(code, reason); err != nil {
 		log.Printf("controld: closing runner connection: %v", err)
 	}
+}
+
+// envID is env's id, or "" for a scratch session's absent environment — so a
+// log line can name the environment without every call site guarding a nil.
+// It travelled here with the rest of sched.go's survivors when the scheduler
+// itself moved into controlapp; its one caller is the create handler's
+// repository preflight.
+func envID(env *Environment) string {
+	if env == nil {
+		return ""
+	}
+	return env.ID
 }
 
 // clip bounds runner-supplied text before it reaches a log line or a

@@ -113,26 +113,6 @@ func assertKeySet(t *testing.T, raw string, want ...string) {
 	}
 }
 
-// drainWake empties a possibly-already-pending wake, so a later assertWoke
-// only sees a wake this test's own action caused.
-func drainWake(s *Server) {
-	select {
-	case <-s.schedWake:
-	default:
-	}
-}
-
-// assertWoke fails unless wakeScheduler was called (a wake is now pending)
-// since the matching drainWake.
-func assertWoke(t *testing.T, s *Server) {
-	t.Helper()
-	select {
-	case <-s.schedWake:
-	default:
-		t.Fatal("wakeScheduler was not called")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // authorizeOwnerOrAdmin (unit)
 // ---------------------------------------------------------------------------
@@ -535,12 +515,17 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 	// registry, so the affinity that used to be a fallback ("rebuild from the
 	// plain image anywhere") became a placement pin instead: the environment
 	// carries the capability snapshot:<runner> and the session waits for that
-	// runner rather than booting a different image somewhere else. Resolution
-	// is what these two cases pin; the pin itself is the scheduler's half.
+	// runner rather than booting a different image somewhere else.
+	//
+	// Both halves are asserted: the image the create resolves to, and where
+	// the scheduler will (not) put it. The other half of the pin — a create
+	// dispatched to the holder even when a roomier runner is standing by — is
+	// sched_test.go's TestCacheTiebreakPrefersTheSnapshotHolder.
 	t.Run("a cache whose holder has no free slot still resolves to the snapshot", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		joinRunner(t, s, ts, runnerScript{Name: "vm1", Used: 1, Total: 1}) // the holder, full
-		joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 2})
+		f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 2})
+		startRun(t, s)
 		_, tok := loginUser(t, st, "alice", "member")
 
 		const ref = "rainier-env:cached-0123456789ab"
@@ -551,11 +536,20 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		if row := getSession(t, st, got.ID); row.ResolvedImage != ref {
 			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.ResolvedImage, ref)
 		}
+		// D3, the placement half: vm2 has two free slots and is never
+		// offered the session, because the image it would boot exists only
+		// on vm1. The session waits for vm1 instead.
+		time.Sleep(150 * time.Millisecond)
+		if row := getSession(t, st, got.ID); row.State != StateQueued || row.Runner != "" {
+			t.Fatalf("session = %q on %q, want still queued and unplaced (pinned to the full holder)", row.State, row.Runner)
+		}
+		wantNothingQueued(t, s, f2)
 	})
 
 	t.Run("a cache whose holder is disconnected still resolves to the snapshot", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
-		joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		startRun(t, s)
 		_, tok := loginUser(t, st, "alice", "member")
 
 		const ref = "rainier-env:cached-0123456789ab"
@@ -566,6 +560,13 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		if row := getSession(t, st, got.ID); row.ResolvedImage != ref {
 			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.ResolvedImage, ref)
 		}
+		// D3 again, with the holder absent rather than full: no connected
+		// runner advertises snapshot:vm-gone, so nothing is placed at all.
+		time.Sleep(150 * time.Millisecond)
+		if row := getSession(t, st, got.ID); row.State != StateQueued || row.Runner != "" {
+			t.Fatalf("session = %q on %q, want still queued and unplaced (its holder is gone)", row.State, row.Runner)
+		}
+		wantNothingQueued(t, s, f)
 	})
 
 	t.Run("a snapshot built from superseded setup is not used", func(t *testing.T) {
@@ -1472,11 +1473,10 @@ func TestGetSession(t *testing.T) {
 
 func TestDeleteSession(t *testing.T) {
 	t.Run("queued cancels without dispatch and wakes the scheduler", func(t *testing.T) {
-		s, st, ts := newTestControld(t)
+		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_del_q", OwnerID: owner.ID, State: StateQueued, Name: "delq"})
 
-		drainWake(s)
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_q", tok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
@@ -1485,7 +1485,11 @@ func TestDeleteSession(t *testing.T) {
 		if got.State != StateCanceled {
 			t.Fatalf("state = %q, want canceled", got.State)
 		}
-		assertWoke(t, s)
+		// The wake itself is the session service's now (controlapp's
+		// DeleteSession wakes the row's pool; controlapp/sessions_test.go
+		// asserts the "wake:pool_a" record), and controld no longer owns a
+		// channel a test could watch — Task 5 deleted schedWake with the
+		// scheduler loop it fed.
 	})
 
 	t.Run("creating is 409 conflict, no dispatch", func(t *testing.T) {

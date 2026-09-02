@@ -674,7 +674,8 @@ func TestSandboxRequestsDoNotBlockTheRunnerReader(t *testing.T) {
 	// While that handler is wedged, an ordinary dispatch still completes.
 	done := make(chan error, 1)
 	go func() {
-		_, err := s.dispatch(context.Background(), "vm1", runner.ToRunner{Type: "suspend", Session: id})
+		_, err := s.transport.Dispatch(context.Background(), installPool, "vm1",
+			runner.ToRunner{Type: "suspend", Session: id})
 		done <- err
 	}()
 	cmd := nextOfType(t, f, "suspend")
