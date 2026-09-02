@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
@@ -97,6 +98,11 @@ type Server struct {
 	// never says "done" is answering an endless stream, and something on this
 	// side has to be the thing that stops reading it.
 	xferMax int64
+
+	// transport is the runner plane behind the control.RunnerTransport port.
+	// It is composed in the recomposition's Task 5; until then it is nil and
+	// unavailableStatus answers 500 for every ErrUnavailable.
+	transport control.RunnerTransport
 
 	// schedWake carries capacity news to the scheduler loop (Task 8). It is
 	// buffered by one and written non-blockingly: the loop only needs to
