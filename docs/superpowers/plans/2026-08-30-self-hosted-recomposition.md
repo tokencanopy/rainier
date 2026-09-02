@@ -36,6 +36,7 @@
 | D7 | The placement pass `continue`s past a store error on the queued→creating transition | The pass ends (`drainPool` returns); the safety tick retries the whole queue | A store that cannot answer one transition will not answer the next; re-run the burst e2e as the gate rather than assume parity | none expected |
 | D8 | (controlapp, not the wire) `controlapp.DeleteSession` on a session whose runner is not connected returns `ErrUnavailable` | It destroys the row without dispatching, exactly as today's handler does; the orphan is destroyed by reconcile when the runner returns | The extraction lost a behavior; reconcile already covers the orphan | `controlapp/sessions_test.go` `TestLifecycleRunnerUnavailable` |
 | D9 | `environment.placement` is a column; `snapshot_runner` is a column | Both still render; `placement` round-trips through `Requirements.Capabilities` as `placement:<runner>`; `snapshot_runner` is read from the store for the view only | `control.Environment` names no runner; a capability is the portable spelling of a pin | none — the JSON is unchanged |
+| D10 | (controlapp, not the wire) `controlapp.CreateSession` answers `ErrUnavailable` when no eligible pool has free capacity, which for self-hosted means "no runner connected" or "every runner full" | It selects the eligible pool with the most free capacity even when that is zero or negative, stores the session queued in it, and the scheduler places it when capacity appears — today's behavior; `ErrUnavailable` remains the answer only when the resolver returns no pool at all | Queueing is the self-hosted contract (`queue_reason` is user-visible); a host that wants admission refusal does it in its pool resolver | `controlapp/sessions_test.go` cases pinning `ErrUnavailable` for a present-but-full pool |
 
 Everything not in this table is a bug in the task that introduced it.
 
@@ -504,7 +505,7 @@ Gate: `go build ./... && go test ./internal/controld -race -count=1` unchanged-g
 **Files:**
 - Modify: `internal/controld/api.go` — everything from `handleCreateSession` through `handleListRunners`, the `sessionRenderer`, `resolveEnvironment`, `resolveRepos`, `resolveImage`, `cacheUsable`, `reclaimWorkspace`; and `handleCreateEnvironment` through `handleDeleteEnvironment`
 - Modify: `internal/controld/api_test.go` — only the cases the deviation table names (D1 message text, D2, D4, D6)
-- Modify: `controlapp/sessions.go` (D8) and `controlapp/sessions_test.go` (`TestLifecycleRunnerUnavailable` → the new behavior, plus one new test)
+- Modify: `controlapp/sessions.go` (D8, D10) and `controlapp/sessions_test.go` (`TestLifecycleRunnerUnavailable` → the new behavior, the full-pool cases → queued, plus two new tests)
 - Modify: `cmd/rainier/main_test.go` — only the two `no_capacity` hits (D4)
 
 **Interfaces:**
@@ -552,6 +553,8 @@ if row.PoolID != "" && row.RunnerID != "" && s.transport.Connected(row.PoolID, r
 ```
 
 and keep the guarded transition to destroyed after it. Update `TestLifecycleRunnerUnavailable` so the delete case expects success with the row destroyed and no dispatch; add `TestDeleteSessionOnDisconnectedRunnerDestroysWithoutDispatch`. Suspend/resume/snapshot keep refusing with `ErrUnavailable` (those need the runner).
+
+**D10** in `controlapp/sessions.go` `selectPool`: drop the `if free <= 0 { continue }` skip so the comparison runs over every eligible pool; the pool with the greatest free capacity wins even when that is `<= 0`, ties still break by ascending `PoolID`, and `ErrUnavailable` is returned only when `pools` is empty. Update the `selectPool`/`CreateSession` tests that pin `ErrUnavailable` for a present-but-full pool to expect a queued session in that pool, and add `TestCreateSessionQueuesWhenThePoolIsFull` proving the row is stored queued with `PoolID` set and the pool woken. The scheduler's `drainPool` already leaves a session queued while no runner has room, so nothing else changes.
 
 Delete from api.go once nothing calls them: `resolveEnvironment`, `resolveRepos`, `resolveImage`, `cacheUsable`, `reclaimWorkspace`, `authorizeOwnerOrAdmin` (the adapter owns the rule now; keep it only if `sessionForRPC` in Task 6 still needs it — Task 6 deletes it otherwise).
 
