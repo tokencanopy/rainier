@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 // AttachmentOptions carries the host-supplied dependencies the attachment
@@ -23,6 +24,12 @@ type AttachmentOptions struct {
 	Events     control.EventRecorder
 	Clock      control.Clock
 	IDs        control.IDGenerator
+	// MaxTransferBytes bounds one push or pull's compressed bytes. Zero means
+	// workspace.MaxBytes; a negative value is control.ErrInvalid. Hosts lower
+	// it in tests so the overrun path is exercised without streaming the full
+	// limit, and a host relaying transfers through its own memory lowers it in
+	// production for the same reason it bounds any other relay.
+	MaxTransferBytes int64
 }
 
 // AttachmentPolicy is the mode-aware attachment authorization seam. The frozen
@@ -40,17 +47,18 @@ type AttachmentPolicy interface {
 // controller-generation fence, and every authorization/readiness/bound check
 // before a byte crosses the broker, runner, reader, or writer seam.
 type AttachmentService struct {
-	auth       control.Authorizer
-	policy     AttachmentPolicy
-	sessions   control.SessionRepository
-	transport  control.RunnerTransport
-	broker     control.AttachmentBroker
-	events     control.EventRecorder
-	clock      control.Clock
-	ids        control.IDGenerator
-	rpcSeq     atomic.Uint64
-	leaseMu    sync.Mutex
-	controller map[attachmentLeaseKey]uint64
+	auth        control.Authorizer
+	policy      AttachmentPolicy
+	sessions    control.SessionRepository
+	transport   control.RunnerTransport
+	broker      control.AttachmentBroker
+	events      control.EventRecorder
+	clock       control.Clock
+	ids         control.IDGenerator
+	maxTransfer int64
+	rpcSeq      atomic.Uint64
+	leaseMu     sync.Mutex
+	controller  map[attachmentLeaseKey]uint64
 }
 
 // attachmentLeaseKey names one session's controller lease by its authoritative
@@ -75,19 +83,25 @@ func NewAttachmentService(opts AttachmentOptions) (*AttachmentService, error) {
 		opts.Broker == nil,
 		opts.Events == nil,
 		opts.Clock == nil,
-		opts.IDs == nil:
+		opts.IDs == nil,
+		opts.MaxTransferBytes < 0:
 		return nil, control.ErrInvalid
 	}
+	maxTransfer := opts.MaxTransferBytes
+	if maxTransfer == 0 {
+		maxTransfer = workspace.MaxBytes
+	}
 	return &AttachmentService{
-		auth:       opts.Authorizer,
-		policy:     opts.Policy,
-		sessions:   opts.Sessions,
-		transport:  opts.Transport,
-		broker:     opts.Broker,
-		events:     opts.Events,
-		clock:      opts.Clock,
-		ids:        opts.IDs,
-		controller: make(map[attachmentLeaseKey]uint64),
+		auth:        opts.Authorizer,
+		policy:      opts.Policy,
+		sessions:    opts.Sessions,
+		transport:   opts.Transport,
+		broker:      opts.Broker,
+		events:      opts.Events,
+		clock:       opts.Clock,
+		ids:         opts.IDs,
+		maxTransfer: maxTransfer,
+		controller:  make(map[attachmentLeaseKey]uint64),
 	}, nil
 }
 

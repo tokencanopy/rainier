@@ -3,11 +3,24 @@ package controlapp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 
 	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
+
+// ErrRunnerRefused is the ErrUnavailable a runner ANSWERED with: it received
+// the command, ran it, and reported failure. It wraps control.ErrUnavailable,
+// so every caller that knows only the closed sentinel set keeps working
+// unchanged — and a host that wants to tell "the runner said no" apart from
+// "the runner said nothing" can ask, which is the difference between an
+// internal failure and an unreachable dependency on the wire.
+//
+// It carries no detail of its own. The runner's failure text stays inside the
+// transport (control/errors.go): a provider-neutral service does not relay a
+// sandbox's words, and this sentinel is the whole answer.
+var ErrRunnerRefused = fmt.Errorf("controlapp: runner refused the command: %w", control.ErrUnavailable)
 
 // SessionOptions carries the host-supplied dependencies of SessionService.
 // Every field is required; NewSessionService refuses a missing dependency with
@@ -157,9 +170,16 @@ func (s *SessionService) CreateSession(ctx context.Context, scope control.Scope,
 }
 
 // selectPool chooses the eligible pool with the greatest free capacity
-// (CapacityTotal - CapacityUsed), breaking ties by ascending PoolID. A pool
-// with no positive capacity is never chosen; none eligible yields
-// control.ErrUnavailable.
+// (CapacityTotal - CapacityUsed), breaking ties by ascending PoolID. Only an
+// empty eligible set yields control.ErrUnavailable.
+//
+// A pool with no free capacity — or negative free capacity, an over-committed
+// fleet — is still a candidate, and a session created into one is stored
+// queued there until the scheduler finds it room. Queueing is the contract a
+// caller sees (`queue_reason` is user-visible), and refusing a create because
+// the fleet is momentarily full would turn a wait into an error. A host that
+// wants admission refusal makes that decision in its pool resolver, by
+// returning no eligible pool at all.
 func (s *SessionService) selectPool(ctx context.Context, scope control.Scope, req control.Requirements) (control.PoolID, error) {
 	pools, err := s.pools.EligiblePools(ctx, scope, req)
 	if err != nil {
@@ -169,9 +189,6 @@ func (s *SessionService) selectPool(ctx context.Context, scope control.Scope, re
 	best := -1
 	for i := range copied {
 		free := copied[i].CapacityTotal - copied[i].CapacityUsed
-		if free <= 0 {
-			continue
-		}
 		if best == -1 ||
 			free > copied[best].CapacityTotal-copied[best].CapacityUsed ||
 			(free == copied[best].CapacityTotal-copied[best].CapacityUsed && copied[i].ID < copied[best].ID) {
@@ -212,18 +229,6 @@ func portableSpecFor(cmd control.CreateSession, env control.Environment) control
 	}
 	spec.EgressAllow = unionHosts(env.EgressAllow, cmd.Spec.EgressAllow)
 	return spec
-}
-
-// unionHosts returns base plus every host of extra it does not already
-// contain, in order, leaving base itself untouched. Two nil inputs stay nil.
-func unionHosts(base, extra []string) []string {
-	out := slices.Clone(base)
-	for _, h := range extra {
-		if !slices.Contains(out, h) {
-			out = append(out, h)
-		}
-	}
-	return out
 }
 
 // runsCachedSnapshot reports whether env's cached snapshot is current and
@@ -340,10 +345,11 @@ func cloneRepos(in []control.RepoRef) []control.RepoRef {
 	return slices.Clone(in)
 }
 
-// dispatch sends msg to the runner that holds row, mapping an absent pool,
-// absent runner, missing connection, transport failure, or a false runner
-// result to the closed ErrUnavailable sentinel. The runner's own detail text
-// never leaves this method.
+// dispatch sends msg to the runner that holds row. Every failure is
+// control.ErrUnavailable: an absent pool, an absent runner, a missing
+// connection, and a transport failure return it bare, while a runner that
+// answered and reported failure returns ErrRunnerRefused, which wraps it. The
+// runner's own detail text never leaves this method in either case.
 func (s *SessionService) dispatch(ctx context.Context, row control.Session, msg runner.ToRunner) (runner.FromRunner, error) {
 	if row.PoolID == "" || row.RunnerID == "" || !s.transport.Connected(row.PoolID, row.RunnerID) {
 		return runner.FromRunner{}, control.ErrUnavailable
@@ -353,7 +359,7 @@ func (s *SessionService) dispatch(ctx context.Context, row control.Session, msg 
 		return runner.FromRunner{}, control.ErrUnavailable
 	}
 	if !res.OK {
-		return runner.FromRunner{}, control.ErrUnavailable
+		return runner.FromRunner{}, ErrRunnerRefused
 	}
 	return res, nil
 }
@@ -424,10 +430,18 @@ func (s *SessionService) DeleteSession(ctx context.Context, scope control.Scope,
 		return nil
 	}
 
-	if _, err := s.dispatch(ctx, row, runner.ToRunner{Type: "destroy", Session: string(row.ID)}); err != nil {
-		return control.ErrUnavailable
+	// A runner that is here gets the destroy and the workspace reclaim; one
+	// that is not gets neither, and the row is destroyed anyway. Blocking the
+	// delete until the runner returns would let an unreachable runner pin a
+	// row open indefinitely, which is worse than a container that outlives its
+	// row — and that container is not lost either: reconcile destroys a
+	// terminal row's orphan when the runner announces it again.
+	if row.PoolID != "" && row.RunnerID != "" && s.transport.Connected(row.PoolID, row.RunnerID) {
+		if _, err := s.dispatch(ctx, row, runner.ToRunner{Type: "destroy", Session: string(row.ID)}); err != nil {
+			return err
+		}
+		s.reclaimWorkspace(ctx, row)
 	}
-	s.reclaimWorkspace(ctx, row)
 	from := control.NonTerminal
 	if row.State == control.StateFailed {
 		from = []control.SessionState{control.StateFailed}
@@ -468,7 +482,7 @@ func (s *SessionService) SuspendSession(ctx context.Context, scope control.Scope
 	}
 
 	if _, err := s.dispatch(ctx, row, runner.ToRunner{Type: "suspend", Session: string(row.ID), Warm: cmd.Warm}); err != nil {
-		return control.Session{}, control.ErrUnavailable
+		return control.Session{}, err
 	}
 
 	to := control.StateSuspendedWarm
@@ -521,7 +535,7 @@ func (s *SessionService) ResumeSession(ctx context.Context, scope control.Scope,
 	}
 
 	if _, err := s.dispatch(ctx, row, runner.ToRunner{Type: "resume", Session: string(row.ID)}); err != nil {
-		return control.Session{}, control.ErrUnavailable
+		return control.Session{}, err
 	}
 	if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, []control.SessionState{row.State}, control.StateRunning, control.TransitionOpts{}); err != nil {
 		if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
@@ -583,7 +597,7 @@ func (s *SessionService) SnapshotSession(ctx context.Context, scope control.Scop
 
 	res, err := s.dispatch(ctx, row, runner.ToRunner{Type: "snapshot", Session: string(row.ID)})
 	if err != nil {
-		return control.Checkpoint{}, control.ErrUnavailable
+		return control.Checkpoint{}, err
 	}
 	if res.Detail == "" {
 		return control.Checkpoint{}, control.ErrUnavailable

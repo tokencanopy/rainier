@@ -19,6 +19,10 @@ type LaunchMaterial struct {
 	GitAuthorName  string
 	GitAuthorEmail string
 	Environment    map[string]string
+	// EgressAllow lists hosts the resolved material needs reachable — for
+	// example the source-control hosts Repos clone from. createSpec unions
+	// them into the session's egress list, in order, without duplicates.
+	EgressAllow []string
 }
 
 // LaunchMaterialResolver is the one real adapter seam this extraction
@@ -286,13 +290,17 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 		// snapshot when one was current and the caller did not override the
 		// image, else the image itself. Setup runs exactly when the row does
 		// not boot the snapshot — an override boots its own image and needs
-		// the setup the snapshot would have carried.
-		if env.Snapshot.Ref == "" || row.Spec.Image != env.Snapshot.Ref {
+		// the setup the snapshot would have carried. A hook travels with its
+		// bound, only a hook that will run gets one, and a hook whose
+		// environment declared no bound gets the host's default.
+		if env.Setup != "" && (env.Snapshot.Ref == "" || row.Spec.Image != env.Snapshot.Ref) {
 			spec.Setup = env.Setup
-			spec.SetupTimeoutSec = env.SetupTimeoutSec
+			spec.SetupTimeoutSec = boundOr(env.SetupTimeoutSec, s.defaultSetupTimeout)
 		}
-		spec.Init = env.Init
-		spec.InitTimeoutSec = env.InitTimeoutSec
+		if env.Init != "" {
+			spec.Init = env.Init
+			spec.InitTimeoutSec = boundOr(env.InitTimeoutSec, s.defaultInitTimeout)
+		}
 	}
 	material, err := s.launchMaterial.ResolveLaunchMaterial(ctx, cloneSession(row), env)
 	if err != nil {
@@ -302,7 +310,27 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 	spec.GitAuthorName = material.GitAuthorName
 	spec.GitAuthorEmail = material.GitAuthorEmail
 	spec.Env = cloneMap(material.Environment)
+	// The session row stores only the egress its caller or environment
+	// declared; the hosts the resolved material needs are the resolver's
+	// knowledge and are added here, at dispatch, so the row and the view a
+	// human reads off it never claim a host nobody asked for.
+	spec.EgressAllow = unionHosts(spec.EgressAllow, material.EgressAllow)
 	return &spec, ""
+}
+
+// unionHosts returns base plus every host of extra it does not already
+// contain, in order, leaving base itself untouched. Deduped because a session
+// that names a material host explicitly (many do) must not end up with it
+// twice, and order is preserved because the resulting list is what a human
+// reads back. Two nil inputs stay nil.
+func unionHosts(base, extra []string) []string {
+	out := slices.Clone(base)
+	for _, h := range extra {
+		if !slices.Contains(out, h) {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // pinSetupHash records which setup script a create is dispatching, before the
@@ -326,6 +354,15 @@ func (s *FleetService) failCreate(ctx context.Context, row control.Session, reas
 		[]control.SessionState{control.StateCreating}, control.StateFailed,
 		control.TransitionOpts{Error: &bounded})
 	s.Wake(row.PoolID)
+}
+
+// boundOr returns the environment's own bound when it declared one, else the
+// host's default.
+func boundOr(declared, fallback int) int {
+	if declared > 0 {
+		return declared
+	}
+	return fallback
 }
 
 func cloneMap(m map[string]string) map[string]string {

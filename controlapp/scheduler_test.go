@@ -640,6 +640,86 @@ func TestQueuedEnvironmentDeepCopiesBeforeResolver(t *testing.T) {
 	}
 }
 
+// TestDispatchCreateUnionsMaterialEgress pins the D6 rule: the session row
+// stores only the egress its caller or environment declared, and the hosts the
+// resolved launch material needs (the source-control hosts a clone reaches)
+// are added at dispatch — in the row's order first, then the new hosts, with
+// no duplicates.
+func TestDispatchCreateUnionsMaterialEgress(t *testing.T) {
+	resolver := &fleetFakeResolver{material: LaunchMaterial{EgressAllow: []string{"github.com", "example.com"}}}
+	fx := newFleetFixtureWithResolver(t, resolver)
+	fx.st.seedRunner(fleetSeededRunner("vm1", 4, 0, true))
+	row := fleetScratchQueued("sess_x", 0)
+	row.Spec.EgressAllow = []string{"example.com", "api.example.com"}
+	fx.st.seedSession(row)
+	fleetRunFixture(t, fx)
+	fx.service.Wake("pool_example")
+
+	want := []string{"example.com", "api.example.com", "github.com"}
+	fleetEventually(t, 2*time.Second, func() error {
+		var spec *runner.Spec
+		for _, cmd := range fx.transport.dispatchedCommands() {
+			if cmd.Type == "create" {
+				spec = cmd.Spec
+			}
+		}
+		if spec == nil {
+			return fmt.Errorf("no create dispatched")
+		}
+		if !slices.Equal(spec.EgressAllow, want) {
+			return fmt.Errorf("egress = %v, want %v", spec.EgressAllow, want)
+		}
+		return nil
+	})
+}
+
+// TestCreateSpecBoundsOnlyTheHooksThatRun pins the host timeout defaults and
+// that a bound travels only with a hook that will run: no setup bound when the
+// snapshot makes setup unnecessary, no init bound without an init hook, the
+// environment's own bound when it declared one, the host's default when not.
+func TestCreateSpecBoundsOnlyTheHooksThatRun(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.service.defaultSetupTimeout = 900
+	fx.service.defaultInitTimeout = 900
+	row := control.Session{ID: "sess_example", WorkspaceID: "ws_example", Name: "investigate", EnvironmentID: "env_example",
+		Spec: control.PortableSpec{Image: "registry.example.invalid/base@sha256:0000"}}
+
+	cases := []struct {
+		name           string
+		env            control.Environment
+		wantSetup      string
+		wantSetupBound int
+		wantInit       string
+		wantInitBound  int
+		rowImage       string // the image the row resolved to at create; "" = the base image
+	}{
+		{"both hooks, no bounds → host defaults", control.Environment{Setup: "apt-get install -y build-essential", Init: "make dev"}, "apt-get install -y build-essential", 900, "make dev", 900, ""},
+		{"declared bounds win", control.Environment{Setup: "s", SetupTimeoutSec: 30, Init: "i", InitTimeoutSec: 60}, "s", 30, "i", 60, ""},
+		{"no init hook → no init bound", control.Environment{Setup: "s", InitTimeoutSec: 60}, "s", 900, "", 0, ""},
+		{"current snapshot → no setup, no setup bound", control.Environment{Setup: "s", SetupHash: "h", SnapshotHash: "h", Snapshot: control.Checkpoint{Ref: "snap:example"}, Init: "i"}, "", 0, "i", 900, "snap:example"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := tc.env
+			env.ID, env.WorkspaceID, env.Image = "env_example", "ws_example", "registry.example.invalid/base@sha256:0000"
+			r := row
+			if tc.rowImage != "" {
+				r.Spec.Image = tc.rowImage // a row created against a current snapshot boots it
+			}
+			spec, fail := fx.service.createSpec(fleetCtx, r, &env)
+			if fail != "" {
+				t.Fatalf("createSpec failed: %s", fail)
+			}
+			if spec.Setup != tc.wantSetup || spec.SetupTimeoutSec != tc.wantSetupBound ||
+				spec.Init != tc.wantInit || spec.InitTimeoutSec != tc.wantInitBound {
+				t.Fatalf("setup=%q/%d init=%q/%d, want setup=%q/%d init=%q/%d",
+					spec.Setup, spec.SetupTimeoutSec, spec.Init, spec.InitTimeoutSec,
+					tc.wantSetup, tc.wantSetupBound, tc.wantInit, tc.wantInitBound)
+			}
+		})
+	}
+}
+
 // TestCreateSpecSendsSetupUnlessTheRowBootsTheSnapshot pins the dispatch half
 // of the composition rule: the row's image was resolved at create, and setup
 // runs exactly when that image is not the environment's current snapshot — so

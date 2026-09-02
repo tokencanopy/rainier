@@ -1,4 +1,32 @@
-// internal/controld/controld.go
+// Package controld is the self-hosted Rainier control plane: the HTTP and
+// WebSocket surface, GitHub login, the secrets vault, and the runner plane,
+// composed over the portable application services in
+// github.com/tokencanopy/rainier/controlapp behind the frozen public
+// github.com/tokencanopy/rainier/control contract.
+//
+// The split is deliberate and the tests hold it: session lifecycle, in-pool
+// placement, runner reconciliation and event application, and attach and
+// workspace orchestration live once, in controlapp, and this package reaches
+// them only through the four services New composes. What this package owns is
+// the host side of each port (adapt_*.go) — the single-tenant Store as
+// workspace-keyed repositories under one installation workspace and pool, the
+// GitHub-role rule as the authorizer and attachment policy, the vault and
+// connectors as launch material, the runner websocket as the transport, the
+// dial-back pairing as the attach broker — plus everything with no portable
+// counterpart: request decoding and JSON rendering, GitHub login and tokens,
+// secrets and credentials, the sandbox's upward credential-mint RPC, and the
+// setup_done snapshot arm.
+//
+// The store is read directly, never for a decision, in a handful of places:
+// an environment referenced by name, the missing-secret and
+// missing-credential preflights at create, a pinned runner's free slots for
+// a session's queue_reason, an environment's snapshot runner for its view,
+// the count behind an in-use refusal, the session behind a runner's
+// setup_done or credential_rejected, and the owner check and readiness wait
+// that precede a terminal's WebSocket upgrade. The direct writes that remain
+// are the runner heartbeat and disconnect flags, the environment snapshot
+// after setup_done, credential status, secrets, users, and tokens —
+// transport bookkeeping and host policy, never lifecycle.
 package controld
 
 import (
@@ -11,7 +39,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tokencanopy/rainier/protocol/workspace"
+	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/controlapp"
 )
 
 const (
@@ -64,6 +93,9 @@ type Config struct {
 	// runner's dial-back before controld closes it. Zero means
 	// defaultAttachPairTTL; tests shorten it.
 	AttachPairTTL time.Duration
+	// MaxTransferBytes is the most this replica relays in one file transfer,
+	// either direction; zero means workspace.MaxBytes; tests lower it.
+	MaxTransferBytes int64
 }
 
 // Server is controld: the HTTP/WebSocket surface, the runner plane, and (as
@@ -90,19 +122,32 @@ type Server struct {
 	// the fleet-wide runner map.
 	attaches *attachTable
 
-	// xferMax is the most this replica will relay in ONE file transfer, in
-	// either direction — workspace.MaxBytes in production, lowered by tests. It is
-	// a field rather than the constant used inline because the pull path is
-	// where a sandbox's own bound stops being enough: a compromised one that
-	// never says "done" is answering an endless stream, and something on this
-	// side has to be the thing that stops reading it.
-	xferMax int64
+	// pushes holds the file uploads this replica is relaying, keyed by the
+	// client's own transfer id — one io.Pipe and one PushWorkspace call per
+	// transfer, spanning the many HTTP requests one upload arrives as (see
+	// api.go). Like the pairing table it has its own lock and its own
+	// lifetime, and its zero value is usable.
+	pushes pushTable
 
-	// schedWake carries capacity news to the scheduler loop (Task 8). It is
-	// buffered by one and written non-blockingly: the loop only needs to
-	// know that *something* changed, so a pending wake absorbs any number
-	// of further ones.
-	schedWake chan struct{}
+	// The four application services controld is composed from, built by New
+	// over the adapters in adapt_*.go. Handlers reach the store, the runner
+	// plane, and the attach plane only through these (Tasks 4–6 of the
+	// recomposition plan rewire them one surface at a time).
+	sessions     *controlapp.SessionService
+	environments *controlapp.EnvironmentService
+	fleet        *controlapp.FleetService
+	attachments  *controlapp.AttachmentService
+
+	// gens hands out the process-local generation each runner connection
+	// acts under; the fleet repository adapter reads it back.
+	gens *runnerGenerations
+
+	// transport is the runner plane behind the control.RunnerTransport port
+	// (adapt_transport.go, over the connection map below) and broker the
+	// dial-back attach pairing behind control.AttachmentBroker
+	// (adapt_attach.go, over the pairing table above).
+	transport control.RunnerTransport
+	broker    control.AttachmentBroker
 }
 
 // New validates cfg, applies defaults, and returns a Server over st.
@@ -139,15 +184,79 @@ func New(st Store, cfg Config) (*Server, error) {
 	if cfg.GitHubAPIBase == "" {
 		cfg.GitHubAPIBase = defaultGitHubAPIBase
 	}
-	return &Server{
+	s := &Server{
 		st:          st,
 		cfg:         cfg,
 		runners:     map[string]*runnerConn{},
 		runnerLocks: map[string]*sync.Mutex{},
 		attaches:    newAttachTable(),
-		xferMax:     workspace.MaxBytes,
-		schedWake:   make(chan struct{}, 1),
-	}, nil
+		gens:        &runnerGenerations{},
+	}
+	s.transport = runnerTransport{srv: s}
+	s.broker = attachBroker{srv: s}
+	if err := s.compose(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// fleetSafetyInterval is how often the fleet service re-drains every known
+// pool even when no wake arrived — the same 10s safety tick today's scheduler
+// loop runs on, so a wake that was coalesced away costs at most that long.
+const fleetSafetyInterval = 10 * time.Second
+
+// compose builds the four application services over one adapter set. Every
+// port is one of the adapters in adapt_*.go; nothing here is a second
+// implementation of any behavior the services own. It is the composition
+// root the program plan keeps reviewer-owned.
+func (s *Server) compose() error {
+	var (
+		auth     = ownerOrAdmin{}
+		sessions = storeSessions{st: s.st}
+		envs     = storeEnvironments{st: s.st}
+		fleet    = &storeFleet{st: s.st, gens: s.gens}
+		pools    = installationPools{st: s.st}
+		events   = logRecorder{}
+		clock    = systemClock{}
+		ids      = idGenerator{}
+	)
+	fleetSvc, err := controlapp.NewFleetService(controlapp.FleetOptions{
+		Authorizer: auth, Sessions: sessions, Environments: envs, Fleet: fleet, Pools: pools,
+		Transport: s.transport, Events: events, Clock: clock, IDs: ids,
+		SafetyInterval: fleetSafetyInterval,
+		LaunchMaterial: launchMaterial{st: s.st, key: s.cfg.SecretsKey},
+		// The self-hosted bounds for a hook whose environment declares none,
+		// exactly as the old scheduler applied them (api.go).
+		DefaultSetupTimeoutSec: defaultSetupTimeoutSec,
+		DefaultInitTimeoutSec:  defaultInitTimeoutSec,
+	})
+	if err != nil {
+		return fmt.Errorf("controld: composing the fleet service: %w", err)
+	}
+	sessionSvc, err := controlapp.NewSessionService(controlapp.SessionOptions{
+		Authorizer: auth, Sessions: sessions, Environments: envs, Pools: pools,
+		Events: events, Clock: clock, IDs: ids, Wake: fleetSvc.Wake,
+		Fleet: fleet, Transport: s.transport,
+	})
+	if err != nil {
+		return fmt.Errorf("controld: composing the session service: %w", err)
+	}
+	envSvc, err := controlapp.NewEnvironmentService(controlapp.EnvironmentOptions{
+		Authorizer: auth, Environments: envs, Events: events, Clock: clock, IDs: ids,
+	})
+	if err != nil {
+		return fmt.Errorf("controld: composing the environment service: %w", err)
+	}
+	attachSvc, err := controlapp.NewAttachmentService(controlapp.AttachmentOptions{
+		Authorizer: auth, Policy: auth, Sessions: sessions, Transport: s.transport,
+		Broker: s.broker, Events: events, Clock: clock, IDs: ids,
+		MaxTransferBytes: s.cfg.MaxTransferBytes,
+	})
+	if err != nil {
+		return fmt.Errorf("controld: composing the attachment service: %w", err)
+	}
+	s.fleet, s.sessions, s.environments, s.attachments = fleetSvc, sessionSvc, envSvc, attachSvc
+	return nil
 }
 
 // Handler returns controld's full HTTP surface: the runner control endpoint
@@ -207,19 +316,16 @@ func (s *Server) Handler() http.Handler {
 	return withMiddleware(mux)
 }
 
-// Run hosts controld's background loops and blocks until ctx is done.
-// schedulerLoop already returns on ctx.Done(), so Run needs nothing further
-// of its own to block on.
+// Run hosts controld's background loops and blocks until ctx is done. The
+// scheduler is the fleet service's own loop, which returns ctx.Err() when the
+// context ends — a shutdown, not a failure, so it is deliberately discarded.
 func (s *Server) Run(ctx context.Context) {
-	s.schedulerLoop(ctx)
+	_ = s.fleet.Run(ctx)
 }
 
-// wakeScheduler tells the scheduler loop that capacity or the queue may have
-// changed. It never blocks: a wake already pending means the loop hasn't run
-// yet and will see this change too.
+// wakeScheduler tells the fleet service that capacity or the queue may have
+// changed in the installation pool. It never blocks: the service coalesces
+// wakes and re-drains every known pool on its safety tick regardless.
 func (s *Server) wakeScheduler() {
-	select {
-	case s.schedWake <- struct{}{}:
-	default:
-	}
+	s.fleet.Wake(installPool)
 }

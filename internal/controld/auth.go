@@ -364,7 +364,7 @@ func (s *Server) requireUser(next func(http.ResponseWriter, *http.Request, User)
 
 // requireAdmin is requireUser plus the role check every fleet-wide mutation
 // needs: team secrets and environments belong to the whole team, so unlike a
-// session (owner-or-admin, authorizeOwnerOrAdmin) they have no owner to fall
+// session (owner-or-admin, the ownerOrAdmin adapter) they have no owner to fall
 // back on — only an admin may write them (design §4.5).
 //
 // The order matters and matches requireUser's own contract: an

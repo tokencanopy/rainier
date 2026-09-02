@@ -1292,12 +1292,14 @@ func TestPrepareAttach(t *testing.T) {
 				return
 			}
 			w.WriteHeader(http.StatusConflict)
-			io.WriteString(w, `{"error":{"code":"no_capacity","message":"runner is full"}}`)
+			// D4: a resume controld cannot honor right now — including a cold
+			// one that no longer fits — is 409 conflict.
+			io.WriteString(w, `{"error":{"code":"conflict","message":"session cannot be resumed right now"}}`)
 		}))
 		defer ts.Close()
 
 		err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach")
-		if err == nil || !strings.Contains(err.Error(), "no_capacity: runner is full") {
+		if err == nil || !strings.Contains(err.Error(), "conflict: session cannot be resumed right now") {
 			t.Fatalf("prepareAttach error = %v, want the original resume failure", err)
 		}
 	})

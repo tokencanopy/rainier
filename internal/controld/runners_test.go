@@ -3,6 +3,7 @@ package controld
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
+	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
@@ -681,7 +683,8 @@ func TestDispatchCorrelatesResults(t *testing.T) {
 	run := func(session string) <-chan outcome {
 		ch := make(chan outcome, 1)
 		go func() {
-			res, err := s.dispatch(context.Background(), "vm1", runner.ToRunner{Type: "snapshot", Session: session})
+			res, err := s.transport.Dispatch(context.Background(), installPool, "vm1",
+				runner.ToRunner{Type: "snapshot", Session: session})
 			ch <- outcome{res, err}
 		}()
 		return ch
@@ -799,9 +802,10 @@ func TestDestroyOrphanRetriesAfterLiveQueueSaturation(t *testing.T) {
 func TestDispatchUnreachable(t *testing.T) {
 	t.Run("never connected", func(t *testing.T) {
 		s, _, _ := newTestControld(t)
-		_, err := s.dispatch(context.Background(), "vm-nope", runner.ToRunner{Type: "destroy", Session: "sess_x"})
-		if !errors.Is(err, ErrRunnerUnreachable) {
-			t.Fatalf("err = %v, want ErrRunnerUnreachable", err)
+		_, err := s.transport.Dispatch(context.Background(), installPool, "vm-nope",
+			runner.ToRunner{Type: "destroy", Session: "sess_x"})
+		if !errors.Is(err, control.ErrUnavailable) {
+			t.Fatalf("err = %v, want control.ErrUnavailable", err)
 		}
 	})
 
@@ -812,7 +816,8 @@ func TestDispatchUnreachable(t *testing.T) {
 
 		errc := make(chan error, 1)
 		go func() {
-			_, err := s.dispatch(context.Background(), "vm1", runner.ToRunner{Type: "suspend", Session: "sess_x"})
+			_, err := s.transport.Dispatch(context.Background(), installPool, "vm1",
+				runner.ToRunner{Type: "suspend", Session: "sess_x"})
 			errc <- err
 		}()
 		f.nextCmd(t) // the command reached the runner; now the runner dies
@@ -820,8 +825,8 @@ func TestDispatchUnreachable(t *testing.T) {
 
 		select {
 		case err := <-errc:
-			if !errors.Is(err, ErrRunnerUnreachable) {
-				t.Fatalf("err = %v, want ErrRunnerUnreachable", err)
+			if !errors.Is(err, control.ErrUnavailable) {
+				t.Fatalf("err = %v, want control.ErrUnavailable", err)
 			}
 		case <-time.After(3 * time.Second):
 			t.Fatal("dispatch did not fail after the connection died")
@@ -834,9 +839,10 @@ func TestDispatchUnreachable(t *testing.T) {
 		waitConnected(t, s, "vm1")
 
 		start := time.Now()
-		_, err := s.dispatch(context.Background(), "vm1", runner.ToRunner{Type: "suspend", Session: "sess_x"})
-		if !errors.Is(err, ErrRunnerUnreachable) {
-			t.Fatalf("err = %v, want ErrRunnerUnreachable", err)
+		_, err := s.transport.Dispatch(context.Background(), installPool, "vm1",
+			runner.ToRunner{Type: "suspend", Session: "sess_x"})
+		if !errors.Is(err, control.ErrUnavailable) {
+			t.Fatalf("err = %v, want control.ErrUnavailable", err)
 		}
 		if elapsed := time.Since(start); elapsed > 2*time.Second {
 			t.Fatalf("dispatch took %s, want ~OpTimeout", elapsed)
@@ -964,7 +970,8 @@ func TestReconnectReplacesConn(t *testing.T) {
 
 	errc := make(chan error, 1)
 	go func() {
-		_, err := s.dispatch(context.Background(), "vm1", runner.ToRunner{Type: "destroy", Session: "sess_x"})
+		_, err := s.transport.Dispatch(context.Background(), installPool, "vm1",
+			runner.ToRunner{Type: "destroy", Session: "sess_x"})
 		errc <- err
 	}()
 	cmd := second.nextCmd(t)
@@ -1737,4 +1744,105 @@ func TestUnroutedPathIs404(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", resp.StatusCode)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// generation fencing (Task 5)
+// ---------------------------------------------------------------------------
+
+// apiSessionState reads a session's state back through the client API, which
+// is the surface a stale runner's report would have to reach to matter.
+func apiSessionState(t *testing.T, ts *httptest.Server, tok, id string) SessionState {
+	t.Helper()
+	resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/"+id, tok, nil, nil)
+	raw := readBody(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v0/sessions/%s = %d; body=%s", id, resp.StatusCode, raw)
+	}
+	var body sessionEnvelope
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatalf("decode session view: %v; body=%s", err, raw)
+	}
+	return SessionState(body.Session.State)
+}
+
+// writeStale writes m without failing the test when the socket has already
+// been closed under it. A superseded connection may or may not still accept a
+// frame — either way controld must not act on what arrives.
+func (f *fakeRunner) writeStale(m runner.FromRunner) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	f.wmu.Lock()
+	defer f.wmu.Unlock()
+	m.Used, m.Total = f.used, f.total
+	_ = wsjson.Write(ctx, f.c, m)
+}
+
+// TestRunnerGenerationFencesAStaleSocket pins both locks on the same door.
+// A runner that redials owns its name from that instant: the connection it
+// replaced is deregistered (so touchRunner stops reading it) AND every event
+// is stamped with the generation of the connection it arrived on, so one that
+// slipped past the first check is still refused by the service's fence.
+func TestRunnerGenerationFencesAStaleSocket(t *testing.T) {
+	t.Run("an event on the superseded socket does not transition the session", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		_, tok := loginUser(t, st, "alice", "member")
+
+		first := joinRunner(t, s, ts, runnerScript{Name: "runner-a", Total: 4})
+		second := joinRunner(t, s, ts, runnerScript{Name: "runner-a", Total: 4})
+
+		// Seeded after both announces so neither reconciliation sweeps it.
+		id := "sess_fence"
+		seedSession(t, st, Session{ID: id, State: StateCreating, Runner: "runner-a"})
+
+		// The stale socket reports the session dead — terminal, and therefore
+		// unrecoverable if it were ever applied.
+		first.writeStale(runner.FromRunner{Type: "event", Session: id, State: "dead"})
+
+		// The live socket reports it running, which is what must actually land.
+		second.event(t, id, "running")
+		eventually(t, 3*time.Second, func() error {
+			if got := apiSessionState(t, ts, tok, id); got != StateRunning {
+				return fmt.Errorf("session state = %q, want running", got)
+			}
+			return nil
+		})
+		// ...and stays there: a stale "dead" handled late would take it back.
+		time.Sleep(150 * time.Millisecond)
+		if got := apiSessionState(t, ts, tok, id); got != StateRunning {
+			t.Fatalf("session state = %q, want still running — the superseded socket was obeyed", got)
+		}
+	})
+
+	// The second lock, on its own. touchRunner drops a superseded socket's
+	// messages before they are ever translated, so the fence underneath is
+	// only observable by handing applyRunnerEvent a connection that claims a
+	// generation the fleet has already moved past — which is exactly the
+	// message an event racing a reconnect would carry.
+	t.Run("an event stamped with a superseded generation is refused", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		joinRunner(t, s, ts, runnerScript{Name: "runner-a", Total: 4}) // generation 1
+		joinRunner(t, s, ts, runnerScript{Name: "runner-a", Total: 4}) // generation 2
+
+		id := "sess_gen"
+		seedSession(t, st, Session{ID: id, State: StateCreating, Runner: "runner-a"})
+		dead := runner.FromRunner{Type: "event", Session: id, State: "dead"}
+
+		stale := newRunnerConn("runner-a", nil)
+		stale.gen = 1
+		s.applyRunnerEvent(context.Background(), stale, dead)
+		if got := getSession(t, st, id); got.State != StateCreating {
+			t.Fatalf("state = %q, want still creating — a superseded generation was applied", got.State)
+		}
+
+		live := newRunnerConn("runner-a", nil)
+		live.gen = s.gens.current("runner-a")
+		if live.gen == stale.gen {
+			t.Fatalf("generation did not advance across the redial: %d", live.gen)
+		}
+		s.applyRunnerEvent(context.Background(), live, dead)
+		if got := wantState(t, st, id, StateDead); got.Error != "runner reported dead" {
+			t.Fatalf("error = %q, want %q", got.Error, "runner reported dead")
+		}
+	})
 }

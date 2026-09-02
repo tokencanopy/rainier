@@ -1033,12 +1033,15 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 		}
 	}
 
-	// A path that is not there answers with the sandbox's own sentence, not a
-	// truncated archive.
+	// A path that is not there answers with an error, not a truncated
+	// archive. The sentence is the API's own: the sandbox understood the
+	// request and declined it (409 conflict, as it has always been), and a
+	// provider-neutral service does not relay a sandbox's words (D1).
 	if err := Pull(c, id, "widget/nothing", t.TempDir(), nil); err == nil {
 		t.Fatal("Pull of a path the session does not have returned nil")
-	} else if !strings.Contains(err.Error(), "does not exist") {
-		t.Fatalf("Pull of a missing path = %v, want the sandbox's own sentence", err)
+	} else if !strings.Contains(err.Error(), "conflict") ||
+		!strings.Contains(err.Error(), "refused the file transfer") {
+		t.Fatalf("Pull of a missing path = %v, want the API's own refusal", err)
 	}
 
 	// --- attach: attachio.Run's non-tty path, exactly like cmd/rainier's

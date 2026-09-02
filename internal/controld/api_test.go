@@ -113,48 +113,6 @@ func assertKeySet(t *testing.T, raw string, want ...string) {
 	}
 }
 
-// drainWake empties a possibly-already-pending wake, so a later assertWoke
-// only sees a wake this test's own action caused.
-func drainWake(s *Server) {
-	select {
-	case <-s.schedWake:
-	default:
-	}
-}
-
-// assertWoke fails unless wakeScheduler was called (a wake is now pending)
-// since the matching drainWake.
-func assertWoke(t *testing.T, s *Server) {
-	t.Helper()
-	select {
-	case <-s.schedWake:
-	default:
-		t.Fatal("wakeScheduler was not called")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// authorizeOwnerOrAdmin (unit)
-// ---------------------------------------------------------------------------
-
-func TestAuthorizeOwnerOrAdmin(t *testing.T) {
-	admin := User{ID: "usr_admin", Role: "admin"}
-	owner := User{ID: "usr_owner", Role: "member"}
-	other := User{ID: "usr_other", Role: "member"}
-	row := Session{OwnerID: "usr_owner"}
-
-	if !authorizeOwnerOrAdmin(admin, row) {
-		t.Error("admin should be authorized regardless of ownership")
-	}
-	if !authorizeOwnerOrAdmin(owner, row) {
-		t.Error("owner should be authorized")
-	}
-	if authorizeOwnerOrAdmin(other, row) {
-		t.Error("non-owner non-admin should not be authorized")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Handler route vocabulary — the /v0/ cut's contract pin
 // ---------------------------------------------------------------------------
 
@@ -530,40 +488,63 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		}
 	})
 
-	// The cache is a per-runner local image, not a registry: dispatching a
-	// cache-hit ref to any other runner would `docker pull` a ref no daemon can
-	// resolve. So a cache whose holder cannot take the session right now is not
-	// a cache hit at all.
-	t.Run("a cache whose holder has no free slot falls back to image and setup", func(t *testing.T) {
+	// D3: a current cache is the image the session runs, whoever holds it and
+	// whatever room they have. The cache is a per-runner local image, not a
+	// registry, so the affinity that used to be a fallback ("rebuild from the
+	// plain image anywhere") became a placement pin instead: the environment
+	// carries the capability snapshot:<runner> and the session waits for that
+	// runner rather than booting a different image somewhere else.
+	//
+	// Both halves are asserted: the image the create resolves to, and where
+	// the scheduler will (not) put it. The other half of the pin — a create
+	// dispatched to the holder even when a roomier runner is standing by — is
+	// sched_test.go's TestCacheTiebreakPrefersTheSnapshotHolder.
+	t.Run("a cache whose holder has no free slot still resolves to the snapshot", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		joinRunner(t, s, ts, runnerScript{Name: "vm1", Used: 1, Total: 1}) // the holder, full
 		f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 2})
 		startRun(t, s)
 		_, tok := loginUser(t, st, "alice", "member")
 
+		const ref = "rainier-env:cached-0123456789ab"
 		env := seedEnv(t, st, Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
-		cacheEnvSnapshot(t, st, env, "rainier-env:cached-0123456789ab", "vm1")
+		cacheEnvSnapshot(t, st, env, ref, "vm1")
 
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "e5", "environment": "cached"})
-		if row := getSession(t, st, got.ID); row.ResolvedImage != "env-img:1" {
-			t.Errorf("stored resolved_image = %q, want the plain image", row.ResolvedImage)
+		if row := getSession(t, st, got.ID); row.ResolvedImage != ref {
+			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.ResolvedImage, ref)
 		}
-		cmd := nextCreate(t, f2)
-		if cmd.Spec.Image != "env-img:1" || cmd.Spec.Setup != "echo hi" {
-			t.Fatalf("spec = %+v, want the plain image rebuilt with its setup on vm2", cmd.Spec)
+		// D3, the placement half: vm2 has two free slots and is never
+		// offered the session, because the image it would boot exists only
+		// on vm1. The session waits for vm1 instead.
+		time.Sleep(150 * time.Millisecond)
+		if row := getSession(t, st, got.ID); row.State != StateQueued || row.Runner != "" {
+			t.Fatalf("session = %q on %q, want still queued and unplaced (pinned to the full holder)", row.State, row.Runner)
 		}
+		wantNothingQueued(t, s, f2)
 	})
 
-	t.Run("a cache whose holder is disconnected falls back to image and setup", func(t *testing.T) {
-		st, ts, f, tok := oneRunnerFleet(t)
-		env := seedEnv(t, st, Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
-		cacheEnvSnapshot(t, st, env, "rainier-env:cached-0123456789ab", "vm-gone")
+	t.Run("a cache whose holder is disconnected still resolves to the snapshot", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+		startRun(t, s)
+		_, tok := loginUser(t, st, "alice", "member")
 
-		createWithEnv(t, ts, tok, map[string]any{"name": "e6", "environment": "cached"})
-		spec := nextCreate(t, f).Spec
-		if spec.Image != "env-img:1" || spec.Setup != "echo hi" {
-			t.Fatalf("spec = %+v, want the plain image rebuilt with its setup", spec)
+		const ref = "rainier-env:cached-0123456789ab"
+		env := seedEnv(t, st, Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
+		cacheEnvSnapshot(t, st, env, ref, "vm-gone")
+
+		got := createWithEnv(t, ts, tok, map[string]any{"name": "e6", "environment": "cached"})
+		if row := getSession(t, st, got.ID); row.ResolvedImage != ref {
+			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.ResolvedImage, ref)
 		}
+		// D3 again, with the holder absent rather than full: no connected
+		// runner advertises snapshot:vm-gone, so nothing is placed at all.
+		time.Sleep(150 * time.Millisecond)
+		if row := getSession(t, st, got.ID); row.State != StateQueued || row.Runner != "" {
+			t.Fatalf("session = %q on %q, want still queued and unplaced (its holder is gone)", row.State, row.Runner)
+		}
+		wantNothingQueued(t, s, f)
 	})
 
 	t.Run("a snapshot built from superseded setup is not used", func(t *testing.T) {
@@ -603,13 +584,28 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		}
 	})
 
-	t.Run("a session egress_allow overrides the environment's", func(t *testing.T) {
+	// A session's egress_allow extends the environment's list rather than
+	// replacing it (control.PortableSpec): the environment's egress is what it
+	// needs to work, and a session adds hosts to it.
+	t.Run("a session egress_allow extends the environment's", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
 		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", EgressAllow: []string{"api.github.com"}})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "e9", "environment": "dev", "egress_allow": []string{"pypi.org"}})
-		if got := nextCreate(t, f).Spec.EgressAllow; !slices.Equal(got, []string{"pypi.org"}) {
-			t.Fatalf("spec.EgressAllow = %v, want the session's own [pypi.org]", got)
+		if got := nextCreate(t, f).Spec.EgressAllow; !slices.Equal(got, []string{"api.github.com", "pypi.org"}) {
+			t.Fatalf("spec.EgressAllow = %v, want the environment's list extended by the session's", got)
+		}
+	})
+
+	// An environment carries no command; the session's cmd is how a session
+	// from one says what to run (control.PortableSpec).
+	t.Run("a session cmd is the environment session's command", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
+		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1"})
+
+		createWithEnv(t, ts, tok, map[string]any{"name": "e9b", "environment": "dev", "cmd": []string{"claude"}})
+		if got := nextCreate(t, f).Spec.Cmd; !slices.Equal(got, []string{"claude"}) {
+			t.Fatalf("spec.Cmd = %v, want the session's [claude]", got)
 		}
 	})
 
@@ -759,15 +755,16 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 			t.Errorf("spec attribution = %q/%q, want %q/%q",
 				spec.GitAuthorName, spec.GitAuthorEmail, u.Login, noreplyFor(u))
 		}
-		// The three hosts a clone/push needs, appended to what the session
-		// already had — and recorded on the row, so the allowlist a session
-		// actually runs with is visible rather than implied.
+		// The three hosts a clone/push needs, appended at DISPATCH to what the
+		// session already had. D6: the row and the view carry only what the
+		// caller or the environment declared — the hosts a clone needs are the
+		// launch material's knowledge, added where the clone is ordered.
 		wantEgress := []string{"pypi.org", "github.com", "codeload.github.com", "objects.githubusercontent.com"}
 		if !slices.Equal(spec.EgressAllow, wantEgress) {
 			t.Errorf("spec.EgressAllow = %v, want %v", spec.EgressAllow, wantEgress)
 		}
-		if row := getSession(t, st, got.ID); !slices.Equal(row.EgressAllow, wantEgress) {
-			t.Errorf("stored egress_allow = %v, want %v", row.EgressAllow, wantEgress)
+		if row := getSession(t, st, got.ID); !slices.Equal(row.EgressAllow, []string{"pypi.org"}) {
+			t.Errorf("stored egress_allow = %v, want the environment's own [pypi.org]", row.EgressAllow)
 		}
 	})
 
@@ -868,8 +865,9 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 		if !slices.Equal(spec.EgressAllow, wantEgress) {
 			t.Errorf("spec.EgressAllow = %v, want %v", spec.EgressAllow, wantEgress)
 		}
-		if row := getSession(t, st, got.ID); !slices.Equal(row.EgressAllow, wantEgress) {
-			t.Errorf("stored egress_allow = %v, want %v", row.EgressAllow, wantEgress)
+		// D6: the row carries what the caller declared, which here is nothing.
+		if row := getSession(t, st, got.ID); len(row.EgressAllow) != 0 {
+			t.Errorf("stored egress_allow = %v, want none — the caller declared none", row.EgressAllow)
 		}
 	})
 
@@ -1427,11 +1425,10 @@ func TestGetSession(t *testing.T) {
 
 func TestDeleteSession(t *testing.T) {
 	t.Run("queued cancels without dispatch and wakes the scheduler", func(t *testing.T) {
-		s, st, ts := newTestControld(t)
+		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
 		seedSession(t, st, Session{ID: "sess_del_q", OwnerID: owner.ID, State: StateQueued, Name: "delq"})
 
-		drainWake(s)
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_q", tok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
@@ -1440,7 +1437,11 @@ func TestDeleteSession(t *testing.T) {
 		if got.State != StateCanceled {
 			t.Fatalf("state = %q, want canceled", got.State)
 		}
-		assertWoke(t, s)
+		// The wake itself is the session service's now (controlapp's
+		// DeleteSession wakes the row's pool; controlapp/sessions_test.go
+		// asserts the "wake:pool_a" record), and controld no longer owns a
+		// channel a test could watch — Task 5 deleted schedWake with the
+		// scheduler loop it fed.
 	})
 
 	t.Run("creating is 409 conflict, no dispatch", func(t *testing.T) {
@@ -2021,7 +2022,12 @@ func TestResumeSession(t *testing.T) {
 		}
 	})
 
-	t.Run("cold resume onto a full runner is 409 no_capacity naming the runner", func(t *testing.T) {
+	// D4: a cold resume that no longer fits is one of the two ways a resume
+	// is refused, and both reach the handler as the same conflict. The slug
+	// narrowed to `conflict` and the sentence stopped naming the runner:
+	// recovering either would mean computing the fleet's free capacity a
+	// second time, in the one place that must make no placement decision.
+	t.Run("cold resume onto a full runner is 409 conflict", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 1, Used: 1,
 			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
@@ -2036,12 +2042,8 @@ func TestResumeSession(t *testing.T) {
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
 		}
-		e := decodeErrBody(t, raw)
-		if e.Error.Code != "no_capacity" {
-			t.Errorf("code = %q, want no_capacity", e.Error.Code)
-		}
-		if !strings.Contains(e.Error.Message, "vm1") {
-			t.Errorf("message = %q, want it to name vm1", e.Error.Message)
+		if e := decodeErrBody(t, raw); e.Error.Code != "conflict" {
+			t.Errorf("code = %q, want conflict", e.Error.Code)
 		}
 	})
 

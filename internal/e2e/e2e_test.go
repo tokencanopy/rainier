@@ -2498,19 +2498,23 @@ func TestConnectorSessionMintsAndReportsDiff(t *testing.T) {
 			spec.GitAuthorName, spec.GitAuthorEmail, e2eLogin, e2eNoreplyEmail)
 	}
 
-	// --- and what its proxy will let through. Asserted on the SESSION VIEW,
-	// not only on the dispatched spec: the row is where a human reads why a
-	// clone is allowed out, and the environment's own host has to survive the
-	// append rather than be replaced by it.
-	gotAllow := rows[created.ID].EgressAllow
+	// --- and what its proxy will let through. D6: the three git hosts are
+	// added where the clone is ordered, from the launch material, rather than
+	// written onto the row at create — the connector said "acme/app", not
+	// three CDN names, and it is the dispatch that knows what a clone reaches.
+	// So the DISPATCHED SPEC carries the environment's own host plus the
+	// three, deduped, while the session view carries what was declared.
 	for _, host := range []string{"registry.example.com", "github.com", "codeload.github.com", "objects.githubusercontent.com"} {
-		if !slices.Contains(gotAllow, host) {
-			t.Fatalf("session egress_allow = %v, want it to carry %q — the connector said \"acme/app\", not three CDN names, so the control plane owes the session the hosts a clone reaches",
-				gotAllow, host)
+		if !slices.Contains(spec.EgressAllow, host) {
+			t.Fatalf("dispatched Spec.EgressAllow = %v, want it to carry %q — the control plane owes the session the hosts a clone reaches",
+				spec.EgressAllow, host)
 		}
 	}
-	if got := len(gotAllow); got != 4 {
-		t.Fatalf("session egress_allow = %v (%d hosts), want exactly the environment's one plus the three git hosts, deduped", gotAllow, got)
+	if got := len(spec.EgressAllow); got != 4 {
+		t.Fatalf("dispatched Spec.EgressAllow = %v (%d hosts), want exactly the environment's one plus the three git hosts, deduped", spec.EgressAllow, got)
+	}
+	if gotAllow := rows[created.ID].EgressAllow; !slices.Equal(gotAllow, []string{"registry.example.com"}) {
+		t.Fatalf("session egress_allow = %v, want exactly what the environment declared", gotAllow)
 	}
 
 	// --- the mint. This is the credential helper's entire exchange, played
@@ -2777,14 +2781,17 @@ func TestPushPullRoundTrip(t *testing.T) {
 	assertTreesEqual(t, src, dst, "the tree that came back to the laptop")
 
 	// A pull of something that is not there is a refusal from inside the
-	// sandbox, and it reaches the client as the sandbox's own sentence rather
-	// than as a truncated archive.
+	// sandbox, and it reaches the client as a refusal — the API's own
+	// sentence under the status a refusal has always carried — rather than as
+	// a truncated archive. The sandbox's own words stop at the service
+	// boundary (D1).
 	err = cli.Pull(f.client(), created.ID, workspace.WorkspaceRoot+"/nothing-here", t.TempDir(), nil)
 	if err == nil {
 		t.Fatal("pulling a path the session does not have succeeded")
 	}
-	if !strings.Contains(err.Error(), "does not exist in this session's workspace") {
-		t.Fatalf("pulling a missing path failed with %v, want the sandbox's own explanation", err)
+	if !strings.Contains(err.Error(), "conflict") ||
+		!strings.Contains(err.Error(), "refused the file transfer") {
+		t.Fatalf("pulling a missing path failed with %v, want the API's own refusal", err)
 	}
 }
 
