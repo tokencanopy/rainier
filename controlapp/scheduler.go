@@ -251,9 +251,10 @@ func (s *FleetService) dispatchCreate(ctx context.Context, pool control.PoolID, 
 		return
 	}
 	res, err := s.transport.Dispatch(ctx, pool, runnerID, runner.ToRunner{
-		Type:    "create",
-		Session: string(row.ID),
-		Spec:    spec,
+		Type:                "create",
+		Session:             string(row.ID),
+		Spec:                spec,
+		PlacementGeneration: s.placedGeneration(ctx, row),
 	})
 	switch {
 	case err != nil:
@@ -271,6 +272,26 @@ func (s *FleetService) dispatchCreate(ctx context.Context, pool control.PoolID, 
 	case !res.OK:
 		s.failCreate(ctx, row, res.Detail)
 	}
+}
+
+// placedGeneration is the placement generation the sandbox this create starts
+// belongs to: the row's AS PLACED, read back from the repository after the
+// transition that named this runner opened it. The row this function was
+// handed is the one drainPool held BEFORE that transition, so its own copy is
+// one behind — and computing the successor here would be this package
+// asserting a rule that is the repository's (ports.go: Transition advances
+// PlacementGeneration when opts.RunnerID names a runner), which is exactly
+// the kind of duplicated arithmetic a stale read is supposed to catch.
+//
+// A read that cannot be made carries nothing rather than the value it knows
+// to be stale: zero is "not carried" on the wire and fences nothing, while a
+// wrong number would fence every event this sandbox ever sends.
+func (s *FleetService) placedGeneration(ctx context.Context, row control.Session) uint64 {
+	placed, err := s.sessions.GetSession(ctx, row.WorkspaceID, row.ID)
+	if err != nil {
+		return 0
+	}
+	return placed.PlacementGeneration
 }
 
 // createSpec builds the runner create spec from the session and its current

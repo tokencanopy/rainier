@@ -754,3 +754,33 @@ func TestCreateSpecSendsSetupUnlessTheRowBootsTheSnapshot(t *testing.T) {
 		})
 	}
 }
+
+// TestDispatchCreateCarriesThePlacementGeneration: the create tells the
+// runner which placement generation the sandbox it is about to start belongs
+// to, and the value is the row's AS PLACED — read back from the repository
+// after the transition that named the runner opened it, never the (already
+// one-behind) copy the caller was handed.
+func TestDispatchCreateCarriesThePlacementGeneration(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.st.seedRunner(fleetSeededRunner("vm1", 2, 0, true))
+	row := control.Session{
+		ID: "sess_pg", WorkspaceID: "ws_example", State: control.StateCreating,
+		PoolID: "pool_example", RunnerID: "vm1", PlacementGeneration: 3,
+		Spec: control.PortableSpec{Image: "img:latest"},
+	}
+	fx.st.seedSession(row)
+
+	// What drainPool holds after its Transition returns: the row as it was
+	// BEFORE the placement, one generation behind the store.
+	stale := row
+	stale.PlacementGeneration = 2
+	fx.service.dispatchCreate(context.Background(), "pool_example", stale, "vm1", nil)
+
+	dispatched := fx.transport.dispatchedCommands()
+	if len(dispatched) != 1 {
+		t.Fatalf("dispatched %d commands, want 1", len(dispatched))
+	}
+	if got := dispatched[0].PlacementGeneration; got != 3 {
+		t.Fatalf("create PlacementGeneration = %d, want 3 (the row as placed)", got)
+	}
+}

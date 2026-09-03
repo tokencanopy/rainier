@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/runnerd"
@@ -25,7 +26,16 @@ func main() {
 	hostname, _ := os.Hostname()
 	runnerName := flag.String("runner-name", hostname, "name this runner announces to controld")
 	proxyURL := flag.String("proxy-url", "", "egress proxy URL injected into every session (forwarded to controld dial mode)")
+	var capabilities capabilityFlag
+	flag.Var(&capabilities, "capability",
+		"a portable capability this runner claims (e.g. gpu); repeatable, or set RAINIER_RUNNER_CAPABILITIES to a comma-separated list")
 	flag.Parse()
+	// The flag wins whole: an operator who passed --capability is naming the
+	// complete set, so the environment's list is a DEFAULT, not something the
+	// flag adds to. Same rule as every other flag here.
+	if len(capabilities) == 0 {
+		capabilities = splitCapabilities(os.Getenv("RAINIER_RUNNER_CAPABILITIES"))
+	}
 
 	drv := driver.NewDocker(driver.DockerOpts{Image: *image, Network: *network, TotalSlots: *slots})
 	// *proxyURL reaches New directly now (Task 13) so the local HTTP-only
@@ -60,13 +70,42 @@ func main() {
 	}()
 	log.Printf("dialing controld at %s as %q", *controld, *runnerName)
 	if err := s.RunAgent(context.Background(), runnerd.AgentConfig{
-		ControldURL: *controld,
-		Token:       *runnerToken,
-		RunnerName:  *runnerName,
-		ProxyURL:    *proxyURL,
+		ControldURL:  *controld,
+		Token:        *runnerToken,
+		RunnerName:   *runnerName,
+		ProxyURL:     *proxyURL,
+		Capabilities: capabilities,
 	}); err != nil {
 		log.Fatalf("agent: %v", err)
 	}
+}
+
+// capabilityFlag collects a repeatable --capability into the list runnerd
+// announces, in the order they were passed. Nothing is validated here: a
+// capability is a claim about this runner, and controld is the one that
+// decides whether it will accept and schedule on it — refusing a token
+// locally would only move the same error to a place the operator cannot see
+// the fleet's answer.
+type capabilityFlag []string
+
+func (c *capabilityFlag) String() string { return strings.Join(*c, ",") }
+
+func (c *capabilityFlag) Set(v string) error {
+	*c = append(*c, v)
+	return nil
+}
+
+// splitCapabilities reads RAINIER_RUNNER_CAPABILITIES: a comma-separated
+// list, trimmed, with empty entries dropped so a trailing comma (or an unset
+// variable) announces nothing rather than a nameless capability.
+func splitCapabilities(v string) []string {
+	var out []string
+	for _, part := range strings.Split(v, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 // envDefault returns env's value when it is set and non-empty, else def — the

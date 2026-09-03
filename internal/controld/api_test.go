@@ -1656,6 +1656,7 @@ func TestDeleteSession(t *testing.T) {
 		// waiting for another reconnect would leave capacity occupied forever.
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Used: 1, Total: 4,
 			Sessions: []runner.SessionInfo{{ID: id, State: "running"}}})
+		drainAccept(t, f)
 		first := f.nextCmd(t)
 		if first.Type != "destroy" || first.Session != id || first.ReqID == 0 {
 			t.Fatalf("first command = %+v, want tracked destroy of %s", first, id)
@@ -3259,7 +3260,7 @@ func TestCreateEnvironment(t *testing.T) {
 		}
 		assertKeySet(t, string(outer["environment"]),
 			"id", "name", "image", "setup", "setup_hash", "init", "init_timeout_sec", "egress_allow", "secret_refs",
-			"connectors", "placement", "setup_timeout_sec", "snapshot_ref", "snapshot_runner",
+			"connectors", "placement", "capabilities", "setup_timeout_sec", "snapshot_ref", "snapshot_runner",
 			"snapshot_hash", "created_at", "updated_at")
 	})
 
@@ -3525,7 +3526,7 @@ func TestListEnvironments(t *testing.T) {
 		}
 		assertKeySet(t, string(arr[0]),
 			"id", "name", "image", "setup", "setup_hash", "init", "init_timeout_sec", "egress_allow", "secret_refs",
-			"connectors", "placement", "setup_timeout_sec", "snapshot_ref", "snapshot_runner",
+			"connectors", "placement", "capabilities", "setup_timeout_sec", "snapshot_ref", "snapshot_runner",
 			"snapshot_hash", "created_at", "updated_at")
 	})
 
@@ -4234,6 +4235,7 @@ func TestCreateDurableBeforeDispatch(t *testing.T) {
 			t.Fatalf("CreateSession never recorded a commit time for %s", id)
 		}
 
+		drainAccept(t, f)
 		cmd := f.nextCmd(t)
 		dispatchAt := time.Now()
 		if cmd.Type != "create" || cmd.Session != id {
@@ -4263,6 +4265,7 @@ func TestCreateDurableBeforeDispatch(t *testing.T) {
 		}
 		id := body.Session.ID
 
+		drainAccept(t, f)
 		cmd := f.nextCmd(t) // reaches the runner; never answered
 		if cmd.Type != "create" || cmd.Session != id {
 			t.Fatalf("got %+v, want create of %s", cmd, id)
@@ -4276,4 +4279,109 @@ func TestCreateDurableBeforeDispatch(t *testing.T) {
 			t.Fatalf("state = %q, want creating or queued (never lost)", got.State)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// environments: portable capabilities (plan 8, D18)
+// ---------------------------------------------------------------------------
+
+// TestEnvironmentCapabilities pins the field an operator uses to say what a
+// runner must be able to do before this environment's sessions land on it:
+// it round-trips through create, get and update, renders as [] rather than
+// null when there is none, and is validated by the same token rule a runner's
+// own announced capabilities are.
+func TestEnvironmentCapabilities(t *testing.T) {
+	t.Run("round-trips through create, get and update", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", map[string]any{
+			"capabilities": []string{"gpu", "docker.rootless"},
+		}))
+		if !slices.Equal(created.Capabilities, []string{"gpu", "docker.rootless"}) {
+			t.Fatalf("created capabilities = %v, want [gpu docker.rootless]", created.Capabilities)
+		}
+		if got := getEnv(t, ts, adminTok, created.ID); !slices.Equal(got.Capabilities, created.Capabilities) {
+			t.Fatalf("read back = %v, want %v", got.Capabilities, created.Capabilities)
+		}
+
+		resp := doJSON(t, ts, http.MethodPatch, "/v0/environments/"+created.ID, adminTok,
+			map[string]any{"capabilities": []string{"gpu"}}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("PATCH status = %d, want 200; body=%s", resp.StatusCode, raw)
+		}
+		if got := getEnv(t, ts, adminTok, created.ID); !slices.Equal(got.Capabilities, []string{"gpu"}) {
+			t.Fatalf("after the patch = %v, want [gpu]", got.Capabilities)
+		}
+
+		// The pin and the portable requirements are independent fields: a
+		// patch that names one must leave the other exactly as it was.
+		resp = doJSON(t, ts, http.MethodPatch, "/v0/environments/"+created.ID, adminTok,
+			map[string]any{"placement": "vm1"}, nil)
+		readBody(t, resp)
+		after := getEnv(t, ts, adminTok, created.ID)
+		if after.Placement != "vm1" || !slices.Equal(after.Capabilities, []string{"gpu"}) {
+			t.Fatalf("placement/capabilities = %q/%v, want vm1/[gpu]", after.Placement, after.Capabilities)
+		}
+	})
+
+	t.Run("an environment with none renders [] and never null", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doJSON(t, ts, http.MethodPost, "/v0/environments", adminTok, envCreateBody("dev", nil), nil)
+		raw := readBody(t, resp)
+		var outer map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &outer); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		var env map[string]json.RawMessage
+		if err := json.Unmarshal(outer["environment"], &env); err != nil {
+			t.Fatalf("decode environment: %v", err)
+		}
+		if string(env["capabilities"]) != "[]" {
+			t.Fatalf("capabilities = %s, want []", env["capabilities"])
+		}
+	})
+
+	t.Run("a capability that is not a token is 400", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doJSON(t, ts, http.MethodPost, "/v0/environments", adminTok,
+			envCreateBody("dev", map[string]any{"capabilities": []string{"GPU"}}), nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+		}
+		if !strings.Contains(raw, "capabilities") {
+			t.Fatalf("body = %s, want it to name the capabilities field", raw)
+		}
+	})
+}
+
+// TestQueueReasonNamesAMissingCapability: a session that cannot be placed
+// because no connected runner claims what its environment requires says so,
+// naming the first requirement nothing in the fleet advertises. The pinned
+// runner's own reason keeps precedence — a pin is the more specific answer.
+func TestQueueReasonNamesAMissingCapability(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	_, adminTok := loginUser(t, st, "root", "admin")
+	joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+
+	env := createEnv(t, ts, adminTok, envCreateBody("gpu-env", map[string]any{
+		"capabilities": []string{"gpu"},
+	}))
+	owner, tok := loginUser(t, st, "alice", "member")
+	seedSession(t, st, control.Session{ID: "sess_wants_gpu", CreatorID: control.ActorID(owner.ID),
+		State: control.StateQueued, EnvironmentID: control.EnvironmentID(env.ID)})
+
+	resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_wants_gpu", tok, nil, nil)
+	raw := readBody(t, resp)
+	var body sessionEnvelope
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, raw)
+	}
+	if got, want := body.Session.QueueReason, "waiting for a runner with capability gpu"; got != want {
+		t.Fatalf("queue_reason = %q, want %q", got, want)
+	}
 }

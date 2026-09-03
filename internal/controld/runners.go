@@ -103,6 +103,13 @@ type runnerConn struct {
 	// connection is fenced by the fleet service (ErrStale) instead of being
 	// applied under the generation of the socket that replaced it.
 	gen uint64
+	// caps is the capability list this connection registered: the host's two
+	// spellings of the runner's name plus what its announce claimed. It is
+	// held here because the heartbeat rewrites the whole runner row, and a
+	// heartbeat that rebuilt the list from the name alone would erase the
+	// runner's own claims the first time it said anything at all. Written
+	// once, in connectRunner, before any goroutine reads it.
+	caps []string
 
 	mu      sync.Mutex
 	pending map[uint64]chan runner.FromRunner
@@ -399,7 +406,7 @@ func (s *Server) touchRunner(ctx context.Context, rc *runnerConn, m runner.FromR
 		CapacityTotal: m.Total,
 		Connected:     true,
 		Generation:    rc.gen,
-		Capabilities:  runnerCapabilities(rc.name),
+		Capabilities:  rc.caps,
 		LastSeenAt:    time.Now(),
 	})
 	switch {
@@ -428,11 +435,14 @@ func (s *Server) touchRunner(ctx context.Context, rc *runnerConn, m runner.FromR
 // credential is news about its OWNER — so they stay here, in the adapter that
 // owns the vault and the snapshot cache (see applyAdapterArm).
 //
-// The event is stamped with rc.gen, the generation of the connection it
-// arrived on, never the runner's current one: a message that outlived its own
-// socket must be fenced by the service (ErrStale), not applied under the
-// generation of the connection that replaced it. touchRunner already drops
-// such a message on the way in; this is the second lock on the same door.
+// The event is stamped with the generation it was PRODUCED under — the one
+// the runner echoed from its accept, or the connection's when it echoed none
+// (eventGeneration) — never the runner's current one: a message that outlived
+// its own socket must be fenced by the service (ErrStale), not applied under
+// the generation of the connection that replaced it. touchRunner already
+// drops such a message on the way in; this is the second lock on the same
+// door, and the session's own placement generation, carried through to the
+// service, is the third.
 func (s *Server) applyRunnerEvent(ctx context.Context, rc *runnerConn, m runner.FromRunner) {
 	name := rc.name
 	if m.Session == "" {
@@ -443,8 +453,11 @@ func (s *Server) applyRunnerEvent(ctx context.Context, rc *runnerConn, m runner.
 		WorkspaceID: installWorkspace,
 		PoolID:      installPool,
 		RunnerID:    control.RunnerID(name),
-		Generation:  rc.gen,
+		Generation:  eventGeneration(rc, m),
 		SessionID:   control.SessionID(m.Session),
+		// Carried through untouched: the session's own authority is the
+		// store's to check, not this adapter's (controlapp fences it).
+		PlacementGeneration: m.PlacementGeneration,
 	}
 	switch m.State {
 	case "running":
@@ -509,6 +522,22 @@ func (s *Server) applyRunnerEvent(ctx context.Context, rc *runnerConn, m runner.
 		log.Printf("controld: runner %s: event %s for %s not applied: %v",
 			name, clip(m.State), clip(m.Session), err)
 	}
+}
+
+// eventGeneration is the runner generation an event is applied under: the one
+// the message itself claims, when it claims one, and otherwise the connection
+// it arrived on.
+//
+// A runner that carries its granted generation is the more precise fence: a
+// message can outlive the connection that produced it (it was queued, or the
+// socket was replaced while it was in flight), and the claim travels with the
+// message where the connection does not. Zero is an old runner, which claims
+// nothing and is therefore judged by its socket exactly as before.
+func eventGeneration(rc *runnerConn, m runner.FromRunner) uint64 {
+	if m.Generation != 0 {
+		return m.Generation
+	}
+	return rc.gen
 }
 
 // applyAdapterArm handles the two events that transition nothing: a finished
@@ -888,9 +917,22 @@ var errRegistrationRefused = errors.New("registration refused")
 // advertises are the two synthesized for its own name (adapt_scope.go), and
 // the native fleet repository now persists them.
 func (s *Server) connectRunner(ctx context.Context, rc *runnerConn, ann runner.FromRunner) error {
+	// Validated BEFORE anything is registered: a runner claiming something it
+	// may not claim is not a runner this fleet will schedule on at all, and
+	// the refusal must leave nothing behind.
+	if err := validateRunnerCapabilities(ann.Capabilities); err != nil {
+		return fmt.Errorf("%w: %v", errRegistrationRefused, err)
+	}
+
 	nl := s.nameLock(rc.name)
 	nl.Lock()
 	defer nl.Unlock()
+
+	// The host's two spellings of this runner's own name first, then what the
+	// runner claims about itself. One list, two authors, and the order says
+	// which is which. Kept on the connection so the heartbeat writes the same
+	// list this registration did.
+	rc.caps = append(runnerCapabilities(rc.name), ann.Capabilities...)
 
 	s.registerRunner(rc)
 	reg, err := s.fleet.RegisterRunner(ctx, control.RunnerRegistration{
@@ -899,7 +941,7 @@ func (s *Server) connectRunner(ctx context.Context, rc *runnerConn, ann runner.F
 		Generation:    rc.gen,
 		CapacityUsed:  ann.Used,
 		CapacityTotal: ann.Total,
-		Capabilities:  runnerCapabilities(rc.name),
+		Capabilities:  rc.caps,
 		Sessions:      announcedSessions(ann.Sessions),
 	})
 	switch {
@@ -908,7 +950,27 @@ func (s *Server) connectRunner(ctx context.Context, rc *runnerConn, ann runner.F
 	case !reg.Accepted:
 		return fmt.Errorf("%w: the fleet holds generation %d", errRegistrationRefused, reg.Generation)
 	}
+	// The answer to the announce, and the first thing this runner hears:
+	// the generation it acts under, and the capabilities controld took from
+	// it. Enqueued while the registration still holds the name lock and
+	// before reconcile dispatches a single destroy, so it cannot arrive
+	// behind a command — the writer drains this queue in order.
+	if err := rc.enqueue(runner.ToRunner{
+		Type: "accept", Generation: rc.gen, Capabilities: ann.Capabilities,
+	}); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateRunnerCapabilities checks what a runner claimed on its announce
+// against the one capability rule this installation has (adapt_scope.go). A
+// failure refuses the registration outright rather than dropping the offending
+// token: a runner that announces something it may not announce is not
+// misconfigured in a way controld can silently paper over, and half-accepting
+// its claims would place sessions on a runner nobody described.
+func validateRunnerCapabilities(caps []string) error {
+	return validateCapabilities("announced capabilities", caps)
 }
 
 // registerRunner installs rc as the live connection for its runner and

@@ -290,12 +290,25 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 // this server's own concerns (the id parameter, s.dialBase, s.proxyURL), not
 // anything a caller — HTTP body or runner.Spec — should be trusted to supply.
 func (s *Server) CreateWithID(ctx context.Context, id string, spec driver.Spec, allow []string) error {
+	// The local HTTP surface has no control plane behind it and therefore no
+	// placement generation to carry: zero is the honest value, and it fences
+	// nothing.
+	return s.createWithID(ctx, id, spec, allow, 0)
+}
+
+// createWithID is CreateWithID plus the one thing only a control-plane create
+// knows: the placement generation the sandbox belongs to, kept on the entry so
+// every event about this session can echo it. It is a separate, unexported
+// entry point rather than a fifth parameter on the exported one because
+// CreateWithID is the local surface's contract and has no such notion.
+func (s *Server) createWithID(ctx context.Context, id string, spec driver.Spec, allow []string, placementGen uint64) error {
 	// The env KEYS are captured here, at the claim, because this is the last
 	// moment the Spec exists: a snapshot minutes later has to name them so the
 	// commit doesn't bake their values into the environment's cached image,
 	// and nothing else in this process remembers what was injected. Keys only
 	// — see sessionEntry.envKeys.
-	if !s.reg.putIfAbsent(id, &sessionEntry{id: id, state: "starting", allow: allow, envKeys: envKeys(spec.Env)}) {
+	if !s.reg.putIfAbsent(id, &sessionEntry{id: id, state: "starting", allow: allow,
+		envKeys: envKeys(spec.Env), placementGen: placementGen}) {
 		return errSessionExists
 	}
 	if err := s.pushEgress(id, allow); err != nil {
