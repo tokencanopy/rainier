@@ -19,6 +19,7 @@ import (
 
 	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/v0wire"
 )
 
 const testRunnerToken = "rnr_test_runner_token"
@@ -1825,7 +1826,7 @@ func apiSessionState(t *testing.T, ts *httptest.Server, tok, id string) control.
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /v0/sessions/%s = %d; body=%s", id, resp.StatusCode, raw)
 	}
-	var body sessionEnvelope
+	var body v0wire.SessionEnvelope
 	if err := json.Unmarshal([]byte(raw), &body); err != nil {
 		t.Fatalf("decode session view: %v; body=%s", err, raw)
 	}

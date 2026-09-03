@@ -2,9 +2,7 @@
 package controld
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +18,7 @@ import (
 	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/controlapp"
 	"github.com/tokencanopy/rainier/protocol/workspace"
+	"github.com/tokencanopy/rainier/v0wire"
 )
 
 // sessionsBodyLimit caps every request body this file decodes: the create
@@ -36,87 +35,6 @@ const (
 	defaultListLimit = 50
 	maxListLimit     = 100
 )
-
-// ---------------------------------------------------------------------------
-// wire shapes
-// ---------------------------------------------------------------------------
-
-// sessionView is the client-facing rendering of a Session: every field the
-// route table promises, RFC 3339 UTC timestamps, and nil Cmd/EgressAllow
-// normalized to "[]" so the API never exposes memstore-vs-pgstore's
-// nil-vs-empty-slice difference. No field is omitempty — the key set is
-// meant to be identical on every session, which is what the response-shape
-// regression tests pin.
-//
-// Image is the image the session ACTUALLY runs: for a session started from an
-// environment that is the resolved one (the environment's image, or its
-// cached snapshot), not the empty override the client sent. Environment and
-// QueueReason are derived, never stored — see sessionDerived.
-type sessionView struct {
-	ID          string   `json:"id"`
-	OwnerID     string   `json:"owner_id"`
-	Name        string   `json:"name"`
-	Image       string   `json:"image"`
-	Cmd         []string `json:"cmd"`
-	EgressAllow []string `json:"egress_allow"`
-	State       string   `json:"state"`
-	Runner      string   `json:"runner"`
-	Reachable   bool     `json:"reachable"`
-	Error       string   `json:"error"`
-	Environment string   `json:"environment"`
-	QueueReason string   `json:"queue_reason"`
-	// ChildExitCode is the exit status of the session's agent process, once
-	// it has one, and null until then. A POINTER, and rendered as null rather
-	// than omitted, because exit 0 is an ANSWER: a session whose agent
-	// finished cleanly has to be distinguishable from one still working, and
-	// a plain int would make those two the same 0. Present on every session
-	// like every other field here — a key that appears only sometimes cannot
-	// be told apart from an older controld that never had it.
-	ChildExitCode *int   `json:"child_exit_code"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedAt     string `json:"updated_at"`
-	LastEventAt   string `json:"last_event_at"`
-}
-
-// sessionDerived carries the three view fields that cannot be read off the
-// session row: each depends on live connection state or on another table, and
-// none is stored. Reachable follows the rule s.Runner != "" &&
-// runnerConnected(s.Runner) && !s.State.Terminal(); Environment is the
-// environment's NAME ("" for a scratch session, or one whose environment has
-// since been deleted); QueueReason explains a queued session that is waiting
-// on a specific runner. sessionRenderer computes all three.
-type sessionDerived struct {
-	Reachable   bool
-	Environment string
-	QueueReason string
-}
-
-// sessionJSON renders s as its client-facing view, with d supplying the
-// fields the row itself cannot answer for.
-func sessionJSON(s control.Session, d sessionDerived) sessionView {
-	return sessionView{
-		ID:          string(s.ID),
-		OwnerID:     string(s.CreatorID),
-		Name:        s.Name,
-		Image:       s.Spec.Image,
-		Cmd:         emptyIfNil(s.Spec.Cmd),
-		EgressAllow: emptyIfNil(s.Spec.EgressAllow),
-		State:       string(s.State),
-		Runner:      string(s.RunnerID),
-		Reachable:   d.Reachable,
-		Error:       s.Error,
-		Environment: d.Environment,
-		QueueReason: d.QueueReason,
-		// Copied, never aliased: the row's pointer may be into a store's own
-		// map (memstore hands out clones for exactly this reason, but a view
-		// that relied on that would be one refactor away from letting a
-		// response mutate the store).
-		ChildExitCode: copyIntPtr(s.ChildExitCode),
-		CreatedAt:     s.CreatedAt.UTC().Format(time.RFC3339),
-		UpdatedAt:     s.UpdatedAt.UTC().Format(time.RFC3339),
-		LastEventAt:   s.LastEventAt.UTC().Format(time.RFC3339),
-	}
-}
 
 // ---------------------------------------------------------------------------
 // rendering a session view
@@ -160,13 +78,13 @@ func (s *Server) renderer(ctx context.Context) *sessionRenderer {
 }
 
 // view renders one session.
-func (r *sessionRenderer) view(row control.Session) sessionView {
-	d := sessionDerived{Reachable: r.srv.reachable(row)}
+func (r *sessionRenderer) view(row control.Session) v0wire.SessionView {
+	d := v0wire.SessionDerived{Reachable: r.srv.reachable(row)}
 	if env := r.environment(string(row.EnvironmentID)); env != nil {
 		d.Environment = env.Name
 		d.QueueReason = r.queueReason(row, *env)
 	}
-	return sessionJSON(row, d)
+	return v0wire.RenderSession(row, d)
 }
 
 // environment returns the environment for id, or nil for a scratch session,
@@ -324,52 +242,12 @@ func (r *sessionRenderer) freeSlots() map[string]int {
 	return free
 }
 
-// emptyIfNil returns ss, or a non-nil empty slice in its place, so
-// json.Marshal always produces "[]" rather than the JSON scalar null.
-func emptyIfNil(ss []string) []string {
-	if ss == nil {
-		return []string{}
-	}
-	return ss
-}
-
-// copyIntPtr clones a nullable int so a rendered view never shares storage
-// with the row it came from. nil stays nil — which is the wire's null, and
-// the honest answer for a session whose agent has not exited.
-func copyIntPtr(p *int) *int {
-	if p == nil {
-		return nil
-	}
-	v := *p
-	return &v
-}
-
-// reachable computes sessionJSON's "reachable" flag for row: a session held
-// by a runner that has a control connection to this replica right now, and is
-// still live enough for that connection to mean anything.
+// reachable computes the session view's "reachable" flag for row (one of
+// v0wire.SessionDerived's three): a session held by a runner that has a
+// control connection to this replica right now, and is still live enough for
+// that connection to mean anything.
 func (s *Server) reachable(row control.Session) bool {
 	return row.RunnerID != "" && s.transport.Connected(installPool, row.RunnerID) && !row.State.Terminal()
-}
-
-type sessionEnvelope struct {
-	Session sessionView `json:"session"`
-}
-
-type sessionsEnvelope struct {
-	Sessions   []sessionView `json:"sessions"`
-	NextCursor string        `json:"next_cursor"`
-}
-
-type runnerSummary struct {
-	Name          string `json:"name"`
-	Connected     bool   `json:"connected"`
-	CapacityUsed  int    `json:"capacity_used"`
-	CapacityTotal int    `json:"capacity_total"`
-	LastSeenAt    string `json:"last_seen_at"`
-}
-
-type runnersEnvelope struct {
-	Runners []runnerSummary `json:"runners"`
 }
 
 type snapshotResponse struct {
@@ -377,103 +255,29 @@ type snapshotResponse struct {
 }
 
 // ---------------------------------------------------------------------------
-// request bodies
-// ---------------------------------------------------------------------------
-
-// createSessionRequest is POST /v0/sessions's body. Environment names the
-// environment this session starts from, by name or by id; omitting it is a
-// scratch session, exactly as before environments existed. Image and
-// EgressAllow are overrides when it is present — see resolveEnvironment.
-type createSessionRequest struct {
-	Name        string   `json:"name,omitempty"`
-	Image       string   `json:"image,omitempty"`
-	Cmd         []string `json:"cmd,omitempty"`
-	EgressAllow []string `json:"egress_allow,omitempty"`
-	Environment string   `json:"environment,omitempty"`
-	// Repos overrides the repositories the environment's github connectors
-	// declare. Absent inherits them; an explicit empty array clones nothing,
-	// exactly the nil-vs-empty distinction egress_allow already draws — and
-	// for the same reason: "I didn't say" and "I said none" are different
-	// answers, and a session that means to be scratch under a repo-carrying
-	// environment has no other way to say so.
-	Repos []repoRequest `json:"repos,omitempty"`
-}
-
-// repoRequest is one entry of that array. BaseBranch is a pointer for the
-// same reason the github connector's is: an explicitly empty base_branch is a
-// typo, never a request for the default, and it must not reach the clone as
-// one.
-type repoRequest struct {
-	Repo       string  `json:"repo"`
-	BaseBranch *string `json:"base_branch"`
-}
-
-// repoOverrides validates a create body's `repos` and returns the refs to
-// record on the session row. It preserves nil-vs-empty: nil in, nil out
-// (inherit the environment's connectors); empty in, empty out (clone
-// nothing).
-//
-// The errors are the caller's to read — each names the offending entry by
-// index and what was wrong with it — and none carries internal detail.
-func repoOverrides(reqs []repoRequest) ([]control.RepoRef, error) {
-	if reqs == nil {
-		return nil, nil
-	}
-	out := make([]control.RepoRef, 0, len(reqs))
-	for i, req := range reqs {
-		if !validRepoRef(req.Repo) {
-			return nil, fmt.Errorf("repos[%d].repo must be \"owner/name\", got %q", i, req.Repo)
-		}
-		ref := control.RepoRef{Repo: req.Repo}
-		if req.BaseBranch != nil {
-			if *req.BaseBranch == "" {
-				return nil, fmt.Errorf("repos[%d].base_branch is empty; omit it for the default (%s)", i, defaultBaseBranch)
-			}
-			ref.BaseBranch = *req.BaseBranch
-		}
-		out = append(out, ref)
-	}
-	return out, nil
-}
-
-// suspendRequest's Warm is a pointer so an absent field is distinguishable
-// from an explicit false — the default is true either way.
-type suspendRequest struct {
-	Warm *bool `json:"warm,omitempty"`
-}
-
-// decodeJSONBody decodes r's body (capped at sessionsBodyLimit) into v,
-// rejecting unknown fields and a body holding more than one JSON value. An
-// empty body decodes to v's zero value: every field in every body this API
-// accepts is optional, so "no body at all" and "{}" are the same request.
-// It writes a 400 invalid_request response and returns false on any
-// failure; callers should return immediately when it does.
-func decodeJSONBody(w http.ResponseWriter, r *http.Request, v any) bool {
-	return decodeJSONBodyLimit(w, r, v, sessionsBodyLimit)
-}
-
-// decodeJSONBodyLimit is decodeJSONBody with an explicit byte cap, for the
-// one body that isn't a small fixed-shape object: PUT /v0/secrets/{name}
-// carries a value up to maxSecretValueBytes, which JSON escaping can inflate
-// well past the sessions limit.
-func decodeJSONBodyLimit(w http.ResponseWriter, r *http.Request, v any, limit int64) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, limit)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
-		writeErr(w, http.StatusBadRequest, "invalid_request", "malformed request body")
-		return false
-	}
-	if dec.More() {
-		writeErr(w, http.StatusBadRequest, "invalid_request", "request body must contain a single JSON object")
-		return false
-	}
-	return true
-}
-
-// ---------------------------------------------------------------------------
 // the session service's errors on the wire
 // ---------------------------------------------------------------------------
+
+// unavailableStatus refines ErrUnavailable the way today's handlers split it:
+// for a session placed on a runner, the dependency a lifecycle command fails
+// on is the runner — it has no control connection here, or it has one and did
+// not answer within OpTimeout — and both have always been 502
+// runner_unreachable (ErrDispatchTimeout wraps ErrRunnerUnreachable). The
+// message says which. A session placed nowhere has no runner to blame, so its
+// ErrUnavailable is the store's and stays 500.
+//
+// It is the host's refinement, not the wire's: only this replica knows which
+// runners are connected to it, which is why v0wire's table stops at the
+// sentinel and this sits here.
+func (s *Server) unavailableStatus(row control.Session) (int, string, string) {
+	if row.RunnerID == "" {
+		return http.StatusInternalServerError, "internal", "internal error"
+	}
+	if s.transport == nil || !s.transport.Connected(installPool, row.RunnerID) {
+		return http.StatusBadGateway, "runner_unreachable", "runner is not connected"
+	}
+	return http.StatusBadGateway, "runner_unreachable", "runner did not respond"
+}
 
 // sessionErrText is the pair of sentences a session handler owns, because the
 // service reports both situations as one sentinel and cannot know which
@@ -488,9 +292,8 @@ type sessionErrText struct {
 	Refused  string
 }
 
-// writeSessionErr answers a session-service error with controlStatus's fixed
-// mapping (adapt_http.go), with the three refinements every session handler
-// shares.
+// writeSessionErr answers a session-service error with v0wire.StatusFor's
+// fixed mapping, with the three refinements every session handler shares.
 //
 // The order matters. A runner that received the command and reported failure
 // (controlapp.ErrRunnerRefused) is checked FIRST: it wraps ErrUnavailable, so
@@ -501,7 +304,7 @@ type sessionErrText struct {
 // off a re-read of the row. A re-read that fails leaves the fixed 500, the
 // honest answer when we cannot even say whose runner it was.
 func (s *Server) writeSessionErr(w http.ResponseWriter, ctx context.Context, id string, err error, text sessionErrText) {
-	status, code, msg := controlStatus(err)
+	status, code, msg := v0wire.StatusFor(err)
 	if status == 0 {
 		return // the caller went away; there is nobody to answer
 	}
@@ -541,16 +344,21 @@ func (s *Server) writeSessionErr(w http.ResponseWriter, ctx context.Context, id 
 // contract deliberately does not carry — a name index, a vault, and a
 // per-user GitHub credential.
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u User) {
-	var req createSessionRequest
-	if !decodeJSONBody(w, r, &req) {
+	var req v0wire.CreateSessionRequest
+	if !v0wire.DecodeJSON(w, r, &req, sessionsBodyLimit) {
 		return
 	}
 
-	repos, err := repoOverrides(req.Repos)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
+	// The command the service takes is the body's own half of the request:
+	// v0wire owns the shape and the repository rules, this handler owns the
+	// two fields that are not in the body (the idempotency header, and the
+	// environment only a host with the name index can resolve).
+	cmd, bad := v0wire.DecodeCreateSession(req)
+	if bad != "" {
+		writeErr(w, http.StatusBadRequest, "invalid_request", bad)
 		return
 	}
+	cmd.IdempotencyKey = r.Header.Get("Idempotency-Key")
 
 	ctx := withUser(r.Context(), u)
 	scope := userScope(u)
@@ -563,22 +371,8 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 		}
 		env = &resolved
 	}
-	if !s.createPreflight(w, ctx, u, repos, env) {
+	if !s.createPreflight(w, ctx, u, cmd.Repos, env) {
 		return
-	}
-
-	cmd := control.CreateSession{
-		Name:           req.Name,
-		Repos:          repos,
-		IdempotencyKey: r.Header.Get("Idempotency-Key"),
-	}
-	// The session's own spec always travels: for a scratch session it is the
-	// whole description, for an environment session it is layered over the
-	// environment field by field (control.PortableSpec) by the service.
-	cmd.Spec = control.PortableSpec{
-		Image:       req.Image,
-		Cmd:         req.Cmd,
-		EgressAllow: req.EgressAllow,
 	}
 	if env != nil {
 		cmd.EnvironmentID = env.ID
@@ -593,7 +387,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 	}
 
 	w.Header().Set("Location", "/v0/sessions/"+string(created.ID))
-	writeJSON(w, http.StatusAccepted, sessionEnvelope{Session: s.renderer(ctx).view(created)})
+	writeJSON(w, http.StatusAccepted, v0wire.SessionEnvelope{Session: s.renderer(ctx).view(created)})
 }
 
 // createSessionEnvironment resolves a create body's `environment` to the environment
@@ -609,7 +403,7 @@ func (s *Server) createSessionEnvironment(w http.ResponseWriter, ctx context.Con
 		return control.Environment{}, false
 	case err != nil:
 		log.Printf("controld: create session: get environment %q: %v", ref, err)
-		writeControlErr(w, err)
+		v0wire.WriteControlError(w, err)
 		return control.Environment{}, false
 	}
 	return env, true
@@ -750,7 +544,7 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request, u Us
 			writeErr(w, http.StatusBadRequest, "invalid_request", "invalid cursor")
 			return
 		}
-		writeControlErr(w, err)
+		v0wire.WriteControlError(w, err)
 		return
 	}
 
@@ -758,14 +552,14 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request, u Us
 	// each row needs come from outside the session table, and this is what
 	// keeps a page of N sessions from repeating those lookups N times.
 	rend := s.renderer(ctx)
-	views := make([]sessionView, 0, len(page.Sessions))
+	views := make([]v0wire.SessionView, 0, len(page.Sessions))
 	for _, row := range page.Sessions {
 		if !matchesSessionFilters(row, q) {
 			continue
 		}
 		views = append(views, rend.view(row))
 	}
-	writeJSON(w, http.StatusOK, sessionsEnvelope{Sessions: views, NextCursor: page.NextCursor})
+	writeJSON(w, http.StatusOK, v0wire.SessionsEnvelope{Sessions: views, NextCursor: page.NextCursor})
 }
 
 // matchesSessionFilters applies the three exact-match query filters to one
@@ -795,7 +589,7 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request, u User
 		s.writeSessionErr(w, ctx, id, err, sessionErrText{Refused: "could not get session"})
 		return
 	}
-	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(ctx).view(row)})
+	writeJSON(w, http.StatusOK, v0wire.SessionEnvelope{Session: s.renderer(ctx).view(row)})
 }
 
 // ---------------------------------------------------------------------------
@@ -833,8 +627,8 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request, u U
 
 func (s *Server) handleSuspendSession(w http.ResponseWriter, r *http.Request, u User) {
 	id := r.PathValue("id")
-	var req suspendRequest
-	if !decodeJSONBody(w, r, &req) {
+	var req v0wire.SuspendRequest
+	if !v0wire.DecodeJSON(w, r, &req, sessionsBodyLimit) {
 		return
 	}
 	// An absent `warm` is indistinguishable from an explicit true; the
@@ -852,7 +646,7 @@ func (s *Server) handleSuspendSession(w http.ResponseWriter, r *http.Request, u 
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(ctx).view(row)})
+	writeJSON(w, http.StatusOK, v0wire.SessionEnvelope{Session: s.renderer(ctx).view(row)})
 }
 
 // ---------------------------------------------------------------------------
@@ -876,7 +670,7 @@ func (s *Server) handleResumeSession(w http.ResponseWriter, r *http.Request, u U
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, sessionEnvelope{Session: s.renderer(ctx).view(row)})
+	writeJSON(w, http.StatusOK, v0wire.SessionEnvelope{Session: s.renderer(ctx).view(row)})
 }
 
 // ---------------------------------------------------------------------------
@@ -905,20 +699,17 @@ func (s *Server) handleListRunners(w http.ResponseWriter, r *http.Request, u Use
 	ctx := withUser(r.Context(), u)
 	page, err := s.fleet.ListRunners(ctx, userScope(u), control.RunnerQuery{Limit: maxListLimit})
 	if err != nil {
-		writeControlErr(w, err)
+		v0wire.WriteControlError(w, err)
 		return
 	}
-	out := make([]runnerSummary, len(page.Runners))
+	out := make([]v0wire.RunnerView, len(page.Runners))
 	for i, row := range page.Runners {
-		out[i] = runnerSummary{
-			Name:          string(row.ID),
-			Connected:     row.Connected,
-			CapacityUsed:  row.CapacityUsed,
-			CapacityTotal: row.CapacityTotal,
-			LastSeenAt:    row.LastSeenAt.UTC().Format(time.RFC3339),
-		}
+		// The stored column is the answer here, as it always has been: this
+		// listing reports the fleet the store knows, not this replica's own
+		// socket table.
+		out[i] = v0wire.RenderRunner(row, row.Connected)
 	}
-	writeJSON(w, http.StatusOK, runnersEnvelope{Runners: out})
+	writeJSON(w, http.StatusOK, v0wire.RunnersEnvelope{Runners: out})
 }
 
 // ---------------------------------------------------------------------------
@@ -977,7 +768,7 @@ func (s *Server) handlePutSecret(w http.ResponseWriter, r *http.Request, u User)
 	}
 
 	var req putSecretRequest
-	if !decodeJSONBodyLimit(w, r, &req, secretsBodyLimit) {
+	if !v0wire.DecodeJSON(w, r, &req, secretsBodyLimit) {
 		return
 	}
 	if req.Value == "" {
@@ -1130,365 +921,9 @@ const defaultInitTimeoutSec = 900
 
 // environmentIDPrefix is what NewEnvironmentID puts in front of every
 // environment id, and therefore what tells an id from a name on the
-// {id}-shaped routes: names can never contain "_" (envNamePattern), so no
-// name can be mistaken for an id.
+// {id}-shaped routes: names can never contain "_" (the name rule is
+// v0wire.ValidateEnvironmentBasics's), so no name can be mistaken for an id.
 const environmentIDPrefix = "env_"
-
-// envNamePattern is the whole vocabulary of an environment name: it is a CLI
-// handle (`rainier new --env dev`) and half of a snapshot ref, so it stays in
-// the lowercase-kebab alphabet that is safe in both a shell word and an OCI
-// tag.
-var envNamePattern = regexp.MustCompile(`^[a-z0-9-]{1,64}$`)
-
-// environmentView is the client-facing rendering of an Environment. Like
-// sessionView, no field is omitempty: the key set is identical on every
-// environment, including the three snapshot fields, which are present and
-// empty until a session build caches one (Task 7's resolution compares
-// snapshot_hash against setup_hash, so a client can see staleness too).
-type environmentView struct {
-	ID              string            `json:"id"`
-	Name            string            `json:"name"`
-	Image           string            `json:"image"`
-	Setup           string            `json:"setup"`
-	SetupHash       string            `json:"setup_hash"`
-	Init            string            `json:"init"`
-	InitTimeoutSec  int               `json:"init_timeout_sec"`
-	EgressAllow     []string          `json:"egress_allow"`
-	SecretRefs      []string          `json:"secret_refs"`
-	Connectors      []json.RawMessage `json:"connectors"`
-	Placement       string            `json:"placement"`
-	Capabilities    []string          `json:"capabilities"`
-	SetupTimeoutSec int               `json:"setup_timeout_sec"`
-	SnapshotRef     string            `json:"snapshot_ref"`
-	SnapshotRunner  string            `json:"snapshot_runner"`
-	SnapshotHash    string            `json:"snapshot_hash"`
-	CreatedAt       string            `json:"created_at"`
-	UpdatedAt       string            `json:"updated_at"`
-}
-
-type environmentEnvelope struct {
-	Environment environmentView `json:"environment"`
-}
-
-type environmentsEnvelope struct {
-	Environments []environmentView `json:"environments"`
-}
-
-// environmentJSON renders e as its client-facing view.
-//
-// Two of the wire's fields have no field of their own on control.Environment,
-// which names no runner: `placement` is carried as the portable capability
-// "placement:<runner>" (adapt_scope.go) and read back out of it here, and
-// `snapshot_runner` — which the control model does not carry at all — is
-// passed in by the handler, which read it off the store row for the view.
-// `capabilities` shares Requirements with the pin and is the rest of it: what
-// this environment needs a runner to be able to DO, with the host's own
-// spellings of WHERE (placement:, snapshot:) filtered back out.
-func environmentJSON(e control.Environment, snapshotRunner string) environmentView {
-	return environmentView{
-		ID:              string(e.ID),
-		Name:            e.Name,
-		Image:           e.Image,
-		Setup:           e.Setup,
-		SetupHash:       e.SetupHash,
-		Init:            e.Init,
-		InitTimeoutSec:  e.InitTimeoutSec,
-		EgressAllow:     emptyIfNil(e.EgressAllow),
-		SecretRefs:      emptyIfNil(e.SecretRefs),
-		Connectors:      connectorsJSON(e.Connectors),
-		Placement:       capabilityValue(e.Requirements.Capabilities, placementCapabilityPrefix),
-		Capabilities:    emptyIfNil(portableCapabilities(e.Requirements.Capabilities)),
-		SetupTimeoutSec: e.SetupTimeoutSec,
-		SnapshotRef:     e.Snapshot.Ref,
-		SnapshotRunner:  snapshotRunner,
-		SnapshotHash:    e.SnapshotHash,
-		CreatedAt:       e.CreatedAt.UTC().Format(time.RFC3339),
-		UpdatedAt:       e.UpdatedAt.UTC().Format(time.RFC3339),
-	}
-}
-
-// connectorsJSON renders cs as the JSON array a client sent: the stored bytes
-// of each connector, handed back without re-rendering. (What survives the
-// round trip is the JSON VALUE — memstore keeps the client's exact bytes,
-// while Postgres's jsonb preserves the value but may re-render whitespace and
-// member order; storetest's sameJSON is where that contract lives.) Never
-// nil, so the array renders as "[]" rather than null.
-func connectorsJSON(cs []control.Connector) []json.RawMessage {
-	out := make([]json.RawMessage, 0, len(cs))
-	for _, c := range cs {
-		raw := c.Raw
-		if len(raw) == 0 {
-			// Unreachable through this API — validateConnectors always keeps
-			// the caller's original bytes — but a Connector with no Raw would
-			// encode as invalid JSON and truncate the whole response, so a
-			// row from anywhere else degrades to the one field we still know.
-			raw = json.RawMessage(`{"type":` + strconv.Quote(c.Type) + `}`)
-		}
-		out = append(out, raw)
-	}
-	return out
-}
-
-// ---------------------------------------------------------------------------
-// connector vocabulary
-//
-// A connector is a declared attachment an environment's sessions get. In
-// Plan 4 the vocabulary is VALIDATED AND STORED ONLY — nothing here connects
-// anything: github clones arrive in Plan 5, files/tunnel in Plan 6, browser
-// in Plans 6-7 (design §4.2). Validating the shape now is what lets those
-// plans land without a migration, and rejecting unknown types now is what
-// keeps an old server from silently ignoring a connector a client relied on.
-// ---------------------------------------------------------------------------
-
-// repoPattern is the "owner/name" spelling of a GitHub repository — the same
-// two-segment shape `gh repo clone` accepts, and nothing else. It is the SHAPE
-// check; validRepoRef below is the whole rule.
-var repoPattern = regexp.MustCompile(`^[\w.-]+/[\w.-]+$`)
-
-// validRepoRef reports whether s names a repository this API will accept.
-//
-// The shape above is not sufficient on its own, because the name does not stay
-// a name: Plan 5's scheduler splits it (sched.go's expandRepos) and puts the
-// second segment straight into a session's repo Dir, which sessiond joins to
-// /workspace un-cleaned (cmd/sessiond/gitchain.go's repoDir) and later hands to
-// `git -C`. Validating that here is the point of a boundary — the alternative
-// is relying on git's own accidents downstream, and an accident is not a rule.
-func validRepoRef(s string) bool {
-	if !repoPattern.MatchString(s) {
-		return false
-	}
-	owner, name, _ := strings.Cut(s, "/")
-	return validRepoSegment(owner) && validRepoSegment(name)
-}
-
-// validRepoSegment refuses the two segments that are not names at all.
-//
-//   - "." and "..": path elements. `/workspace/..` is `/`, and today the only
-//     thing standing between that and a clone outside the workspace is git
-//     refusing a non-empty destination — its accident, not this boundary's
-//     rule. GitHub does not allow either as a repository name anyway.
-//   - a leading "-": an option wherever this string later sits in an argv, and
-//     neither a GitHub login nor a repository name starts with one.
-//
-// A leading "." is deliberately still ALLOWED: `.github` is a real and common
-// repository name, and refusing it would reject a legitimate connector to close
-// nothing (a dotted directory under /workspace is still under /workspace).
-func validRepoSegment(s string) bool {
-	return s != "." && s != ".." && !strings.HasPrefix(s, "-")
-}
-
-// githubConnector is the github connector's v0 shape. BaseBranch is a pointer
-// so an absent base_branch (which means defaultBaseBranch) is distinguishable
-// from an explicit empty one — an empty branch name is a typo, never a
-// request for the default, and it must not reach Plan 5's clone as one.
-type githubConnector struct {
-	Type       string  `json:"type"`
-	Repo       string  `json:"repo"`
-	BaseBranch *string `json:"base_branch"`
-}
-
-type filesConnector struct {
-	Type  string   `json:"type"`
-	Paths []string `json:"paths"`
-}
-
-type tunnelConnector struct {
-	Type       string `json:"type"`
-	Name       string `json:"name"`
-	TargetHost string `json:"target_host"`
-	TargetPort int    `json:"target_port"`
-}
-
-type browserConnector struct {
-	Type string `json:"type"`
-	Tier string `json:"tier"`
-}
-
-// validateConnectors decodes and validates raw — the "connectors" member of
-// an environment body — into the rows the store persists. An absent or empty
-// array is no connectors at all.
-//
-// Every returned Connector carries the element's ORIGINAL bytes in Raw: the
-// stores render an empty Raw differently, so keeping Raw always-populated
-// here is what keeps that difference out of reachable space, and it is what
-// lets a client read back exactly the object it wrote.
-//
-// Errors are written for the caller: each names the offending element by
-// index and says what was wrong with it, and none carries internal detail.
-func validateConnectors(raw json.RawMessage) ([]control.Connector, error) {
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	var elems []json.RawMessage
-	if err := json.Unmarshal(raw, &elems); err != nil {
-		return nil, errors.New("connectors must be an array of objects")
-	}
-	if len(elems) == 0 {
-		return nil, nil
-	}
-
-	out := make([]control.Connector, 0, len(elems))
-	for i, elem := range elems {
-		// Loose decode first, for the discriminator alone: the strict decode
-		// below can't run until we know which shape to check against.
-		var head struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal(elem, &head); err != nil {
-			return nil, fmt.Errorf("connectors[%d] must be an object", i)
-		}
-		if head.Type == "" {
-			return nil, fmt.Errorf("connectors[%d] is missing type", i)
-		}
-		if err := validateConnector(head.Type, elem); err != nil {
-			return nil, fmt.Errorf("connectors[%d]: %w", i, err)
-		}
-		out = append(out, control.Connector{Type: head.Type, Raw: elem})
-	}
-	return out, nil
-}
-
-// validateConnector strictly decodes one connector element against the shape
-// its already-decoded connType names, and checks its fields. Unknown types
-// are rejected by name (fail closed, design §4.2).
-func validateConnector(connType string, elem json.RawMessage) error {
-	switch connType {
-	case "github":
-		_, err := decodeGitHubConnector(elem)
-		return err
-
-	case "files":
-		var c filesConnector
-		if err := strictDecode(elem, &c); err != nil {
-			return err
-		}
-		if len(c.Paths) == 0 {
-			return errors.New("files connector needs at least one entry in paths")
-		}
-		for _, p := range c.Paths {
-			if p == "" {
-				return errors.New("files connector has an empty string in paths")
-			}
-		}
-		return nil
-
-	case "tunnel":
-		var c tunnelConnector
-		if err := strictDecode(elem, &c); err != nil {
-			return err
-		}
-		if c.Name == "" {
-			return errors.New("tunnel connector needs a name")
-		}
-		if c.TargetHost == "" {
-			return errors.New("tunnel connector needs a target_host")
-		}
-		if c.TargetPort < 1 || c.TargetPort > 65535 {
-			return fmt.Errorf("tunnel connector target_port %d is outside 1..65535", c.TargetPort)
-		}
-		return nil
-
-	case "browser":
-		var c browserConnector
-		if err := strictDecode(elem, &c); err != nil {
-			return err
-		}
-		if c.Tier != "dedicated" && c.Tier != "extension" {
-			return fmt.Errorf("browser connector tier must be dedicated or extension, got %q", c.Tier)
-		}
-		return nil
-
-	default:
-		return fmt.Errorf("unknown connector type %q", connType)
-	}
-}
-
-// decodeGitHubConnector strictly decodes elem as a github connector. The
-// returned BaseBranch is never nil: an absent base_branch is filled in with
-// defaultBaseBranch here, in the decode Plan 5's clone path repeats against
-// the stored bytes — the default lives here, not in the stored row, so an
-// environment keeps exactly the object its author wrote.
-func decodeGitHubConnector(elem json.RawMessage) (githubConnector, error) {
-	var c githubConnector
-	if err := strictDecode(elem, &c); err != nil {
-		return githubConnector{}, err
-	}
-	if !validRepoRef(c.Repo) {
-		return githubConnector{}, fmt.Errorf("github connector repo must be \"owner/name\", got %q", c.Repo)
-	}
-	if c.BaseBranch == nil {
-		def := defaultBaseBranch
-		c.BaseBranch = &def
-	} else if *c.BaseBranch == "" {
-		return githubConnector{}, errors.New("github connector base_branch is empty; omit it for the default (" + defaultBaseBranch + ")")
-	}
-	return c, nil
-}
-
-// strictDecode decodes elem into v rejecting unknown fields — the per-type
-// half of connector validation, and the reason a typo'd key is a 400 instead
-// of a silently dropped setting.
-func strictDecode(elem json.RawMessage, v any) error {
-	dec := json.NewDecoder(bytes.NewReader(elem))
-	dec.DisallowUnknownFields()
-	return dec.Decode(v)
-}
-
-// ---------------------------------------------------------------------------
-// environment request bodies
-// ---------------------------------------------------------------------------
-
-type createEnvironmentRequest struct {
-	Name            string          `json:"name,omitempty"`
-	Image           string          `json:"image,omitempty"`
-	Setup           string          `json:"setup,omitempty"`
-	Init            string          `json:"init,omitempty"`
-	InitTimeoutSec  int             `json:"init_timeout_sec,omitempty"`
-	EgressAllow     []string        `json:"egress_allow,omitempty"`
-	SecretRefs      []string        `json:"secret_refs,omitempty"`
-	Connectors      json.RawMessage `json:"connectors,omitempty"`
-	Placement       string          `json:"placement,omitempty"`
-	Capabilities    []string        `json:"capabilities,omitempty"`
-	SetupTimeoutSec int             `json:"setup_timeout_sec,omitempty"`
-}
-
-// patchEnvironmentRequest is PATCH's body: every field is a pointer (or, for
-// connectors, a nil-able raw message) so "absent" is distinguishable from
-// "set to the zero value" — clearing a list and leaving it alone are
-// different requests.
-type patchEnvironmentRequest struct {
-	Name            *string         `json:"name,omitempty"`
-	Image           *string         `json:"image,omitempty"`
-	Setup           *string         `json:"setup,omitempty"`
-	Init            *string         `json:"init,omitempty"`
-	InitTimeoutSec  *int            `json:"init_timeout_sec,omitempty"`
-	EgressAllow     *[]string       `json:"egress_allow,omitempty"`
-	SecretRefs      *[]string       `json:"secret_refs,omitempty"`
-	Connectors      json.RawMessage `json:"connectors,omitempty"`
-	Placement       *string         `json:"placement,omitempty"`
-	Capabilities    *[]string       `json:"capabilities,omitempty"`
-	SetupTimeoutSec *int            `json:"setup_timeout_sec,omitempty"`
-}
-
-// validateEnvironmentBasics checks the four scalar rules create and patch
-// share, returning a client-facing message (or "" when the row is fine).
-// Placement is deliberately unchecked: an environment may be pinned to a
-// runner that hasn't joined the fleet yet, which is exactly how the hardware
-// case is set up (design §4.6). Neither script is checked either — a shell
-// script is only wrong once it runs.
-func validateEnvironmentBasics(name, image string, setupTimeoutSec, initTimeoutSec int) string {
-	switch {
-	case !envNamePattern.MatchString(name):
-		return "name must match [a-z0-9-]{1,64}"
-	case image == "":
-		return "image is required"
-	case setupTimeoutSec < 0:
-		return "setup_timeout_sec must not be negative"
-	case initTimeoutSec < 0:
-		return "init_timeout_sec must not be negative"
-	}
-	return ""
-}
 
 // missingSecretRef returns the first name in refs that no stored secret
 // answers to, or "" when they all exist. It reads the secret LISTING —
@@ -1539,7 +974,7 @@ func (s *Server) environmentRef(ctx context.Context, scope control.Scope, ref st
 // and only while the snapshot is current — but the wire has always shown the
 // column, stale or not, so the view reads the column. It decides nothing; an
 // unreadable row simply shows no runner.
-func (s *Server) snapshotRunnerOf(ctx context.Context, id control.EnvironmentID) string {
+func (s *Server) snapshotRunnerOf(ctx context.Context, id control.EnvironmentID) control.RunnerID {
 	holder, err := s.st.SnapshotRunner(ctx, installWorkspace, id)
 	if err != nil {
 		if !errors.Is(err, control.ErrNotFound) {
@@ -1547,24 +982,7 @@ func (s *Server) snapshotRunnerOf(ctx context.Context, id control.EnvironmentID)
 		}
 		return ""
 	}
-	return string(holder)
-}
-
-// environmentRequirements composes an environment's one requirements list out
-// of the two halves the wire keeps apart: the operator's runner pin, which
-// control.Environment cannot name directly and so round-trips through the
-// capability "placement:<runner>" (adapt_scope.go), and the portable
-// capabilities the operator asked for. The pin goes first, so the list reads
-// where-then-what, and environmentJSON takes the two halves back out by the
-// same rule. No pin and no capabilities is no requirements at all rather than
-// an empty list.
-func environmentRequirements(placement string, capabilities []string) control.Requirements {
-	var caps []string
-	if placement != "" {
-		caps = append(caps, placementCapabilityPrefix+placement)
-	}
-	caps = append(caps, capabilities...)
-	return control.Requirements{Capabilities: caps}
+	return holder
 }
 
 // handleCreateEnvironment serves POST /v0/environments (admin): validate the
@@ -1574,19 +992,19 @@ func environmentRequirements(placement string, capabilities []string) control.Re
 // name pattern, the connector shapes) and the vault's answer about
 // secret_refs.
 func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request, u User) {
-	var req createEnvironmentRequest
-	if !decodeJSONBodyLimit(w, r, &req, environmentsBodyLimit) {
+	var req v0wire.CreateEnvironmentRequest
+	if !v0wire.DecodeJSON(w, r, &req, environmentsBodyLimit) {
 		return
 	}
-	if bad := validateEnvironmentBasics(req.Name, req.Image, req.SetupTimeoutSec, req.InitTimeoutSec); bad != "" {
+	if bad := v0wire.ValidateEnvironmentBasics(req.Name, req.Image, req.SetupTimeoutSec, req.InitTimeoutSec); bad != "" {
 		writeErr(w, http.StatusBadRequest, "invalid_request", bad)
 		return
 	}
-	if err := validateCapabilities("capabilities", req.Capabilities); err != nil {
+	if err := v0wire.ValidateCapabilities("capabilities", req.Capabilities); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	conns, err := validateConnectors(req.Connectors)
+	conns, err := v0wire.ValidateConnectors(req.Connectors)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
@@ -1605,7 +1023,7 @@ func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request,
 		EgressAllow:     req.EgressAllow,
 		SecretRefs:      req.SecretRefs,
 		Connectors:      conns,
-		Requirements:    environmentRequirements(req.Placement, req.Capabilities),
+		Requirements:    v0wire.EnvironmentRequirements(req.Placement, req.Capabilities),
 		SetupTimeoutSec: req.SetupTimeoutSec,
 	})
 	if err != nil {
@@ -1615,13 +1033,13 @@ func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request,
 			return
 		}
 		log.Printf("controld: create environment %q: %v", req.Name, err)
-		writeControlErr(w, err)
+		v0wire.WriteControlError(w, err)
 		return
 	}
 
 	// A brand-new environment has no cached snapshot, so no runner holds one.
 	w.Header().Set("Location", "/v0/environments/"+string(created.ID))
-	writeJSON(w, http.StatusCreated, environmentEnvelope{Environment: environmentJSON(created, "")})
+	writeJSON(w, http.StatusCreated, v0wire.EnvironmentEnvelope{Environment: v0wire.RenderEnvironment(created, "")})
 }
 
 // secretRefsExist answers the vault question create and patch share: every
@@ -1651,7 +1069,7 @@ func (s *Server) handleListEnvironments(w http.ResponseWriter, r *http.Request, 
 	page, err := s.environments.ListEnvironments(ctx, userScope(u), control.EnvironmentQuery{})
 	if err != nil {
 		log.Printf("controld: list environments: %v", err)
-		writeControlErr(w, err)
+		v0wire.WriteControlError(w, err)
 		return
 	}
 	// The snapshot runner is a view-only column (see snapshotRunnerOf), and
@@ -1661,15 +1079,15 @@ func (s *Server) handleListEnvironments(w http.ResponseWriter, r *http.Request, 
 	// runner stale or not. So it is the host lookup, once per row on the page
 	// — there are few environments per deployment, and this is the same
 	// question the single-environment view asks.
-	runners := make(map[string]string, len(page.Environments))
+	runners := make(map[string]control.RunnerID, len(page.Environments))
 	for _, row := range page.Environments {
 		runners[string(row.ID)] = s.snapshotRunnerOf(ctx, row.ID)
 	}
-	out := make([]environmentView, len(page.Environments))
+	out := make([]v0wire.EnvironmentView, len(page.Environments))
 	for i, row := range page.Environments {
-		out[i] = environmentJSON(row, runners[string(row.ID)])
+		out[i] = v0wire.RenderEnvironment(row, runners[string(row.ID)])
 	}
-	writeJSON(w, http.StatusOK, environmentsEnvelope{Environments: out})
+	writeJSON(w, http.StatusOK, v0wire.EnvironmentsEnvelope{Environments: out})
 }
 
 // handleGetEnvironment serves GET /v0/environments/{id}, by id or by name.
@@ -1681,8 +1099,8 @@ func (s *Server) handleGetEnvironment(w http.ResponseWriter, r *http.Request, u 
 		writeEnvironmentLookupErr(w, ref, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, environmentEnvelope{
-		Environment: environmentJSON(row, s.snapshotRunnerOf(ctx, row.ID)),
+	writeJSON(w, http.StatusOK, v0wire.EnvironmentEnvelope{
+		Environment: v0wire.RenderEnvironment(row, s.snapshotRunnerOf(ctx, row.ID)),
 	})
 }
 
@@ -1693,7 +1111,7 @@ func writeEnvironmentLookupErr(w http.ResponseWriter, ref string, err error) {
 	if !errors.Is(err, control.ErrNotFound) {
 		log.Printf("controld: get environment %q: %v", ref, err)
 	}
-	writeControlErr(w, err)
+	v0wire.WriteControlError(w, err)
 }
 
 // handleUpdateEnvironment serves PATCH /v0/environments/{id} (admin): a
@@ -1712,8 +1130,8 @@ func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	var req patchEnvironmentRequest
-	if !decodeJSONBodyLimit(w, r, &req, environmentsBodyLimit) {
+	var req v0wire.PatchEnvironmentRequest
+	if !v0wire.DecodeJSON(w, r, &req, environmentsBodyLimit) {
 		return
 	}
 
@@ -1735,7 +1153,7 @@ func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request,
 	if req.InitTimeoutSec != nil {
 		initTimeout = *req.InitTimeoutSec
 	}
-	if bad := validateEnvironmentBasics(name, image, setupTimeout, initTimeout); bad != "" {
+	if bad := v0wire.ValidateEnvironmentBasics(name, image, setupTimeout, initTimeout); bad != "" {
 		writeErr(w, http.StatusBadRequest, "invalid_request", bad)
 		return
 	}
@@ -1751,7 +1169,7 @@ func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request,
 		SetupTimeoutSec: req.SetupTimeoutSec,
 	}
 	if req.Connectors != nil {
-		conns, err := validateConnectors(req.Connectors)
+		conns, err := v0wire.ValidateConnectors(req.Connectors)
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 			return
@@ -1775,19 +1193,19 @@ func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request,
 	// untouched placement (and the snapshot affinity beside it) exactly as
 	// the store has it.
 	if req.Placement != nil || req.Capabilities != nil {
-		placement := capabilityValue(cur.Requirements.Capabilities, placementCapabilityPrefix)
+		placement := v0wire.PlacementOf(cur.Requirements)
 		if req.Placement != nil {
 			placement = *req.Placement
 		}
 		capabilities := portableCapabilities(cur.Requirements.Capabilities)
 		if req.Capabilities != nil {
-			if err := validateCapabilities("capabilities", *req.Capabilities); err != nil {
+			if err := v0wire.ValidateCapabilities("capabilities", *req.Capabilities); err != nil {
 				writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 				return
 			}
 			capabilities = *req.Capabilities
 		}
-		reqs := environmentRequirements(placement, capabilities)
+		reqs := v0wire.EnvironmentRequirements(placement, capabilities)
 		cmd.Requirements = &reqs
 	}
 
@@ -1801,11 +1219,11 @@ func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request,
 		if !errors.Is(err, control.ErrNotFound) && !errors.Is(err, control.ErrInvalid) {
 			log.Printf("controld: update environment %s: %v", cur.ID, err)
 		}
-		writeControlErr(w, err)
+		v0wire.WriteControlError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, environmentEnvelope{
-		Environment: environmentJSON(updated, s.snapshotRunnerOf(ctx, updated.ID)),
+	writeJSON(w, http.StatusOK, v0wire.EnvironmentEnvelope{
+		Environment: v0wire.RenderEnvironment(updated, s.snapshotRunnerOf(ctx, updated.ID)),
 	})
 }
 
@@ -1832,7 +1250,7 @@ func (s *Server) handleDeleteEnvironment(w http.ResponseWriter, r *http.Request,
 		if !errors.Is(err, control.ErrNotFound) {
 			log.Printf("controld: delete environment %s: %v", row.ID, err)
 		}
-		writeControlErr(w, err)
+		v0wire.WriteControlError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -2088,7 +1506,7 @@ var pushErrText = workspaceErrText{
 func (s *Server) handlePushFiles(w http.ResponseWriter, r *http.Request, u User) {
 	id := sessionForRPC(r)
 	var chunk workspace.PushChunk
-	if !decodeJSONBodyLimit(w, r, &chunk, filesBodyLimit) {
+	if !v0wire.DecodeJSON(w, r, &chunk, filesBodyLimit) {
 		return
 	}
 	if msg := validatePushChunk(chunk); msg != "" {
