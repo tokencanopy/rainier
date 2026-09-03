@@ -238,6 +238,8 @@ func (s *Server) compose() error {
 		events   = logRecorder{}
 		clock    = systemClock{}
 		ids      = idGenerator{}
+		uow      = directUnitOfWork{}
+		ckpts    = pinnedCheckpoints{st: s.st}
 	)
 	fleetSvc, err := controlapp.NewFleetService(controlapp.FleetOptions{
 		Authorizer: auth, Sessions: sessions, Environments: envs, Fleet: fleet, Pools: pools,
@@ -248,6 +250,8 @@ func (s *Server) compose() error {
 		// exactly as the old scheduler applied them (api.go).
 		DefaultSetupTimeoutSec: defaultSetupTimeoutSec,
 		DefaultInitTimeoutSec:  defaultInitTimeoutSec,
+		UnitOfWork:             uow,
+		Checkpoints:            ckpts,
 	})
 	if err != nil {
 		return fmt.Errorf("controld: composing the fleet service: %w", err)
@@ -255,20 +259,21 @@ func (s *Server) compose() error {
 	sessionSvc, err := controlapp.NewSessionService(controlapp.SessionOptions{
 		Authorizer: auth, Sessions: sessions, Environments: envs, Pools: pools,
 		Events: events, Clock: clock, IDs: ids, Wake: fleetSvc.Wake,
-		Fleet: fleet, Transport: s.transport,
+		Fleet: fleet, Transport: s.transport, UnitOfWork: uow,
 	})
 	if err != nil {
 		return fmt.Errorf("controld: composing the session service: %w", err)
 	}
 	envSvc, err := controlapp.NewEnvironmentService(controlapp.EnvironmentOptions{
 		Authorizer: auth, Environments: envs, Events: events, Clock: clock, IDs: ids,
+		UnitOfWork: uow,
 	})
 	if err != nil {
 		return fmt.Errorf("controld: composing the environment service: %w", err)
 	}
 	attachSvc, err := controlapp.NewAttachmentService(controlapp.AttachmentOptions{
 		Authorizer: auth, Policy: auth, Sessions: sessions, Transport: s.transport,
-		Broker: s.broker, Events: events, Clock: clock, IDs: ids,
+		Broker: s.broker, Events: events, Clock: clock, IDs: ids, UnitOfWork: uow,
 		MaxTransferBytes: s.cfg.MaxTransferBytes,
 	})
 	if err != nil {

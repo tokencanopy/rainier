@@ -37,6 +37,10 @@ type SessionOptions struct {
 	Wake         func(control.PoolID)
 	Fleet        control.FleetRepository
 	Transport    control.RunnerTransport
+	// UnitOfWork is the host's atomicity. The service holds it so a command's
+	// mutation and the event describing it can commit together; nothing in
+	// this task opens a unit yet.
+	UnitOfWork control.UnitOfWork
 }
 
 // SessionService owns session creation, authorization, lifecycle dispatch, and
@@ -53,6 +57,7 @@ type SessionService struct {
 	wake         func(control.PoolID)
 	fleet        control.FleetRepository
 	transport    control.RunnerTransport
+	uow          control.UnitOfWork
 }
 
 // NewSessionService validates that every dependency is present and returns a
@@ -60,7 +65,7 @@ type SessionService struct {
 func NewSessionService(o SessionOptions) (*SessionService, error) {
 	if o.Authorizer == nil || o.Sessions == nil || o.Environments == nil ||
 		o.Pools == nil || o.Events == nil || o.Clock == nil || o.IDs == nil || o.Wake == nil ||
-		o.Fleet == nil || o.Transport == nil {
+		o.Fleet == nil || o.Transport == nil || o.UnitOfWork == nil {
 		return nil, control.ErrInvalid
 	}
 	return &SessionService{
@@ -74,6 +79,7 @@ func NewSessionService(o SessionOptions) (*SessionService, error) {
 		wake:         o.Wake,
 		fleet:        o.Fleet,
 		transport:    o.Transport,
+		uow:          o.UnitOfWork,
 	}, nil
 }
 

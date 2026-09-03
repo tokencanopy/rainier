@@ -1000,6 +1000,7 @@ func newBoundedAttachmentFixture(t *testing.T, bound int64) *attachmentFixture {
 		Events:           fx.events,
 		Clock:            attachmentFakeClock(func() time.Time { return time.Unix(0, 0) }),
 		IDs:              fx.ids,
+		UnitOfWork:       directUOW{},
 		MaxTransferBytes: bound,
 	})
 	if err != nil {
@@ -1065,6 +1066,7 @@ func TestNewAttachmentServiceRejectsNegativeBound(t *testing.T) {
 		Events:           &attachmentFakeEvents{},
 		Clock:            attachmentFakeClock(func() time.Time { return time.Unix(0, 0) }),
 		IDs:              attachmentFakeIDs{eventID: "evt_example"},
+		UnitOfWork:       directUOW{},
 		MaxTransferBytes: -1,
 	}
 	if _, err := NewAttachmentService(opts); !errors.Is(err, control.ErrInvalid) {

@@ -40,6 +40,7 @@ func newEnvironmentFixture(t *testing.T) *environmentFixture {
 		Events:       events,
 		Clock:        sessionStubClock{now: sessionFixedNow},
 		IDs:          &sessionStubIDs{log: log, sessionID: "sess_example", envID: "env_example", eventID: "evt_example"},
+		UnitOfWork:   directUOW{},
 	})
 	if err != nil {
 		t.Fatalf("NewEnvironmentService: %v", err)
@@ -54,6 +55,7 @@ func validEnvironmentOptions() EnvironmentOptions {
 		Events:       &sessionStubEventRecorder{},
 		Clock:        sessionStubClock{now: sessionFixedNow},
 		IDs:          &sessionStubIDs{sessionID: "sess_example", envID: "env_example", eventID: "evt_example"},
+		UnitOfWork:   directUOW{},
 	}
 }
 
@@ -70,6 +72,7 @@ func TestNewEnvironmentServiceRequiresEveryDependency(t *testing.T) {
 		{"events", func(o *EnvironmentOptions) { o.Events = nil }},
 		{"clock", func(o *EnvironmentOptions) { o.Clock = nil }},
 		{"ids", func(o *EnvironmentOptions) { o.IDs = nil }},
+		{"unit of work", func(o *EnvironmentOptions) { o.UnitOfWork = nil }},
 	}
 	for _, tt := range tests {
 		o := validEnvironmentOptions()

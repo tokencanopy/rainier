@@ -128,6 +128,12 @@ type RunnerEvent struct {
 	State         SessionState
 	Detail        string
 	ChildExitCode *int
+	// PlacementGeneration is the session placement generation the runner
+	// was given when the sandbox was created, echoed back so a report from a
+	// stale sandbox is fenced by the session's own authority and not only by
+	// the connection it arrived on. Zero means "not carried" (an old runner)
+	// and fences nothing.
+	PlacementGeneration uint64
 }
 
 // Fleet is the fleet half of the caller-facing application contract. The
@@ -166,4 +172,8 @@ type Event struct {
 	Resource    Resource
 	At          time.Time
 	Usage       Usage
+	// PlacementGeneration is the session placement generation an event about
+	// a session happened under, so usage is attributed to exactly one
+	// generation; zero for an event about any other resource.
+	PlacementGeneration uint64
 }

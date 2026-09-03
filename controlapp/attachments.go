@@ -24,6 +24,10 @@ type AttachmentOptions struct {
 	Events     control.EventRecorder
 	Clock      control.Clock
 	IDs        control.IDGenerator
+	// UnitOfWork is the host's atomicity: an attachment's event is a write
+	// like any other and commits with what it describes. Nothing in this task
+	// opens a unit yet.
+	UnitOfWork control.UnitOfWork
 	// MaxTransferBytes bounds one push or pull's compressed bytes. Zero means
 	// workspace.MaxBytes; a negative value is control.ErrInvalid. Hosts lower
 	// it in tests so the overrun path is exercised without streaming the full
@@ -55,6 +59,7 @@ type AttachmentService struct {
 	events      control.EventRecorder
 	clock       control.Clock
 	ids         control.IDGenerator
+	uow         control.UnitOfWork
 	maxTransfer int64
 	rpcSeq      atomic.Uint64
 }
@@ -73,6 +78,7 @@ func NewAttachmentService(opts AttachmentOptions) (*AttachmentService, error) {
 		opts.Events == nil,
 		opts.Clock == nil,
 		opts.IDs == nil,
+		opts.UnitOfWork == nil,
 		opts.MaxTransferBytes < 0:
 		return nil, control.ErrInvalid
 	}
@@ -89,6 +95,7 @@ func NewAttachmentService(opts AttachmentOptions) (*AttachmentService, error) {
 		events:      opts.Events,
 		clock:       opts.Clock,
 		ids:         opts.IDs,
+		uow:         opts.UnitOfWork,
 		maxTransfer: maxTransfer,
 	}, nil
 }

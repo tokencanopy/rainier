@@ -87,6 +87,7 @@ func externalAttachmentOptions() controlapp.AttachmentOptions {
 		Events:     attachmentExtEvents{},
 		Clock:      attachmentExtClock(func() time.Time { return time.Unix(0, 0) }),
 		IDs:        attachmentExtIDs{},
+		UnitOfWork: extDirectUOW{},
 	}
 }
 

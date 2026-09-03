@@ -16,10 +16,12 @@ import (
 // single-tenant installation. The three repository ports are not here: the
 // store implements them itself, and compose() reads them off it.
 var (
-	_ control.PoolResolver  = installationPools{}
-	_ control.EventRecorder = logRecorder{}
-	_ control.Clock         = systemClock{}
-	_ control.IDGenerator   = idGenerator{}
+	_ control.PoolResolver      = installationPools{}
+	_ control.EventRecorder     = logRecorder{}
+	_ control.UnitOfWork        = directUnitOfWork{}
+	_ control.CheckpointLocator = pinnedCheckpoints{}
+	_ control.Clock             = systemClock{}
+	_ control.IDGenerator       = idGenerator{}
 )
 
 // installationPools is control.PoolResolver for an installation whose whole
@@ -75,6 +77,56 @@ type logRecorder struct{}
 func (logRecorder) Record(_ context.Context, e control.Event) error {
 	log.Printf("controld: event %s %s %s", e.Action, e.Resource.Kind, e.Resource.ID)
 	return nil
+}
+
+// directUnitOfWork is control.UnitOfWork for a host that has no transactions
+// to open. Run calls fn with the context it was handed and returns fn's error
+// unchanged, which is exactly what a command does today: the port permits a
+// host without transactions to run fn directly, and this installation's
+// stores gain a real unit of work in a later plan.
+type directUnitOfWork struct{}
+
+func (directUnitOfWork) Run(ctx context.Context, fn func(context.Context) error) error {
+	return fn(ctx)
+}
+
+// pinnedCheckpoints is control.CheckpointLocator for an installation whose
+// checkpoints are container images built by, and living on, one runner: a
+// snapshot boots on its holder and nowhere else. It is the locator spelling
+// of the affinity the stores derive today, and the honest answer for this
+// build — nothing here can pull a snapshot to a second runner.
+type pinnedCheckpoints struct{ st Store }
+
+// LocateCheckpoint names the runner holding cp, or nowhere. It finds the
+// environment whose current cache carries cp.Ref and asks the store which
+// runner built it; an environment with no holder, a ref no environment of ws
+// carries, and an empty ref are all "nowhere", which tells the caller to boot
+// without the checkpoint rather than to fail. A store that cannot answer is
+// the error, because "nowhere" would silently rebuild what is already cached.
+func (p pinnedCheckpoints) LocateCheckpoint(ctx context.Context, ws control.WorkspaceID, cp control.Checkpoint) (control.CheckpointLocation, error) {
+	if cp.Ref == "" {
+		return control.CheckpointLocation{}, nil
+	}
+	// A listing, until the store gains the direct lookup: an installation has
+	// a handful of environments, and the scheduler asks once per queued row.
+	rows, _, err := p.st.Environments().ListEnvironments(ctx, ws, control.EnvironmentQuery{})
+	if err != nil {
+		return control.CheckpointLocation{}, err
+	}
+	for _, env := range rows {
+		if env.Snapshot.Ref != cp.Ref {
+			continue
+		}
+		holder, err := p.st.SnapshotRunner(ctx, ws, env.ID)
+		if err != nil {
+			return control.CheckpointLocation{}, err
+		}
+		if holder == "" {
+			return control.CheckpointLocation{}, nil
+		}
+		return control.CheckpointLocation{Runners: []control.RunnerID{holder}}, nil
+	}
+	return control.CheckpointLocation{}, nil
 }
 
 // systemClock is control.Clock against the wall clock.
