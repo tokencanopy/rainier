@@ -100,6 +100,14 @@ export RAINIER_DB="postgres://postgres:<the password>@127.0.0.1:5432/rainier?ssl
 controld runs its own migrations on startup; there is no separate migrate
 step.
 
+This release applies 0007 and 0008, which put a workspace and a pool on every
+row. 0008 is a contract step: it drops the `sessions.resolved_image` and
+`environments.placement` columns the expand step replaced, and the scope
+defaults with them, so an older controld cannot write to the migrated
+database. If the installation has state worth keeping, rehearse it: take a
+`pg_dump` before the upgrade, then restore that dump onto a scratch database
+and start the new controld against it first.
+
 ## 4. controld
 
 The fleet token is the shared secret every runnerd presents. Generate it

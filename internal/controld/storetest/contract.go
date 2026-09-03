@@ -3,68 +3,61 @@ package storetest
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"reflect"
-	"slices"
 	"testing"
 	"time"
 
+	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/internal/controld"
 )
 
-// sameJSON fails the test unless got carries the same JSON value as want.
-// Connector bytes are stored verbatim as a value, not as a byte string:
-// Postgres's jsonb re-renders whitespace and member order on the way back
-// out, so the contract pins the value every store must preserve — no member
-// added, dropped, or rewritten.
-func sameJSON(t *testing.T, want string, got []byte) {
-	t.Helper()
-	var w, g any
-	if err := json.Unmarshal([]byte(want), &w); err != nil {
-		t.Fatalf("want is not valid JSON (%s): %v", want, err)
-	}
-	if err := json.Unmarshal(got, &g); err != nil {
-		t.Fatalf("stored JSON is invalid (%s): %v", got, err)
-	}
-	if !reflect.DeepEqual(w, g) {
-		t.Fatalf("json value: want %s, got %s", want, got)
-	}
-}
+// The synthetic scope the host-lookup cases run in. They are the same two
+// workspaces and two pools controlapp/repotest uses, so a store's host
+// lookups and its repositories are proved over the same shapes.
+const (
+	hostWorkspace control.WorkspaceID = "ws_alpha"
+	hostOtherWS   control.WorkspaceID = "ws_beta"
+	hostPoolA     control.PoolID      = "pool_a"
+	hostPoolB     control.PoolID      = "pool_b"
+)
 
-func RunContract(t *testing.T, open func(t *testing.T) controld.Store) {
+// RunHost is the contract of controld.HostStore: the persistence the
+// self-hosted host owns beside the control repositories — identity (users and
+// bearer tokens), the vault (secrets and credentials), and the four lookups
+// the control ports deliberately have no method for.
+//
+// Every case answers with the control sentinel set: a lookup that finds
+// nothing is control.ErrNotFound, and a name already held is
+// control.ErrConflict. There is one sentinel set in the codebase, and this is
+// it.
+//
+// A lookup case needs rows HostStore itself cannot create, so it asks the
+// store for its repository accessors. Every store that has host lookups has
+// them; one that does not is failed here rather than silently skipped.
+func RunHost(t *testing.T, open func(t *testing.T) controld.HostStore) {
 	ctx := context.Background()
-	mkUser := func(t *testing.T, st controld.Store) controld.User {
+	mkUser := func(t *testing.T, st controld.HostStore) controld.User {
 		u, err := st.UpsertUser(ctx, 42, "alice", "admin")
 		if err != nil {
 			t.Fatal(err)
 		}
 		return u
 	}
-	mkSess := func(t *testing.T, st controld.Store, owner, name string) controld.Session {
-		s, err := st.CreateSession(ctx, controld.Session{
-			ID: controld.NewSessionID(), OwnerID: owner, Name: name,
-			Image: "img", State: controld.StateQueued})
-		if err != nil {
-			t.Fatal(err)
+	ports := func(t *testing.T, st controld.HostStore) controld.Repositories {
+		t.Helper()
+		r, ok := st.(controld.Repositories)
+		if !ok {
+			t.Fatalf("a host store must also carry the repository accessors; %T does not", st)
 		}
-		return s
+		return r
 	}
-	const connectorJSON = `{"type":"github","repo":"acme/app","base_branch":"main"}`
-	mkEnv := func(t *testing.T, st controld.Store, name string) controld.Environment {
-		e, err := st.CreateEnvironment(ctx, controld.Environment{
-			ID: controld.NewEnvironmentID(), Name: name,
-			Image: "img:1", Setup: "make deps",
-			Init: "make dev-server &", InitTimeoutSec: 120,
-			EgressAllow: []string{"github.com"},
-			SecretRefs:  []string{"GITHUB_TOKEN"},
-			Connectors:  []controld.Connector{{Type: "github", Raw: json.RawMessage(connectorJSON)}},
-			Placement:   "vm1", SetupTimeoutSec: 600,
-		})
-		if err != nil {
-			t.Fatal(err)
+	provision := func(t *testing.T, st controld.HostStore, wss ...control.WorkspaceID) {
+		t.Helper()
+		for _, ws := range wss {
+			if err := st.EnsureWorkspace(ctx, ws); err != nil {
+				t.Fatalf("EnsureWorkspace(%s): %v", ws, err)
+			}
 		}
-		return e
 	}
 
 	t.Run("user upsert is stable by github id", func(t *testing.T) {
@@ -93,349 +86,24 @@ func RunContract(t *testing.T, open func(t *testing.T) controld.Store) {
 		if err != nil || got.ID != u.ID {
 			t.Fatalf("lookup: %v %+v", err, got)
 		}
-		if _, err := st.UserByToken(ctx, controld.HashToken("rnr_bogus")); !errors.Is(err, controld.ErrNotFound) {
+		if _, err := st.UserByToken(ctx, controld.HashToken("rnr_bogus")); !errors.Is(err, control.ErrNotFound) {
 			t.Fatalf("want ErrNotFound, got %v", err)
 		}
 	})
 
-	t.Run("guarded transition: wrong from-state loses with ErrConflict", func(t *testing.T) {
+	t.Run("user lookup by id", func(t *testing.T) {
 		st := open(t)
 		u := mkUser(t, st)
-		s := mkSess(t, st, u.ID, "")
-		r := "vm1"
-		if err := st.Transition(ctx, s.ID, []controld.SessionState{controld.StateQueued}, controld.StateCreating, controld.TransitionOpts{Runner: &r}); err != nil {
-			t.Fatal(err)
-		}
-		err := st.Transition(ctx, s.ID, []controld.SessionState{controld.StateQueued}, controld.StateCanceled, controld.TransitionOpts{})
-		if !errors.Is(err, controld.ErrConflict) {
-			t.Fatalf("want ErrConflict, got %v", err)
-		}
-		got, _ := st.GetSession(ctx, s.ID)
-		if got.State != controld.StateCreating || got.Runner != "vm1" {
-			t.Fatalf("state clobbered: %+v", got)
-		}
-	})
 
-	t.Run("active name unique per owner; freed by terminal state", func(t *testing.T) {
-		st := open(t)
-		u := mkUser(t, st)
-		mkSess(t, st, u.ID, "dev")
-		_, err := st.CreateSession(ctx, controld.Session{ID: controld.NewSessionID(), OwnerID: u.ID, Name: "dev", State: controld.StateQueued})
-		if !errors.Is(err, controld.ErrConflict) {
-			t.Fatalf("want ErrConflict, got %v", err)
-		}
-		// terminal frees the name
-		first, _ := st.SessionByName(ctx, u.ID, "dev")
-		if err := st.Transition(ctx, first.ID, controld.NonTerminal, controld.StateCanceled, controld.TransitionOpts{}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := st.CreateSession(ctx, controld.Session{ID: controld.NewSessionID(), OwnerID: u.ID, Name: "dev", State: controld.StateQueued}); err != nil {
-			t.Fatalf("terminal session must free the name: %v", err)
-		}
-	})
-
-	t.Run("idempotency key replays", func(t *testing.T) {
-		st := open(t)
-		u := mkUser(t, st)
-		s1, err := st.CreateSession(ctx, controld.Session{ID: controld.NewSessionID(), OwnerID: u.ID, IdempotencyKey: "k1", State: controld.StateQueued})
+		got, err := st.GetUser(ctx, u.ID)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("GetUser: %v", err)
 		}
-		_, err = st.CreateSession(ctx, controld.Session{ID: controld.NewSessionID(), OwnerID: u.ID, IdempotencyKey: "k1", State: controld.StateQueued})
-		if !errors.Is(err, controld.ErrIdemReplay) {
-			t.Fatalf("want ErrIdemReplay, got %v", err)
+		if got.ID != u.ID || got.GitHubID != u.GitHubID || got.Login != u.Login || got.Role != u.Role {
+			t.Fatalf("GetUser = %+v, want %+v", got, u)
 		}
-		got, err := st.SessionByIdem(ctx, u.ID, "k1")
-		if err != nil || got.ID != s1.ID {
-			t.Fatalf("replay lookup: %v %+v", err, got)
-		}
-	})
-
-	t.Run("list pagination is stable and cursor resumes", func(t *testing.T) {
-		st := open(t)
-		u := mkUser(t, st)
-		var ids []string
-		for i := 0; i < 5; i++ {
-			s := mkSess(t, st, u.ID, "")
-			ids = append(ids, s.ID)
-			time.Sleep(2 * time.Millisecond) // distinct created_at
-		}
-		page1, next, err := st.ListSessions(ctx, controld.SessionQuery{Limit: 3})
-		if err != nil || len(page1) != 3 || next == "" {
-			t.Fatalf("page1: %v n=%d next=%q", err, len(page1), next)
-		}
-		page2, next2, err := st.ListSessions(ctx, controld.SessionQuery{Limit: 3, Cursor: next})
-		if err != nil || len(page2) != 2 || next2 != "" {
-			t.Fatalf("page2: %v n=%d", err, len(page2))
-		}
-		if page1[0].ID != ids[4] {
-			t.Fatalf("newest first: got %s want %s", page1[0].ID, ids[4])
-		}
-		seen := map[string]bool{}
-		for _, s := range append(page1, page2...) {
-			seen[s.ID] = true
-		}
-		if len(seen) != 5 {
-			t.Fatalf("pages overlap or drop: %v", seen)
-		}
-	})
-
-	t.Run("terminal sessions hidden unless IncludeTerminal", func(t *testing.T) {
-		st := open(t)
-		u := mkUser(t, st)
-		s := mkSess(t, st, u.ID, "")
-		st.Transition(ctx, s.ID, controld.NonTerminal, controld.StateDead, controld.TransitionOpts{})
-		rows, _, _ := st.ListSessions(ctx, controld.SessionQuery{Limit: 10})
-		if len(rows) != 0 {
-			t.Fatalf("terminal leaked into default list")
-		}
-		rows, _, _ = st.ListSessions(ctx, controld.SessionQuery{Limit: 10, IncludeTerminal: true})
-		if len(rows) != 1 {
-			t.Fatalf("IncludeTerminal missing row")
-		}
-	})
-
-	t.Run("list filters by exact name", func(t *testing.T) {
-		st := open(t)
-		u := mkUser(t, st)
-		want := mkSess(t, st, u.ID, "box")
-		mkSess(t, st, u.ID, "box-extra")
-		if err := st.Transition(ctx, want.ID, controld.NonTerminal, controld.StateFailed, controld.TransitionOpts{}); err != nil {
-			t.Fatal(err)
-		}
-
-		rows, _, err := st.ListSessions(ctx, controld.SessionQuery{
-			Name: "box", IncludeTerminal: true, Limit: 10,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(rows) != 1 || rows[0].ID != want.ID {
-			t.Fatalf("exact-name rows = %+v, want only %s", rows, want.ID)
-		}
-	})
-
-	t.Run("runners upsert and sessions-on-runner filter", func(t *testing.T) {
-		st := open(t)
-		u := mkUser(t, st)
-		if err := st.UpsertRunner(ctx, controld.Runner{Name: "vm1", CapacityUsed: 1, CapacityTotal: 4, Connected: true, LastSeenAt: time.Now()}); err != nil {
-			t.Fatal(err)
-		}
-		s := mkSess(t, st, u.ID, "")
-		r := "vm1"
-		st.Transition(ctx, s.ID, controld.NonTerminal, controld.StateCreating, controld.TransitionOpts{Runner: &r})
-		on, err := st.SessionsOnRunner(ctx, "vm1", []controld.SessionState{controld.StateCreating})
-		if err != nil || len(on) != 1 || on[0].ID != s.ID {
-			t.Fatalf("on-runner: %v %+v", err, on)
-		}
-		runners, _ := st.ListRunners(ctx)
-		if len(runners) != 1 || runners[0].CapacityTotal != 4 {
-			t.Fatalf("runners: %+v", runners)
-		}
-	})
-
-	t.Run("oldest queued ordering", func(t *testing.T) {
-		st := open(t)
-		u := mkUser(t, st)
-		a := mkSess(t, st, u.ID, "")
-		time.Sleep(2 * time.Millisecond)
-		mkSess(t, st, u.ID, "")
-		q, err := st.OldestQueued(ctx)
-		if err != nil || len(q) != 2 || q[0].ID != a.ID {
-			t.Fatalf("fifo order: %v %+v", err, q)
-		}
-	})
-
-	t.Run("environment CRUD and name uniqueness", func(t *testing.T) {
-		st := open(t)
-		e := mkEnv(t, st, "dev")
-		if e.SetupHash != controld.SetupHash("img:1", "make deps") {
-			t.Fatalf("create must compute setup_hash, got %q", e.SetupHash)
-		}
-		if e.CreatedAt.IsZero() || e.UpdatedAt.IsZero() {
-			t.Fatalf("create must stamp timestamps: %+v", e)
-		}
-		if e.SnapshotRef != "" || e.SnapshotRunner != "" || e.SnapshotHash != "" {
-			t.Fatalf("a fresh environment has no snapshot: %+v", e)
-		}
-
-		byID, err := st.GetEnvironment(ctx, e.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if byID.Name != "dev" || byID.Image != "img:1" || byID.Setup != "make deps" ||
-			byID.Placement != "vm1" || byID.SetupTimeoutSec != 600 || byID.SetupHash != e.SetupHash {
-			t.Fatalf("get by id: %+v", byID)
-		}
-		if !slices.Equal(byID.EgressAllow, []string{"github.com"}) {
-			t.Fatalf("egress_allow round trip: %+v", byID.EgressAllow)
-		}
-		if !slices.Equal(byID.SecretRefs, []string{"GITHUB_TOKEN"}) {
-			t.Fatalf("secret_refs round trip: %+v", byID.SecretRefs)
-		}
-		if len(byID.Connectors) != 1 || byID.Connectors[0].Type != "github" {
-			t.Fatalf("connectors round trip: %+v", byID.Connectors)
-		}
-		sameJSON(t, connectorJSON, byID.Connectors[0].Raw)
-
-		byName, err := st.GetEnvironmentByName(ctx, "dev")
-		if err != nil || byName.ID != e.ID {
-			t.Fatalf("get by name: %v %+v", err, byName)
-		}
-		if _, err := st.GetEnvironment(ctx, "env_nosuch"); !errors.Is(err, controld.ErrNotFound) {
-			t.Fatalf("unknown id: want ErrNotFound, got %v", err)
-		}
-		if _, err := st.GetEnvironmentByName(ctx, "nosuch"); !errors.Is(err, controld.ErrNotFound) {
-			t.Fatalf("unknown name: want ErrNotFound, got %v", err)
-		}
-
-		_, err = st.CreateEnvironment(ctx, controld.Environment{
-			ID: controld.NewEnvironmentID(), Name: "dev", Image: "img:2"})
-		if !errors.Is(err, controld.ErrConflict) {
-			t.Fatalf("duplicate name: want ErrConflict, got %v", err)
-		}
-
-		// A create ignores whatever snapshot the caller made up — only
-		// SetEnvironmentSnapshot writes those columns.
-		alpha, err := st.CreateEnvironment(ctx, controld.Environment{
-			ID: controld.NewEnvironmentID(), Name: "alpha", Image: "img:1",
-			SnapshotRef: "made-up", SnapshotRunner: "vm9", SnapshotHash: "deadbeef"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if alpha.SnapshotRef != "" || alpha.SnapshotRunner != "" || alpha.SnapshotHash != "" {
-			t.Fatalf("create must ignore caller-supplied snapshot columns: %+v", alpha)
-		}
-
-		envs, err := st.ListEnvironments(ctx)
-		if err != nil || len(envs) != 2 {
-			t.Fatalf("list: %v %+v", err, envs)
-		}
-		if envs[0].Name != "alpha" || envs[1].Name != "dev" {
-			t.Fatalf("list must be name asc: %q %q", envs[0].Name, envs[1].Name)
-		}
-
-		// A setup change moves setup_hash; created_at stays put.
-		upd := byID
-		upd.Setup = "make deps && make build"
-		moved, err := st.UpdateEnvironment(ctx, upd)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if moved.SetupHash == e.SetupHash {
-			t.Fatalf("setup change must move setup_hash, still %q", moved.SetupHash)
-		}
-		if moved.SetupHash != controld.SetupHash(moved.Image, moved.Setup) {
-			t.Fatalf("update must recompute setup_hash from image+setup: %+v", moved)
-		}
-		if !moved.CreatedAt.Equal(e.CreatedAt) {
-			t.Fatalf("update must not move created_at: %v vs %v", moved.CreatedAt, e.CreatedAt)
-		}
-
-		// An egress-only change leaves setup_hash alone: the build inputs
-		// didn't change, so a cached snapshot stays valid.
-		upd2 := moved
-		upd2.EgressAllow = []string{"github.com", "proxy.golang.org"}
-		got2, err := st.UpdateEnvironment(ctx, upd2)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got2.SetupHash != moved.SetupHash {
-			t.Fatalf("egress-only change must not move setup_hash: %q vs %q", got2.SetupHash, moved.SetupHash)
-		}
-		if !slices.Equal(got2.EgressAllow, []string{"github.com", "proxy.golang.org"}) {
-			t.Fatalf("update must persist egress_allow: %+v", got2.EgressAllow)
-		}
-		if reread, err := st.GetEnvironment(ctx, e.ID); err != nil || reread.Setup != upd.Setup ||
-			!slices.Equal(reread.EgressAllow, got2.EgressAllow) || reread.SetupHash != got2.SetupHash {
-			t.Fatalf("update must persist: %v %+v", err, reread)
-		}
-
-		// Renaming onto a name another environment holds conflicts.
-		alpha.Name = "dev"
-		if _, err := st.UpdateEnvironment(ctx, alpha); !errors.Is(err, controld.ErrConflict) {
-			t.Fatalf("rename onto a taken name: want ErrConflict, got %v", err)
-		}
-		if _, err := st.UpdateEnvironment(ctx, controld.Environment{ID: "env_nosuch", Name: "ghost"}); !errors.Is(err, controld.ErrNotFound) {
-			t.Fatalf("update unknown id: want ErrNotFound, got %v", err)
-		}
-
-		if err := st.DeleteEnvironment(ctx, alpha.ID); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := st.GetEnvironment(ctx, alpha.ID); !errors.Is(err, controld.ErrNotFound) {
-			t.Fatalf("deleted environment: want ErrNotFound, got %v", err)
-		}
-		if err := st.DeleteEnvironment(ctx, alpha.ID); !errors.Is(err, controld.ErrNotFound) {
-			t.Fatalf("delete twice: want ErrNotFound, got %v", err)
-		}
-		if envs, err := st.ListEnvironments(ctx); err != nil || len(envs) != 1 || envs[0].ID != e.ID {
-			t.Fatalf("after delete: %v %+v", err, envs)
-		}
-	})
-
-	t.Run("guarded snapshot update", func(t *testing.T) {
-		st := open(t)
-		e := mkEnv(t, st, "dev")
-
-		if err := st.SetEnvironmentSnapshot(ctx, e.ID, e.SetupHash, "rainier-env:dev-aaaa", "vm1"); err != nil {
-			t.Fatal(err)
-		}
-		cached, err := st.GetEnvironment(ctx, e.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if cached.SnapshotRef != "rainier-env:dev-aaaa" || cached.SnapshotRunner != "vm1" || cached.SnapshotHash != e.SetupHash {
-			t.Fatalf("snapshot not recorded: %+v", cached)
-		}
-
-		// Editing setup moves setup_hash and leaves the (now stale) snapshot
-		// columns exactly as they were — only SetEnvironmentSnapshot writes
-		// them, so the snapshot fields carried in here are ignored too.
-		upd := cached
-		upd.Setup = "make deps && make build"
-		upd.SnapshotRef, upd.SnapshotRunner, upd.SnapshotHash = "hijacked", "vm9", "deadbeef"
-		moved, err := st.UpdateEnvironment(ctx, upd)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if moved.SetupHash == e.SetupHash {
-			t.Fatalf("setup change must move setup_hash, still %q", moved.SetupHash)
-		}
-		if moved.SnapshotRef != "rainier-env:dev-aaaa" || moved.SnapshotRunner != "vm1" || moved.SnapshotHash != e.SetupHash {
-			t.Fatalf("update must not touch snapshot columns: %+v", moved)
-		}
-
-		// A snapshot built from the OLD hash must not land.
-		err = st.SetEnvironmentSnapshot(ctx, e.ID, e.SetupHash, "rainier-env:dev-stale", "vm2")
-		if !errors.Is(err, controld.ErrConflict) {
-			t.Fatalf("stale snapshot: want ErrConflict, got %v", err)
-		}
-		after, err := st.GetEnvironment(ctx, e.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if after.SnapshotRef != "rainier-env:dev-aaaa" || after.SnapshotRunner != "vm1" ||
-			after.SnapshotHash != e.SetupHash || after.SetupHash != moved.SetupHash {
-			t.Fatalf("losing set must change nothing: %+v", after)
-		}
-
-		// The matching hash still lands.
-		if err := st.SetEnvironmentSnapshot(ctx, e.ID, moved.SetupHash, "rainier-env:dev-bbbb", "vm2"); err != nil {
-			t.Fatal(err)
-		}
-		fresh, err := st.GetEnvironment(ctx, e.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if fresh.SnapshotRef != "rainier-env:dev-bbbb" || fresh.SnapshotRunner != "vm2" || fresh.SnapshotHash != moved.SetupHash {
-			t.Fatalf("matching hash must land: %+v", fresh)
-		}
-
-		// An environment that no longer exists has nothing to guard, and the
-		// snapshot must not land there either.
-		if err := st.SetEnvironmentSnapshot(ctx, "env_nosuch", moved.SetupHash, "rainier-env:ghost", "vm1"); !errors.Is(err, controld.ErrConflict) {
-			t.Fatalf("unknown environment: want ErrConflict, got %v", err)
+		if _, err := st.GetUser(ctx, "usr_nosuch"); !errors.Is(err, control.ErrNotFound) {
+			t.Fatalf("GetUser of an unknown id = %v, want ErrNotFound", err)
 		}
 	})
 
@@ -452,7 +120,7 @@ func RunContract(t *testing.T, open func(t *testing.T) controld.Store) {
 		if !bytes.Equal(gotCT, ct1) || !bytes.Equal(gotNonce, nonce1) {
 			t.Fatalf("ciphertext/nonce round trip: %x %x", gotCT, gotNonce)
 		}
-		if _, _, err := st.GetSecret(ctx, "NOSUCH"); !errors.Is(err, controld.ErrNotFound) {
+		if _, _, err := st.GetSecret(ctx, "NOSUCH"); !errors.Is(err, control.ErrNotFound) {
 			t.Fatalf("unknown secret: want ErrNotFound, got %v", err)
 		}
 
@@ -501,10 +169,10 @@ func RunContract(t *testing.T, open func(t *testing.T) controld.Store) {
 		if err := st.DeleteSecret(ctx, "GITHUB_TOKEN"); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := st.GetSecret(ctx, "GITHUB_TOKEN"); !errors.Is(err, controld.ErrNotFound) {
+		if _, _, err := st.GetSecret(ctx, "GITHUB_TOKEN"); !errors.Is(err, control.ErrNotFound) {
 			t.Fatalf("deleted secret: want ErrNotFound, got %v", err)
 		}
-		if err := st.DeleteSecret(ctx, "GITHUB_TOKEN"); !errors.Is(err, controld.ErrNotFound) {
+		if err := st.DeleteSecret(ctx, "GITHUB_TOKEN"); !errors.Is(err, control.ErrNotFound) {
 			t.Fatalf("delete twice: want ErrNotFound, got %v", err)
 		}
 		if metas, err := st.ListSecrets(ctx); err != nil || len(metas) != 1 || metas[0].Name != "ANTHROPIC_KEY" {
@@ -512,371 +180,6 @@ func RunContract(t *testing.T, open func(t *testing.T) controld.Store) {
 		}
 	})
 
-	t.Run("count sessions by environment", func(t *testing.T) {
-		st := open(t)
-		u := mkUser(t, st)
-		e := mkEnv(t, st, "dev")
-		other := mkEnv(t, st, "other")
-
-		mkOn := func(env string) controld.Session {
-			s, err := st.CreateSession(ctx, controld.Session{
-				ID: controld.NewSessionID(), OwnerID: u.ID, EnvironmentID: env,
-				Image: "img", State: controld.StateQueued})
-			if err != nil {
-				t.Fatal(err)
-			}
-			return s
-		}
-		mkOn(e.ID)
-		gone := mkOn(e.ID)
-		mkOn(other.ID)
-		mkSess(t, st, u.ID, "") // scratch: no environment at all
-		if err := st.Transition(ctx, gone.ID, controld.NonTerminal, controld.StateDead, controld.TransitionOpts{}); err != nil {
-			t.Fatal(err)
-		}
-
-		n, err := st.CountSessionsByEnvironment(ctx, e.ID, controld.NonTerminal)
-		if err != nil || n != 1 {
-			t.Fatalf("live count: %v n=%d", err, n)
-		}
-		all, err := st.CountSessionsByEnvironment(ctx, e.ID, nil)
-		if err != nil || all != 2 {
-			t.Fatalf("no state filter counts every session on the env: %v n=%d", err, all)
-		}
-		if n, err := st.CountSessionsByEnvironment(ctx, "env_nosuch", controld.NonTerminal); err != nil || n != 0 {
-			t.Fatalf("unknown env: %v n=%d", err, n)
-		}
-	})
-
-	t.Run("session env columns persist", func(t *testing.T) {
-		st := open(t)
-		u := mkUser(t, st)
-		e := mkEnv(t, st, "dev")
-
-		s, err := st.CreateSession(ctx, controld.Session{
-			ID: controld.NewSessionID(), OwnerID: u.ID, Name: "work",
-			EnvironmentID: e.ID, ResolvedImage: "rainier-env:dev-aaaa",
-			Image: "img", State: controld.StateQueued})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if s.EnvironmentID != e.ID || s.ResolvedImage != "rainier-env:dev-aaaa" {
-			t.Fatalf("create must return the env columns: %+v", s)
-		}
-		got, err := st.GetSession(ctx, s.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got.EnvironmentID != e.ID || got.ResolvedImage != "rainier-env:dev-aaaa" {
-			t.Fatalf("get must return the env columns: %+v", got)
-		}
-		rows, _, err := st.ListSessions(ctx, controld.SessionQuery{Limit: 10})
-		if err != nil || len(rows) != 1 || rows[0].ID != s.ID {
-			t.Fatalf("list: %v %+v", err, rows)
-		}
-		if rows[0].EnvironmentID != e.ID || rows[0].ResolvedImage != "rainier-env:dev-aaaa" {
-			t.Fatalf("list must return the env columns: %+v", rows[0])
-		}
-
-		// A scratch session carries neither.
-		scratch := mkSess(t, st, u.ID, "scratch")
-		if scratch.EnvironmentID != "" || scratch.ResolvedImage != "" {
-			t.Fatalf("scratch session: %+v", scratch)
-		}
-		gotScratch, err := st.GetSession(ctx, scratch.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if gotScratch.EnvironmentID != "" || gotScratch.ResolvedImage != "" {
-			t.Fatalf("scratch session after get: %+v", gotScratch)
-		}
-	})
-
-	// A session's setup_hash is the provenance of the script it was dispatched
-	// with: written once by the create dispatch, read when that setup finishes
-	// to decide whether the container may become the environment's cache.
-	t.Run("session setup hash persists and is settable", func(t *testing.T) {
-		st := open(t)
-		u := mkUser(t, st)
-		e := mkEnv(t, st, "dev")
-
-		// It round-trips through create like any other column...
-		const atCreate = "aaaa1111"
-		s, err := st.CreateSession(ctx, controld.Session{
-			ID: controld.NewSessionID(), OwnerID: u.ID, Name: "work",
-			EnvironmentID: e.ID, ResolvedImage: e.Image, SetupHash: atCreate,
-			Image: "img", State: controld.StateQueued})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if s.SetupHash != atCreate {
-			t.Fatalf("create must return setup_hash: %+v", s)
-		}
-
-		// ...and the dispatch-time write replaces it, visible through every
-		// read path.
-		const atDispatch = "bbbb2222"
-		if err := st.SetSessionSetupHash(ctx, s.ID, atDispatch); err != nil {
-			t.Fatalf("SetSessionSetupHash: %v", err)
-		}
-		got, err := st.GetSession(ctx, s.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got.SetupHash != atDispatch {
-			t.Fatalf("get setup_hash = %q, want %q", got.SetupHash, atDispatch)
-		}
-		rows, _, err := st.ListSessions(ctx, controld.SessionQuery{Limit: 10})
-		if err != nil || len(rows) != 1 {
-			t.Fatalf("list: %v %+v", err, rows)
-		}
-		if rows[0].SetupHash != atDispatch {
-			t.Fatalf("list setup_hash = %q, want %q", rows[0].SetupHash, atDispatch)
-		}
-		onRunner, err := st.SessionsOnRunner(ctx, "", []controld.SessionState{controld.StateQueued})
-		if err != nil || len(onRunner) != 1 || onRunner[0].SetupHash != atDispatch {
-			t.Fatalf("sessions-on-runner setup_hash: %v %+v", err, onRunner)
-		}
-
-		// A session dispatched without a script keeps the column empty.
-		scratch := mkSess(t, st, u.ID, "scratch")
-		if scratch.SetupHash != "" {
-			t.Fatalf("scratch session setup_hash = %q, want empty", scratch.SetupHash)
-		}
-
-		if err := st.SetSessionSetupHash(ctx, "sess_nosuch", atDispatch); !errors.Is(err, controld.ErrNotFound) {
-			t.Fatalf("SetSessionSetupHash on an unknown id = %v, want ErrNotFound", err)
-		}
-	})
-
-	// An environment's init hook runs on every session boot, not once at build
-	// time, so it is deliberately NOT part of setup_hash: editing init must
-	// leave a cached snapshot usable. That is the whole point of the column,
-	// and the assertion below is what stops a future refactor from folding it
-	// into the hash and silently invalidating every team's cache.
-	t.Run("environment init round-trips and stays out of setup_hash", func(t *testing.T) {
-		st := open(t)
-		e := mkEnv(t, st, "dev")
-
-		if e.Init != "make dev-server &" || e.InitTimeoutSec != 120 {
-			t.Fatalf("create must return init columns: %+v", e)
-		}
-		if e.SetupHash != controld.SetupHash(e.Image, e.Setup) {
-			t.Fatalf("setup_hash must come from image+setup alone, got %q", e.SetupHash)
-		}
-
-		byID, err := st.GetEnvironment(ctx, e.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if byID.Init != "make dev-server &" || byID.InitTimeoutSec != 120 {
-			t.Fatalf("get must return init columns: %+v", byID)
-		}
-		byName, err := st.GetEnvironmentByName(ctx, "dev")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if byName.Init != e.Init || byName.InitTimeoutSec != e.InitTimeoutSec {
-			t.Fatalf("get by name must return init columns: %+v", byName)
-		}
-		rows, err := st.ListEnvironments(ctx)
-		if err != nil || len(rows) != 1 {
-			t.Fatalf("list: %v %+v", err, rows)
-		}
-		if rows[0].Init != e.Init || rows[0].InitTimeoutSec != e.InitTimeoutSec {
-			t.Fatalf("list must return init columns: %+v", rows[0])
-		}
-
-		// UpdateEnvironment carries init exactly like setup...
-		upd := byID
-		upd.Init = "make dev-server --port 8080 &"
-		upd.InitTimeoutSec = 300
-		moved, err := st.UpdateEnvironment(ctx, upd)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if moved.Init != upd.Init || moved.InitTimeoutSec != 300 {
-			t.Fatalf("update must persist init columns: %+v", moved)
-		}
-		// ...but an init-only change must NOT move setup_hash: the build
-		// inputs are unchanged, so a cached snapshot stays valid.
-		if moved.SetupHash != e.SetupHash {
-			t.Fatalf("init-only change must not move setup_hash: %q vs %q", moved.SetupHash, e.SetupHash)
-		}
-		if reread, err := st.GetEnvironment(ctx, e.ID); err != nil ||
-			reread.Init != upd.Init || reread.InitTimeoutSec != 300 || reread.SetupHash != e.SetupHash {
-			t.Fatalf("update must persist: %v %+v", err, reread)
-		}
-
-		// An environment with no init at all keeps the columns empty.
-		bare, err := st.CreateEnvironment(ctx, controld.Environment{
-			ID: controld.NewEnvironmentID(), Name: "bare", Image: "img:1"})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if bare.Init != "" || bare.InitTimeoutSec != 0 {
-			t.Fatalf("an environment with no init: %+v", bare)
-		}
-	})
-
-	// child_exit_code is the agent process's own verdict, recorded when the
-	// child exits while the session itself stays up (the operator still has a
-	// shell). It is nullable because "no exit yet" and "exited 0" are
-	// different facts — a plain int column could not tell them apart.
-	t.Run("session child exit code is nullable and settable", func(t *testing.T) {
-		st := open(t)
-		u := mkUser(t, st)
-
-		// A caller-supplied value at create is ignored: nothing has exited yet.
-		code := 3
-		s, err := st.CreateSession(ctx, controld.Session{
-			ID: controld.NewSessionID(), OwnerID: u.ID, Name: "work",
-			Image: "img", State: controld.StateQueued, ChildExitCode: &code})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if s.ChildExitCode != nil {
-			t.Fatalf("create must ignore a caller-supplied child_exit_code, got %d", *s.ChildExitCode)
-		}
-		got, err := st.GetSession(ctx, s.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got.ChildExitCode != nil {
-			t.Fatalf("a fresh session has no child exit code, got %d", *got.ChildExitCode)
-		}
-
-		// Zero is a real exit code, and must not read as "never exited".
-		if err := st.SetChildExitCode(ctx, s.ID, 0); err != nil {
-			t.Fatalf("SetChildExitCode: %v", err)
-		}
-		got, err = st.GetSession(ctx, s.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got.ChildExitCode == nil || *got.ChildExitCode != 0 {
-			t.Fatalf("exit 0 must persist as a set value, got %v", got.ChildExitCode)
-		}
-
-		if err := st.SetChildExitCode(ctx, s.ID, 137); err != nil {
-			t.Fatal(err)
-		}
-		got, err = st.GetSession(ctx, s.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got.ChildExitCode == nil || *got.ChildExitCode != 137 {
-			t.Fatalf("get child_exit_code = %v, want 137", got.ChildExitCode)
-		}
-		rows, _, err := st.ListSessions(ctx, controld.SessionQuery{Limit: 10})
-		if err != nil || len(rows) != 1 {
-			t.Fatalf("list: %v %+v", err, rows)
-		}
-		if rows[0].ChildExitCode == nil || *rows[0].ChildExitCode != 137 {
-			t.Fatalf("list child_exit_code = %v, want 137", rows[0].ChildExitCode)
-		}
-		onRunner, err := st.SessionsOnRunner(ctx, "", []controld.SessionState{controld.StateQueued})
-		if err != nil || len(onRunner) != 1 {
-			t.Fatalf("sessions on runner: %v %+v", err, onRunner)
-		}
-		if onRunner[0].ChildExitCode == nil || *onRunner[0].ChildExitCode != 137 {
-			t.Fatalf("sessions-on-runner child_exit_code = %v, want 137", onRunner[0].ChildExitCode)
-		}
-
-		if err := st.SetChildExitCode(ctx, "sess_nosuch", 1); !errors.Is(err, controld.ErrNotFound) {
-			t.Fatalf("SetChildExitCode on an unknown id = %v, want ErrNotFound", err)
-		}
-	})
-
-	// A user is looked up by id — not just by token — because a session
-	// outlives the request that created it: the create dispatch has to turn a
-	// row's owner_id into the GitHub login and numeric id its commits are
-	// attributed to, and nothing about the dispatch carries a bearer token.
-	t.Run("user lookup by id", func(t *testing.T) {
-		st := open(t)
-		u := mkUser(t, st)
-
-		got, err := st.GetUser(ctx, u.ID)
-		if err != nil {
-			t.Fatalf("GetUser: %v", err)
-		}
-		if got.ID != u.ID || got.GitHubID != u.GitHubID || got.Login != u.Login || got.Role != u.Role {
-			t.Fatalf("GetUser = %+v, want %+v", got, u)
-		}
-		if _, err := st.GetUser(ctx, "usr_nosuch"); !errors.Is(err, controld.ErrNotFound) {
-			t.Fatalf("GetUser of an unknown id = %v, want ErrNotFound", err)
-		}
-	})
-
-	// A session's repo override is the caller's own `repos` list, recorded at
-	// create because the dispatch that needs it happens later — possibly after
-	// a restart, on another replica, off a row read back out of this store.
-	// Three states, all distinct: no override at all (use the environment's
-	// connectors), an explicit empty one (clone nothing), and a real list.
-	t.Run("session repo override round-trips, and absent differs from empty", func(t *testing.T) {
-		st := open(t)
-		u := mkUser(t, st)
-
-		refs := []controld.RepoRef{{Repo: "acme/app"}, {Repo: "acme/infra", BaseBranch: "release"}}
-		s, err := st.CreateSession(ctx, controld.Session{
-			ID: controld.NewSessionID(), OwnerID: u.ID, Name: "work",
-			Image: "img", State: controld.StateQueued, Repos: refs})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(s.Repos, refs) {
-			t.Fatalf("create must return the repo override: %+v", s.Repos)
-		}
-		got, err := st.GetSession(ctx, s.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(got.Repos, refs) {
-			t.Fatalf("get repos = %+v, want %+v", got.Repos, refs)
-		}
-		queued, err := st.OldestQueued(ctx)
-		if err != nil || len(queued) != 1 {
-			t.Fatalf("oldest queued: %v %+v", err, queued)
-		}
-		if !reflect.DeepEqual(queued[0].Repos, refs) {
-			t.Fatalf("oldest-queued repos = %+v, want %+v — the dispatch reads the row from here",
-				queued[0].Repos, refs)
-		}
-
-		// An explicit empty list means "this session clones nothing", which is
-		// a different instruction from "no override given" and must survive as
-		// one: a nil here would silently re-adopt the environment's connectors.
-		none, err := st.CreateSession(ctx, controld.Session{
-			ID: controld.NewSessionID(), OwnerID: u.ID, Name: "none",
-			Image: "img", State: controld.StateQueued, Repos: []controld.RepoRef{}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		gotNone, err := st.GetSession(ctx, none.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if gotNone.Repos == nil || len(gotNone.Repos) != 0 {
-			t.Fatalf("an explicit empty override read back as %#v, want a non-nil empty list", gotNone.Repos)
-		}
-
-		// And a session that named none has none.
-		scratch := mkSess(t, st, u.ID, "scratch")
-		if scratch.Repos != nil {
-			t.Fatalf("create returned repos %#v for a session that named none", scratch.Repos)
-		}
-		gotScratch, err := st.GetSession(ctx, scratch.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if gotScratch.Repos != nil {
-			t.Fatalf("get returned repos %#v for a session that named none", gotScratch.Repos)
-		}
-	})
-
-	// The credential vault: one row per (user, provider), holding sealed bytes
-	// the store never interprets. Every assertion here is about the row's
-	// lifecycle — the seal itself lives above the store.
 	t.Run("credential upsert, get, status, touch, and list", func(t *testing.T) {
 		st := open(t)
 		alice := mkUser(t, st)
@@ -1043,26 +346,127 @@ func RunContract(t *testing.T, open func(t *testing.T) controld.Store) {
 
 		// Every lookup by an identity nothing answers to is ErrNotFound —
 		// including a provider this user has but another user's row holds.
-		if _, err := st.GetCredential(ctx, alice.ID, "nosuch"); !errors.Is(err, controld.ErrNotFound) {
+		if _, err := st.GetCredential(ctx, alice.ID, "nosuch"); !errors.Is(err, control.ErrNotFound) {
 			t.Fatalf("unknown provider: want ErrNotFound, got %v", err)
 		}
-		if _, err := st.GetCredential(ctx, "usr_nosuch", "github"); !errors.Is(err, controld.ErrNotFound) {
+		if _, err := st.GetCredential(ctx, "usr_nosuch", "github"); !errors.Is(err, control.ErrNotFound) {
 			t.Fatalf("unknown user: want ErrNotFound, got %v", err)
 		}
-		if _, err := st.GetCredential(ctx, bob.ID, "aprovider"); !errors.Is(err, controld.ErrNotFound) {
+		if _, err := st.GetCredential(ctx, bob.ID, "aprovider"); !errors.Is(err, control.ErrNotFound) {
 			t.Fatalf("another user's provider: want ErrNotFound, got %v", err)
 		}
-		if err := st.SetCredentialStatus(ctx, alice.ID, "nosuch", controld.CredentialNeedsRefresh); !errors.Is(err, controld.ErrNotFound) {
+		if err := st.SetCredentialStatus(ctx, alice.ID, "nosuch", controld.CredentialNeedsRefresh); !errors.Is(err, control.ErrNotFound) {
 			t.Fatalf("SetCredentialStatus on an unknown provider: want ErrNotFound, got %v", err)
 		}
-		if err := st.SetCredentialStatus(ctx, "usr_nosuch", "github", controld.CredentialNeedsRefresh); !errors.Is(err, controld.ErrNotFound) {
+		if err := st.SetCredentialStatus(ctx, "usr_nosuch", "github", controld.CredentialNeedsRefresh); !errors.Is(err, control.ErrNotFound) {
 			t.Fatalf("SetCredentialStatus on an unknown user: want ErrNotFound, got %v", err)
 		}
-		if err := st.TouchCredentialUsed(ctx, alice.ID, "nosuch"); !errors.Is(err, controld.ErrNotFound) {
+		if err := st.TouchCredentialUsed(ctx, alice.ID, "nosuch"); !errors.Is(err, control.ErrNotFound) {
 			t.Fatalf("TouchCredentialUsed on an unknown provider: want ErrNotFound, got %v", err)
 		}
-		if err := st.TouchCredentialUsed(ctx, "usr_nosuch", "github"); !errors.Is(err, controld.ErrNotFound) {
+		if err := st.TouchCredentialUsed(ctx, "usr_nosuch", "github"); !errors.Is(err, control.ErrNotFound) {
 			t.Fatalf("TouchCredentialUsed on an unknown user: want ErrNotFound, got %v", err)
+		}
+	})
+
+	// EnsureWorkspace is what makes a store from any source usable: New calls
+	// it for the installation workspace on every start, so it has to be a
+	// statement of fact rather than a create that can fail the second time.
+	t.Run("workspace provisioning is idempotent", func(t *testing.T) {
+		st := open(t)
+		for i := 1; i <= 2; i++ {
+			if err := st.EnsureWorkspace(ctx, hostWorkspace); err != nil {
+				t.Fatalf("EnsureWorkspace call %d: %v", i, err)
+			}
+		}
+	})
+
+	// The name index is a locator, never authority: it resolves a name INSIDE
+	// a workspace, and a name another workspace holds is simply not there.
+	t.Run("environment lookup by name is workspace-scoped", func(t *testing.T) {
+		st := open(t)
+		envs := ports(t, st).Environments()
+		provision(t, st, hostWorkspace, hostOtherWS)
+
+		row, err := envs.CreateEnvironment(ctx, hostWorkspace, control.Environment{
+			ID: "env_a", Name: "dev", Image: "img:1", SetupHash: "h1"})
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		got, err := st.EnvironmentByName(ctx, hostWorkspace, "dev")
+		if err != nil || got != row.ID {
+			t.Fatalf("EnvironmentByName = %q, %v; want %q", got, err, row.ID)
+		}
+		if _, err := st.EnvironmentByName(ctx, hostOtherWS, "dev"); !errors.Is(err, control.ErrNotFound) {
+			t.Fatalf("another workspace's name: err = %v, want control.ErrNotFound", err)
+		}
+		if _, err := st.EnvironmentByName(ctx, hostWorkspace, "nosuch"); !errors.Is(err, control.ErrNotFound) {
+			t.Fatalf("unknown name: err = %v, want control.ErrNotFound", err)
+		}
+	})
+
+	// SnapshotRunner decides nothing — it reports which runner built the
+	// cached snapshot, and it keeps reporting it after the setup hash moves
+	// on, because the wire has always shown that column stale or not.
+	t.Run("snapshot runner names the holder, stale or not", func(t *testing.T) {
+		st := open(t)
+		envs := ports(t, st).Environments()
+		provision(t, st, hostWorkspace)
+
+		env, err := envs.CreateEnvironment(ctx, hostWorkspace, control.Environment{
+			ID: "env_a", Name: "dev", Image: "img:1", Setup: "make deps", SetupHash: "h1"})
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if holder, err := st.SnapshotRunner(ctx, hostWorkspace, env.ID); err != nil || holder != "" {
+			t.Fatalf("a fresh environment's holder = %q, %v; want no holder", holder, err)
+		}
+		if err := envs.SetEnvironmentSnapshot(ctx, hostWorkspace, env.ID, "h1", "snap:1", "runner_a"); err != nil {
+			t.Fatalf("snapshot: %v", err)
+		}
+		if holder, err := st.SnapshotRunner(ctx, hostWorkspace, env.ID); err != nil || holder != "runner_a" {
+			t.Fatalf("holder = %q, %v; want runner_a", holder, err)
+		}
+
+		moved := env
+		moved.SetupHash = "h2"
+		moved.Setup = "make deps && make build"
+		if _, err := envs.UpdateEnvironment(ctx, hostWorkspace, moved); err != nil {
+			t.Fatalf("update: %v", err)
+		}
+		if holder, err := st.SnapshotRunner(ctx, hostWorkspace, env.ID); err != nil || holder != "runner_a" {
+			t.Fatalf("holder after the hash moved = %q, %v; want runner_a still", holder, err)
+		}
+	})
+
+	// The generation the fleet repository fences on has exactly one writer.
+	// It is keyed by pool, so the same runner name in two pools counts
+	// separately, and it only ever goes up.
+	t.Run("runner generations are per pool and monotonic", func(t *testing.T) {
+		st := open(t)
+		fleet := ports(t, st).Fleet()
+
+		for want := uint64(1); want <= 3; want++ {
+			got, err := st.NextRunnerGeneration(ctx, hostPoolA, "runner_a")
+			if err != nil || got != want {
+				t.Fatalf("NextRunnerGeneration(pool_a) = %d, %v; want %d", got, err, want)
+			}
+		}
+		if got, err := st.NextRunnerGeneration(ctx, hostPoolB, "runner_a"); err != nil || got != 1 {
+			t.Fatalf("NextRunnerGeneration(pool_b) = %d, %v; want 1", got, err)
+		}
+
+		for _, tc := range []struct {
+			pool control.PoolID
+			want uint64
+		}{{hostPoolA, 3}, {hostPoolB, 1}} {
+			rows, err := fleet.ListRunners(ctx, tc.pool)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("ListRunners(%s) = %+v, %v; want one row", tc.pool, rows, err)
+			}
+			if rows[0].ID != "runner_a" || rows[0].Generation != tc.want {
+				t.Fatalf("%s's runner_a generation = %d, want %d", tc.pool, rows[0].Generation, tc.want)
+			}
 		}
 	})
 }

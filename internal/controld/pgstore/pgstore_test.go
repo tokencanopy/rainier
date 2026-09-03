@@ -3,6 +3,8 @@ package pgstore
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -12,8 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/controlapp/repotest"
 	"github.com/tokencanopy/rainier/internal/controld"
 	"github.com/tokencanopy/rainier/internal/controld/storetest"
 )
@@ -62,48 +67,14 @@ func startPostgres(t *testing.T) string {
 	return dsn
 }
 
-func TestPGStoreContract(t *testing.T) {
-	dsn := startPostgres(t)
-	n := 0
-	storetest.RunContract(t, func(t *testing.T) controld.Store {
-		// fresh schema per subtest: unique search_path-free approach — create
-		// a numbered database so subtests don't see each other's rows.
-		n++
-		name := fmt.Sprintf("contract_%d", n)
-		admin, err := Open(context.Background(), dsn)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := admin.execAdmin(context.Background(), "CREATE DATABASE "+name); err != nil {
-			t.Fatal(err)
-		}
-		st, err := Open(context.Background(), strings.Replace(dsn, "/postgres?", "/"+name+"?", 1))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return st
-	})
-}
-
 // freshStore opens a brand-new, empty database on dsn's server so a test can
 // run in isolation from every other test on the same throwaway postgres
-// container. Mirrors the per-subtest database logic inlined in
-// TestPGStoreContract above.
+// container. name is a label, not the database name: freshDB derives a legal,
+// unique one from it, so a caller may pass t.Name() straight through however
+// the subtest is called and however often the test runs.
 func freshStore(t *testing.T, dsn, name string) *Store {
 	t.Helper()
-	ctx := context.Background()
-	admin, err := Open(ctx, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := admin.execAdmin(ctx, "CREATE DATABASE "+name); err != nil {
-		t.Fatal(err)
-	}
-	st, err := Open(ctx, strings.Replace(dsn, "/postgres?", "/"+name+"?", 1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return st
+	return reopen(t, freshDB(t, dsn, name))
 }
 
 // TestListSessionsExactMultiplePagination pins the behavior the shared
@@ -121,15 +92,19 @@ func TestListSessionsExactMultiplePagination(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 4; i++ {
-		if _, err := st.CreateSession(ctx, controld.Session{
-			ID: controld.NewSessionID(), OwnerID: u.ID, Image: "img", State: controld.StateQueued,
+		if _, err := st.Sessions().CreateSession(ctx, "ws_self_hosted", control.Session{
+			ID:        control.SessionID(controld.NewSessionID()),
+			CreatorID: control.ActorID(u.ID),
+			Spec:      control.PortableSpec{Image: "img"},
+			State:     control.StateQueued,
+			PoolID:    "pool_self_hosted",
 		}); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(2 * time.Millisecond) // distinct created_at
 	}
 
-	page, next, err := st.ListSessions(ctx, controld.SessionQuery{Limit: 4})
+	page, next, err := st.Sessions().ListSessions(ctx, "ws_self_hosted", control.SessionQuery{Limit: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +115,7 @@ func TestListSessionsExactMultiplePagination(t *testing.T) {
 		t.Fatal("want non-empty next cursor when the page comes back exactly full, even though no further rows exist")
 	}
 
-	page2, next2, err := st.ListSessions(ctx, controld.SessionQuery{Limit: 4, Cursor: next})
+	page2, next2, err := st.Sessions().ListSessions(ctx, "ws_self_hosted", control.SessionQuery{Limit: 4, Cursor: next})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +163,7 @@ func TestUserByTokenTouchesLastUsedAt(t *testing.T) {
 		t.Fatal("want last_used_at set after UserByToken, got NULL")
 	}
 
-	if _, err := st.UserByToken(ctx, controld.HashToken("rnr_bogus")); !errors.Is(err, controld.ErrNotFound) {
+	if _, err := st.UserByToken(ctx, controld.HashToken("rnr_bogus")); !errors.Is(err, control.ErrNotFound) {
 		t.Fatalf("want ErrNotFound for unknown token, got %v", err)
 	}
 }
@@ -238,14 +213,7 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 
 	// Build a database that stops at 0003, the way a deployed controld from
 	// the previous plan would have it.
-	admin, err := Open(ctx, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := admin.execAdmin(ctx, "CREATE DATABASE upgrade_0004"); err != nil {
-		t.Fatal(err)
-	}
-	legacyDSN := strings.Replace(dsn, "/postgres?", "/upgrade_0004?", 1)
+	legacyDSN := freshDB(t, dsn, t.Name())
 	pool, err := pgxpool.New(ctx, legacyDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -302,34 +270,39 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	if want := embeddedMigrationVersions(t); !slices.Equal(applied, want) {
 		t.Fatalf("schema_migrations = %v, want every embedded migration in order %v", applied, want)
 	}
+	// This release's head is 8: a database that stopped at 0003 runs the
+	// expand step (0007) and the contract step (0008) in the same start.
+	if head := applied[len(applied)-1]; head != 8 {
+		t.Fatalf("head migration = %d, want 8", head)
+	}
 
 	// The legacy session survived, and its new columns read as "never exited"
 	// rather than "exited 0", and as "named no repo override" rather than
 	// "asked for no repositories" — a pre-0005 row stores SQL NULL there, and
 	// a nil Repos is what lets its environment's connectors still decide.
-	sess, err := st.GetSession(ctx, "sess_legacy")
+	sess, err := st.Sessions().GetSession(ctx, "ws_self_hosted", "sess_legacy")
 	if err != nil {
 		t.Fatalf("legacy session after upgrade: %v", err)
 	}
 	if sess.ChildExitCode != nil {
 		t.Fatalf("legacy session child_exit_code = %d, want NULL", *sess.ChildExitCode)
 	}
-	if sess.Repos != nil {
-		t.Fatalf("legacy session repos = %#v, want nil (no override), not an empty list", sess.Repos)
+	if sess.Spec.Repos != nil {
+		t.Fatalf("legacy session repos = %#v, want nil (no override), not an empty list", sess.Spec.Repos)
 	}
-	if sess.Name != "old" || sess.Image != "img:0" || sess.State != controld.StateRunning {
+	if sess.Name != "old" || sess.Spec.Image != "img:0" || sess.State != control.StateRunning {
 		t.Fatalf("legacy session lost data across the migration: %+v", sess)
 	}
-	if err := st.SetChildExitCode(ctx, "sess_legacy", 0); err != nil {
+	if err := st.Sessions().SetChildExitCode(ctx, "ws_self_hosted", "sess_legacy", 0); err != nil {
 		t.Fatal(err)
 	}
-	if sess, err = st.GetSession(ctx, "sess_legacy"); err != nil || sess.ChildExitCode == nil || *sess.ChildExitCode != 0 {
+	if sess, err = st.Sessions().GetSession(ctx, "ws_self_hosted", "sess_legacy"); err != nil || sess.ChildExitCode == nil || *sess.ChildExitCode != 0 {
 		t.Fatalf("after SetChildExitCode(0): %v %+v", err, sess.ChildExitCode)
 	}
 
 	// The legacy environment survived with an empty init hook, and its
 	// setup_hash — the identity a cached snapshot is keyed by — did not move.
-	env, err := st.GetEnvironment(ctx, "env_legacy")
+	env, err := st.Environments().GetEnvironment(ctx, "ws_self_hosted", "env_legacy")
 	if err != nil {
 		t.Fatalf("legacy environment after upgrade: %v", err)
 	}
@@ -363,7 +336,247 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	if _, err := st.pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, gone.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.GetCredential(ctx, gone.ID, "github"); !errors.Is(err, controld.ErrNotFound) {
+	if _, err := st.GetCredential(ctx, gone.ID, "github"); !errors.Is(err, control.ErrNotFound) {
 		t.Fatalf("ON DELETE CASCADE must take the credential with the user, got %v", err)
+	}
+
+	// Replay: a controld that restarts against an already-migrated database
+	// runs Migrate again, and it must do nothing at all. Every statement in
+	// the expand step (0007) and the contract step (0008) is a one-way ALTER
+	// or DROP, so a second application would fail loudly rather than
+	// silently — the assertion is that the version set is unchanged (through
+	// 8) and the rows still read.
+	if err := Migrate(ctx, st.pool); err != nil {
+		t.Fatalf("Migrate twice: %v", err)
+	}
+	var replayed []int
+	rows, err = st.pool.Query(ctx, `SELECT version FROM schema_migrations ORDER BY version`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		replayed = append(replayed, v)
+	}
+	rows.Close()
+	if !slices.Equal(replayed, applied) {
+		t.Fatalf("a second Migrate changed schema_migrations: %v, want %v", replayed, applied)
+	}
+	if _, err := st.Sessions().GetSession(ctx, "ws_self_hosted", "sess_legacy"); err != nil {
+		t.Fatalf("the legacy session must still read after a replayed Migrate: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the native repositories (O9)
+// ---------------------------------------------------------------------------
+
+// dbName turns a test name into a legal, unique Postgres database name:
+// lowercased, every character an identifier cannot hold replaced, truncated
+// to leave room for a random suffix. The suffix is what lets the same test
+// run twice against the same throwaway server (`-count=2`, or a second `go
+// test`) without colliding with the database its first run created.
+func dbName(name string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(name) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	trimmed := strings.Trim(b.String(), "_")
+	if len(trimmed) > 40 {
+		trimmed = trimmed[:40]
+	}
+	suffix := make([]byte, 4)
+	if _, err := rand.Read(suffix); err != nil {
+		panic("pgstore test: crypto/rand: " + err.Error())
+	}
+	return "t_" + trimmed + "_" + hex.EncodeToString(suffix)
+}
+
+// freshDB creates a brand-new, empty database on dsn's server and returns the
+// DSN that reaches it. The database is dropped when the test ends, so a
+// throwaway server does not accumulate one per case forever.
+func freshDB(t *testing.T, dsn, name string) string {
+	t.Helper()
+	ctx := context.Background()
+	db := dbName(name)
+	admin, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+db, pgx.QueryExecModeSimpleProtocol); err != nil {
+		admin.Close()
+		t.Fatalf("create database %s: %v", db, err)
+	}
+	admin.Close()
+	t.Cleanup(func() {
+		cleanup, err := pgxpool.New(context.Background(), dsn)
+		if err != nil {
+			return
+		}
+		defer cleanup.Close()
+		cleanup.Exec(context.Background(), "DROP DATABASE IF EXISTS "+db+" WITH (FORCE)", pgx.QueryExecModeSimpleProtocol)
+	})
+	return strings.Replace(dsn, "/postgres?", "/"+db+"?", 1)
+}
+
+// reopen opens a second Store over a database that already exists — the
+// restart case, where the process is new and the rows are not.
+func reopen(t *testing.T, dbDSN string) *Store {
+	t.Helper()
+	st, err := Open(context.Background(), dbDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	return st
+}
+
+// rawPoolAt creates a fresh database, migrates it to exactly version, and
+// hands back the raw pool — the way a deployment that stopped at that
+// version looks, before the migration under test runs.
+func rawPoolAt(t *testing.T, dsn string, version int) *pgxpool.Pool {
+	t.Helper()
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, freshDB(t, dsn, t.Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := migrateTo(ctx, pool, version); err != nil {
+		t.Fatalf("migrate to %d: %v", version, err)
+	}
+	return pool
+}
+
+// mustExec runs one raw statement, the way the pre-O9 code wrote its rows.
+func mustExec(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), sql, args...); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+}
+
+// TestPGStoreRepositories runs the public repository contract every host's
+// store must pass, over a fresh database per case.
+func TestPGStoreRepositories(t *testing.T) {
+	dsn := startPostgres(t)
+	repotest.Run(t, func(t *testing.T) repotest.Stores {
+		st := freshStore(t, dsn, t.Name())
+		return repotest.Stores{
+			Sessions:     st.Sessions(),
+			Environments: st.Environments(),
+			Fleet:        st.Fleet(),
+			Provision:    st.EnsureWorkspace,
+		}
+	})
+}
+
+// TestPGStoreHost runs the host-side contract: identity, the vault, and the
+// four lookups the control ports deliberately lack.
+func TestPGStoreHost(t *testing.T) {
+	dsn := startPostgres(t)
+	storetest.RunHost(t, func(t *testing.T) controld.HostStore {
+		return freshStore(t, dsn, t.Name())
+	})
+}
+
+// TestMigration0007BackfillsExistingRows proves the expand step against rows
+// the pre-O9 code wrote: they come out scoped, their resolved image is their
+// image, and an operator's pin is a capability.
+func TestMigration0007BackfillsExistingRows(t *testing.T) {
+	ctx := context.Background()
+	pool := rawPoolAt(t, startPostgres(t), 6)
+	mustExec(t, pool, `INSERT INTO users (id, github_id, login, role) VALUES ('usr_example', 1, 'octocat-example', 'admin')`)
+	mustExec(t, pool, `INSERT INTO environments (id, name, image, setup_hash, placement) VALUES ('env_example', 'py', 'img:1', 'h1', 'vm1')`)
+	mustExec(t, pool, `INSERT INTO sessions (id, owner_id, name, image, resolved_image, state, runner, environment_id) VALUES ('sess_example', 'usr_example', 'dev', '', 'rainier-env:env_example-abc', 'running', 'vm1', 'env_example')`)
+	mustExec(t, pool, `INSERT INTO runners (name, capacity_total, connected) VALUES ('vm1', 4, true)`)
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	st := &Store{pool: pool}
+
+	row, err := st.Sessions().GetSession(ctx, "ws_self_hosted", "sess_example")
+	if err != nil || row.Spec.Image != "rainier-env:env_example-abc" || row.PoolID != "pool_self_hosted" ||
+		row.PlacementGeneration != 1 || row.RunnerID != "vm1" {
+		t.Fatalf("session after 0007: %+v, %v", row, err)
+	}
+	if row.WorkspaceID != "ws_self_hosted" || row.CreatorID != "usr_example" || row.ControllerGeneration != 0 {
+		t.Fatalf("session scope after 0007: %+v", row)
+	}
+	env, err := st.Environments().GetEnvironment(ctx, "ws_self_hosted", "env_example")
+	if err != nil || !slices.Equal(env.Requirements.Capabilities, []string{"placement:vm1"}) {
+		t.Fatalf("environment after 0007: %+v, %v", env, err)
+	}
+	runners, err := st.Fleet().ListRunners(ctx, "pool_self_hosted")
+	if err != nil || len(runners) != 1 || runners[0].ID != "vm1" || runners[0].Generation != 0 {
+		t.Fatalf("runners after 0007: %+v, %v", runners, err)
+	}
+	if runners[0].PoolID != "pool_self_hosted" || runners[0].CapacityTotal != 4 || !runners[0].Connected {
+		t.Fatalf("runner fields after 0007: %+v", runners[0])
+	}
+
+	// And the contract step (0008) took the two columns the expand step
+	// replaced, and the scope defaults with them: after this release a row
+	// written without a workspace is a database error, not a silent write
+	// into the installation's own workspace.
+	for _, gone := range []struct{ table, column string }{
+		{"sessions", "resolved_image"},
+		{"environments", "placement"},
+	} {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM information_schema.columns WHERE table_name = $1 AND column_name = $2`,
+			gone.table, gone.column).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("%s.%s survived 0008", gone.table, gone.column)
+		}
+	}
+	for _, scoped := range []struct{ table, column string }{
+		{"sessions", "workspace_id"},
+		{"sessions", "pool_id"},
+		{"environments", "workspace_id"},
+		{"runners", "pool_id"},
+	} {
+		var def *string
+		if err := pool.QueryRow(ctx,
+			`SELECT column_default FROM information_schema.columns WHERE table_name = $1 AND column_name = $2`,
+			scoped.table, scoped.column).Scan(&def); err != nil {
+			t.Fatalf("%s.%s: %v", scoped.table, scoped.column, err)
+		}
+		if def != nil {
+			t.Fatalf("%s.%s still defaults to %q after 0008", scoped.table, scoped.column, *def)
+		}
+	}
+}
+
+// TestNextRunnerGenerationSurvivesReopen is the restart case: a second Store
+// over the same database continues the sequence, because the generation the
+// fleet fences on is a row and not a process's memory.
+func TestNextRunnerGenerationSurvivesReopen(t *testing.T) {
+	ctx := context.Background()
+	dbDSN := freshDB(t, startPostgres(t), t.Name())
+	a := reopen(t, dbDSN)
+	for want := uint64(1); want <= 2; want++ {
+		got, err := a.NextRunnerGeneration(ctx, "pool_a", "runner_a")
+		if err != nil || got != want {
+			t.Fatalf("gen = %d, %v; want %d", got, err, want)
+		}
+	}
+	a.Close()
+
+	b := reopen(t, dbDSN)
+	if got, err := b.NextRunnerGeneration(ctx, "pool_a", "runner_a"); err != nil || got != 3 {
+		t.Fatalf("after reopen gen = %d, %v; want 3", got, err)
 	}
 }

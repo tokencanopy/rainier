@@ -93,16 +93,16 @@ type sessionDerived struct {
 
 // sessionJSON renders s as its client-facing view, with d supplying the
 // fields the row itself cannot answer for.
-func sessionJSON(s Session, d sessionDerived) sessionView {
+func sessionJSON(s control.Session, d sessionDerived) sessionView {
 	return sessionView{
-		ID:          s.ID,
-		OwnerID:     s.OwnerID,
+		ID:          string(s.ID),
+		OwnerID:     string(s.CreatorID),
 		Name:        s.Name,
-		Image:       s.effectiveImage(),
-		Cmd:         emptyIfNil(s.Cmd),
-		EgressAllow: emptyIfNil(s.EgressAllow),
+		Image:       s.Spec.Image,
+		Cmd:         emptyIfNil(s.Spec.Cmd),
+		EgressAllow: emptyIfNil(s.Spec.EgressAllow),
 		State:       string(s.State),
-		Runner:      s.Runner,
+		Runner:      string(s.RunnerID),
 		Reachable:   d.Reachable,
 		Error:       s.Error,
 		Environment: d.Environment,
@@ -162,7 +162,7 @@ func (r *sessionRenderer) view(row control.Session) sessionView {
 		d.Environment = env.Name
 		d.QueueReason = r.queueReason(row, *env)
 	}
-	return sessionJSON(sessionFromControl(row), d)
+	return sessionJSON(row, d)
 }
 
 // environment returns the environment for id, or nil for a scratch session,
@@ -199,7 +199,7 @@ func (r *sessionRenderer) environment(id string) *control.Environment {
 //
 // The pin is read off the environment's portable requirements: control names
 // no runner, so an operator's `placement` is carried as the capability
-// "placement:<runner>" (adapt_store.go).
+// "placement:<runner>" (adapt_scope.go).
 func (r *sessionRenderer) queueReason(row control.Session, env control.Environment) string {
 	pin := capabilityValue(env.Requirements.Capabilities, placementCapabilityPrefix)
 	if row.State != control.StateQueued || pin == "" || r.runnerHasRoom(pin) {
@@ -234,7 +234,8 @@ func (r *sessionRenderer) runnerHasRoom(name string) bool {
 // yields an empty map rather than a partial one — half a capacity picture is
 // not a smaller truth, it is a different fleet.
 func (r *sessionRenderer) freeSlots() map[string]int {
-	rows, err := r.srv.st.ListRunners(r.ctx)
+	fleet := r.srv.st.Fleet()
+	rows, err := fleet.ListRunners(r.ctx, installPool)
 	if err != nil {
 		log.Printf("controld: rendering a session view: listing runners: %v", err)
 		return map[string]int{}
@@ -244,12 +245,12 @@ func (r *sessionRenderer) freeSlots() map[string]int {
 		if !row.Connected {
 			continue
 		}
-		creating, err := r.srv.st.SessionsOnRunner(r.ctx, row.Name, []SessionState{StateCreating})
+		creating, err := fleet.SessionsOnRunner(r.ctx, installPool, row.ID, []control.SessionState{control.StateCreating})
 		if err != nil {
 			log.Printf("controld: rendering a session view: sessions creating on a runner: %v", err)
 			return map[string]int{}
 		}
-		free[row.Name] = row.CapacityTotal - row.CapacityUsed - len(creating)
+		free[string(row.ID)] = row.CapacityTotal - row.CapacityUsed - len(creating)
 	}
 	return free
 }
@@ -345,16 +346,16 @@ type repoRequest struct {
 //
 // The errors are the caller's to read — each names the offending entry by
 // index and what was wrong with it — and none carries internal detail.
-func repoOverrides(reqs []repoRequest) ([]RepoRef, error) {
+func repoOverrides(reqs []repoRequest) ([]control.RepoRef, error) {
 	if reqs == nil {
 		return nil, nil
 	}
-	out := make([]RepoRef, 0, len(reqs))
+	out := make([]control.RepoRef, 0, len(reqs))
 	for i, req := range reqs {
 		if !validRepoRef(req.Repo) {
 			return nil, fmt.Errorf("repos[%d].repo must be \"owner/name\", got %q", i, req.Repo)
 		}
-		ref := RepoRef{Repo: req.Repo}
+		ref := control.RepoRef{Repo: req.Repo}
 		if req.BaseBranch != nil {
 			if *req.BaseBranch == "" {
 				return nil, fmt.Errorf("repos[%d].base_branch is empty; omit it for the default (%s)", i, defaultBaseBranch)
@@ -499,7 +500,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 
 	cmd := control.CreateSession{
 		Name:           req.Name,
-		Repos:          reposToControl(repos),
+		Repos:          repos,
 		IdempotencyKey: r.Header.Get("Idempotency-Key"),
 	}
 	// The session's own spec always travels: for a scratch session it is the
@@ -560,26 +561,23 @@ func (s *Server) createSessionEnvironment(w http.ResponseWriter, ctx context.Con
 // github` while the session sits there, and the clone that follows works — so
 // the clone, not the create, is the right place for it to say so. A
 // credential that is not there at all never becomes present that way.
-func (s *Server) createPreflight(w http.ResponseWriter, ctx context.Context, u User, repos []RepoRef, env *control.Environment) bool {
-	var storeEnv *Environment
+func (s *Server) createPreflight(w http.ResponseWriter, ctx context.Context, u User, repos []control.RepoRef, env *control.Environment) bool {
 	if env != nil {
-		row := environmentFromControl(*env)
-		storeEnv = &row
-		_, missing, err := s.secretEnv(ctx, row)
+		_, missing, err := s.secretEnv(ctx, *env)
 		switch {
 		case err != nil:
-			log.Printf("controld: create session: resolving secrets of environment %s: %v", row.ID, err)
+			log.Printf("controld: create session: resolving secrets of environment %s: %v", env.ID, err)
 			writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
 			return false
 		case missing != "":
-			writeErr(w, http.StatusConflict, "conflict", missingSecretMessage(row, missing))
+			writeErr(w, http.StatusConflict, "conflict", missingSecretMessage(*env, missing))
 			return false
 		}
 	}
 
-	refs, err := sessionRepoRefs(Session{Repos: repos}, storeEnv)
+	refs, err := sessionRepoRefs(control.Session{Spec: control.PortableSpec{Repos: repos}}, env)
 	if err != nil {
-		log.Printf("controld: create session: resolving the repositories of environment %s: %v", envID(storeEnv), err)
+		log.Printf("controld: create session: resolving the repositories of environment %s: %v", envID(env), err)
 		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
 		return false
 	}
@@ -589,7 +587,7 @@ func (s *Server) createPreflight(w http.ResponseWriter, ctx context.Context, u U
 	// The row itself is never read — only its existence is — so no credential
 	// material is loaded, let alone rendered into the response.
 	if _, err := s.st.GetCredential(ctx, u.ID, githubProvider); err != nil {
-		if errors.Is(err, ErrNotFound) {
+		if errors.Is(err, control.ErrNotFound) {
 			writeErr(w, http.StatusConflict, "conflict", ErrCredentialMissing.Error())
 			return false
 		}
@@ -607,7 +605,7 @@ func (s *Server) createPreflight(w http.ResponseWriter, ctx context.Context, u U
 // failure. No return value and no error text here ever carries a secret VALUE.
 // The three results are, in order: the variables, the name of the first
 // reference that had no secret behind it, and a genuine failure.
-func (s *Server) secretEnv(ctx context.Context, env Environment) (map[string]string, string, error) {
+func (s *Server) secretEnv(ctx context.Context, env control.Environment) (map[string]string, string, error) {
 	if len(env.SecretRefs) == 0 {
 		return nil, "", nil
 	}
@@ -615,7 +613,7 @@ func (s *Server) secretEnv(ctx context.Context, env Environment) (map[string]str
 	for _, name := range env.SecretRefs {
 		ciphertext, nonce, err := s.st.GetSecret(ctx, name)
 		if err != nil {
-			if errors.Is(err, ErrNotFound) {
+			if errors.Is(err, control.ErrNotFound) {
 				return nil, name, nil
 			}
 			return nil, "", fmt.Errorf("get secret %s: %w", name, err)
@@ -632,7 +630,7 @@ func (s *Server) secretEnv(ctx context.Context, env Environment) (map[string]str
 // missingSecretMessage is the one client-facing sentence for a dangling
 // secret_ref, shared by the create's 409 and the dispatch's failure text so
 // an operator meets the same words wherever the reference breaks.
-func missingSecretMessage(env Environment, name string) string {
+func missingSecretMessage(env control.Environment, name string) string {
 	return fmt.Sprintf("environment %q references secret %q, which no longer exists", env.Name, name)
 }
 
@@ -973,7 +971,7 @@ func (s *Server) handleDeleteSecret(w http.ResponseWriter, r *http.Request, u Us
 		return
 	}
 	if err := s.st.DeleteSecret(r.Context(), name); err != nil {
-		if errors.Is(err, ErrNotFound) {
+		if errors.Is(err, control.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "not_found", "secret not found")
 			return
 		}
@@ -1110,7 +1108,7 @@ type environmentsEnvelope struct {
 //
 // Two of the wire's fields have no field of their own on control.Environment,
 // which names no runner: `placement` is carried as the portable capability
-// "placement:<runner>" (adapt_store.go) and read back out of it here, and
+// "placement:<runner>" (adapt_scope.go) and read back out of it here, and
 // `snapshot_runner` — which the control model does not carry at all — is
 // passed in by the handler, which read it off the store row for the view.
 func environmentJSON(e control.Environment, snapshotRunner string) environmentView {
@@ -1124,7 +1122,7 @@ func environmentJSON(e control.Environment, snapshotRunner string) environmentVi
 		InitTimeoutSec:  e.InitTimeoutSec,
 		EgressAllow:     emptyIfNil(e.EgressAllow),
 		SecretRefs:      emptyIfNil(e.SecretRefs),
-		Connectors:      connectorsJSON(connectorsFromControl(e.Connectors)),
+		Connectors:      connectorsJSON(e.Connectors),
 		Placement:       capabilityValue(e.Requirements.Capabilities, placementCapabilityPrefix),
 		SetupTimeoutSec: e.SetupTimeoutSec,
 		SnapshotRef:     e.Snapshot.Ref,
@@ -1141,7 +1139,7 @@ func environmentJSON(e control.Environment, snapshotRunner string) environmentVi
 // while Postgres's jsonb preserves the value but may re-render whitespace and
 // member order; storetest's sameJSON is where that contract lives.) Never
 // nil, so the array renders as "[]" rather than null.
-func connectorsJSON(cs []Connector) []json.RawMessage {
+func connectorsJSON(cs []control.Connector) []json.RawMessage {
 	out := make([]json.RawMessage, 0, len(cs))
 	for _, c := range cs {
 		raw := c.Raw
@@ -1243,7 +1241,7 @@ type browserConnector struct {
 //
 // Errors are written for the caller: each names the offending element by
 // index and says what was wrong with it, and none carries internal detail.
-func validateConnectors(raw json.RawMessage) ([]Connector, error) {
+func validateConnectors(raw json.RawMessage) ([]control.Connector, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
@@ -1255,7 +1253,7 @@ func validateConnectors(raw json.RawMessage) ([]Connector, error) {
 		return nil, nil
 	}
 
-	out := make([]Connector, 0, len(elems))
+	out := make([]control.Connector, 0, len(elems))
 	for i, elem := range elems {
 		// Loose decode first, for the discriminator alone: the strict decode
 		// below can't run until we know which shape to check against.
@@ -1271,7 +1269,7 @@ func validateConnectors(raw json.RawMessage) ([]Connector, error) {
 		if err := validateConnector(head.Type, elem); err != nil {
 			return nil, fmt.Errorf("connectors[%d]: %w", i, err)
 		}
-		out = append(out, Connector{Type: head.Type, Raw: elem})
+		out = append(out, control.Connector{Type: head.Type, Raw: elem})
 	}
 	return out, nil
 }
@@ -1450,11 +1448,11 @@ func (s *Server) missingSecretRef(ctx context.Context, refs []string) (string, e
 // which is what authorizes the read.
 func (s *Server) environmentRef(ctx context.Context, scope control.Scope, ref string) (control.Environment, error) {
 	if !strings.HasPrefix(ref, environmentIDPrefix) {
-		row, err := s.st.GetEnvironmentByName(ctx, ref)
+		id, err := s.st.EnvironmentByName(ctx, scope.WorkspaceID, ref)
 		if err != nil {
-			return control.Environment{}, storeErr(err)
+			return control.Environment{}, err
 		}
-		return s.environments.GetEnvironment(ctx, scope, control.EnvironmentID(row.ID))
+		return s.environments.GetEnvironment(ctx, scope, id)
 	}
 	return s.environments.GetEnvironment(ctx, scope, control.EnvironmentID(ref))
 }
@@ -1466,19 +1464,19 @@ func (s *Server) environmentRef(ctx context.Context, scope control.Scope, ref st
 // column, stale or not, so the view reads the column. It decides nothing; an
 // unreadable row simply shows no runner.
 func (s *Server) snapshotRunnerOf(ctx context.Context, id control.EnvironmentID) string {
-	row, err := s.st.GetEnvironment(ctx, string(id))
+	holder, err := s.st.SnapshotRunner(ctx, installWorkspace, id)
 	if err != nil {
-		if !errors.Is(err, ErrNotFound) {
+		if !errors.Is(err, control.ErrNotFound) {
 			log.Printf("controld: rendering environment %s: reading its snapshot runner: %v", id, err)
 		}
 		return ""
 	}
-	return row.SnapshotRunner
+	return string(holder)
 }
 
 // placementRequirements is the portable spelling of an operator's runner pin:
 // control.Environment names no runner, so `placement` round-trips through the
-// capability "placement:<runner>" (adapt_store.go). An empty placement is no
+// capability "placement:<runner>" (adapt_scope.go). An empty placement is no
 // capability at all rather than an empty one.
 func placementRequirements(placement string) control.Requirements {
 	if placement == "" {
@@ -1520,7 +1518,7 @@ func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request,
 		InitTimeoutSec:  req.InitTimeoutSec,
 		EgressAllow:     req.EgressAllow,
 		SecretRefs:      req.SecretRefs,
-		Connectors:      connectorsToControl(conns),
+		Connectors:      conns,
 		Requirements:    placementRequirements(req.Placement),
 		SetupTimeoutSec: req.SetupTimeoutSec,
 	})
@@ -1570,16 +1568,16 @@ func (s *Server) handleListEnvironments(w http.ResponseWriter, r *http.Request, 
 		writeControlErr(w, err)
 		return
 	}
-	// One store read for the whole page rather than one per row: the snapshot
-	// runner is a view-only column (see snapshotRunnerOf) and a listing that
-	// asked for it row by row would read the table twice over.
-	runners := map[string]string{}
-	if rows, err := s.st.ListEnvironments(ctx); err != nil {
-		log.Printf("controld: list environments: reading their snapshot runners: %v", err)
-	} else {
-		for _, row := range rows {
-			runners[row.ID] = row.SnapshotRunner
-		}
+	// The snapshot runner is a view-only column (see snapshotRunnerOf), and
+	// the page the service returned cannot answer for it: control.Environment
+	// carries a snapshot's holder only as a capability, and only while the
+	// snapshot is still current, whereas this column has always shown the
+	// runner stale or not. So it is the host lookup, once per row on the page
+	// — there are few environments per deployment, and this is the same
+	// question the single-environment view asks.
+	runners := make(map[string]string, len(page.Environments))
+	for _, row := range page.Environments {
+		runners[string(row.ID)] = s.snapshotRunnerOf(ctx, row.ID)
 	}
 	out := make([]environmentView, len(page.Environments))
 	for i, row := range page.Environments {
@@ -1672,8 +1670,7 @@ func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request,
 			writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 			return
 		}
-		converted := connectorsToControl(conns)
-		cmd.Connectors = &converted
+		cmd.Connectors = &conns
 	}
 	// Only the refs this request supplies are checked for existence: a patch
 	// answers for what it sets, and refs that were valid when they were set
@@ -1748,7 +1745,7 @@ func (s *Server) handleDeleteEnvironment(w http.ResponseWriter, r *http.Request,
 // counting against anything but a real id would sweep in sessions that belong
 // to no environment at all.
 func (s *Server) stillInUseMessage(ctx context.Context, env control.Environment) string {
-	n, err := s.st.CountSessionsByEnvironment(ctx, string(env.ID), NonTerminal)
+	n, err := s.st.Environments().CountSessionsByEnvironment(ctx, installWorkspace, env.ID, control.NonTerminal)
 	if err != nil || n <= 0 {
 		return fmt.Sprintf("environment %q still has non-terminal session(s)", env.Name)
 	}

@@ -13,7 +13,14 @@ import (
 // The host ports that are not persistence: which pools a session may run in,
 // where an application event goes, what time it is, and where new identities
 // come from. Each is the smallest thing that satisfies its contract for a
-// single-tenant installation.
+// single-tenant installation. The three repository ports are not here: the
+// store implements them itself, and compose() reads them off it.
+var (
+	_ control.PoolResolver  = installationPools{}
+	_ control.EventRecorder = logRecorder{}
+	_ control.Clock         = systemClock{}
+	_ control.IDGenerator   = idGenerator{}
+)
 
 // installationPools is control.PoolResolver for an installation whose whole
 // fleet is one pool.
@@ -25,15 +32,20 @@ type installationPools struct{ st Store }
 // the session service refuses a pool with no free capacity itself, and a
 // session with nowhere to go should be queued waiting for a runner, which is
 // today's behavior, rather than refused for having no eligible pool at all.
+//
+// The capabilities are the rows' OWN, not a list synthesized from each name:
+// a runner advertises them when it registers and the fleet repository stores
+// them, so the pool a placement is matched against describes the fleet as it
+// actually announced itself.
 func (p installationPools) EligiblePools(ctx context.Context, scope control.Scope, req control.Requirements) ([]control.Pool, error) {
 	if scope.WorkspaceID != installWorkspace {
 		return nil, control.ErrNotFound
 	}
-	rows, err := p.st.ListRunners(ctx)
+	rows, err := p.st.Fleet().ListRunners(ctx, installPool)
 	if err != nil {
-		return nil, storeErr(err)
+		return nil, err
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
 
 	pool := control.Pool{ID: installPool}
 	for _, r := range rows {
@@ -42,7 +54,7 @@ func (p installationPools) EligiblePools(ctx context.Context, scope control.Scop
 		}
 		pool.CapacityUsed += r.CapacityUsed
 		pool.CapacityTotal += r.CapacityTotal
-		for _, c := range runnerCapabilities(r.Name) {
+		for _, c := range r.Capabilities {
 			if !slices.Contains(pool.Capabilities, c) {
 				pool.Capabilities = append(pool.Capabilities, c)
 			}

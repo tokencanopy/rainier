@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
@@ -218,7 +219,7 @@ func TestCreateSession(t *testing.T) {
 		if body.Session.OwnerID != u.ID {
 			t.Errorf("owner_id = %q, want %q", body.Session.OwnerID, u.ID)
 		}
-		if body.Session.State != string(StateQueued) {
+		if body.Session.State != string(control.StateQueued) {
 			t.Errorf("state = %q, want queued", body.Session.State)
 		}
 		if body.Session.Name != "dev1" {
@@ -226,7 +227,7 @@ func TestCreateSession(t *testing.T) {
 		}
 
 		got := getSession(t, st, body.Session.ID)
-		if got.State != StateQueued {
+		if got.State != control.StateQueued {
 			t.Errorf("stored state = %q, want queued", got.State)
 		}
 	})
@@ -297,7 +298,8 @@ func TestCreateSession(t *testing.T) {
 			t.Fatalf("replay id = %q, want %q (same row)", secondBody.Session.ID, firstBody.Session.ID)
 		}
 
-		rows, _, err := st.ListSessions(context.Background(), SessionQuery{IncludeTerminal: true, Limit: 100})
+		rows, _, err := st.Sessions().ListSessions(context.Background(), installWorkspace,
+			control.SessionQuery{IncludeTerminal: true, Limit: 100})
 		if err != nil {
 			t.Fatalf("ListSessions: %v", err)
 		}
@@ -309,7 +311,7 @@ func TestCreateSession(t *testing.T) {
 	t.Run("nil cmd and egress_allow render as empty arrays, not null", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		u, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_nilarr", OwnerID: u.ID, State: StateQueued})
+		seedSession(t, st, control.Session{ID: "sess_nilarr", CreatorID: control.ActorID(u.ID), State: control.StateQueued})
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_nilarr", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -382,9 +384,9 @@ func createWithEnv(t *testing.T, ts *httptest.Server, tok string, body map[strin
 
 // countSessions returns how many session rows st holds, terminal included —
 // the "nothing was written" assertion the pre-insert rejection paths need.
-func countSessions(t *testing.T, st Store) int {
+func countSessions(t *testing.T, st MemStore) int {
 	t.Helper()
-	rows, _, err := st.ListSessions(context.Background(), SessionQuery{IncludeTerminal: true, Limit: maxListLimit})
+	rows, _, err := st.Sessions().ListSessions(context.Background(), installWorkspace, control.SessionQuery{IncludeTerminal: true})
 	if err != nil {
 		t.Fatalf("ListSessions: %v", err)
 	}
@@ -394,7 +396,7 @@ func countSessions(t *testing.T, st Store) int {
 func TestCreateSessionResolvesEnvironment(t *testing.T) {
 	// oneRunnerFleet is the common fixture: a controld with its scheduler
 	// running and a single connected runner to receive the create.
-	oneRunnerFleet := func(t *testing.T) (Store, *httptest.Server, *fakeRunner, string) {
+	oneRunnerFleet := func(t *testing.T) (MemStore, *httptest.Server, *fakeRunner, string) {
 		t.Helper()
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
@@ -406,7 +408,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 	t.Run("cache miss dispatches the environment's image, setup and secrets", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
 		putSecretValue(t, st, "GH_TOKEN", "ghp_resolved_value")
-		env := seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", Setup: "apt-get install -y jq",
+		env := seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1", Setup: "apt-get install -y jq",
 			EgressAllow: []string{"api.github.com"}, SecretRefs: []string{"GH_TOKEN"}})
 
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "e1", "environment": "dev"})
@@ -418,11 +420,11 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		if row.EnvironmentID != env.ID {
 			t.Errorf("stored environment_id = %q, want %q", row.EnvironmentID, env.ID)
 		}
-		if row.ResolvedImage != "env-img:1" {
-			t.Errorf("stored resolved_image = %q, want env-img:1", row.ResolvedImage)
+		if row.Spec.Image != "env-img:1" {
+			t.Errorf("stored resolved_image = %q, want env-img:1", row.Spec.Image)
 		}
-		if !slices.Equal(row.EgressAllow, []string{"api.github.com"}) {
-			t.Errorf("stored egress_allow = %v, want the environment's", row.EgressAllow)
+		if !slices.Equal(row.Spec.EgressAllow, []string{"api.github.com"}) {
+			t.Errorf("stored egress_allow = %v, want the environment's", row.Spec.EgressAllow)
 		}
 
 		cmd := nextCreate(t, f)
@@ -449,7 +451,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 
 	t.Run("an explicit setup_timeout_sec is dispatched verbatim", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
-		seedEnv(t, st, Environment{Name: "slow", Image: "env-img:1", Setup: "sleep 1", SetupTimeoutSec: 120})
+		seedEnv(t, st, control.Environment{Name: "slow", Image: "env-img:1", Setup: "sleep 1", SetupTimeoutSec: 120})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "e2", "environment": "slow"})
 		if got := nextCreate(t, f).Spec.SetupTimeoutSec; got != 120 {
@@ -459,7 +461,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 
 	t.Run("an environment with no setup dispatches neither setup nor a timeout", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
-		seedEnv(t, st, Environment{Name: "bare", Image: "env-img:1"})
+		seedEnv(t, st, control.Environment{Name: "bare", Image: "env-img:1"})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "e3", "environment": "bare"})
 		spec := nextCreate(t, f).Spec
@@ -470,13 +472,13 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 
 	t.Run("a current cache dispatches the snapshot with no setup", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
-		env := seedEnv(t, st, Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
+		env := seedEnv(t, st, control.Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
 		const ref = "rainier-env:cached-0123456789ab"
 		cacheEnvSnapshot(t, st, env, ref, "vm1")
 
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "e4", "environment": "cached"})
-		if row := getSession(t, st, got.ID); row.ResolvedImage != ref {
-			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.ResolvedImage, ref)
+		if row := getSession(t, st, got.ID); row.Spec.Image != ref {
+			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.Spec.Image, ref)
 		}
 		spec := nextCreate(t, f).Spec
 		if spec.Image != ref {
@@ -507,19 +509,19 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		_, tok := loginUser(t, st, "alice", "member")
 
 		const ref = "rainier-env:cached-0123456789ab"
-		env := seedEnv(t, st, Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
+		env := seedEnv(t, st, control.Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
 		cacheEnvSnapshot(t, st, env, ref, "vm1")
 
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "e5", "environment": "cached"})
-		if row := getSession(t, st, got.ID); row.ResolvedImage != ref {
-			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.ResolvedImage, ref)
+		if row := getSession(t, st, got.ID); row.Spec.Image != ref {
+			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.Spec.Image, ref)
 		}
 		// D3, the placement half: vm2 has two free slots and is never
 		// offered the session, because the image it would boot exists only
 		// on vm1. The session waits for vm1 instead.
 		time.Sleep(150 * time.Millisecond)
-		if row := getSession(t, st, got.ID); row.State != StateQueued || row.Runner != "" {
-			t.Fatalf("session = %q on %q, want still queued and unplaced (pinned to the full holder)", row.State, row.Runner)
+		if row := getSession(t, st, got.ID); row.State != control.StateQueued || row.RunnerID != "" {
+			t.Fatalf("session = %q on %q, want still queued and unplaced (pinned to the full holder)", row.State, row.RunnerID)
 		}
 		wantNothingQueued(t, s, f2)
 	})
@@ -531,29 +533,30 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		_, tok := loginUser(t, st, "alice", "member")
 
 		const ref = "rainier-env:cached-0123456789ab"
-		env := seedEnv(t, st, Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
+		env := seedEnv(t, st, control.Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
 		cacheEnvSnapshot(t, st, env, ref, "vm-gone")
 
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "e6", "environment": "cached"})
-		if row := getSession(t, st, got.ID); row.ResolvedImage != ref {
-			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.ResolvedImage, ref)
+		if row := getSession(t, st, got.ID); row.Spec.Image != ref {
+			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.Spec.Image, ref)
 		}
 		// D3 again, with the holder absent rather than full: no connected
 		// runner advertises snapshot:vm-gone, so nothing is placed at all.
 		time.Sleep(150 * time.Millisecond)
-		if row := getSession(t, st, got.ID); row.State != StateQueued || row.Runner != "" {
-			t.Fatalf("session = %q on %q, want still queued and unplaced (its holder is gone)", row.State, row.Runner)
+		if row := getSession(t, st, got.ID); row.State != control.StateQueued || row.RunnerID != "" {
+			t.Fatalf("session = %q on %q, want still queued and unplaced (its holder is gone)", row.State, row.RunnerID)
 		}
 		wantNothingQueued(t, s, f)
 	})
 
 	t.Run("a snapshot built from superseded setup is not used", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
-		env := seedEnv(t, st, Environment{Name: "stale", Image: "env-img:1", Setup: "echo old"})
+		env := seedEnv(t, st, control.Environment{Name: "stale", Image: "env-img:1", Setup: "echo old"})
 		cacheEnvSnapshot(t, st, env, "rainier-env:stale-0123456789ab", "vm1")
 
 		env.Setup = "echo new"
-		if _, err := st.UpdateEnvironment(context.Background(), env); err != nil {
+		env.SetupHash = SetupHash(env.Image, env.Setup)
+		if _, err := st.Environments().UpdateEnvironment(context.Background(), installWorkspace, env); err != nil {
 			t.Fatalf("UpdateEnvironment: %v", err)
 		}
 
@@ -566,12 +569,12 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 
 	t.Run("a session image overrides even a current cache", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
-		env := seedEnv(t, st, Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
+		env := seedEnv(t, st, control.Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
 		cacheEnvSnapshot(t, st, env, "rainier-env:cached-0123456789ab", "vm1")
 
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "e8", "environment": "cached", "image": "custom:9"})
-		if row := getSession(t, st, got.ID); row.ResolvedImage != "custom:9" {
-			t.Errorf("stored resolved_image = %q, want custom:9", row.ResolvedImage)
+		if row := getSession(t, st, got.ID); row.Spec.Image != "custom:9" {
+			t.Errorf("stored resolved_image = %q, want custom:9", row.Spec.Image)
 		}
 		spec := nextCreate(t, f).Spec
 		if spec.Image != "custom:9" {
@@ -589,7 +592,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 	// needs to work, and a session adds hosts to it.
 	t.Run("a session egress_allow extends the environment's", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", EgressAllow: []string{"api.github.com"}})
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1", EgressAllow: []string{"api.github.com"}})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "e9", "environment": "dev", "egress_allow": []string{"pypi.org"}})
 		if got := nextCreate(t, f).Spec.EgressAllow; !slices.Equal(got, []string{"api.github.com", "pypi.org"}) {
@@ -601,7 +604,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 	// from one says what to run (control.PortableSpec).
 	t.Run("a session cmd is the environment session's command", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1"})
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1"})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "e9b", "environment": "dev", "cmd": []string{"claude"}})
 		if got := nextCreate(t, f).Spec.Cmd; !slices.Equal(got, []string{"claude"}) {
@@ -611,7 +614,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 
 	t.Run("the environment may be named by id", func(t *testing.T) {
 		st, ts, _, tok := oneRunnerFleet(t)
-		env := seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1"})
+		env := seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1"})
 
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "e10", "environment": env.ID})
 		if got.Environment != "dev" {
@@ -650,7 +653,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 	t.Run("a deleted secret_ref is 409 before the row is created", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", SecretRefs: []string{"GH_TOKEN"}})
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1", SecretRefs: []string{"GH_TOKEN"}})
 
 		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", tok,
 			map[string]any{"name": "orphan", "environment": "dev"}, nil)
@@ -677,8 +680,10 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		if got.Environment != "" || got.QueueReason != "" {
 			t.Errorf("scratch session = %+v, want no environment and no queue reason", got)
 		}
-		if row := getSession(t, st, got.ID); row.EnvironmentID != "" || row.ResolvedImage != "" {
-			t.Errorf("stored row = %+v, want no environment_id and no resolved_image", row)
+		// There is no resolved-image column any more: a scratch row's Spec
+		// carries the caller's own image, because resolution never ran for it.
+		if row := getSession(t, st, got.ID); row.EnvironmentID != "" || row.Spec.Image != "ubuntu:latest" {
+			t.Errorf("stored row = %+v, want no environment_id and the caller's own image", row)
 		}
 		spec := nextCreate(t, f).Spec
 		if spec.Image != "ubuntu:latest" || spec.Setup != "" || spec.SetupTimeoutSec != 0 || spec.Env != nil {
@@ -712,7 +717,7 @@ func githubConnectorJSON(repo, baseBranch string) json.RawMessage {
 // repoFleet is the repo tests' fixture: a controld with its scheduler
 // running, one connected runner to receive the create, and an owner who has
 // already logged in to GitHub.
-func repoFleet(t *testing.T) (*Server, Store, *httptest.Server, *fakeRunner, User, string) {
+func repoFleet(t *testing.T) (*Server, MemStore, *httptest.Server, *fakeRunner, User, string) {
 	t.Helper()
 	s, st, ts := newTestControld(t)
 	f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
@@ -732,9 +737,9 @@ func noreplyFor(u User) string {
 func TestCreateSessionResolvesRepos(t *testing.T) {
 	t.Run("a github connector becomes a RepoSpec, with attribution and the git egress", func(t *testing.T) {
 		_, st, ts, f, u, tok := repoFleet(t)
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1",
 			EgressAllow: []string{"pypi.org"},
-			Connectors: []Connector{
+			Connectors: []control.Connector{
 				{Type: "github", Raw: githubConnectorJSON("acme/app", "")},
 				{Type: "github", Raw: githubConnectorJSON("acme/infra", "develop")},
 			}})
@@ -763,16 +768,16 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 		if !slices.Equal(spec.EgressAllow, wantEgress) {
 			t.Errorf("spec.EgressAllow = %v, want %v", spec.EgressAllow, wantEgress)
 		}
-		if row := getSession(t, st, got.ID); !slices.Equal(row.EgressAllow, []string{"pypi.org"}) {
-			t.Errorf("stored egress_allow = %v, want the environment's own [pypi.org]", row.EgressAllow)
+		if row := getSession(t, st, got.ID); !slices.Equal(row.Spec.EgressAllow, []string{"pypi.org"}) {
+			t.Errorf("stored egress_allow = %v, want the environment's own [pypi.org]", row.Spec.EgressAllow)
 		}
 	})
 
 	t.Run("the git hosts are appended once, not duplicated", func(t *testing.T) {
 		_, st, ts, f, _, tok := repoFleet(t)
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1",
 			EgressAllow: []string{"github.com"},
-			Connectors:  []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
+			Connectors:  []control.Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "dup", "environment": "dev"})
 		want := []string{"github.com", "codeload.github.com", "objects.githubusercontent.com"}
@@ -783,8 +788,8 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 
 	t.Run("a session repos override beats the environment's connectors", func(t *testing.T) {
 		_, st, ts, f, _, tok := repoFleet(t)
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
-			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1",
+			Connectors: []control.Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "over", "environment": "dev",
 			"repos": []map[string]any{{"repo": "other/svc", "base_branch": "develop"}}})
@@ -798,8 +803,8 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 
 	t.Run("an explicit empty repos array clones nothing", func(t *testing.T) {
 		_, st, ts, f, _, tok := repoFleet(t)
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", EgressAllow: []string{"pypi.org"},
-			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1", EgressAllow: []string{"pypi.org"},
+			Connectors: []control.Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "bare", "environment": "dev", "repos": []any{}})
 		spec := nextCreate(t, f).Spec
@@ -817,8 +822,8 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 
 	t.Run("a session with no name branches off its id", func(t *testing.T) {
 		_, st, ts, f, _, tok := repoFleet(t)
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
-			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1",
+			Connectors: []control.Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
 
 		got := createWithEnv(t, ts, tok, map[string]any{"environment": "dev"})
 		wantBranch := "rainier/" + got.ID[len(got.ID)-12:]
@@ -830,8 +835,8 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 
 	t.Run("two repos of the same name land in different directories", func(t *testing.T) {
 		_, st, ts, f, _, tok := repoFleet(t)
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
-			Connectors: []Connector{
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1",
+			Connectors: []control.Connector{
 				{Type: "github", Raw: githubConnectorJSON("acme/app", "")},
 				{Type: "github", Raw: githubConnectorJSON("other/app", "")},
 			}})
@@ -866,8 +871,8 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 			t.Errorf("spec.EgressAllow = %v, want %v", spec.EgressAllow, wantEgress)
 		}
 		// D6: the row carries what the caller declared, which here is nothing.
-		if row := getSession(t, st, got.ID); len(row.EgressAllow) != 0 {
-			t.Errorf("stored egress_allow = %v, want none — the caller declared none", row.EgressAllow)
+		if row := getSession(t, st, got.ID); len(row.Spec.EgressAllow) != 0 {
+			t.Errorf("stored egress_allow = %v, want none — the caller declared none", row.Spec.EgressAllow)
 		}
 	})
 
@@ -881,8 +886,8 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 			t.Fatalf("storeGitHubCredential: %v", err)
 		}
 		_, bobTok := loginUser(t, st, "bob", "member")
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
-			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1",
+			Connectors: []control.Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
 
 		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", bobTok,
 			map[string]any{"name": "nocred", "environment": "dev"}, nil)
@@ -912,8 +917,8 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 		startRun(t, s)
 		_, tok := loginUser(t, st, "alice", "member")
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
-			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1",
+			Connectors: []control.Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "none", "environment": "dev", "repos": []any{}})
 		if spec := nextCreate(t, f).Spec; spec.Repos != nil {
@@ -932,8 +937,8 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 		if err := st.SetCredentialStatus(context.Background(), u.ID, "github", CredentialNeedsRefresh); err != nil {
 			t.Fatalf("SetCredentialStatus: %v", err)
 		}
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1",
-			Connectors: []Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1",
+			Connectors: []control.Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "stale", "environment": "dev"})
 		if got := nextCreate(t, f).Spec.Repos; len(got) != 1 || got[0].Name != "app" {
@@ -977,7 +982,7 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestCreateSessionDispatchesInit(t *testing.T) {
-	oneRunnerFleet := func(t *testing.T) (Store, *httptest.Server, *fakeRunner, string) {
+	oneRunnerFleet := func(t *testing.T) (MemStore, *httptest.Server, *fakeRunner, string) {
 		t.Helper()
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
@@ -988,7 +993,7 @@ func TestCreateSessionDispatchesInit(t *testing.T) {
 
 	t.Run("an environment's init rides the create with the default bound", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", Init: "make dev-server &"})
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1", Init: "make dev-server &"})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "i1", "environment": "dev"})
 		spec := nextCreate(t, f).Spec
@@ -1002,7 +1007,7 @@ func TestCreateSessionDispatchesInit(t *testing.T) {
 
 	t.Run("an explicit init_timeout_sec is dispatched verbatim", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", Init: "sleep 1", InitTimeoutSec: 60})
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1", Init: "sleep 1", InitTimeoutSec: 60})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "i2", "environment": "dev"})
 		if got := nextCreate(t, f).Spec.InitTimeoutSec; got != 60 {
@@ -1012,7 +1017,7 @@ func TestCreateSessionDispatchesInit(t *testing.T) {
 
 	t.Run("an environment with no init dispatches neither the hook nor a bound", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
-		seedEnv(t, st, Environment{Name: "dev", Image: "env-img:1", InitTimeoutSec: 60})
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1", InitTimeoutSec: 60})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "i3", "environment": "dev"})
 		spec := nextCreate(t, f).Spec
@@ -1027,7 +1032,7 @@ func TestCreateSessionDispatchesInit(t *testing.T) {
 	// hand the session a workspace with no dev server and no explanation.
 	t.Run("a cache hit runs init but not setup", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
-		env := seedEnv(t, st, Environment{Name: "cached", Image: "env-img:1",
+		env := seedEnv(t, st, control.Environment{Name: "cached", Image: "env-img:1",
 			Setup: "echo hi", Init: "make dev-server &", InitTimeoutSec: 60})
 		const ref = "rainier-env:cached-0123456789ab"
 		cacheEnvSnapshot(t, st, env, ref, "vm1")
@@ -1049,18 +1054,28 @@ func TestCreateSessionDispatchesInit(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // envReadCountingStore counts GetEnvironment calls, so the list handler's
-// per-request cache can be pinned as a fact rather than a comment.
+// per-request cache can be pinned as a fact rather than a comment. It counts
+// them where the handler makes them: on the environment repository.
 type envReadCountingStore struct {
-	Store
+	MemStore
 	mu sync.Mutex
 	n  int
 }
 
-func (e *envReadCountingStore) GetEnvironment(ctx context.Context, id string) (Environment, error) {
-	e.mu.Lock()
-	e.n++
-	e.mu.Unlock()
-	return e.Store.GetEnvironment(ctx, id)
+func (e *envReadCountingStore) Environments() control.EnvironmentRepository {
+	return countingEnvironments{EnvironmentRepository: e.MemStore.Environments(), owner: e}
+}
+
+type countingEnvironments struct {
+	control.EnvironmentRepository
+	owner *envReadCountingStore
+}
+
+func (c countingEnvironments) GetEnvironment(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID) (control.Environment, error) {
+	c.owner.mu.Lock()
+	c.owner.n++
+	c.owner.mu.Unlock()
+	return c.EnvironmentRepository.GetEnvironment(ctx, ws, id)
 }
 
 func (e *envReadCountingStore) reads() int {
@@ -1073,9 +1088,9 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 	t.Run("an environment-backed session renders the environment's name", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		u, tok := loginUser(t, st, "alice", "member")
-		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1"})
-		seedSession(t, st, Session{ID: "sess_env1", OwnerID: u.ID, State: StateRunning, Runner: "vm1",
-			EnvironmentID: env.ID, ResolvedImage: "img:1"})
+		env := seedEnv(t, st, control.Environment{Name: "dev", Image: "img:1"})
+		seedSession(t, st, control.Session{ID: "sess_env1", CreatorID: control.ActorID(u.ID), State: control.StateRunning, RunnerID: "vm1",
+			EnvironmentID: env.ID, Spec: control.PortableSpec{Image: "img:1"}})
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_env1", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -1094,8 +1109,8 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 	t.Run("a session whose environment was deleted renders an empty name", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		u, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_orphan", OwnerID: u.ID, State: StateRunning,
-			EnvironmentID: "env_deadbeef", ResolvedImage: "img:1"})
+		seedSession(t, st, control.Session{ID: "sess_orphan", CreatorID: control.ActorID(u.ID), State: control.StateRunning,
+			EnvironmentID: "env_deadbeef", Spec: control.PortableSpec{Image: "img:1"}})
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_orphan", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -1111,9 +1126,9 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 	t.Run("a queued session pinned to a runner that is not here says so", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		u, tok := loginUser(t, st, "alice", "member")
-		env := seedEnv(t, st, Environment{Name: "hardware", Image: "img:1", Placement: "rainier-gpu"})
-		seedSession(t, st, Session{ID: "sess_wait", OwnerID: u.ID, State: StateQueued,
-			EnvironmentID: env.ID, ResolvedImage: "img:1"})
+		env := seedEnv(t, st, control.Environment{Name: "hardware", Image: "img:1", Requirements: control.Requirements{Capabilities: []string{placementCapabilityPrefix + "rainier-gpu"}}})
+		seedSession(t, st, control.Session{ID: "sess_wait", CreatorID: control.ActorID(u.ID), State: control.StateQueued,
+			EnvironmentID: env.ID, Spec: control.PortableSpec{Image: "img:1"}})
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_wait", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -1121,7 +1136,7 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
-		if body.Session.State != string(StateQueued) {
+		if body.Session.State != string(control.StateQueued) {
 			t.Errorf("state = %q, want queued", body.Session.State)
 		}
 		if want := "waiting for runner rainier-gpu"; body.Session.QueueReason != want {
@@ -1133,9 +1148,9 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 		u, tok := loginUser(t, st, "alice", "member")
-		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Placement: "vm1"})
-		seedSession(t, st, Session{ID: "sess_soon", OwnerID: u.ID, State: StateQueued,
-			EnvironmentID: env.ID, ResolvedImage: "img:1"})
+		env := seedEnv(t, st, control.Environment{Name: "dev", Image: "img:1", Requirements: control.Requirements{Capabilities: []string{placementCapabilityPrefix + "vm1"}}})
+		seedSession(t, st, control.Session{ID: "sess_soon", CreatorID: control.ActorID(u.ID), State: control.StateQueued,
+			EnvironmentID: env.ID, Spec: control.PortableSpec{Image: "img:1"}})
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_soon", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -1152,9 +1167,9 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		joinRunner(t, s, ts, runnerScript{Name: "vm1", Used: 2, Total: 2})
 		u, tok := loginUser(t, st, "alice", "member")
-		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Placement: "vm1"})
-		seedSession(t, st, Session{ID: "sess_full", OwnerID: u.ID, State: StateQueued,
-			EnvironmentID: env.ID, ResolvedImage: "img:1"})
+		env := seedEnv(t, st, control.Environment{Name: "dev", Image: "img:1", Requirements: control.Requirements{Capabilities: []string{placementCapabilityPrefix + "vm1"}}})
+		seedSession(t, st, control.Session{ID: "sess_full", CreatorID: control.ActorID(u.ID), State: control.StateQueued,
+			EnvironmentID: env.ID, Spec: control.PortableSpec{Image: "img:1"}})
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_full", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -1168,15 +1183,15 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 	})
 
 	t.Run("the list renders both fields, reading each environment once", func(t *testing.T) {
-		cst := &envReadCountingStore{Store: NewMemStore()}
+		cst := &envReadCountingStore{MemStore: NewMemStore()}
 		_, ts := newTestControldOver(t, cst)
 		u, tok := loginUser(t, cst, "alice", "member")
-		env := seedEnv(t, cst, Environment{Name: "hardware", Image: "img:1", Placement: "rainier-gpu"})
+		env := seedEnv(t, cst, control.Environment{Name: "hardware", Image: "img:1", Requirements: control.Requirements{Capabilities: []string{placementCapabilityPrefix + "rainier-gpu"}}})
 		for _, id := range []string{"sess_a", "sess_b", "sess_c"} {
-			seedSession(t, cst, Session{ID: id, OwnerID: u.ID, Name: id, State: StateQueued,
-				EnvironmentID: env.ID, ResolvedImage: "img:1"})
+			seedSession(t, cst, control.Session{ID: control.SessionID(id), CreatorID: control.ActorID(u.ID), Name: id, State: control.StateQueued,
+				EnvironmentID: env.ID, Spec: control.PortableSpec{Image: "img:1"}})
 		}
-		seedSession(t, cst, Session{ID: "sess_scratch", OwnerID: u.ID, Name: "scratch", State: StateQueued})
+		seedSession(t, cst, control.Session{ID: "sess_scratch", CreatorID: control.ActorID(u.ID), Name: "scratch", State: control.StateQueued})
 
 		before := cst.reads()
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions", tok, nil, nil)
@@ -1213,15 +1228,26 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // spyListStore records the SessionQuery it was last called with, so a test
-// can pin the default/cap on Limit without seeding 100+ rows.
+// can pin the default/cap on Limit without seeding 100+ rows. The query it
+// records is the one the session repository is asked, which is the one the
+// handler composed.
 type spyListStore struct {
-	Store
-	lastQuery SessionQuery
+	MemStore
+	lastQuery control.SessionQuery
 }
 
-func (s *spyListStore) ListSessions(ctx context.Context, q SessionQuery) ([]Session, string, error) {
-	s.lastQuery = q
-	return s.Store.ListSessions(ctx, q)
+func (s *spyListStore) Sessions() control.SessionRepository {
+	return spyListSessions{SessionRepository: s.MemStore.Sessions(), owner: s}
+}
+
+type spyListSessions struct {
+	control.SessionRepository
+	owner *spyListStore
+}
+
+func (s spyListSessions) ListSessions(ctx context.Context, ws control.WorkspaceID, q control.SessionQuery) ([]control.Session, string, error) {
+	s.owner.lastQuery = q
+	return s.SessionRepository.ListSessions(ctx, ws, q)
 }
 
 func TestListSessions(t *testing.T) {
@@ -1230,9 +1256,9 @@ func TestListSessions(t *testing.T) {
 		owner, tok := loginUser(t, st, "alice", "member")
 		other, _ := loginUser(t, st, "bob", "member")
 
-		seedSession(t, st, Session{ID: "sess_l1", OwnerID: owner.ID, State: StateQueued, Name: "l1"})
-		seedSession(t, st, Session{ID: "sess_l2", OwnerID: other.ID, State: StateRunning, Name: "l2"})
-		seedSession(t, st, Session{ID: "sess_l3", OwnerID: owner.ID, State: StateDestroyed, Name: "l3"})
+		seedSession(t, st, control.Session{ID: "sess_l1", CreatorID: control.ActorID(owner.ID), State: control.StateQueued, Name: "l1"})
+		seedSession(t, st, control.Session{ID: "sess_l2", CreatorID: control.ActorID(other.ID), State: control.StateRunning, Name: "l2"})
+		seedSession(t, st, control.Session{ID: "sess_l3", CreatorID: control.ActorID(owner.ID), State: control.StateDestroyed, Name: "l3"})
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -1258,7 +1284,7 @@ func TestListSessions(t *testing.T) {
 	t.Run("all=true includes terminal sessions", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_term", OwnerID: owner.ID, State: StateDestroyed, Name: "term"})
+		seedSession(t, st, control.Session{ID: "sess_term", CreatorID: control.ActorID(owner.ID), State: control.StateDestroyed, Name: "term"})
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions?all=true", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -1280,8 +1306,8 @@ func TestListSessions(t *testing.T) {
 	t.Run("name filters exactly", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_name_want", OwnerID: owner.ID, State: StateRunning, Name: "box"})
-		seedSession(t, st, Session{ID: "sess_name_other", OwnerID: owner.ID, State: StateRunning, Name: "box-extra"})
+		seedSession(t, st, control.Session{ID: "sess_name_want", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, Name: "box"})
+		seedSession(t, st, control.Session{ID: "sess_name_other", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, Name: "box-extra"})
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions?name=box", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -1311,7 +1337,7 @@ func TestListSessions(t *testing.T) {
 	})
 
 	t.Run("limit defaults to 50 and caps at 100", func(t *testing.T) {
-		spy := &spyListStore{Store: NewMemStore()}
+		spy := &spyListStore{MemStore: NewMemStore()}
 		_, ts := newTestControldOver(t, spy)
 		_, tok := loginUser(t, spy, "alice", "member")
 
@@ -1339,7 +1365,7 @@ func TestListSessions(t *testing.T) {
 	t.Run("response shape is pinned", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_shape_list", OwnerID: owner.ID, State: StateQueued, Name: "shape"})
+		seedSession(t, st, control.Session{ID: "sess_shape_list", CreatorID: control.ActorID(owner.ID), State: control.StateQueued, Name: "shape"})
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions", tok, nil, nil)
 		raw := readBody(t, resp)
 		assertKeySet(t, raw, "sessions", "next_cursor")
@@ -1354,7 +1380,7 @@ func TestGetSession(t *testing.T) {
 	t.Run("happy path", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_get1", OwnerID: owner.ID, State: StateRunning, Name: "get1", Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_get1", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, Name: "get1", RunnerID: "vm1"})
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_get1", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -1391,7 +1417,7 @@ func TestGetSession(t *testing.T) {
 	t.Run("reachable is true only when the runner is connected and the session is non-terminal", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_reach", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_reach", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm1"})
 		// Announce the row present and agreeing so reconcile doesn't sweep
 		// it (an announce silent on it would mark it dead).
 		startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
@@ -1412,7 +1438,7 @@ func TestGetSession(t *testing.T) {
 	t.Run("response shape is pinned", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_shape2", OwnerID: owner.ID, State: StateQueued})
+		seedSession(t, st, control.Session{ID: "sess_shape2", CreatorID: control.ActorID(owner.ID), State: control.StateQueued})
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_shape2", tok, nil, nil)
 		raw := readBody(t, resp)
 		assertKeySet(t, raw, "session")
@@ -1427,14 +1453,14 @@ func TestDeleteSession(t *testing.T) {
 	t.Run("queued cancels without dispatch and wakes the scheduler", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_del_q", OwnerID: owner.ID, State: StateQueued, Name: "delq"})
+		seedSession(t, st, control.Session{ID: "sess_del_q", CreatorID: control.ActorID(owner.ID), State: control.StateQueued, Name: "delq"})
 
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_q", tok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
 		got := getSession(t, st, "sess_del_q")
-		if got.State != StateCanceled {
+		if got.State != control.StateCanceled {
 			t.Fatalf("state = %q, want canceled", got.State)
 		}
 		// The wake itself is the session service's now (controlapp's
@@ -1447,7 +1473,7 @@ func TestDeleteSession(t *testing.T) {
 	t.Run("creating is 409 conflict, no dispatch", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_del_c", OwnerID: owner.ID, State: StateCreating, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_del_c", CreatorID: control.ActorID(owner.ID), State: control.StateCreating, RunnerID: "vm1"})
 
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_c", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -1458,7 +1484,7 @@ func TestDeleteSession(t *testing.T) {
 			t.Errorf("code = %q, want conflict", e.Error.Code)
 		}
 		got := getSession(t, st, "sess_del_c")
-		if got.State != StateCreating {
+		if got.State != control.StateCreating {
 			t.Fatalf("state = %q, want unchanged (creating)", got.State)
 		}
 	})
@@ -1467,7 +1493,7 @@ func TestDeleteSession(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, _ := loginUser(t, st, "alice", "member")
 		_, otherTok := loginUser(t, st, "bob", "member")
-		seedSession(t, st, Session{ID: "sess_del_authz", OwnerID: owner.ID, State: StateQueued})
+		seedSession(t, st, control.Session{ID: "sess_del_authz", CreatorID: control.ActorID(owner.ID), State: control.StateQueued})
 
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_authz", otherTok, nil, nil)
 		raw := readBody(t, resp)
@@ -1478,7 +1504,7 @@ func TestDeleteSession(t *testing.T) {
 			t.Errorf("code = %q, want forbidden", e.Error.Code)
 		}
 		got := getSession(t, st, "sess_del_authz")
-		if got.State != StateQueued {
+		if got.State != control.StateQueued {
 			t.Fatalf("state = %q, want unchanged (queued)", got.State)
 		}
 	})
@@ -1487,7 +1513,7 @@ func TestDeleteSession(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, _ := loginUser(t, st, "alice", "member")
 		_, adminTok := loginUser(t, st, "root", "admin")
-		seedSession(t, st, Session{ID: "sess_del_admin", OwnerID: owner.ID, State: StateQueued})
+		seedSession(t, st, control.Session{ID: "sess_del_admin", CreatorID: control.ActorID(owner.ID), State: control.StateQueued})
 
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_admin", adminTok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
@@ -1498,14 +1524,14 @@ func TestDeleteSession(t *testing.T) {
 	t.Run("terminal is idempotent 204", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_del_term", OwnerID: owner.ID, State: StateDestroyed})
+		seedSession(t, st, control.Session{ID: "sess_del_term", CreatorID: control.ActorID(owner.ID), State: control.StateDestroyed})
 
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_term", tok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
 		got := getSession(t, st, "sess_del_term")
-		if got.State != StateDestroyed {
+		if got.State != control.StateDestroyed {
 			t.Fatalf("state = %q, want unchanged (destroyed)", got.State)
 		}
 	})
@@ -1520,8 +1546,8 @@ func TestDeleteSession(t *testing.T) {
 
 		owner, tok := loginUser(t, st, "alice", "member")
 		reason := "clone failed"
-		seedSession(t, st, Session{ID: "sess_del_failed", OwnerID: owner.ID, State: StateFailed,
-			Runner: "vm1", Error: reason})
+		seedSession(t, st, control.Session{ID: "sess_del_failed", CreatorID: control.ActorID(owner.ID), State: control.StateFailed,
+			RunnerID: "vm1", Error: reason})
 
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
@@ -1539,7 +1565,7 @@ func TestDeleteSession(t *testing.T) {
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
-		if got := getSession(t, st, "sess_del_failed"); got.State != StateDestroyed || got.Error != reason {
+		if got := getSession(t, st, "sess_del_failed"); got.State != control.StateDestroyed || got.Error != reason {
 			t.Fatalf("row = %s / %q, want destroyed with the failed diagnosis preserved", got.State, got.Error)
 		}
 
@@ -1561,8 +1587,8 @@ func TestDeleteSession(t *testing.T) {
 
 		owner, tok := loginUser(t, st, "alice", "member")
 		reason := "runner reported dead"
-		seedSession(t, st, Session{ID: "sess_del_dead", OwnerID: owner.ID, State: StateDead,
-			Runner: "vm1", Error: reason})
+		seedSession(t, st, control.Session{ID: "sess_del_dead", CreatorID: control.ActorID(owner.ID), State: control.StateDead,
+			RunnerID: "vm1", Error: reason})
 
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_dead", tok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
@@ -1577,7 +1603,7 @@ func TestDeleteSession(t *testing.T) {
 		}
 		// The row is terminal and stays exactly as it was: a dead session's
 		// diagnosis is what the user came back for.
-		if got := getSession(t, st, "sess_del_dead"); got.State != StateDead || got.Error != reason {
+		if got := getSession(t, st, "sess_del_dead"); got.State != control.StateDead || got.Error != reason {
 			t.Fatalf("row = %s / %q, want it unchanged", got.State, got.Error)
 		}
 	})
@@ -1588,7 +1614,7 @@ func TestDeleteSession(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_del_unplaced", OwnerID: owner.ID, State: StateFailed})
+		seedSession(t, st, control.Session{ID: "sess_del_unplaced", CreatorID: control.ActorID(owner.ID), State: control.StateFailed})
 
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_unplaced", tok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
@@ -1600,14 +1626,14 @@ func TestDeleteSession(t *testing.T) {
 	t.Run("placed on a disconnected runner marks destroyed directly", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_del_gone", OwnerID: owner.ID, State: StateRunning, Runner: "vm-ghost"})
+		seedSession(t, st, control.Session{ID: "sess_del_gone", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm-ghost"})
 
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_gone", tok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
 		got := getSession(t, st, "sess_del_gone")
-		if got.State != StateDestroyed {
+		if got.State != control.StateDestroyed {
 			t.Fatalf("state = %q, want destroyed", got.State)
 		}
 	})
@@ -1616,13 +1642,13 @@ func TestDeleteSession(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
 		id := "sess_del_retry"
-		seedSession(t, st, Session{ID: id, OwnerID: owner.ID, State: StateFailed, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: control.SessionID(id), CreatorID: control.ActorID(owner.ID), State: control.StateFailed, RunnerID: "vm1"})
 
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/"+id, tok, nil, nil)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
-		wantState(t, st, id, StateDestroyed)
+		wantState(t, st, id, control.StateDestroyed)
 
 		// The runner was offline for the DELETE and still has the attachable
 		// failed container. Its reconnect makes that container an orphan. A
@@ -1646,7 +1672,7 @@ func TestDeleteSession(t *testing.T) {
 		f.setCapacity(0, 4)
 		f.reply(t, second, true, "")
 		eventually(t, 3*time.Second, func() error {
-			runners, err := st.ListRunners(context.Background())
+			runners, err := st.Fleet().ListRunners(context.Background(), installPool)
 			if err != nil {
 				return err
 			}
@@ -1665,7 +1691,7 @@ func TestDeleteSession(t *testing.T) {
 		awaitReconciled(t, f)
 
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_del_live", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_del_live", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm1"})
 
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
@@ -1683,7 +1709,7 @@ func TestDeleteSession(t *testing.T) {
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
-		wantState(t, st, "sess_del_live", StateDestroyed)
+		wantState(t, st, "sess_del_live", control.StateDestroyed)
 
 		// The destroy already took the volume with it; the reclaim goes out
 		// anyway, and the runner answers ok for an absent one. Belt and
@@ -1704,7 +1730,7 @@ func TestDeleteSession(t *testing.T) {
 		awaitReconciled(t, f)
 
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_del_timeout", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_del_timeout", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm1"})
 
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/sessions/sess_del_timeout", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -1729,7 +1755,7 @@ func TestDeleteSession(t *testing.T) {
 		awaitReconciled(t, f)
 
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_del_fail", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_del_fail", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm1"})
 
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
@@ -1751,7 +1777,7 @@ func TestDeleteSession(t *testing.T) {
 			t.Errorf("response leaked runner detail: %s", raw)
 		}
 		got := getSession(t, st, "sess_del_fail")
-		if got.State != StateRunning {
+		if got.State != control.StateRunning {
 			t.Fatalf("state = %q, want unchanged (running); a failed destroy must not be marked destroyed", got.State)
 		}
 	})
@@ -1766,20 +1792,30 @@ func TestDeleteSession(t *testing.T) {
 // call proceed, so it observes the row already moved and returns
 // ErrConflict.
 type raceTransitionStore struct {
-	Store
+	MemStore
 	triggerID   string
-	raceToState SessionState
+	raceToState control.SessionState
 	triggered   bool
 }
 
-func (r *raceTransitionStore) Transition(ctx context.Context, id string, from []SessionState, to SessionState, opts TransitionOpts) error {
-	if !r.triggered && id == r.triggerID {
-		r.triggered = true
-		if err := r.Store.Transition(ctx, id, NonTerminal, r.raceToState, TransitionOpts{}); err != nil {
+func (r *raceTransitionStore) Sessions() control.SessionRepository {
+	return raceTransitionSessions{SessionRepository: r.MemStore.Sessions(), owner: r}
+}
+
+type raceTransitionSessions struct {
+	control.SessionRepository
+	owner *raceTransitionStore
+}
+
+func (r raceTransitionSessions) Transition(ctx context.Context, ws control.WorkspaceID, id control.SessionID, from []control.SessionState, to control.SessionState, opts control.TransitionOpts) error {
+	if o := r.owner; !o.triggered && string(id) == o.triggerID {
+		o.triggered = true
+		if err := r.SessionRepository.Transition(ctx, ws, id,
+			control.NonTerminal, o.raceToState, control.TransitionOpts{}); err != nil {
 			panic(fmt.Sprintf("raceTransitionStore: forcing the race: %v", err))
 		}
 	}
-	return r.Store.Transition(ctx, id, from, to, opts)
+	return r.SessionRepository.Transition(ctx, ws, id, from, to, opts)
 }
 
 // ---------------------------------------------------------------------------
@@ -1795,7 +1831,7 @@ func TestSuspendSession(t *testing.T) {
 		awaitReconciled(t, f)
 
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_susp1", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_susp1", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm1"})
 
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
@@ -1817,10 +1853,10 @@ func TestSuspendSession(t *testing.T) {
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
-		if body.Session.State != string(StateSuspendedWarm) {
+		if body.Session.State != string(control.StateSuspendedWarm) {
 			t.Errorf("state = %q, want suspended_warm", body.Session.State)
 		}
-		wantState(t, st, "sess_susp1", StateSuspendedWarm)
+		wantState(t, st, "sess_susp1", control.StateSuspendedWarm)
 	})
 
 	t.Run("warm:false suspends cold", func(t *testing.T) {
@@ -1831,7 +1867,7 @@ func TestSuspendSession(t *testing.T) {
 		awaitReconciled(t, f)
 
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_susp2", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_susp2", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm1"})
 
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
@@ -1850,7 +1886,7 @@ func TestSuspendSession(t *testing.T) {
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
-		if body.Session.State != string(StateSuspendedCold) {
+		if body.Session.State != string(control.StateSuspendedCold) {
 			t.Errorf("state = %q, want suspended_cold", body.Session.State)
 		}
 	})
@@ -1858,7 +1894,7 @@ func TestSuspendSession(t *testing.T) {
 	t.Run("unknown field in body is 400 invalid_request", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_susp_badbody", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_susp_badbody", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm1"})
 
 		resp := doRaw(t, ts, http.MethodPost, "/v0/sessions/sess_susp_badbody/suspend", tok, `{"warm":true,"bogus":1}`)
 		raw := readBody(t, resp)
@@ -1873,7 +1909,7 @@ func TestSuspendSession(t *testing.T) {
 	t.Run("not running is 409 conflict", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_susp_bad", OwnerID: owner.ID, State: StateQueued})
+		seedSession(t, st, control.Session{ID: "sess_susp_bad", CreatorID: control.ActorID(owner.ID), State: control.StateQueued})
 
 		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_susp_bad/suspend", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -1889,7 +1925,7 @@ func TestSuspendSession(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, _ := loginUser(t, st, "alice", "member")
 		_, otherTok := loginUser(t, st, "bob", "member")
-		seedSession(t, st, Session{ID: "sess_susp_authz", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_susp_authz", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm1"})
 
 		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_susp_authz/suspend", otherTok, nil, nil)
 		raw := readBody(t, resp)
@@ -1904,7 +1940,7 @@ func TestSuspendSession(t *testing.T) {
 	t.Run("runner unreachable is 502 runner_unreachable", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_susp_unreach", OwnerID: owner.ID, State: StateRunning, Runner: "vm-nope"})
+		seedSession(t, st, control.Session{ID: "sess_susp_unreach", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm-nope"})
 
 		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_susp_unreach/suspend", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -1924,7 +1960,7 @@ func TestSuspendSession(t *testing.T) {
 		awaitReconciled(t, f)
 
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_susp_shape", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_susp_shape", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm1"})
 
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
@@ -1945,7 +1981,7 @@ func TestSuspendSession(t *testing.T) {
 	// was trying to reach.
 	t.Run("concurrent mutation racing the runner round-trip: response reflects real persisted state", func(t *testing.T) {
 		const id = "sess_susp_race"
-		race := &raceTransitionStore{Store: NewMemStore(), triggerID: id, raceToState: StateDestroyed}
+		race := &raceTransitionStore{MemStore: NewMemStore(), triggerID: id, raceToState: control.StateDestroyed}
 		s, ts := newTestControldOver(t, race)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
 			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
@@ -1953,7 +1989,7 @@ func TestSuspendSession(t *testing.T) {
 		awaitReconciled(t, f)
 
 		owner, tok := loginUser(t, race, "alice", "member")
-		seedSession(t, race, Session{ID: id, OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+		seedSession(t, race, control.Session{ID: control.SessionID(id), CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm1"})
 
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
@@ -1972,11 +2008,11 @@ func TestSuspendSession(t *testing.T) {
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
-		if body.Session.State != string(StateDestroyed) {
+		if body.Session.State != string(control.StateDestroyed) {
 			t.Fatalf("response state = %q, want destroyed (the real persisted state) — got a fabricated state instead", body.Session.State)
 		}
 		got := getSession(t, race, id)
-		if got.State != StateDestroyed {
+		if got.State != control.StateDestroyed {
 			t.Fatalf("stored state = %q, want destroyed", got.State)
 		}
 	})
@@ -1995,7 +2031,7 @@ func TestResumeSession(t *testing.T) {
 		awaitReconciled(t, f)
 
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_res1", OwnerID: owner.ID, State: StateSuspendedWarm, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_res1", CreatorID: control.ActorID(owner.ID), State: control.StateSuspendedWarm, RunnerID: "vm1"})
 
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
@@ -2017,7 +2053,7 @@ func TestResumeSession(t *testing.T) {
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
-		if body.Session.State != string(StateRunning) {
+		if body.Session.State != string(control.StateRunning) {
 			t.Errorf("state = %q, want running", body.Session.State)
 		}
 	})
@@ -2035,7 +2071,7 @@ func TestResumeSession(t *testing.T) {
 		awaitReconciled(t, f)
 
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_res_full", OwnerID: owner.ID, State: StateSuspendedCold, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_res_full", CreatorID: control.ActorID(owner.ID), State: control.StateSuspendedCold, RunnerID: "vm1"})
 
 		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_res_full/resume", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -2050,7 +2086,7 @@ func TestResumeSession(t *testing.T) {
 	t.Run("runner disconnected is 502 runner_unreachable", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_res_gone", OwnerID: owner.ID, State: StateSuspendedWarm, Runner: "vm-ghost"})
+		seedSession(t, st, control.Session{ID: "sess_res_gone", CreatorID: control.ActorID(owner.ID), State: control.StateSuspendedWarm, RunnerID: "vm-ghost"})
 
 		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_res_gone/resume", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -2065,7 +2101,7 @@ func TestResumeSession(t *testing.T) {
 	t.Run("not suspended is 409 conflict", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_res_bad", OwnerID: owner.ID, State: StateQueued})
+		seedSession(t, st, control.Session{ID: "sess_res_bad", CreatorID: control.ActorID(owner.ID), State: control.StateQueued})
 
 		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_res_bad/resume", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -2081,7 +2117,7 @@ func TestResumeSession(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, _ := loginUser(t, st, "alice", "member")
 		_, otherTok := loginUser(t, st, "bob", "member")
-		seedSession(t, st, Session{ID: "sess_res_authz", OwnerID: owner.ID, State: StateSuspendedWarm, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_res_authz", CreatorID: control.ActorID(owner.ID), State: control.StateSuspendedWarm, RunnerID: "vm1"})
 
 		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_res_authz/resume", otherTok, nil, nil)
 		raw := readBody(t, resp)
@@ -2101,7 +2137,7 @@ func TestResumeSession(t *testing.T) {
 		awaitReconciled(t, f)
 
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_res_shape", OwnerID: owner.ID, State: StateSuspendedWarm, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_res_shape", CreatorID: control.ActorID(owner.ID), State: control.StateSuspendedWarm, RunnerID: "vm1"})
 
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
@@ -2121,7 +2157,7 @@ func TestResumeSession(t *testing.T) {
 	// persisted state, not a fabricated "running".
 	t.Run("concurrent mutation racing the runner round-trip: response reflects real persisted state", func(t *testing.T) {
 		const id = "sess_res_race"
-		race := &raceTransitionStore{Store: NewMemStore(), triggerID: id, raceToState: StateDestroyed}
+		race := &raceTransitionStore{MemStore: NewMemStore(), triggerID: id, raceToState: control.StateDestroyed}
 		s, ts := newTestControldOver(t, race)
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
 			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
@@ -2129,7 +2165,7 @@ func TestResumeSession(t *testing.T) {
 		awaitReconciled(t, f)
 
 		owner, tok := loginUser(t, race, "alice", "member")
-		seedSession(t, race, Session{ID: id, OwnerID: owner.ID, State: StateSuspendedWarm, Runner: "vm1"})
+		seedSession(t, race, control.Session{ID: control.SessionID(id), CreatorID: control.ActorID(owner.ID), State: control.StateSuspendedWarm, RunnerID: "vm1"})
 
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
@@ -2148,11 +2184,11 @@ func TestResumeSession(t *testing.T) {
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
-		if body.Session.State != string(StateDestroyed) {
+		if body.Session.State != string(control.StateDestroyed) {
 			t.Fatalf("response state = %q, want destroyed (the real persisted state) — got a fabricated state instead", body.Session.State)
 		}
 		got := getSession(t, race, id)
-		if got.State != StateDestroyed {
+		if got.State != control.StateDestroyed {
 			t.Fatalf("stored state = %q, want destroyed", got.State)
 		}
 	})
@@ -2171,7 +2207,7 @@ func TestSnapshotSession(t *testing.T) {
 		awaitReconciled(t, f)
 
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_snap1", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_snap1", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm1"})
 
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
@@ -2201,7 +2237,7 @@ func TestSnapshotSession(t *testing.T) {
 	t.Run("from queued is 409 conflict", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_snap_bad", OwnerID: owner.ID, State: StateQueued})
+		seedSession(t, st, control.Session{ID: "sess_snap_bad", CreatorID: control.ActorID(owner.ID), State: control.StateQueued})
 
 		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_snap_bad/snapshot", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -2217,7 +2253,7 @@ func TestSnapshotSession(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, _ := loginUser(t, st, "alice", "member")
 		_, otherTok := loginUser(t, st, "bob", "member")
-		seedSession(t, st, Session{ID: "sess_snap_authz", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_snap_authz", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm1"})
 
 		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_snap_authz/snapshot", otherTok, nil, nil)
 		raw := readBody(t, resp)
@@ -2232,7 +2268,7 @@ func TestSnapshotSession(t *testing.T) {
 	t.Run("runner unreachable is 502 runner_unreachable", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_snap_unreach", OwnerID: owner.ID, State: StateRunning, Runner: "vm-ghost"})
+		seedSession(t, st, control.Session{ID: "sess_snap_unreach", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm-ghost"})
 
 		resp := doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_snap_unreach/snapshot", tok, nil, nil)
 		raw := readBody(t, resp)
@@ -2252,7 +2288,7 @@ func TestSnapshotSession(t *testing.T) {
 		awaitReconciled(t, f)
 
 		owner, tok := loginUser(t, st, "alice", "member")
-		seedSession(t, st, Session{ID: "sess_snap_shape", OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_snap_shape", CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm1"})
 
 		type result struct{ resp *http.Response }
 		resc := make(chan result, 1)
@@ -2420,7 +2456,7 @@ func TestPutSecret(t *testing.T) {
 		if e := decodeErrBody(t, raw); e.Error.Code != "invalid_request" {
 			t.Errorf("code = %q, want invalid_request", e.Error.Code)
 		}
-		if _, _, err := st.GetSecret(context.Background(), "BIG"); !errors.Is(err, ErrNotFound) {
+		if _, _, err := st.GetSecret(context.Background(), "BIG"); !errors.Is(err, control.ErrNotFound) {
 			t.Errorf("an over-cap value was stored anyway (GetSecret err = %v)", err)
 		}
 	})
@@ -2478,7 +2514,7 @@ func TestPutSecret(t *testing.T) {
 		if e := decodeErrBody(t, raw); e.Error.Code != "forbidden" {
 			t.Errorf("code = %q, want forbidden", e.Error.Code)
 		}
-		if _, _, err := st.GetSecret(context.Background(), "MEMBER_TRY"); !errors.Is(err, ErrNotFound) {
+		if _, _, err := st.GetSecret(context.Background(), "MEMBER_TRY"); !errors.Is(err, control.ErrNotFound) {
 			t.Errorf("a member's rejected PUT stored the secret anyway (err = %v)", err)
 		}
 	})
@@ -2648,7 +2684,7 @@ func TestDeleteSecret(t *testing.T) {
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, raw)
 		}
-		if _, _, err := st.GetSecret(context.Background(), "DOOMED"); !errors.Is(err, ErrNotFound) {
+		if _, _, err := st.GetSecret(context.Background(), "DOOMED"); !errors.Is(err, control.ErrNotFound) {
 			t.Fatalf("GetSecret after delete: err = %v, want ErrNotFound", err)
 		}
 	})
@@ -3077,12 +3113,16 @@ func putSecretValue(t *testing.T, st Store, name, value string) {
 // seedEnv stores e straight into st (minting an id when it has none) and
 // returns the row the store actually holds — SetupHash included, since the
 // resolution rules compare against it.
-func seedEnv(t *testing.T, st Store, e Environment) Environment {
+func seedEnv(t *testing.T, st MemStore, e control.Environment) control.Environment {
 	t.Helper()
 	if e.ID == "" {
-		e.ID = NewEnvironmentID()
+		e.ID = control.EnvironmentID(NewEnvironmentID())
 	}
-	out, err := st.CreateEnvironment(context.Background(), e)
+	// SetupHash is the store's own column on the old surface, recomputed on
+	// every write; the repository stores what it is given, so the seed
+	// computes the same identity here.
+	e.SetupHash = SetupHash(e.Image, e.Setup)
+	out, err := st.Environments().CreateEnvironment(context.Background(), installWorkspace, e)
 	if err != nil {
 		t.Fatalf("seed environment %q: %v", e.Name, err)
 	}
@@ -3092,12 +3132,13 @@ func seedEnv(t *testing.T, st Store, e Environment) Environment {
 // cacheEnvSnapshot records a built snapshot against env — what Task 9's setup
 // orchestration does once a session's setup script finishes — and returns the
 // refreshed row.
-func cacheEnvSnapshot(t *testing.T, st Store, env Environment, ref, runner string) Environment {
+func cacheEnvSnapshot(t *testing.T, st MemStore, env control.Environment, ref, runner string) control.Environment {
 	t.Helper()
-	if err := st.SetEnvironmentSnapshot(context.Background(), env.ID, env.SetupHash, ref, runner); err != nil {
+	if err := st.Environments().SetEnvironmentSnapshot(context.Background(), installWorkspace,
+		env.ID, env.SetupHash, ref, control.RunnerID(runner)); err != nil {
 		t.Fatalf("SetEnvironmentSnapshot(%s): %v", env.ID, err)
 	}
-	out, err := st.GetEnvironment(context.Background(), env.ID)
+	out, err := st.Environments().GetEnvironment(context.Background(), installWorkspace, env.ID)
 	if err != nil {
 		t.Fatalf("GetEnvironment(%s): %v", env.ID, err)
 	}
@@ -3163,7 +3204,7 @@ func TestCreateEnvironment(t *testing.T) {
 		}
 
 		// The row the store actually holds, including verbatim connector bytes.
-		row, err := st.GetEnvironment(context.Background(), got.ID)
+		row, err := st.Environments().GetEnvironment(context.Background(), installWorkspace, control.EnvironmentID(got.ID))
 		if err != nil {
 			t.Fatalf("GetEnvironment: %v", err)
 		}
@@ -3359,7 +3400,7 @@ func TestCreateEnvironment(t *testing.T) {
 		if e.Error.Code != "invalid_request" || !strings.Contains(e.Error.Message, "ABSENT") {
 			t.Errorf("error = %+v, want invalid_request naming ABSENT", e.Error)
 		}
-		if envs, err := st.ListEnvironments(context.Background()); err != nil || len(envs) != 0 {
+		if envs, _, err := st.Environments().ListEnvironments(context.Background(), installWorkspace, control.EnvironmentQuery{}); err != nil || len(envs) != 0 {
 			t.Errorf("environments after a rejected create = %+v (err %v), want none", envs, err)
 		}
 	})
@@ -3411,7 +3452,7 @@ func TestCreateEnvironment(t *testing.T) {
 		if e := decodeErrBody(t, raw); e.Error.Code != "forbidden" {
 			t.Errorf("code = %q, want forbidden", e.Error.Code)
 		}
-		if envs, err := st.ListEnvironments(context.Background()); err != nil || len(envs) != 0 {
+		if envs, _, err := st.Environments().ListEnvironments(context.Background(), installWorkspace, control.EnvironmentQuery{}); err != nil || len(envs) != 0 {
 			t.Errorf("environments after a member's create = %+v (err %v), want none", envs, err)
 		}
 	})
@@ -3615,7 +3656,8 @@ func TestUpdateEnvironment(t *testing.T) {
 		created := createEnv(t, ts, adminTok, envCreateBody("dev", map[string]any{
 			"setup": "echo hi", "init": "old-init", "init_timeout_sec": 60,
 		}))
-		if err := st.SetEnvironmentSnapshot(context.Background(), created.ID, created.SetupHash, "rainier-env:dev-aaaa", "vm1"); err != nil {
+		if err := st.Environments().SetEnvironmentSnapshot(context.Background(), installWorkspace,
+			control.EnvironmentID(created.ID), created.SetupHash, "rainier-env:dev-aaaa", "vm1"); err != nil {
 			t.Fatalf("SetEnvironmentSnapshot: %v", err)
 		}
 
@@ -3648,7 +3690,8 @@ func TestUpdateEnvironment(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, adminTok := loginUser(t, st, "root", "admin")
 		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
-		if err := st.SetEnvironmentSnapshot(context.Background(), created.ID, created.SetupHash, "rainier-env:dev-aaaa", "vm1"); err != nil {
+		if err := st.Environments().SetEnvironmentSnapshot(context.Background(), installWorkspace,
+			control.EnvironmentID(created.ID), created.SetupHash, "rainier-env:dev-aaaa", "vm1"); err != nil {
 			t.Fatalf("SetEnvironmentSnapshot: %v", err)
 		}
 
@@ -3823,8 +3866,9 @@ func TestDeleteEnvironment(t *testing.T) {
 		if raw != "" {
 			t.Errorf("204 carried a body: %q", raw)
 		}
-		if _, err := st.GetEnvironment(context.Background(), created.ID); !errors.Is(err, ErrNotFound) {
-			t.Errorf("GetEnvironment after delete: err = %v, want ErrNotFound", err)
+		if _, err := st.Environments().GetEnvironment(context.Background(), installWorkspace,
+			control.EnvironmentID(created.ID)); !errors.Is(err, control.ErrNotFound) {
+			t.Errorf("GetEnvironment after delete: err = %v, want control.ErrNotFound", err)
 		}
 	})
 
@@ -3838,8 +3882,9 @@ func TestDeleteEnvironment(t *testing.T) {
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204", resp.StatusCode)
 		}
-		if _, err := st.GetEnvironment(context.Background(), created.ID); !errors.Is(err, ErrNotFound) {
-			t.Errorf("GetEnvironment after delete by name: err = %v, want ErrNotFound", err)
+		if _, err := st.Environments().GetEnvironment(context.Background(), installWorkspace,
+			control.EnvironmentID(created.ID)); !errors.Is(err, control.ErrNotFound) {
+			t.Errorf("GetEnvironment after delete by name: err = %v, want control.ErrNotFound", err)
 		}
 	})
 
@@ -3847,9 +3892,9 @@ func TestDeleteEnvironment(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		u, adminTok := loginUser(t, st, "root", "admin")
 		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
-		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, EnvironmentID: created.ID, State: StateRunning})
-		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, EnvironmentID: created.ID, State: StateQueued})
-		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, EnvironmentID: created.ID, State: StateDestroyed})
+		seedSession(t, st, control.Session{ID: control.SessionID(NewSessionID()), CreatorID: control.ActorID(u.ID), EnvironmentID: control.EnvironmentID(created.ID), State: control.StateRunning})
+		seedSession(t, st, control.Session{ID: control.SessionID(NewSessionID()), CreatorID: control.ActorID(u.ID), EnvironmentID: control.EnvironmentID(created.ID), State: control.StateQueued})
+		seedSession(t, st, control.Session{ID: control.SessionID(NewSessionID()), CreatorID: control.ActorID(u.ID), EnvironmentID: control.EnvironmentID(created.ID), State: control.StateDestroyed})
 
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/environments/dev", adminTok, nil, nil)
 		raw := readBody(t, resp)
@@ -3860,7 +3905,8 @@ func TestDeleteEnvironment(t *testing.T) {
 		if e.Error.Code != "conflict" || !strings.Contains(e.Error.Message, "2") {
 			t.Errorf("error = %+v, want conflict naming the count 2", e.Error)
 		}
-		if _, err := st.GetEnvironment(context.Background(), created.ID); err != nil {
+		if _, err := st.Environments().GetEnvironment(context.Background(), installWorkspace,
+			control.EnvironmentID(created.ID)); err != nil {
 			t.Errorf("a refused delete removed the environment anyway: %v", err)
 		}
 	})
@@ -3869,7 +3915,7 @@ func TestDeleteEnvironment(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		u, adminTok := loginUser(t, st, "root", "admin")
 		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
-		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, EnvironmentID: created.ID, State: StateDestroyed})
+		seedSession(t, st, control.Session{ID: control.SessionID(NewSessionID()), CreatorID: control.ActorID(u.ID), EnvironmentID: control.EnvironmentID(created.ID), State: control.StateDestroyed})
 
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/environments/dev", adminTok, nil, nil)
 		readBody(t, resp)
@@ -3886,16 +3932,17 @@ func TestDeleteEnvironment(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		u, adminTok := loginUser(t, st, "root", "admin")
 		created := createEnv(t, ts, adminTok, envCreateBody("dev", nil))
-		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, State: StateRunning})
-		seedSession(t, st, Session{ID: NewSessionID(), OwnerID: u.ID, State: StateQueued})
+		seedSession(t, st, control.Session{ID: control.SessionID(NewSessionID()), CreatorID: control.ActorID(u.ID), State: control.StateRunning})
+		seedSession(t, st, control.Session{ID: control.SessionID(NewSessionID()), CreatorID: control.ActorID(u.ID), State: control.StateQueued})
 
 		resp := doRequest(t, ts, http.MethodDelete, "/v0/environments/dev", adminTok, nil, nil)
 		raw := readBody(t, resp)
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, raw)
 		}
-		if _, err := st.GetEnvironment(context.Background(), created.ID); !errors.Is(err, ErrNotFound) {
-			t.Errorf("GetEnvironment after delete: err = %v, want ErrNotFound", err)
+		if _, err := st.Environments().GetEnvironment(context.Background(), installWorkspace,
+			control.EnvironmentID(created.ID)); !errors.Is(err, control.ErrNotFound) {
+			t.Errorf("GetEnvironment after delete: err = %v, want control.ErrNotFound", err)
 		}
 	})
 
@@ -3926,7 +3973,8 @@ func TestDeleteEnvironment(t *testing.T) {
 		if e := decodeErrBody(t, raw); e.Error.Code != "forbidden" {
 			t.Errorf("code = %q, want forbidden", e.Error.Code)
 		}
-		if _, err := st.GetEnvironment(context.Background(), created.ID); err != nil {
+		if _, err := st.Environments().GetEnvironment(context.Background(), installWorkspace,
+			control.EnvironmentID(created.ID)); err != nil {
 			t.Errorf("a member's delete removed the environment anyway: %v", err)
 		}
 	})
@@ -4124,21 +4172,30 @@ func TestMiddleware(t *testing.T) {
 // TestCreateDurableBeforeDispatch pins against a fake runner's dispatch
 // arrival time.
 type commitTimingStore struct {
-	Store
+	MemStore
 	mu        sync.Mutex
 	committed map[string]time.Time
 }
 
-func newCommitTimingStore(st Store) *commitTimingStore {
-	return &commitTimingStore{Store: st, committed: map[string]time.Time{}}
+func newCommitTimingStore(st MemStore) *commitTimingStore {
+	return &commitTimingStore{MemStore: st, committed: map[string]time.Time{}}
 }
 
-func (c *commitTimingStore) CreateSession(ctx context.Context, s Session) (Session, error) {
-	out, err := c.Store.CreateSession(ctx, s)
+func (c *commitTimingStore) Sessions() control.SessionRepository {
+	return commitTimingSessions{SessionRepository: c.MemStore.Sessions(), owner: c}
+}
+
+type commitTimingSessions struct {
+	control.SessionRepository
+	owner *commitTimingStore
+}
+
+func (c commitTimingSessions) CreateSession(ctx context.Context, ws control.WorkspaceID, s control.Session) (control.Session, error) {
+	out, err := c.SessionRepository.CreateSession(ctx, ws, s)
 	if err == nil {
-		c.mu.Lock()
-		c.committed[out.ID] = time.Now()
-		c.mu.Unlock()
+		c.owner.mu.Lock()
+		c.owner.committed[string(out.ID)] = time.Now()
+		c.owner.mu.Unlock()
 	}
 	return out, err
 }
@@ -4211,11 +4268,11 @@ func TestCreateDurableBeforeDispatch(t *testing.T) {
 			t.Fatalf("got %+v, want create of %s", cmd, id)
 		}
 
-		got, err := cst.GetSession(context.Background(), id)
+		got, err := cst.Sessions().GetSession(context.Background(), installWorkspace, control.SessionID(id))
 		if err != nil {
 			t.Fatalf("GetSession(%s): %v (row was lost)", id, err)
 		}
-		if got.State != StateCreating && got.State != StateQueued {
+		if got.State != control.StateCreating && got.State != control.StateQueued {
 			t.Fatalf("state = %q, want creating or queued (never lost)", got.State)
 		}
 	})

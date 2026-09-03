@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
@@ -24,9 +25,9 @@ import (
 
 // sandboxSession seeds a running session placed on runner — the row
 // sessionRPC resolves to find which connection to dispatch on.
-func sandboxSession(t *testing.T, st Store, id, runner string) string {
+func sandboxSession(t *testing.T, st MemStore, id, runner string) string {
 	t.Helper()
-	seedSession(t, st, Session{ID: id, State: StateRunning, Runner: runner})
+	seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateRunning, RunnerID: control.RunnerID(runner)})
 	return id
 }
 
@@ -55,9 +56,9 @@ func (f *fakeRunner) answerRPC(t *testing.T, cmd runner.ToRunner, ok bool, paylo
 // sandboxSessionFor is sandboxSession for a session with an OWNER: the mint
 // reads whose credential to unseal off the row, so the tests that drive one
 // have to say who that is.
-func sandboxSessionFor(t *testing.T, st Store, id, runner, userID string) string {
+func sandboxSessionFor(t *testing.T, st MemStore, id, runner, userID string) string {
 	t.Helper()
-	seedSession(t, st, Session{ID: id, State: StateRunning, Runner: runner, OwnerID: userID})
+	seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateRunning, RunnerID: control.RunnerID(runner), CreatorID: control.ActorID(userID)})
 	return id
 }
 
@@ -304,12 +305,12 @@ func TestMintGitCredentialAnswersTheSandbox(t *testing.T) {
 func TestMintGitCredentialRefusesWithTheNamedAction(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		seed func(t *testing.T, s *Server, st Store, userID string)
+		seed func(t *testing.T, s *Server, st MemStore, userID string)
 		want string
 	}{
 		{
 			name: "a credential something has already rejected",
-			seed: func(t *testing.T, s *Server, st Store, userID string) {
+			seed: func(t *testing.T, s *Server, st MemStore, userID string) {
 				seedGitHubCredential(t, s, st, userID)
 				s.rejectCredential(context.Background(), userID, githubProvider)
 			},
@@ -317,7 +318,7 @@ func TestMintGitCredentialRefusesWithTheNamedAction(t *testing.T) {
 		},
 		{
 			name: "no credential at all",
-			seed: func(t *testing.T, s *Server, st Store, userID string) {},
+			seed: func(t *testing.T, s *Server, st MemStore, userID string) {},
 			want: ErrCredentialMissing.Error(),
 		},
 	} {
@@ -388,8 +389,8 @@ func TestMintForASessionWithNoOwnerIsRefused(t *testing.T) {
 	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
 	// Written straight through the store: seedSession supplies an owner, and
 	// the row this test needs is the one nothing in the API can produce.
-	if _, err := st.CreateSession(context.Background(),
-		Session{ID: "sess_ownerless", State: StateRunning, Runner: "vm1"}); err != nil {
+	if _, err := st.Sessions().CreateSession(context.Background(), installWorkspace,
+		control.Session{ID: "sess_ownerless", State: control.StateRunning, PoolID: installPool, RunnerID: "vm1"}); err != nil {
 		t.Fatalf("seeding an ownerless session: %v", err)
 	}
 
@@ -466,19 +467,28 @@ func TestMintGitCredentialNeverLogsTheToken(t *testing.T) {
 // sandbox request inside its handler and prove the connection's reader is not
 // waiting behind it.
 type blockingGetStore struct {
-	Store
+	MemStore
 	id      string
 	entered chan struct{}
 	release chan struct{}
 	once    sync.Once
 }
 
-func (b *blockingGetStore) GetSession(ctx context.Context, id string) (Session, error) {
-	if id == b.id {
-		b.once.Do(func() { close(b.entered) })
-		<-b.release
+func (b *blockingGetStore) Sessions() control.SessionRepository {
+	return blockingGetSessions{SessionRepository: b.MemStore.Sessions(), owner: b}
+}
+
+type blockingGetSessions struct {
+	control.SessionRepository
+	owner *blockingGetStore
+}
+
+func (b blockingGetSessions) GetSession(ctx context.Context, ws control.WorkspaceID, id control.SessionID) (control.Session, error) {
+	if o := b.owner; string(id) == o.id {
+		o.once.Do(func() { close(o.entered) })
+		<-o.release
 	}
-	return b.Store.GetSession(ctx, id)
+	return b.SessionRepository.GetSession(ctx, ws, id)
 }
 
 // TestSandboxRequestsDoNotBlockTheRunnerReader: answering a sandbox request
@@ -490,7 +500,7 @@ func (b *blockingGetStore) GetSession(ctx context.Context, id string) (Session, 
 // meanwhile.
 func TestSandboxRequestsDoNotBlockTheRunnerReader(t *testing.T) {
 	base := NewMemStore()
-	bs := &blockingGetStore{Store: base, id: "sess_req_slow",
+	bs := &blockingGetStore{MemStore: base, id: "sess_req_slow",
 		entered: make(chan struct{}), release: make(chan struct{})}
 	s, ts := newTestControldOver(t, bs)
 	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})

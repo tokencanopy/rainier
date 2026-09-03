@@ -36,8 +36,7 @@ var _ controlapp.LaunchMaterialResolver = launchMaterial{}
 // repositories, then the attribution and git egress a clone implies, then the
 // environment's secrets.
 func (l launchMaterial) ResolveLaunchMaterial(ctx context.Context, row control.Session, env *control.Environment) (controlapp.LaunchMaterial, error) {
-	shimRow, shimEnv := launchShim(row, env)
-	refs, err := sessionRepoRefs(shimRow, shimEnv)
+	refs, err := sessionRepoRefs(row, env)
 	if err != nil {
 		// The connector was accepted by the same strict decode on the way in,
 		// so this is a store the API cannot read back; its text says nothing a
@@ -47,7 +46,7 @@ func (l launchMaterial) ResolveLaunchMaterial(ctx context.Context, row control.S
 
 	var m controlapp.LaunchMaterial
 	if len(refs) > 0 {
-		m.Repos = expandRepos(shimRow, refs)
+		m.Repos = expandRepos(row, refs)
 		// Attribution is resolved from the creator's user row at dispatch, not
 		// copied onto the session at create: it is derived data, and a login
 		// the user has since changed on GitHub is re-read here rather than
@@ -85,7 +84,7 @@ func (l launchMaterial) secretEnvironment(ctx context.Context, env *control.Envi
 	for _, name := range env.SecretRefs {
 		ciphertext, nonce, err := l.st.GetSecret(ctx, name)
 		if err != nil {
-			if errors.Is(err, ErrNotFound) {
+			if errors.Is(err, control.ErrNotFound) {
 				// The name, and only the name: no value was ever loaded.
 				return nil, fmt.Errorf("environment references secret %q, which no longer exists", name)
 			}
@@ -98,33 +97,6 @@ func (l launchMaterial) secretEnvironment(ctx context.Context, env *control.Envi
 		vars[name] = string(plaintext)
 	}
 	return vars, nil
-}
-
-// launchShim re-spells the control model in the store's own vocabulary for the
-// two moved helpers below, which have always spoken it. It carries only what
-// they read — the session's identity, name and repo override, and the
-// environment's connectors — and it preserves the one distinction the whole
-// clone path turns on: a nil Repos means "inherit the environment's
-// connectors", while an explicit empty one means "clone nothing".
-func launchShim(row control.Session, env *control.Environment) (Session, *Environment) {
-	shimRow := Session{ID: string(row.ID), Name: row.Name}
-	if row.Spec.Repos != nil {
-		shimRow.Repos = make([]RepoRef, 0, len(row.Spec.Repos))
-		for _, r := range row.Spec.Repos {
-			shimRow.Repos = append(shimRow.Repos, RepoRef{Repo: r.Repo, BaseBranch: r.BaseBranch})
-		}
-	}
-	if env == nil {
-		return shimRow, nil
-	}
-	shimEnv := &Environment{ID: string(env.ID)}
-	if env.Connectors != nil {
-		shimEnv.Connectors = make([]Connector, 0, len(env.Connectors))
-		for _, c := range env.Connectors {
-			shimEnv.Connectors = append(shimEnv.Connectors, Connector{Type: c.Type, Raw: c.Raw})
-		}
-	}
-	return shimRow, shimEnv
 }
 
 // ---------------------------------------------------------------------------
@@ -157,14 +129,14 @@ var gitEgressHosts = []string{"github.com", "codeload.github.com", "objects.gith
 // because the store keeps a connector as the object its author wrote; this is
 // the same strict decode the API validated it with on the way in, so a
 // connector that was accepted then is accepted now.
-func sessionRepoRefs(row Session, env *Environment) ([]RepoRef, error) {
-	if row.Repos != nil {
-		return row.Repos, nil
+func sessionRepoRefs(row control.Session, env *control.Environment) ([]control.RepoRef, error) {
+	if row.Spec.Repos != nil {
+		return row.Spec.Repos, nil
 	}
 	if env == nil {
 		return nil, nil
 	}
-	var refs []RepoRef
+	var refs []control.RepoRef
 	for i, c := range env.Connectors {
 		if c.Type != "github" {
 			continue
@@ -173,7 +145,7 @@ func sessionRepoRefs(row Session, env *Environment) ([]RepoRef, error) {
 		if err != nil {
 			return nil, fmt.Errorf("connectors[%d]: %w", i, err)
 		}
-		refs = append(refs, RepoRef{Repo: gc.Repo, BaseBranch: *gc.BaseBranch})
+		refs = append(refs, control.RepoRef{Repo: gc.Repo, BaseBranch: *gc.BaseBranch})
 	}
 	return refs, nil
 }
@@ -190,7 +162,7 @@ func noreplyEmail(u User) string {
 // expandRepos turns refs into the clone instructions a sandbox executes,
 // resolving the two names a repository reference does not carry: the branch
 // the session works on, and the directory it lands in.
-func expandRepos(row Session, refs []RepoRef) []runner.RepoSpec {
+func expandRepos(row control.Session, refs []control.RepoRef) []runner.RepoSpec {
 	if len(refs) == 0 {
 		return nil
 	}
@@ -222,10 +194,10 @@ func expandRepos(row Session, refs []RepoRef) []runner.RepoSpec {
 // git refuses as a ref fails the clone stage loudly, with the name in the
 // error, which is a better answer than silently working on a branch the user
 // did not name.
-func sessionBranch(row Session) string {
+func sessionBranch(row control.Session) string {
 	name := row.Name
 	if name == "" {
-		name = row.ID
+		name = string(row.ID)
 		if len(name) > 12 {
 			name = name[len(name)-12:]
 		}
@@ -261,9 +233,9 @@ func uniqueDir(taken map[string]bool, owner, name string) string {
 // can say which environment it was working from without guarding a nil. Its
 // one caller is the create handler's repository preflight; it lives here with
 // the rest of the repository resolution it belongs to.
-func envID(env *Environment) string {
+func envID(env *control.Environment) string {
 	if env == nil {
 		return ""
 	}
-	return env.ID
+	return string(env.ID)
 }

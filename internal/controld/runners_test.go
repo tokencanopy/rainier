@@ -32,7 +32,7 @@ const testRunnerToken = "rnr_test_runner_token"
 // minute but not by much, for the reason spelled out below; opts override any
 // field before New validates it, and the tests that assert a timeout pass their
 // own.
-func newTestControld(t *testing.T, opts ...func(*Config)) (*Server, Store, *httptest.Server) {
+func newTestControld(t *testing.T, opts ...func(*Config)) (*Server, MemStore, *httptest.Server) {
 	t.Helper()
 	st := NewMemStore()
 	s, ts := newTestControldOver(t, st, opts...)
@@ -41,7 +41,7 @@ func newTestControld(t *testing.T, opts ...func(*Config)) (*Server, Store, *http
 
 // newTestControldOver is newTestControld over a caller-supplied store — for
 // tests that wrap the store to force an interleaving.
-func newTestControldOver(t *testing.T, st Store, opts ...func(*Config)) (*Server, *httptest.Server) {
+func newTestControldOver(t *testing.T, st MemStore, opts ...func(*Config)) (*Server, *httptest.Server) {
 	t.Helper()
 	cfg := Config{
 		RunnerToken: testRunnerToken,
@@ -302,11 +302,11 @@ func wantNothingQueued(t *testing.T, s *Server, f *fakeRunner) {
 // waits for that to land. One connection's messages are handled in order and
 // in the reader, so this proves every event sent before it has already been
 // applied — the synchronization the "and nothing happened" assertions need.
-func wantEventHandled(t *testing.T, st Store, f *fakeRunner, id string) {
+func wantEventHandled(t *testing.T, st MemStore, f *fakeRunner, id string) {
 	t.Helper()
-	seedSession(t, st, Session{ID: id, State: StateCreating, Runner: f.name})
+	seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateCreating, RunnerID: control.RunnerID(f.name)})
 	f.event(t, id, "running")
-	wantState(t, st, id, StateRunning)
+	wantState(t, st, id, control.StateRunning)
 }
 
 // eventually polls fn until it returns nil or d elapses — controld processes
@@ -337,12 +337,18 @@ func waitConnected(t *testing.T, s *Server, name string) {
 	})
 }
 
-func seedSession(t *testing.T, st Store, s Session) Session {
+func seedSession(t *testing.T, st MemStore, s control.Session) control.Session {
 	t.Helper()
-	if s.OwnerID == "" {
-		s.OwnerID = "usr_test"
+	if s.CreatorID == "" {
+		s.CreatorID = "usr_test"
 	}
-	out, err := st.CreateSession(context.Background(), s)
+	// The pool is the installation's, as it is on every row this store has
+	// ever held: a queued session is queued *in* the install pool, and that
+	// is the key the fleet repository's queue and capacity reads use.
+	if s.PoolID == "" {
+		s.PoolID = installPool
+	}
+	out, err := st.Sessions().CreateSession(context.Background(), installWorkspace, s)
 	if err != nil {
 		t.Fatalf("seed session %s: %v", s.ID, err)
 	}
@@ -354,24 +360,36 @@ func seedSession(t *testing.T, st Store, s Session) Session {
 // environment's image, and carrying the pin of the script it was dispatched
 // with (see Session.SetupHash). Tests that want a DIFFERENT provenance say so
 // by writing the row themselves.
-func seedSetupSession(t *testing.T, st Store, id, runner string, env Environment) Session {
+func seedSetupSession(t *testing.T, st MemStore, id, runner string, env control.Environment) control.Session {
 	t.Helper()
-	return seedSession(t, st, Session{ID: id, State: StateRunning, Runner: runner,
-		EnvironmentID: env.ID, ResolvedImage: env.Image, SetupHash: SetupHash(env.Image, env.Setup)})
+	return seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateRunning, RunnerID: control.RunnerID(runner),
+		EnvironmentID: env.ID, Spec: control.PortableSpec{Image: env.Image}, SetupHash: SetupHash(env.Image, env.Setup)})
 }
 
-func envRow(t *testing.T, st Store, id string) Environment {
+func envRow(t *testing.T, st MemStore, id control.EnvironmentID) control.Environment {
 	t.Helper()
-	e, err := st.GetEnvironment(context.Background(), id)
+	e, err := st.Environments().GetEnvironment(context.Background(), installWorkspace, id)
 	if err != nil {
 		t.Fatalf("get environment %s: %v", id, err)
 	}
 	return e
 }
 
-func getSession(t *testing.T, st Store, id string) Session {
+// envSnapshotRunner names the runner that built id's cached snapshot, "" when
+// there is none. control.Environment carries the snapshot but not its holder,
+// so the host lookup — not the row — answers for it.
+func envSnapshotRunner(t *testing.T, st MemStore, id control.EnvironmentID) control.RunnerID {
 	t.Helper()
-	s, err := st.GetSession(context.Background(), id)
+	r, err := st.SnapshotRunner(context.Background(), installWorkspace, id)
+	if err != nil {
+		t.Fatalf("snapshot runner of %s: %v", id, err)
+	}
+	return r
+}
+
+func getSession(t *testing.T, st MemStore, id string) control.Session {
+	t.Helper()
+	s, err := st.Sessions().GetSession(context.Background(), installWorkspace, control.SessionID(id))
 	if err != nil {
 		t.Fatalf("get session %s: %v", id, err)
 	}
@@ -380,9 +398,9 @@ func getSession(t *testing.T, st Store, id string) Session {
 
 // wantState polls until the session reaches want, reporting the state it was
 // stuck in otherwise.
-func wantState(t *testing.T, st Store, id string, want SessionState) Session {
+func wantState(t *testing.T, st MemStore, id string, want control.SessionState) control.Session {
 	t.Helper()
-	var got Session
+	var got control.Session
 	eventually(t, 3*time.Second, func() error {
 		got = getSession(t, st, id)
 		if got.State != want {
@@ -480,7 +498,7 @@ func TestProtoRejected(t *testing.T) {
 	}
 
 	// A runner we refused to speak to must not appear in the fleet.
-	rs, err := st.ListRunners(context.Background())
+	rs, err := st.Fleet().ListRunners(context.Background(), installPool)
 	if err != nil {
 		t.Fatalf("ListRunners: %v", err)
 	}
@@ -495,7 +513,7 @@ func TestAnnounceUpsertsRunner(t *testing.T) {
 	waitConnected(t, s, "vm1")
 
 	eventually(t, 3*time.Second, func() error {
-		rs, err := st.ListRunners(context.Background())
+		rs, err := st.Fleet().ListRunners(context.Background(), installPool)
 		if err != nil {
 			return err
 		}
@@ -503,7 +521,7 @@ func TestAnnounceUpsertsRunner(t *testing.T) {
 			return fmt.Errorf("ListRunners = %+v, want 1 runner", rs)
 		}
 		r := rs[0]
-		if r.Name != "vm1" || !r.Connected || r.CapacityUsed != 1 || r.CapacityTotal != 4 {
+		if r.ID != "vm1" || !r.Connected || r.CapacityUsed != 1 || r.CapacityTotal != 4 {
 			return fmt.Errorf("runner = %+v, want {vm1 used:1 total:4 connected:true}", r)
 		}
 		if r.LastSeenAt.IsZero() {
@@ -515,7 +533,7 @@ func TestAnnounceUpsertsRunner(t *testing.T) {
 	f.close()
 
 	eventually(t, 3*time.Second, func() error {
-		rs, err := st.ListRunners(context.Background())
+		rs, err := st.Fleet().ListRunners(context.Background(), installPool)
 		if err != nil {
 			return err
 		}
@@ -540,14 +558,14 @@ func TestReconcileTable(t *testing.T) {
 	t.Run("running present and agreeing bumps last_event_at", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		id := "sess_agree"
-		seedSession(t, st, Session{ID: id, State: StateRunning, Runner: "vm1", CreatedAt: old, UpdatedAt: old, LastEventAt: old})
+		seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateRunning, RunnerID: "vm1", CreatedAt: old, UpdatedAt: old, LastEventAt: old})
 		startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
 			Sessions: []runner.SessionInfo{{ID: id, State: "running"}}})
 		waitConnected(t, s, "vm1")
 
 		eventually(t, 3*time.Second, func() error {
 			got := getSession(t, st, id)
-			if got.State != StateRunning {
+			if got.State != control.StateRunning {
 				return fmt.Errorf("state = %q, want running", got.State)
 			}
 			if !got.LastEventAt.After(old) {
@@ -560,25 +578,25 @@ func TestReconcileTable(t *testing.T) {
 	t.Run("running present with different state adopts announced state", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		id := "sess_adopt"
-		seedSession(t, st, Session{ID: id, State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateRunning, RunnerID: "vm1"})
 		startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
 			Sessions: []runner.SessionInfo{{ID: id, State: "suspended_cold"}}})
 		waitConnected(t, s, "vm1")
 
-		got := wantState(t, st, id, StateSuspendedCold)
-		if got.Runner != "vm1" {
-			t.Fatalf("runner = %q, want vm1", got.Runner)
+		got := wantState(t, st, id, control.StateSuspendedCold)
+		if got.RunnerID != "vm1" {
+			t.Fatalf("runner = %q, want vm1", got.RunnerID)
 		}
 	})
 
 	t.Run("running absent is dead with lost at announce", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		id := "sess_lost"
-		seedSession(t, st, Session{ID: id, State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateRunning, RunnerID: "vm1"})
 		startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4})
 		waitConnected(t, s, "vm1")
 
-		got := wantState(t, st, id, StateDead)
+		got := wantState(t, st, id, control.StateDead)
 		if got.Error != "lost at announce" {
 			t.Fatalf("error = %q, want %q", got.Error, "lost at announce")
 		}
@@ -587,20 +605,20 @@ func TestReconcileTable(t *testing.T) {
 	t.Run("creating absent goes back to queued", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		id := "sess_requeue"
-		seedSession(t, st, Session{ID: id, State: StateCreating, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateCreating, RunnerID: "vm1"})
 		startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4})
 		waitConnected(t, s, "vm1")
 
-		got := wantState(t, st, id, StateQueued)
-		if got.Runner != "" {
-			t.Fatalf("runner = %q, want cleared", got.Runner)
+		got := wantState(t, st, id, control.StateQueued)
+		if got.RunnerID != "" {
+			t.Fatalf("runner = %q, want cleared", got.RunnerID)
 		}
 	})
 
 	t.Run("terminal row announced present is destroyed as an orphan", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		id := "sess_terminal"
-		seedSession(t, st, Session{ID: id, State: StateDestroyed, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateDestroyed, RunnerID: "vm1"})
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
 			Sessions: []runner.SessionInfo{{ID: id, State: "running"}}})
 
@@ -609,7 +627,7 @@ func TestReconcileTable(t *testing.T) {
 			t.Fatalf("got %+v, want destroy of %s", cmd, id)
 		}
 		f.reply(t, cmd, true, "")
-		if got := getSession(t, st, id); got.State != StateDestroyed {
+		if got := getSession(t, st, id); got.State != control.StateDestroyed {
 			t.Fatalf("state = %q, want destroyed (untouched)", got.State)
 		}
 	})
@@ -632,7 +650,7 @@ func TestReconcileTable(t *testing.T) {
 	t.Run("live row placed on another runner is destroyed as a duplicate", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		id := "sess_dupe"
-		seedSession(t, st, Session{ID: id, State: StateRunning, Runner: "vm2"})
+		seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateRunning, RunnerID: "vm2"})
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
 			Sessions: []runner.SessionInfo{{ID: id, State: "running"}}})
 
@@ -642,8 +660,8 @@ func TestReconcileTable(t *testing.T) {
 		}
 		f.reply(t, cmd, true, "")
 		got := getSession(t, st, id)
-		if got.State != StateRunning || got.Runner != "vm2" {
-			t.Fatalf("row = %s on %q, want running on vm2 (untouched)", got.State, got.Runner)
+		if got.State != control.StateRunning || got.RunnerID != "vm2" {
+			t.Fatalf("row = %s on %q, want running on vm2 (untouched)", got.State, got.RunnerID)
 		}
 	})
 
@@ -656,7 +674,7 @@ func TestReconcileTable(t *testing.T) {
 	t.Run("live row announced by a runner it is not placed on is adopted", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		id := "sess_unplaced"
-		seedSession(t, st, Session{ID: id, State: StateQueued})
+		seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateQueued})
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4, Sessions: []runner.SessionInfo{
 			{ID: id, State: "running"},
 			{ID: ghostSession, State: "running"},
@@ -664,9 +682,9 @@ func TestReconcileTable(t *testing.T) {
 		waitConnected(t, s, "vm1")
 
 		awaitReconciled(t, f)
-		got := wantState(t, st, id, StateRunning)
-		if got.Runner != "vm1" {
-			t.Fatalf("runner = %q, want vm1", got.Runner)
+		got := wantState(t, st, id, control.StateRunning)
+		if got.RunnerID != "vm1" {
+			t.Fatalf("runner = %q, want vm1", got.RunnerID)
 		}
 	})
 }
@@ -861,13 +879,13 @@ func TestEventUpdatesStore(t *testing.T) {
 	awaitReconciled(t, f)
 
 	id := "sess_evt"
-	seedSession(t, st, Session{ID: id, State: StateCreating, Runner: "vm1"})
+	seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateCreating, RunnerID: "vm1"})
 
 	f.event(t, id, "running")
-	wantState(t, st, id, StateRunning)
+	wantState(t, st, id, control.StateRunning)
 
 	f.event(t, id, "dead")
-	got := wantState(t, st, id, StateDead)
+	got := wantState(t, st, id, control.StateDead)
 	if got.Error != "runner reported dead" {
 		t.Fatalf("error = %q, want %q", got.Error, "runner reported dead")
 	}
@@ -877,19 +895,19 @@ func TestEventUpdatesStore(t *testing.T) {
 	// session that has since been re-placed to a terminal state.
 	t.Run("event from a runner the session is not placed on is ignored", func(t *testing.T) {
 		elsewhere := "sess_elsewhere"
-		seedSession(t, st, Session{ID: elsewhere, State: StateRunning, Runner: "vm2"})
+		seedSession(t, st, control.Session{ID: control.SessionID(elsewhere), State: control.StateRunning, RunnerID: "vm2"})
 		sync := "sess_sync"
-		seedSession(t, st, Session{ID: sync, State: StateCreating, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: control.SessionID(sync), State: control.StateCreating, RunnerID: "vm1"})
 
 		f.event(t, elsewhere, "dead")
 		f.event(t, sync, "running")
 		// The reader handles messages in order, so the second event landing
 		// proves the first has already been fully handled (and ignored).
-		wantState(t, st, sync, StateRunning)
+		wantState(t, st, sync, control.StateRunning)
 
 		got := getSession(t, st, elsewhere)
-		if got.State != StateRunning || got.Runner != "vm2" {
-			t.Fatalf("row = %s on %q, want running on vm2 (untouched)", got.State, got.Runner)
+		if got.State != control.StateRunning || got.RunnerID != "vm2" {
+			t.Fatalf("row = %s on %q, want running on vm2 (untouched)", got.State, got.RunnerID)
 		}
 	})
 
@@ -900,19 +918,19 @@ func TestEventUpdatesStore(t *testing.T) {
 	// that is alive — terminally, since dead is not recoverable.
 	t.Run("dead event for an unplaced (requeued) row is ignored", func(t *testing.T) {
 		requeued := "sess_requeued"
-		seedSession(t, st, Session{ID: requeued, State: StateQueued})
+		seedSession(t, st, control.Session{ID: control.SessionID(requeued), State: control.StateQueued})
 		sync := "sess_sync2"
-		seedSession(t, st, Session{ID: sync, State: StateCreating, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: control.SessionID(sync), State: control.StateCreating, RunnerID: "vm1"})
 
 		f.event(t, requeued, "dead")
 		f.event(t, sync, "running")
 		// In-order handling again: the second event landing proves the first
 		// has already been handled (and ignored).
-		wantState(t, st, sync, StateRunning)
+		wantState(t, st, sync, control.StateRunning)
 
 		got := getSession(t, st, requeued)
-		if got.State != StateQueued || got.Runner != "" {
-			t.Fatalf("row = %s on %q, want queued and unplaced (untouched)", got.State, got.Runner)
+		if got.State != control.StateQueued || got.RunnerID != "" {
+			t.Fatalf("row = %s on %q, want queued and unplaced (untouched)", got.State, got.RunnerID)
 		}
 	})
 }
@@ -928,7 +946,7 @@ func TestCapacityRidesEveryMessage(t *testing.T) {
 	f.event(t, "sess_unknown", "running") // unknown session: only capacity matters
 
 	eventually(t, 3*time.Second, func() error {
-		rs, err := st.ListRunners(context.Background())
+		rs, err := st.Fleet().ListRunners(context.Background(), installPool)
 		if err != nil {
 			return err
 		}
@@ -958,7 +976,7 @@ func TestReconnectReplacesConn(t *testing.T) {
 	// The runner stays connected — the replaced conn's cleanup is
 	// pointer-guarded — and dispatch reaches the new socket.
 	eventually(t, 3*time.Second, func() error {
-		rs, err := st.ListRunners(context.Background())
+		rs, err := st.Fleet().ListRunners(context.Background(), installPool)
 		if err != nil {
 			return err
 		}
@@ -995,7 +1013,7 @@ func TestReconnectReplacesConn(t *testing.T) {
 // because a correctly serialized controld makes that upsert wait on *us* —
 // without the fallback the test would wedge instead of passing.
 type raceStore struct {
-	Store
+	MemStore
 	entered  chan struct{} // the first disconnect write has begun
 	upserted chan struct{} // some connected:true upsert has completed
 	wrote    chan struct{} // the first disconnect write has returned
@@ -1007,35 +1025,46 @@ type raceStore struct {
 
 func newRaceStore() *raceStore {
 	return &raceStore{
-		Store:    NewMemStore(),
+		MemStore: NewMemStore(),
 		entered:  make(chan struct{}),
 		upserted: make(chan struct{}),
 		wrote:    make(chan struct{}),
 	}
 }
 
-func (r *raceStore) SetRunnerConnected(ctx context.Context, name string, connected bool) error {
+func (r *raceStore) Fleet() control.FleetRepository {
+	return raceFleet{FleetRepository: r.MemStore.Fleet(), owner: r}
+}
+
+type raceFleet struct {
+	control.FleetRepository
+	owner *raceStore
+}
+
+func (r raceFleet) SetRunnerConnected(ctx context.Context, pool control.PoolID, id control.RunnerID, connected bool) error {
 	if connected {
-		return r.Store.SetRunnerConnected(ctx, name, connected)
+		return r.FleetRepository.SetRunnerConnected(ctx, pool, id, connected)
 	}
-	r.enteredOnce.Do(func() { close(r.entered) })
+	o := r.owner
+	o.enteredOnce.Do(func() { close(o.entered) })
 	select {
-	case <-r.upserted:
+	case <-o.upserted:
 	case <-time.After(500 * time.Millisecond):
 	}
-	err := r.Store.SetRunnerConnected(ctx, name, connected)
-	r.wroteOnce.Do(func() { close(r.wrote) })
+	err := r.FleetRepository.SetRunnerConnected(ctx, pool, id, connected)
+	o.wroteOnce.Do(func() { close(o.wrote) })
 	return err
 }
 
-func (r *raceStore) UpsertRunner(ctx context.Context, run Runner) error {
-	err := r.Store.UpsertRunner(ctx, run)
+func (r raceFleet) UpsertRunner(ctx context.Context, pool control.PoolID, run control.Runner) error {
+	err := r.FleetRepository.UpsertRunner(ctx, pool, run)
 	// Only a connect that happens *after* the teardown began is the one this
 	// test is racing; the first runner's own announce must not release it.
+	o := r.owner
 	select {
-	case <-r.entered:
+	case <-o.entered:
 		if run.Connected {
-			r.upsertedOnce.Do(func() { close(r.upserted) })
+			o.upsertedOnce.Do(func() { close(o.upserted) })
 		}
 	default:
 	}
@@ -1070,7 +1099,7 @@ func TestRedialSurvivesStaleDisconnect(t *testing.T) {
 	awaitChan(t, rs.wrote, "teardown's disconnect write returning")
 
 	eventually(t, 3*time.Second, func() error {
-		runners, err := rs.ListRunners(context.Background())
+		runners, err := rs.Fleet().ListRunners(context.Background(), installPool)
 		if err != nil {
 			return err
 		}
@@ -1149,9 +1178,9 @@ func TestSetupDoneCachesTheSnapshot(t *testing.T) {
 	f1 := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 	f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 1})
 
-	env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "apt-get install -y jq"})
-	seedSession(t, st, Session{ID: "sess_setup", State: StateQueued, Name: "setup1",
-		EnvironmentID: env.ID, ResolvedImage: env.Image, CreatedAt: time.Now().Add(-time.Hour)})
+	env := seedEnv(t, st, control.Environment{Name: "dev", Image: "img:1", Setup: "apt-get install -y jq"})
+	seedSession(t, st, control.Session{ID: "sess_setup", State: control.StateQueued, Name: "setup1",
+		EnvironmentID: env.ID, Spec: control.PortableSpec{Image: env.Image}, CreatedAt: time.Now().Add(-time.Hour)})
 	startRun(t, s)
 
 	create := nextCreate(t, f1)
@@ -1160,11 +1189,11 @@ func TestSetupDoneCachesTheSnapshot(t *testing.T) {
 	}
 	f1.reply(t, create, true, "")
 	f1.event(t, "sess_setup", "running")
-	wantState(t, st, "sess_setup", StateRunning)
+	wantState(t, st, "sess_setup", control.StateRunning)
 
 	f1.eventDetail(t, "sess_setup", "setup_done", "")
 
-	wantRef := "rainier-env:" + env.ID + "-" + env.SetupHash[:12]
+	wantRef := "rainier-env:" + string(env.ID) + "-" + env.SetupHash[:12]
 	snap := nextOfType(t, f1, "snapshot")
 	if snap.Session != "sess_setup" || snap.Ref != wantRef {
 		t.Fatalf("snapshot command = %+v, want sess_setup at ref %s", snap, wantRef)
@@ -1172,17 +1201,17 @@ func TestSetupDoneCachesTheSnapshot(t *testing.T) {
 	f1.reply(t, snap, true, snap.Ref)
 
 	eventually(t, 3*time.Second, func() error {
-		got := envRow(t, st, env.ID)
-		if got.SnapshotRef != wantRef || got.SnapshotRunner != "vm1" || got.SnapshotHash != env.SetupHash {
+		got, holder := envRow(t, st, env.ID), envSnapshotRunner(t, st, env.ID)
+		if got.Snapshot.Ref != wantRef || holder != "vm1" || got.SnapshotHash != env.SetupHash {
 			return fmt.Errorf("environment cache = %q/%q/%q, want %q/vm1/%s",
-				got.SnapshotRef, got.SnapshotRunner, got.SnapshotHash, wantRef, env.SetupHash)
+				got.Snapshot.Ref, holder, got.SnapshotHash, wantRef, env.SetupHash)
 		}
 		return nil
 	})
 
 	// Clause 4: a setup event says nothing about the session's own state. The
 	// `running` event governs, and it already did.
-	if got := getSession(t, st, "sess_setup"); got.State != StateRunning {
+	if got := getSession(t, st, "sess_setup"); got.State != control.StateRunning {
 		t.Fatalf("session = %q after setup_done, want running (untouched)", got.State)
 	}
 
@@ -1203,13 +1232,13 @@ func TestSetupDoneNoOps(t *testing.T) {
 	t.Run("scratch session", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-		seedSession(t, st, Session{ID: "sess_scratch", State: StateRunning, Runner: "vm1", Image: "img:1"})
+		seedSession(t, st, control.Session{ID: "sess_scratch", State: control.StateRunning, RunnerID: "vm1", Spec: control.PortableSpec{Image: "img:1"}})
 
 		f.eventDetail(t, "sess_scratch", "setup_done", "")
 		wantEventHandled(t, st, f, "sess_sync_scratch")
 		wantNothingQueued(t, s, f)
 
-		if got := getSession(t, st, "sess_scratch"); got.State != StateRunning {
+		if got := getSession(t, st, "sess_scratch"); got.State != control.StateRunning {
 			t.Fatalf("session = %q, want running (untouched)", got.State)
 		}
 	})
@@ -1217,7 +1246,7 @@ func TestSetupDoneNoOps(t *testing.T) {
 	t.Run("environment already cached at the current hash", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "echo hi"})
+		env := seedEnv(t, st, control.Environment{Name: "dev", Image: "img:1", Setup: "echo hi"})
 		const ref = "rainier-env:already-cached"
 		env = cacheEnvSnapshot(t, st, env, ref, "vm2")
 		seedSetupSession(t, st, "sess_cached", "vm1", env)
@@ -1226,18 +1255,18 @@ func TestSetupDoneNoOps(t *testing.T) {
 		wantEventHandled(t, st, f, "sess_sync_cached")
 		wantNothingQueued(t, s, f)
 
-		got := envRow(t, st, env.ID)
-		if got.SnapshotRef != ref || got.SnapshotRunner != "vm2" {
-			t.Fatalf("environment cache = %q on %q, want %q on vm2 (untouched)", got.SnapshotRef, got.SnapshotRunner, ref)
+		got, holder := envRow(t, st, env.ID), envSnapshotRunner(t, st, env.ID)
+		if got.Snapshot.Ref != ref || holder != "vm2" {
+			t.Fatalf("environment cache = %q on %q, want %q on vm2 (untouched)", got.Snapshot.Ref, holder, ref)
 		}
 	})
 
 	t.Run("environment deleted while the setup ran", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-		env := seedEnv(t, st, Environment{Name: "doomed", Image: "img:1", Setup: "echo hi"})
+		env := seedEnv(t, st, control.Environment{Name: "doomed", Image: "img:1", Setup: "echo hi"})
 		seedSetupSession(t, st, "sess_orphan", "vm1", env)
-		if err := st.DeleteEnvironment(context.Background(), env.ID); err != nil {
+		if err := st.Environments().DeleteEnvironment(context.Background(), installWorkspace, env.ID); err != nil {
 			t.Fatalf("DeleteEnvironment: %v", err)
 		}
 
@@ -1254,17 +1283,17 @@ func TestSetupDoneNoOps(t *testing.T) {
 		// asked for.
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "echo hi"})
-		seedSession(t, st, Session{ID: "sess_override", State: StateRunning, Runner: "vm1",
-			Image: "myfork:latest", EnvironmentID: env.ID, ResolvedImage: "myfork:latest",
+		env := seedEnv(t, st, control.Environment{Name: "dev", Image: "img:1", Setup: "echo hi"})
+		seedSession(t, st, control.Session{ID: "sess_override", State: control.StateRunning, RunnerID: "vm1",
+			Spec: control.PortableSpec{Image: "myfork:latest"}, EnvironmentID: env.ID,
 			SetupHash: SetupHash("myfork:latest", env.Setup)})
 
 		f.eventDetail(t, "sess_override", "setup_done", "")
 		wantEventHandled(t, st, f, "sess_sync_override")
 		wantNothingQueued(t, s, f)
 
-		if got := envRow(t, st, env.ID); got.SnapshotRef != "" {
-			t.Fatalf("environment cached as %q from an overridden image; want no cache", got.SnapshotRef)
+		if got := envRow(t, st, env.ID); got.Snapshot.Ref != "" {
+			t.Fatalf("environment cached as %q from an overridden image; want no cache", got.Snapshot.Ref)
 		}
 	})
 }
@@ -1275,13 +1304,13 @@ func TestSetupDoneNoOps(t *testing.T) {
 func TestSetupFailedFailsTheSession(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
-		from   SessionState
+		from   control.SessionState
 		detail string
 		want   string
 	}{
 		{
 			name:   "from creating",
-			from:   StateCreating,
+			from:   control.StateCreating,
 			detail: "rc 7: boom",
 			want:   "setup failed: rc 7: boom",
 		},
@@ -1290,7 +1319,7 @@ func TestSetupFailedFailsTheSession(t *testing.T) {
 			// is still creating — but the registration `running` event can
 			// outrun the rc write, so that from-state must be accepted too.
 			name:   "from running",
-			from:   StateRunning,
+			from:   control.StateRunning,
 			detail: "rc -1: setup timed out after 900s",
 			want:   "setup failed: rc -1: setup timed out after 900s",
 		},
@@ -1298,11 +1327,11 @@ func TestSetupFailedFailsTheSession(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s, st, ts := newTestControld(t)
 			f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-			seedSession(t, st, Session{ID: "sess_failed", State: tc.from, Runner: "vm1"})
+			seedSession(t, st, control.Session{ID: "sess_failed", State: tc.from, RunnerID: "vm1"})
 
 			f.eventDetail(t, "sess_failed", "setup_failed", tc.detail)
 
-			got := wantState(t, st, "sess_failed", StateFailed)
+			got := wantState(t, st, "sess_failed", control.StateFailed)
 			if got.Error != tc.want {
 				t.Fatalf("error = %q, want %q", got.Error, tc.want)
 			}
@@ -1319,13 +1348,13 @@ func TestSetupFailedFailsTheSession(t *testing.T) {
 func TestStageFailedFailsTheSession(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
-		from   SessionState
+		from   control.SessionState
 		detail string
 		want   string
 	}{
 		{
 			name:   "a clone that could not authenticate",
-			from:   StateCreating,
+			from:   control.StateCreating,
 			detail: "clone: rc 128: fatal: Authentication failed for 'https://github.com/acme/app.test/'",
 			want:   "clone failed: rc 128: fatal: Authentication failed for 'https://github.com/acme/app.test/'",
 		},
@@ -1334,7 +1363,7 @@ func TestStageFailedFailsTheSession(t *testing.T) {
 			// write, exactly as it can for setup, so that from-state is
 			// accepted too (see setupFailedFrom).
 			name:   "an init that was killed at its timeout",
-			from:   StateRunning,
+			from:   control.StateRunning,
 			detail: "init: rc -1: init timed out after 300s",
 			want:   "init failed: rc -1: init timed out after 300s",
 		},
@@ -1344,7 +1373,7 @@ func TestStageFailedFailsTheSession(t *testing.T) {
 			// because which one a session sends depends only on how old the
 			// sessiond inside its image is.
 			name:   "the setup stage under the new name",
-			from:   StateCreating,
+			from:   control.StateCreating,
 			detail: "setup: rc 7: boom",
 			want:   "setup failed: rc 7: boom",
 		},
@@ -1355,7 +1384,7 @@ func TestStageFailedFailsTheSession(t *testing.T) {
 			// the row `creating` forever. It fails under a stage name that
 			// claims nothing.
 			name:   "a detail with no stage in front of it",
-			from:   StateCreating,
+			from:   control.StateCreating,
 			detail: "rc 3",
 			want:   "boot failed: rc 3",
 		},
@@ -1363,11 +1392,11 @@ func TestStageFailedFailsTheSession(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s, st, ts := newTestControld(t)
 			f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-			seedSession(t, st, Session{ID: "sess_staged", State: tc.from, Runner: "vm1"})
+			seedSession(t, st, control.Session{ID: "sess_staged", State: tc.from, RunnerID: "vm1"})
 
 			f.eventDetail(t, "sess_staged", "stage_failed", tc.detail)
 
-			got := wantState(t, st, "sess_staged", StateFailed)
+			got := wantState(t, st, "sess_staged", control.StateFailed)
 			if got.Error != tc.want {
 				t.Fatalf("error = %q, want %q", got.Error, tc.want)
 			}
@@ -1387,14 +1416,14 @@ func TestCredentialRejectedFlipsTheStoredCredential(t *testing.T) {
 	f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 	u := seedVaultUser(t, st, 8801, "alice")
 	seedGitHubCredential(t, s, st, u.ID)
-	seedSession(t, st, Session{ID: "sess_rejected", State: StateRunning, Runner: "vm1", OwnerID: u.ID})
+	seedSession(t, st, control.Session{ID: "sess_rejected", State: control.StateRunning, RunnerID: "vm1", CreatorID: control.ActorID(u.ID)})
 
 	f.event(t, "sess_rejected", "credential_rejected")
 
 	wantCredentialStatus(t, st, u.ID, CredentialNeedsRefresh)
 	// A rejection says nothing about the SESSION: the git operation failed,
 	// the container did not. It keeps running (and its slot).
-	if got := getSession(t, st, "sess_rejected"); got.State != StateRunning {
+	if got := getSession(t, st, "sess_rejected"); got.State != control.StateRunning {
 		t.Fatalf("session state = %q, want it left running — a refused credential is not a dead session", got.State)
 	}
 }
@@ -1411,7 +1440,7 @@ func TestCredentialEventsFromANonPlacedRunnerAreIgnored(t *testing.T) {
 	seedGitHubCredential(t, s, st, u.ID)
 
 	t.Run("credential_rejected for a session placed elsewhere", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_cred_elsewhere", State: StateRunning, Runner: "vm2", OwnerID: u.ID})
+		seedSession(t, st, control.Session{ID: "sess_cred_elsewhere", State: control.StateRunning, RunnerID: "vm2", CreatorID: control.ActorID(u.ID)})
 
 		f.event(t, "sess_cred_elsewhere", "credential_rejected")
 		wantEventHandled(t, st, f, "sess_sync_cr")
@@ -1422,7 +1451,7 @@ func TestCredentialEventsFromANonPlacedRunnerAreIgnored(t *testing.T) {
 	})
 
 	t.Run("credential_rejected for an unplaced (requeued) row", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_cred_requeued", State: StateQueued, OwnerID: u.ID})
+		seedSession(t, st, control.Session{ID: "sess_cred_requeued", State: control.StateQueued, CreatorID: control.ActorID(u.ID)})
 
 		f.event(t, "sess_cred_requeued", "credential_rejected")
 		wantEventHandled(t, st, f, "sess_sync_cq")
@@ -1433,14 +1462,14 @@ func TestCredentialEventsFromANonPlacedRunnerAreIgnored(t *testing.T) {
 	})
 
 	t.Run("stage_failed for a session placed elsewhere", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_stage_elsewhere", State: StateRunning, Runner: "vm2", OwnerID: u.ID})
+		seedSession(t, st, control.Session{ID: "sess_stage_elsewhere", State: control.StateRunning, RunnerID: "vm2", CreatorID: control.ActorID(u.ID)})
 
 		f.eventDetail(t, "sess_stage_elsewhere", "stage_failed", "clone: rc 128: nope")
 		wantEventHandled(t, st, f, "sess_sync_se")
 
 		got := getSession(t, st, "sess_stage_elsewhere")
-		if got.State != StateRunning || got.Runner != "vm2" {
-			t.Fatalf("row = %s on %q, want running on vm2 (untouched)", got.State, got.Runner)
+		if got.State != control.StateRunning || got.RunnerID != "vm2" {
+			t.Fatalf("row = %s on %q, want running on vm2 (untouched)", got.State, got.RunnerID)
 		}
 	})
 }
@@ -1454,7 +1483,7 @@ func TestChildExitedRecordsTheExitCode(t *testing.T) {
 	t.Run("records the code and leaves the session running", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-		seedSession(t, st, Session{ID: "sess_exit", State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_exit", State: control.StateRunning, RunnerID: "vm1"})
 
 		f.eventDetail(t, "sess_exit", "child_exited", "137")
 		eventually(t, 3*time.Second, func() error {
@@ -1467,7 +1496,7 @@ func TestChildExitedRecordsTheExitCode(t *testing.T) {
 			}
 			return nil
 		})
-		if got := getSession(t, st, "sess_exit"); got.State != StateRunning {
+		if got := getSession(t, st, "sess_exit"); got.State != control.StateRunning {
 			t.Fatalf("state = %q after child_exited, want running — an exited agent leaves the session up for viewers", got.State)
 		}
 	})
@@ -1478,7 +1507,7 @@ func TestChildExitedRecordsTheExitCode(t *testing.T) {
 		// working, which is the single most common case there is.
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-		seedSession(t, st, Session{ID: "sess_exit_zero", State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_exit_zero", State: control.StateRunning, RunnerID: "vm1"})
 
 		f.eventDetail(t, "sess_exit_zero", "child_exited", "0")
 		eventually(t, 3*time.Second, func() error {
@@ -1499,7 +1528,7 @@ func TestChildExitedRecordsTheExitCode(t *testing.T) {
 		// any exit code.
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-		seedSession(t, st, Session{ID: "sess_exit_elsewhere", State: StateRunning, Runner: "vm2"})
+		seedSession(t, st, control.Session{ID: "sess_exit_elsewhere", State: control.StateRunning, RunnerID: "vm2"})
 
 		f.eventDetail(t, "sess_exit_elsewhere", "child_exited", "1")
 		wantEventHandled(t, st, f, "sess_sync_exit_e")
@@ -1512,7 +1541,7 @@ func TestChildExitedRecordsTheExitCode(t *testing.T) {
 	t.Run("an unparseable code is dropped, not guessed at", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-		seedSession(t, st, Session{ID: "sess_exit_junk", State: StateRunning, Runner: "vm1"})
+		seedSession(t, st, control.Session{ID: "sess_exit_junk", State: control.StateRunning, RunnerID: "vm1"})
 
 		f.eventDetail(t, "sess_exit_junk", "child_exited", "not a number")
 		wantEventHandled(t, st, f, "sess_sync_exit_j")
@@ -1521,7 +1550,7 @@ func TestChildExitedRecordsTheExitCode(t *testing.T) {
 		if got.ChildExitCode != nil {
 			t.Fatalf("child exit code = %d from an undecodable detail; 0 would read as a clean exit", *got.ChildExitCode)
 		}
-		if got.State != StateRunning {
+		if got.State != control.StateRunning {
 			t.Fatalf("state = %q, want running (untouched)", got.State)
 		}
 	})
@@ -1534,7 +1563,7 @@ func TestChildExitedRecordsTheExitCode(t *testing.T) {
 func TestSetupEventsFromANonPlacedRunnerAreIgnored(t *testing.T) {
 	s, st, ts := newTestControld(t)
 	f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-	env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "echo hi"})
+	env := seedEnv(t, st, control.Environment{Name: "dev", Image: "img:1", Setup: "echo hi"})
 
 	t.Run("setup_failed for a session placed elsewhere", func(t *testing.T) {
 		seedSetupSession(t, st, "sess_elsewhere_failed", "vm2", env)
@@ -1543,21 +1572,21 @@ func TestSetupEventsFromANonPlacedRunnerAreIgnored(t *testing.T) {
 		wantEventHandled(t, st, f, "sess_sync_ef")
 
 		got := getSession(t, st, "sess_elsewhere_failed")
-		if got.State != StateRunning || got.Runner != "vm2" {
-			t.Fatalf("row = %s on %q, want running on vm2 (untouched)", got.State, got.Runner)
+		if got.State != control.StateRunning || got.RunnerID != "vm2" {
+			t.Fatalf("row = %s on %q, want running on vm2 (untouched)", got.State, got.RunnerID)
 		}
 	})
 
 	t.Run("setup_failed for an unplaced (requeued) row", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_requeued_failed", State: StateQueued,
-			EnvironmentID: env.ID, ResolvedImage: env.Image, SetupHash: SetupHash(env.Image, env.Setup)})
+		seedSession(t, st, control.Session{ID: "sess_requeued_failed", State: control.StateQueued,
+			EnvironmentID: env.ID, Spec: control.PortableSpec{Image: env.Image}, SetupHash: SetupHash(env.Image, env.Setup)})
 
 		f.eventDetail(t, "sess_requeued_failed", "setup_failed", "rc 1: boom")
 		wantEventHandled(t, st, f, "sess_sync_rf")
 
 		got := getSession(t, st, "sess_requeued_failed")
-		if got.State != StateQueued || got.Runner != "" {
-			t.Fatalf("row = %s on %q, want queued and unplaced (untouched)", got.State, got.Runner)
+		if got.State != control.StateQueued || got.RunnerID != "" {
+			t.Fatalf("row = %s on %q, want queued and unplaced (untouched)", got.State, got.RunnerID)
 		}
 	})
 
@@ -1568,21 +1597,21 @@ func TestSetupEventsFromANonPlacedRunnerAreIgnored(t *testing.T) {
 		wantEventHandled(t, st, f, "sess_sync_ed")
 		wantNothingQueued(t, s, f)
 
-		if got := envRow(t, st, env.ID); got.SnapshotRef != "" {
-			t.Fatalf("environment cached as %q on a report from a runner it isn't placed on", got.SnapshotRef)
+		if got := envRow(t, st, env.ID); got.Snapshot.Ref != "" {
+			t.Fatalf("environment cached as %q on a report from a runner it isn't placed on", got.Snapshot.Ref)
 		}
 	})
 
 	t.Run("setup_done for an unplaced (requeued) row", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_requeued_done", State: StateQueued,
-			EnvironmentID: env.ID, ResolvedImage: env.Image, SetupHash: SetupHash(env.Image, env.Setup)})
+		seedSession(t, st, control.Session{ID: "sess_requeued_done", State: control.StateQueued,
+			EnvironmentID: env.ID, Spec: control.PortableSpec{Image: env.Image}, SetupHash: SetupHash(env.Image, env.Setup)})
 
 		f.eventDetail(t, "sess_requeued_done", "setup_done", "")
 		wantEventHandled(t, st, f, "sess_sync_rd")
 		wantNothingQueued(t, s, f)
 
-		if got := envRow(t, st, env.ID); got.SnapshotRef != "" {
-			t.Fatalf("environment cached as %q from an unplaced row", got.SnapshotRef)
+		if got := envRow(t, st, env.ID); got.Snapshot.Ref != "" {
+			t.Fatalf("environment cached as %q from an unplaced row", got.Snapshot.Ref)
 		}
 	})
 }
@@ -1598,9 +1627,9 @@ func TestSetupDoneAfterAScriptEditDoesNotCache(t *testing.T) {
 	s, st, ts := newTestControld(t)
 	f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 
-	env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "install v1"})
-	seedSession(t, st, Session{ID: "sess_edited", State: StateQueued, Name: "edited",
-		EnvironmentID: env.ID, ResolvedImage: env.Image, CreatedAt: time.Now().Add(-time.Hour)})
+	env := seedEnv(t, st, control.Environment{Name: "dev", Image: "img:1", Setup: "install v1"})
+	seedSession(t, st, control.Session{ID: "sess_edited", State: control.StateQueued, Name: "edited",
+		EnvironmentID: env.ID, Spec: control.PortableSpec{Image: env.Image}, CreatedAt: time.Now().Add(-time.Hour)})
 	startRun(t, s)
 
 	// The dispatch carries v1 of the script and pins it (production code, not
@@ -1620,20 +1649,21 @@ func TestSetupDoneAfterAScriptEditDoesNotCache(t *testing.T) {
 	// ...and the script changes while it runs.
 	edited := env
 	edited.Setup = "install v2"
-	if _, err := st.UpdateEnvironment(context.Background(), edited); err != nil {
+	edited.SetupHash = SetupHash(edited.Image, edited.Setup)
+	if _, err := st.Environments().UpdateEnvironment(context.Background(), installWorkspace, edited); err != nil {
 		t.Fatalf("UpdateEnvironment: %v", err)
 	}
 
 	f.event(t, "sess_edited", "running")
-	wantState(t, st, "sess_edited", StateRunning)
+	wantState(t, st, "sess_edited", control.StateRunning)
 	f.eventDetail(t, "sess_edited", "setup_done", "")
 	wantEventHandled(t, st, f, "sess_sync_edited")
 
 	// No snapshot may be dispatched at all: what that container holds is v1.
 	wantNothingQueued(t, s, f)
-	if got := envRow(t, st, env.ID); got.SnapshotRef != "" || got.SnapshotHash != "" {
+	if got := envRow(t, st, env.ID); got.Snapshot.Ref != "" || got.SnapshotHash != "" {
 		t.Fatalf("environment cached as %q/%q from a container that ran the pre-edit script",
-			got.SnapshotRef, got.SnapshotHash)
+			got.Snapshot.Ref, got.SnapshotHash)
 	}
 }
 
@@ -1641,18 +1671,27 @@ func TestSetupDoneAfterAScriptEditDoesNotCache(t *testing.T) {
 // orchestration attempts, so a test can wait for the guarded write — and its
 // verdict — instead of polling for the absence of one.
 type envSnapshotSpy struct {
-	Store
+	MemStore
 	calls chan error
 }
 
 func newEnvSnapshotSpy() *envSnapshotSpy {
-	return &envSnapshotSpy{Store: NewMemStore(), calls: make(chan error, 8)}
+	return &envSnapshotSpy{MemStore: NewMemStore(), calls: make(chan error, 8)}
 }
 
-func (e *envSnapshotSpy) SetEnvironmentSnapshot(ctx context.Context, envID, expectHash, ref, runner string) error {
-	err := e.Store.SetEnvironmentSnapshot(ctx, envID, expectHash, ref, runner)
+func (e *envSnapshotSpy) Environments() control.EnvironmentRepository {
+	return spyEnvironments{EnvironmentRepository: e.MemStore.Environments(), owner: e}
+}
+
+type spyEnvironments struct {
+	control.EnvironmentRepository
+	owner *envSnapshotSpy
+}
+
+func (e spyEnvironments) SetEnvironmentSnapshot(ctx context.Context, ws control.WorkspaceID, envID control.EnvironmentID, expectHash, ref string, runnerID control.RunnerID) error {
+	err := e.EnvironmentRepository.SetEnvironmentSnapshot(ctx, ws, envID, expectHash, ref, runnerID)
 	select {
-	case e.calls <- err:
+	case e.owner.calls <- err:
 	default:
 	}
 	return err
@@ -1668,12 +1707,12 @@ func TestSetupDoneStaleEnvironmentIsDropped(t *testing.T) {
 	f1 := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 	f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 4})
 
-	env := seedEnv(t, spy, Environment{Name: "dev", Image: "img:1", Setup: "echo one"})
+	env := seedEnv(t, spy, control.Environment{Name: "dev", Image: "img:1", Setup: "echo one"})
 	seedSetupSession(t, spy, "sess_stale", "vm1", env)
 
 	f1.eventDetail(t, "sess_stale", "setup_done", "")
 	snap := nextOfType(t, f1, "snapshot")
-	if want := "rainier-env:" + env.ID + "-" + env.SetupHash[:12]; snap.Ref != want {
+	if want := "rainier-env:" + string(env.ID) + "-" + env.SetupHash[:12]; snap.Ref != want {
 		t.Fatalf("snapshot ref = %q, want %q", snap.Ref, want)
 	}
 
@@ -1681,23 +1720,24 @@ func TestSetupDoneStaleEnvironmentIsDropped(t *testing.T) {
 	// names an image of the OLD script.
 	edited := env
 	edited.Setup = "echo two"
-	if _, err := spy.UpdateEnvironment(context.Background(), edited); err != nil {
+	edited.SetupHash = SetupHash(edited.Image, edited.Setup)
+	if _, err := spy.Environments().UpdateEnvironment(context.Background(), installWorkspace, edited); err != nil {
 		t.Fatalf("UpdateEnvironment: %v", err)
 	}
 	f1.reply(t, snap, true, snap.Ref)
 
 	select {
 	case err := <-spy.calls:
-		if !errors.Is(err, ErrConflict) {
-			t.Fatalf("guarded write returned %v, want ErrConflict — the stale snapshot must not land", err)
+		if !errors.Is(err, control.ErrStale) {
+			t.Fatalf("guarded write returned %v, want ErrStale — the stale snapshot must not land", err)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("the orchestration never attempted the guarded write")
 	}
 
-	got := envRow(t, spy, env.ID)
-	if got.SnapshotRef != "" || got.SnapshotRunner != "" || got.SnapshotHash != "" {
-		t.Fatalf("environment cache = %q/%q/%q, want all empty", got.SnapshotRef, got.SnapshotRunner, got.SnapshotHash)
+	got, holder := envRow(t, spy, env.ID), envSnapshotRunner(t, spy, env.ID)
+	if got.Snapshot.Ref != "" || holder != "" || got.SnapshotHash != "" {
+		t.Fatalf("environment cache = %q/%q/%q, want all empty", got.Snapshot.Ref, holder, got.SnapshotHash)
 	}
 	// Nothing was cached, so there is nothing to warm.
 	wantNothingQueued(t, s, f2)
@@ -1712,7 +1752,7 @@ func TestSetupDoneSnapshotFailureRecordsNothing(t *testing.T) {
 	f1 := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 	f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 4})
 
-	env := seedEnv(t, spy, Environment{Name: "dev", Image: "img:1", Setup: "echo one"})
+	env := seedEnv(t, spy, control.Environment{Name: "dev", Image: "img:1", Setup: "echo one"})
 	seedSetupSession(t, spy, "sess_snapfail", "vm1", env)
 
 	f1.eventDetail(t, "sess_snapfail", "setup_done", "")
@@ -1725,8 +1765,8 @@ func TestSetupDoneSnapshotFailureRecordsNothing(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 
-	if got := envRow(t, spy, env.ID); got.SnapshotRef != "" {
-		t.Fatalf("environment cached as %q after a failed snapshot", got.SnapshotRef)
+	if got := envRow(t, spy, env.ID); got.Snapshot.Ref != "" {
+		t.Fatalf("environment cached as %q after a failed snapshot", got.Snapshot.Ref)
 	}
 	wantNothingQueued(t, s, f2)
 }
@@ -1752,7 +1792,7 @@ func TestUnroutedPathIs404(t *testing.T) {
 
 // apiSessionState reads a session's state back through the client API, which
 // is the surface a stale runner's report would have to reach to matter.
-func apiSessionState(t *testing.T, ts *httptest.Server, tok, id string) SessionState {
+func apiSessionState(t *testing.T, ts *httptest.Server, tok, id string) control.SessionState {
 	t.Helper()
 	resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/"+id, tok, nil, nil)
 	raw := readBody(t, resp)
@@ -1763,7 +1803,7 @@ func apiSessionState(t *testing.T, ts *httptest.Server, tok, id string) SessionS
 	if err := json.Unmarshal([]byte(raw), &body); err != nil {
 		t.Fatalf("decode session view: %v; body=%s", err, raw)
 	}
-	return SessionState(body.Session.State)
+	return control.SessionState(body.Session.State)
 }
 
 // writeStale writes m without failing the test when the socket has already
@@ -1793,7 +1833,7 @@ func TestRunnerGenerationFencesAStaleSocket(t *testing.T) {
 
 		// Seeded after both announces so neither reconciliation sweeps it.
 		id := "sess_fence"
-		seedSession(t, st, Session{ID: id, State: StateCreating, Runner: "runner-a"})
+		seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateCreating, RunnerID: "runner-a"})
 
 		// The stale socket reports the session dead — terminal, and therefore
 		// unrecoverable if it were ever applied.
@@ -1802,14 +1842,14 @@ func TestRunnerGenerationFencesAStaleSocket(t *testing.T) {
 		// The live socket reports it running, which is what must actually land.
 		second.event(t, id, "running")
 		eventually(t, 3*time.Second, func() error {
-			if got := apiSessionState(t, ts, tok, id); got != StateRunning {
+			if got := apiSessionState(t, ts, tok, id); got != control.StateRunning {
 				return fmt.Errorf("session state = %q, want running", got)
 			}
 			return nil
 		})
 		// ...and stays there: a stale "dead" handled late would take it back.
 		time.Sleep(150 * time.Millisecond)
-		if got := apiSessionState(t, ts, tok, id); got != StateRunning {
+		if got := apiSessionState(t, ts, tok, id); got != control.StateRunning {
 			t.Fatalf("session state = %q, want still running — the superseded socket was obeyed", got)
 		}
 	})
@@ -1825,23 +1865,29 @@ func TestRunnerGenerationFencesAStaleSocket(t *testing.T) {
 		joinRunner(t, s, ts, runnerScript{Name: "runner-a", Total: 4}) // generation 2
 
 		id := "sess_gen"
-		seedSession(t, st, Session{ID: id, State: StateCreating, Runner: "runner-a"})
+		seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateCreating, RunnerID: "runner-a"})
 		dead := runner.FromRunner{Type: "event", Session: id, State: "dead"}
 
 		stale := newRunnerConn("runner-a", nil)
 		stale.gen = 1
 		s.applyRunnerEvent(context.Background(), stale, dead)
-		if got := getSession(t, st, id); got.State != StateCreating {
+		if got := getSession(t, st, id); got.State != control.StateCreating {
 			t.Fatalf("state = %q, want still creating — a superseded generation was applied", got.State)
 		}
 
+		// The authoritative generation is the store's, not a table inside
+		// this process: it is on the runner's own row.
+		rows, err := st.Fleet().ListRunners(context.Background(), installPool)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("list runners: %+v, %v", rows, err)
+		}
 		live := newRunnerConn("runner-a", nil)
-		live.gen = s.gens.current("runner-a")
+		live.gen = rows[0].Generation
 		if live.gen == stale.gen {
 			t.Fatalf("generation did not advance across the redial: %d", live.gen)
 		}
 		s.applyRunnerEvent(context.Background(), live, dead)
-		if got := wantState(t, st, id, StateDead); got.Error != "runner reported dead" {
+		if got := wantState(t, st, id, control.StateDead); got.Error != "runner reported dead" {
 			t.Fatalf("error = %q, want %q", got.Error, "runner reported dead")
 		}
 	})

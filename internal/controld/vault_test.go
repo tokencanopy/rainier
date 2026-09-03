@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tokencanopy/rainier/control"
 )
 
 // vaultToken is the fake GitHub access token every vault test seals. It is
@@ -347,7 +349,7 @@ func TestRejectCredentialUnknownRowIsQuiet(t *testing.T) {
 	s.rejectCredential(ctx, u.ID, "github")
 	s.rejectCredential(ctx, "usr_nobody", "github")
 
-	if _, err := st.GetCredential(ctx, u.ID, "github"); !errors.Is(err, ErrNotFound) {
+	if _, err := st.GetCredential(ctx, u.ID, "github"); !errors.Is(err, control.ErrNotFound) {
 		t.Fatalf("GetCredential = %v, want ErrNotFound — rejecting must not create a row", err)
 	}
 }

@@ -22,13 +22,19 @@ test -d controlapp
 test -f controlapp/doc.go
 go list ./controlapp >/dev/null
 
+test -d controlapp/repotest
+test -f controlapp/repotest/doc.go
+go list ./controlapp/repotest >/dev/null
+
 # ---------------------------------------------------------------------------
 # 1. import hygiene
 # ---------------------------------------------------------------------------
-# The same table is applied to every public application package; the failure
-# message names which package pulled the forbidden import in.
+# The same table is applied to every public application package — including
+# controlapp/repotest, the repository contract suite a hosted store must pass,
+# which is public precisely so a host outside this repository can run it. The
+# failure message names which package pulled the forbidden import in.
 bad_imports=0
-for pkg in control controlapp; do
+for pkg in control controlapp controlapp/repotest; do
   while IFS= read -r imp; do
     [[ -z "$imp" ]] && continue
     lower="$(printf '%s' "$imp" | tr '[:upper:]' '[:lower:]')"
@@ -65,21 +71,7 @@ fi
 # The exact interface-freeze allowlist: every public control model that still
 # has a private twin in internal/controld, to be removed by the extraction
 # lanes. Nothing else may appear in both packages.
-allowlist=(
-  SessionState
-  StateQueued StateCreating StateRunning StateSuspendedWarm StateSuspendedCold
-  StateCanceled StateFailed StateDead StateDestroyed
-  NonTerminal
-  Session
-  SessionQuery
-  TransitionOpts
-  RepoRef
-  Environment
-  Connector
-  Runner
-  ErrNotFound
-  ErrConflict
-)
+allowlist=()
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -160,7 +152,7 @@ while IFS= read -r name; do
     continue
   fi
   allowed=0
-  for a in "${allowlist[@]}"; do
+  for a in ${allowlist[@]+"${allowlist[@]}"}; do
     [[ "$name" == "$a" ]] && allowed=1
   done
   if [[ "$allowed" == "1" ]]; then

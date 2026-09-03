@@ -15,6 +15,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
+	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/internal/runnerd"
@@ -32,7 +33,7 @@ import (
 // derived from it). That means the listener has to exist before New
 // validates the config, so the server is built unstarted and started once the
 // handler is known.
-func newAttachControld(t *testing.T, opts ...func(*Config)) (*Server, Store, *httptest.Server) {
+func newAttachControld(t *testing.T, opts ...func(*Config)) (*Server, MemStore, *httptest.Server) {
 	t.Helper()
 	st := NewMemStore()
 	ts := httptest.NewUnstartedServer(nil)
@@ -258,7 +259,7 @@ func (fs *fakeSessiond) nextClose(t *testing.T) uint64 {
 // logged-in user owns.
 type attachFixture struct {
 	s   *Server
-	st  Store
+	st  MemStore
 	ts  *httptest.Server
 	sd  *fakeSessiond
 	tok string
@@ -282,7 +283,7 @@ func newAttachFixture(t *testing.T) *attachFixture {
 	// the announce is truth, so a row the runner doesn't announce would be
 	// marked dead and a session controld doesn't have would be destroyed as
 	// an orphan.
-	seedSession(t, st, Session{ID: id, OwnerID: u.ID, State: StateRunning, Runner: "vm1"})
+	seedSession(t, st, control.Session{ID: control.SessionID(id), CreatorID: control.ActorID(u.ID), State: control.StateRunning, RunnerID: "vm1"})
 	if err := rd.CreateWithID(context.Background(), id, driver.Spec{Image: "img"}, nil); err != nil {
 		t.Fatalf("runnerd CreateWithID: %v", err)
 	}
@@ -405,7 +406,7 @@ func TestAttachSessionDeathCascadesToClient(t *testing.T) {
 
 func TestAttachRequiresAuth(t *testing.T) {
 	_, st, ts := newAttachControld(t)
-	seedSession(t, st, Session{ID: "sess_auth", State: StateRunning, Runner: "vm1"})
+	seedSession(t, st, control.Session{ID: "sess_auth", State: control.StateRunning, RunnerID: "vm1"})
 
 	for _, tc := range []struct {
 		name  string
@@ -450,12 +451,12 @@ func TestAttachAuthorization(t *testing.T) {
 	awaitReconciled(t, f)
 
 	id := "sess_owned_by_alice"
-	seedSession(t, st, Session{ID: id, OwnerID: owner.ID, State: StateRunning, Runner: "vm1"})
+	seedSession(t, st, control.Session{ID: control.SessionID(id), CreatorID: control.ActorID(owner.ID), State: control.StateRunning, RunnerID: "vm1"})
 	// A session that will never reach `running`: an authorization check
 	// placed after the wait would answer this one 503 in 30s instead of 403
 	// at once, which is exactly what the timing bound below catches.
 	queued := "sess_queued_by_alice"
-	seedSession(t, st, Session{ID: queued, OwnerID: owner.ID, State: StateQueued})
+	seedSession(t, st, control.Session{ID: control.SessionID(queued), CreatorID: control.ActorID(owner.ID), State: control.StateQueued})
 
 	for _, tc := range []struct{ name, session string }{
 		{"non-owner member is refused", id},
@@ -509,7 +510,7 @@ func TestAttachWrongState(t *testing.T) {
 	u, tok := loginUser(t, st, "alice", "member")
 
 	t.Run("queued waits the budget then 503", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_queued", OwnerID: u.ID, State: StateQueued})
+		seedSession(t, st, control.Session{ID: "sess_queued", CreatorID: control.ActorID(u.ID), State: control.StateQueued})
 		start := time.Now()
 		c, resp, err := dialAttach(t, ts, "sess_queued", "", tok)
 		if err == nil {
@@ -529,7 +530,7 @@ func TestAttachWrongState(t *testing.T) {
 	})
 
 	t.Run("terminal 503s without waiting", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_dead", OwnerID: u.ID, State: StateDead})
+		seedSession(t, st, control.Session{ID: "sess_dead", CreatorID: control.ActorID(u.ID), State: control.StateDead})
 		_, resp, err := dialAttach(t, ts, "sess_dead", "", tok)
 		if err == nil {
 			t.Fatal("dial succeeded, want rejection before upgrade")
@@ -552,7 +553,7 @@ func TestAttachWrongState(t *testing.T) {
 	})
 
 	t.Run("running on a disconnected runner is 502", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_gone_runner", OwnerID: u.ID, State: StateRunning, Runner: "vm-gone"})
+		seedSession(t, st, control.Session{ID: "sess_gone_runner", CreatorID: control.ActorID(u.ID), State: control.StateRunning, RunnerID: "vm-gone"})
 		_, resp, err := dialAttach(t, ts, "sess_gone_runner", "", tok)
 		if err == nil {
 			t.Fatal("dial succeeded, want rejection before upgrade")
@@ -568,7 +569,7 @@ func TestAttachWrongState(t *testing.T) {
 		// connection there is nothing to send a dial_attach down, so this is
 		// the ordinary not-ready answer rather than a socket that upgrades and
 		// then dies.
-		seedSession(t, st, Session{ID: "sess_failed_gone", OwnerID: u.ID, State: StateFailed, Runner: "vm-gone"})
+		seedSession(t, st, control.Session{ID: "sess_failed_gone", CreatorID: control.ActorID(u.ID), State: control.StateFailed, RunnerID: "vm-gone"})
 		_, resp, err := dialAttach(t, ts, "sess_failed_gone", "", tok)
 		if err == nil {
 			t.Fatal("dial succeeded, want rejection before upgrade")
@@ -580,7 +581,7 @@ func TestAttachWrongState(t *testing.T) {
 	})
 
 	t.Run("failed with no runner at all is 503", func(t *testing.T) {
-		seedSession(t, st, Session{ID: "sess_failed_unplaced", OwnerID: u.ID, State: StateFailed})
+		seedSession(t, st, control.Session{ID: "sess_failed_unplaced", CreatorID: control.ActorID(u.ID), State: control.StateFailed})
 		_, resp, err := dialAttach(t, ts, "sess_failed_unplaced", "", tok)
 		if err == nil {
 			t.Fatal("dial succeeded, want rejection before upgrade")
@@ -607,7 +608,8 @@ func TestAttachToFailedSession(t *testing.T) {
 	ts, sd := fx.ts, fx.sd
 
 	reason := "setup failed: rc 7: E: unable to locate package foo"
-	err := fx.st.Transition(context.Background(), fx.id, NonTerminal, StateFailed, TransitionOpts{Error: &reason})
+	err := fx.st.Sessions().Transition(context.Background(), installWorkspace, control.SessionID(fx.id),
+		control.NonTerminal, control.StateFailed, control.TransitionOpts{Error: &reason})
 	if err != nil {
 		t.Fatalf("failing the session: %v", err)
 	}
@@ -641,11 +643,11 @@ func TestAttachToFailedSession(t *testing.T) {
 
 	// The row is untouched by the attach: reading a failure must not resurrect
 	// it, and the slot is still held until an explicit rm.
-	after, err := fx.st.GetSession(context.Background(), fx.id)
+	after, err := fx.st.Sessions().GetSession(context.Background(), installWorkspace, control.SessionID(fx.id))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.State != StateFailed || after.Error != reason {
+	if after.State != control.StateFailed || after.Error != reason {
 		t.Fatalf("session after the attach = %s / %q, want it still failed with its error intact", after.State, after.Error)
 	}
 }
@@ -663,7 +665,8 @@ func TestAttachToDeadSessionIsRefused(t *testing.T) {
 	fx := newAttachFixture(t)
 
 	reason := "runner reported dead"
-	err := fx.st.Transition(context.Background(), fx.id, NonTerminal, StateDead, TransitionOpts{Error: &reason})
+	err := fx.st.Sessions().Transition(context.Background(), installWorkspace, control.SessionID(fx.id),
+		control.NonTerminal, control.StateDead, control.TransitionOpts{Error: &reason})
 	if err != nil {
 		t.Fatalf("killing the session: %v", err)
 	}
@@ -733,7 +736,7 @@ func TestAttachRequiresResizeFirst(t *testing.T) {
 	awaitReconciled(t, f)
 
 	id := "sess_no_resize"
-	seedSession(t, st, Session{ID: id, OwnerID: u.ID, State: StateRunning, Runner: "vm1"})
+	seedSession(t, st, control.Session{ID: control.SessionID(id), CreatorID: control.ActorID(u.ID), State: control.StateRunning, RunnerID: "vm1"})
 
 	cli, _, err := dialAttach(t, ts, id, "", tok)
 	if err != nil {
@@ -778,7 +781,7 @@ func TestPairingTTL(t *testing.T) {
 	awaitReconciled(t, f)
 
 	id := "sess_ttl"
-	seedSession(t, st, Session{ID: id, OwnerID: u.ID, State: StateRunning, Runner: "vm1"})
+	seedSession(t, st, control.Session{ID: control.SessionID(id), CreatorID: control.ActorID(u.ID), State: control.StateRunning, RunnerID: "vm1"})
 
 	cli, _, err := dialAttach(t, ts, id, "?since=3", tok)
 	if err != nil {

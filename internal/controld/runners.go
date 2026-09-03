@@ -225,11 +225,23 @@ func (s *Server) handleRunnerConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	name := ann.Runner
 
-	rc := newRunnerConn(name, c)
 	// The generation is minted before anything is registered, so it is the
 	// one this connection acts under for its whole life: registration,
-	// reconciliation, and every event read off the socket.
-	rc.gen = s.gens.next(name)
+	// reconciliation, every event read off the socket, and every heartbeat.
+	// It comes from the STORE, so it continues across a restart and no two
+	// replicas can hand out the same authority. A store that cannot mint one
+	// is a connection that must not be served at all — everything downstream
+	// fences on this number, so serving without it would be serving with no
+	// authority rather than with fresh authority.
+	gen, err := s.st.NextRunnerGeneration(connCtx, installPool, control.RunnerID(name))
+	if err != nil {
+		log.Printf("controld: opening a generation for runner %s: %v", name, err)
+		closeRunner(c, websocket.StatusInternalError, "registration refused")
+		return
+	}
+
+	rc := newRunnerConn(name, c)
+	rc.gen = gen
 	connErr := s.connectRunner(connCtx, rc, ann)
 
 	var writerDone sync.WaitGroup
@@ -380,14 +392,26 @@ func (s *Server) touchRunner(ctx context.Context, rc *runnerConn, m runner.FromR
 	if !s.isCurrentConn(rc) {
 		return false
 	}
-	err := s.st.UpsertRunner(ctx, Runner{
-		Name:          rc.name,
+	err := s.st.Fleet().UpsertRunner(ctx, installPool, control.Runner{
+		ID:            control.RunnerID(rc.name),
+		PoolID:        installPool,
 		CapacityUsed:  m.Used,
 		CapacityTotal: m.Total,
 		Connected:     true,
+		Generation:    rc.gen,
+		Capabilities:  runnerCapabilities(rc.name),
 		LastSeenAt:    time.Now(),
 	})
-	if err != nil {
+	switch {
+	case errors.Is(err, control.ErrStale):
+		// Another replica (or a redial this process never saw) opened a
+		// newer generation for this runner. Registration is not the only
+		// place authority can be lost, so the heartbeat is the second fence:
+		// this connection is superseded and must stop reading, which ends it
+		// and closes the socket the runner will redial on.
+		log.Printf("controld: runner %s: connection at generation %d is superseded", rc.name, rc.gen)
+		return false
+	case err != nil:
 		log.Printf("controld: upsert runner %s: %v", rc.name, err)
 	}
 	return true
@@ -499,9 +523,9 @@ func (s *Server) applyRunnerEvent(ctx context.Context, rc *runnerConn, m runner.
 // environment's cache, or invalidate the credential of a user whose work it is
 // no longer running.
 func (s *Server) applyAdapterArm(ctx context.Context, name string, m runner.FromRunner) {
-	row, err := s.st.GetSession(ctx, m.Session)
+	row, err := s.st.Sessions().GetSession(ctx, installWorkspace, control.SessionID(m.Session))
 	switch {
-	case errors.Is(err, ErrNotFound):
+	case errors.Is(err, control.ErrNotFound):
 		log.Printf("controld: runner %s: event for unknown session %s; ignoring", name, clip(m.Session))
 		return
 	case err != nil:
@@ -528,11 +552,11 @@ func (s *Server) applyAdapterArm(ctx context.Context, name string, m runner.From
 		// The event carries nothing, deliberately: WHOSE credential it was is
 		// the row's own answer, and a token — or anything derived from one —
 		// has no business on this channel.
-		if row.OwnerID == "" {
+		if row.CreatorID == "" {
 			log.Printf("controld: runner %s: credential_rejected for %s, which has no owner; ignoring", name, row.ID)
 			return
 		}
-		s.rejectCredential(ctx, row.OwnerID, githubProvider)
+		s.rejectCredential(ctx, string(row.CreatorID), githubProvider)
 	}
 }
 
@@ -564,12 +588,12 @@ func stageFailure(stage, detail string) string {
 // a stale holder must not be able to kill the live copy, to have its own
 // container's image published as an environment's cache, or to invalidate a
 // credential for work it is no longer running.
-func placedExactlyOn(row Session, runner, state string) bool {
-	if row.Runner == runner {
+func placedExactlyOn(row control.Session, runner, state string) bool {
+	if string(row.RunnerID) == runner {
 		return true
 	}
 	log.Printf("controld: runner %s reported %s for %s, but the store places it on %q; ignoring",
-		runner, clip(state), row.ID, row.Runner)
+		runner, clip(state), row.ID, row.RunnerID)
 	return false
 }
 
@@ -595,7 +619,7 @@ func snapshotRef(envID, setupHash string) string {
 // follows must not be: dispatch waits for a result THIS reader is the one to
 // deliver, so running it inline would deadlock the connection until OpTimeout
 // and stall every other event and result the runner sends meanwhile.
-func (s *Server) cacheEnvironment(ctx context.Context, runner string, row Session) {
+func (s *Server) cacheEnvironment(ctx context.Context, runner string, row control.Session) {
 	env, hash, ok := s.snapshotWanted(ctx, runner, row)
 	if !ok {
 		return
@@ -632,21 +656,21 @@ func (s *Server) cacheEnvironment(ctx context.Context, runner string, row Sessio
 // environment whose image moved (and a session that overrode it), the pin
 // catches a script edit — and since the hash is f(image, setup), together
 // they leave no edit uncovered.
-func (s *Server) snapshotWanted(ctx context.Context, runner string, row Session) (Environment, string, bool) {
+func (s *Server) snapshotWanted(ctx context.Context, runner string, row control.Session) (control.Environment, string, bool) {
 	if row.EnvironmentID == "" {
 		log.Printf("controld: runner %s: setup finished for scratch session %s; nothing to cache", runner, row.ID)
-		return Environment{}, "", false
+		return control.Environment{}, "", false
 	}
-	env, err := s.st.GetEnvironment(ctx, row.EnvironmentID)
+	env, err := s.st.Environments().GetEnvironment(ctx, installWorkspace, row.EnvironmentID)
 	switch {
-	case errors.Is(err, ErrNotFound):
+	case errors.Is(err, control.ErrNotFound):
 		log.Printf("controld: runner %s: setup finished for %s, whose environment %s is gone; nothing to cache",
-			runner, row.ID, clip(row.EnvironmentID))
-		return Environment{}, "", false
+			runner, row.ID, clip(string(row.EnvironmentID)))
+		return control.Environment{}, "", false
 	case err != nil:
 		log.Printf("controld: runner %s: setup finished for %s: reading environment %s: %v",
-			runner, row.ID, clip(row.EnvironmentID), err)
-		return Environment{}, "", false
+			runner, row.ID, clip(string(row.EnvironmentID)), err)
+		return control.Environment{}, "", false
 	}
 
 	// Recomputed rather than read out of env.SetupHash: this hash is both the
@@ -657,16 +681,16 @@ func (s *Server) snapshotWanted(ctx context.Context, runner string, row Session)
 	switch {
 	case env.SnapshotHash == hash:
 		log.Printf("controld: environment %s is already cached as %s; %s needs no snapshot",
-			env.ID, env.SnapshotRef, row.ID)
-		return Environment{}, "", false
-	case row.ResolvedImage != env.Image:
+			env.ID, env.Snapshot.Ref, row.ID)
+		return control.Environment{}, "", false
+	case row.Spec.Image != env.Image:
 		log.Printf("controld: environment %s: not caching %s — it ran the setup over %q, not the environment's %q",
-			env.ID, row.ID, clip(row.ResolvedImage), clip(env.Image))
-		return Environment{}, "", false
+			env.ID, row.ID, clip(row.Spec.Image), clip(env.Image))
+		return control.Environment{}, "", false
 	case row.SetupHash != hash:
 		log.Printf("controld: environment %s: not caching %s — the setup it ran predates an edit to the environment",
 			env.ID, row.ID)
-		return Environment{}, "", false
+		return control.Environment{}, "", false
 	}
 	return env, hash, true
 }
@@ -678,10 +702,10 @@ func (s *Server) snapshotWanted(ctx context.Context, runner string, row Session)
 // Nothing here needs undoing when a step fails: an environment with no
 // snapshot recorded is exactly an environment whose next session runs the
 // setup script again — slower, never wrong.
-func (s *Server) buildSnapshot(ctx context.Context, runnerName string, row Session, env Environment, hash string) {
-	ref := snapshotRef(env.ID, hash)
+func (s *Server) buildSnapshot(ctx context.Context, runnerName string, row control.Session, env control.Environment, hash string) {
+	ref := snapshotRef(string(env.ID), hash)
 	res, err := s.transport.Dispatch(ctx, installPool, control.RunnerID(runnerName),
-		runner.ToRunner{Type: "snapshot", Session: row.ID, Ref: ref})
+		runner.ToRunner{Type: "snapshot", Session: string(row.ID), Ref: ref})
 	switch {
 	case err != nil:
 		log.Printf("controld: snapshotting %s for environment %s on %s: %v", row.ID, env.ID, runnerName, err)
@@ -706,12 +730,13 @@ func (s *Server) buildSnapshot(ctx context.Context, runnerName string, row Sessi
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), storeCleanupTimeout)
 	defer cancel()
 
-	switch err := s.st.SetEnvironmentSnapshot(wctx, env.ID, hash, ref, runnerName); {
-	case errors.Is(err, ErrConflict):
-		// The environment was edited or deleted while the snapshot was
-		// building, so this image is of a setup nobody asked for any more.
-		// The guarded write is precisely what keeps it from becoming the
-		// cache (design §4.3); the next session rebuilds from the new script.
+	switch err := s.st.Environments().SetEnvironmentSnapshot(wctx, installWorkspace, env.ID, hash, ref, control.RunnerID(runnerName)); {
+	case errors.Is(err, control.ErrStale), errors.Is(err, control.ErrNotFound):
+		// The environment was edited (stale) or deleted (not found) while the
+		// snapshot was building, so this image is of a setup nobody asked for
+		// any more. The guarded write is precisely what keeps it from becoming
+		// the cache (design §4.3); the next session rebuilds from the new
+		// script.
 		log.Printf("controld: environment %s changed while %s was being snapshotted; dropping %s",
 			env.ID, row.ID, ref)
 		return
@@ -860,7 +885,8 @@ var errRegistrationRefused = errors.New("registration refused")
 // runner's name lock so that a connection being retired at this same instant
 // either writes its disconnect before us or (seeing itself replaced) not at
 // all. The row write itself is the service's; the capabilities a runner
-// advertises are the two synthesized for its own name (adapt_store.go).
+// advertises are the two synthesized for its own name (adapt_scope.go), and
+// the native fleet repository now persists them.
 func (s *Server) connectRunner(ctx context.Context, rc *runnerConn, ann runner.FromRunner) error {
 	nl := s.nameLock(rc.name)
 	nl.Lock()
@@ -929,7 +955,7 @@ func (s *Server) retireRunner(rc *runnerConn) {
 	// with this connection, and the store write must still happen.
 	ctx, cancel := context.WithTimeout(context.Background(), storeCleanupTimeout)
 	defer cancel()
-	if err := s.st.SetRunnerConnected(ctx, rc.name, false); err != nil && !errors.Is(err, ErrNotFound) {
+	if err := s.st.Fleet().SetRunnerConnected(ctx, installPool, control.RunnerID(rc.name), false); err != nil && !errors.Is(err, control.ErrNotFound) {
 		log.Printf("controld: marking runner %s disconnected: %v", rc.name, err)
 	}
 	// A runner going away frees nothing by itself, but its sessions are

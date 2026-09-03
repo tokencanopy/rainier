@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/tokencanopy/rainier/control"
 )
 
 // The credential vault is the whole behavior layer over the credentials
@@ -95,7 +97,7 @@ func (s *Server) storeGitHubCredential(ctx context.Context, userID, token, scope
 func (s *Server) mintGitCredential(ctx context.Context, userID string) (string, error) {
 	c, err := s.st.GetCredential(ctx, userID, githubProvider)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
+		if errors.Is(err, control.ErrNotFound) {
 			return "", ErrCredentialMissing
 		}
 		return "", fmt.Errorf("loading the github credential: %w", err)
@@ -133,7 +135,7 @@ func (s *Server) mintGitCredential(ctx context.Context, userID string) (string, 
 func (s *Server) rejectCredential(ctx context.Context, userID, provider string) {
 	err := s.st.SetCredentialStatus(ctx, userID, provider, CredentialNeedsRefresh)
 	switch {
-	case errors.Is(err, ErrNotFound):
+	case errors.Is(err, control.ErrNotFound):
 		// Nothing to flip. A rejection for a credential that isn't there is
 		// already the state we'd be moving toward, so this is a no-op, not a
 		// problem.

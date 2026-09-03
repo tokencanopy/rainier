@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
@@ -165,18 +166,18 @@ func (s *Server) answerSessionRequest(ctx context.Context, rc *runnerConn, sessi
 }
 
 func (s *Server) authorizeSessionRequest(ctx context.Context, runner, sessionID string, env runner.RPCEnvelope) runner.RPCEnvelope {
-	row, err := s.st.GetSession(ctx, sessionID)
+	row, err := s.st.Sessions().GetSession(ctx, installWorkspace, control.SessionID(sessionID))
 	switch {
-	case errors.Is(err, ErrNotFound):
+	case errors.Is(err, control.ErrNotFound):
 		log.Printf("controld: runner %s asked %q for unknown session %s; refusing",
 			runner, clip(env.Method), clip(sessionID))
 		return rpcRefusal(env.ID, "no such session")
 	case err != nil:
 		log.Printf("controld: runner %s: %s for %s: %v", runner, clip(env.Method), clip(sessionID), err)
 		return rpcRefusal(env.ID, "the session could not be read")
-	case row.Runner != runner:
+	case string(row.RunnerID) != runner:
 		log.Printf("controld: runner %s asked %q for %s, which the store places on %q; refusing",
-			runner, clip(env.Method), row.ID, row.Runner)
+			runner, clip(env.Method), row.ID, row.RunnerID)
 		return rpcRefusal(env.ID, "this session is not placed on the runner that asked")
 	}
 	return s.handleSessionRequest(ctx, runner, row, env)
@@ -191,7 +192,7 @@ func (s *Server) authorizeSessionRequest(ctx context.Context, runner, sessionID 
 // read could see a different row — and the owner every method needs is already
 // on it. Unknown methods are refused by name, which is also what a newer
 // sandbox talking to an older controld gets: a clear answer rather than a hang.
-func (s *Server) handleSessionRequest(ctx context.Context, runner string, row Session, env runner.RPCEnvelope) runner.RPCEnvelope {
+func (s *Server) handleSessionRequest(ctx context.Context, runner string, row control.Session, env runner.RPCEnvelope) runner.RPCEnvelope {
 	switch env.Method {
 	case mintGitCredentialMethod:
 		return s.answerMintGitCredential(ctx, runner, row, env)
@@ -231,8 +232,8 @@ type mintAnswer struct {
 // The token itself appears in exactly one place: the payload below. Not in the
 // log line, not in an error, not in the refusal — see the vault's own note on
 // secret hygiene (vault.go).
-func (s *Server) answerMintGitCredential(ctx context.Context, runnerName string, row Session, env runner.RPCEnvelope) runner.RPCEnvelope {
-	if row.OwnerID == "" {
+func (s *Server) answerMintGitCredential(ctx context.Context, runnerName string, row control.Session, env runner.RPCEnvelope) runner.RPCEnvelope {
+	if row.CreatorID == "" {
 		// Unreachable through the API (every create records its caller), and
 		// refused rather than looked up anyway: the owner IS the authority
 		// this mint acts with, and a lookup for the empty user is one stray
@@ -241,13 +242,13 @@ func (s *Server) answerMintGitCredential(ctx context.Context, runnerName string,
 		return rpcRefusal(env.ID, "this session has no owner to mint a github credential for")
 	}
 
-	token, err := s.mintGitCredential(ctx, row.OwnerID)
+	token, err := s.mintGitCredential(ctx, string(row.CreatorID))
 	switch {
 	case errors.Is(err, ErrCredentialNeedsRefresh), errors.Is(err, ErrCredentialMissing):
-		log.Printf("controld: session %s: no github credential to mint for user %s: %v", row.ID, row.OwnerID, err)
+		log.Printf("controld: session %s: no github credential to mint for user %s: %v", row.ID, row.CreatorID, err)
 		return rpcRefusal(env.ID, err.Error())
 	case err != nil:
-		log.Printf("controld: session %s: minting a github credential for user %s: %v", row.ID, row.OwnerID, err)
+		log.Printf("controld: session %s: minting a github credential for user %s: %v", row.ID, row.CreatorID, err)
 		return rpcRefusal(env.ID, "the github credential could not be read")
 	}
 
@@ -259,7 +260,7 @@ func (s *Server) answerMintGitCredential(ctx context.Context, runnerName string,
 		log.Printf("controld: session %s: encoding the github credential answer failed", row.ID)
 		return rpcRefusal(env.ID, "the github credential could not be encoded")
 	}
-	log.Printf("controld: session %s: minted a github credential for user %s on runner %s", row.ID, row.OwnerID, runnerName)
+	log.Printf("controld: session %s: minted a github credential for user %s on runner %s", row.ID, row.CreatorID, runnerName)
 	return runner.RPCEnvelope{ID: env.ID, Method: "resp", OK: true, Payload: body}
 }
 

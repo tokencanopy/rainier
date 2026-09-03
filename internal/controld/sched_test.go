@@ -122,14 +122,14 @@ func autoAckCreates(t *testing.T, f *fakeRunner) *cmdRecorder {
 // seedQueued seeds a queued session with a distinct, deterministic
 // CreatedAt so OldestQueued's FIFO ordering doesn't depend on wall-clock
 // resolution between seeds.
-func seedQueued(t *testing.T, st Store, id string, offset int) Session {
+func seedQueued(t *testing.T, st MemStore, id string, offset int) control.Session {
 	t.Helper()
 	base := time.Now().Add(-time.Hour)
-	return seedSession(t, st, Session{
-		ID:        id,
-		State:     StateQueued,
+	return seedSession(t, st, control.Session{
+		ID:        control.SessionID(id),
+		State:     control.StateQueued,
 		Name:      id,
-		Image:     "img:latest",
+		Spec:      control.PortableSpec{Image: "img:latest"},
 		CreatedAt: base.Add(time.Duration(offset) * time.Second),
 	})
 }
@@ -179,16 +179,16 @@ func TestPlacementPinPlacesOnThePinnedRunner(t *testing.T) {
 	autoAckCreates(t, f1)
 	autoAckCreates(t, f2)
 
-	env := seedEnv(t, st, Environment{Name: "pinned", Image: "img:1", Placement: "vm2"})
-	seedSession(t, st, Session{ID: "sess_pinned", State: StateQueued, Name: "pinned1",
-		EnvironmentID: env.ID, ResolvedImage: env.Image, CreatedAt: time.Now().Add(-time.Hour)})
+	env := seedEnv(t, st, control.Environment{Name: "pinned", Image: "img:1", Requirements: control.Requirements{Capabilities: []string{placementCapabilityPrefix + "vm2"}}})
+	seedSession(t, st, control.Session{ID: "sess_pinned", State: control.StateQueued, Name: "pinned1",
+		EnvironmentID: env.ID, Spec: control.PortableSpec{Image: env.Image}, CreatedAt: time.Now().Add(-time.Hour)})
 
 	startRun(t, s)
 
 	eventually(t, 3*time.Second, func() error {
 		got := getSession(t, st, "sess_pinned")
-		if got.State != StateCreating || got.Runner != "vm2" {
-			return fmt.Errorf("session = %q on %q, want creating on vm2 (the pin)", got.State, got.Runner)
+		if got.State != control.StateCreating || got.RunnerID != "vm2" {
+			return fmt.Errorf("session = %q on %q, want creating on vm2 (the pin)", got.State, got.RunnerID)
 		}
 		return nil
 	})
@@ -206,22 +206,22 @@ func TestPlacementPinQueuesWhenTheRunnerHasNoRoom(t *testing.T) {
 		joinRunner(t, s, ts, runnerScript{Name: "vm2", Used: 1, Total: 1})
 		rec := autoAckCreates(t, f1)
 
-		env := seedEnv(t, st, Environment{Name: "pinned", Image: "img:1", Placement: "vm2"})
-		seedSession(t, st, Session{ID: "sess_blocked", State: StateQueued, Name: "blocked",
-			EnvironmentID: env.ID, ResolvedImage: env.Image, CreatedAt: time.Now().Add(-time.Hour)})
+		env := seedEnv(t, st, control.Environment{Name: "pinned", Image: "img:1", Requirements: control.Requirements{Capabilities: []string{placementCapabilityPrefix + "vm2"}}})
+		seedSession(t, st, control.Session{ID: "sess_blocked", State: control.StateQueued, Name: "blocked",
+			EnvironmentID: env.ID, Spec: control.PortableSpec{Image: env.Image}, CreatedAt: time.Now().Add(-time.Hour)})
 		seedQueued(t, st, "sess_behind", 1)
 
 		startRun(t, s)
 
 		// The unpinned session behind it places on vm1...
-		wantState(t, st, "sess_behind", StateCreating)
+		wantState(t, st, "sess_behind", control.StateCreating)
 		if got := rec.snapshot(); !sameSet(got, []string{"sess_behind"}) {
 			t.Fatalf("vm1 received creates for %v, want only sess_behind", got)
 		}
 		// ...while the pinned one stays queued and unplaced.
 		got := getSession(t, st, "sess_blocked")
-		if got.State != StateQueued || got.Runner != "" {
-			t.Fatalf("pinned session = %q on %q, want still queued and unplaced", got.State, got.Runner)
+		if got.State != control.StateQueued || got.RunnerID != "" {
+			t.Fatalf("pinned session = %q on %q, want still queued and unplaced", got.State, got.RunnerID)
 		}
 	})
 
@@ -230,19 +230,19 @@ func TestPlacementPinQueuesWhenTheRunnerHasNoRoom(t *testing.T) {
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 		rec := autoAckCreates(t, f)
 
-		env := seedEnv(t, st, Environment{Name: "hardware", Image: "img:1", Placement: "rainier-gpu"})
-		seedSession(t, st, Session{ID: "sess_hw", State: StateQueued, Name: "hw",
-			EnvironmentID: env.ID, ResolvedImage: env.Image, CreatedAt: time.Now().Add(-time.Hour)})
+		env := seedEnv(t, st, control.Environment{Name: "hardware", Image: "img:1", Requirements: control.Requirements{Capabilities: []string{placementCapabilityPrefix + "rainier-gpu"}}})
+		seedSession(t, st, control.Session{ID: "sess_hw", State: control.StateQueued, Name: "hw",
+			EnvironmentID: env.ID, Spec: control.PortableSpec{Image: env.Image}, CreatedAt: time.Now().Add(-time.Hour)})
 		seedQueued(t, st, "sess_any", 1)
 
 		startRun(t, s)
 
-		wantState(t, st, "sess_any", StateCreating)
+		wantState(t, st, "sess_any", control.StateCreating)
 		if got := rec.snapshot(); !sameSet(got, []string{"sess_any"}) {
 			t.Fatalf("vm1 received creates for %v, want only sess_any", got)
 		}
-		if got := getSession(t, st, "sess_hw"); got.State != StateQueued || got.Runner != "" {
-			t.Fatalf("pinned session = %q on %q, want still queued and unplaced", got.State, got.Runner)
+		if got := getSession(t, st, "sess_hw"); got.State != control.StateQueued || got.RunnerID != "" {
+			t.Fatalf("pinned session = %q on %q, want still queued and unplaced", got.State, got.RunnerID)
 		}
 	})
 }
@@ -257,19 +257,19 @@ func TestCacheTiebreakPrefersTheSnapshotHolder(t *testing.T) {
 	autoAckCreates(t, f1)
 	autoAckCreates(t, f2)
 
-	env := seedEnv(t, st, Environment{Name: "cached", Image: "img:1", Setup: "echo hi"})
+	env := seedEnv(t, st, control.Environment{Name: "cached", Image: "img:1", Setup: "echo hi"})
 	const ref = "rainier-env:cached-0123456789ab"
 	env = cacheEnvSnapshot(t, st, env, ref, "vm2")
 
-	seedSession(t, st, Session{ID: "sess_cached", State: StateQueued, Name: "cached1",
-		EnvironmentID: env.ID, ResolvedImage: ref, CreatedAt: time.Now().Add(-time.Hour)})
+	seedSession(t, st, control.Session{ID: "sess_cached", State: control.StateQueued, Name: "cached1",
+		EnvironmentID: env.ID, Spec: control.PortableSpec{Image: ref}, CreatedAt: time.Now().Add(-time.Hour)})
 
 	startRun(t, s)
 
 	eventually(t, 3*time.Second, func() error {
 		got := getSession(t, st, "sess_cached")
-		if got.State != StateCreating || got.Runner != "vm2" {
-			return fmt.Errorf("session = %q on %q, want creating on vm2 (the snapshot holder)", got.State, got.Runner)
+		if got.State != control.StateCreating || got.RunnerID != "vm2" {
+			return fmt.Errorf("session = %q on %q, want creating on vm2 (the snapshot holder)", got.State, got.RunnerID)
 		}
 		return nil
 	})
@@ -308,17 +308,17 @@ func TestSchedulerFIFOPlacementAndCapacityFrees(t *testing.T) {
 	if got := rec.snapshot(); len(got) != 2 || !sameSet(got, []string{"sess_q1", "sess_q2"}) {
 		t.Fatalf("dispatched = %v, want exactly {sess_q1, sess_q2} (the oldest two)", got)
 	}
-	wantState(t, st, "sess_q1", StateCreating)
-	wantState(t, st, "sess_q2", StateCreating)
+	wantState(t, st, "sess_q1", control.StateCreating)
+	wantState(t, st, "sess_q2", control.StateCreating)
 
 	// No capacity left: sess_q3 waits, and keeps waiting through a mere
 	// "running" event — Used catching up to 1 is exactly offset by the
 	// creating-count dropping to 1, so no net capacity appears.
 	f.setCapacity(1, 2)
 	f.event(t, "sess_q1", "running")
-	wantState(t, st, "sess_q1", StateRunning)
+	wantState(t, st, "sess_q1", control.StateRunning)
 	time.Sleep(150 * time.Millisecond)
-	if got := getSession(t, st, "sess_q3"); got.State != StateQueued {
+	if got := getSession(t, st, "sess_q3"); got.State != control.StateQueued {
 		t.Fatalf("sess_q3 state = %q, want still queued (a running event must not free a slot)", got.State)
 	}
 	if n := rec.len(); n != 2 {
@@ -328,15 +328,15 @@ func TestSchedulerFIFOPlacementAndCapacityFrees(t *testing.T) {
 	// A slot only frees once the session actually terminates.
 	f.setCapacity(0, 2)
 	f.event(t, "sess_q1", "dead")
-	wantState(t, st, "sess_q1", StateDead)
+	wantState(t, st, "sess_q1", control.StateDead)
 
 	eventually(t, 2*time.Second, func() error {
 		got := getSession(t, st, "sess_q3")
-		if got.State != StateCreating {
+		if got.State != control.StateCreating {
 			return fmt.Errorf("sess_q3 state = %q, want creating", got.State)
 		}
-		if got.Runner != "vm1" {
-			return fmt.Errorf("sess_q3 runner = %q, want vm1", got.Runner)
+		if got.RunnerID != "vm1" {
+			return fmt.Errorf("sess_q3 runner = %q, want vm1", got.RunnerID)
 		}
 		return nil
 	})
@@ -352,15 +352,15 @@ func TestSchedulerFIFOPlacementAndCapacityFrees(t *testing.T) {
 	// inside this bound is the wake doing its job.
 	seedQueued(t, st, "sess_q4", 3)
 	time.Sleep(150 * time.Millisecond)
-	if got := getSession(t, st, "sess_q4"); got.State != StateQueued {
+	if got := getSession(t, st, "sess_q4"); got.State != control.StateQueued {
 		t.Fatalf("sess_q4 state = %q, want queued (no headroom until a creating row clears)", got.State)
 	}
 
 	f.event(t, "sess_q2", "running")
 	eventually(t, 2*time.Second, func() error {
 		got := getSession(t, st, "sess_q4")
-		if got.State != StateCreating || got.Runner != "vm1" {
-			return fmt.Errorf("sess_q4 = %q on %q, want creating on vm1 promptly after the running event", got.State, got.Runner)
+		if got.State != control.StateCreating || got.RunnerID != "vm1" {
+			return fmt.Errorf("sess_q4 = %q on %q, want creating on vm1 promptly after the running event", got.State, got.RunnerID)
 		}
 		return nil
 	})
@@ -390,7 +390,7 @@ func TestCreateDispatchFailureRequeues(t *testing.T) {
 		}
 		ackCreate(t, f, cmd, false, "boom")
 
-		got := wantState(t, st, id, StateFailed)
+		got := wantState(t, st, id, control.StateFailed)
 		if got.Error != "boom" {
 			t.Fatalf("error = %q, want %q", got.Error, "boom")
 		}
@@ -407,12 +407,21 @@ func TestCreateDispatchFailureRequeues(t *testing.T) {
 // pinFailStore fails every SetSessionSetupHash, so a create whose setup
 // provenance cannot be recorded can be observed end to end.
 type pinFailStore struct {
-	Store
+	MemStore
 	err error
 }
 
-func (p *pinFailStore) SetSessionSetupHash(ctx context.Context, id, hash string) error {
-	return p.err
+func (p *pinFailStore) Sessions() control.SessionRepository {
+	return pinFailSessions{SessionRepository: p.MemStore.Sessions(), owner: p}
+}
+
+type pinFailSessions struct {
+	control.SessionRepository
+	owner *pinFailStore
+}
+
+func (p pinFailSessions) SetSessionSetupHash(ctx context.Context, ws control.WorkspaceID, id control.SessionID, hash string) error {
+	return p.owner.err
 }
 
 // TestSetupPinIsWrittenBeforeTheCreate pins both halves of the provenance
@@ -431,9 +440,9 @@ func TestSetupPinIsWrittenBeforeTheCreate(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 
-		env := seedEnv(t, st, Environment{Name: "dev", Image: "img:1", Setup: "make deps"})
-		seedSession(t, st, Session{ID: "sess_pin", State: StateQueued, Name: "pin",
-			EnvironmentID: env.ID, ResolvedImage: env.Image, CreatedAt: time.Now().Add(-time.Hour)})
+		env := seedEnv(t, st, control.Environment{Name: "dev", Image: "img:1", Setup: "make deps"})
+		seedSession(t, st, control.Session{ID: "sess_pin", State: control.StateQueued, Name: "pin",
+			EnvironmentID: env.ID, Spec: control.PortableSpec{Image: env.Image}, CreatedAt: time.Now().Add(-time.Hour)})
 
 		startRun(t, s)
 
@@ -464,17 +473,17 @@ func TestSetupPinIsWrittenBeforeTheCreate(t *testing.T) {
 	})
 
 	t.Run("a pin that cannot be written fails the session and sends nothing", func(t *testing.T) {
-		store := &pinFailStore{Store: NewMemStore(), err: errors.New("store down")}
+		store := &pinFailStore{MemStore: NewMemStore(), err: errors.New("store down")}
 		s, ts := newTestControldOver(t, store)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
 
-		env := seedEnv(t, store, Environment{Name: "dev", Image: "img:1", Setup: "make deps"})
-		seedSession(t, store, Session{ID: "sess_pinfail", State: StateQueued, Name: "pinfail",
-			EnvironmentID: env.ID, ResolvedImage: env.Image, CreatedAt: time.Now().Add(-time.Hour)})
+		env := seedEnv(t, store, control.Environment{Name: "dev", Image: "img:1", Setup: "make deps"})
+		seedSession(t, store, control.Session{ID: "sess_pinfail", State: control.StateQueued, Name: "pinfail",
+			EnvironmentID: env.ID, Spec: control.PortableSpec{Image: env.Image}, CreatedAt: time.Now().Add(-time.Hour)})
 
 		startRun(t, s)
 
-		got := wantState(t, store, "sess_pinfail", StateFailed)
+		got := wantState(t, store, "sess_pinfail", control.StateFailed)
 		if got.Error != "could not record the setup this session runs" {
 			t.Fatalf("error = %q, want the provenance failure", got.Error)
 		}
