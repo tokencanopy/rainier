@@ -411,8 +411,17 @@ type pinFailStore struct {
 	err error
 }
 
-func (p *pinFailStore) SetSessionSetupHash(ctx context.Context, id, hash string) error {
-	return p.err
+func (p *pinFailStore) Sessions() control.SessionRepository {
+	return pinFailSessions{SessionRepository: p.MemStore.Sessions(), owner: p}
+}
+
+type pinFailSessions struct {
+	control.SessionRepository
+	owner *pinFailStore
+}
+
+func (p pinFailSessions) SetSessionSetupHash(ctx context.Context, ws control.WorkspaceID, id control.SessionID, hash string) error {
+	return p.owner.err
 }
 
 // TestSetupPinIsWrittenBeforeTheCreate pins both halves of the provenance

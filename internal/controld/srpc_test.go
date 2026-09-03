@@ -474,12 +474,21 @@ type blockingGetStore struct {
 	once    sync.Once
 }
 
-func (b *blockingGetStore) GetSession(ctx context.Context, id string) (Session, error) {
-	if id == b.id {
-		b.once.Do(func() { close(b.entered) })
-		<-b.release
+func (b *blockingGetStore) Sessions() control.SessionRepository {
+	return blockingGetSessions{SessionRepository: b.MemStore.Sessions(), owner: b}
+}
+
+type blockingGetSessions struct {
+	control.SessionRepository
+	owner *blockingGetStore
+}
+
+func (b blockingGetSessions) GetSession(ctx context.Context, ws control.WorkspaceID, id control.SessionID) (control.Session, error) {
+	if o := b.owner; string(id) == o.id {
+		o.once.Do(func() { close(o.entered) })
+		<-o.release
 	}
-	return b.MemStore.GetSession(ctx, id)
+	return b.SessionRepository.GetSession(ctx, ws, id)
 }
 
 // TestSandboxRequestsDoNotBlockTheRunnerReader: answering a sandbox request

@@ -199,7 +199,7 @@ func (r *sessionRenderer) environment(id string) *control.Environment {
 //
 // The pin is read off the environment's portable requirements: control names
 // no runner, so an operator's `placement` is carried as the capability
-// "placement:<runner>" (adapt_store.go).
+// "placement:<runner>" (adapt_scope.go).
 func (r *sessionRenderer) queueReason(row control.Session, env control.Environment) string {
 	pin := capabilityValue(env.Requirements.Capabilities, placementCapabilityPrefix)
 	if row.State != control.StateQueued || pin == "" || r.runnerHasRoom(pin) {
@@ -234,7 +234,8 @@ func (r *sessionRenderer) runnerHasRoom(name string) bool {
 // yields an empty map rather than a partial one — half a capacity picture is
 // not a smaller truth, it is a different fleet.
 func (r *sessionRenderer) freeSlots() map[string]int {
-	rows, err := r.srv.st.ListRunners(r.ctx)
+	fleet := r.srv.st.Fleet()
+	rows, err := fleet.ListRunners(r.ctx, installPool)
 	if err != nil {
 		log.Printf("controld: rendering a session view: listing runners: %v", err)
 		return map[string]int{}
@@ -244,12 +245,12 @@ func (r *sessionRenderer) freeSlots() map[string]int {
 		if !row.Connected {
 			continue
 		}
-		creating, err := r.srv.st.SessionsOnRunner(r.ctx, row.Name, []SessionState{StateCreating})
+		creating, err := fleet.SessionsOnRunner(r.ctx, installPool, row.ID, []control.SessionState{control.StateCreating})
 		if err != nil {
 			log.Printf("controld: rendering a session view: sessions creating on a runner: %v", err)
 			return map[string]int{}
 		}
-		free[row.Name] = row.CapacityTotal - row.CapacityUsed - len(creating)
+		free[string(row.ID)] = row.CapacityTotal - row.CapacityUsed - len(creating)
 	}
 	return free
 }
@@ -1110,7 +1111,7 @@ type environmentsEnvelope struct {
 //
 // Two of the wire's fields have no field of their own on control.Environment,
 // which names no runner: `placement` is carried as the portable capability
-// "placement:<runner>" (adapt_store.go) and read back out of it here, and
+// "placement:<runner>" (adapt_scope.go) and read back out of it here, and
 // `snapshot_runner` — which the control model does not carry at all — is
 // passed in by the handler, which read it off the store row for the view.
 func environmentJSON(e control.Environment, snapshotRunner string) environmentView {
@@ -1450,11 +1451,11 @@ func (s *Server) missingSecretRef(ctx context.Context, refs []string) (string, e
 // which is what authorizes the read.
 func (s *Server) environmentRef(ctx context.Context, scope control.Scope, ref string) (control.Environment, error) {
 	if !strings.HasPrefix(ref, environmentIDPrefix) {
-		row, err := s.st.GetEnvironmentByName(ctx, ref)
+		id, err := s.st.EnvironmentByName(ctx, scope.WorkspaceID, ref)
 		if err != nil {
-			return control.Environment{}, storeErr(err)
+			return control.Environment{}, err
 		}
-		return s.environments.GetEnvironment(ctx, scope, control.EnvironmentID(row.ID))
+		return s.environments.GetEnvironment(ctx, scope, id)
 	}
 	return s.environments.GetEnvironment(ctx, scope, control.EnvironmentID(ref))
 }
@@ -1466,19 +1467,19 @@ func (s *Server) environmentRef(ctx context.Context, scope control.Scope, ref st
 // column, stale or not, so the view reads the column. It decides nothing; an
 // unreadable row simply shows no runner.
 func (s *Server) snapshotRunnerOf(ctx context.Context, id control.EnvironmentID) string {
-	row, err := s.st.GetEnvironment(ctx, string(id))
+	holder, err := s.st.SnapshotRunner(ctx, installWorkspace, id)
 	if err != nil {
-		if !errors.Is(err, ErrNotFound) {
+		if !errors.Is(err, control.ErrNotFound) {
 			log.Printf("controld: rendering environment %s: reading its snapshot runner: %v", id, err)
 		}
 		return ""
 	}
-	return row.SnapshotRunner
+	return string(holder)
 }
 
 // placementRequirements is the portable spelling of an operator's runner pin:
 // control.Environment names no runner, so `placement` round-trips through the
-// capability "placement:<runner>" (adapt_store.go). An empty placement is no
+// capability "placement:<runner>" (adapt_scope.go). An empty placement is no
 // capability at all rather than an empty one.
 func placementRequirements(placement string) control.Requirements {
 	if placement == "" {
@@ -1570,16 +1571,16 @@ func (s *Server) handleListEnvironments(w http.ResponseWriter, r *http.Request, 
 		writeControlErr(w, err)
 		return
 	}
-	// One store read for the whole page rather than one per row: the snapshot
-	// runner is a view-only column (see snapshotRunnerOf) and a listing that
-	// asked for it row by row would read the table twice over.
-	runners := map[string]string{}
-	if rows, err := s.st.ListEnvironments(ctx); err != nil {
-		log.Printf("controld: list environments: reading their snapshot runners: %v", err)
-	} else {
-		for _, row := range rows {
-			runners[row.ID] = row.SnapshotRunner
-		}
+	// The snapshot runner is a view-only column (see snapshotRunnerOf), and
+	// the page the service returned cannot answer for it: control.Environment
+	// carries a snapshot's holder only as a capability, and only while the
+	// snapshot is still current, whereas this column has always shown the
+	// runner stale or not. So it is the host lookup, once per row on the page
+	// — there are few environments per deployment, and this is the same
+	// question the single-environment view asks.
+	runners := make(map[string]string, len(page.Environments))
+	for _, row := range page.Environments {
+		runners[string(row.ID)] = s.snapshotRunnerOf(ctx, row.ID)
 	}
 	out := make([]environmentView, len(page.Environments))
 	for i, row := range page.Environments {
@@ -1748,7 +1749,7 @@ func (s *Server) handleDeleteEnvironment(w http.ResponseWriter, r *http.Request,
 // counting against anything but a real id would sweep in sessions that belong
 // to no environment at all.
 func (s *Server) stillInUseMessage(ctx context.Context, env control.Environment) string {
-	n, err := s.st.CountSessionsByEnvironment(ctx, string(env.ID), NonTerminal)
+	n, err := s.st.Environments().CountSessionsByEnvironment(ctx, installWorkspace, env.ID, control.NonTerminal)
 	if err != nil || n <= 0 {
 		return fmt.Sprintf("environment %q still has non-terminal session(s)", env.Name)
 	}

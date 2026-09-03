@@ -150,7 +150,7 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 	// session actually becomes attachable.
 	row, err := s.waitRunning(r.Context(), id)
 	switch {
-	case errors.Is(err, ErrNotFound):
+	case errors.Is(err, control.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "not_found", "session not found")
 		return
 	case errors.Is(err, errSessionNotReady):
@@ -167,7 +167,7 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 	// Running but unreachable: the row says a runner holds this session and
 	// that runner has no control connection here, so there is nothing to
 	// send a dial_attach down.
-	if row.Runner == "" || !s.transport.Connected(installPool, control.RunnerID(row.Runner)) {
+	if row.RunnerID == "" || !s.transport.Connected(installPool, row.RunnerID) {
 		writeErr(w, http.StatusBadGateway, "runner_unreachable", "runner is not connected")
 		return
 	}
@@ -207,9 +207,9 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 // ownerOrAdmin policy adapter, asked the same question about the same
 // resource, and the service's own answer downstream stays authoritative.
 func (s *Server) mayAttach(w http.ResponseWriter, r *http.Request, u User, id string) bool {
-	row, err := s.st.GetSession(r.Context(), id)
+	row, err := s.st.Sessions().GetSession(r.Context(), installWorkspace, control.SessionID(id))
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
+		if errors.Is(err, control.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "not_found", "session not found")
 			return false
 		}
@@ -218,7 +218,7 @@ func (s *Server) mayAttach(w http.ResponseWriter, r *http.Request, u User, id st
 		return false
 	}
 	resource := control.Resource{Kind: control.ResourceSession, WorkspaceID: installWorkspace,
-		ID: row.ID, CreatorID: control.ActorID(row.OwnerID)}
+		ID: string(row.ID), CreatorID: row.CreatorID}
 	if err := (ownerOrAdmin{}).AuthorizeAttachment(withUser(r.Context(), u), userScope(u),
 		resource, control.AttachmentController); err != nil {
 		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to attach to this session")
@@ -233,15 +233,15 @@ func (s *Server) mayAttach(w http.ResponseWriter, r *http.Request, u User, id st
 // holding the request open for that is friendlier than making every client
 // implement its own retry loop — the CLI still gets a 503 to spin on when the
 // budget runs out.
-func (s *Server) waitRunning(ctx context.Context, id string) (Session, error) {
+func (s *Server) waitRunning(ctx context.Context, id string) (control.Session, error) {
 	deadline := time.Now().Add(s.cfg.AttachWait)
 	for {
-		row, err := s.st.GetSession(ctx, id)
+		row, err := s.st.Sessions().GetSession(ctx, installWorkspace, control.SessionID(id))
 		if err != nil {
-			return Session{}, err
+			return control.Session{}, err
 		}
 		switch {
-		case row.State == StateRunning:
+		case row.State == control.StateRunning:
 			return row, nil
 		case s.failedButAttachable(row):
 			// Immediately, without consuming any of the budget: this state is
@@ -258,7 +258,7 @@ func (s *Server) waitRunning(ctx context.Context, id string) (Session, error) {
 		select {
 		case <-time.After(attachPollInterval):
 		case <-ctx.Done():
-			return Session{}, ctx.Err()
+			return control.Session{}, ctx.Err()
 		}
 	}
 }
@@ -296,8 +296,8 @@ func (s *Server) waitRunning(ctx context.Context, id string) (Session, error) {
 // failed session's container across reconnects would mean exempting it from
 // that rule with nothing left to reap it. Documented in deploy-gce.md §7 as
 // "read the log before restarting runnerd".
-func (s *Server) failedButAttachable(row Session) bool {
-	return row.State == StateFailed && row.Runner != "" && s.runnerConnected(row.Runner)
+func (s *Server) failedButAttachable(row control.Session) bool {
+	return row.State == control.StateFailed && row.RunnerID != "" && s.runnerConnected(string(row.RunnerID))
 }
 
 // attachBackURL renders the dial-back URL for attachID: this replica's own

@@ -1032,28 +1032,39 @@ func newRaceStore() *raceStore {
 	}
 }
 
-func (r *raceStore) SetRunnerConnected(ctx context.Context, name string, connected bool) error {
+func (r *raceStore) Fleet() control.FleetRepository {
+	return raceFleet{FleetRepository: r.MemStore.Fleet(), owner: r}
+}
+
+type raceFleet struct {
+	control.FleetRepository
+	owner *raceStore
+}
+
+func (r raceFleet) SetRunnerConnected(ctx context.Context, pool control.PoolID, id control.RunnerID, connected bool) error {
 	if connected {
-		return r.MemStore.SetRunnerConnected(ctx, name, connected)
+		return r.FleetRepository.SetRunnerConnected(ctx, pool, id, connected)
 	}
-	r.enteredOnce.Do(func() { close(r.entered) })
+	o := r.owner
+	o.enteredOnce.Do(func() { close(o.entered) })
 	select {
-	case <-r.upserted:
+	case <-o.upserted:
 	case <-time.After(500 * time.Millisecond):
 	}
-	err := r.MemStore.SetRunnerConnected(ctx, name, connected)
-	r.wroteOnce.Do(func() { close(r.wrote) })
+	err := r.FleetRepository.SetRunnerConnected(ctx, pool, id, connected)
+	o.wroteOnce.Do(func() { close(o.wrote) })
 	return err
 }
 
-func (r *raceStore) UpsertRunner(ctx context.Context, run Runner) error {
-	err := r.MemStore.UpsertRunner(ctx, run)
+func (r raceFleet) UpsertRunner(ctx context.Context, pool control.PoolID, run control.Runner) error {
+	err := r.FleetRepository.UpsertRunner(ctx, pool, run)
 	// Only a connect that happens *after* the teardown began is the one this
 	// test is racing; the first runner's own announce must not release it.
+	o := r.owner
 	select {
-	case <-r.entered:
+	case <-o.entered:
 		if run.Connected {
-			r.upsertedOnce.Do(func() { close(r.upserted) })
+			o.upsertedOnce.Do(func() { close(o.upserted) })
 		}
 	default:
 	}
@@ -1668,10 +1679,19 @@ func newEnvSnapshotSpy() *envSnapshotSpy {
 	return &envSnapshotSpy{MemStore: NewMemStore(), calls: make(chan error, 8)}
 }
 
-func (e *envSnapshotSpy) SetEnvironmentSnapshot(ctx context.Context, envID, expectHash, ref, runner string) error {
-	err := e.MemStore.SetEnvironmentSnapshot(ctx, envID, expectHash, ref, runner)
+func (e *envSnapshotSpy) Environments() control.EnvironmentRepository {
+	return spyEnvironments{EnvironmentRepository: e.MemStore.Environments(), owner: e}
+}
+
+type spyEnvironments struct {
+	control.EnvironmentRepository
+	owner *envSnapshotSpy
+}
+
+func (e spyEnvironments) SetEnvironmentSnapshot(ctx context.Context, ws control.WorkspaceID, envID control.EnvironmentID, expectHash, ref string, runnerID control.RunnerID) error {
+	err := e.EnvironmentRepository.SetEnvironmentSnapshot(ctx, ws, envID, expectHash, ref, runnerID)
 	select {
-	case e.calls <- err:
+	case e.owner.calls <- err:
 	default:
 	}
 	return err
@@ -1708,8 +1728,8 @@ func TestSetupDoneStaleEnvironmentIsDropped(t *testing.T) {
 
 	select {
 	case err := <-spy.calls:
-		if !errors.Is(err, ErrConflict) {
-			t.Fatalf("guarded write returned %v, want ErrConflict — the stale snapshot must not land", err)
+		if !errors.Is(err, control.ErrStale) {
+			t.Fatalf("guarded write returned %v, want ErrStale — the stale snapshot must not land", err)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("the orchestration never attempted the guarded write")
@@ -1855,8 +1875,14 @@ func TestRunnerGenerationFencesAStaleSocket(t *testing.T) {
 			t.Fatalf("state = %q, want still creating — a superseded generation was applied", got.State)
 		}
 
+		// The authoritative generation is the store's, not a table inside
+		// this process: it is on the runner's own row.
+		rows, err := st.Fleet().ListRunners(context.Background(), installPool)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("list runners: %+v, %v", rows, err)
+		}
 		live := newRunnerConn("runner-a", nil)
-		live.gen = s.gens.current("runner-a")
+		live.gen = rows[0].Generation
 		if live.gen == stale.gen {
 			t.Fatalf("generation did not advance across the redial: %d", live.gen)
 		}

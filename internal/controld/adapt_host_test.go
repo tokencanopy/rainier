@@ -28,9 +28,21 @@ func TestEligiblePoolsSumsConnectedRunners(t *testing.T) {
 		t.Fatalf("empty fleet pools = %+v", got)
 	}
 
-	st.UpsertRunner(ctx, Runner{Name: "runner-a", CapacityUsed: 1, CapacityTotal: 4, Connected: true})
-	st.UpsertRunner(ctx, Runner{Name: "runner-b", CapacityUsed: 2, CapacityTotal: 2, Connected: true})
-	st.UpsertRunner(ctx, Runner{Name: "runner-c", CapacityUsed: 5, CapacityTotal: 9, Connected: false})
+	// Seeded as a runner registers itself: its own capabilities on its own
+	// row, which is where the pool's list is now unioned from.
+	seedRunner := func(name string, used, total int, connected bool) {
+		t.Helper()
+		if err := st.Fleet().UpsertRunner(ctx, installPool, control.Runner{
+			ID: control.RunnerID(name), PoolID: installPool,
+			CapacityUsed: used, CapacityTotal: total, Connected: connected,
+			Capabilities: runnerCapabilities(name),
+		}); err != nil {
+			t.Fatalf("seed runner %s: %v", name, err)
+		}
+	}
+	seedRunner("runner-a", 1, 4, true)
+	seedRunner("runner-b", 2, 2, true)
+	seedRunner("runner-c", 5, 9, false)
 
 	got, err = pools.EligiblePools(ctx, scope, control.Requirements{})
 	if err != nil {

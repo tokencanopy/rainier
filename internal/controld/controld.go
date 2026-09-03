@@ -8,11 +8,13 @@
 // placement, runner reconciliation and event application, and attach and
 // workspace orchestration live once, in controlapp, and this package reaches
 // them only through the four services New composes. What this package owns is
-// the host side of each port (adapt_*.go) — the single-tenant Store as
-// workspace-keyed repositories under one installation workspace and pool, the
-// GitHub-role rule as the authorizer and attachment policy, the vault and
+// the host side of each port (adapt_*.go) — the pool resolver over the one
+// installation pool, the GitHub-role rule as the authorizer and attachment
+// policy, the vault and
 // connectors as launch material, the runner websocket as the transport, the
-// dial-back pairing as the attach broker — plus everything with no portable
+// dial-back pairing as the attach broker — while the three repository ports
+// are the store's own, implemented natively over its workspace-keyed rows and
+// read off it by compose(). Plus everything with no portable
 // counterpart: request decoding and JSON rendering, GitHub login and tokens,
 // secrets and credentials, the sandbox's upward credential-mint RPC, and the
 // setup_done snapshot arm.
@@ -58,6 +60,11 @@ const (
 	// defaultAttachPairTTL bounds how long a parked client socket waits for
 	// its runner to dial back before controld closes it (design §5).
 	defaultAttachPairTTL = 15 * time.Second
+	// ensureWorkspaceTimeout bounds New's one store write. It is startup, not
+	// a request, so it is generous — but bounded, so a store that will never
+	// answer produces an error a process manager can act on rather than a
+	// controld wedged before it ever listened.
+	ensureWorkspaceTimeout = 10 * time.Second
 )
 
 // Config is controld's startup configuration. RunnerToken, ExternalURL, and
@@ -138,15 +145,6 @@ type Server struct {
 	fleet        *controlapp.FleetService
 	attachments  *controlapp.AttachmentService
 
-	// gens hands out the process-local generation each runner connection
-	// acts under; the fleet repository adapter reads it back.
-	gens *runnerGenerations
-
-	// leases hands out the process-local controller generation each terminal
-	// controller acts under; the session repository adapter answers
-	// NextControllerGeneration from it until the store persists it.
-	leases *controllerLeases
-
 	// transport is the runner plane behind the control.RunnerTransport port
 	// (adapt_transport.go, over the connection map below) and broker the
 	// dial-back attach pairing behind control.AttachmentBroker
@@ -189,14 +187,27 @@ func New(st Store, cfg Config) (*Server, error) {
 	if cfg.GitHubAPIBase == "" {
 		cfg.GitHubAPIBase = defaultGitHubAPIBase
 	}
+	// The installation workspace has to exist before anything reads or
+	// writes a row keyed by it, and a store from any source — a fresh
+	// memstore, a database that predates the scope columns, one restored from
+	// a dump — may not carry it yet. Asserting it here fails closed: a
+	// controld that came up over a store it cannot scope would answer every
+	// request with "not found" and look like data loss.
+	//
+	// Its own context, because New takes none and a wedged store must not
+	// hang startup indefinitely.
+	ensureCtx, cancelEnsure := context.WithTimeout(context.Background(), ensureWorkspaceTimeout)
+	defer cancelEnsure()
+	if err := st.EnsureWorkspace(ensureCtx, installWorkspace); err != nil {
+		return nil, fmt.Errorf("controld: provisioning the installation workspace: %w", err)
+	}
+
 	s := &Server{
 		st:          st,
 		cfg:         cfg,
 		runners:     map[string]*runnerConn{},
 		runnerLocks: map[string]*sync.Mutex{},
 		attaches:    newAttachTable(),
-		gens:        &runnerGenerations{},
-		leases:      &controllerLeases{},
 	}
 	s.transport = runnerTransport{srv: s}
 	s.broker = attachBroker{srv: s}
@@ -211,16 +222,18 @@ func New(st Store, cfg Config) (*Server, error) {
 // loop runs on, so a wake that was coalesced away costs at most that long.
 const fleetSafetyInterval = 10 * time.Second
 
-// compose builds the four application services over one adapter set. Every
-// port is one of the adapters in adapt_*.go; nothing here is a second
+// compose builds the four application services over one adapter set. The
+// three repository ports are the store's own accessors — the sessions
+// Sessions() creates are the sessions Fleet() places — and every other port
+// is one of the adapters in adapt_*.go; nothing here is a second
 // implementation of any behavior the services own. It is the composition
 // root the program plan keeps reviewer-owned.
 func (s *Server) compose() error {
 	var (
 		auth     = ownerOrAdmin{}
-		sessions = storeSessions{st: s.st, leases: s.leases}
-		envs     = storeEnvironments{st: s.st}
-		fleet    = &storeFleet{st: s.st, gens: s.gens}
+		sessions = s.st.Sessions()
+		envs     = s.st.Environments()
+		fleet    = s.st.Fleet()
 		pools    = installationPools{st: s.st}
 		events   = logRecorder{}
 		clock    = systemClock{}

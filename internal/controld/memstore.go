@@ -1595,21 +1595,11 @@ func connectorsFromControl(in []control.Connector) []Connector {
 	return out
 }
 
-// capabilityValue returns the tail of the first capability carrying prefix,
-// or "" when none does.
-func capabilityValue(caps []string, prefix string) string {
-	for _, c := range caps {
-		if after, ok := strings.CutPrefix(c, prefix); ok {
-			return after
-		}
-	}
-	return ""
-}
-
-// runnerToControl lifts a runner row. The generation is process-local in O8
-// (runnerGenerations), and the two capabilities are synthesized from the name
-// so a session pinned to this runner by an environment's placement, or held
-// to it by a snapshot it built, matches it.
+// runnerToControl lifts a runner row onto the old surface's four columns plus
+// the two the old surface has no place for: the generation the caller supplies
+// and the capabilities synthesized from the name, so a session pinned to this
+// runner by an environment's placement, or held to it by a snapshot it built,
+// matches it.
 func runnerToControl(r Runner, gen uint64) control.Runner {
 	return control.Runner{
 		ID:            control.RunnerID(r.Name),
@@ -1621,11 +1611,6 @@ func runnerToControl(r Runner, gen uint64) control.Runner {
 		Capabilities:  runnerCapabilities(r.Name),
 		LastSeenAt:    r.LastSeenAt,
 	}
-}
-
-// runnerCapabilities is the pair every runner advertises for its own name.
-func runnerCapabilities(name string) []string {
-	return []string{placementCapabilityPrefix + name, SnapshotCapability(control.RunnerID(name))}
 }
 
 // statesFromControl converts a from-list or state filter.

@@ -1054,18 +1054,28 @@ func TestCreateSessionDispatchesInit(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // envReadCountingStore counts GetEnvironment calls, so the list handler's
-// per-request cache can be pinned as a fact rather than a comment.
+// per-request cache can be pinned as a fact rather than a comment. It counts
+// them where the handler makes them: on the environment repository.
 type envReadCountingStore struct {
 	MemStore
 	mu sync.Mutex
 	n  int
 }
 
-func (e *envReadCountingStore) GetEnvironment(ctx context.Context, id string) (Environment, error) {
-	e.mu.Lock()
-	e.n++
-	e.mu.Unlock()
-	return e.MemStore.GetEnvironment(ctx, id)
+func (e *envReadCountingStore) Environments() control.EnvironmentRepository {
+	return countingEnvironments{EnvironmentRepository: e.MemStore.Environments(), owner: e}
+}
+
+type countingEnvironments struct {
+	control.EnvironmentRepository
+	owner *envReadCountingStore
+}
+
+func (c countingEnvironments) GetEnvironment(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID) (control.Environment, error) {
+	c.owner.mu.Lock()
+	c.owner.n++
+	c.owner.mu.Unlock()
+	return c.EnvironmentRepository.GetEnvironment(ctx, ws, id)
 }
 
 func (e *envReadCountingStore) reads() int {
@@ -1218,15 +1228,26 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // spyListStore records the SessionQuery it was last called with, so a test
-// can pin the default/cap on Limit without seeding 100+ rows.
+// can pin the default/cap on Limit without seeding 100+ rows. The query it
+// records is the one the session repository is asked, which is the one the
+// handler composed.
 type spyListStore struct {
 	MemStore
-	lastQuery SessionQuery
+	lastQuery control.SessionQuery
 }
 
-func (s *spyListStore) ListSessions(ctx context.Context, q SessionQuery) ([]Session, string, error) {
-	s.lastQuery = q
-	return s.MemStore.ListSessions(ctx, q)
+func (s *spyListStore) Sessions() control.SessionRepository {
+	return spyListSessions{SessionRepository: s.MemStore.Sessions(), owner: s}
+}
+
+type spyListSessions struct {
+	control.SessionRepository
+	owner *spyListStore
+}
+
+func (s spyListSessions) ListSessions(ctx context.Context, ws control.WorkspaceID, q control.SessionQuery) ([]control.Session, string, error) {
+	s.owner.lastQuery = q
+	return s.SessionRepository.ListSessions(ctx, ws, q)
 }
 
 func TestListSessions(t *testing.T) {
@@ -1777,15 +1798,24 @@ type raceTransitionStore struct {
 	triggered   bool
 }
 
-func (r *raceTransitionStore) Transition(ctx context.Context, id string, from []SessionState, to SessionState, opts TransitionOpts) error {
-	if !r.triggered && id == r.triggerID {
-		r.triggered = true
-		if err := r.MemStore.Sessions().Transition(ctx, installWorkspace, control.SessionID(id),
-			control.NonTerminal, r.raceToState, control.TransitionOpts{}); err != nil {
+func (r *raceTransitionStore) Sessions() control.SessionRepository {
+	return raceTransitionSessions{SessionRepository: r.MemStore.Sessions(), owner: r}
+}
+
+type raceTransitionSessions struct {
+	control.SessionRepository
+	owner *raceTransitionStore
+}
+
+func (r raceTransitionSessions) Transition(ctx context.Context, ws control.WorkspaceID, id control.SessionID, from []control.SessionState, to control.SessionState, opts control.TransitionOpts) error {
+	if o := r.owner; !o.triggered && string(id) == o.triggerID {
+		o.triggered = true
+		if err := r.SessionRepository.Transition(ctx, ws, id,
+			control.NonTerminal, o.raceToState, control.TransitionOpts{}); err != nil {
 			panic(fmt.Sprintf("raceTransitionStore: forcing the race: %v", err))
 		}
 	}
-	return r.MemStore.Transition(ctx, id, from, to, opts)
+	return r.SessionRepository.Transition(ctx, ws, id, from, to, opts)
 }
 
 // ---------------------------------------------------------------------------
@@ -4151,12 +4181,21 @@ func newCommitTimingStore(st MemStore) *commitTimingStore {
 	return &commitTimingStore{MemStore: st, committed: map[string]time.Time{}}
 }
 
-func (c *commitTimingStore) CreateSession(ctx context.Context, s Session) (Session, error) {
-	out, err := c.MemStore.CreateSession(ctx, s)
+func (c *commitTimingStore) Sessions() control.SessionRepository {
+	return commitTimingSessions{SessionRepository: c.MemStore.Sessions(), owner: c}
+}
+
+type commitTimingSessions struct {
+	control.SessionRepository
+	owner *commitTimingStore
+}
+
+func (c commitTimingSessions) CreateSession(ctx context.Context, ws control.WorkspaceID, s control.Session) (control.Session, error) {
+	out, err := c.SessionRepository.CreateSession(ctx, ws, s)
 	if err == nil {
-		c.mu.Lock()
-		c.committed[out.ID] = time.Now()
-		c.mu.Unlock()
+		c.owner.mu.Lock()
+		c.owner.committed[string(out.ID)] = time.Now()
+		c.owner.mu.Unlock()
 	}
 	return out, err
 }

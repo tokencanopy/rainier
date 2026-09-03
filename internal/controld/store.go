@@ -1,8 +1,10 @@
-// Package controld defines controld's domain types and its Store
-// persistence interface. internal/controld/memstore.go and pgstore (a later
-// task) both implement Store, and both must pass the contract suite in
-// internal/controld/storetest unchanged — that suite, not this file's
-// comments, is the source of truth for exact semantics.
+// Package controld defines controld's domain types and its Store persistence
+// interface: the host's own persistence, the three control repository ports,
+// and the old single-tenant surface the twins still carry.
+// internal/controld/memstore.go and pgstore both implement Store, and both
+// must pass controlapp/repotest and internal/controld/storetest unchanged —
+// those suites, not this file's comments, are the source of truth for exact
+// semantics.
 package controld
 
 import (
@@ -275,19 +277,18 @@ type SessionQuery struct {
 	Cursor          string
 }
 
-// Store is controld's persistence interface. memstore (this package) and
-// pgstore (a later task) both implement it; storetest.RunContract pins the
-// semantics both must satisfy identically.
+// Store is controld's persistence interface: the host's own persistence
+// (HostStore), the three control repository ports (Repositories), and — until
+// Task 5 deletes them — the old single-tenant methods every test still seeds
+// and reads through. Production reaches a store only through the first two.
+// memstore (this package) and pgstore both implement it; storetest.RunContract
+// pins the semantics of the old surface, controlapp/repotest the ports'.
 type Store interface {
-	UpsertUser(ctx context.Context, githubID int64, login, role string) (User, error)
-	InsertToken(ctx context.Context, userID, tokenHash string) error
-	UserByToken(ctx context.Context, tokenHash string) (User, error) // touches last_used_at; ErrNotFound
-	// GetUser looks a user up by id, for the paths that hold a row rather
-	// than a request: the create dispatch turns a session's owner_id into the
-	// GitHub login and numeric id its commits are attributed to, long after
-	// the bearer token that created it is out of scope. ErrNotFound.
-	GetUser(ctx context.Context, id string) (User, error)
+	HostStore
+	Repositories
 
+	// The old single-tenant surface. Identity and the vault are not repeated
+	// here — they are HostStore's, and they stay there after Task 5.
 	CreateSession(ctx context.Context, s Session) (Session, error) // ErrConflict (name), ErrIdemReplay (idem key)
 	GetSession(ctx context.Context, id string) (Session, error)
 	SessionByIdem(ctx context.Context, ownerID, key string) (Session, error)
@@ -345,33 +346,6 @@ type Store interface {
 	// a hash mismatch — like an environment that no longer exists — returns
 	// ErrConflict and changes nothing.
 	SetEnvironmentSnapshot(ctx context.Context, envID, expectHash, ref, runner string) error
-
-	// PutSecret stores (or replaces) the sealed value of name. Sealing
-	// happens above the store: ciphertext and nonce are opaque bytes here.
-	PutSecret(ctx context.Context, name string, ciphertext, nonce []byte) error
-	ListSecrets(ctx context.Context) ([]SecretMeta, error) // name asc; never ciphertext
-	GetSecret(ctx context.Context, name string) (ciphertext, nonce []byte, err error)
-	DeleteSecret(ctx context.Context, name string) error // ErrNotFound
-
-	// UpsertCredential stores (or wholly replaces) the credential for
-	// (c.UserID, c.Provider). A re-upsert is a fresh login — new bytes, new
-	// scopes, new clocks — so it restamps every zero timestamp with now and
-	// keeps nothing from the row it replaces. An empty Status stores
-	// CredentialValid, matching the column's own default.
-	UpsertCredential(ctx context.Context, c Credential) error
-	GetCredential(ctx context.Context, userID, provider string) (Credential, error) // ErrNotFound
-	// SetCredentialStatus flips a credential's status (and bumps updated_at),
-	// leaving its value, scopes, and other clocks alone. ErrNotFound if the
-	// user has no credential for that provider.
-	SetCredentialStatus(ctx context.Context, userID, provider, status string) error
-	// TouchCredentialUsed stamps last_used_at. It is a read-path write, so it
-	// deliberately leaves updated_at alone — that clock belongs to edits.
-	// ErrNotFound if there is no such credential.
-	TouchCredentialUsed(ctx context.Context, userID, provider string) error
-	// ListCredentials returns userID's credentials, provider ascending, and
-	// never another user's. The rows carry sealed bytes like any other read;
-	// stripping them for a client-facing view is the caller's job.
-	ListCredentials(ctx context.Context, userID string) ([]Credential, error)
 }
 
 // HostStore is the persistence the self-hosted host owns beside the control
@@ -426,15 +400,12 @@ type Repositories interface {
 	Fleet() control.FleetRepository
 }
 
-// MemStore is the shape the in-memory store has today, and the shape Store
-// itself becomes once controld composes over the ports and the twin-typed
-// methods are deleted: the host's own persistence, the three control
-// repositories, and — until then — the old single-tenant surface every
-// handler and test still calls.
+// MemStore is the shape the in-memory store has: Store itself, now that Store
+// is the union of the host's own persistence, the three control repositories,
+// and the old single-tenant surface every test still seeds through. It stays
+// as its own name because every test helper is written in terms of it.
 type MemStore interface {
 	Store
-	HostStore
-	Repositories
 }
 
 // snapshotCheckpointFormat is the format every self-hosted environment
