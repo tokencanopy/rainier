@@ -232,6 +232,48 @@ func TestCreateSession(t *testing.T) {
 		}
 	})
 
+	// The create and the event describing it are one unit of work through the
+	// whole stack: one HTTP call leaves exactly one event about the session,
+	// carrying the placement generation the stored row opened. This runs over
+	// the in-memory store because it is the store the rest of this file uses;
+	// that the same rows reach SQL inside one transaction is pgstore_test.go's
+	// assertion, not this one's.
+	t.Run("the create and its event are one committed unit", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, tok := loginUser(t, st, "alice", "member")
+
+		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", tok,
+			map[string]any{"name": "dev1"}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202; body=%s", resp.StatusCode, raw)
+		}
+		var body sessionEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+
+		var about []control.Event
+		for _, e := range st.Events() {
+			if e.Resource.ID == body.Session.ID {
+				about = append(about, e)
+			}
+		}
+		if len(about) != 1 {
+			t.Fatalf("recorded %d events about the session, want exactly 1", len(about))
+		}
+		ev := about[0]
+		if ev.Action != control.ActionCreate || ev.Resource.Kind != control.ResourceSession {
+			t.Errorf("event = %s %s, want create session", ev.Action, ev.Resource.Kind)
+		}
+		if ev.WorkspaceID != installWorkspace || ev.Resource.WorkspaceID != installWorkspace {
+			t.Errorf("event workspace = %q/%q, want %q", ev.WorkspaceID, ev.Resource.WorkspaceID, installWorkspace)
+		}
+		if ev.PlacementGeneration != 1 {
+			t.Errorf("placement generation = %d, want 1 (the generation the create opened)", ev.PlacementGeneration)
+		}
+	})
+
 	t.Run("unknown field is 400 invalid_request", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")

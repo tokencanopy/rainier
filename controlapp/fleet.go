@@ -43,7 +43,8 @@ type FleetOptions struct {
 	DefaultInitTimeoutSec  int
 
 	// UnitOfWork is the host's atomicity: a runner event's transition and the
-	// event recording it are one fact. Nothing in this task opens a unit yet.
+	// event recording it are one fact, committed together by one Run. Wake
+	// follows the commit, never precedes it.
 	UnitOfWork control.UnitOfWork
 
 	// Checkpoints is the host's knowledge of where a checkpoint can boot. The
@@ -632,7 +633,9 @@ var _ control.Fleet = (*FleetService)(nil)
 
 // ApplyRunnerEvent applies one unsolicited runner lifecycle report. Identity
 // and generation are fenced before any state logic or event record; a
-// mismatch available in this contract returns ErrStale with no effects.
+// mismatch available in this contract returns ErrStale with no effects. The
+// accepted mutation and the event describing it commit in one unit of work,
+// and the pool is woken only after that unit commits.
 func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.RunnerEvent) error {
 	if event.WorkspaceID == "" || event.PoolID == "" || event.RunnerID == "" || event.SessionID == "" {
 		return control.ErrInvalid
@@ -704,13 +707,15 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 			// A different exit code contradicts the recorded one.
 			return control.ErrConflict
 		}
-		if err := s.sessions.SetChildExitCode(ctx, event.WorkspaceID, event.SessionID, *event.ChildExitCode); err != nil {
-			if errors.Is(err, control.ErrNotFound) {
-				return control.ErrStale
+		return s.uow.Run(ctx, func(ctx context.Context) error {
+			if err := s.sessions.SetChildExitCode(ctx, event.WorkspaceID, event.SessionID, *event.ChildExitCode); err != nil {
+				if errors.Is(err, control.ErrNotFound) {
+					return control.ErrStale
+				}
+				return portError(err)
 			}
-			return portError(err)
-		}
-		return s.recordLifecycleEvent(ctx, event, row, eventID)
+			return s.recordLifecycleEvent(ctx, event, row, eventID)
+		})
 	}
 
 	target := event.State
@@ -726,31 +731,44 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 		reason := runnerReportedDead
 		opts.Error = &reason
 	}
-	err = s.sessions.Transition(ctx, event.WorkspaceID, event.SessionID, eventTransitions[target], target, opts)
-	switch {
-	case err == nil:
-		s.Wake(event.PoolID)
-		return s.recordLifecycleEvent(ctx, event, row, eventID)
-	case errors.Is(err, control.ErrConflict):
-		// A conflict because an identical event already applied is success;
-		// any other conflict remains ErrConflict.
-		cur, gerr := s.sessions.GetSession(ctx, event.WorkspaceID, event.SessionID)
-		if gerr == nil && cur.State == target {
-			return nil
+	// The state change and the fact recording it are one unit: a crash
+	// between them would leave a session whose history skips the very
+	// transition that moved it. The scheduler is woken only after the unit
+	// commits.
+	applied := false
+	if err := s.uow.Run(ctx, func(ctx context.Context) error {
+		terr := s.sessions.Transition(ctx, event.WorkspaceID, event.SessionID, eventTransitions[target], target, opts)
+		switch {
+		case terr == nil:
+			applied = true
+			return s.recordLifecycleEvent(ctx, event, row, eventID)
+		case errors.Is(terr, control.ErrConflict):
+			// A conflict because an identical event already applied is
+			// success; any other conflict remains ErrConflict.
+			cur, gerr := s.sessions.GetSession(ctx, event.WorkspaceID, event.SessionID)
+			if gerr == nil && cur.State == target {
+				return nil
+			}
+			return control.ErrConflict
+		case errors.Is(terr, control.ErrNotFound):
+			return control.ErrStale
+		default:
+			return portError(terr)
 		}
-		return control.ErrConflict
-	case errors.Is(err, control.ErrNotFound):
-		return control.ErrStale
-	default:
-		return portError(err)
+	}); err != nil {
+		return err
 	}
+	if applied {
+		s.Wake(event.PoolID)
+	}
+	return nil
 }
 
-// recordLifecycleEvent records one provider-neutral service fact after an
-// accepted mutation. The runner's free text never reaches an Event: it is
-// bounded into the session's own error column only. A recorder that fails
-// surfaces ErrUnavailable rather than silently discarding the accepted
-// mutation's event.
+// recordLifecycleEvent records one provider-neutral service fact for a
+// mutation made in the same unit of work, on the ctx that unit handed it. The
+// runner's free text never reaches an Event: it is bounded into the session's
+// own error column only. A recorder that fails surfaces ErrUnavailable, which
+// fails the unit and rolls the mutation back with it.
 func (s *FleetService) recordLifecycleEvent(ctx context.Context, event control.RunnerEvent, row control.Session, eventID control.EventID) error {
 	if err := s.events.Record(ctx, control.Event{
 		ID:          eventID,
@@ -764,6 +782,11 @@ func (s *FleetService) recordLifecycleEvent(ctx context.Context, event control.R
 			CreatorID:   row.CreatorID,
 		},
 		At: s.clock.Now(),
+		// The generation the row holds after the mutation. No lifecycle
+		// transition in eventTransitions names a runner — only a placement
+		// does, and a runner report is never one — so the row read before the
+		// transition still carries the value it has after it.
+		PlacementGeneration: row.PlacementGeneration,
 	}); err != nil {
 		return control.ErrUnavailable
 	}

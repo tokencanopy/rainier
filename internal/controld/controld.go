@@ -235,11 +235,15 @@ func (s *Server) compose() error {
 		envs     = s.st.Environments()
 		fleet    = s.st.Fleet()
 		pools    = installationPools{st: s.st}
-		events   = logRecorder{}
 		clock    = systemClock{}
 		ids      = idGenerator{}
-		uow      = directUnitOfWork{}
 		ckpts    = pinnedCheckpoints{st: s.st}
+		// The store is both the host's atomicity and its event record: an
+		// event lands in the same transaction as the mutation it describes,
+		// which is what makes it a fact rather than a hope. Passing anything
+		// else here would put the two writes in different units.
+		events control.EventRecorder = s.st
+		uow    control.UnitOfWork    = s.st
 	)
 	fleetSvc, err := controlapp.NewFleetService(controlapp.FleetOptions{
 		Authorizer: auth, Sessions: sessions, Environments: envs, Fleet: fleet, Pools: pools,

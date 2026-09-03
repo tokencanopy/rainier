@@ -252,9 +252,11 @@ func (s *AttachmentService) PushWorkspace(ctx context.Context, scope control.Sco
 			break
 		}
 	}
-	if err := s.record(ctx, eventID, scope, control.ActionPush, control.Resource{
-		Kind: control.ResourceSession, WorkspaceID: row.WorkspaceID,
-		ID: string(row.ID), CreatorID: row.CreatorID,
+	if err := s.uow.Run(ctx, func(ctx context.Context) error {
+		return s.record(ctx, eventID, scope, control.ActionPush, control.Resource{
+			Kind: control.ResourceSession, WorkspaceID: row.WorkspaceID,
+			ID: string(row.ID), CreatorID: row.CreatorID,
+		}, row.PlacementGeneration)
 	}); err != nil {
 		return err
 	}
@@ -314,9 +316,11 @@ func (s *AttachmentService) PullWorkspace(ctx context.Context, scope control.Sco
 			break
 		}
 	}
-	if err := s.record(ctx, eventID, scope, control.ActionPull, control.Resource{
-		Kind: control.ResourceSession, WorkspaceID: row.WorkspaceID,
-		ID: string(row.ID), CreatorID: row.CreatorID,
+	if err := s.uow.Run(ctx, func(ctx context.Context) error {
+		return s.record(ctx, eventID, scope, control.ActionPull, control.Resource{
+			Kind: control.ResourceSession, WorkspaceID: row.WorkspaceID,
+			ID: string(row.ID), CreatorID: row.CreatorID,
+		}, row.PlacementGeneration)
 	}); err != nil {
 		return err
 	}

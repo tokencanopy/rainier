@@ -25,8 +25,10 @@ type AttachmentOptions struct {
 	Clock      control.Clock
 	IDs        control.IDGenerator
 	// UnitOfWork is the host's atomicity: an attachment's event is a write
-	// like any other and commits with what it describes. Nothing in this task
-	// opens a unit yet.
+	// like any other and commits inside one Run. The effect it describes is a
+	// transport call rather than a store write, so it stays outside the unit
+	// — the unit holds every store write the operation makes, which here is
+	// the event alone.
 	UnitOfWork control.UnitOfWork
 	// MaxTransferBytes bounds one push or pull's compressed bytes. Zero means
 	// workspace.MaxBytes; a negative value is control.ErrInvalid. Hosts lower
@@ -214,7 +216,9 @@ func (s *AttachmentService) AttachTerminal(ctx context.Context, scope control.Sc
 		_ = stream.Close(control.ErrUnavailable)
 		return control.ErrUnavailable
 	}
-	if err := s.record(ctx, eventID, scope, control.ActionAttach, resource); err != nil {
+	if err := s.uow.Run(ctx, func(ctx context.Context) error {
+		return s.record(ctx, eventID, scope, control.ActionAttach, resource, row.PlacementGeneration)
+	}); err != nil {
 		return err
 	}
 	return nil
@@ -233,20 +237,25 @@ func (s *AttachmentService) newEvent() (control.EventID, error) {
 }
 
 // record writes one provider-neutral event for an already-accepted operation
-// using an ID minted before the operation ran. Recording is not yet atomic
-// with the attach/push/pull effect: a recorder failure surfaces as
-// control.ErrUnavailable after the effect is accepted, and until the
-// transactional-outbox plan lands a crash between the effect and the recorded
-// event can still lose the event. Events and errors never carry terminal,
-// workspace, or path content.
-func (s *AttachmentService) record(ctx context.Context, id control.EventID, scope control.Scope, action control.Action, resource control.Resource) error {
+// using an ID minted before the operation ran. Callers run it inside a
+// UnitOfWork.Run and hand it that unit's ctx, so the event is the whole of
+// what the operation commits — the attach/push/pull effect itself is a
+// transport call, not a store write, and no unit can roll a delivered byte
+// back. A recorder failure is control.ErrUnavailable. Events and errors never
+// carry terminal, workspace, or path content.
+//
+// placementGeneration is the session's, so an attach or a transfer is
+// attributed to exactly one placement of the session it touched.
+func (s *AttachmentService) record(ctx context.Context, id control.EventID, scope control.Scope,
+	action control.Action, resource control.Resource, placementGeneration uint64) error {
 	if err := s.events.Record(ctx, control.Event{
-		ID:          id,
-		WorkspaceID: scope.WorkspaceID,
-		ActorID:     scope.Actor.ID,
-		Action:      action,
-		Resource:    resource,
-		At:          s.clock.Now(),
+		ID:                  id,
+		WorkspaceID:         scope.WorkspaceID,
+		ActorID:             scope.Actor.ID,
+		Action:              action,
+		Resource:            resource,
+		At:                  s.clock.Now(),
+		PlacementGeneration: placementGeneration,
 	}); err != nil {
 		return control.ErrUnavailable
 	}

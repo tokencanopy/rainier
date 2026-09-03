@@ -16,9 +16,9 @@ type EnvironmentOptions struct {
 	Events       control.EventRecorder
 	Clock        control.Clock
 	IDs          control.IDGenerator
-	// UnitOfWork is the host's atomicity, held for the same reason
-	// SessionOptions holds one: an environment write and its event are one
-	// fact. Nothing in this task opens a unit yet.
+	// UnitOfWork is the host's atomicity, used for the same reason
+	// SessionOptions uses one: an environment write and its event are one
+	// fact, and they commit together or not at all.
 	UnitOfWork control.UnitOfWork
 }
 
@@ -89,18 +89,26 @@ func (s *EnvironmentService) CreateEnvironment(ctx context.Context, scope contro
 		UpdatedAt:       now,
 	}
 
-	stored, err := s.environments.CreateEnvironment(ctx, scope.WorkspaceID, row)
-	if err != nil {
-		switch {
-		case errors.Is(err, control.ErrConflict):
-			return control.Environment{}, control.ErrConflict
-		case errors.Is(err, control.ErrNotFound):
-			return control.Environment{}, control.ErrNotFound
-		default:
-			return control.Environment{}, control.ErrUnavailable
+	// The row and its event are one fact, written in one unit of work. An
+	// event about an environment carries no placement generation: an
+	// environment is a template, never a placement.
+	var stored control.Environment
+	if err := s.uow.Run(ctx, func(ctx context.Context) error {
+		var err error
+		stored, err = s.environments.CreateEnvironment(ctx, scope.WorkspaceID, row)
+		if err != nil {
+			switch {
+			case errors.Is(err, control.ErrConflict):
+				return control.ErrConflict
+			case errors.Is(err, control.ErrNotFound):
+				return control.ErrNotFound
+			default:
+				return control.ErrUnavailable
+			}
 		}
-	}
-	if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionCreate, environmentResource(stored)); err != nil {
+		return recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionCreate,
+			environmentResource(stored), 0)
+	}); err != nil {
 		return control.Environment{}, err
 	}
 	return sessionCloneEnvironment(stored), nil
@@ -204,18 +212,23 @@ func (s *EnvironmentService) UpdateEnvironment(ctx context.Context, scope contro
 	}
 	next.SetupHash = setupHash(next.Image, next.Setup)
 
-	stored, err := s.environments.UpdateEnvironment(ctx, scope.WorkspaceID, next)
-	if err != nil {
-		switch {
-		case errors.Is(err, control.ErrConflict):
-			return control.Environment{}, control.ErrConflict
-		case errors.Is(err, control.ErrNotFound):
-			return control.Environment{}, control.ErrNotFound
-		default:
-			return control.Environment{}, control.ErrUnavailable
+	var stored control.Environment
+	if err := s.uow.Run(ctx, func(ctx context.Context) error {
+		var err error
+		stored, err = s.environments.UpdateEnvironment(ctx, scope.WorkspaceID, next)
+		if err != nil {
+			switch {
+			case errors.Is(err, control.ErrConflict):
+				return control.ErrConflict
+			case errors.Is(err, control.ErrNotFound):
+				return control.ErrNotFound
+			default:
+				return control.ErrUnavailable
+			}
 		}
-	}
-	if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionUpdate, environmentResource(stored)); err != nil {
+		return recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionUpdate,
+			environmentResource(stored), 0)
+	}); err != nil {
 		return control.Environment{}, err
 	}
 	return sessionCloneEnvironment(stored), nil
@@ -247,13 +260,16 @@ func (s *EnvironmentService) DeleteEnvironment(ctx context.Context, scope contro
 	if n != 0 {
 		return control.ErrConflict
 	}
-	if err := s.environments.DeleteEnvironment(ctx, scope.WorkspaceID, cmd.ID); err != nil {
-		if errors.Is(err, control.ErrNotFound) {
-			return control.ErrNotFound
+	return s.uow.Run(ctx, func(ctx context.Context) error {
+		if err := s.environments.DeleteEnvironment(ctx, scope.WorkspaceID, cmd.ID); err != nil {
+			if errors.Is(err, control.ErrNotFound) {
+				return control.ErrNotFound
+			}
+			return control.ErrUnavailable
 		}
-		return control.ErrUnavailable
-	}
-	return recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionDelete, environmentResource(row))
+		return recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionDelete,
+			environmentResource(row), 0)
+	})
 }
 
 // environmentResource names the environment an authorization decision is
