@@ -49,7 +49,13 @@ GitHub-login roles as the authorizer, the vault as launch material, the runner
 websocket as the transport, dial-back pairing as the attach broker — and keeps
 only what is genuinely host-specific: HTTP/WebSocket handling, GitHub login,
 secrets, and the sandbox's upward credential request. Rainier Cloud composes
-the same `controlapp` with its own adapters.
+the same `controlapp` with its own adapters. Three more public packages
+carry what a host needs beyond the services: [`runnerplane`](runnerplane/doc.go)
+(the runner WebSocket endpoint, generation fencing, dispatch correlation),
+[`attachplane`](attachplane/doc.go) (the terminal attach handshake and
+splice), and [`v0wire`](v0wire/doc.go) (the `/v0/` JSON shapes and the
+status table), each behind a small host interface that self-hosted
+`controld` implements exactly as a hosted cell does.
 
 ## Quickstart
 

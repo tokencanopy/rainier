@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Publish the last OSS pieces a hosted regional cell needs and cannot get from `control`/`controlapp` today — the runner plane, the attach plane, the `/v0/` wire shapes, and hosted login in the CLI — as public packages that self-hosted `controld` composes exactly as the cell will, and tag `v0.1.0`.
+**Goal:** Publish the last OSS pieces a hosted regional cell needs and cannot get from `control`/`controlapp` today — the runner plane, the attach plane, the `/v0/` wire shapes, and hosted login in the CLI — as public packages that self-hosted `controld` composes exactly as the cell will, and tag `v0.0.2`.
 
 **Architecture:** Everything a cell needs already exists in `internal/controld`, coupled to `Server`. This plan extracts three packages behind small host interfaces and recomposes controld over them: `runnerplane` (the runner WebSocket endpoint, connection registry, dispatch correlation, generation mint and fence, capability acceptance, event translation), `attachplane` (the dial-back pairing, the terminal splice, the WebSocket terminal stream), and `v0wire` (the JSON views, request bodies, validators, and the closed sentinel→status table of `/v0/`). The CLI learns the hosted passwordless login and named contexts so one `rainier` binary talks to a self-hosted controld or a hosted cell. No behavior on the self-hosted wire changes; the live-fleet e2e is the proof.
 
 **Tech Stack:** Go 1.25, `coder/websocket`, `control`, `controlapp`, `protocol/{runner,terminal,workspace}`, `internal/relay` (importable by these packages: they live in the same module).
 
-**Spec:** `rainier-cloud/docs/architecture/adr-0001-oss-cloud-composition.md` — "OSS application-service boundary" ("HTTP routing … remain outside the application service": the routing stays with each host; the wire *shapes* and the runner/attach *protocol handling* are behavior the ADR gives the OSS, since Cloud "operates hosted endpoints" and must not copy protocol handling), "Responsibility boundary" (runner registration/reconciliation: OSS owns contract and behavior; attach orchestration: OSS owns), "Versioning and rollout compatibility"; `rainier-cloud/docs/architecture/adr-0002-gcp-v0-provider-architecture.md` "Cell gateway" (terminates hosted runner streams and terminal attach); `rainier-cloud/docs/superpowers/plans/2026-08-30-hosted-implementation-program.md` Wave 6 (worker C: gateway primitives) and gate O10; PRD §7 (CLI-first login journey), §14 (the CLI is the supported contract). This is OSS plan #10; the hosted lifecycle canary (rainier-cloud) consumes `v0.1.0`.
+**Spec:** `rainier-cloud/docs/architecture/adr-0001-oss-cloud-composition.md` — "OSS application-service boundary" ("HTTP routing … remain outside the application service": the routing stays with each host; the wire *shapes* and the runner/attach *protocol handling* are behavior the ADR gives the OSS, since Cloud "operates hosted endpoints" and must not copy protocol handling), "Responsibility boundary" (runner registration/reconciliation: OSS owns contract and behavior; attach orchestration: OSS owns), "Versioning and rollout compatibility"; `rainier-cloud/docs/architecture/adr-0002-gcp-v0-provider-architecture.md` "Cell gateway" (terminates hosted runner streams and terminal attach); `rainier-cloud/docs/superpowers/plans/2026-08-30-hosted-implementation-program.md` Wave 6 (worker C: gateway primitives) and gate O10; PRD §7 (CLI-first login journey), §14 (the CLI is the supported contract). This is OSS plan #10; the hosted lifecycle canary (rainier-cloud) consumes `v0.0.2`.
 
 ## Global Constraints
 
@@ -234,12 +234,12 @@ type Config struct {
 
 ---
 
-### Task 5: Docs, the live-fleet proof, and `v0.1.0` (reviewer)
+### Task 5: Docs, the live-fleet proof, and `v0.0.2` (reviewer)
 
 - `README.md`, `docs/deploy-gce.md`: contexts, `login --cloud`; the three packages in the "public Go surface" list.
 - `scripts/check-public-control.sh`: hygiene for the three packages.
 - Live-fleet e2e on the fleet VM from the integration branch, every scene.
-- Tag `v0.1.0` with release notes naming the three packages and the CLI change; the external-import proof extends to `runnerplane`, `attachplane`, `v0wire`.
+- Tag `v0.0.2` with release notes naming the three packages and the CLI change; the external-import proof extends to `runnerplane`, `attachplane`, `v0wire`.
 
 ## Acceptance
 
