@@ -8,12 +8,14 @@ package runner
 import "encoding/json"
 
 // ProtocolVersion is the wire version a runner announces and controld checks
-// before it accepts any command from that connection. It is fixed at 1:
-// capability negotiation and a rolling-version window are deferred to a
-// later plan, so version 1 does not itself negotiate anything. An announce
-// whose value controld does not speak is fatal to the connection: controld
-// closes it with a close reason naming both the announced and the expected
-// version.
+// before it accepts any command from that connection. It is 1: capability
+// negotiation rides on additive fields of this version — a runner announces
+// its capabilities and controld answers with an accept naming the generation
+// and the capabilities it took — so a runner that sends none is judged
+// exactly as before, and a rolling-version window is still deferred to the
+// compatibility ADR. An announce whose value controld does not speak is
+// fatal to the connection: controld closes it with a close reason naming
+// both the announced and the expected version.
 const ProtocolVersion = 1
 
 // RPCEnvelope is one message of the session RPC — the bidirectional

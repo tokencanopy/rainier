@@ -106,7 +106,9 @@ row. 0008 is a contract step: it drops the `sessions.resolved_image` and
 defaults with them, so an older controld cannot write to the migrated
 database. If the installation has state worth keeping, rehearse it: take a
 `pg_dump` before the upgrade, then restore that dump onto a scratch database
-and start the new controld against it first.
+and start the new controld against it first. 0009 adds the `events` table:
+every lifecycle change writes its provider-neutral event in the same
+transaction as the row it describes; nothing in this release reads it back.
 
 ## 4. controld
 
@@ -173,6 +175,7 @@ starts runnerd. Setting `CONTROLD_URL` is what puts runnerd in dial mode:
 ```bash
 CONTROLD_URL=ws://rainier-1:9090 \
 RAINIER_RUNNER_TOKEN="$(cat ~/.rainier-runner-token)" \
+RAINIER_RUNNER_CAPABILITIES=gpu \
 RUNNER_NAME=rainier-1 \
   ./scripts/fleet-up.sh
 
@@ -181,6 +184,11 @@ grep 'connected' /tmp/controld.log     # → controld: runner rainier-1 connecte
 
 `fleet-up.sh` hands the token to runnerd through the environment, never as a
 flag — runnerd reads `RAINIER_RUNNER_TOKEN` itself — for the same reason.
+`RAINIER_RUNNER_CAPABILITIES` (comma-separated; or `--capability` repeated) is
+what this runner claims it can do: lowercase tokens such as `gpu`. An
+environment that requires a capability (`rainier env create --capability gpu`)
+only ever lands on a runner that announced it; leave it unset for a runner
+with nothing special to claim.
 
 Adding a second VM later is exactly steps 1, 2 and 5 with a different
 `RUNNER_NAME` and `CONTROLD_URL=ws://rainier-1:9090` — no controld config
