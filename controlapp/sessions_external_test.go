@@ -95,6 +95,9 @@ func (sessionExtSessionRepo) SetSessionSetupHash(context.Context, control.Worksp
 func (sessionExtSessionRepo) SetChildExitCode(context.Context, control.WorkspaceID, control.SessionID, int) error {
 	return nil
 }
+func (sessionExtSessionRepo) NextControllerGeneration(context.Context, control.WorkspaceID, control.SessionID) (uint64, error) {
+	return 0, control.ErrNotFound
+}
 
 type sessionExtEnvironmentRepo struct{}
 

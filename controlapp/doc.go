@@ -19,9 +19,9 @@
 // of an environment's build inputs. FleetService owns fleet truth and
 // within-pool scheduling, while injected adapters own connections,
 // persistence, eligible-pool policy, sensitive launch material, and provider
-// execution. AttachmentService resolves and authorizes a session, grants a
-// fenced controller generation, and delegates terminal transport to an
-// AttachmentBroker.
+// execution. AttachmentService resolves and authorizes a session, grants the
+// repository's next controller generation, and delegates terminal transport
+// to an AttachmentBroker.
 //
 // Terminal bytes stay opaque. This package never parses a socket, logs a
 // terminal message, persists terminal bytes, or duplicates the terminal

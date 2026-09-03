@@ -236,12 +236,28 @@ func (r *sessionStubSessionRepo) Transition(ctx context.Context, ws control.Work
 	s.State = to
 	if opts.RunnerID != nil {
 		s.RunnerID = *opts.RunnerID
+		// What the contract says a store does: a transition that names a
+		// runner is a placement, and a placement opens a generation.
+		if *opts.RunnerID != "" {
+			s.PlacementGeneration++
+		}
 	}
 	if opts.Error != nil {
 		s.Error = *opts.Error
 	}
 	r.rows[id] = s
 	return nil
+}
+
+func (r *sessionStubSessionRepo) NextControllerGeneration(ctx context.Context, ws control.WorkspaceID, id control.SessionID) (uint64, error) {
+	r.log.add("sessions:next-controller-generation")
+	s, ok := r.rows[id]
+	if !ok || s.WorkspaceID != ws {
+		return 0, control.ErrNotFound
+	}
+	s.ControllerGeneration++
+	r.rows[id] = s
+	return s.ControllerGeneration, nil
 }
 
 func (r *sessionStubSessionRepo) SetSessionSetupHash(ctx context.Context, ws control.WorkspaceID, id control.SessionID, hash string) error {
@@ -1160,6 +1176,37 @@ func TestResumeColdRequiresFreeCapacity(t *testing.T) {
 			t.Fatalf("state = %q, want running", got.State)
 		}
 	})
+}
+
+// TestColdResumeOpensANewPlacementGeneration pins PRD §9: a cold resume
+// starts a new sandbox, so it is a placement and names the row's own runner
+// in its transition; a warm resume unpauses the sandbox it has and names
+// none. The stub repository counts a generation per transition that names a
+// runner, exactly as the contract says a store must.
+func TestColdResumeOpensANewPlacementGeneration(t *testing.T) {
+	for _, tc := range []struct {
+		from    control.SessionState
+		wantGen uint64
+	}{
+		{control.StateSuspendedCold, 2},
+		{control.StateSuspendedWarm, 1},
+	} {
+		t.Run(string(tc.from), func(t *testing.T) {
+			f := newSessionFixtureFull(t)
+			f.fleet.runners = []control.Runner{{ID: "runner_a", PoolID: "pool_a", CapacityTotal: 4, CapacityUsed: 1, Connected: true}}
+			f.fleet.creatingOnRunner = map[string][]control.Session{}
+			f.repo.put(sessionInState(tc.from))
+
+			got, err := f.svc.ResumeSession(context.Background(), sessionTestScope(), control.ResumeSession{ID: "sess_example"})
+			if err != nil {
+				t.Fatalf("%s: %v", tc.from, err)
+			}
+			if got.PlacementGeneration != tc.wantGen || got.RunnerID != "runner_a" {
+				t.Fatalf("%s: generation %d on %q, want %d on runner_a",
+					tc.from, got.PlacementGeneration, got.RunnerID, tc.wantGen)
+			}
+		})
+	}
 }
 
 func TestSnapshotSession(t *testing.T) {

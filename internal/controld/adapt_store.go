@@ -324,11 +324,58 @@ func (g *runnerGenerations) current(name string) uint64 {
 }
 
 // ---------------------------------------------------------------------------
+// controller leases
+// ---------------------------------------------------------------------------
+
+// controllerLeases is the process-local controller generation table the
+// self-hosted adapter answers NextControllerGeneration from until the store
+// persists it (Task 2 of the workspace-scope plan). Keyed by session; a
+// restart starts every session over at 0, which is sound because every
+// attachment dies with the process.
+type controllerLeases struct {
+	mu  sync.Mutex
+	cur map[control.SessionID]uint64
+}
+
+// next opens a new controller generation for id and returns it: 1 for the
+// first controller, 2 for the next, and so on.
+func (l *controllerLeases) next(id control.SessionID) uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.cur == nil {
+		l.cur = make(map[control.SessionID]uint64)
+	}
+	l.cur[id]++
+	return l.cur[id]
+}
+
+// current reports id's controller generation, 0 when no controller has
+// attached to it in this process.
+func (l *controllerLeases) current(id control.SessionID) uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.cur[id]
+}
+
+// ---------------------------------------------------------------------------
 // sessions
 // ---------------------------------------------------------------------------
 
-// storeSessions is control.SessionRepository over Store.
-type storeSessions struct{ st Store }
+// storeSessions is control.SessionRepository over Store, plus the
+// process-local controller lease table the store has no column for.
+type storeSessions struct {
+	st     Store
+	leases *controllerLeases
+}
+
+// generation reports a session's controller generation, 0 when no lease
+// table is wired (nothing has taken control in this process).
+func (r storeSessions) generation(id control.SessionID) uint64 {
+	if r.leases == nil {
+		return 0
+	}
+	return r.leases.current(id)
+}
 
 func (r storeSessions) CreateSession(ctx context.Context, ws control.WorkspaceID, s control.Session) (control.Session, error) {
 	if ws != installWorkspace {
@@ -355,7 +402,9 @@ func (r storeSessions) GetSession(ctx context.Context, ws control.WorkspaceID, i
 	if err != nil {
 		return control.Session{}, storeErr(err)
 	}
-	return sessionToControl(row), nil
+	c := sessionToControl(row)
+	c.ControllerGeneration = r.generation(id)
+	return c, nil
 }
 
 func (r storeSessions) SessionByIDem(ctx context.Context, ws control.WorkspaceID, creator control.ActorID, key string) (control.Session, error) {
@@ -389,7 +438,11 @@ func (r storeSessions) ListSessions(ctx context.Context, ws control.WorkspaceID,
 		}
 		return nil, "", storeErr(err)
 	}
-	return sessionsToControl(rows), next, nil
+	out := sessionsToControl(rows)
+	for i := range out {
+		out[i].ControllerGeneration = r.generation(out[i].ID)
+	}
+	return out, next, nil
 }
 
 func (r storeSessions) Transition(ctx context.Context, ws control.WorkspaceID, id control.SessionID, from []control.SessionState, to control.SessionState, opts control.TransitionOpts) error {
@@ -416,6 +469,26 @@ func (r storeSessions) SetChildExitCode(ctx context.Context, ws control.Workspac
 		return control.ErrNotFound
 	}
 	return storeErr(r.st.SetChildExitCode(ctx, string(id), code))
+}
+
+// NextControllerGeneration advances id's controller generation in the
+// process-local table, after confirming through the store that the session
+// exists: the table is not authority over a session's existence, the store
+// is, and a generation for a row that is gone would be authority over
+// nothing.
+func (r storeSessions) NextControllerGeneration(ctx context.Context, ws control.WorkspaceID, id control.SessionID) (uint64, error) {
+	if ws != installWorkspace {
+		return 0, control.ErrNotFound
+	}
+	if _, err := r.st.GetSession(ctx, string(id)); err != nil {
+		return 0, storeErr(err)
+	}
+	if r.leases == nil {
+		// A repository composed without a lease table cannot hand out
+		// authority; refusing is the only safe answer.
+		return 0, control.ErrUnavailable
+	}
+	return r.leases.next(id), nil
 }
 
 // ---------------------------------------------------------------------------

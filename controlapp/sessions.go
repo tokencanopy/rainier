@@ -505,7 +505,9 @@ func (s *SessionService) SuspendSession(ctx context.Context, scope control.Scope
 
 // ResumeSession accepts only a warm/cold suspended session. A cold resume must
 // fit on the runner already holding the volume; dispatch precedes the guarded
-// transition back to running.
+// transition back to running. A cold resume is a placement: it names the
+// session's runner again so the repository opens a new generation for the
+// sandbox it starts; a warm resume unpauses the sandbox it has.
 func (s *SessionService) ResumeSession(ctx context.Context, scope control.Scope, cmd control.ResumeSession) (control.Session, error) {
 	if err := scope.Validate(); err != nil {
 		return control.Session{}, control.ErrInvalid
@@ -537,7 +539,14 @@ func (s *SessionService) ResumeSession(ctx context.Context, scope control.Scope,
 	if _, err := s.dispatch(ctx, row, runner.ToRunner{Type: "resume", Session: string(row.ID)}); err != nil {
 		return control.Session{}, err
 	}
-	if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, []control.SessionState{row.State}, control.StateRunning, control.TransitionOpts{}); err != nil {
+	// A cold resume starts a new sandbox on the runner that holds the volume,
+	// so its transition names that runner and the repository opens a new
+	// placement generation for it; a warm resume names none.
+	opts := control.TransitionOpts{}
+	if row.State == control.StateSuspendedCold {
+		opts.RunnerID = &row.RunnerID
+	}
+	if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, []control.SessionState{row.State}, control.StateRunning, opts); err != nil {
 		if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
 			return control.Session{}, control.ErrUnavailable
 		}

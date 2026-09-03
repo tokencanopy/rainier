@@ -418,6 +418,9 @@ func (fakeSessionRepository) SetSessionSetupHash(context.Context, control.Worksp
 func (fakeSessionRepository) SetChildExitCode(context.Context, control.WorkspaceID, control.SessionID, int) error {
 	return nil
 }
+func (fakeSessionRepository) NextControllerGeneration(context.Context, control.WorkspaceID, control.SessionID) (uint64, error) {
+	return 0, nil
+}
 
 type fakeEnvironmentRepository struct{}
 
