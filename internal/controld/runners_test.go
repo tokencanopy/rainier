@@ -2083,3 +2083,48 @@ func TestCreateCarriesThePlacementGeneration(t *testing.T) {
 		t.Fatalf("create PlacementGeneration = %d, want the row's %d", cmd.PlacementGeneration, row.PlacementGeneration)
 	}
 }
+
+// TestConnectRunnerRefusalDoesNotCloseTheWinningConn pins the ordering
+// connectRunner must hold: a reconnect the fleet service is about to refuse
+// must never take down the connection that already holds the accepted
+// generation. Before #36 registerRunner ran before the fleet check, so a
+// delayed, lower-generation redial reaching connectRunner after a newer one
+// had already registered swapped itself in and closed the accepted connection
+// on its way to being refused itself, leaving that runner disconnected until
+// its next redial.
+func TestConnectRunnerRefusalDoesNotCloseTheWinningConn(t *testing.T) {
+	s, st, ts := newTestControld(t)
+
+	joinRunner(t, s, ts, runnerScript{Name: "runner-a", Total: 4}) // generation 1
+	joinRunner(t, s, ts, runnerScript{Name: "runner-a", Total: 4}) // generation 2, replaces gen 1 normally
+
+	live := s.conn("runner-a")
+	if live == nil {
+		t.Fatal("runner-a has no live connection")
+	}
+	// The generation is the store's (plan 7): read it back from the fleet row.
+	rows, err := st.Fleet().ListRunners(context.Background(), installPool)
+	if err != nil || len(rows) != 1 || rows[0].Generation != 2 {
+		t.Fatalf("live generation: rows = %+v, err = %v; want runner-a at generation 2", rows, err)
+	}
+
+	// A redial that was assigned generation 1 before the reconnect above but
+	// only now reaches connectRunner, e.g. because its own handshake was
+	// slow. The fleet service must refuse it: generation 1 is superseded.
+	stale := newRunnerConn("runner-a", nil)
+	stale.gen = 1
+
+	err = s.connectRunner(context.Background(), stale, runner.FromRunner{Total: 4})
+	if !errors.Is(err, errRegistrationRefused) {
+		t.Fatalf("connectRunner(stale gen 1) error = %v, want errRegistrationRefused", err)
+	}
+
+	select {
+	case <-live.done:
+		t.Fatal("the live (accepted, generation 2) connection was closed by a reconnect attempt the fleet service went on to refuse")
+	default:
+	}
+	if got := s.conn("runner-a"); got != live {
+		t.Fatalf("s.conn(runner-a) = %p, want the still-live connection %p: a refused reconnect replaced it in the registry", got, live)
+	}
+}

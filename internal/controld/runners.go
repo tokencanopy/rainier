@@ -257,9 +257,9 @@ func (s *Server) handleRunnerConnect(w http.ResponseWriter, r *http.Request) {
 		writerDone.Wait()
 	}()
 	if connErr != nil {
-		// connectRunner registers before it calls the service, so rc is in
-		// the map even now; the deferred retire above is what takes it back
-		// out.
+		// A refused claim was never installed as the live connection (#36),
+		// so the deferred retire above finds rc is not current and leaves
+		// the accepted connection — if any — untouched.
 		log.Printf("controld: registering runner %s (generation %d): %v", name, rc.gen, connErr)
 		closeRunner(c, websocket.StatusInternalError, "registration refused")
 		return
@@ -909,8 +909,8 @@ func (s *Server) nameLock(name string) *sync.Mutex {
 // holds. It says nothing the runner supplied.
 var errRegistrationRefused = errors.New("registration refused")
 
-// connectRunner installs rc as the live connection for its runner and
-// registers the generation it claims with the fleet service, both under the
+// connectRunner registers the generation rc claims with the fleet service
+// before installing it as the runner's live connection, both under the
 // runner's name lock so that a connection being retired at this same instant
 // either writes its disconnect before us or (seeing itself replaced) not at
 // all. The row write itself is the service's; the capabilities a runner
@@ -928,13 +928,12 @@ func (s *Server) connectRunner(ctx context.Context, rc *runnerConn, ann runner.F
 	nl.Lock()
 	defer nl.Unlock()
 
-	// The host's two spellings of this runner's own name first, then what the
+	// The host's spelling of this runner's own name first, then what the
 	// runner claims about itself. One list, two authors, and the order says
 	// which is which. Kept on the connection so the heartbeat writes the same
 	// list this registration did.
 	rc.caps = append(runnerCapabilities(rc.name), ann.Capabilities...)
 
-	s.registerRunner(rc)
 	reg, err := s.fleet.RegisterRunner(ctx, control.RunnerRegistration{
 		WorkspaceID: installWorkspace, PoolID: installPool,
 		RunnerID:      control.RunnerID(rc.name),
@@ -950,6 +949,13 @@ func (s *Server) connectRunner(ctx context.Context, rc *runnerConn, ann runner.F
 	case !reg.Accepted:
 		return fmt.Errorf("%w: the fleet holds generation %d", errRegistrationRefused, reg.Generation)
 	}
+	// Only a claim the fleet accepted becomes the live connection. Swapping
+	// the socket in first would close whatever it replaces — possibly an
+	// already-accepted, higher-generation connection — on the way to being
+	// refused itself, leaving the runner fully disconnected until its next
+	// redial (#36).
+	s.registerRunner(rc)
+
 	// The answer to the announce, and the first thing this runner hears:
 	// the generation it acts under, and the capabilities controld took from
 	// it. Enqueued while the registration still holds the name lock and
