@@ -112,15 +112,6 @@ func assertErrCode(t *testing.T, resp *http.Response, want string) {
 	}
 }
 
-// pendingAttaches reports how many pairings the table currently holds, read
-// under the table's own lock. In-package test access rather than a
-// production accessor nothing but a test would call.
-func pendingAttaches(s *Server) int {
-	s.attaches.mu.Lock()
-	defer s.attaches.mu.Unlock()
-	return len(s.attaches.m)
-}
-
 func writeClient(t *testing.T, c *websocket.Conn, m terminal.ClientMessage) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -309,7 +300,7 @@ func newAttachFixture(t *testing.T) *attachFixture {
 // resize sizes the FrameOpen and is NOT forwarded again as a client frame).
 func TestAttachEndToEnd(t *testing.T) {
 	fx := newAttachFixture(t)
-	s, ts, sd := fx.s, fx.ts, fx.sd
+	ts, sd := fx.ts, fx.sd
 
 	cli, resp, err := dialAttach(t, ts, fx.id, "?since=7", fx.tok)
 	if err != nil {
@@ -355,12 +346,9 @@ func TestAttachEndToEnd(t *testing.T) {
 	if got := sd.nextClose(t); got != open.AttachID {
 		t.Fatalf("FrameClose for attach %d, want %d", got, open.AttachID)
 	}
-	eventually(t, 3*time.Second, func() error {
-		if n := pendingAttaches(s); n != 0 {
-			return fmt.Errorf("pairing table still holds %d entries", n)
-		}
-		return nil
-	})
+	// That the pairing itself drains is attachplane's own claim now
+	// (TestBrokerSplicesBothDirections): the table left this package with
+	// the broker, and controld holds no handle to it.
 }
 
 // TestAttachSessionDeathCascadesToClient is TestAttachEndToEnd's cascade run
@@ -396,12 +384,8 @@ func TestAttachSessionDeathCascadesToClient(t *testing.T) {
 	} else if readCtx.Err() != nil {
 		t.Fatalf("client socket never closed after the session conn died: %v", err)
 	}
-	eventually(t, 3*time.Second, func() error {
-		if n := pendingAttaches(fx.s); n != 0 {
-			return fmt.Errorf("pairing table still holds %d entries", n)
-		}
-		return nil
-	})
+	// The pairing's own drain is asserted where the table now lives
+	// (attachplane.TestBrokerSplicesBothDirections).
 }
 
 func TestAttachRequiresAuth(t *testing.T) {
@@ -475,9 +459,6 @@ func TestAttachAuthorization(t *testing.T) {
 			assertErrCode(t, resp, "forbidden")
 			if elapsed := time.Since(start); elapsed > 5*time.Second {
 				t.Fatalf("403 took %s: authorization must not be gated behind the attach wait", elapsed)
-			}
-			if n := pendingAttaches(s); n != 0 {
-				t.Fatalf("pairing table holds %d entries after a refused attach, want 0", n)
 			}
 		})
 	}
@@ -757,9 +738,9 @@ func TestAttachRequiresResizeFirst(t *testing.T) {
 		t.Fatalf("runner was asked to dial back for a rejected attach: %+v", cmd)
 	default:
 	}
-	if n := pendingAttaches(s); n != 0 {
-		t.Fatalf("pairing table holds %d entries after a rejected attach, want 0", n)
-	}
+	// A refused first message parks nothing, which is attachplane's claim
+	// against its own table (TestBrokerRefusesAFirstMessageThatIsNotResize);
+	// here the silent runner channel above is the observable half.
 }
 
 // TestPairingTTL pins the case the design's TTL exists for: the runner takes
@@ -818,9 +799,16 @@ func TestPairingTTL(t *testing.T) {
 	} else if readCtx.Err() != nil {
 		t.Fatalf("client socket never closed after the pairing TTL: %v", err)
 	}
+	// And the pairing is gone, observed the way a late runner observes it:
+	// the dial-back it was minted for is answered 404 rather than upgraded.
 	eventually(t, 3*time.Second, func() error {
-		if s.attaches.has(at.AttachID) {
-			return fmt.Errorf("pairing %s still in the table after its TTL", at.AttachID)
+		c, resp, err := dialAttachBack(t, ts, at.AttachID, testRunnerToken)
+		if err == nil {
+			c.CloseNow()
+			return fmt.Errorf("pairing %s still claimable after its TTL", at.AttachID)
+		}
+		if resp == nil || resp.StatusCode != http.StatusNotFound {
+			return fmt.Errorf("dial-back after the TTL = %+v (%v), want 404", resp, err)
 		}
 		return nil
 	})

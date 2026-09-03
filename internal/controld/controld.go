@@ -35,12 +35,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/tokencanopy/rainier/attachplane"
 	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/controlapp"
 )
@@ -122,12 +124,13 @@ type Server struct {
 	// never held while mu is.
 	runnerLocks map[string]*sync.Mutex
 
-	// attaches holds the attach pairings this replica is waiting on, keyed
-	// by attach_id — client sockets parked between the dial_attach sent to
-	// their runner and the dial-back that claims them (see attach.go). It
-	// has its own lock: pairing is per-socket and must never contend with
-	// the fleet-wide runner map.
-	attaches *attachTable
+	// attach is the dial-back attach plane: the pairings this replica is
+	// waiting on — client sockets parked between the dial_attach sent to
+	// their runner and the dial-back that claims them — behind the broker
+	// and the dial-back handler composed below. Its state is its own:
+	// pairing is per-socket and must never contend with the fleet-wide
+	// runner map.
+	attach *attachplane.Plane
 
 	// pushes holds the file uploads this replica is relaying, keyed by the
 	// client's own transfer id — one io.Pipe and one PushWorkspace call per
@@ -207,10 +210,12 @@ func New(st Store, cfg Config) (*Server, error) {
 		cfg:         cfg,
 		runners:     map[string]*runnerConn{},
 		runnerLocks: map[string]*sync.Mutex{},
-		attaches:    newAttachTable(),
 	}
 	s.transport = runnerTransport{srv: s}
-	s.broker = attachBroker{srv: s}
+	s.attach = attachplane.New(attachHost{s}, attachplane.Options{
+		PairTTL: cfg.AttachPairTTL, Logf: log.Printf,
+	})
+	s.broker = s.attach.Broker()
 	if err := s.compose(); err != nil {
 		return nil, err
 	}
@@ -295,7 +300,7 @@ func (s *Server) compose() error {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v0/runners/connect", s.handleRunnerConnect)
-	mux.HandleFunc("GET /v0/runners/attach-back", s.handleAttachBack)
+	mux.Handle("GET /v0/runners/attach-back", s.attach.BackHandler())
 	mux.HandleFunc("POST /v0/auth/github", s.handleGitHubAuth)
 	mux.HandleFunc("GET /v0/me", s.requireUser(s.handleMe))
 

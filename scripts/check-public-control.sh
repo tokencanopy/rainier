@@ -33,36 +33,61 @@ test -d v0wire
 test -f v0wire/doc.go
 go list ./v0wire >/dev/null
 
+test -d attachplane
+test -f attachplane/doc.go
+go list ./attachplane >/dev/null
+
+test -d runnerplane 2>/dev/null || { echo "runnerplane not present yet (Task 1 pending)"; }
+test -f runnerplane/doc.go 2>/dev/null || true
+go list ./runnerplane >/dev/null 2>&1 || true
+
 # ---------------------------------------------------------------------------
 # 1. import hygiene
 # ---------------------------------------------------------------------------
 # The same table is applied to every public application package — including
 # controlapp/repotest, the repository contract suite a hosted store must pass,
 # which is public precisely so a host outside this repository can run it, and
-# v0wire, the /v0/ JSON wire a hosted cell serves from its own router. The
-# failure message names which package pulled the forbidden import in.
+# v0wire (the /v0/ JSON wire a hosted cell serves from its own router), and
+# the two planes (attachplane, runnerplane). The failure message names which
+# package pulled the forbidden import in.
+#
+# Rows are relaxed only where a package's whole subject is the thing the row
+# forbids: net/http for the wire and the planes (v0wire renders responses and
+# decodes bodies; a plane IS an endpoint), WebSocket for the planes only, and
+# internal/relay for attachplane only — the runner side of the attach hop,
+# which attachplane's tests pin its own conn against (its shipped code does
+# not import it). Every other row applies to every package unchanged, and the
+# application packages above the wire and the planes get no relaxation.
 bad_imports=0
-for pkg in control controlapp controlapp/repotest v0wire; do
-  # The application contract is transport-neutral and must stay that way. The
-  # wire and plane packages are the exception the ADR names: their whole
-  # subject is an HTTP surface, so net/http is theirs to import (v0wire renders
-  # responses and decodes bodies) — and only net/http. Every other line of the
-  # table below applies to them unchanged.
-  http_ok=0
+for pkg in control controlapp controlapp/repotest v0wire attachplane runnerplane; do
+  http_ok=0; ws_ok=0; relay_ok=0
   case "$pkg" in
-    v0wire) http_ok=1 ;;
+    v0wire)      http_ok=1 ;;
+    attachplane) http_ok=1; ws_ok=1; relay_ok=1 ;;
+    runnerplane) http_ok=1; ws_ok=1 ;;
   esac
   while IFS= read -r imp; do
     [[ -z "$imp" ]] && continue
     lower="$(printf '%s' "$imp" | tr '[:upper:]' '[:lower:]')"
     case "$lower" in
-      *rainier/internal/*)   reason="internal/ path" ;;
+      *rainier/internal/relay)
+                             [[ "$pkg" == "attachplane" ]] && continue
+                             reason="internal/ path" ;;
+      *rainier/internal/*)
+        if [[ "$relay_ok" == "1" && "$lower" == *rainier/internal/relay ]]; then
+          continue
+        fi
+        reason="internal/ path" ;;
       *net/http*)
         if [[ "$http_ok" == "1" ]]; then
           continue
         fi
         reason="HTTP server" ;;
-      *coder/websocket*)     reason="WebSocket" ;;
+      *coder/websocket*)
+        if [[ "$ws_ok" == "1" ]]; then
+          continue
+        fi
+        reason="WebSocket" ;;
       *database/sql*)        reason="SQL" ;;
       *jackc/pgx*)           reason="pgx" ;;
       *docker*)              reason="Docker" ;;

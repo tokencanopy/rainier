@@ -3,114 +3,31 @@ package controld
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 
+	"github.com/tokencanopy/rainier/attachplane"
 	"github.com/tokencanopy/rainier/control"
-	"github.com/tokencanopy/rainier/internal/relay"
-	"github.com/tokencanopy/rainier/protocol/terminal"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 const (
-	// attachReadLimit matches runnerd's and sessiond's own read limits: a
-	// snapshot replaying a large scrollback is the biggest frame either
-	// direction of this splice ever carries.
-	attachReadLimit = 16 << 20
 	// attachPollInterval is how often the bounded wait re-reads a session
 	// row while waiting for it to reach `running`.
 	attachPollInterval = 100 * time.Millisecond
-	// attachFirstMsgTimeout bounds how long an upgraded-but-silent client
-	// may hold a socket before sending the resize the protocol requires
-	// first. Without it a client that connects and says nothing parks a
-	// goroutine and a file descriptor indefinitely.
-	attachFirstMsgTimeout = 15 * time.Second
 )
 
 // errSessionNotReady is waitRunning's answer when the session did not reach
 // `running` within the wait budget — or never will, because it is already
 // terminal. The route maps it to 503 `session_not_ready`.
 var errSessionNotReady = errors.New("session not ready")
-
-// ---------------------------------------------------------------------------
-// pairing table
-// ---------------------------------------------------------------------------
-
-// pendingAttach is one client socket parked between the dial_attach sent to
-// its runner and the dial-back that claims it.
-//
-// done is closed by whoever claims the entry — the dial-back once its splice
-// has finished, or the TTL timer when nobody ever came — and is what releases
-// the client handler. That handler must not return before then: returning
-// runs its deferred close on a socket the splice is still using.
-type pendingAttach struct {
-	stream control.TerminalStream
-	done   chan struct{}
-}
-
-// attachTable holds the pairings this replica is waiting on, keyed by
-// attach_id. The state is deliberately replica-local (design §6): the
-// dial-back's target_url names this exact replica, so no other one can be
-// asked to claim an entry, and a replica dying takes only its own live
-// attaches with it — clients re-attach, nothing else is lost.
-type attachTable struct {
-	mu sync.Mutex
-	m  map[string]*pendingAttach
-}
-
-func newAttachTable() *attachTable { return &attachTable{m: map[string]*pendingAttach{}} }
-
-// park registers pa under id, reporting false if that id is already parked
-// rather than overwriting it. An overwrite would orphan the previous client
-// on a `done` nobody holds any more — it would hang until its own handler's
-// TTL fired, and the TTL would then close a socket the table no longer knows
-// about. Ids are 8 random bytes, so a genuine collision is not a thing that
-// happens; a duplicate means something is wrong and the caller says so
-// loudly rather than papering over it.
-func (t *attachTable) park(id string, pa *pendingAttach) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if _, exists := t.m[id]; exists {
-		return false
-	}
-	t.m[id] = pa
-	return true
-}
-
-// claim removes and returns id's entry. The lookup and the removal are one
-// locked step, which is what makes ownership of a parked socket exclusive:
-// the dial-back and the TTL timer both race for it and exactly one wins, so
-// the socket is never closed by one while the other is splicing it, and
-// pendingAttach.done is never closed twice.
-func (t *attachTable) claim(id string) (*pendingAttach, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	pa, ok := t.m[id]
-	if ok {
-		delete(t.m, id)
-	}
-	return pa, ok
-}
-
-// has reports whether id is currently parked. It is a hint, not a claim: the
-// dial-back uses it to answer an expired attach_id with a plain HTTP 404
-// before upgrading. Claiming that early would be a bug — a failed upgrade
-// would then leave the client parked on a `done` nobody can ever close — so
-// claim, after the upgrade, stays authoritative.
-func (t *attachTable) has(id string) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	_, ok := t.m[id]
-	return ok
-}
 
 // ---------------------------------------------------------------------------
 // WS GET /v0/sessions/{id}/attach?since=
@@ -177,15 +94,14 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 		return // Accept has already answered the request
 	}
 	defer c.CloseNow()
-	c.SetReadLimit(attachReadLimit)
 
 	// From here the attach belongs to the attachment service: it re-checks
 	// authority and attachability against the authoritative row, fences the
 	// controller generation, and hands the stream to the broker, which parks
 	// it and asks the runner to dial back. Every answer left is a close
 	// reason, so a failure is closed rather than written.
-	stream := newWSTerminalStream(c)
-	ctx := withAttachSince(withUser(r.Context(), u), since)
+	stream := attachplane.ClientStream(c)
+	ctx := attachplane.WithSince(withUser(r.Context(), u), since)
 	err = s.attachments.AttachTerminal(ctx, userScope(u), control.AttachTerminal{
 		SessionID: control.SessionID(id),
 		Since:     since,
@@ -300,13 +216,43 @@ func (s *Server) failedButAttachable(row control.Session) bool {
 	return row.State == control.StateFailed && row.RunnerID != "" && s.runnerConnected(string(row.RunnerID))
 }
 
-// attachBackURL renders the dial-back URL for attachID: this replica's own
+// ---------------------------------------------------------------------------
+// the attach plane's host
+// ---------------------------------------------------------------------------
+
+// attachHost is the self-hosted host of the attach plane (attachplane.Host):
+// the fleet token as the dial-back's credential, this replica's runner
+// connections as the way a dial_attach reaches a runner, and this replica's
+// own ExternalURL as the dial-back address.
+type attachHost struct{ srv *Server }
+
+var _ attachplane.Host = attachHost{}
+
+// IdentifyRunner authenticates a dial-back with the same fleet runner token
+// handleRunnerConnect checks. The token is fleet-wide and the dial-back
+// carries nothing else — runnerd dials the target_url it was handed, with a
+// bearer and no name — so the runner is left unnamed here; the installation
+// pool is the only pool there is.
+func (h attachHost) IdentifyRunner(_ context.Context, r *http.Request) (control.PoolID, control.RunnerID, error) {
+	if !h.srv.runnerTokenOK(r.Header.Get("Authorization")) {
+		return "", "", control.ErrDenied
+	}
+	return installPool, "", nil
+}
+
+// Send queues the dial_attach on the runner's control connection. Self-hosted
+// has one pool, so the pool is not consulted.
+func (h attachHost) Send(_ control.PoolID, id control.RunnerID, m runner.ToRunner) error {
+	return h.srv.sendToRunner(string(id), m)
+}
+
+// BackURL renders the dial-back URL for attachID: this replica's own
 // ExternalURL with the scheme switched to ws(s). Naming the replica
 // explicitly is what keeps the pairing correct once more than one controld
 // runs (design §6) — the runner must come back to the replica holding the
 // client socket, not to whichever one a load balancer picks.
-func (s *Server) attachBackURL(attachID string) string {
-	base := s.cfg.ExternalURL // New guarantees an absolute http(s) URL
+func (h attachHost) BackURL(attachID string) string {
+	base := h.srv.cfg.ExternalURL // New guarantees an absolute http(s) URL
 	switch {
 	case strings.HasPrefix(base, "https://"):
 		base = "wss://" + strings.TrimPrefix(base, "https://")
@@ -314,116 +260,4 @@ func (s *Server) attachBackURL(attachID string) string {
 		base = "ws://" + strings.TrimPrefix(base, "http://")
 	}
 	return base + "/v0/runners/attach-back?attach_id=" + attachID
-}
-
-// ---------------------------------------------------------------------------
-// WS GET /v0/runners/attach-back?attach_id=
-// ---------------------------------------------------------------------------
-
-// handleAttachBack serves the runner half of the pairing: runnerd dials this
-// outbound (spec rule 3 — nothing dials into a runner) carrying the attach_id
-// controld handed it, and controld splices that socket onto the client
-// waiting under it. Authentication is the fleet runner token, the same check
-// handleRunnerConnect makes.
-func (s *Server) handleAttachBack(w http.ResponseWriter, r *http.Request) {
-	if !s.runnerTokenOK(r.Header.Get("Authorization")) {
-		writeErr(w, http.StatusUnauthorized, "unauthenticated", "invalid runner token")
-		return
-	}
-	attachID := r.URL.Query().Get("attach_id")
-	// Answer an expired or unknown pairing as plain HTTP, before upgrading:
-	// a runner that dialed back too late gets a status code it can log
-	// rather than a websocket it must decode a close reason from. This is
-	// only a hint — claim below is what actually takes ownership.
-	if !s.attaches.has(attachID) {
-		writeErr(w, http.StatusNotFound, "not_found", "unknown attach id")
-		return
-	}
-
-	c, err := websocket.Accept(w, r, nil)
-	if err != nil {
-		return // Accept has already answered the request
-	}
-	defer c.CloseNow()
-	c.SetReadLimit(attachReadLimit)
-
-	pa, ok := s.attaches.claim(attachID)
-	if !ok {
-		// The TTL fired between the check above and here: the client socket
-		// is already closed and gone. Not a protocol violation on the
-		// runner's part — it did exactly what it was told, just too late —
-		// so it gets "try again later", the same code the expired client got.
-		closeAttach(c, websocket.StatusTryAgainLater, "attach pairing expired")
-		return
-	}
-	// Release the client handler once the splice is over, whatever ends it.
-	defer close(pa.done)
-
-	splice(r.Context(), pa.stream, relay.WSConn(c))
-}
-
-// splice pumps one live attach both directions until either side ends, then
-// closes both. The two halves are typed differently and deliberately so: the
-// client speaks whole terminal messages across control.TerminalStream, while
-// the runner's dial-back socket is raw relay frames — and protocol/terminal
-// is the wire format on both, so re-encoding between them is lossless.
-// controld still interprets nothing: a message is decoded to be forwarded and
-// for no other reason, and none of it is logged.
-func splice(ctx context.Context, client control.TerminalStream, runner relay.Conn) {
-	done := make(chan struct{}, 2)
-	go func() {
-		defer func() { done <- struct{}{} }()
-		for {
-			m, err := client.Receive(ctx)
-			if err != nil {
-				return
-			}
-			raw, err := json.Marshal(m)
-			if err != nil {
-				return
-			}
-			if runner.Write(ctx, raw) != nil {
-				return
-			}
-		}
-	}()
-	go func() {
-		defer func() { done <- struct{}{} }()
-		for {
-			raw, err := runner.Read(ctx)
-			if err != nil {
-				return
-			}
-			var m terminal.ServerMessage
-			if json.Unmarshal(raw, &m) != nil {
-				// A frame that is not a server message is the runner half
-				// breaking the protocol; ending the attach says so, where
-				// dropping it would leave a client missing output it has no
-				// way to notice. Nothing about the frame is logged.
-				return
-			}
-			if client.Send(ctx, m) != nil {
-				return
-			}
-		}
-	}()
-	<-done
-	_ = client.Close(errAttachEnded)
-	runner.Close()
-	<-done // let the second pump exit before returning
-}
-
-// closeAttach closes an attach socket with a reason the protocol can actually
-// carry. Close reasons cap at 123 bytes and a wrapped read error can exceed
-// that; an over-long reason makes coder/websocket drop the close frame
-// entirely, leaving the peer with a bare EOF instead of the diagnostic.
-// Same discipline as closeRunner on the runner plane.
-func closeAttach(c *websocket.Conn, code websocket.StatusCode, reason string) {
-	const maxReason = 123
-	if len(reason) > maxReason {
-		reason = strings.ToValidUTF8(reason[:maxReason], "")
-	}
-	if err := c.Close(code, reason); err != nil {
-		log.Printf("controld: closing attach socket: %v", err)
-	}
 }
