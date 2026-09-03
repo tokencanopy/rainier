@@ -11,7 +11,8 @@
 // the host side of each port (adapt_*.go) — the pool resolver over the one
 // installation pool, the GitHub-role rule as the authorizer and attachment
 // policy, the vault and
-// connectors as launch material, the runner websocket as the transport, the
+// connectors as launch material, the runner plane
+// (github.com/tokencanopy/rainier/runnerplane) as the transport, the
 // dial-back pairing as the attach broker — while the three repository ports
 // are the store's own, implemented natively over its workspace-keyed rows and
 // read off it by compose(). Plus everything with no portable
@@ -39,12 +40,12 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/tokencanopy/rainier/attachplane"
 	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/controlapp"
+	"github.com/tokencanopy/rainier/runnerplane"
 )
 
 const (
@@ -114,15 +115,12 @@ type Server struct {
 	st  Store
 	cfg Config
 
-	// mu guards runners and runnerLocks. It is held only for map reads and
-	// writes, never across a store call or a socket write, so a slow runner
-	// can't stall registration for the rest of the fleet.
-	mu      sync.Mutex
-	runners map[string]*runnerConn
-	// runnerLocks serializes the store writes that describe one runner
-	// (connected flag and capacity) — see nameLock. Keyed by runner name,
-	// never held while mu is.
-	runnerLocks map[string]*sync.Mutex
+	// plane is the runner plane: the runner WebSocket endpoint, the
+	// connection registry behind it, the generation mint and its fences,
+	// reconciliation, event translation, and the dispatch correlation. It is
+	// composed over runnerHost (runners.go), which answers the handful of
+	// questions the plane deliberately leaves to its host.
+	plane *runnerplane.Plane
 
 	// attach is the dial-back attach plane: the pairings this replica is
 	// waiting on — client sockets parked between the dial_attach sent to
@@ -149,9 +147,9 @@ type Server struct {
 	attachments  *controlapp.AttachmentService
 
 	// transport is the runner plane behind the control.RunnerTransport port
-	// (adapt_transport.go, over the connection map below) and broker the
-	// dial-back attach pairing behind control.AttachmentBroker
-	// (adapt_attach.go, over the pairing table above).
+	// (plane.Transport()) and broker the dial-back attach pairing behind
+	// control.AttachmentBroker (adapt_attach.go, over the pairing table
+	// above).
 	transport control.RunnerTransport
 	broker    control.AttachmentBroker
 }
@@ -206,12 +204,19 @@ func New(st Store, cfg Config) (*Server, error) {
 	}
 
 	s := &Server{
-		st:          st,
-		cfg:         cfg,
-		runners:     map[string]*runnerConn{},
-		runnerLocks: map[string]*sync.Mutex{},
+		st:  st,
+		cfg: cfg,
 	}
-	s.transport = runnerTransport{srv: s}
+	// The runner plane is built before the services because it IS the
+	// transport they are composed over; its host reaches back through s for
+	// the fleet service, which compose() sets a moment later and nothing
+	// calls before. The attach plane likewise reaches the runner plane
+	// through s.sendToRunner.
+	s.plane = runnerplane.New(runnerHost{s}, runnerplane.Options{
+		OpTimeout: cfg.OpTimeout,
+		Logf:      func(format string, a ...any) { log.Printf("controld: "+format, a...) },
+	})
+	s.transport = s.plane.Transport()
 	s.attach = attachplane.New(attachHost{s}, attachplane.Options{
 		PairTTL: cfg.AttachPairTTL, Logf: log.Printf,
 	})
@@ -299,7 +304,7 @@ func (s *Server) compose() error {
 // claims 404.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v0/runners/connect", s.handleRunnerConnect)
+	mux.Handle("GET /v0/runners/connect", s.plane.Handler())
 	mux.Handle("GET /v0/runners/attach-back", s.attach.BackHandler())
 	mux.HandleFunc("POST /v0/auth/github", s.handleGitHubAuth)
 	mux.HandleFunc("GET /v0/me", s.requireUser(s.handleMe))

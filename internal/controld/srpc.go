@@ -7,163 +7,30 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"sync"
-	"sync/atomic"
 
 	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // The session RPC is controld's request/response channel to the inside of a
-// sandbox, and this file is the UPWARD half of it — the half whose requests
+// sandbox, and this file is the host's half of it — the half whose requests
 // the sandbox originates and controld answers.
 //
-// Downward, a request rides a ToRunner "session_rpc" and its answer comes back
-// as a FromRunner "session_req" whose envelope Method is "resp", correlated by
-// the envelope's own ID. That half belongs to the attachment service now: it
-// mints the id and validates the answer (controlapp/workspace_rpc.go), and
-// runnerTransport.Dispatch carries it over this connection's srpcTable
-// (adapt_transport.go). What stays here is the table itself, and the routing
-// that delivers a "resp" into it.
+// The transport is the runner plane's: it carries a request down as a
+// ToRunner "session_rpc", correlates the answer by the envelope's own id, and
+// routes an inbound "session_req" either into that pending table or, when it
+// is a fresh request from a sandbox, to this file through
+// runnerplane.Host.SessionRequest (runners.go). What stays here is what
+// answering one means for THIS installation: the placement check that
+// authorizes it, and the one method behind it.
 //
-// Upward (routeSessionReq): a sandbox asks controld for something (a git
-// credential) and waits for the answer. The request arrives as a "session_req"
-// with a method; the answer goes back down as a "session_rpc" whose envelope
-// Method is "resp", echoing the id the SANDBOX chose.
-//
-// Those two id spaces never collide, and nothing anywhere remaps an id,
-// because a response always travels in the opposite direction to its request:
-// a "resp" arriving here can only ever be answering a request this end sent,
-// so it is matched against this end's table and no other. runnerd in between
-// forwards envelopes verbatim, routing by session name alone.
-
-// srpcTable is one runner connection's pending table for the session RPCs
-// CONTROLD originated. It is deliberately separate from runnerConn.pending
-// (the runner-dispatch table keyed by ReqID): the two id spaces mean different
-// things — a ReqID correlates a command the RUNNER executes and answers, an
-// envelope ID correlates a request the SANDBOX answers — and sharing a counter
-// between them would make a runner's result and a sandbox's response
-// indistinguishable to whichever one happened to be waiting.
-type srpcTable struct {
-	// seq is this connection's id source. Per-connection like ReqID's, so ids
-	// never have to be unique across the fleet, only across one socket.
-	seq atomic.Uint64
-
-	mu      sync.Mutex
-	pending map[uint64]chan runner.RPCEnvelope
-}
-
-func newSRPCTable() *srpcTable {
-	return &srpcTable{pending: map[uint64]chan runner.RPCEnvelope{}}
-}
-
-// add registers a pending call and returns the channel its answer will arrive
-// on. Buffered by one, so deliver never blocks the connection's reader even if
-// the caller has already stopped waiting.
-func (t *srpcTable) add(id uint64) chan runner.RPCEnvelope {
-	ch := make(chan runner.RPCEnvelope, 1)
-	t.mu.Lock()
-	t.pending[id] = ch
-	t.mu.Unlock()
-	return ch
-}
-
-func (t *srpcTable) remove(id uint64) {
-	t.mu.Lock()
-	delete(t.pending, id)
-	t.mu.Unlock()
-}
-
-// deliver hands a response to whoever is waiting on its id, reporting whether
-// anyone was. A duplicate response for the same id is dropped rather than
-// stalling the reader (the channel is buffered by one and the caller always
-// removes its own entry).
-func (t *srpcTable) deliver(env runner.RPCEnvelope) bool {
-	t.mu.Lock()
-	ch, ok := t.pending[env.ID]
-	t.mu.Unlock()
-	if !ok {
-		return false
-	}
-	select {
-	case ch <- env:
-	default:
-	}
-	return true
-}
-
-// len reports how many calls are still pending on this connection. Tests use
-// it to prove every exit path — answer, timeout, conn death — takes its entry
-// with it; production code does not read it.
-func (t *srpcTable) len() int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return len(t.pending)
-}
-
-// ---------------------------------------------------------------------------
-// sandbox-initiated requests
-// ---------------------------------------------------------------------------
-
-// routeSessionReq handles one "session_req" from a runner: either the response
-// to a request this replica sent down, or a fresh request from inside a
-// sandbox that controld has to answer.
-//
-// It runs on the connection's reader, so the response half is delivered inline
-// (a buffered channel hand-off) and the request half is not: answering reads
-// the store, and this goroutine is the only one delivering every result and
-// event that runner sends. Anything unroutable is logged and dropped — this
-// message crossed a container boundary, and a malformed one must not be able
-// to end the connection every session on that runner depends on.
-func (s *Server) routeSessionReq(ctx context.Context, rc *runnerConn, m runner.FromRunner) {
-	if m.RPC == nil {
-		log.Printf("controld: runner %s: session_req for %s carried no envelope", rc.name, clip(m.Session))
-		return
-	}
-	env := *m.RPC
-	if env.ID == 0 {
-		log.Printf("controld: runner %s: session_req for %s carried no id; dropping",
-			rc.name, clip(m.Session))
-		return
-	}
-	if env.Method == "resp" {
-		if !rc.srpc.deliver(env) {
-			log.Printf("controld: runner %s: session-RPC response for unknown id %d (timed out?)", rc.name, env.ID)
-		}
-		return
-	}
-	if m.Session == "" {
-		// Nothing to authorize the request against, and nowhere to send the
-		// answer: a session_req names its session or it is not routable.
-		log.Printf("controld: runner %s: session_req %q named no session; dropping", rc.name, clip(env.Method))
-		return
-	}
-	go s.answerSessionRequest(ctx, rc, m.Session, env)
-}
-
-// answerSessionRequest authorizes one sandbox-initiated request and sends back
-// whatever the method answered — always exactly one response, because the
-// sandbox is holding a pending entry (and, for a credential mint, a git
-// process) until one arrives.
-//
-// The placement check is the authorization: the runner token is fleet-wide, so
-// a session_req proves only that SOME runner sent it, while every method
-// behind this routing acts with the session owner's authority. A request for a
-// session the store does not place on the asking runner is refused before any
-// method runs — the same guard applyEvent applies to the events that end a
-// session, and for the same reason: a stale or misbehaving runner must not be
-// able to act on a session that is not its.
-func (s *Server) answerSessionRequest(ctx context.Context, rc *runnerConn, sessionID string, env runner.RPCEnvelope) {
-	ans := s.authorizeSessionRequest(ctx, rc.name, sessionID, env)
-	// The id and the method are this layer's to set, never the handler's: the
-	// id is what the sandbox correlates against, and every answer is a "resp".
-	ans.ID = env.ID
-	ans.Method = "resp"
-	if err := rc.enqueue(runner.ToRunner{Type: "session_rpc", Session: sessionID, RPC: &ans}); err != nil {
-		log.Printf("controld: answering %s for session %s on runner %s: %v",
-			clip(env.Method), clip(sessionID), rc.name, err)
-	}
-}
+// The placement check is the authorization: the runner token is fleet-wide,
+// so a session_req proves only that SOME runner sent it, while every method
+// behind this routing acts with the session owner's authority. A request for
+// a session the store does not place on the asking runner is refused before
+// any method runs — the same guard the events that end a session apply, and
+// for the same reason: a stale or misbehaving runner must not be able to act
+// on a session that is not its.
 
 func (s *Server) authorizeSessionRequest(ctx context.Context, runner, sessionID string, env runner.RPCEnvelope) runner.RPCEnvelope {
 	row, err := s.st.Sessions().GetSession(ctx, installWorkspace, control.SessionID(sessionID))

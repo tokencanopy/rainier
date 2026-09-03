@@ -37,9 +37,9 @@ test -d attachplane
 test -f attachplane/doc.go
 go list ./attachplane >/dev/null
 
-test -d runnerplane 2>/dev/null || { echo "runnerplane not present yet (Task 1 pending)"; }
-test -f runnerplane/doc.go 2>/dev/null || true
-go list ./runnerplane >/dev/null 2>&1 || true
+test -d runnerplane
+test -f runnerplane/doc.go
+go list ./runnerplane >/dev/null
 
 # ---------------------------------------------------------------------------
 # 1. import hygiene
@@ -70,14 +70,16 @@ for pkg in control controlapp controlapp/repotest v0wire attachplane runnerplane
     [[ -z "$imp" ]] && continue
     lower="$(printf '%s' "$imp" | tr '[:upper:]' '[:lower:]')"
     case "$lower" in
-      *rainier/internal/relay)
-                             [[ "$pkg" == "attachplane" ]] && continue
-                             reason="internal/ path" ;;
       *rainier/internal/*)
         if [[ "$relay_ok" == "1" && "$lower" == *rainier/internal/relay ]]; then
           continue
         fi
         reason="internal/ path" ;;
+      *rainier/controlapp*)
+        case "$pkg" in
+          attachplane|runnerplane) reason="controlapp (a plane is composed beside it, never over it)" ;;
+          *) continue ;;
+        esac ;;
       *net/http*)
         if [[ "$http_ok" == "1" ]]; then
           continue
