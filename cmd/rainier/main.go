@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -72,6 +73,10 @@ func main() {
 		err = runSecret(rest)
 	case "env":
 		err = runEnv(rest)
+	case "context":
+		err = runContext(rest)
+	case "workspace":
+		err = runWorkspace(rest)
 	case "-h", "--help", "help":
 		printUsage()
 		return
@@ -91,7 +96,8 @@ func printUsage() {
 
 commands:
   login    [--from-gh] [--token GH_TOKEN] [--client-id ID] [--server URL]
-           [--refresh PROVIDER]
+           [--refresh PROVIDER] [--context NAME]
+  login    --cloud EDGE_URL [--device-name NAME] [--context NAME]
   new      [--name N] [--env ENV] [--image IMG] [--egress host,host] [--detach]
            [-- CMD ARGS...]
   ls       [--all]
@@ -106,6 +112,8 @@ commands:
   creds
   secret   set <NAME> [--value V] | ls | rm <NAME>
   env      create <name> [flags] | ls | show <ref> | update <ref> [flags] | rm <ref>
+  context  list | use <name> | current | remove <name>
+  workspace use <id>
 
 new --env starts the session from an environment (by name or id): its image,
 setup script, egress and secrets. --image and --egress override the
@@ -139,6 +147,14 @@ lands in your shell history:  cat token.txt | rainier secret set GH_TOKEN
 Secret values are write-only: this API never gives one back, and "secret ls"
 shows names and timestamps only. Names are [A-Z0-9_], up to 64 characters —
 they become environment variables inside your sessions.
+
+login --cloud EDGE_URL logs in to a hosted rainier: it prints (and opens) a
+URL, you finish signing in there, and the CLI stores the result as a context
+named after the edge host. A context is one server and the credentials for it
+— "context list" shows them, "context use NAME" switches, and every other
+command talks to whichever one is current. A hosted context is scoped to one
+workspace: a login with a single workspace picks it, and "workspace use <id>"
+chooses when there are several.
 
 <id|name>: a "sess_" prefix is used as a session id directly. Anything else
 is resolved by name against your team's non-terminal sessions — names are
@@ -322,6 +338,9 @@ func runLogin(args []string) error {
 	clientID := fs.String("client-id", "", "GitHub OAuth App client id — runs the device flow")
 	server := fs.String("server", "", "controld server URL")
 	refresh := fs.String("refresh", "", "replace the stored credential for this `provider` (github) — use it when `rainier creds` says needs_refresh")
+	cloud := fs.String("cloud", "", "hosted edge `URL` — runs the browser login instead of the GitHub one")
+	deviceName := fs.String("device-name", "", "how this device is `named` in the hosted login attempt (default: the hostname)")
+	contextName := fs.String("context", "", "config context to write (default: \"default\" for a GitHub login, the edge host for --cloud)")
 	fs.Parse(reorderArgs(fs, args))
 
 	if *refresh != "" && !slices.Contains(refreshableProviders, *refresh) {
@@ -329,10 +348,28 @@ func runLogin(args []string) error {
 			*refresh, strings.Join(refreshableProviders, ", "))
 	}
 
+	// The hosted login is a different exchange with a different server: it
+	// shares only the word "login", so combining it with the GitHub flags is
+	// refused rather than silently honoring one of them.
+	if *cloud != "" {
+		if *fromGH || *token != "" || *clientID != "" || *refresh != "" || *server != "" {
+			return fmt.Errorf("login --cloud names the hosted edge and runs the browser login; " +
+				"it takes none of --from-gh, --token, --client-id, --refresh or --server")
+		}
+		return runCloudLogin(*cloud, *deviceName, *contextName)
+	}
+
 	cfg, _ := cli.Load() // a missing/unreadable config is not fatal here: --server can still supply everything
+	// A GitHub login writes the "default" context unless one is named: it is
+	// the self-hosted half of the config, and it must not be affected by
+	// whichever hosted context happens to be current.
+	target := *contextName
+	if target == "" {
+		target = cli.DefaultContext
+	}
 	serverURL := *server
 	if serverURL == "" {
-		serverURL = cfg.ServerURL
+		serverURL = cfg.Contexts[target].Server
 	}
 	if serverURL == "" {
 		fmt.Fprintln(os.Stderr, "rainier login: --server URL is required (no server configured yet)")
@@ -381,10 +418,12 @@ func runLogin(args []string) error {
 	// An older controld that does not send an id leaves whatever is already
 	// cached alone: a refresh of a GitHub credential is no reason to forget
 	// who the caller is.
-	cfg.ServerURL, cfg.Token = serverURL, resp.Token
+	ctx := cfg.Contexts[target]
+	ctx.Server, ctx.Token = serverURL, resp.Token
 	if resp.User.ID != "" {
-		cfg.OwnerID = resp.User.ID
+		ctx.OwnerID = resp.User.ID
 	}
+	cfg.SetContext(target, ctx)
 	if err := cli.Save(cfg); err != nil {
 		return fmt.Errorf("saving config: %w", err)
 	}
@@ -422,7 +461,7 @@ func runCreds(args []string) error {
 	if err != nil {
 		return err
 	}
-	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	c := cli.NewClient(cfg)
 
 	var resp credentialsEnvelope
 	if err := c.Do(http.MethodGet, "/v0/credentials", nil, &resp); err != nil {
@@ -554,6 +593,426 @@ func pollAccessToken(clientID, deviceCode string) (accessTokenResponse, error) {
 }
 
 // ---------------------------------------------------------------------------
+// hosted login (--cloud), contexts and workspaces
+// ---------------------------------------------------------------------------
+
+// The hosted login is passwordless and happens in a browser: this CLI starts
+// an attempt, prints (and, when it can, opens) the URL the human finishes it
+// at, and polls one endpoint until the browser half is done. It never sees an
+// email code and never handles a password — it holds a poll token, and gets a
+// token pair back. Everything after that is the same CLI against a different
+// server, with one addition: the workspace the context is scoped to.
+
+const (
+	// minPollInterval and maxPollInterval bound whatever poll_interval_seconds
+	// the edge asks for. The floor keeps a misconfigured (or hostile) edge from
+	// turning this loop into a hot one; the ceiling keeps a large value from
+	// leaving a human staring at a finished browser tab.
+	minPollInterval = 2 * time.Second
+	maxPollInterval = 10 * time.Second
+	// loginAttemptFallbackTTL bounds the poll loop when the attempt names no
+	// expiry this CLI can parse. The edge's own expires_at is authoritative
+	// whenever it is readable.
+	loginAttemptFallbackTTL = 15 * time.Minute
+	// edgeRequestTimeout bounds one request of the login exchange, so a
+	// blackholed poll fails that poll instead of parking the whole login.
+	edgeRequestTimeout = 30 * time.Second
+)
+
+// loginAttempt is POST /v0/auth/login-attempts' response: the attempt's id,
+// the path (on the same server) the human opens, the token this CLI polls
+// with, and how long it may keep doing so.
+type loginAttempt struct {
+	ID                  string `json:"id"`
+	BrowserPath         string `json:"browser_path"`
+	PollToken           string `json:"poll_token"`
+	ExpiresAt           string `json:"expires_at"`
+	PollIntervalSeconds int    `json:"poll_interval_seconds"`
+}
+
+// workspaceView is one row of GET /v0/workspaces — the workspaces this
+// account may act in, and the caller's role in each.
+type workspaceView struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Role string `json:"role"`
+}
+
+type workspacesEnvelope struct {
+	Workspaces []workspaceView `json:"workspaces"`
+	NextCursor string          `json:"next_cursor"`
+}
+
+func runCloudLogin(edgeURL, deviceName, contextName string) error {
+	return runCloudLoginSleep(edgeURL, deviceName, contextName, time.Sleep)
+}
+
+// runCloudLoginSleep is runCloudLogin with the wait between polls injected,
+// the way attachWithRetrySleep is: the flow's shape — how many polls, at what
+// interval — is exactly what a test needs to pin, and it must not cost the
+// test the real seconds.
+func runCloudLoginSleep(edgeURL, deviceName, contextName string, sleep func(time.Duration)) error {
+	base := strings.TrimRight(edgeURL, "/")
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("login --cloud: %q is not an http(s) URL", edgeURL)
+	}
+	if deviceName == "" {
+		deviceName = defaultDeviceName()
+	}
+	// A context named after the edge host is what makes two hosted accounts,
+	// or a hosted edge beside a self-hosted controld, nameable without the
+	// user inventing anything.
+	if contextName == "" {
+		contextName = u.Host
+	}
+
+	var attempt loginAttempt
+	if _, err := edgePost(base+"/v0/auth/login-attempts",
+		map[string]string{"device_name": deviceName}, &attempt); err != nil {
+		return fmt.Errorf("starting the login: %w", err)
+	}
+	if attempt.ID == "" || attempt.BrowserPath == "" || attempt.PollToken == "" {
+		return fmt.Errorf("starting the login: the server's login attempt is incomplete")
+	}
+
+	browseURL := base + attempt.BrowserPath
+	fmt.Printf("Open this URL to finish signing in as %s:\n\n  %s\n\n", deviceName, browseURL)
+	openBrowser(browseURL)
+	fmt.Println("Waiting for the browser…")
+
+	pair, err := pollLoginAttempt(base, attempt, sleep)
+	if err != nil {
+		return err
+	}
+
+	cfg, _ := cli.Load() // a missing config is exactly what a first login expects
+	ctx := cfg.Contexts[contextName]
+	ctx.Server, ctx.Token = base, pair.AccessToken
+	ctx.RefreshToken, ctx.AccessExpiresAt = pair.RefreshToken, pair.AccessExpiresAt
+	cfg.SetContext(contextName, ctx)
+	if err := cli.Save(cfg); err != nil {
+		return fmt.Errorf("saving config: %w", err)
+	}
+	fmt.Printf("logged in to %s (context %s)\n", u.Host, contextName)
+
+	return selectWorkspace(contextName)
+}
+
+// selectWorkspace finishes a hosted login: one workspace is the answer and
+// becomes the context's scope; several are printed for the user to choose
+// from, because picking for them would silently attach every later command to
+// the wrong team; none is said plainly, since the next step is in the browser.
+func selectWorkspace(contextName string) error {
+	cfg, err := cli.Load()
+	if err != nil {
+		return err
+	}
+	spaces, err := listWorkspaces(cli.NewClient(cfg))
+	if err != nil {
+		return fmt.Errorf("listing workspaces: %w", err)
+	}
+	switch len(spaces) {
+	case 0:
+		fmt.Println("no workspaces yet — create one in the browser, then run `rainier workspace use <id>`")
+		return nil
+	case 1:
+		return setWorkspace(contextName, spaces[0])
+	default:
+		fmt.Println("workspaces:")
+		printWorkspaces(spaces)
+		fmt.Println("run `rainier workspace use <id>` to choose one")
+		return nil
+	}
+}
+
+// setWorkspace stores w as contextName's scope. The config is re-read first:
+// the listing that produced w may have refreshed the hosted token pair, and
+// writing back a copy loaded before that would strand the context on a
+// refresh token the edge has already spent.
+func setWorkspace(contextName string, w workspaceView) error {
+	cfg, err := cli.Load()
+	if err != nil {
+		return err
+	}
+	ctx := cfg.Contexts[contextName]
+	ctx.Workspace = w.ID
+	cfg.UpdateContext(contextName, ctx)
+	if err := cli.Save(cfg); err != nil {
+		return fmt.Errorf("saving config: %w", err)
+	}
+	fmt.Printf("workspace: %s (%s)\n", w.ID, w.Name)
+	return nil
+}
+
+func listWorkspaces(c *cli.Client) ([]workspaceView, error) {
+	var resp workspacesEnvelope
+	if err := c.Do(http.MethodGet, "/v0/workspaces", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Workspaces, nil
+}
+
+func printWorkspaces(spaces []workspaceView) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "ID\tNAME\tROLE")
+	for _, s := range spaces {
+		fmt.Fprintf(w, "%s\t%s\t%s\n", s.ID, s.Name, s.Role)
+	}
+	w.Flush()
+}
+
+// pollLoginAttempt polls the exchange until the browser half completes. 202
+// means the human is still working; 200 carries the token pair; 410 means the
+// attempt lapsed, which is also what the deadline means locally.
+func pollLoginAttempt(base string, attempt loginAttempt, sleep func(time.Duration)) (cli.TokenPair, error) {
+	interval := time.Duration(attempt.PollIntervalSeconds) * time.Second
+	interval = min(max(interval, minPollInterval), maxPollInterval)
+	deadline := time.Now().Add(loginAttemptFallbackTTL)
+	if t, err := time.Parse(time.RFC3339, attempt.ExpiresAt); err == nil {
+		deadline = t
+	}
+
+	path := base + "/v0/auth/login-attempts/" + url.PathEscape(attempt.ID) + "/exchange"
+	body := map[string]string{"poll_token": attempt.PollToken}
+	for {
+		var pair cli.TokenPair
+		status, err := edgePost(path, body, &pair)
+		switch {
+		case err == nil && status == http.StatusOK && pair.AccessToken != "":
+			return pair, nil
+		case err == nil:
+			// 202: the browser half is not finished yet.
+		default:
+			var apiErr *cli.APIError
+			if errors.As(err, &apiErr) && (apiErr.Status == http.StatusGone || apiErr.Code == "login_expired") {
+				return cli.TokenPair{}, errLoginExpired(base)
+			}
+			return cli.TokenPair{}, err
+		}
+		if !time.Now().Before(deadline) {
+			return cli.TokenPair{}, errLoginExpired(base)
+		}
+		sleep(interval)
+	}
+}
+
+func errLoginExpired(base string) error {
+	return fmt.Errorf("this login expired before the browser finished; run `rainier login --cloud %s` again", base)
+}
+
+// edgePost performs one JSON request of the hosted login exchange and reports
+// the status alongside the error, which the poll loop needs: on this wire 202
+// and 200 are both successes that mean different things. A non-2xx is decoded
+// as the API's error envelope, so a 410 arrives as a *cli.APIError the caller
+// can recognize without reading prose.
+func edgePost(fullURL string, in, out any) (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), edgeRequestTimeout)
+	defer cancel()
+
+	b, err := json.Marshal(in)
+	if err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(b))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Request-Id", cli.RandHex(8))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, edgeBodyLimit))
+	if err != nil {
+		return resp.StatusCode, err
+	}
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if out != nil && len(bytes.TrimSpace(data)) > 0 {
+			if err := json.Unmarshal(data, out); err != nil {
+				return resp.StatusCode, fmt.Errorf("decoding the response: %w", err)
+			}
+		}
+		return resp.StatusCode, nil
+	}
+
+	var env struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil || env.Error.Code == "" {
+		return resp.StatusCode, fmt.Errorf("unexpected response: %d", resp.StatusCode)
+	}
+	return resp.StatusCode, &cli.APIError{Code: env.Error.Code, Message: env.Error.Message, Status: resp.StatusCode}
+}
+
+// edgeBodyLimit caps how much of a login-exchange response is ever read: the
+// bodies on this wire are a handful of fields, and the far side is untrusted
+// until the login succeeds.
+const edgeBodyLimit = 64 << 10
+
+// defaultDeviceName names this machine in the hosted login attempt — it is
+// what the human sees in the browser ("approve a login from …") and later in
+// their session list. The hostname is the one identifier that is both stable
+// and already known to them.
+func defaultDeviceName() string {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
+	}
+	return "rainier-cli"
+}
+
+// openBrowser opens url in the desktop browser, best effort. Printing the URL
+// is the contract; opening it is a convenience, so every failure here — no
+// opener on a headless box, an opener that exits nonzero — is silent.
+// RAINIER_NO_BROWSER=1 turns it off outright.
+func openBrowser(target string) {
+	if os.Getenv("RAINIER_NO_BROWSER") != "" {
+		return
+	}
+	opener := "xdg-open"
+	if runtime.GOOS == "darwin" {
+		opener = "open"
+	}
+	path, err := exec.LookPath(opener)
+	if err != nil {
+		return
+	}
+	cmd := exec.Command(path, target)
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	go cmd.Wait() //nolint:errcheck // reap the opener; its outcome is not ours
+}
+
+// ---------------------------------------------------------------------------
+// context
+// ---------------------------------------------------------------------------
+
+// runContext is the switch between servers: one config holds a self-hosted
+// controld and any number of hosted edges, and exactly one of them is current.
+func runContext(args []string) error {
+	fs := flag.NewFlagSet("context", flag.ExitOnError)
+	fs.Parse(args)
+	rest := fs.Args()
+	if len(rest) == 0 {
+		return fmt.Errorf("usage: rainier context list | use <name> | current | remove <name>")
+	}
+
+	cfg, err := cli.Load()
+	if err != nil {
+		return err
+	}
+
+	switch rest[0] {
+	case "list":
+		if len(cfg.Contexts) == 0 {
+			fmt.Println("no contexts yet: run `rainier login --server URL` or `rainier login --cloud EDGE_URL`")
+			return nil
+		}
+		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(w, "CURRENT\tNAME\tSERVER\tWORKSPACE")
+		current := cfg.ActiveName()
+		for _, name := range cfg.Names() {
+			ctx := cfg.Contexts[name]
+			marker := ""
+			if name == current {
+				marker = "*"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", marker, name, ctx.Server, dashIfEmpty(ctx.Workspace))
+		}
+		return w.Flush()
+
+	case "current":
+		if _, ok := cfg.Active(); !ok {
+			return fmt.Errorf("no current context: run `rainier login --server URL` or `rainier login --cloud EDGE_URL`")
+		}
+		fmt.Println(cfg.ActiveName())
+		return nil
+
+	case "use":
+		if len(rest) != 2 {
+			return fmt.Errorf("usage: rainier context use <name>")
+		}
+		if !cfg.Use(rest[1]) {
+			return fmt.Errorf("no context named %s; `rainier context list` shows the ones there are", rest[1])
+		}
+		if err := cli.Save(cfg); err != nil {
+			return fmt.Errorf("saving config: %w", err)
+		}
+		fmt.Printf("context: %s (%s)\n", rest[1], cfg.ServerURL)
+		return nil
+
+	case "remove":
+		if len(rest) != 2 {
+			return fmt.Errorf("usage: rainier context remove <name>")
+		}
+		if !cfg.RemoveContext(rest[1]) {
+			return fmt.Errorf("no context named %s; `rainier context list` shows the ones there are", rest[1])
+		}
+		if err := cli.Save(cfg); err != nil {
+			return fmt.Errorf("saving config: %w", err)
+		}
+		fmt.Printf("removed context %s\n", rest[1])
+		return nil
+
+	default:
+		return fmt.Errorf("rainier context: unknown subcommand %q; use list, use, current or remove", rest[0])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// workspace
+// ---------------------------------------------------------------------------
+
+// runWorkspace picks which hosted workspace the current context acts in. The
+// id is checked against the account's own listing here, so a typo fails now
+// rather than as an unexplainable refusal on the next command.
+func runWorkspace(args []string) error {
+	fs := flag.NewFlagSet("workspace", flag.ExitOnError)
+	fs.Parse(args)
+	rest := fs.Args()
+	if len(rest) != 2 || rest[0] != "use" {
+		return fmt.Errorf("usage: rainier workspace use <id>")
+	}
+	id := rest[1]
+
+	cfg, err := requireLogin()
+	if err != nil {
+		return err
+	}
+	name := cfg.ActiveName()
+	ctx, _ := cfg.Active()
+	if !ctx.Hosted() {
+		return fmt.Errorf("workspace use: context %s is not a hosted one; workspaces come from `rainier login --cloud EDGE_URL`", name)
+	}
+
+	spaces, err := listWorkspaces(cli.NewClient(cfg))
+	if err != nil {
+		return fmt.Errorf("listing workspaces: %w", err)
+	}
+	i := slices.IndexFunc(spaces, func(w workspaceView) bool { return w.ID == id })
+	if i < 0 {
+		ids := make([]string, 0, len(spaces))
+		for _, w := range spaces {
+			ids = append(ids, w.ID)
+		}
+		if len(ids) == 0 {
+			return fmt.Errorf("no workspace %s: this account has no workspaces yet", id)
+		}
+		return fmt.Errorf("no workspace %s in this account; yours are: %s", id, strings.Join(ids, ", "))
+	}
+	return setWorkspace(name, spaces[i])
+}
+
+// ---------------------------------------------------------------------------
 // new
 // ---------------------------------------------------------------------------
 
@@ -572,7 +1031,7 @@ func runNew(args []string) error {
 	if err != nil {
 		return err
 	}
-	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	c := cli.NewClient(cfg)
 
 	// --env and the two override flags compose: the environment supplies
 	// everything the flags don't, and controld resolves the pair (design §4.3).
@@ -623,6 +1082,11 @@ func attachWithRetry(cfg cli.Config, id string, since uint64) error {
 func attachWithRetrySleep(cfg cli.Config, id string, since uint64, sleep func(time.Duration)) error {
 	wsURL := wsURLFor(cfg.ServerURL, id)
 	header := http.Header{"Authorization": {"Bearer " + cfg.Token}}
+	// The terminal stream is scoped like every other request on a hosted
+	// context: the edge routes it by the same header.
+	if ctx, ok := cfg.Active(); ok && ctx.Workspace != "" {
+		header.Set("Rainier-Workspace", ctx.Workspace)
+	}
 	deadline := time.Now().Add(60 * time.Second)
 	established := false
 	backoff := 100 * time.Millisecond
@@ -707,7 +1171,7 @@ func runLs(args []string) error {
 	if err != nil {
 		return err
 	}
-	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	c := cli.NewClient(cfg)
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "ID\tNAME\tENV\tSTATE\tRUNNER\tREACHABLE\tAGE")
@@ -1176,7 +1640,7 @@ func runSecretSet(args []string) error {
 		return fmt.Errorf("secret value is empty: pass --value, or pipe the value on stdin")
 	}
 
-	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	c := cli.NewClient(cfg)
 	if err := c.Do(http.MethodPut, "/v0/secrets/"+url.PathEscape(name), putSecretRequest{Value: v}, nil); err != nil {
 		return err
 	}
@@ -1215,7 +1679,7 @@ func runSecretLs(args []string) error {
 	if err != nil {
 		return err
 	}
-	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	c := cli.NewClient(cfg)
 
 	var resp secretsEnvelope
 	if err := c.Do(http.MethodGet, "/v0/secrets", nil, &resp); err != nil {
@@ -1239,7 +1703,7 @@ func runSecretRm(args []string) error {
 	if err != nil {
 		return err
 	}
-	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	c := cli.NewClient(cfg)
 	if err := c.Do(http.MethodDelete, "/v0/secrets/"+url.PathEscape(name), nil, nil); err != nil {
 		return err
 	}
@@ -1408,7 +1872,7 @@ func runEnvCreate(args []string) error {
 	if err != nil {
 		return err
 	}
-	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	c := cli.NewClient(cfg)
 
 	body := createEnvironmentRequest{
 		Name:            name,
@@ -1439,7 +1903,7 @@ func runEnvLs(args []string) error {
 	if err != nil {
 		return err
 	}
-	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	c := cli.NewClient(cfg)
 
 	var resp environmentsEnvelope
 	if err := c.Do(http.MethodGet, "/v0/environments", nil, &resp); err != nil {
@@ -1474,7 +1938,7 @@ func runEnvShow(args []string) error {
 	if err != nil {
 		return err
 	}
-	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	c := cli.NewClient(cfg)
 
 	// Decoded as raw JSON and re-indented, so what's printed is exactly what
 	// the server said — including any field this CLI's own struct doesn't
@@ -1557,7 +2021,7 @@ func runEnvUpdate(args []string) error {
 	if err != nil {
 		return err
 	}
-	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	c := cli.NewClient(cfg)
 
 	var resp environmentEnvelope
 	if err := c.Do(http.MethodPatch, "/v0/environments/"+url.PathEscape(ref), patch, &resp); err != nil {
@@ -1576,7 +2040,7 @@ func runEnvRm(args []string) error {
 	if err != nil {
 		return err
 	}
-	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	c := cli.NewClient(cfg)
 	if err := c.Do(http.MethodDelete, "/v0/environments/"+url.PathEscape(ref), nil, nil); err != nil {
 		return err
 	}
@@ -1853,7 +2317,7 @@ func resolveClientAndIDWithScope(ref string, scope sessionResolveScope) (cli.Con
 	if err != nil {
 		return cli.Config{}, nil, "", err
 	}
-	c := &cli.Client{Base: cfg.ServerURL, Token: cfg.Token}
+	c := cli.NewClient(cfg)
 	id, err := resolveSessionIDWithScope(c, cfg.OwnerID, ref, scope)
 	if err != nil {
 		return cli.Config{}, nil, "", err

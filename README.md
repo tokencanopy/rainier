@@ -68,6 +68,31 @@ bin/rainier suspend box1 && bin/rainier resume box1
 bin/rainier rm box1
 ```
 
+### Hosted login and contexts
+
+A hosted rainier logs in through the browser instead of a GitHub token:
+
+```bash
+bin/rainier login --cloud https://edge.example.test   # prints (and opens) a URL
+bin/rainier context list                              # every server this CLI knows
+bin/rainier workspace use ws_example                  # when the account has several
+```
+
+`login --cloud` starts a login attempt, prints the URL you finish signing in
+at, polls until the browser half is done, and stores the result as a **context**
+named after the edge host. A context is one server plus the credentials for it;
+`context use NAME` switches, `context current` says which one is live, and every
+other command talks to whichever is current. `login --server` (the GitHub login
+above) writes the `default` context unless `--context NAME` names another, so a
+self-hosted controld and a hosted edge live side by side in one config.
+
+A hosted context is scoped to one workspace, sent as `Rainier-Workspace` on
+every request: a login that finds exactly one workspace adopts it, and
+`workspace use <id>` chooses when there are several. Hosted access tokens are
+short-lived — the CLI refreshes them silently and re-saves the rotated pair, and
+only says "log in again" when that is genuinely the remaining step. Set
+`RAINIER_NO_BROWSER=1` on a headless box to print the URL without opening it.
+
 `rainier new` attaches immediately by default so you watch the agent boot;
 `--detach` opts out. `rainier attach` is state-aware: a suspended session is
 resumed first, and an established viewer reconnects after transient network or
