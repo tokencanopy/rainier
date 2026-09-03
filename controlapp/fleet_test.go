@@ -153,9 +153,18 @@ func (st *fleetFakeStore) transition(ws control.WorkspaceID, id control.SessionI
 	s.State = to
 	if opts.RunnerID != nil {
 		s.RunnerID = *opts.RunnerID
+		// A generation is one sandbox on one runner, so it opens exactly when
+		// a transition names a runner to run on (control.Session).
+		if *opts.RunnerID != "" {
+			s.PlacementGeneration++
+		}
 	}
 	if opts.Error != nil {
 		s.Error = *opts.Error
+	}
+	// The image this placement resolved; nothing else writes it.
+	if opts.Image != nil {
+		s.Spec.Image = *opts.Image
 	}
 	m[id] = s
 	return nil
@@ -544,6 +553,9 @@ type fleetFixture struct {
 	ids       *fleetFakeIDs
 	st        *fleetFakeStore
 	resolver  *fleetFakeResolver
+	// checkpoints is the fixture's locator. A test sets its answer BEFORE
+	// starting the scheduler loop, which is the only reader.
+	checkpoints *locatorStub
 }
 
 func newFleetFixtureWithResolver(t *testing.T, resolver LaunchMaterialResolver) *fleetFixture {
@@ -558,6 +570,7 @@ func newFleetFixtureWithResolver(t *testing.T, resolver LaunchMaterialResolver) 
 	events := &fleetFakeEvents{}
 	clock := &fleetFakeClock{now: time.Unix(1_700_000_000, 0)}
 	ids := &fleetFakeIDs{}
+	ckpts := &locatorStub{}
 	r := resolver
 	if r == nil {
 		r = &fleetFakeResolver{}
@@ -579,7 +592,7 @@ func newFleetFixtureWithResolver(t *testing.T, resolver LaunchMaterialResolver) 
 		SafetyInterval: time.Second,
 		LaunchMaterial: r,
 		UnitOfWork:     directUOW{},
-		Checkpoints:    locatorStub{},
+		Checkpoints:    ckpts,
 	})
 	if err != nil {
 		t.Fatalf("NewFleetService: %v", err)
@@ -587,7 +600,7 @@ func newFleetFixtureWithResolver(t *testing.T, resolver LaunchMaterialResolver) 
 	return &fleetFixture{
 		service: svc, auth: auth, sessions: sessions, envs: envs, fleet: fleet,
 		pools: pools, transport: transport, events: events, clock: clock, ids: ids, st: st,
-		resolver: fr,
+		resolver: fr, checkpoints: ckpts,
 	}
 }
 

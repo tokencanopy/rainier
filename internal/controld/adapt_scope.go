@@ -21,18 +21,18 @@ const (
 
 // placementCapabilityPrefix is the capability spelling of an explicit runner
 // pin (environment.placement), which control.Environment cannot name
-// directly. Its sibling, the affinity of a current snapshot to the runner
-// that built it, lives in store.go beside the helpers that write and strip
-// it. Runners advertise both for their own name.
+// directly. It is the host's own prefix, and the only one controld
+// synthesizes for a runner's name.
 const placementCapabilityPrefix = "placement:"
 
-// runnerCapabilities is the pair every runner advertises for its own name: an
-// environment pinned to it by placement, and one held to it by the snapshot it
-// built, both match. It is the host's spelling of a runner's identity as a
-// capability, which is why it lives here with the other scope constants rather
-// than in either store.
+// runnerCapabilities is what every runner advertises for its own name: the
+// one capability an environment pinned to it by placement requires. A
+// snapshot's affinity to the runner that built it used to be a second one;
+// it is the checkpoint locator's answer now (adapt_host.go), because where a
+// checkpoint can boot is knowledge about the checkpoint, not a claim a runner
+// makes about itself.
 func runnerCapabilities(name string) []string {
-	return []string{placementCapabilityPrefix + name, SnapshotCapability(control.RunnerID(name))}
+	return []string{placementCapabilityPrefix + name}
 }
 
 // The capability token rule, and the one this installation applies to every

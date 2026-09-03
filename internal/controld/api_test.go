@@ -470,6 +470,9 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		}
 	})
 
+	// D16: the image a session runs is decided at placement, where the
+	// holder is known. The create answers with the environment's image; the
+	// placement onto vm1, which holds the snapshot, resolves it to the ref.
 	t.Run("a current cache dispatches the snapshot with no setup", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
 		env := seedEnv(t, st, control.Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
@@ -477,8 +480,8 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		cacheEnvSnapshot(t, st, env, ref, "vm1")
 
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "e4", "environment": "cached"})
-		if row := getSession(t, st, got.ID); row.Spec.Image != ref {
-			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.Spec.Image, ref)
+		if got.Image != "env-img:1" {
+			t.Errorf("the created session's view shows image %q, want the environment's env-img:1 until it is placed", got.Image)
 		}
 		spec := nextCreate(t, f).Spec
 		if spec.Image != ref {
@@ -488,20 +491,18 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 			t.Errorf("spec setup = %q/%d, want none — the cached image IS the finished setup",
 				spec.Setup, spec.SetupTimeoutSec)
 		}
+		// The create is out, so the placement that resolved it has committed.
+		if row := getSession(t, st, got.ID); row.Spec.Image != ref {
+			t.Errorf("stored resolved_image = %q, want the snapshot %q once placed on its holder", row.Spec.Image, ref)
+		}
 	})
 
-	// D3: a current cache is the image the session runs, whoever holds it and
-	// whatever room they have. The cache is a per-runner local image, not a
-	// registry, so the affinity that used to be a fallback ("rebuild from the
-	// plain image anywhere") became a placement pin instead: the environment
-	// carries the capability snapshot:<runner> and the session waits for that
-	// runner rather than booting a different image somewhere else.
-	//
-	// Both halves are asserted: the image the create resolves to, and where
-	// the scheduler will (not) put it. The other half of the pin — a create
-	// dispatched to the holder even when a roomier runner is standing by — is
-	// sched_test.go's TestCacheTiebreakPrefersTheSnapshotHolder.
-	t.Run("a cache whose holder has no free slot still resolves to the snapshot", func(t *testing.T) {
+	// D17 restores the pre-O8 rule O8's D3 traded away: the cache is a
+	// per-runner local image, not a registry, so a holder that cannot take
+	// the session right now is not a cache hit at all — the session boots the
+	// environment's image and rebuilds its setup somewhere that has room. A
+	// cache is a head start, never a pin.
+	t.Run("a cache whose holder has no free slot falls back to image and setup", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		joinRunner(t, s, ts, runnerScript{Name: "vm1", Used: 1, Total: 1}) // the holder, full
 		f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 2})
@@ -513,40 +514,28 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		cacheEnvSnapshot(t, st, env, ref, "vm1")
 
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "e5", "environment": "cached"})
-		if row := getSession(t, st, got.ID); row.Spec.Image != ref {
-			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.Spec.Image, ref)
+		cmd := nextCreate(t, f2)
+		if cmd.Spec.Image != "env-img:1" || cmd.Spec.Setup != "echo hi" {
+			t.Fatalf("spec = %+v, want the plain image rebuilt with its setup on vm2", cmd.Spec)
 		}
-		// D3, the placement half: vm2 has two free slots and is never
-		// offered the session, because the image it would boot exists only
-		// on vm1. The session waits for vm1 instead.
-		time.Sleep(150 * time.Millisecond)
-		if row := getSession(t, st, got.ID); row.State != control.StateQueued || row.RunnerID != "" {
-			t.Fatalf("session = %q on %q, want still queued and unplaced (pinned to the full holder)", row.State, row.RunnerID)
+		if row := getSession(t, st, got.ID); row.Spec.Image != "env-img:1" {
+			t.Errorf("stored resolved_image = %q, want the plain image", row.Spec.Image)
 		}
-		wantNothingQueued(t, s, f2)
 	})
 
-	t.Run("a cache whose holder is disconnected still resolves to the snapshot", func(t *testing.T) {
-		s, st, ts := newTestControld(t)
-		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-		startRun(t, s)
-		_, tok := loginUser(t, st, "alice", "member")
-
-		const ref = "rainier-env:cached-0123456789ab"
+	t.Run("a cache whose holder is disconnected falls back to image and setup", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
 		env := seedEnv(t, st, control.Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
-		cacheEnvSnapshot(t, st, env, ref, "vm-gone")
+		cacheEnvSnapshot(t, st, env, "rainier-env:cached-0123456789ab", "vm-gone")
 
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "e6", "environment": "cached"})
-		if row := getSession(t, st, got.ID); row.Spec.Image != ref {
-			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.Spec.Image, ref)
+		spec := nextCreate(t, f).Spec
+		if spec.Image != "env-img:1" || spec.Setup != "echo hi" {
+			t.Fatalf("spec = %+v, want the plain image rebuilt with its setup", spec)
 		}
-		// D3 again, with the holder absent rather than full: no connected
-		// runner advertises snapshot:vm-gone, so nothing is placed at all.
-		time.Sleep(150 * time.Millisecond)
-		if row := getSession(t, st, got.ID); row.State != control.StateQueued || row.RunnerID != "" {
-			t.Fatalf("session = %q on %q, want still queued and unplaced (its holder is gone)", row.State, row.RunnerID)
+		if row := getSession(t, st, got.ID); row.Spec.Image != "env-img:1" {
+			t.Errorf("stored resolved_image = %q, want the plain image", row.Spec.Image)
 		}
-		wantNothingQueued(t, s, f)
 	})
 
 	t.Run("a snapshot built from superseded setup is not used", func(t *testing.T) {

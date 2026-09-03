@@ -89,7 +89,7 @@ func (s *FleetService) drainPool(ctx context.Context, pool control.PoolID) {
 		if !ok {
 			continue // its environment is unreadable right now; try next pass
 		}
-		runnerID, ok := pickForEnvironment(views, env)
+		runnerID, image, ok := s.placeQueued(ctx, row, env, views)
 		if !ok {
 			// The fleet has room, just not for this session's requirements.
 			// Skipping the row rather than ending the pass keeps one blocked
@@ -97,9 +97,17 @@ func (s *FleetService) drainPool(ctx context.Context, pool control.PoolID) {
 			continue
 		}
 		rid := runnerID
+		opts := control.TransitionOpts{RunnerID: &rid}
+		if image != nil {
+			// The image this placement resolved travels with the placement,
+			// in the same statement as the state, and is what the create
+			// dispatched below must carry.
+			opts.Image = image
+			row.Spec.Image = *image
+		}
 		if err := s.sessions.Transition(ctx, row.WorkspaceID, row.ID,
 			[]control.SessionState{control.StateQueued}, control.StateCreating,
-			control.TransitionOpts{RunnerID: &rid}); err != nil {
+			opts); err != nil {
 			if errors.Is(err, control.ErrConflict) || errors.Is(err, control.ErrNotFound) {
 				continue // moved on under us
 			}
@@ -153,23 +161,87 @@ func pickRunner(views []runnerView) (control.RunnerID, bool) {
 	return views[best].id, true
 }
 
-// pickForEnvironment narrows pickRunner to runners holding every portable
-// capability the session's environment requires.
-func pickForEnvironment(views []runnerView, env *control.Environment) (control.RunnerID, bool) {
-	if env == nil {
-		return pickRunner(views)
+// candidatesFor narrows the fleet to the runners eligible to run a session
+// from env at all: every connected runner holding every portable capability
+// env requires. Capacity is deliberately not part of it — pickRunner applies
+// that — so placement can ask "who could take this?" and "which of those are
+// preferable?" over one list, and fall back from the second to the first.
+func candidatesFor(views []runnerView, env *control.Environment) []runnerView {
+	if env == nil || len(env.Requirements.Capabilities) == 0 {
+		return views
 	}
-	reqs := env.Requirements.Capabilities
-	if len(reqs) == 0 {
-		return pickRunner(views)
-	}
-	candidates := make([]runnerView, 0, len(views))
+	out := make([]runnerView, 0, len(views))
 	for _, v := range views {
-		if hasAllCapabilities(v.caps, reqs) {
-			candidates = append(candidates, v)
+		if hasAllCapabilities(v.caps, env.Requirements.Capabilities) {
+			out = append(out, v)
 		}
 	}
-	return pickRunner(candidates)
+	return out
+}
+
+// admittedBy narrows candidates to the ones a checkpoint location allows: all
+// of them when the checkpoint is portable, else the runners it names. A
+// location that is neither — the zero value — admits nobody, which is exactly
+// "this checkpoint is not usable right now".
+func admittedBy(candidates []runnerView, loc control.CheckpointLocation) []runnerView {
+	if loc.Portable {
+		return candidates
+	}
+	out := make([]runnerView, 0, len(candidates))
+	for _, v := range candidates {
+		if slices.Contains(loc.Runners, v.id) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// placeQueued decides where a queued row goes and which image that placement
+// resolved: nil when the placement resolves none and the row's stored image
+// stands.
+//
+// A session from an environment with a current snapshot prefers a runner the
+// host says can boot that checkpoint, and boots the snapshot there. When no
+// such runner has room — the holder is full, or away, or the checkpoint is
+// nowhere — it falls back to any eligible runner and boots the environment's
+// own image, which createSpec then rebuilds with the environment's setup. A
+// cache is a head start, never a pin: waiting for one machine to free a slot
+// is worse than paying for the setup somewhere that has room now.
+//
+// A scratch session, a stale snapshot, and a session whose caller overrode
+// the image all place exactly as they did before: an override boots the image
+// its caller asked for, and no placement may quietly substitute another.
+func (s *FleetService) placeQueued(ctx context.Context, row control.Session, env *control.Environment, views []runnerView) (control.RunnerID, *string, bool) {
+	candidates := candidatesFor(views, env)
+	if env == nil || !runsCachedSnapshot(*env) || overridesEnvironmentImage(row, *env) {
+		id, ok := pickRunner(candidates)
+		return id, nil, ok
+	}
+	// An error is not a location: the checkpoint is simply not known to be
+	// anywhere, which is the same answer as nowhere. Nothing is logged — the
+	// fallback is a normal placement, not an incident.
+	loc, err := s.checkpoints.LocateCheckpoint(ctx, row.WorkspaceID, env.Snapshot)
+	if err != nil {
+		loc = control.CheckpointLocation{}
+	}
+	if id, ok := pickRunner(admittedBy(candidates, loc)); ok {
+		ref := env.Snapshot.Ref
+		return id, &ref, true
+	}
+	id, ok := pickRunner(candidates)
+	if !ok {
+		return "", nil, false
+	}
+	image := env.Image
+	return id, &image, true
+}
+
+// overridesEnvironmentImage reports whether row's stored image is a caller's
+// own choice rather than one of the two images a placement may resolve
+// between. A requeued row still carrying the ref a previous placement wrote
+// is not an override: it is re-resolved from scratch.
+func overridesEnvironmentImage(row control.Session, env control.Environment) bool {
+	return row.Spec.Image != env.Image && row.Spec.Image != env.Snapshot.Ref
 }
 
 func hasAllCapabilities(caps, reqs []string) bool {

@@ -56,7 +56,7 @@ func TestEligiblePoolsSumsConnectedRunners(t *testing.T) {
 	if got[0].CapacityUsed != 3 || got[0].CapacityTotal != 6 {
 		t.Fatalf("capacity = %d/%d, want 3/6", got[0].CapacityUsed, got[0].CapacityTotal)
 	}
-	want := []string{"placement:runner-a", "snapshot:runner-a", "placement:runner-b", "snapshot:runner-b"}
+	want := []string{"placement:runner-a", "placement:runner-b"}
 	if strings.Join(got[0].Capabilities, ",") != strings.Join(want, ",") {
 		t.Fatalf("capabilities = %v, want %v", got[0].Capabilities, want)
 	}

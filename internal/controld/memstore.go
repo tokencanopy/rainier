@@ -480,7 +480,6 @@ func (r memEnvironments) CreateEnvironment(ctx context.Context, ws control.Works
 		e.UpdatedAt = now
 	}
 	e.WorkspaceID = ws
-	e.Requirements.Capabilities = StripSnapshotCapabilities(e.Requirements.Capabilities)
 	// A brand-new environment has no cached snapshot, whatever the caller
 	// passed — only SetEnvironmentSnapshot writes these.
 	e.Snapshot, e.SnapshotHash = control.Checkpoint{}, ""
@@ -488,7 +487,7 @@ func (r memEnvironments) CreateEnvironment(ctx context.Context, ws control.Works
 	cp := cloneControlEnvironment(e)
 	m.environments[key] = &cp
 	delete(m.snapshots, key)
-	return m.environmentView(key, cp), nil
+	return cloneControlEnvironment(cp), nil
 }
 
 func (r memEnvironments) GetEnvironment(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID) (control.Environment, error) {
@@ -503,7 +502,7 @@ func (r memEnvironments) GetEnvironment(ctx context.Context, ws control.Workspac
 	if !ok {
 		return control.Environment{}, control.ErrNotFound
 	}
-	return m.environmentView(key, *e), nil
+	return cloneControlEnvironment(*e), nil
 }
 
 func (r memEnvironments) ListEnvironments(ctx context.Context, ws control.WorkspaceID, q control.EnvironmentQuery) ([]control.Environment, string, error) {
@@ -517,7 +516,7 @@ func (r memEnvironments) ListEnvironments(ctx context.Context, ws control.Worksp
 		if key.ws != ws {
 			continue
 		}
-		rows = append(rows, m.environmentView(key, *e))
+		rows = append(rows, cloneControlEnvironment(*e))
 	}
 	m.mu.Unlock()
 
@@ -573,11 +572,10 @@ func (r memEnvironments) UpdateEnvironment(ctx context.Context, ws control.Works
 	upd.CreatedAt = cur.CreatedAt
 	upd.Snapshot = cloneControlEnvironment(*cur).Snapshot
 	upd.SnapshotHash = cur.SnapshotHash
-	upd.Requirements.Capabilities = StripSnapshotCapabilities(upd.Requirements.Capabilities)
 	upd.UpdatedAt = time.Now()
 
 	m.environments[key] = &upd
-	return m.environmentView(key, upd), nil
+	return cloneControlEnvironment(upd), nil
 }
 
 func (r memEnvironments) DeleteEnvironment(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID) error {
@@ -639,20 +637,6 @@ func (r memEnvironments) SetEnvironmentSnapshot(ctx context.Context, ws control.
 	e.UpdatedAt = time.Now()
 	m.snapshots[key] = runnerID
 	return nil
-}
-
-// environmentView is the row as callers see it: a clone, plus the affinity
-// capability the cached snapshot lends the environment while it is still
-// current. A snapshot whose hash no longer matches the environment's is
-// stale, and a stale snapshot must not hold a session to one runner. The
-// caller holds the lock.
-func (m *memStore) environmentView(key environmentKey, e control.Environment) control.Environment {
-	c := cloneControlEnvironment(e)
-	holder := m.snapshots[key]
-	if c.Snapshot.Ref != "" && holder != "" && c.SnapshotHash == c.SetupHash {
-		c.Requirements.Capabilities = append(c.Requirements.Capabilities, SnapshotCapability(holder))
-	}
-	return c
 }
 
 // environmentByName finds ws's environment called name, or nil. The caller
@@ -862,7 +846,8 @@ func (m *memStore) SnapshotRunner(ctx context.Context, ws control.WorkspaceID, i
 // environment's CURRENT cache has it. A cache whose hash no longer matches
 // its environment's setup hash is stale, and a stale image is not an answer
 // to "where can this checkpoint boot" — so the scan requires the two to
-// agree, exactly as environmentView does before it lends out the affinity.
+// agree, which is the same currency rule controlapp.runsCachedSnapshot
+// applies before it asks this question at all.
 func (m *memStore) SnapshotHolder(ctx context.Context, ws control.WorkspaceID, ref string) (control.RunnerID, error) {
 	if ws == "" || ref == "" {
 		return "", control.ErrInvalid

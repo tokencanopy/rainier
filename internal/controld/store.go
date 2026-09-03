@@ -13,7 +13,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"strings"
 	"time"
 
 	"github.com/tokencanopy/rainier/control"
@@ -165,42 +164,10 @@ type MemStore interface {
 // changing the field.
 const snapshotCheckpointFormat = "rainier-runner-v0"
 
-// snapshotCapabilityPrefix is the self-hosted spelling of a snapshot's
-// affinity to the runner that built it. It lives beside the helpers that
-// write and strip it rather than beside the scope constants, because the
-// stores are what put it on an environment and take it back off.
-const snapshotCapabilityPrefix = "snapshot:"
-
 // SnapshotCheckpoint is the control spelling of a self-hosted environment
-// snapshot: a runner-built image ref, the one format this build has.
+// snapshot — a runner-built image ref, the one format this build has.
 func SnapshotCheckpoint(ref string) control.Checkpoint {
 	return control.Checkpoint{Ref: ref, Format: snapshotCheckpointFormat, Capabilities: []string{"workspace"}}
-}
-
-// SnapshotCapability is the self-hosted spelling of a CURRENT snapshot's
-// affinity to the runner that built it: appended to an environment's
-// requirements on the way out of a store, stripped on the way in. A later
-// plan replaces it with a portable checkpoint locator and deletes it.
-func SnapshotCapability(holder control.RunnerID) string {
-	return snapshotCapabilityPrefix + string(holder)
-}
-
-// StripSnapshotCapabilities returns caps without any snapshot affinity. A
-// store owns that capability the way it owns the cache it describes, so a
-// caller's copy of it — read back out and written straight in again — is
-// dropped rather than persisted.
-func StripSnapshotCapabilities(caps []string) []string {
-	if caps == nil {
-		return nil
-	}
-	out := make([]string, 0, len(caps))
-	for _, c := range caps {
-		if strings.HasPrefix(c, snapshotCapabilityPrefix) {
-			continue
-		}
-		out = append(out, c)
-	}
-	return out
 }
 
 // randHex returns n random bytes, hex-encoded (2n hex characters), sourced

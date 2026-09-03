@@ -1944,7 +1944,7 @@ func TestAnnouncedCapabilities(t *testing.T) {
 			t.Fatalf("accept Capabilities = %v, want the announced pair", acc.Capabilities)
 		}
 
-		want := []string{"placement:vm1", SnapshotCapability("vm1"), "gpu", "docker.rootless"}
+		want := append(runnerCapabilities("vm1"), "gpu", "docker.rootless")
 		wantCapabilities := func(when string) {
 			t.Helper()
 			eventually(t, 3*time.Second, func() error {

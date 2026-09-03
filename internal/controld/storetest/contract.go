@@ -433,7 +433,7 @@ func RunHost(t *testing.T, open func(t *testing.T) controld.HostStore) {
 			t.Fatalf("a fresh environment's holder = %q, %v; want no holder", holder, err)
 		}
 		if err := envs.SetEnvironmentSnapshot(ctx, hostWorkspace, env.ID, "h1", "snap:1", "runner_a"); err != nil {
-			t.Fatalf("snapshot: %v", err)
+			t.Fatalf("SetEnvironmentSnapshot: %v", err)
 		}
 		if holder, err := st.SnapshotRunner(ctx, hostWorkspace, env.ID); err != nil || holder != "runner_a" {
 			t.Fatalf("holder = %q, %v; want runner_a", holder, err)
@@ -470,7 +470,7 @@ func RunHost(t *testing.T, open func(t *testing.T) controld.HostStore) {
 		}
 
 		if err := envs.SetEnvironmentSnapshot(ctx, hostWorkspace, env.ID, "h1", "snap:1", "runner_a"); err != nil {
-			t.Fatalf("snapshot: %v", err)
+			t.Fatalf("SetEnvironmentSnapshot: %v", err)
 		}
 		if holder, err := st.SnapshotHolder(ctx, hostWorkspace, "snap:1"); err != nil || holder != "runner_a" {
 			t.Fatalf("holder = %q, %v; want runner_a", holder, err)

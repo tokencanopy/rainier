@@ -153,17 +153,17 @@ func scanControlEnvironment(row rowScanner) (control.Environment, error) {
 	if snapshotRef != "" {
 		e.Snapshot = controld.SnapshotCheckpoint(snapshotRef)
 	}
-	if snapshotRef != "" && snapshotRunner != "" && e.SnapshotHash == e.SetupHash {
-		e.Requirements.Capabilities = append(e.Requirements.Capabilities, controld.SnapshotCapability(control.RunnerID(snapshotRunner)))
-	}
+	// snapshot_runner is deliberately not turned into a requirement here:
+	// where a snapshot can boot is the host's checkpoint locator's answer
+	// (HostStore.SnapshotHolder reads this same column), and an environment's
+	// requirements are only what a caller wrote — snapshot_runner is scanned
+	// for that reader, not for this one.
 	return e, nil
 }
 
 // environmentWriteColumns marshals the four jsonb columns an insert or update
-// writes. The snapshot affinity is stripped on the way in: the store owns
-// that capability the way it owns the cache it describes, so a caller's copy
-// of it — read back out and written straight in again — is dropped rather
-// than persisted.
+// writes. Requirements go in exactly as the caller wrote them: the store adds
+// nothing to them on the way out, so there is nothing to strip on the way in.
 func environmentWriteColumns(e control.Environment) (egress, refs, connectors, requirements []byte, err error) {
 	if egress, err = json.Marshal(nonNilStrings(e.EgressAllow)); err != nil {
 		return nil, nil, nil, nil, err
@@ -174,9 +174,7 @@ func environmentWriteColumns(e control.Environment) (egress, refs, connectors, r
 	if connectors, err = encodeControlConnectors(e.Connectors); err != nil {
 		return nil, nil, nil, nil, err
 	}
-	stripped := e.Requirements
-	stripped.Capabilities = controld.StripSnapshotCapabilities(stripped.Capabilities)
-	if requirements, err = encodeRequirements(stripped); err != nil {
+	if requirements, err = encodeRequirements(e.Requirements); err != nil {
 		return nil, nil, nil, nil, err
 	}
 	return egress, refs, connectors, requirements, nil

@@ -770,8 +770,11 @@ func TestCreateSessionResolvesEnvironmentWithoutAliasing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Spec.Image != "registry.example.invalid/rainier@sha256:cafe" {
-		t.Fatalf("current snapshot not resolved: %q", got.Spec.Image)
+	// D16: the stored image is the environment's own, even with a current
+	// snapshot. Which image the session actually boots is decided at
+	// placement, where the checkpoint's location is known.
+	if got.Spec.Image != env.Image {
+		t.Fatalf("stored image = %q, want the environment's %q", got.Spec.Image, env.Image)
 	}
 	if got.Spec.Repos != nil {
 		t.Fatalf("nil repos lost: %#v", got.Spec.Repos)
@@ -1514,8 +1517,10 @@ func TestCreateSessionScratchWithoutImageAsksForTheHostDefault(t *testing.T) {
 
 // TestCreateSessionLayersOverridesOnTheEnvironment pins the composition rule
 // control.PortableSpec documents, through the service: an environment is the
-// template, the session's own image, command, and egress override it field by
-// field, and an image override forgoes the environment's snapshot.
+// template, and the session's own image, command, and egress override it
+// field by field. The image a create stores is never the snapshot ref (D16):
+// a create does not know where the snapshot can boot, so it stores the
+// environment's image and the placement resolves the rest.
 func TestCreateSessionLayersOverridesOnTheEnvironment(t *testing.T) {
 	env := sessionExampleEnvironment()
 	env.EgressAllow = []string{"registry.example.invalid"}
@@ -1529,16 +1534,16 @@ func TestCreateSessionLayersOverridesOnTheEnvironment(t *testing.T) {
 		wantCmd    []string
 		wantEgress []string
 	}{
-		{"nothing set: snapshot image, environment egress, default command", control.PortableSpec{},
-			"snap:example", nil, []string{"registry.example.invalid"}},
+		{"nothing set: environment image, environment egress, default command", control.PortableSpec{},
+			env.Image, nil, []string{"registry.example.invalid"}},
 		{"command only", control.PortableSpec{Cmd: []string{"claude"}},
-			"snap:example", []string{"claude"}, []string{"registry.example.invalid"}},
-		{"image override forgoes the snapshot", control.PortableSpec{Image: "registry.example.invalid/other@sha256:0001"},
+			env.Image, []string{"claude"}, []string{"registry.example.invalid"}},
+		{"image override wins over the environment's image", control.PortableSpec{Image: "registry.example.invalid/other@sha256:0001"},
 			"registry.example.invalid/other@sha256:0001", nil, []string{"registry.example.invalid"}},
 		{"egress extends, deduplicated, in order", control.PortableSpec{EgressAllow: []string{"api.example.com", "registry.example.invalid"}},
-			"snap:example", nil, []string{"registry.example.invalid", "api.example.com"}},
+			env.Image, nil, []string{"registry.example.invalid", "api.example.com"}},
 		{"explicitly empty egress adds nothing", control.PortableSpec{EgressAllow: []string{}},
-			"snap:example", nil, []string{"registry.example.invalid"}},
+			env.Image, nil, []string{"registry.example.invalid"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1591,5 +1596,31 @@ func TestCreateSessionInvalidInput(t *testing.T) {
 	}
 	if len(log.snapshot()) != 0 {
 		t.Fatalf("malformed repo touched ports: %v", log.snapshot())
+	}
+}
+
+// TestCreateFromACachedEnvironmentStoresTheEnvironmentImage is D16 on its
+// own: a create cannot know where a checkpoint can boot, so it stores the
+// environment's image. The snapshot ref reaches the row only through the
+// placement transition that resolved it.
+func TestCreateFromACachedEnvironmentStoresTheEnvironmentImage(t *testing.T) {
+	svc, repo, envRepo, pools, _, _, _ := newSessionFixture(t)
+	env := sessionExampleEnvironment()
+	env.Snapshot = control.Checkpoint{Ref: "snap:example", Format: "rainier-runner-v0"}
+	env.SnapshotHash = env.SetupHash // current
+	envRepo.put(env)
+	pools.pools = []control.Pool{{ID: "pool_a", CapacityTotal: 1, CapacityUsed: 0}}
+
+	got, err := svc.CreateSession(context.Background(), sessionTestScope(), control.CreateSession{
+		Name: "investigate", EnvironmentID: env.ID,
+	})
+	if err != nil {
+		t.Fatalf("create refused: %v", err)
+	}
+	if got.Spec.Image != env.Image {
+		t.Fatalf("returned image = %q, want the environment's %q", got.Spec.Image, env.Image)
+	}
+	if stored := repo.rows[got.ID]; stored.Spec.Image != env.Image {
+		t.Fatalf("stored image = %q, want the environment's %q", stored.Spec.Image, env.Image)
 	}
 }

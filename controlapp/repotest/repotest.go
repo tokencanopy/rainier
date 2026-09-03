@@ -872,7 +872,7 @@ func caseEnvironmentRoundTrip(t *testing.T, s Stores) {
 	want.WorkspaceID = Alpha
 	sameEnvironment(t, "created row", created, want)
 	if created.Snapshot.Ref != "" || created.Snapshot.Format != "" || created.SnapshotHash != "" {
-		t.Fatalf("a fresh environment has no snapshot: %+v / %q", created.Snapshot, created.SnapshotHash)
+		t.Fatalf("a fresh environment must have no snapshot; got %+v / %q", created.Snapshot, created.SnapshotHash)
 	}
 	if created.SetupHash != "h1" {
 		t.Fatalf("SetupHash = %q, want the caller's h1 — the repository computes none", created.SetupHash)
@@ -971,7 +971,7 @@ func caseEnvironmentUpdateIgnoresCache(t *testing.T, s Stores) {
 	ctx := context.Background()
 	env := mustCreateEnv(t, s, Alpha, fixtureEnvironment("env_a", "dev"))
 	if err := s.Environments.SetEnvironmentSnapshot(ctx, Alpha, env.ID, "h1", "snap:1", "runner_a"); err != nil {
-		t.Fatalf("snapshot: %v", err)
+		t.Fatalf("SetEnvironmentSnapshot: %v", err)
 	}
 	cached, err := s.Environments.GetEnvironment(ctx, Alpha, env.ID)
 	if err != nil {
@@ -1004,16 +1004,17 @@ func caseEnvironmentUpdateIgnoresCache(t *testing.T, s Stores) {
 }
 
 // caseEnvironmentSnapshot (E6) pins the compare-and-set that keeps a snapshot
-// honest, and the affinity capability a CURRENT snapshot lends the
-// environment: emitted while the hash still matches, gone the moment it does
-// not.
+// honest. A store records the snapshot and its hash and nothing else: where
+// the snapshot can boot is the host's checkpoint locator's answer, not a
+// capability a store invents, so the environment's requirements come back
+// exactly as they were written.
 func caseEnvironmentSnapshot(t *testing.T, s Stores) {
 	ctx := context.Background()
 	env := mustCreateEnv(t, s, Alpha, fixtureEnvironment("env_a", "dev"))
 	stored := slices.Clone(env.Requirements.Capabilities)
 
 	if err := s.Environments.SetEnvironmentSnapshot(ctx, Alpha, env.ID, "h1", "snap:1", "runner_a"); err != nil {
-		t.Fatalf("snapshot: %v", err)
+		t.Fatalf("SetEnvironmentSnapshot: %v", err)
 	}
 	cached, err := s.Environments.GetEnvironment(ctx, Alpha, env.ID)
 	if err != nil {
@@ -1022,9 +1023,8 @@ func caseEnvironmentSnapshot(t *testing.T, s Stores) {
 	if cached.Snapshot.Ref != "snap:1" || cached.Snapshot.Format == "" || cached.SnapshotHash != "h1" {
 		t.Fatalf("snapshot not recorded: %+v / %q", cached.Snapshot, cached.SnapshotHash)
 	}
-	wantCaps := append(slices.Clone(stored), "snapshot:runner_a")
-	if !slices.Equal(cached.Requirements.Capabilities, wantCaps) {
-		t.Fatalf("capabilities = %q, want the stored ones then %q", cached.Requirements.Capabilities, "snapshot:runner_a")
+	if !slices.Equal(cached.Requirements.Capabilities, stored) {
+		t.Fatalf("capabilities = %q, want exactly the stored ones %q — a store invents none", cached.Requirements.Capabilities, stored)
 	}
 
 	if err := s.Environments.SetEnvironmentSnapshot(ctx, Alpha, env.ID, "h9", "snap:2", "runner_b"); !errors.Is(err, control.ErrStale) {
@@ -1036,8 +1036,8 @@ func caseEnvironmentSnapshot(t *testing.T, s Stores) {
 	}
 	sameEnvironment(t, "after a losing snapshot", after, cached)
 
-	// Once the setup hash moves on, the snapshot is stale and stops holding
-	// the environment to the runner that built it.
+	// Once the setup hash moves on, the snapshot is stale — and the
+	// requirements are still only what was written.
 	upd := after
 	upd.SetupHash = "h2"
 	if _, err := s.Environments.UpdateEnvironment(ctx, Alpha, upd); err != nil {
@@ -1048,7 +1048,7 @@ func caseEnvironmentSnapshot(t *testing.T, s Stores) {
 		t.Fatal(err)
 	}
 	if !slices.Equal(moved.Requirements.Capabilities, stored) {
-		t.Fatalf("a stale snapshot must stop pinning: capabilities = %q, want %q", moved.Requirements.Capabilities, stored)
+		t.Fatalf("capabilities = %q, want the stored ones %q", moved.Requirements.Capabilities, stored)
 	}
 
 	if err := s.Environments.SetEnvironmentSnapshot(ctx, Alpha, "env_nosuch", "h1", "snap:3", "runner_a"); !errors.Is(err, control.ErrNotFound) {

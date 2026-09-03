@@ -223,14 +223,16 @@ func portableSpecFor(cmd control.CreateSession, env control.Environment) control
 		spec.EgressAllow = cloneStrings(cmd.Spec.EgressAllow)
 		return spec
 	}
-	switch {
-	case cmd.Spec.Image != "":
+	if cmd.Spec.Image != "" {
 		// An override boots its own image. The snapshot was built from the
 		// environment's image and setup, so it cannot stand in for this one.
 		spec.Image = cmd.Spec.Image
-	case runsCachedSnapshot(env):
-		spec.Image = env.Snapshot.Ref
-	default:
+	} else {
+		// Never the snapshot ref, however current the cache is: a create does
+		// not know where that checkpoint can boot, and a stored ref no runner
+		// with room can resolve is a session pinned to one machine. The
+		// placement asks the host's CheckpointLocator and writes back the
+		// image it resolved (control.TransitionOpts.Image).
 		spec.Image = env.Image
 	}
 	spec.EgressAllow = unionHosts(env.EgressAllow, cmd.Spec.EgressAllow)
@@ -238,7 +240,8 @@ func portableSpecFor(cmd control.CreateSession, env control.Environment) control
 }
 
 // runsCachedSnapshot reports whether env's cached snapshot is current and
-// therefore the image a session from it should boot.
+// therefore the image a session from it should boot where that snapshot can
+// be booted. The scheduler asks; a create never does.
 func runsCachedSnapshot(env control.Environment) bool {
 	return env.Snapshot.Ref != "" && env.SnapshotHash == env.SetupHash
 }
