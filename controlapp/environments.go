@@ -16,6 +16,10 @@ type EnvironmentOptions struct {
 	Events       control.EventRecorder
 	Clock        control.Clock
 	IDs          control.IDGenerator
+	// UnitOfWork is the host's atomicity, held for the same reason
+	// SessionOptions holds one: an environment write and its event are one
+	// fact. Nothing in this task opens a unit yet.
+	UnitOfWork control.UnitOfWork
 }
 
 // EnvironmentService owns reusable environment CRUD and setup-checkpoint
@@ -26,11 +30,13 @@ type EnvironmentService struct {
 	events       control.EventRecorder
 	clock        control.Clock
 	ids          control.IDGenerator
+	uow          control.UnitOfWork
 }
 
 // NewEnvironmentService returns ErrInvalid for a missing dependency.
 func NewEnvironmentService(o EnvironmentOptions) (*EnvironmentService, error) {
-	if o.Authorizer == nil || o.Environments == nil || o.Events == nil || o.Clock == nil || o.IDs == nil {
+	if o.Authorizer == nil || o.Environments == nil || o.Events == nil || o.Clock == nil ||
+		o.IDs == nil || o.UnitOfWork == nil {
 		return nil, control.ErrInvalid
 	}
 	return &EnvironmentService{
@@ -39,6 +45,7 @@ func NewEnvironmentService(o EnvironmentOptions) (*EnvironmentService, error) {
 		events:       o.Events,
 		clock:        o.Clock,
 		ids:          o.IDs,
+		uow:          o.UnitOfWork,
 	}, nil
 }
 

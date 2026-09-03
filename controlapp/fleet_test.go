@@ -578,6 +578,8 @@ func newFleetFixtureWithResolver(t *testing.T, resolver LaunchMaterialResolver) 
 		IDs:            ids,
 		SafetyInterval: time.Second,
 		LaunchMaterial: r,
+		UnitOfWork:     directUOW{},
+		Checkpoints:    locatorStub{},
 	})
 	if err != nil {
 		t.Fatalf("NewFleetService: %v", err)
@@ -646,6 +648,8 @@ func TestNewFleetServiceRequiresEveryPort(t *testing.T) {
 			IDs:            &fleetFakeIDs{},
 			SafetyInterval: time.Second,
 			LaunchMaterial: &fleetFakeResolver{},
+			UnitOfWork:     directUOW{},
+			Checkpoints:    locatorStub{},
 		}
 	}
 	if _, err := NewFleetService(base()); err != nil {
@@ -662,6 +666,8 @@ func TestNewFleetServiceRequiresEveryPort(t *testing.T) {
 		"clock":           func(o *FleetOptions) { o.Clock = nil },
 		"ids":             func(o *FleetOptions) { o.IDs = nil },
 		"launch material": func(o *FleetOptions) { o.LaunchMaterial = nil },
+		"unit of work":    func(o *FleetOptions) { o.UnitOfWork = nil },
+		"checkpoints":     func(o *FleetOptions) { o.Checkpoints = nil },
 	} {
 		o := base()
 		zero(&o)
@@ -1472,6 +1478,70 @@ func TestApplyRunnerEventRejectsStale(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The session's own authority, beside the runner's: an event echoing the
+// placement generation the sandbox was created under is applied, one echoing
+// a superseded generation is stale even though it arrived on the current
+// connection, and an event that carries none (an old runner) is fenced by the
+// connection alone, exactly as before this field existed.
+func TestApplyRunnerEventFencesOnPlacementGeneration(t *testing.T) {
+	seed := func(t *testing.T) *fleetFixture {
+		t.Helper()
+		fx := newFleetFixture(t)
+		fx.st.seedRunner(fleetEventRunner(1))
+		fx.st.seedSession(control.Session{
+			ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
+			PoolID: "pool_example", RunnerID: "runner_example", PlacementGeneration: 3,
+		})
+		return fx
+	}
+	event := func(gen uint64) control.RunnerEvent {
+		return control.RunnerEvent{
+			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+			Generation: 1, SessionID: "sess_example", State: control.StateRunning,
+			PlacementGeneration: gen,
+		}
+	}
+
+	t.Run("a matching generation applies", func(t *testing.T) {
+		fx := seed(t)
+		if err := fx.service.ApplyRunnerEvent(fleetCtx, event(3)); err != nil {
+			t.Fatalf("matching placement generation: %v", err)
+		}
+		if got := fleetGetSessionState(t, fx, "ws_example", "sess_example").State; got != control.StateRunning {
+			t.Fatalf("state = %q, want running", got)
+		}
+		if fx.st.transitionCalls != 1 || len(fx.events.recorded()) != 1 {
+			t.Fatalf("transitions %d, events %d; want 1/1", fx.st.transitionCalls, len(fx.events.recorded()))
+		}
+	})
+
+	t.Run("a superseded generation is stale with no effects", func(t *testing.T) {
+		fx := seed(t)
+		if err := fx.service.ApplyRunnerEvent(fleetCtx, event(2)); !errors.Is(err, control.ErrStale) {
+			t.Fatalf("got %v, want ErrStale", err)
+		}
+		if got := fleetGetSessionState(t, fx, "ws_example", "sess_example").State; got != control.StateCreating {
+			t.Fatalf("state = %q, want creating (untouched)", got)
+		}
+		if fx.st.transitionCalls != 0 || len(fx.events.recorded()) != 0 {
+			t.Fatal("a stale placement generation had effects")
+		}
+	})
+
+	t.Run("zero fences nothing", func(t *testing.T) {
+		fx := seed(t)
+		if err := fx.service.ApplyRunnerEvent(fleetCtx, event(0)); err != nil {
+			t.Fatalf("an event carrying no placement generation: %v", err)
+		}
+		if got := fleetGetSessionState(t, fx, "ws_example", "sess_example").State; got != control.StateRunning {
+			t.Fatalf("state = %q, want running", got)
+		}
+		if fx.st.transitionCalls != 1 || len(fx.events.recorded()) != 1 {
+			t.Fatalf("transitions %d, events %d; want 1/1", fx.st.transitionCalls, len(fx.events.recorded()))
+		}
+	})
 }
 
 func TestApplyRunnerEventDuplicateTerminalIsSuccess(t *testing.T) {

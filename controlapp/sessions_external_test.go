@@ -45,6 +45,7 @@ func sessionMustSessions() control.Sessions {
 		Wake:         func(control.PoolID) {},
 		Fleet:        sessionExtFleet{},
 		Transport:    sessionExtTransport{},
+		UnitOfWork:   extDirectUOW{},
 	})
 	if err != nil {
 		panic(err)
@@ -59,6 +60,7 @@ func sessionMustEnvironments() control.Environments {
 		Events:       sessionExtEventRecorder{},
 		Clock:        sessionExtClock{now: sessionExtNow},
 		IDs:          sessionExtIDs{},
+		UnitOfWork:   extDirectUOW{},
 	})
 	if err != nil {
 		panic(err)

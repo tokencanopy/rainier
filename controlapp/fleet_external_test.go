@@ -29,6 +29,8 @@ func fleetExternalOptions() controlapp.FleetOptions {
 		IDs:            fleetExtIDs{},
 		SafetyInterval: time.Second,
 		LaunchMaterial: fleetExtResolver{},
+		UnitOfWork:     extDirectUOW{},
+		Checkpoints:    extLocatorStub{},
 	}
 }
 

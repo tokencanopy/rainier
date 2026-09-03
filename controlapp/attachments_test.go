@@ -46,6 +46,7 @@ func TestNewAttachmentServiceRejectsMissingDependency(t *testing.T) {
 		Events:     &attachmentFakeEvents{},
 		Clock:      attachmentFakeClock(func() time.Time { return time.Unix(0, 0) }),
 		IDs:        attachmentFakeIDs{eventID: "evt_example"},
+		UnitOfWork: directUOW{},
 	}
 	tests := []struct {
 		name   string
@@ -59,6 +60,7 @@ func TestNewAttachmentServiceRejectsMissingDependency(t *testing.T) {
 		{"events", func(o *AttachmentOptions) { o.Events = nil }},
 		{"clock", func(o *AttachmentOptions) { o.Clock = nil }},
 		{"ids", func(o *AttachmentOptions) { o.IDs = nil }},
+		{"unit of work", func(o *AttachmentOptions) { o.UnitOfWork = nil }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -521,6 +523,7 @@ func newAttachmentFixture(t *testing.T) *attachmentFixture {
 		Events:     fx.events,
 		Clock:      attachmentFakeClock(func() time.Time { return time.Unix(0, 0) }),
 		IDs:        fx.ids,
+		UnitOfWork: directUOW{},
 	})
 	if err != nil {
 		t.Fatalf("NewAttachmentService: %v", err)

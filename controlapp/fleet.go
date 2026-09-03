@@ -41,6 +41,15 @@ type FleetOptions struct {
 	// hook unbounded here and defers to the runner's own default.
 	DefaultSetupTimeoutSec int
 	DefaultInitTimeoutSec  int
+
+	// UnitOfWork is the host's atomicity: a runner event's transition and the
+	// event recording it are one fact. Nothing in this task opens a unit yet.
+	UnitOfWork control.UnitOfWork
+
+	// Checkpoints is the host's knowledge of where a checkpoint can boot. The
+	// scheduler prefers a runner that admits one and falls back to a rebuild
+	// elsewhere; nothing in this task asks it yet.
+	Checkpoints control.CheckpointLocator
 }
 
 // FleetService implements control.Fleet and owns runner registration,
@@ -65,6 +74,11 @@ type FleetService struct {
 	// hook whose environment declares none (FleetOptions).
 	defaultSetupTimeout int
 	defaultInitTimeout  int
+
+	// uow is the host's atomicity and checkpoints its knowledge of where a
+	// checkpoint can boot (FleetOptions).
+	uow         control.UnitOfWork
+	checkpoints control.CheckpointLocator
 
 	// wake carries pool IDs that need a placement pass. It is buffered so
 	// Wake never blocks a caller; Run drains it.
@@ -91,6 +105,9 @@ func NewFleetService(opts FleetOptions) (*FleetService, error) {
 	if opts.LaunchMaterial == nil {
 		return nil, control.ErrInvalid
 	}
+	if opts.UnitOfWork == nil || opts.Checkpoints == nil {
+		return nil, control.ErrInvalid
+	}
 	return &FleetService{
 		auth:                opts.Authorizer,
 		sessions:            opts.Sessions,
@@ -105,6 +122,8 @@ func NewFleetService(opts FleetOptions) (*FleetService, error) {
 		launchMaterial:      opts.LaunchMaterial,
 		defaultSetupTimeout: opts.DefaultSetupTimeoutSec,
 		defaultInitTimeout:  opts.DefaultInitTimeoutSec,
+		uow:                 opts.UnitOfWork,
+		checkpoints:         opts.Checkpoints,
 		wake:                make(chan control.PoolID, 64),
 		known:               make(map[control.PoolID]struct{}),
 	}, nil
@@ -654,6 +673,13 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 		}
 	}
 	if !matched {
+		return control.ErrStale
+	}
+	// The session's own authority, beside the runner's: a report echoing a
+	// placement generation the row has moved past comes from a sandbox this
+	// session no longer has, even when it arrives on the current connection.
+	// Zero is "not carried" (an old runner) and fences nothing.
+	if event.PlacementGeneration != 0 && event.PlacementGeneration != row.PlacementGeneration {
 		return control.ErrStale
 	}
 

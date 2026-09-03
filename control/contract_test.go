@@ -38,6 +38,8 @@ var (
 	_ control.RunnerTransport       = (*fakeRunnerTransport)(nil)
 	_ control.AttachmentBroker      = (*fakeAttachmentBroker)(nil)
 	_ control.EventRecorder         = (*fakeEventRecorder)(nil)
+	_ control.UnitOfWork            = (*fakeUnitOfWork)(nil)
+	_ control.CheckpointLocator     = (*fakeCheckpointLocator)(nil)
 	_ control.Clock                 = fakeClock(nil)
 	_ control.IDGenerator           = fakeIDGenerator{}
 	_ control.TerminalStream        = (*fakeTerminalStream)(nil)
@@ -317,6 +319,44 @@ func TestIdealCallSite(t *testing.T) {
 	if app.lastScope != scope {
 		t.Fatalf("fake received scope %+v, want %+v", app.lastScope, scope)
 	}
+
+	// The host's atomicity and its knowledge of where a checkpoint can boot
+	// are ports too, and an external package satisfies both: a unit of work
+	// runs the closure it is handed, and a locator answers with a location.
+	uow := &fakeUnitOfWork{}
+	ran := false
+	if err := uow.Run(context.Background(), func(context.Context) error {
+		ran = true
+		return nil
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !ran || uow.runs != 1 {
+		t.Fatalf("unit of work ran %v after %d Run calls, want the closure once", ran, uow.runs)
+	}
+	sentinel := errors.New("safe context only")
+	if err := uow.Run(context.Background(), func(context.Context) error { return sentinel }); !errors.Is(err, sentinel) {
+		t.Fatalf("Run returned %v, want fn's own error", err)
+	}
+
+	locator := &fakeCheckpointLocator{
+		location: control.CheckpointLocation{Runners: []control.RunnerID{"runner_example"}},
+	}
+	loc, err := locator.LocateCheckpoint(context.Background(), "ws_example",
+		control.Checkpoint{Ref: "ckpt_example", Format: "rainier-workspace-v0"})
+	if err != nil {
+		t.Fatalf("LocateCheckpoint: %v", err)
+	}
+	if loc.Portable || len(loc.Runners) != 1 || loc.Runners[0] != "runner_example" {
+		t.Fatalf("location = %+v, want the one named runner", loc)
+	}
+	if locator.asked.Ref != "ckpt_example" || locator.askedWS != "ws_example" {
+		t.Fatalf("locator asked for %q in %q", locator.asked.Ref, locator.askedWS)
+	}
+	// Both empty is "nowhere", and Portable is "any runner of the pool" —
+	// the two answers the scheduler branches on.
+	_ = control.CheckpointLocation{}
+	_ = control.CheckpointLocation{Portable: true}
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +526,29 @@ func (fakeAttachmentBroker) Attach(context.Context, control.AttachTarget, contro
 type fakeEventRecorder struct{}
 
 func (fakeEventRecorder) Record(context.Context, control.Event) error { return nil }
+
+// fakeUnitOfWork is a host without transactions: Run executes fn directly and
+// returns its error unchanged, which is exactly what the port permits.
+type fakeUnitOfWork struct{ runs int }
+
+func (f *fakeUnitOfWork) Run(ctx context.Context, fn func(context.Context) error) error {
+	f.runs++
+	return fn(ctx)
+}
+
+// fakeCheckpointLocator answers with a fixed location and records what it was
+// asked, so an external caller can prove the port carries the workspace and
+// the checkpoint and nothing else.
+type fakeCheckpointLocator struct {
+	location control.CheckpointLocation
+	askedWS  control.WorkspaceID
+	asked    control.Checkpoint
+}
+
+func (f *fakeCheckpointLocator) LocateCheckpoint(_ context.Context, ws control.WorkspaceID, cp control.Checkpoint) (control.CheckpointLocation, error) {
+	f.askedWS, f.asked = ws, cp
+	return f.location, nil
+}
 
 type fakeClock func() time.Time
 

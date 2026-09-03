@@ -181,6 +181,33 @@ type EventRecorder interface {
 	Record(context.Context, Event) error
 }
 
+// UnitOfWork is the host's atomicity: Run executes fn so that every
+// repository write and event record fn makes through the context it is
+// handed commits together or not at all. A nested Run joins the enclosing
+// unit rather than starting another. A host without transactions (an
+// in-memory store) runs fn directly. Run returns fn's error unchanged, and
+// ErrUnavailable when the unit itself cannot be opened or committed; no
+// transaction, connection, or driver type crosses this port.
+type UnitOfWork interface {
+	Run(ctx context.Context, fn func(ctx context.Context) error) error
+}
+
+// CheckpointLocation is where a checkpoint can be booted: on any runner of
+// the pool (Portable), or only on the named ones. Both empty means nowhere
+// — the checkpoint is not usable right now and the caller boots without it.
+type CheckpointLocation struct {
+	Portable bool
+	Runners  []RunnerID
+}
+
+// CheckpointLocator is the host's knowledge of where checkpoint artifacts
+// live. Self-hosted snapshots are container images on the runner that built
+// them; hosted checkpoints are regional objects any capable runner restores.
+// The application asks and never assumes.
+type CheckpointLocator interface {
+	LocateCheckpoint(ctx context.Context, ws WorkspaceID, cp Checkpoint) (CheckpointLocation, error)
+}
+
 // Clock supplies time to the application. Adapters may freeze or skew it in
 // tests.
 type Clock interface {

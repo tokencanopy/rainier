@@ -510,6 +510,7 @@ func validSessionOptions() SessionOptions {
 		Wake:         func(control.PoolID) {},
 		Fleet:        &sessionStubFleet{},
 		Transport:    &sessionStubTransport{},
+		UnitOfWork:   directUOW{},
 	}
 }
 
@@ -531,6 +532,7 @@ func TestNewSessionServiceRequiresEveryDependency(t *testing.T) {
 		{"wake", func(o *SessionOptions) { o.Wake = nil }},
 		{"fleet", func(o *SessionOptions) { o.Fleet = nil }},
 		{"transport", func(o *SessionOptions) { o.Transport = nil }},
+		{"unit of work", func(o *SessionOptions) { o.UnitOfWork = nil }},
 	}
 	for _, tt := range tests {
 		o := validSessionOptions()
@@ -576,6 +578,7 @@ func newSessionFixtureFull(t *testing.T) *sessionFixture {
 		Wake:         func(p control.PoolID) { log.add("wake:" + string(p)) },
 		Fleet:        fleet,
 		Transport:    transport,
+		UnitOfWork:   directUOW{},
 	})
 	if err != nil {
 		t.Fatalf("NewSessionService: %v", err)

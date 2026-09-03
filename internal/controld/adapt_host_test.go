@@ -3,6 +3,7 @@ package controld
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log"
 	"strings"
 	"testing"
@@ -131,5 +132,92 @@ func TestSystemClockReportsWallTime(t *testing.T) {
 	after := time.Now()
 	if got.Before(before) || got.After(after) {
 		t.Fatalf("Now() = %v, outside [%v, %v]", got, before, after)
+	}
+}
+
+// A self-hosted installation has no transactions to open: the unit of work is
+// the closure itself, run on the context it was handed, and fn's error is the
+// answer unchanged. That is what the port permits a host without transactions
+// to do, and Task 2 replaces it with the store's real one.
+func TestDirectUnitOfWorkRunsTheClosureOnTheSameContext(t *testing.T) {
+	ctx := context.WithValue(context.Background(), userContextKey{}, User{ID: "usr_example"})
+	var inner context.Context
+	if err := (directUnitOfWork{}).Run(ctx, func(c context.Context) error {
+		inner = c
+		return nil
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if inner != ctx {
+		t.Fatal("Run handed fn a context of its own; a host without transactions carries nothing")
+	}
+	boom := errors.New("safe context only")
+	if err := (directUnitOfWork{}).Run(ctx, func(context.Context) error { return boom }); !errors.Is(err, boom) {
+		t.Fatalf("Run returned %v, want fn's own error unchanged", err)
+	}
+}
+
+// A self-hosted snapshot is a container image on the runner that built it, so
+// the locator's whole answer is that one runner: nowhere before a snapshot
+// exists, the holder once it does, and nowhere for a ref no environment of
+// this workspace carries.
+func TestPinnedCheckpointsNamesTheHolderAndNobodyElse(t *testing.T) {
+	ctx := context.Background()
+	st := NewMemStore()
+	envs := st.Environments()
+	loc := pinnedCheckpoints{st: st}
+
+	env, err := envs.CreateEnvironment(ctx, installWorkspace, control.Environment{
+		ID: "env_example", Name: "dev", Image: "registry.example.invalid/base@sha256:0000",
+		Setup: "make deps", SetupHash: "h1",
+	})
+	if err != nil {
+		t.Fatalf("create environment: %v", err)
+	}
+
+	// No snapshot yet: nowhere, and the caller boots without one.
+	got, err := loc.LocateCheckpoint(ctx, installWorkspace, SnapshotCheckpoint("snap:1"))
+	if err != nil {
+		t.Fatalf("locate before the snapshot: %v", err)
+	}
+	if got.Portable || len(got.Runners) != 0 {
+		t.Fatalf("location before the snapshot = %+v, want nowhere", got)
+	}
+
+	if err := envs.SetEnvironmentSnapshot(ctx, installWorkspace, env.ID, "h1", "snap:1", "runner_a"); err != nil {
+		t.Fatalf("set snapshot: %v", err)
+	}
+
+	got, err = loc.LocateCheckpoint(ctx, installWorkspace, SnapshotCheckpoint("snap:1"))
+	if err != nil {
+		t.Fatalf("locate: %v", err)
+	}
+	if got.Portable {
+		t.Fatal("a runner-built image is not portable")
+	}
+	if len(got.Runners) != 1 || got.Runners[0] != "runner_a" {
+		t.Fatalf("runners = %v, want exactly the holder", got.Runners)
+	}
+
+	// A ref nothing in this workspace holds, an empty ref, and another
+	// workspace's view are all nowhere rather than an error.
+	for name, cp := range map[string]control.Checkpoint{
+		"unknown ref": SnapshotCheckpoint("snap:other"),
+		"empty ref":   {},
+	} {
+		got, err := loc.LocateCheckpoint(ctx, installWorkspace, cp)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got.Portable || len(got.Runners) != 0 {
+			t.Fatalf("%s: location = %+v, want nowhere", name, got)
+		}
+	}
+	got, err = loc.LocateCheckpoint(ctx, "ws_other", SnapshotCheckpoint("snap:1"))
+	if err != nil {
+		t.Fatalf("another workspace: %v", err)
+	}
+	if got.Portable || len(got.Runners) != 0 {
+		t.Fatalf("another workspace saw %+v, want nowhere", got)
 	}
 }

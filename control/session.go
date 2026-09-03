@@ -54,6 +54,10 @@ var NonTerminal = []SessionState{StateQueued, StateCreating, StateRunning, State
 type TransitionOpts struct {
 	RunnerID *RunnerID
 	Error    *string
+	// Image, when non-nil, records the image this placement resolved for the
+	// session (Spec.Image): the cached checkpoint on a runner that holds it,
+	// else the environment's own image. Set only by a placement transition.
+	Image *string
 }
 
 // RepoRef is one entry of a session's repository override, in the spelling
