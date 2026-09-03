@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/tokencanopy/rainier/control"
 )
 
 const (
@@ -352,7 +354,7 @@ func (s *Server) requireUser(next func(http.ResponseWriter, *http.Request, User)
 
 		u, err := s.st.UserByToken(r.Context(), HashToken(tok))
 		if err != nil {
-			if !errors.Is(err, ErrNotFound) {
+			if !errors.Is(err, control.ErrNotFound) {
 				log.Printf("controld: user by token: %v", err)
 			}
 			writeErr(w, http.StatusUnauthorized, "unauthenticated", "invalid or expired token")

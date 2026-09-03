@@ -71,21 +71,7 @@ fi
 # The exact interface-freeze allowlist: every public control model that still
 # has a private twin in internal/controld, to be removed by the extraction
 # lanes. Nothing else may appear in both packages.
-allowlist=(
-  SessionState
-  StateQueued StateCreating StateRunning StateSuspendedWarm StateSuspendedCold
-  StateCanceled StateFailed StateDead StateDestroyed
-  NonTerminal
-  Session
-  SessionQuery
-  TransitionOpts
-  RepoRef
-  Environment
-  Connector
-  Runner
-  ErrNotFound
-  ErrConflict
-)
+allowlist=()
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -166,7 +152,7 @@ while IFS= read -r name; do
     continue
   fi
   allowed=0
-  for a in "${allowlist[@]}"; do
+  for a in ${allowlist[@]+"${allowlist[@]}"}; do
     [[ "$name" == "$a" ]] && allowed=1
   done
   if [[ "$allowed" == "1" ]]; then

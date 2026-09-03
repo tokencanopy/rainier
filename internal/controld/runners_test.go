@@ -1099,7 +1099,7 @@ func TestRedialSurvivesStaleDisconnect(t *testing.T) {
 	awaitChan(t, rs.wrote, "teardown's disconnect write returning")
 
 	eventually(t, 3*time.Second, func() error {
-		runners, err := rs.ListRunners(context.Background())
+		runners, err := rs.Fleet().ListRunners(context.Background(), installPool)
 		if err != nil {
 			return err
 		}

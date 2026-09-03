@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/controlapp/repotest"
 	"github.com/tokencanopy/rainier/internal/controld"
 	"github.com/tokencanopy/rainier/internal/controld/storetest"
@@ -66,17 +67,6 @@ func startPostgres(t *testing.T) string {
 	return dsn
 }
 
-func TestPGStoreContract(t *testing.T) {
-	dsn := startPostgres(t)
-	n := 0
-	storetest.RunContract(t, func(t *testing.T) controld.Store {
-		// fresh schema per subtest: unique search_path-free approach — create
-		// a numbered database so subtests don't see each other's rows.
-		n++
-		return freshStore(t, dsn, fmt.Sprintf("contract_%d", n))
-	})
-}
-
 // freshStore opens a brand-new, empty database on dsn's server so a test can
 // run in isolation from every other test on the same throwaway postgres
 // container. name is a label, not the database name: freshDB derives a legal,
@@ -102,15 +92,19 @@ func TestListSessionsExactMultiplePagination(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 4; i++ {
-		if _, err := st.CreateSession(ctx, controld.Session{
-			ID: controld.NewSessionID(), OwnerID: u.ID, Image: "img", State: controld.StateQueued,
+		if _, err := st.Sessions().CreateSession(ctx, "ws_self_hosted", control.Session{
+			ID:        control.SessionID(controld.NewSessionID()),
+			CreatorID: control.ActorID(u.ID),
+			Spec:      control.PortableSpec{Image: "img"},
+			State:     control.StateQueued,
+			PoolID:    "pool_self_hosted",
 		}); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(2 * time.Millisecond) // distinct created_at
 	}
 
-	page, next, err := st.ListSessions(ctx, controld.SessionQuery{Limit: 4})
+	page, next, err := st.Sessions().ListSessions(ctx, "ws_self_hosted", control.SessionQuery{Limit: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +115,7 @@ func TestListSessionsExactMultiplePagination(t *testing.T) {
 		t.Fatal("want non-empty next cursor when the page comes back exactly full, even though no further rows exist")
 	}
 
-	page2, next2, err := st.ListSessions(ctx, controld.SessionQuery{Limit: 4, Cursor: next})
+	page2, next2, err := st.Sessions().ListSessions(ctx, "ws_self_hosted", control.SessionQuery{Limit: 4, Cursor: next})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +163,7 @@ func TestUserByTokenTouchesLastUsedAt(t *testing.T) {
 		t.Fatal("want last_used_at set after UserByToken, got NULL")
 	}
 
-	if _, err := st.UserByToken(ctx, controld.HashToken("rnr_bogus")); !errors.Is(err, controld.ErrNotFound) {
+	if _, err := st.UserByToken(ctx, controld.HashToken("rnr_bogus")); !errors.Is(err, control.ErrNotFound) {
 		t.Fatalf("want ErrNotFound for unknown token, got %v", err)
 	}
 }
@@ -276,34 +270,39 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	if want := embeddedMigrationVersions(t); !slices.Equal(applied, want) {
 		t.Fatalf("schema_migrations = %v, want every embedded migration in order %v", applied, want)
 	}
+	// This release's head is 8: a database that stopped at 0003 runs the
+	// expand step (0007) and the contract step (0008) in the same start.
+	if head := applied[len(applied)-1]; head != 8 {
+		t.Fatalf("head migration = %d, want 8", head)
+	}
 
 	// The legacy session survived, and its new columns read as "never exited"
 	// rather than "exited 0", and as "named no repo override" rather than
 	// "asked for no repositories" — a pre-0005 row stores SQL NULL there, and
 	// a nil Repos is what lets its environment's connectors still decide.
-	sess, err := st.GetSession(ctx, "sess_legacy")
+	sess, err := st.Sessions().GetSession(ctx, "ws_self_hosted", "sess_legacy")
 	if err != nil {
 		t.Fatalf("legacy session after upgrade: %v", err)
 	}
 	if sess.ChildExitCode != nil {
 		t.Fatalf("legacy session child_exit_code = %d, want NULL", *sess.ChildExitCode)
 	}
-	if sess.Repos != nil {
-		t.Fatalf("legacy session repos = %#v, want nil (no override), not an empty list", sess.Repos)
+	if sess.Spec.Repos != nil {
+		t.Fatalf("legacy session repos = %#v, want nil (no override), not an empty list", sess.Spec.Repos)
 	}
-	if sess.Name != "old" || sess.Image != "img:0" || sess.State != controld.StateRunning {
+	if sess.Name != "old" || sess.Spec.Image != "img:0" || sess.State != control.StateRunning {
 		t.Fatalf("legacy session lost data across the migration: %+v", sess)
 	}
-	if err := st.SetChildExitCode(ctx, "sess_legacy", 0); err != nil {
+	if err := st.Sessions().SetChildExitCode(ctx, "ws_self_hosted", "sess_legacy", 0); err != nil {
 		t.Fatal(err)
 	}
-	if sess, err = st.GetSession(ctx, "sess_legacy"); err != nil || sess.ChildExitCode == nil || *sess.ChildExitCode != 0 {
+	if sess, err = st.Sessions().GetSession(ctx, "ws_self_hosted", "sess_legacy"); err != nil || sess.ChildExitCode == nil || *sess.ChildExitCode != 0 {
 		t.Fatalf("after SetChildExitCode(0): %v %+v", err, sess.ChildExitCode)
 	}
 
 	// The legacy environment survived with an empty init hook, and its
 	// setup_hash — the identity a cached snapshot is keyed by — did not move.
-	env, err := st.GetEnvironment(ctx, "env_legacy")
+	env, err := st.Environments().GetEnvironment(ctx, "ws_self_hosted", "env_legacy")
 	if err != nil {
 		t.Fatalf("legacy environment after upgrade: %v", err)
 	}
@@ -337,15 +336,16 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	if _, err := st.pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, gone.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.GetCredential(ctx, gone.ID, "github"); !errors.Is(err, controld.ErrNotFound) {
+	if _, err := st.GetCredential(ctx, gone.ID, "github"); !errors.Is(err, control.ErrNotFound) {
 		t.Fatalf("ON DELETE CASCADE must take the credential with the user, got %v", err)
 	}
 
 	// Replay: a controld that restarts against an already-migrated database
 	// runs Migrate again, and it must do nothing at all. Every statement in
-	// the expand step (0007) is a one-way ALTER, so a second application
-	// would fail loudly rather than silently — the assertion is that the
-	// version set is unchanged and the rows still read.
+	// the expand step (0007) and the contract step (0008) is a one-way ALTER
+	// or DROP, so a second application would fail loudly rather than
+	// silently — the assertion is that the version set is unchanged (through
+	// 8) and the rows still read.
 	if err := Migrate(ctx, st.pool); err != nil {
 		t.Fatalf("Migrate twice: %v", err)
 	}
@@ -522,6 +522,41 @@ func TestMigration0007BackfillsExistingRows(t *testing.T) {
 	}
 	if runners[0].PoolID != "pool_self_hosted" || runners[0].CapacityTotal != 4 || !runners[0].Connected {
 		t.Fatalf("runner fields after 0007: %+v", runners[0])
+	}
+
+	// And the contract step (0008) took the two columns the expand step
+	// replaced, and the scope defaults with them: after this release a row
+	// written without a workspace is a database error, not a silent write
+	// into the installation's own workspace.
+	for _, gone := range []struct{ table, column string }{
+		{"sessions", "resolved_image"},
+		{"environments", "placement"},
+	} {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM information_schema.columns WHERE table_name = $1 AND column_name = $2`,
+			gone.table, gone.column).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("%s.%s survived 0008", gone.table, gone.column)
+		}
+	}
+	for _, scoped := range []struct{ table, column string }{
+		{"sessions", "workspace_id"},
+		{"sessions", "pool_id"},
+		{"environments", "workspace_id"},
+		{"runners", "pool_id"},
+	} {
+		var def *string
+		if err := pool.QueryRow(ctx,
+			`SELECT column_default FROM information_schema.columns WHERE table_name = $1 AND column_name = $2`,
+			scoped.table, scoped.column).Scan(&def); err != nil {
+			t.Fatalf("%s.%s: %v", scoped.table, scoped.column, err)
+		}
+		if def != nil {
+			t.Fatalf("%s.%s still defaults to %q after 0008", scoped.table, scoped.column, *def)
+		}
 	}
 }
 

@@ -2456,7 +2456,7 @@ func TestPutSecret(t *testing.T) {
 		if e := decodeErrBody(t, raw); e.Error.Code != "invalid_request" {
 			t.Errorf("code = %q, want invalid_request", e.Error.Code)
 		}
-		if _, _, err := st.GetSecret(context.Background(), "BIG"); !errors.Is(err, ErrNotFound) {
+		if _, _, err := st.GetSecret(context.Background(), "BIG"); !errors.Is(err, control.ErrNotFound) {
 			t.Errorf("an over-cap value was stored anyway (GetSecret err = %v)", err)
 		}
 	})
@@ -2514,7 +2514,7 @@ func TestPutSecret(t *testing.T) {
 		if e := decodeErrBody(t, raw); e.Error.Code != "forbidden" {
 			t.Errorf("code = %q, want forbidden", e.Error.Code)
 		}
-		if _, _, err := st.GetSecret(context.Background(), "MEMBER_TRY"); !errors.Is(err, ErrNotFound) {
+		if _, _, err := st.GetSecret(context.Background(), "MEMBER_TRY"); !errors.Is(err, control.ErrNotFound) {
 			t.Errorf("a member's rejected PUT stored the secret anyway (err = %v)", err)
 		}
 	})
@@ -2684,7 +2684,7 @@ func TestDeleteSecret(t *testing.T) {
 		if resp.StatusCode != http.StatusNoContent {
 			t.Fatalf("status = %d, want 204; body=%s", resp.StatusCode, raw)
 		}
-		if _, _, err := st.GetSecret(context.Background(), "DOOMED"); !errors.Is(err, ErrNotFound) {
+		if _, _, err := st.GetSecret(context.Background(), "DOOMED"); !errors.Is(err, control.ErrNotFound) {
 			t.Fatalf("GetSecret after delete: err = %v, want ErrNotFound", err)
 		}
 	})
@@ -3400,7 +3400,7 @@ func TestCreateEnvironment(t *testing.T) {
 		if e.Error.Code != "invalid_request" || !strings.Contains(e.Error.Message, "ABSENT") {
 			t.Errorf("error = %+v, want invalid_request naming ABSENT", e.Error)
 		}
-		if envs, err := st.ListEnvironments(context.Background()); err != nil || len(envs) != 0 {
+		if envs, _, err := st.Environments().ListEnvironments(context.Background(), installWorkspace, control.EnvironmentQuery{}); err != nil || len(envs) != 0 {
 			t.Errorf("environments after a rejected create = %+v (err %v), want none", envs, err)
 		}
 	})
@@ -3452,7 +3452,7 @@ func TestCreateEnvironment(t *testing.T) {
 		if e := decodeErrBody(t, raw); e.Error.Code != "forbidden" {
 			t.Errorf("code = %q, want forbidden", e.Error.Code)
 		}
-		if envs, err := st.ListEnvironments(context.Background()); err != nil || len(envs) != 0 {
+		if envs, _, err := st.Environments().ListEnvironments(context.Background(), installWorkspace, control.EnvironmentQuery{}); err != nil || len(envs) != 0 {
 			t.Errorf("environments after a member's create = %+v (err %v), want none", envs, err)
 		}
 	})

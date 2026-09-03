@@ -1,6 +1,7 @@
-// Package controld defines controld's domain types and its Store persistence
-// interface: the host's own persistence, the three control repository ports,
-// and the old single-tenant surface the twins still carry.
+// Package controld defines controld's host-owned domain types and its Store
+// persistence interface: the host's own persistence (identity, the vault, and
+// the lookups the control ports lack) and the three control repository ports.
+// Sessions, environments, and runners are control's types, not this package's.
 // internal/controld/memstore.go and pgstore both implement Store, and both
 // must pass controlapp/repotest and internal/controld/storetest unchanged —
 // those suites, not this file's comments, are the source of truth for exact
@@ -12,55 +13,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
-	"errors"
 	"strings"
 	"time"
 
 	"github.com/tokencanopy/rainier/control"
 )
-
-// SessionState is a Session's lifecycle state.
-type SessionState string
-
-const (
-	StateQueued        SessionState = "queued"
-	StateCreating      SessionState = "creating"
-	StateRunning       SessionState = "running"
-	StateSuspendedWarm SessionState = "suspended_warm"
-	StateSuspendedCold SessionState = "suspended_cold"
-	StateCanceled      SessionState = "canceled"
-	StateFailed        SessionState = "failed"
-	StateDead          SessionState = "dead"
-	StateDestroyed     SessionState = "destroyed"
-)
-
-// Terminal reports whether s is out of the schedulable lifecycle and hidden
-// from the default list: canceled, failed, dead, or destroyed. Failed has one
-// explicit exit: rm destroys its retained diagnostic container and advances
-// the row to destroyed; no scheduler/event transition revives a terminal row.
-func (s SessionState) Terminal() bool {
-	switch s {
-	case StateCanceled, StateFailed, StateDead, StateDestroyed:
-		return true
-	}
-	return false
-}
-
-// OccupiesSlot reports whether a session in state s counts against a
-// runner's capacity: creating, running, or suspended_warm.
-func (s SessionState) OccupiesSlot() bool {
-	switch s {
-	case StateCreating, StateRunning, StateSuspendedWarm:
-		return true
-	}
-	return false
-}
-
-// NonTerminal lists every non-terminal state, in the order a session
-// normally progresses through them. Callers pass it as Transition's
-// from-list when any live state should be accepted.
-var NonTerminal = []SessionState{StateQueued, StateCreating, StateRunning, StateSuspendedWarm, StateSuspendedCold}
 
 // User is an authenticated controld operator, identified by GitHub account.
 type User struct {
@@ -69,132 +26,6 @@ type User struct {
 	Login     string
 	Role      string
 	CreatedAt time.Time
-}
-
-// Session is one coding-agent run: its identity, placement, and lifecycle
-// state.
-type Session struct {
-	ID             string
-	OwnerID        string
-	Name           string
-	Image          string
-	Cmd            []string
-	EgressAllow    []string
-	State          SessionState
-	Runner         string // runner name; "" until placed
-	IdempotencyKey string // "" = none
-	Error          string
-	EnvironmentID  string // environment this session came from; "" for scratch
-	ResolvedImage  string // image actually dispatched (snapshot or env image); "" for scratch
-	// SetupHash identifies the build inputs of the setup script this session
-	// was actually dispatched with: SetupHash(resolved image, script), pinned
-	// by the create dispatch and "" when no script was sent. It is the
-	// session's provenance, and the only way controld can tell, when the setup
-	// finishes, whether the container it is about to snapshot was built from
-	// the environment as it stands NOW — the environment may have been edited
-	// while the script ran, and the row carries no other trace of which script
-	// that was.
-	SetupHash string
-	// Repos is the session's own `repos` override: the repositories it clones
-	// INSTEAD of the ones its environment's github connectors declare. Three
-	// states, all distinct and all load-bearing:
-	//
-	//   - nil: the caller named none, so the environment's connectors decide
-	//     (a scratch session with no override clones nothing).
-	//   - empty but non-nil: the caller explicitly asked for no clone at all,
-	//     which an environment's connectors must not override.
-	//   - populated: exactly these, in this order.
-	//
-	// It is recorded on the row rather than resolved into the Spec at create
-	// time because the create only QUEUES the session: the dispatch that turns
-	// this into clone instructions happens later, from a row read back out of
-	// the store, possibly after a restart and possibly on another replica. The
-	// expansion itself (branch names, directories) still happens at dispatch,
-	// like every other thing the Spec carries.
-	Repos []RepoRef
-	// ChildExitCode is the exit status of the session's agent process, once
-	// it has exited. It is a pointer because "the child has not exited" and
-	// "the child exited 0" are different facts and a plain int cannot tell
-	// them apart — a session whose agent finished cleanly still has a live
-	// container and a shell the operator can attach to. Only
-	// SetChildExitCode writes it; create always leaves it nil.
-	ChildExitCode *int
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
-	LastEventAt   time.Time
-}
-
-// effectiveImage is the image this session actually runs: the one resolution
-// settled on for a session started from an environment (its image, or the
-// environment's cached snapshot), and the caller's own Image for a scratch
-// session, which has no ResolvedImage at all. Every place that needs "which
-// image is this" — the dispatched Spec, the client-facing view — asks here,
-// so the two can never disagree.
-func (s Session) effectiveImage() string {
-	if s.ResolvedImage != "" {
-		return s.ResolvedImage
-	}
-	return s.Image
-}
-
-// RepoRef is one entry of a session's `repos` override, in the spelling the
-// client sent: "owner/name" plus the branch to clone from. It is deliberately
-// the REQUEST's shape and not the resolved one — the session branch and the
-// directory a repository lands in are derived at dispatch from the session
-// itself, so storing them here would be storing a copy of a derivation.
-//
-// An empty BaseBranch means the default branch; the API rejects an explicitly
-// empty one, so "" here can only ever mean "unset".
-type RepoRef struct {
-	Repo       string `json:"repo"`
-	BaseBranch string `json:"base_branch,omitempty"`
-}
-
-// Connector is one entry of an Environment's connectors array: the "type"
-// member decoded out, plus the whole original object kept verbatim in Raw.
-// The store treats a connector as opaque — it persists Raw as-is and decodes
-// Type back out of it; the API layer is what validates a connector's shape
-// per type.
-type Connector struct {
-	Type string          `json:"type"`
-	Raw  json.RawMessage `json:"-"` // full original object, stored verbatim
-}
-
-// Environment is a named, reusable template a session starts from: the image
-// and setup script that define its filesystem, plus the egress, secrets, and
-// connectors it may use.
-//
-// Four fields belong to the store, not to callers. SetupHash is recomputed
-// from Image and Setup on every create and update — whatever a caller puts
-// there is ignored. The three Snapshot fields are written only by
-// SetEnvironmentSnapshot: create leaves them empty and update leaves them
-// exactly as they were, so a snapshot built from a superseded SetupHash
-// stays visibly stale (SnapshotHash != SetupHash) instead of being silently
-// adopted or silently dropped.
-//
-// Init and InitTimeoutSec are deliberately absent from SetupHash. Setup
-// builds the filesystem once and is cached as a snapshot; init runs on every
-// session boot, after the code is in place, so editing it changes nothing
-// about the image the snapshot holds. Folding init into the hash would throw
-// away a whole team's cache for a change that cannot affect it.
-type Environment struct {
-	ID              string
-	Name            string
-	Image           string
-	Setup           string
-	SetupHash       string // sha256(image+"\x00"+setup); store-maintained
-	Init            string // per-boot hook, run after setup and clone
-	InitTimeoutSec  int
-	EgressAllow     []string
-	SecretRefs      []string
-	Connectors      []Connector
-	Placement       string // runner name, or "" for any runner
-	SetupTimeoutSec int
-	SnapshotRef     string // "" until cached
-	SnapshotRunner  string // runner that built the cache
-	SnapshotHash    string // setup_hash the snapshot was built from
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
 }
 
 // SecretMeta is everything about a stored secret except the secret: its name
@@ -237,124 +68,24 @@ type Credential struct {
 	UpdatedAt                       time.Time
 }
 
-// Runner is a registered runnerd fleet member and its current capacity.
-type Runner struct {
-	Name          string
-	CapacityUsed  int
-	CapacityTotal int
-	Connected     bool
-	LastSeenAt    time.Time
-}
-
-var (
-	// ErrNotFound is returned when a lookup by id, token, name, or key
-	// finds nothing.
-	ErrNotFound = errors.New("not found")
-	// ErrConflict is returned when a guarded Transition's from-list
-	// doesn't contain the row's current state, or CreateSession's name
-	// is already held by another non-terminal session of the same owner.
-	ErrConflict = errors.New("conflict")
-	// ErrIdemReplay is returned by CreateSession when the owner has
-	// already used the given idempotency key.
-	ErrIdemReplay = errors.New("idempotent replay")
-)
-
-// TransitionOpts carries the columns Transition may update alongside state.
-// A nil field leaves that column unchanged.
-type TransitionOpts struct {
-	Runner *string
-	Error  *string
-}
-
-// SessionQuery filters and paginates ListSessions. Name is an exact match;
-// empty means every name.
-type SessionQuery struct {
-	States          []SessionState
-	Name            string
-	Runner          string
-	IncludeTerminal bool
-	Limit           int
-	Cursor          string
-}
-
 // Store is controld's persistence interface: the host's own persistence
-// (HostStore), the three control repository ports (Repositories), and — until
-// Task 5 deletes them — the old single-tenant methods every test still seeds
-// and reads through. Production reaches a store only through the first two.
-// memstore (this package) and pgstore both implement it; storetest.RunContract
-// pins the semantics of the old surface, controlapp/repotest the ports'.
+// (HostStore) and the three control repository ports (Repositories). There is
+// no third surface — sessions, environments, and runners exist once, as
+// control types, and every caller reaches them through the ports.
+// memstore (this package) and pgstore both implement it; storetest.RunHost
+// pins the host half's semantics, controlapp/repotest the ports'.
 type Store interface {
 	HostStore
 	Repositories
-
-	// The old single-tenant surface. Identity and the vault are not repeated
-	// here — they are HostStore's, and they stay there after Task 5.
-	CreateSession(ctx context.Context, s Session) (Session, error) // ErrConflict (name), ErrIdemReplay (idem key)
-	GetSession(ctx context.Context, id string) (Session, error)
-	SessionByIdem(ctx context.Context, ownerID, key string) (Session, error)
-	SessionByName(ctx context.Context, ownerID, name string) (Session, error) // non-terminal only
-	ListSessions(ctx context.Context, q SessionQuery) (rows []Session, next string, err error)
-	SessionsOnRunner(ctx context.Context, runner string, states []SessionState) ([]Session, error)
-	OldestQueued(ctx context.Context) ([]Session, error) // created_at asc
-	// Transition returns ErrConflict if the session's current state isn't
-	// in from, ErrNotFound if id doesn't exist. On success it also bumps
-	// updated_at and last_event_at.
-	Transition(ctx context.Context, id string, from []SessionState, to SessionState, opts TransitionOpts) error
-	// SetSessionSetupHash records the identity of the setup script a session
-	// was dispatched with (see Session.SetupHash). It is unguarded — the
-	// create dispatch writes it once, before the command goes out — and
-	// returns ErrNotFound if id doesn't exist.
-	SetSessionSetupHash(ctx context.Context, id, hash string) error
-	// SetChildExitCode records the exit status of a session's agent process
-	// (see Session.ChildExitCode). Like SetSessionSetupHash it is unguarded
-	// and state-agnostic — the child exiting is an observation, not a
-	// lifecycle transition — and returns ErrNotFound if id doesn't exist.
-	SetChildExitCode(ctx context.Context, id string, code int) error
-
-	UpsertRunner(ctx context.Context, r Runner) error // by Name; sets connected/capacity/last_seen
-	SetRunnerConnected(ctx context.Context, name string, connected bool) error
-	ListRunners(ctx context.Context) ([]Runner, error)
-
-	// CreateEnvironment stores e with a freshly computed SetupHash and no
-	// snapshot, and returns the stored row. ErrConflict if the name is
-	// already held.
-	CreateEnvironment(ctx context.Context, e Environment) (Environment, error)
-	GetEnvironment(ctx context.Context, id string) (Environment, error)
-	GetEnvironmentByName(ctx context.Context, name string) (Environment, error)
-	// ListEnvironments returns every environment, name ascending. There are
-	// few environments per deployment, so this page is the whole table.
-	ListEnvironments(ctx context.Context) ([]Environment, error)
-	// UpdateEnvironment replaces the mutable columns of the environment with
-	// e.ID, recomputes SetupHash, and leaves created_at and the snapshot
-	// columns alone. ErrNotFound if no such id, ErrConflict if e.Name is
-	// held by another environment.
-	UpdateEnvironment(ctx context.Context, e Environment) (Environment, error)
-	DeleteEnvironment(ctx context.Context, id string) error // ErrNotFound
-	// CountSessionsByEnvironment counts sessions on envID whose state is in
-	// states; an empty states counts every session on the environment.
-	//
-	// envID must be a REAL environment id. A scratch session carries
-	// environment_id "", so passing "" counts every scratch session in the
-	// fleet — a number that means nothing here and, used as a delete guard,
-	// would refuse a deletion because of sessions that belong to no
-	// environment at all. Callers resolve their ref to an id first (see
-	// handleDeleteEnvironment).
-	CountSessionsByEnvironment(ctx context.Context, envID string, states []SessionState) (int, error)
-	// SetEnvironmentSnapshot records a built snapshot against the
-	// environment, but only while its SetupHash is still expectHash. A
-	// snapshot built from setup that has since been edited must not land, so
-	// a hash mismatch — like an environment that no longer exists — returns
-	// ErrConflict and changes nothing.
-	SetEnvironmentSnapshot(ctx context.Context, envID, expectHash, ref, runner string) error
 }
 
 // HostStore is the persistence the self-hosted host owns beside the control
 // repositories: identity (users, bearer tokens), the vault (secrets,
 // credentials), and four lookups the control ports deliberately have no
-// method for. Like the ports, its four lookups return the control sentinel
-// set and never leak SQL, a DSN, or a row's contents in an error; the
-// identity and vault methods keep the store's own sentinels until the old
-// Store methods go.
+// method for. Like the ports, every method here answers with the control
+// sentinel set — control.ErrNotFound for a lookup that finds nothing,
+// control.ErrConflict for a name already held — and never leaks SQL, a DSN,
+// or a row's contents in an error.
 type HostStore interface {
 	// EnsureWorkspace makes ws exist; idempotent. New calls it for the
 	// installation workspace, the repository contract suite for its two.
@@ -400,10 +131,9 @@ type Repositories interface {
 	Fleet() control.FleetRepository
 }
 
-// MemStore is the shape the in-memory store has: Store itself, now that Store
-// is the union of the host's own persistence, the three control repositories,
-// and the old single-tenant surface every test still seeds through. It stays
-// as its own name because every test helper is written in terms of it.
+// MemStore is the shape the in-memory store has: Store itself, the union of
+// the host's own persistence and the three control repositories. It stays as
+// its own name because every test helper is written in terms of it.
 type MemStore interface {
 	Store
 }

@@ -93,16 +93,16 @@ type sessionDerived struct {
 
 // sessionJSON renders s as its client-facing view, with d supplying the
 // fields the row itself cannot answer for.
-func sessionJSON(s Session, d sessionDerived) sessionView {
+func sessionJSON(s control.Session, d sessionDerived) sessionView {
 	return sessionView{
-		ID:          s.ID,
-		OwnerID:     s.OwnerID,
+		ID:          string(s.ID),
+		OwnerID:     string(s.CreatorID),
 		Name:        s.Name,
-		Image:       s.effectiveImage(),
-		Cmd:         emptyIfNil(s.Cmd),
-		EgressAllow: emptyIfNil(s.EgressAllow),
+		Image:       s.Spec.Image,
+		Cmd:         emptyIfNil(s.Spec.Cmd),
+		EgressAllow: emptyIfNil(s.Spec.EgressAllow),
 		State:       string(s.State),
-		Runner:      s.Runner,
+		Runner:      string(s.RunnerID),
 		Reachable:   d.Reachable,
 		Error:       s.Error,
 		Environment: d.Environment,
@@ -162,7 +162,7 @@ func (r *sessionRenderer) view(row control.Session) sessionView {
 		d.Environment = env.Name
 		d.QueueReason = r.queueReason(row, *env)
 	}
-	return sessionJSON(sessionFromControl(row), d)
+	return sessionJSON(row, d)
 }
 
 // environment returns the environment for id, or nil for a scratch session,
@@ -346,16 +346,16 @@ type repoRequest struct {
 //
 // The errors are the caller's to read — each names the offending entry by
 // index and what was wrong with it — and none carries internal detail.
-func repoOverrides(reqs []repoRequest) ([]RepoRef, error) {
+func repoOverrides(reqs []repoRequest) ([]control.RepoRef, error) {
 	if reqs == nil {
 		return nil, nil
 	}
-	out := make([]RepoRef, 0, len(reqs))
+	out := make([]control.RepoRef, 0, len(reqs))
 	for i, req := range reqs {
 		if !validRepoRef(req.Repo) {
 			return nil, fmt.Errorf("repos[%d].repo must be \"owner/name\", got %q", i, req.Repo)
 		}
-		ref := RepoRef{Repo: req.Repo}
+		ref := control.RepoRef{Repo: req.Repo}
 		if req.BaseBranch != nil {
 			if *req.BaseBranch == "" {
 				return nil, fmt.Errorf("repos[%d].base_branch is empty; omit it for the default (%s)", i, defaultBaseBranch)
@@ -500,7 +500,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request, u U
 
 	cmd := control.CreateSession{
 		Name:           req.Name,
-		Repos:          reposToControl(repos),
+		Repos:          repos,
 		IdempotencyKey: r.Header.Get("Idempotency-Key"),
 	}
 	// The session's own spec always travels: for a scratch session it is the
@@ -561,26 +561,23 @@ func (s *Server) createSessionEnvironment(w http.ResponseWriter, ctx context.Con
 // github` while the session sits there, and the clone that follows works — so
 // the clone, not the create, is the right place for it to say so. A
 // credential that is not there at all never becomes present that way.
-func (s *Server) createPreflight(w http.ResponseWriter, ctx context.Context, u User, repos []RepoRef, env *control.Environment) bool {
-	var storeEnv *Environment
+func (s *Server) createPreflight(w http.ResponseWriter, ctx context.Context, u User, repos []control.RepoRef, env *control.Environment) bool {
 	if env != nil {
-		row := environmentFromControl(*env)
-		storeEnv = &row
-		_, missing, err := s.secretEnv(ctx, row)
+		_, missing, err := s.secretEnv(ctx, *env)
 		switch {
 		case err != nil:
-			log.Printf("controld: create session: resolving secrets of environment %s: %v", row.ID, err)
+			log.Printf("controld: create session: resolving secrets of environment %s: %v", env.ID, err)
 			writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
 			return false
 		case missing != "":
-			writeErr(w, http.StatusConflict, "conflict", missingSecretMessage(row, missing))
+			writeErr(w, http.StatusConflict, "conflict", missingSecretMessage(*env, missing))
 			return false
 		}
 	}
 
-	refs, err := sessionRepoRefs(Session{Repos: repos}, storeEnv)
+	refs, err := sessionRepoRefs(control.Session{Spec: control.PortableSpec{Repos: repos}}, env)
 	if err != nil {
-		log.Printf("controld: create session: resolving the repositories of environment %s: %v", envID(storeEnv), err)
+		log.Printf("controld: create session: resolving the repositories of environment %s: %v", envID(env), err)
 		writeErr(w, http.StatusInternalServerError, "internal", "could not create session")
 		return false
 	}
@@ -590,7 +587,7 @@ func (s *Server) createPreflight(w http.ResponseWriter, ctx context.Context, u U
 	// The row itself is never read — only its existence is — so no credential
 	// material is loaded, let alone rendered into the response.
 	if _, err := s.st.GetCredential(ctx, u.ID, githubProvider); err != nil {
-		if errors.Is(err, ErrNotFound) {
+		if errors.Is(err, control.ErrNotFound) {
 			writeErr(w, http.StatusConflict, "conflict", ErrCredentialMissing.Error())
 			return false
 		}
@@ -608,7 +605,7 @@ func (s *Server) createPreflight(w http.ResponseWriter, ctx context.Context, u U
 // failure. No return value and no error text here ever carries a secret VALUE.
 // The three results are, in order: the variables, the name of the first
 // reference that had no secret behind it, and a genuine failure.
-func (s *Server) secretEnv(ctx context.Context, env Environment) (map[string]string, string, error) {
+func (s *Server) secretEnv(ctx context.Context, env control.Environment) (map[string]string, string, error) {
 	if len(env.SecretRefs) == 0 {
 		return nil, "", nil
 	}
@@ -616,7 +613,7 @@ func (s *Server) secretEnv(ctx context.Context, env Environment) (map[string]str
 	for _, name := range env.SecretRefs {
 		ciphertext, nonce, err := s.st.GetSecret(ctx, name)
 		if err != nil {
-			if errors.Is(err, ErrNotFound) {
+			if errors.Is(err, control.ErrNotFound) {
 				return nil, name, nil
 			}
 			return nil, "", fmt.Errorf("get secret %s: %w", name, err)
@@ -633,7 +630,7 @@ func (s *Server) secretEnv(ctx context.Context, env Environment) (map[string]str
 // missingSecretMessage is the one client-facing sentence for a dangling
 // secret_ref, shared by the create's 409 and the dispatch's failure text so
 // an operator meets the same words wherever the reference breaks.
-func missingSecretMessage(env Environment, name string) string {
+func missingSecretMessage(env control.Environment, name string) string {
 	return fmt.Sprintf("environment %q references secret %q, which no longer exists", env.Name, name)
 }
 
@@ -974,7 +971,7 @@ func (s *Server) handleDeleteSecret(w http.ResponseWriter, r *http.Request, u Us
 		return
 	}
 	if err := s.st.DeleteSecret(r.Context(), name); err != nil {
-		if errors.Is(err, ErrNotFound) {
+		if errors.Is(err, control.ErrNotFound) {
 			writeErr(w, http.StatusNotFound, "not_found", "secret not found")
 			return
 		}
@@ -1125,7 +1122,7 @@ func environmentJSON(e control.Environment, snapshotRunner string) environmentVi
 		InitTimeoutSec:  e.InitTimeoutSec,
 		EgressAllow:     emptyIfNil(e.EgressAllow),
 		SecretRefs:      emptyIfNil(e.SecretRefs),
-		Connectors:      connectorsJSON(connectorsFromControl(e.Connectors)),
+		Connectors:      connectorsJSON(e.Connectors),
 		Placement:       capabilityValue(e.Requirements.Capabilities, placementCapabilityPrefix),
 		SetupTimeoutSec: e.SetupTimeoutSec,
 		SnapshotRef:     e.Snapshot.Ref,
@@ -1142,7 +1139,7 @@ func environmentJSON(e control.Environment, snapshotRunner string) environmentVi
 // while Postgres's jsonb preserves the value but may re-render whitespace and
 // member order; storetest's sameJSON is where that contract lives.) Never
 // nil, so the array renders as "[]" rather than null.
-func connectorsJSON(cs []Connector) []json.RawMessage {
+func connectorsJSON(cs []control.Connector) []json.RawMessage {
 	out := make([]json.RawMessage, 0, len(cs))
 	for _, c := range cs {
 		raw := c.Raw
@@ -1244,7 +1241,7 @@ type browserConnector struct {
 //
 // Errors are written for the caller: each names the offending element by
 // index and says what was wrong with it, and none carries internal detail.
-func validateConnectors(raw json.RawMessage) ([]Connector, error) {
+func validateConnectors(raw json.RawMessage) ([]control.Connector, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
@@ -1256,7 +1253,7 @@ func validateConnectors(raw json.RawMessage) ([]Connector, error) {
 		return nil, nil
 	}
 
-	out := make([]Connector, 0, len(elems))
+	out := make([]control.Connector, 0, len(elems))
 	for i, elem := range elems {
 		// Loose decode first, for the discriminator alone: the strict decode
 		// below can't run until we know which shape to check against.
@@ -1272,7 +1269,7 @@ func validateConnectors(raw json.RawMessage) ([]Connector, error) {
 		if err := validateConnector(head.Type, elem); err != nil {
 			return nil, fmt.Errorf("connectors[%d]: %w", i, err)
 		}
-		out = append(out, Connector{Type: head.Type, Raw: elem})
+		out = append(out, control.Connector{Type: head.Type, Raw: elem})
 	}
 	return out, nil
 }
@@ -1521,7 +1518,7 @@ func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request,
 		InitTimeoutSec:  req.InitTimeoutSec,
 		EgressAllow:     req.EgressAllow,
 		SecretRefs:      req.SecretRefs,
-		Connectors:      connectorsToControl(conns),
+		Connectors:      conns,
 		Requirements:    placementRequirements(req.Placement),
 		SetupTimeoutSec: req.SetupTimeoutSec,
 	})
@@ -1673,8 +1670,7 @@ func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request,
 			writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 			return
 		}
-		converted := connectorsToControl(conns)
-		cmd.Connectors = &converted
+		cmd.Connectors = &conns
 	}
 	// Only the refs this request supplies are checked for existence: a patch
 	// answers for what it sets, and refs that were valid when they were set

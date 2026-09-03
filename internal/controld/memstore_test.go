@@ -8,10 +8,6 @@ import (
 	"github.com/tokencanopy/rainier/internal/controld/storetest"
 )
 
-func TestMemStoreContract(t *testing.T) {
-	storetest.RunContract(t, func(t *testing.T) controld.Store { return controld.NewMemStore() })
-}
-
 // TestMemStoreRepositories runs the public repository contract suite against
 // the in-memory store's three native ports. They share one backing store, so
 // a session created through Sessions is visible to Fleet.SessionsOnRunner —

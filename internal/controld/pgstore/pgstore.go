@@ -6,7 +6,6 @@ package pgstore
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -14,7 +13,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tokencanopy/rainier/control"
@@ -23,7 +21,7 @@ import (
 
 // terminalStates lists the SessionState values SessionState.Terminal
 // reports true for, spelled out for use inside SQL literals. Keep in sync
-// with controld.SessionState.Terminal.
+// with control.SessionState.Terminal.
 const terminalStatesSQL = `'canceled','failed','dead','destroyed'`
 
 // Store is a Postgres-backed controld.Store.
@@ -72,9 +70,8 @@ func (s *Store) Environments() control.EnvironmentRepository { return pgEnvironm
 func (s *Store) Fleet() control.FleetRepository { return pgFleet{s} }
 
 var (
-	// The old single-tenant surface, the host's own persistence, and the
-	// three control repositories: one store, three contracts, until Task 5
-	// deletes the first of them.
+	// The host's own persistence and the three control repositories: one
+	// store, and the union of the two is controld.Store.
 	_ controld.Store        = (*Store)(nil)
 	_ controld.HostStore    = (*Store)(nil)
 	_ controld.Repositories = (*Store)(nil)
@@ -119,7 +116,7 @@ func (s *Store) UserByToken(ctx context.Context, tokenHash string) (controld.Use
 		RETURNING user_id`, tokenHash).Scan(&userID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return controld.User{}, controld.ErrNotFound
+			return controld.User{}, control.ErrNotFound
 		}
 		return controld.User{}, fmt.Errorf("pgstore: user by token: %w", err)
 	}
@@ -130,7 +127,7 @@ func (s *Store) UserByToken(ctx context.Context, tokenHash string) (controld.Use
 		Scan(&u.ID, &u.GitHubID, &u.Login, &u.Role, &u.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return controld.User{}, controld.ErrNotFound
+			return controld.User{}, control.ErrNotFound
 		}
 		return controld.User{}, fmt.Errorf("pgstore: user by token: %w", err)
 	}
@@ -144,16 +141,14 @@ func (s *Store) GetUser(ctx context.Context, id string) (controld.User, error) {
 		Scan(&u.ID, &u.GitHubID, &u.Login, &u.Role, &u.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return controld.User{}, controld.ErrNotFound
+			return controld.User{}, control.ErrNotFound
 		}
 		return controld.User{}, fmt.Errorf("pgstore: get user: %w", err)
 	}
 	return u, nil
 }
 
-// --- sessions -----------------------------------------------------------
-
-const selectSessionCols = `id, owner_id, name, image, cmd, egress_allow, repos, state, runner, idempotency_key, error, environment_id, resolved_image, setup_hash, child_exit_code, created_at, updated_at, last_event_at`
+// --- row scanning ---------------------------------------------------------
 
 // rowScanner is satisfied by both pgx.Row and pgx.Rows.
 type rowScanner interface {
@@ -167,642 +162,6 @@ func nonNilStrings(ss []string) []string {
 		return []string{}
 	}
 	return ss
-}
-
-func scanSession(row rowScanner) (controld.Session, error) {
-	var sess controld.Session
-	var state string
-	var idem *string
-	var cmdBytes, egressBytes, reposBytes []byte
-
-	if err := row.Scan(&sess.ID, &sess.OwnerID, &sess.Name, &sess.Image, &cmdBytes, &egressBytes, &reposBytes,
-		&state, &sess.Runner, &idem, &sess.Error, &sess.EnvironmentID, &sess.ResolvedImage, &sess.SetupHash,
-		&sess.ChildExitCode, &sess.CreatedAt, &sess.UpdatedAt, &sess.LastEventAt); err != nil {
-		return controld.Session{}, err
-	}
-	sess.State = controld.SessionState(state)
-	if idem != nil {
-		sess.IdempotencyKey = *idem
-	}
-	if len(cmdBytes) > 0 {
-		if err := json.Unmarshal(cmdBytes, &sess.Cmd); err != nil {
-			return controld.Session{}, fmt.Errorf("pgstore: decode cmd: %w", err)
-		}
-	}
-	if len(egressBytes) > 0 {
-		if err := json.Unmarshal(egressBytes, &sess.EgressAllow); err != nil {
-			return controld.Session{}, fmt.Errorf("pgstore: decode egress_allow: %w", err)
-		}
-	}
-	// A SQL NULL scans as no bytes at all and stays a nil Repos — the session
-	// named no override. An empty JSON array decodes to a non-nil empty slice,
-	// which is the other instruction ("clone nothing") and must not collapse
-	// into the first.
-	if len(reposBytes) > 0 {
-		if err := json.Unmarshal(reposBytes, &sess.Repos); err != nil {
-			return controld.Session{}, fmt.Errorf("pgstore: decode repos: %w", err)
-		}
-	}
-	return sess, nil
-}
-
-func (s *Store) CreateSession(ctx context.Context, sess controld.Session) (controld.Session, error) {
-	now := time.Now()
-	createdAt, updatedAt, lastEventAt := sess.CreatedAt, sess.UpdatedAt, sess.LastEventAt
-	if createdAt.IsZero() {
-		createdAt = now
-	}
-	if updatedAt.IsZero() {
-		updatedAt = now
-	}
-	if lastEventAt.IsZero() {
-		lastEventAt = now
-	}
-
-	// Marshal a nil slice as "[]", not JSON null: the column is declared
-	// NOT NULL DEFAULT '[]' and meant to always hold a JSON array, so any
-	// SQL that expects to index or measure it (jsonb_array_length, etc.)
-	// shouldn't have to special-case a bare JSON null.
-	cmd, err := json.Marshal(nonNilStrings(sess.Cmd))
-	if err != nil {
-		return controld.Session{}, fmt.Errorf("pgstore: encode cmd: %w", err)
-	}
-	egress, err := json.Marshal(nonNilStrings(sess.EgressAllow))
-	if err != nil {
-		return controld.Session{}, fmt.Errorf("pgstore: encode egress_allow: %w", err)
-	}
-	// repos is the one list column where nil is NOT the empty array: a session
-	// that named no override stores SQL NULL, and one that explicitly named an
-	// empty list stores '[]'. Collapsing them would make an explicit "clone
-	// nothing" silently inherit its environment's connectors at dispatch.
-	var repos []byte
-	if sess.Repos != nil {
-		repos, err = json.Marshal(sess.Repos)
-		if err != nil {
-			return controld.Session{}, fmt.Errorf("pgstore: encode repos: %w", err)
-		}
-	}
-	// idempotency_key is stored NULL for "no key" so the sessions_idem
-	// partial unique index (WHERE idempotency_key IS NOT NULL) doesn't
-	// treat every empty-key session for an owner as a collision.
-	var idem *string
-	if sess.IdempotencyKey != "" {
-		idem = &sess.IdempotencyKey
-	}
-
-	row := s.pool.QueryRow(ctx, `
-		INSERT INTO sessions (id, owner_id, name, image, cmd, egress_allow, repos, state, runner, idempotency_key, error, environment_id, resolved_image, setup_hash, created_at, updated_at, last_event_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-		RETURNING `+selectSessionCols,
-		sess.ID, sess.OwnerID, sess.Name, sess.Image, cmd, egress, repos, string(sess.State), sess.Runner, idem, sess.Error,
-		sess.EnvironmentID, sess.ResolvedImage, sess.SetupHash, createdAt, updatedAt, lastEventAt)
-
-	out, err := scanSession(row)
-	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			switch pgErr.ConstraintName {
-			case "sessions_idem":
-				return controld.Session{}, controld.ErrIdemReplay
-			case "sessions_owner_name_active":
-				return controld.Session{}, controld.ErrConflict
-			}
-		}
-		return controld.Session{}, fmt.Errorf("pgstore: create session: %w", err)
-	}
-	return out, nil
-}
-
-func (s *Store) GetSession(ctx context.Context, id string) (controld.Session, error) {
-	row := s.pool.QueryRow(ctx, `SELECT `+selectSessionCols+` FROM sessions WHERE id = $1`, id)
-	sess, err := scanSession(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return controld.Session{}, controld.ErrNotFound
-		}
-		return controld.Session{}, fmt.Errorf("pgstore: get session: %w", err)
-	}
-	return sess, nil
-}
-
-func (s *Store) SessionByIdem(ctx context.Context, ownerID, key string) (controld.Session, error) {
-	if key == "" {
-		return controld.Session{}, controld.ErrNotFound
-	}
-	row := s.pool.QueryRow(ctx, `SELECT `+selectSessionCols+` FROM sessions WHERE owner_id = $1 AND idempotency_key = $2`, ownerID, key)
-	sess, err := scanSession(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return controld.Session{}, controld.ErrNotFound
-		}
-		return controld.Session{}, fmt.Errorf("pgstore: session by idem: %w", err)
-	}
-	return sess, nil
-}
-
-func (s *Store) SessionByName(ctx context.Context, ownerID, name string) (controld.Session, error) {
-	if name == "" {
-		return controld.Session{}, controld.ErrNotFound
-	}
-	row := s.pool.QueryRow(ctx, `SELECT `+selectSessionCols+` FROM sessions
-		WHERE owner_id = $1 AND name = $2 AND state NOT IN (`+terminalStatesSQL+`)`, ownerID, name)
-	sess, err := scanSession(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return controld.Session{}, controld.ErrNotFound
-		}
-		return controld.Session{}, fmt.Errorf("pgstore: session by name: %w", err)
-	}
-	return sess, nil
-}
-
-func (s *Store) ListSessions(ctx context.Context, q controld.SessionQuery) ([]controld.Session, string, error) {
-	var sb strings.Builder
-	sb.WriteString(`SELECT ` + selectSessionCols + ` FROM sessions WHERE true`)
-	var args []any
-
-	if !q.IncludeTerminal {
-		sb.WriteString(` AND state NOT IN (` + terminalStatesSQL + `)`)
-	}
-	if len(q.States) > 0 {
-		states := make([]string, len(q.States))
-		for i, st := range q.States {
-			states[i] = string(st)
-		}
-		args = append(args, states)
-		fmt.Fprintf(&sb, " AND state = ANY($%d)", len(args))
-	}
-	if q.Name != "" {
-		args = append(args, q.Name)
-		fmt.Fprintf(&sb, " AND name = $%d", len(args))
-	}
-	if q.Runner != "" {
-		args = append(args, q.Runner)
-		fmt.Fprintf(&sb, " AND runner = $%d", len(args))
-	}
-	if q.Cursor != "" {
-		nano, id, err := decodeCursor(q.Cursor)
-		if err != nil {
-			return nil, "", err
-		}
-		args = append(args, time.Unix(0, nano))
-		cArg := len(args)
-		args = append(args, id)
-		idArg := len(args)
-		fmt.Fprintf(&sb, " AND (created_at, id) < ($%d, $%d)", cArg, idArg)
-	}
-	sb.WriteString(` ORDER BY created_at DESC, id DESC`)
-	if q.Limit > 0 {
-		args = append(args, q.Limit)
-		fmt.Fprintf(&sb, " LIMIT $%d", len(args))
-	}
-
-	rows, err := s.pool.Query(ctx, sb.String(), args...)
-	if err != nil {
-		return nil, "", fmt.Errorf("pgstore: list sessions: %w", err)
-	}
-	defer rows.Close()
-
-	out := make([]controld.Session, 0)
-	for rows.Next() {
-		sess, err := scanSession(rows)
-		if err != nil {
-			return nil, "", fmt.Errorf("pgstore: list sessions: %w", err)
-		}
-		out = append(out, sess)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, "", fmt.Errorf("pgstore: list sessions: %w", err)
-	}
-
-	// Exact-multiple pagination: a full page always gets a next cursor,
-	// even if there happen to be no further rows — no look-ahead query.
-	next := ""
-	if q.Limit > 0 && len(out) == q.Limit {
-		last := out[len(out)-1]
-		next = encodeCursor(last.CreatedAt, last.ID)
-	}
-	return out, next, nil
-}
-
-func (s *Store) SessionsOnRunner(ctx context.Context, runner string, states []controld.SessionState) ([]controld.Session, error) {
-	var sb strings.Builder
-	sb.WriteString(`SELECT ` + selectSessionCols + ` FROM sessions WHERE runner = $1`)
-	args := []any{runner}
-	if len(states) > 0 {
-		strs := make([]string, len(states))
-		for i, st := range states {
-			strs[i] = string(st)
-		}
-		args = append(args, strs)
-		sb.WriteString(" AND state = ANY($2)")
-	}
-
-	rows, err := s.pool.Query(ctx, sb.String(), args...)
-	if err != nil {
-		return nil, fmt.Errorf("pgstore: sessions on runner: %w", err)
-	}
-	defer rows.Close()
-
-	out := make([]controld.Session, 0)
-	for rows.Next() {
-		sess, err := scanSession(rows)
-		if err != nil {
-			return nil, fmt.Errorf("pgstore: sessions on runner: %w", err)
-		}
-		out = append(out, sess)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) OldestQueued(ctx context.Context) ([]controld.Session, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+selectSessionCols+` FROM sessions
-		WHERE state = $1 ORDER BY created_at ASC, id ASC`, string(controld.StateQueued))
-	if err != nil {
-		return nil, fmt.Errorf("pgstore: oldest queued: %w", err)
-	}
-	defer rows.Close()
-
-	out := make([]controld.Session, 0)
-	for rows.Next() {
-		sess, err := scanSession(rows)
-		if err != nil {
-			return nil, fmt.Errorf("pgstore: oldest queued: %w", err)
-		}
-		out = append(out, sess)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) Transition(ctx context.Context, id string, from []controld.SessionState, to controld.SessionState, opts controld.TransitionOpts) error {
-	fromStrs := make([]string, len(from))
-	for i, f := range from {
-		fromStrs[i] = string(f)
-	}
-
-	ct, err := s.pool.Exec(ctx, `
-		UPDATE sessions
-		SET state = $1, runner = COALESCE($2, runner), error = COALESCE($3, error),
-		    updated_at = now(), last_event_at = now()
-		WHERE id = $4 AND state = ANY($5)`,
-		string(to), opts.Runner, opts.Error, id, fromStrs)
-	if err != nil {
-		return fmt.Errorf("pgstore: transition: %w", err)
-	}
-	if ct.RowsAffected() > 0 {
-		return nil
-	}
-
-	// 0 rows affected: id doesn't exist (ErrNotFound) or exists but its
-	// current state isn't in from (ErrConflict).
-	if _, err := s.GetSession(ctx, id); err != nil {
-		if errors.Is(err, controld.ErrNotFound) {
-			return controld.ErrNotFound
-		}
-		return err
-	}
-	return controld.ErrConflict
-}
-
-func (s *Store) SetSessionSetupHash(ctx context.Context, id, hash string) error {
-	// Unguarded and state-agnostic: the create dispatch writes this once,
-	// before the command goes out, and nothing else ever writes it. It is
-	// provenance, not lifecycle, so it deliberately leaves last_event_at
-	// alone — a session's liveness clock must not tick for a bookkeeping
-	// write.
-	ct, err := s.pool.Exec(ctx, `UPDATE sessions SET setup_hash = $1, updated_at = now() WHERE id = $2`, hash, id)
-	if err != nil {
-		return fmt.Errorf("pgstore: set session setup hash: %w", err)
-	}
-	if ct.RowsAffected() == 0 {
-		return controld.ErrNotFound
-	}
-	return nil
-}
-
-func (s *Store) SetChildExitCode(ctx context.Context, id string, code int) error {
-	// Unguarded and state-agnostic, like SetSessionSetupHash: the child
-	// exiting is an observation about the process inside the container, not a
-	// transition of the session itself, and the session stays attachable
-	// afterwards. last_event_at is deliberately left alone for the same
-	// reason SetSessionSetupHash leaves it alone.
-	ct, err := s.pool.Exec(ctx, `UPDATE sessions SET child_exit_code = $1, updated_at = now() WHERE id = $2`, code, id)
-	if err != nil {
-		return fmt.Errorf("pgstore: set child exit code: %w", err)
-	}
-	if ct.RowsAffected() == 0 {
-		return controld.ErrNotFound
-	}
-	return nil
-}
-
-// --- runners --------------------------------------------------------------
-
-func (s *Store) UpsertRunner(ctx context.Context, r controld.Runner) error {
-	var lastSeen *time.Time
-	if !r.LastSeenAt.IsZero() {
-		lastSeen = &r.LastSeenAt
-	}
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO runners (name, capacity_used, capacity_total, connected, last_seen_at)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (pool_id, name) DO UPDATE SET
-			capacity_used = EXCLUDED.capacity_used,
-			capacity_total = EXCLUDED.capacity_total,
-			connected = EXCLUDED.connected,
-			last_seen_at = EXCLUDED.last_seen_at`,
-		r.Name, r.CapacityUsed, r.CapacityTotal, r.Connected, lastSeen)
-	if err != nil {
-		return fmt.Errorf("pgstore: upsert runner: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) SetRunnerConnected(ctx context.Context, name string, connected bool) error {
-	ct, err := s.pool.Exec(ctx, `UPDATE runners SET connected = $1, last_seen_at = now() WHERE name = $2`, connected, name)
-	if err != nil {
-		return fmt.Errorf("pgstore: set runner connected: %w", err)
-	}
-	if ct.RowsAffected() == 0 {
-		return controld.ErrNotFound
-	}
-	return nil
-}
-
-func (s *Store) ListRunners(ctx context.Context) ([]controld.Runner, error) {
-	rows, err := s.pool.Query(ctx, `SELECT name, capacity_used, capacity_total, connected, last_seen_at FROM runners`)
-	if err != nil {
-		return nil, fmt.Errorf("pgstore: list runners: %w", err)
-	}
-	defer rows.Close()
-
-	out := make([]controld.Runner, 0)
-	for rows.Next() {
-		var r controld.Runner
-		var lastSeen *time.Time
-		if err := rows.Scan(&r.Name, &r.CapacityUsed, &r.CapacityTotal, &r.Connected, &lastSeen); err != nil {
-			return nil, fmt.Errorf("pgstore: list runners: %w", err)
-		}
-		if lastSeen != nil {
-			r.LastSeenAt = *lastSeen
-		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
-}
-
-// --- environments ---------------------------------------------------------
-
-const selectEnvironmentCols = `id, name, image, setup, setup_hash, init, init_timeout_sec, egress_allow, secret_refs, connectors, placement, setup_timeout_sec, snapshot_ref, snapshot_runner, snapshot_hash, created_at, updated_at`
-
-// encodeConnectors renders cs as the JSON array the connectors column holds:
-// each element is that connector's own object, passed through untouched, so
-// members this build knows nothing about survive a round trip. (jsonb still
-// normalizes whitespace and member order on the way in — it stores a value,
-// not a byte string — but adds, drops, and rewrites nothing.) A connector
-// carrying no Raw, built in code rather than decoded from a request, is
-// stored as the bare envelope {"type": ...} so the column never holds a
-// JSON null.
-func encodeConnectors(cs []controld.Connector) ([]byte, error) {
-	raws := make([]json.RawMessage, 0, len(cs))
-	for _, c := range cs {
-		if len(c.Raw) == 0 {
-			b, err := json.Marshal(c)
-			if err != nil {
-				return nil, err
-			}
-			raws = append(raws, b)
-			continue
-		}
-		raws = append(raws, c.Raw)
-	}
-	return json.Marshal(raws)
-}
-
-// decodeConnectors is encodeConnectors's inverse: it splits the stored array
-// into one Connector per element, keeping that element's bytes in Raw and
-// lifting its "type" member into Type.
-func decodeConnectors(b []byte) ([]controld.Connector, error) {
-	if len(b) == 0 {
-		return nil, nil
-	}
-	var raws []json.RawMessage
-	if err := json.Unmarshal(b, &raws); err != nil {
-		return nil, err
-	}
-	if len(raws) == 0 {
-		return nil, nil
-	}
-	out := make([]controld.Connector, 0, len(raws))
-	for _, raw := range raws {
-		var envelope struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal(raw, &envelope); err != nil {
-			return nil, err
-		}
-		out = append(out, controld.Connector{Type: envelope.Type, Raw: raw})
-	}
-	return out, nil
-}
-
-func scanEnvironment(row rowScanner) (controld.Environment, error) {
-	var e controld.Environment
-	var egressBytes, refsBytes, connectorBytes []byte
-
-	if err := row.Scan(&e.ID, &e.Name, &e.Image, &e.Setup, &e.SetupHash, &e.Init, &e.InitTimeoutSec,
-		&egressBytes, &refsBytes, &connectorBytes, &e.Placement, &e.SetupTimeoutSec,
-		&e.SnapshotRef, &e.SnapshotRunner, &e.SnapshotHash,
-		&e.CreatedAt, &e.UpdatedAt); err != nil {
-		return controld.Environment{}, err
-	}
-	if len(egressBytes) > 0 {
-		if err := json.Unmarshal(egressBytes, &e.EgressAllow); err != nil {
-			return controld.Environment{}, fmt.Errorf("pgstore: decode egress_allow: %w", err)
-		}
-	}
-	if len(refsBytes) > 0 {
-		if err := json.Unmarshal(refsBytes, &e.SecretRefs); err != nil {
-			return controld.Environment{}, fmt.Errorf("pgstore: decode secret_refs: %w", err)
-		}
-	}
-	connectors, err := decodeConnectors(connectorBytes)
-	if err != nil {
-		return controld.Environment{}, fmt.Errorf("pgstore: decode connectors: %w", err)
-	}
-	e.Connectors = connectors
-	return e, nil
-}
-
-// environmentColumns marshals the jsonb columns an insert or update writes.
-func environmentColumns(e controld.Environment) (egress, refs, connectors []byte, err error) {
-	if egress, err = json.Marshal(nonNilStrings(e.EgressAllow)); err != nil {
-		return nil, nil, nil, fmt.Errorf("pgstore: encode egress_allow: %w", err)
-	}
-	if refs, err = json.Marshal(nonNilStrings(e.SecretRefs)); err != nil {
-		return nil, nil, nil, fmt.Errorf("pgstore: encode secret_refs: %w", err)
-	}
-	if connectors, err = encodeConnectors(e.Connectors); err != nil {
-		return nil, nil, nil, fmt.Errorf("pgstore: encode connectors: %w", err)
-	}
-	return egress, refs, connectors, nil
-}
-
-func (s *Store) CreateEnvironment(ctx context.Context, e controld.Environment) (controld.Environment, error) {
-	now := time.Now()
-	createdAt, updatedAt := e.CreatedAt, e.UpdatedAt
-	if createdAt.IsZero() {
-		createdAt = now
-	}
-	if updatedAt.IsZero() {
-		updatedAt = now
-	}
-	egress, refs, connectors, err := environmentColumns(e)
-	if err != nil {
-		return controld.Environment{}, err
-	}
-
-	// The snapshot columns are left at their '' defaults: a new environment
-	// has no cache, and only SetEnvironmentSnapshot ever writes one.
-	row := s.pool.QueryRow(ctx, `
-		INSERT INTO environments (id, name, image, setup, setup_hash, init, init_timeout_sec, egress_allow, secret_refs, connectors, placement, setup_timeout_sec, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-		RETURNING `+selectEnvironmentCols,
-		e.ID, e.Name, e.Image, e.Setup, controld.SetupHash(e.Image, e.Setup), e.Init, e.InitTimeoutSec,
-		egress, refs, connectors, e.Placement, e.SetupTimeoutSec, createdAt, updatedAt)
-
-	out, err := scanEnvironment(row)
-	if err != nil {
-		// environments has exactly two unique constraints — the primary key
-		// and the name — and either one means the caller lost a race for an
-		// identity that is already taken.
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			return controld.Environment{}, controld.ErrConflict
-		}
-		return controld.Environment{}, fmt.Errorf("pgstore: create environment: %w", err)
-	}
-	return out, nil
-}
-
-func (s *Store) GetEnvironment(ctx context.Context, id string) (controld.Environment, error) {
-	row := s.pool.QueryRow(ctx, `SELECT `+selectEnvironmentCols+` FROM environments WHERE id = $1`, id)
-	e, err := scanEnvironment(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return controld.Environment{}, controld.ErrNotFound
-		}
-		return controld.Environment{}, fmt.Errorf("pgstore: get environment: %w", err)
-	}
-	return e, nil
-}
-
-func (s *Store) GetEnvironmentByName(ctx context.Context, name string) (controld.Environment, error) {
-	row := s.pool.QueryRow(ctx, `SELECT `+selectEnvironmentCols+` FROM environments WHERE name = $1`, name)
-	e, err := scanEnvironment(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return controld.Environment{}, controld.ErrNotFound
-		}
-		return controld.Environment{}, fmt.Errorf("pgstore: get environment by name: %w", err)
-	}
-	return e, nil
-}
-
-func (s *Store) ListEnvironments(ctx context.Context) ([]controld.Environment, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+selectEnvironmentCols+` FROM environments ORDER BY name ASC`)
-	if err != nil {
-		return nil, fmt.Errorf("pgstore: list environments: %w", err)
-	}
-	defer rows.Close()
-
-	out := make([]controld.Environment, 0)
-	for rows.Next() {
-		e, err := scanEnvironment(rows)
-		if err != nil {
-			return nil, fmt.Errorf("pgstore: list environments: %w", err)
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) UpdateEnvironment(ctx context.Context, e controld.Environment) (controld.Environment, error) {
-	egress, refs, connectors, err := environmentColumns(e)
-	if err != nil {
-		return controld.Environment{}, err
-	}
-
-	// created_at and the snapshot columns are absent on purpose: an update
-	// re-states what the operator asked for, and leaves a stale snapshot
-	// standing for the caching path to rebuild.
-	row := s.pool.QueryRow(ctx, `
-		UPDATE environments SET
-			name = $2, image = $3, setup = $4, setup_hash = $5, init = $6, init_timeout_sec = $7,
-			egress_allow = $8, secret_refs = $9,
-			connectors = $10, placement = $11, setup_timeout_sec = $12, updated_at = now()
-		WHERE id = $1
-		RETURNING `+selectEnvironmentCols,
-		e.ID, e.Name, e.Image, e.Setup, controld.SetupHash(e.Image, e.Setup), e.Init, e.InitTimeoutSec,
-		egress, refs, connectors, e.Placement, e.SetupTimeoutSec)
-
-	out, err := scanEnvironment(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return controld.Environment{}, controld.ErrNotFound
-		}
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			return controld.Environment{}, controld.ErrConflict
-		}
-		return controld.Environment{}, fmt.Errorf("pgstore: update environment: %w", err)
-	}
-	return out, nil
-}
-
-func (s *Store) DeleteEnvironment(ctx context.Context, id string) error {
-	ct, err := s.pool.Exec(ctx, `DELETE FROM environments WHERE id = $1`, id)
-	if err != nil {
-		return fmt.Errorf("pgstore: delete environment: %w", err)
-	}
-	if ct.RowsAffected() == 0 {
-		return controld.ErrNotFound
-	}
-	return nil
-}
-
-func (s *Store) CountSessionsByEnvironment(ctx context.Context, envID string, states []controld.SessionState) (int, error) {
-	sql := `SELECT count(*) FROM sessions WHERE environment_id = $1`
-	args := []any{envID}
-	if len(states) > 0 {
-		strs := make([]string, len(states))
-		for i, st := range states {
-			strs[i] = string(st)
-		}
-		args = append(args, strs)
-		sql += ` AND state = ANY($2)`
-	}
-
-	var n int
-	if err := s.pool.QueryRow(ctx, sql, args...).Scan(&n); err != nil {
-		return 0, fmt.Errorf("pgstore: count sessions by environment: %w", err)
-	}
-	return n, nil
-}
-
-func (s *Store) SetEnvironmentSnapshot(ctx context.Context, envID, expectHash, ref, runner string) error {
-	ct, err := s.pool.Exec(ctx, `
-		UPDATE environments SET snapshot_ref = $3, snapshot_runner = $4, snapshot_hash = $2, updated_at = now()
-		WHERE id = $1 AND setup_hash = $2`, envID, expectHash, ref, runner)
-	if err != nil {
-		return fmt.Errorf("pgstore: set environment snapshot: %w", err)
-	}
-	// No row matched: the environment's setup moved on (or the environment
-	// is gone), so this snapshot is for a build nobody wants any more.
-	if ct.RowsAffected() == 0 {
-		return controld.ErrConflict
-	}
-	return nil
 }
 
 // --- secrets --------------------------------------------------------------
@@ -844,7 +203,7 @@ func (s *Store) GetSecret(ctx context.Context, name string) ([]byte, []byte, err
 	err := s.pool.QueryRow(ctx, `SELECT ciphertext, nonce FROM secrets WHERE name = $1`, name).Scan(&ciphertext, &nonce)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil, controld.ErrNotFound
+			return nil, nil, control.ErrNotFound
 		}
 		return nil, nil, fmt.Errorf("pgstore: get secret: %w", err)
 	}
@@ -857,7 +216,7 @@ func (s *Store) DeleteSecret(ctx context.Context, name string) error {
 		return fmt.Errorf("pgstore: delete secret: %w", err)
 	}
 	if ct.RowsAffected() == 0 {
-		return controld.ErrNotFound
+		return control.ErrNotFound
 	}
 	return nil
 }
@@ -931,7 +290,7 @@ func (s *Store) GetCredential(ctx context.Context, userID, provider string) (con
 	c, err := scanCredential(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return controld.Credential{}, controld.ErrNotFound
+			return controld.Credential{}, control.ErrNotFound
 		}
 		return controld.Credential{}, fmt.Errorf("pgstore: get credential for provider %q: %w", provider, err)
 	}
@@ -946,7 +305,7 @@ func (s *Store) SetCredentialStatus(ctx context.Context, userID, provider, statu
 		return fmt.Errorf("pgstore: set credential status for provider %q: %w", provider, err)
 	}
 	if ct.RowsAffected() == 0 {
-		return controld.ErrNotFound
+		return control.ErrNotFound
 	}
 	return nil
 }
@@ -962,7 +321,7 @@ func (s *Store) TouchCredentialUsed(ctx context.Context, userID, provider string
 		return fmt.Errorf("pgstore: touch credential for provider %q: %w", provider, err)
 	}
 	if ct.RowsAffected() == 0 {
-		return controld.ErrNotFound
+		return control.ErrNotFound
 	}
 	return nil
 }
@@ -992,7 +351,7 @@ func (s *Store) ListCredentials(ctx context.Context, userID string) ([]controld.
 // encodeCursor and decodeCursor implement ListSessions's opaque page
 // cursor: base64 raw-URL encoding of "<created_at unixnano>|<id>". This
 // must stay byte-compatible with controld.memStore's cursor of the same
-// name, since storetest.RunContract runs unchanged against both stores.
+// name, since controlapp/repotest runs unchanged against both stores.
 //
 // created_at round-trips exactly despite Postgres's microsecond (not
 // nanosecond) timestamptz precision because the nanosecond value encoded

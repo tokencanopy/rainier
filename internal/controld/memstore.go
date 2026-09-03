@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -21,8 +20,7 @@ import (
 // model and keyed by the scope that owns them — a session and an environment
 // by workspace, a runner by pool — so the three repository ports are views
 // over the rows themselves rather than translations of somebody else's
-// shape. The single-tenant Store surface is still here, as a conversion over
-// those same rows, until every caller has moved to the ports.
+// shape.
 //
 // One mutex guards every map, and no live pointer ever crosses the lock
 // boundary: every method returns value copies, the same discipline as
@@ -856,7 +854,7 @@ func (m *memStore) GetUser(ctx context.Context, id string) (User, error) {
 	defer m.mu.Unlock()
 	u, ok := m.users[id]
 	if !ok {
-		return User{}, ErrNotFound
+		return User{}, control.ErrNotFound
 	}
 	return *u, nil
 }
@@ -866,11 +864,11 @@ func (m *memStore) UserByToken(ctx context.Context, tokenHash string) (User, err
 	defer m.mu.Unlock()
 	userID, ok := m.tokens[tokenHash]
 	if !ok {
-		return User{}, ErrNotFound
+		return User{}, control.ErrNotFound
 	}
 	u, ok := m.users[userID]
 	if !ok {
-		return User{}, ErrNotFound
+		return User{}, control.ErrNotFound
 	}
 	return *u, nil
 }
@@ -908,7 +906,7 @@ func (m *memStore) GetSecret(ctx context.Context, name string) ([]byte, []byte, 
 	defer m.mu.Unlock()
 	row, ok := m.secrets[name]
 	if !ok {
-		return nil, nil, ErrNotFound
+		return nil, nil, control.ErrNotFound
 	}
 	return bytes.Clone(row.ciphertext), bytes.Clone(row.nonce), nil
 }
@@ -917,7 +915,7 @@ func (m *memStore) DeleteSecret(ctx context.Context, name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.secrets[name]; !ok {
-		return ErrNotFound
+		return control.ErrNotFound
 	}
 	delete(m.secrets, name)
 	return nil
@@ -973,7 +971,7 @@ func (m *memStore) GetCredential(ctx context.Context, userID, provider string) (
 	defer m.mu.Unlock()
 	c, ok := m.credentials[credKey{userID, provider}]
 	if !ok {
-		return Credential{}, ErrNotFound
+		return Credential{}, control.ErrNotFound
 	}
 	return cloneCredential(*c), nil
 }
@@ -983,7 +981,7 @@ func (m *memStore) SetCredentialStatus(ctx context.Context, userID, provider, st
 	defer m.mu.Unlock()
 	c, ok := m.credentials[credKey{userID, provider}]
 	if !ok {
-		return ErrNotFound
+		return control.ErrNotFound
 	}
 	c.Status = status
 	c.UpdatedAt = time.Now()
@@ -995,7 +993,7 @@ func (m *memStore) TouchCredentialUsed(ctx context.Context, userID, provider str
 	defer m.mu.Unlock()
 	c, ok := m.credentials[credKey{userID, provider}]
 	if !ok {
-		return ErrNotFound
+		return control.ErrNotFound
 	}
 	// last_used_at only: updated_at is the edit clock, and a mint is a read.
 	c.LastUsedAt = time.Now()
@@ -1015,344 +1013,6 @@ func (m *memStore) ListCredentials(ctx context.Context, userID string) ([]Creden
 
 	sort.Slice(out, func(i, j int) bool { return out[i].Provider < out[j].Provider })
 	return out, nil
-}
-
-// ---------------------------------------------------------------------------
-// the old single-tenant Store surface
-// ---------------------------------------------------------------------------
-
-// Everything below is Store as it was before the ports, kept alive so every
-// handler and test that has not moved yet still compiles and still sees
-// exactly the behavior storetest.RunContract pins. Each method is the same
-// three steps — convert the twin types up into the control model, call the
-// native port under the installation's own workspace and pool, and convert
-// the answer back down, mapping the control sentinels onto the private ones
-// this contract names. There is one store, one set of rows, and two ways in;
-// the later recomposition deletes this one.
-
-// nativeErr maps a control sentinel back onto the old Store contract's
-// smaller set. A stale write is a conflict there: the old surface has no
-// generation to be stale against, so a caller's only answer was ever "you
-// lost, read again".
-func nativeErr(err error) error {
-	switch {
-	case err == nil:
-		return nil
-	case errors.Is(err, control.ErrNotFound):
-		return ErrNotFound
-	case errors.Is(err, control.ErrConflict), errors.Is(err, control.ErrStale):
-		return ErrConflict
-	default:
-		return err
-	}
-}
-
-// CreateSession refuses a replayed idempotency key, which is the old
-// contract: the port answers a replay with the row the key already created,
-// and the O8 adapter turns this error back into that row.
-func (m *memStore) CreateSession(ctx context.Context, s Session) (Session, error) {
-	sessions := m.Sessions()
-	if s.IdempotencyKey != "" {
-		if _, err := sessions.SessionByIDem(ctx, installWorkspace, control.ActorID(s.OwnerID), s.IdempotencyKey); err == nil {
-			return Session{}, ErrIdemReplay
-		}
-	}
-	row, err := sessions.CreateSession(ctx, installWorkspace, sessionToControl(s))
-	if err != nil {
-		return Session{}, nativeErr(err)
-	}
-	return sessionFromControl(row), nil
-}
-
-func (m *memStore) GetSession(ctx context.Context, id string) (Session, error) {
-	row, err := m.Sessions().GetSession(ctx, installWorkspace, control.SessionID(id))
-	if err != nil {
-		return Session{}, nativeErr(err)
-	}
-	return sessionFromControl(row), nil
-}
-
-func (m *memStore) SessionByIdem(ctx context.Context, ownerID, key string) (Session, error) {
-	row, err := m.Sessions().SessionByIDem(ctx, installWorkspace, control.ActorID(ownerID), key)
-	if err != nil {
-		return Session{}, nativeErr(err)
-	}
-	return sessionFromControl(row), nil
-}
-
-// SessionByName has no port method — the control model resolves a name in
-// the service, not the repository — so it scans the same rows directly.
-func (m *memStore) SessionByName(ctx context.Context, ownerID, name string) (Session, error) {
-	if name == "" {
-		return Session{}, ErrNotFound
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for key, s := range m.sessions {
-		if key.ws != installWorkspace {
-			continue
-		}
-		if string(s.CreatorID) == ownerID && s.Name == name && !s.State.Terminal() {
-			return sessionFromControl(cloneControlSession(*s)), nil
-		}
-	}
-	return Session{}, ErrNotFound
-}
-
-// ListSessions filters on three columns control.SessionQuery does not carry
-// (state, exact name, runner), so it pages over the rows itself rather than
-// filtering a page the port already cut.
-func (m *memStore) ListSessions(ctx context.Context, q SessionQuery) ([]Session, string, error) {
-	m.mu.Lock()
-	rows := make([]control.Session, 0, len(m.sessions))
-	for key, s := range m.sessions {
-		if key.ws != installWorkspace {
-			continue
-		}
-		rows = append(rows, cloneControlSession(*s))
-	}
-	m.mu.Unlock()
-	sortSessionsNewestFirst(rows)
-
-	states := statesToControl(q.States)
-	filtered := make([]control.Session, 0, len(rows))
-	for _, s := range rows {
-		switch {
-		case !q.IncludeTerminal && s.State.Terminal():
-		case len(states) > 0 && !slices.Contains(states, s.State):
-		case q.Name != "" && s.Name != q.Name:
-		case q.Runner != "" && string(s.RunnerID) != q.Runner:
-		default:
-			filtered = append(filtered, s)
-		}
-	}
-
-	start := 0
-	if q.Cursor != "" {
-		curNano, curID, err := decodeCursor(q.Cursor)
-		if err != nil {
-			return nil, "", err
-		}
-		start = len(filtered)
-		for i, s := range filtered {
-			nano := s.CreatedAt.UnixNano()
-			if nano < curNano || (nano == curNano && string(s.ID) < curID) {
-				start = i
-				break
-			}
-		}
-	}
-	page, next := pageOf(filtered[start:], q.Limit, func(s control.Session) string {
-		return encodeCursor(s.CreatedAt, string(s.ID))
-	})
-
-	out := make([]Session, len(page))
-	for i, s := range page {
-		out[i] = sessionFromControl(s)
-	}
-	return out, next, nil
-}
-
-func (m *memStore) SessionsOnRunner(ctx context.Context, runner string, states []SessionState) ([]Session, error) {
-	rows, err := m.Fleet().SessionsOnRunner(ctx, installPool, control.RunnerID(runner), statesToControl(states))
-	if err != nil {
-		return nil, nativeErr(err)
-	}
-	return sessionsFromControl(rows), nil
-}
-
-func (m *memStore) OldestQueued(ctx context.Context) ([]Session, error) {
-	rows, err := m.Fleet().OldestQueued(ctx, installPool)
-	if err != nil {
-		return nil, nativeErr(err)
-	}
-	return sessionsFromControl(rows), nil
-}
-
-func (m *memStore) Transition(ctx context.Context, id string, from []SessionState, to SessionState, opts TransitionOpts) error {
-	copts := control.TransitionOpts{Error: opts.Error}
-	if opts.Runner != nil {
-		runner := control.RunnerID(*opts.Runner)
-		copts.RunnerID = &runner
-	}
-	return nativeErr(m.Sessions().Transition(ctx, installWorkspace, control.SessionID(id),
-		statesToControl(from), control.SessionState(to), copts))
-}
-
-func (m *memStore) SetSessionSetupHash(ctx context.Context, id, hash string) error {
-	return nativeErr(m.Sessions().SetSessionSetupHash(ctx, installWorkspace, control.SessionID(id), hash))
-}
-
-func (m *memStore) SetChildExitCode(ctx context.Context, id string, code int) error {
-	return nativeErr(m.Sessions().SetChildExitCode(ctx, installWorkspace, control.SessionID(id), code))
-}
-
-// UpsertRunner writes the four columns the old surface has and carries the
-// two it does not — the generation and the capability list — forward from
-// the stored row. Blanking a generation this caller cannot see would hand
-// the next stale connection a fence to walk through, and the fence itself is
-// skipped for the same reason: an old-surface write knows no generation to
-// lose with.
-func (m *memStore) UpsertRunner(ctx context.Context, r Runner) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	key := runnerKey{installPool, control.RunnerID(r.Name)}
-	next := control.Runner{
-		ID:            key.id,
-		PoolID:        installPool,
-		CapacityUsed:  r.CapacityUsed,
-		CapacityTotal: r.CapacityTotal,
-		Connected:     r.Connected,
-		LastSeenAt:    r.LastSeenAt,
-	}
-	if cur, ok := m.runners[key]; ok {
-		next.Generation = cur.Generation
-		next.Capabilities = slices.Clone(cur.Capabilities)
-	}
-	m.runners[key] = &next
-	return nil
-}
-
-func (m *memStore) SetRunnerConnected(ctx context.Context, name string, connected bool) error {
-	return nativeErr(m.Fleet().SetRunnerConnected(ctx, installPool, control.RunnerID(name), connected))
-}
-
-func (m *memStore) ListRunners(ctx context.Context) ([]Runner, error) {
-	rows, err := m.Fleet().ListRunners(ctx, installPool)
-	if err != nil {
-		return nil, nativeErr(err)
-	}
-	out := make([]Runner, len(rows))
-	for i, r := range rows {
-		out[i] = runnerFromControl(r)
-	}
-	return out, nil
-}
-
-func (m *memStore) CreateEnvironment(ctx context.Context, e Environment) (Environment, error) {
-	c := environmentToControl(e)
-	// SetupHash is the store's on this surface: whatever the caller put there
-	// is ignored and the pair (image, setup) is hashed again.
-	c.SetupHash = SetupHash(e.Image, e.Setup)
-	row, err := m.Environments().CreateEnvironment(ctx, installWorkspace, c)
-	if err != nil {
-		return Environment{}, nativeErr(err)
-	}
-	return m.environmentToStore(row), nil
-}
-
-func (m *memStore) GetEnvironment(ctx context.Context, id string) (Environment, error) {
-	row, err := m.Environments().GetEnvironment(ctx, installWorkspace, control.EnvironmentID(id))
-	if err != nil {
-		return Environment{}, nativeErr(err)
-	}
-	return m.environmentToStore(row), nil
-}
-
-func (m *memStore) GetEnvironmentByName(ctx context.Context, name string) (Environment, error) {
-	id, err := m.EnvironmentByName(ctx, installWorkspace, name)
-	if err != nil {
-		return Environment{}, nativeErr(err)
-	}
-	return m.GetEnvironment(ctx, string(id))
-}
-
-func (m *memStore) ListEnvironments(ctx context.Context) ([]Environment, error) {
-	rows, _, err := m.Environments().ListEnvironments(ctx, installWorkspace, control.EnvironmentQuery{})
-	if err != nil {
-		return nil, nativeErr(err)
-	}
-	out := make([]Environment, len(rows))
-	for i, row := range rows {
-		out[i] = m.environmentToStore(row)
-	}
-	return out, nil
-}
-
-func (m *memStore) UpdateEnvironment(ctx context.Context, e Environment) (Environment, error) {
-	c := environmentToControl(e)
-	c.SetupHash = SetupHash(e.Image, e.Setup)
-	row, err := m.Environments().UpdateEnvironment(ctx, installWorkspace, c)
-	if err != nil {
-		return Environment{}, nativeErr(err)
-	}
-	return m.environmentToStore(row), nil
-}
-
-func (m *memStore) DeleteEnvironment(ctx context.Context, id string) error {
-	return nativeErr(m.Environments().DeleteEnvironment(ctx, installWorkspace, control.EnvironmentID(id)))
-}
-
-func (m *memStore) CountSessionsByEnvironment(ctx context.Context, envID string, states []SessionState) (int, error) {
-	n, err := m.Environments().CountSessionsByEnvironment(ctx, installWorkspace,
-		control.EnvironmentID(envID), statesToControl(states))
-	if err != nil {
-		return 0, nativeErr(err)
-	}
-	return n, nil
-}
-
-// SetEnvironmentSnapshot reports both losing outcomes as ErrConflict, which
-// is the old contract: an environment that is gone and a setup hash that has
-// moved on are the same answer here — the snapshot has nothing to belong to.
-func (m *memStore) SetEnvironmentSnapshot(ctx context.Context, envID, expectHash, ref, runner string) error {
-	err := m.Environments().SetEnvironmentSnapshot(ctx, installWorkspace,
-		control.EnvironmentID(envID), expectHash, ref, control.RunnerID(runner))
-	switch {
-	case err == nil:
-		return nil
-	case errors.Is(err, control.ErrNotFound), errors.Is(err, control.ErrStale):
-		return ErrConflict
-	default:
-		return nativeErr(err)
-	}
-}
-
-// environmentToStore lowers a control environment onto the twin's columns,
-// including the three the control model keeps elsewhere: the snapshot's ref
-// and hash travel on the row, and its holder in the store's own index.
-func (m *memStore) environmentToStore(c control.Environment) Environment {
-	e := environmentFromControl(c)
-	e.SnapshotRef = c.Snapshot.Ref
-	e.SnapshotHash = c.SnapshotHash
-	m.mu.Lock()
-	e.SnapshotRunner = string(m.snapshots[environmentKey{c.WorkspaceID, c.ID}])
-	m.mu.Unlock()
-	return e
-}
-
-// runnerFromControl lowers a runner back onto the twin's five columns. The
-// pool, the generation, and the capabilities have no column there.
-func runnerFromControl(r control.Runner) Runner {
-	return Runner{
-		Name:          string(r.ID),
-		CapacityUsed:  r.CapacityUsed,
-		CapacityTotal: r.CapacityTotal,
-		Connected:     r.Connected,
-		LastSeenAt:    r.LastSeenAt,
-	}
-}
-
-// sessionsFromControl lowers a whole listing.
-func sessionsFromControl(rows []control.Session) []Session {
-	out := make([]Session, len(rows))
-	for i, row := range rows {
-		out[i] = sessionFromControl(row)
-	}
-	return out
-}
-
-// statesToControl converts a from-list or state filter up into the control
-// vocabulary; statesFromControl is its inverse.
-func statesToControl(in []SessionState) []control.SessionState {
-	if in == nil {
-		return nil
-	}
-	out := make([]control.SessionState, len(in))
-	for i, s := range in {
-		out[i] = control.SessionState(s)
-	}
-	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -1402,225 +1062,4 @@ func decodeEnvCursor(cursor string) (name string, id control.EnvironmentID, err 
 		return "", "", fmt.Errorf("controld: invalid cursor: %q", cursor)
 	}
 	return rawName, control.EnvironmentID(rawID), nil
-}
-
-// ---------------------------------------------------------------------------
-// the O8 conversions, over the same rows
-// ---------------------------------------------------------------------------
-
-// sessionToControl lifts a store row into the control model. Three fields
-// have no column and are supplied by the installation's identity: the
-// workspace, the pool (a queued session is queued *in* the installation
-// pool, so it is set whether or not the row is placed), and the placement
-// generation, which is 1 for every row until O9 persists it.
-func sessionToControl(s Session) control.Session {
-	return control.Session{
-		ID:            control.SessionID(s.ID),
-		WorkspaceID:   installWorkspace,
-		CreatorID:     control.ActorID(s.OwnerID),
-		Name:          s.Name,
-		State:         control.SessionState(s.State),
-		EnvironmentID: control.EnvironmentID(s.EnvironmentID),
-		Spec: control.PortableSpec{
-			Image:       s.effectiveImage(),
-			Cmd:         slices.Clone(s.Cmd),
-			EgressAllow: slices.Clone(s.EgressAllow),
-			Repos:       reposToControl(s.Repos),
-		},
-		SetupHash:           s.SetupHash,
-		PoolID:              installPool,
-		RunnerID:            control.RunnerID(s.Runner),
-		PlacementGeneration: 1,
-		IdempotencyKey:      s.IdempotencyKey,
-		ChildExitCode:       s.ChildExitCode,
-		Error:               s.Error,
-		CreatedAt:           s.CreatedAt,
-		UpdatedAt:           s.UpdatedAt,
-		LastEventAt:         s.LastEventAt,
-	}
-}
-
-// sessionFromControl lowers a control session back onto the store's columns.
-// The image lands in whichever of the two image columns the row's kind calls
-// for: a session started from an environment has its image *resolved* (the
-// environment's image, or its cached snapshot), while a scratch session has
-// only the caller's own (store.go, Session.effectiveImage).
-func sessionFromControl(c control.Session) Session {
-	s := Session{
-		ID:             string(c.ID),
-		OwnerID:        string(c.CreatorID),
-		Name:           c.Name,
-		Cmd:            slices.Clone(c.Spec.Cmd),
-		EgressAllow:    slices.Clone(c.Spec.EgressAllow),
-		State:          SessionState(c.State),
-		Runner:         string(c.RunnerID),
-		IdempotencyKey: c.IdempotencyKey,
-		Error:          c.Error,
-		EnvironmentID:  string(c.EnvironmentID),
-		SetupHash:      c.SetupHash,
-		Repos:          reposFromControl(c.Spec.Repos),
-		ChildExitCode:  c.ChildExitCode,
-		CreatedAt:      c.CreatedAt,
-		UpdatedAt:      c.UpdatedAt,
-		LastEventAt:    c.LastEventAt,
-	}
-	if c.EnvironmentID != "" {
-		s.ResolvedImage = c.Spec.Image
-	} else {
-		s.Image = c.Spec.Image
-	}
-	return s
-}
-
-// sessionsToControl converts a whole page or listing.
-func sessionsToControl(rows []Session) []control.Session {
-	if rows == nil {
-		return nil
-	}
-	out := make([]control.Session, len(rows))
-	for i, row := range rows {
-		out[i] = sessionToControl(row)
-	}
-	return out
-}
-
-// reposToControl and reposFromControl preserve the nil-vs-empty distinction
-// the override depends on: nil means "inherit the environment's connectors",
-// an empty slice means "clone nothing" (store.go, Session.Repos).
-func reposToControl(in []RepoRef) []control.RepoRef {
-	if in == nil {
-		return nil
-	}
-	out := make([]control.RepoRef, len(in))
-	for i, r := range in {
-		out[i] = control.RepoRef{Repo: r.Repo, BaseBranch: r.BaseBranch}
-	}
-	return out
-}
-
-func reposFromControl(in []control.RepoRef) []RepoRef {
-	if in == nil {
-		return nil
-	}
-	out := make([]RepoRef, len(in))
-	for i, r := range in {
-		out[i] = RepoRef{Repo: r.Repo, BaseBranch: r.BaseBranch}
-	}
-	return out
-}
-
-// environmentToControl lifts an environment row. control.Environment names no
-// runner, so the two things that pin one — the operator's explicit placement
-// and the affinity a cached snapshot has to the runner that built it — become
-// portable capabilities the pool resolver can match. The snapshot pin is
-// emitted only while the snapshot is still current: a snapshot built from
-// setup that has since been edited must not hold a session to one runner.
-func environmentToControl(e Environment) control.Environment {
-	c := control.Environment{
-		ID:              control.EnvironmentID(e.ID),
-		WorkspaceID:     installWorkspace,
-		Name:            e.Name,
-		Image:           e.Image,
-		Setup:           e.Setup,
-		SetupHash:       e.SetupHash,
-		Init:            e.Init,
-		InitTimeoutSec:  e.InitTimeoutSec,
-		EgressAllow:     slices.Clone(e.EgressAllow),
-		SecretRefs:      slices.Clone(e.SecretRefs),
-		Connectors:      connectorsToControl(e.Connectors),
-		SetupTimeoutSec: e.SetupTimeoutSec,
-		SnapshotHash:    e.SnapshotHash,
-		CreatedAt:       e.CreatedAt,
-		UpdatedAt:       e.UpdatedAt,
-	}
-	if e.SnapshotRef != "" {
-		c.Snapshot = SnapshotCheckpoint(e.SnapshotRef)
-	}
-	var caps []string
-	if e.Placement != "" {
-		caps = append(caps, placementCapabilityPrefix+e.Placement)
-	}
-	if e.SnapshotRef != "" && e.SnapshotRunner != "" && e.SnapshotHash == e.SetupHash {
-		caps = append(caps, SnapshotCapability(control.RunnerID(e.SnapshotRunner)))
-	}
-	c.Requirements.Capabilities = caps
-	return c
-}
-
-// environmentFromControl lowers an environment back onto the store's columns.
-// It never writes the three snapshot columns: those are the store's, written
-// only by SetEnvironmentSnapshot, so a snapshot built from a superseded setup
-// hash stays visibly stale instead of being silently adopted or dropped
-// (store.go, Environment). The placement and snapshot capabilities are
-// likewise dropped rather than written back — placement is recovered into its
-// own column, and O8 has no column for any other requirement.
-func environmentFromControl(c control.Environment) Environment {
-	return Environment{
-		ID:              string(c.ID),
-		Name:            c.Name,
-		Image:           c.Image,
-		Setup:           c.Setup,
-		SetupHash:       c.SetupHash,
-		Init:            c.Init,
-		InitTimeoutSec:  c.InitTimeoutSec,
-		EgressAllow:     slices.Clone(c.EgressAllow),
-		SecretRefs:      slices.Clone(c.SecretRefs),
-		Connectors:      connectorsFromControl(c.Connectors),
-		Placement:       capabilityValue(c.Requirements.Capabilities, placementCapabilityPrefix),
-		SetupTimeoutSec: c.SetupTimeoutSec,
-		CreatedAt:       c.CreatedAt,
-		UpdatedAt:       c.UpdatedAt,
-	}
-}
-
-func connectorsToControl(in []Connector) []control.Connector {
-	if in == nil {
-		return nil
-	}
-	out := make([]control.Connector, len(in))
-	for i, c := range in {
-		out[i] = control.Connector{Type: c.Type, Raw: slices.Clone(c.Raw)}
-	}
-	return out
-}
-
-func connectorsFromControl(in []control.Connector) []Connector {
-	if in == nil {
-		return nil
-	}
-	out := make([]Connector, len(in))
-	for i, c := range in {
-		out[i] = Connector{Type: c.Type, Raw: slices.Clone(c.Raw)}
-	}
-	return out
-}
-
-// runnerToControl lifts a runner row onto the old surface's four columns plus
-// the two the old surface has no place for: the generation the caller supplies
-// and the capabilities synthesized from the name, so a session pinned to this
-// runner by an environment's placement, or held to it by a snapshot it built,
-// matches it.
-func runnerToControl(r Runner, gen uint64) control.Runner {
-	return control.Runner{
-		ID:            control.RunnerID(r.Name),
-		PoolID:        installPool,
-		CapacityUsed:  r.CapacityUsed,
-		CapacityTotal: r.CapacityTotal,
-		Connected:     r.Connected,
-		Generation:    gen,
-		Capabilities:  runnerCapabilities(r.Name),
-		LastSeenAt:    r.LastSeenAt,
-	}
-}
-
-// statesFromControl converts a from-list or state filter.
-func statesFromControl(in []control.SessionState) []SessionState {
-	if in == nil {
-		return nil
-	}
-	out := make([]SessionState, len(in))
-	for i, s := range in {
-		out[i] = SessionState(s)
-	}
-	return out
 }
