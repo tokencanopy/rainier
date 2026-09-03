@@ -2,7 +2,6 @@ package controld
 
 import (
 	"context"
-	"log"
 	"slices"
 	"sort"
 	"time"
@@ -11,14 +10,14 @@ import (
 )
 
 // The host ports that are not persistence: which pools a session may run in,
-// where an application event goes, what time it is, and where new identities
-// come from. Each is the smallest thing that satisfies its contract for a
-// single-tenant installation. The three repository ports are not here: the
-// store implements them itself, and compose() reads them off it.
+// where a checkpoint can boot, what time it is, and where new identities come
+// from. Each is the smallest thing that satisfies its contract for a
+// single-tenant installation. The repository ports are not here, and neither
+// are the unit of work and the event record: the store implements all of
+// them itself, and compose() reads them off it — an event has to commit with
+// the row it describes, which only the store can do.
 var (
 	_ control.PoolResolver      = installationPools{}
-	_ control.EventRecorder     = logRecorder{}
-	_ control.UnitOfWork        = directUnitOfWork{}
 	_ control.CheckpointLocator = pinnedCheckpoints{}
 	_ control.Clock             = systemClock{}
 	_ control.IDGenerator       = idGenerator{}
@@ -65,31 +64,6 @@ func (p installationPools) EligiblePools(ctx context.Context, scope control.Scop
 	return []control.Pool{pool}, nil
 }
 
-// logRecorder is control.EventRecorder against the process log. O8 has no
-// event table, and an event is a fact worth seeing rather than one worth
-// keeping, so it is logged and dropped.
-type logRecorder struct{}
-
-// Record logs the action, the resource kind, and the resource id — three
-// opaque values — and nothing else from the event. A session's name, image,
-// error tail, and usage never reach a log line from here. It never fails: an
-// unrecorded event must not fail the operation that produced it.
-func (logRecorder) Record(_ context.Context, e control.Event) error {
-	log.Printf("controld: event %s %s %s", e.Action, e.Resource.Kind, e.Resource.ID)
-	return nil
-}
-
-// directUnitOfWork is control.UnitOfWork for a host that has no transactions
-// to open. Run calls fn with the context it was handed and returns fn's error
-// unchanged, which is exactly what a command does today: the port permits a
-// host without transactions to run fn directly, and this installation's
-// stores gain a real unit of work in a later plan.
-type directUnitOfWork struct{}
-
-func (directUnitOfWork) Run(ctx context.Context, fn func(context.Context) error) error {
-	return fn(ctx)
-}
-
 // pinnedCheckpoints is control.CheckpointLocator for an installation whose
 // checkpoints are container images built by, and living on, one runner: a
 // snapshot boots on its holder and nowhere else. It is the locator spelling
@@ -97,36 +71,24 @@ func (directUnitOfWork) Run(ctx context.Context, fn func(context.Context) error)
 // build — nothing here can pull a snapshot to a second runner.
 type pinnedCheckpoints struct{ st Store }
 
-// LocateCheckpoint names the runner holding cp, or nowhere. It finds the
-// environment whose current cache carries cp.Ref and asks the store which
-// runner built it; an environment with no holder, a ref no environment of ws
-// carries, and an empty ref are all "nowhere", which tells the caller to boot
-// without the checkpoint rather than to fail. A store that cannot answer is
-// the error, because "nowhere" would silently rebuild what is already cached.
+// LocateCheckpoint names the runner holding cp, or nowhere. It is one store
+// lookup by ref: a cache nobody holds, a cache whose environment's setup has
+// moved on, a ref no environment of ws carries, and an empty ref are all
+// "nowhere", which tells the caller to boot without the checkpoint rather
+// than to fail. A store that cannot answer is the error, because "nowhere"
+// would silently rebuild what is already cached.
 func (p pinnedCheckpoints) LocateCheckpoint(ctx context.Context, ws control.WorkspaceID, cp control.Checkpoint) (control.CheckpointLocation, error) {
 	if cp.Ref == "" {
 		return control.CheckpointLocation{}, nil
 	}
-	// A listing, until the store gains the direct lookup: an installation has
-	// a handful of environments, and the scheduler asks once per queued row.
-	rows, _, err := p.st.Environments().ListEnvironments(ctx, ws, control.EnvironmentQuery{})
+	holder, err := p.st.SnapshotHolder(ctx, ws, cp.Ref)
 	if err != nil {
 		return control.CheckpointLocation{}, err
 	}
-	for _, env := range rows {
-		if env.Snapshot.Ref != cp.Ref {
-			continue
-		}
-		holder, err := p.st.SnapshotRunner(ctx, ws, env.ID)
-		if err != nil {
-			return control.CheckpointLocation{}, err
-		}
-		if holder == "" {
-			return control.CheckpointLocation{}, nil
-		}
-		return control.CheckpointLocation{Runners: []control.RunnerID{holder}}, nil
+	if holder == "" {
+		return control.CheckpointLocation{}, nil
 	}
-	return control.CheckpointLocation{}, nil
+	return control.CheckpointLocation{Runners: []control.RunnerID{holder}}, nil
 }
 
 // systemClock is control.Clock against the wall clock.

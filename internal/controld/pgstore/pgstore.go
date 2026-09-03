@@ -55,7 +55,7 @@ func (s *Store) Close() {
 // execAdmin runs raw SQL that cannot go through the extended query
 // protocol (e.g. CREATE DATABASE). Test-only convenience.
 func (s *Store) execAdmin(ctx context.Context, sql string) error {
-	_, err := s.pool.Exec(ctx, sql, pgx.QueryExecModeSimpleProtocol)
+	_, err := s.q(ctx).Exec(ctx, sql, pgx.QueryExecModeSimpleProtocol)
 	return err
 }
 
@@ -84,7 +84,7 @@ var (
 // --- users & tokens ---------------------------------------------------
 
 func (s *Store) UpsertUser(ctx context.Context, githubID int64, login, role string) (controld.User, error) {
-	row := s.pool.QueryRow(ctx, `
+	row := s.q(ctx).QueryRow(ctx, `
 		INSERT INTO users (id, github_id, login, role)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (github_id) DO UPDATE SET login = EXCLUDED.login, role = EXCLUDED.role
@@ -100,7 +100,7 @@ func (s *Store) UpsertUser(ctx context.Context, githubID int64, login, role stri
 
 func (s *Store) InsertToken(ctx context.Context, userID, tokenHash string) error {
 	// token_hash is already globally unique, so it doubles as the row id.
-	_, err := s.pool.Exec(ctx, `
+	_, err := s.q(ctx).Exec(ctx, `
 		INSERT INTO api_tokens (id, user_id, token_hash) VALUES ($1, $2, $3)`,
 		tokenHash, userID, tokenHash)
 	if err != nil {
@@ -111,7 +111,7 @@ func (s *Store) InsertToken(ctx context.Context, userID, tokenHash string) error
 
 func (s *Store) UserByToken(ctx context.Context, tokenHash string) (controld.User, error) {
 	var userID string
-	err := s.pool.QueryRow(ctx, `
+	err := s.q(ctx).QueryRow(ctx, `
 		UPDATE api_tokens SET last_used_at = now() WHERE token_hash = $1
 		RETURNING user_id`, tokenHash).Scan(&userID)
 	if err != nil {
@@ -122,7 +122,7 @@ func (s *Store) UserByToken(ctx context.Context, tokenHash string) (controld.Use
 	}
 
 	var u controld.User
-	err = s.pool.QueryRow(ctx, `
+	err = s.q(ctx).QueryRow(ctx, `
 		SELECT id, github_id, login, role, created_at FROM users WHERE id = $1`, userID).
 		Scan(&u.ID, &u.GitHubID, &u.Login, &u.Role, &u.CreatedAt)
 	if err != nil {
@@ -136,7 +136,7 @@ func (s *Store) UserByToken(ctx context.Context, tokenHash string) (controld.Use
 
 func (s *Store) GetUser(ctx context.Context, id string) (controld.User, error) {
 	var u controld.User
-	err := s.pool.QueryRow(ctx, `
+	err := s.q(ctx).QueryRow(ctx, `
 		SELECT id, github_id, login, role, created_at FROM users WHERE id = $1`, id).
 		Scan(&u.ID, &u.GitHubID, &u.Login, &u.Role, &u.CreatedAt)
 	if err != nil {
@@ -167,7 +167,7 @@ func nonNilStrings(ss []string) []string {
 // --- secrets --------------------------------------------------------------
 
 func (s *Store) PutSecret(ctx context.Context, name string, ciphertext, nonce []byte) error {
-	_, err := s.pool.Exec(ctx, `
+	_, err := s.q(ctx).Exec(ctx, `
 		INSERT INTO secrets (name, ciphertext, nonce) VALUES ($1, $2, $3)
 		ON CONFLICT (name) DO UPDATE SET
 			ciphertext = EXCLUDED.ciphertext, nonce = EXCLUDED.nonce, updated_at = now()`,
@@ -181,7 +181,7 @@ func (s *Store) PutSecret(ctx context.Context, name string, ciphertext, nonce []
 func (s *Store) ListSecrets(ctx context.Context) ([]controld.SecretMeta, error) {
 	// The ciphertext and nonce columns are deliberately not selected: a
 	// listing has no business carrying secret material.
-	rows, err := s.pool.Query(ctx, `SELECT name, created_at, updated_at FROM secrets ORDER BY name ASC`)
+	rows, err := s.q(ctx).Query(ctx, `SELECT name, created_at, updated_at FROM secrets ORDER BY name ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("pgstore: list secrets: %w", err)
 	}
@@ -200,7 +200,7 @@ func (s *Store) ListSecrets(ctx context.Context) ([]controld.SecretMeta, error) 
 
 func (s *Store) GetSecret(ctx context.Context, name string) ([]byte, []byte, error) {
 	var ciphertext, nonce []byte
-	err := s.pool.QueryRow(ctx, `SELECT ciphertext, nonce FROM secrets WHERE name = $1`, name).Scan(&ciphertext, &nonce)
+	err := s.q(ctx).QueryRow(ctx, `SELECT ciphertext, nonce FROM secrets WHERE name = $1`, name).Scan(&ciphertext, &nonce)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil, control.ErrNotFound
@@ -211,7 +211,7 @@ func (s *Store) GetSecret(ctx context.Context, name string) ([]byte, []byte, err
 }
 
 func (s *Store) DeleteSecret(ctx context.Context, name string) error {
-	ct, err := s.pool.Exec(ctx, `DELETE FROM secrets WHERE name = $1`, name)
+	ct, err := s.q(ctx).Exec(ctx, `DELETE FROM secrets WHERE name = $1`, name)
 	if err != nil {
 		return fmt.Errorf("pgstore: delete secret: %w", err)
 	}
@@ -255,7 +255,7 @@ func (s *Store) UpsertCredential(ctx context.Context, c controld.Credential) err
 	}
 	// A whole-row replace: an upsert is a fresh login, so every column moves,
 	// including obtained_at — the row now describes a different token.
-	_, err := s.pool.Exec(ctx, `
+	_, err := s.q(ctx).Exec(ctx, `
 		INSERT INTO credentials (user_id, provider, ciphertext, nonce, refresh_ciphertext, refresh_nonce,
 			status, scopes, obtained_at, expires_at, last_verified_at, last_used_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
@@ -286,7 +286,7 @@ func (s *Store) UpsertCredential(ctx context.Context, c controld.Credential) err
 }
 
 func (s *Store) GetCredential(ctx context.Context, userID, provider string) (controld.Credential, error) {
-	row := s.pool.QueryRow(ctx, `SELECT `+selectCredentialCols+` FROM credentials WHERE user_id = $1 AND provider = $2`, userID, provider)
+	row := s.q(ctx).QueryRow(ctx, `SELECT `+selectCredentialCols+` FROM credentials WHERE user_id = $1 AND provider = $2`, userID, provider)
 	c, err := scanCredential(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -298,7 +298,7 @@ func (s *Store) GetCredential(ctx context.Context, userID, provider string) (con
 }
 
 func (s *Store) SetCredentialStatus(ctx context.Context, userID, provider, status string) error {
-	ct, err := s.pool.Exec(ctx, `
+	ct, err := s.q(ctx).Exec(ctx, `
 		UPDATE credentials SET status = $3, updated_at = now()
 		WHERE user_id = $1 AND provider = $2`, userID, provider, status)
 	if err != nil {
@@ -314,7 +314,7 @@ func (s *Store) TouchCredentialUsed(ctx context.Context, userID, provider string
 	// last_used_at only. updated_at is the row's edit clock, and a mint is a
 	// read: a session using a credential must not make it look freshly
 	// changed to whoever is watching the status.
-	ct, err := s.pool.Exec(ctx, `
+	ct, err := s.q(ctx).Exec(ctx, `
 		UPDATE credentials SET last_used_at = now()
 		WHERE user_id = $1 AND provider = $2`, userID, provider)
 	if err != nil {
@@ -329,7 +329,7 @@ func (s *Store) TouchCredentialUsed(ctx context.Context, userID, provider string
 func (s *Store) ListCredentials(ctx context.Context, userID string) ([]controld.Credential, error) {
 	// Scoped to one user by the query itself, not by a filter above it: there
 	// is no code path here that could hand back another user's row.
-	rows, err := s.pool.Query(ctx, `SELECT `+selectCredentialCols+` FROM credentials WHERE user_id = $1 ORDER BY provider ASC`, userID)
+	rows, err := s.q(ctx).Query(ctx, `SELECT `+selectCredentialCols+` FROM credentials WHERE user_id = $1 ORDER BY provider ASC`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("pgstore: list credentials: %w", err)
 	}

@@ -13,7 +13,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"strings"
 	"time"
 
 	"github.com/tokencanopy/rainier/control"
@@ -69,13 +68,22 @@ type Credential struct {
 }
 
 // Store is controld's persistence interface: the host's own persistence
-// (HostStore) and the three control repository ports (Repositories). There is
-// no third surface — sessions, environments, and runners exist once, as
-// control types, and every caller reaches them through the ports.
-// memstore (this package) and pgstore both implement it; storetest.RunHost
-// pins the host half's semantics, controlapp/repotest the ports'.
+// (HostStore), the host's atomicity and event record (control.UnitOfWork and
+// control.EventRecorder), and the three control repository ports
+// (Repositories). There is no third surface — sessions, environments, and
+// runners exist once, as control types, and every caller reaches them through
+// the ports.
+//
+// The unit of work and the recorder are on the store rather than beside it
+// because they are the same write: an event is durable exactly when the
+// mutation it describes is, which only the thing holding the transaction can
+// promise. memstore (this package) and pgstore both implement it;
+// storetest.RunHost pins the host half's semantics, controlapp/repotest the
+// ports'.
 type Store interface {
 	HostStore
+	control.UnitOfWork
+	control.EventRecorder
 	Repositories
 }
 
@@ -115,6 +123,13 @@ type HostStore interface {
 	// when there is none — stale or not, because the wire has always shown
 	// the column. It decides nothing.
 	SnapshotRunner(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID) (control.RunnerID, error)
+	// SnapshotHolder names the runner holding the snapshot with ref in ws,
+	// "" when no environment's current cache has it. A cache whose hash no
+	// longer matches its environment's setup hash is stale and holds
+	// nothing, which is the difference between this and SnapshotRunner: this
+	// one is asked where a checkpoint can boot, and a stale image is not an
+	// answer to that. An empty workspace or ref is control.ErrInvalid.
+	SnapshotHolder(ctx context.Context, ws control.WorkspaceID, ref string) (control.RunnerID, error)
 	// NextRunnerGeneration opens a new generation for id in pool and returns
 	// it: 1 for a runner never seen, else one more than stored. It is the
 	// only writer of the generation the fleet repository fences on.
@@ -131,11 +146,16 @@ type Repositories interface {
 	Fleet() control.FleetRepository
 }
 
-// MemStore is the shape the in-memory store has: Store itself, the union of
-// the host's own persistence and the three control repositories. It stays as
-// its own name because every test helper is written in terms of it.
+// MemStore is the shape the in-memory store has: Store itself, plus the one
+// window no durable store owes anybody. It stays as its own name because
+// every test helper is written in terms of it.
 type MemStore interface {
 	Store
+	// Events returns a copy of every event recorded so far, in the order it
+	// was recorded. It exists for tests above the store: nothing in the
+	// process consumes an event, and the in-memory store is the durable home
+	// of nothing, so keeping them costs only what a test then reads back.
+	Events() []control.Event
 }
 
 // snapshotCheckpointFormat is the format every self-hosted environment
@@ -144,42 +164,10 @@ type MemStore interface {
 // changing the field.
 const snapshotCheckpointFormat = "rainier-runner-v0"
 
-// snapshotCapabilityPrefix is the self-hosted spelling of a snapshot's
-// affinity to the runner that built it. It lives beside the helpers that
-// write and strip it rather than beside the scope constants, because the
-// stores are what put it on an environment and take it back off.
-const snapshotCapabilityPrefix = "snapshot:"
-
 // SnapshotCheckpoint is the control spelling of a self-hosted environment
-// snapshot: a runner-built image ref, the one format this build has.
+// snapshot — a runner-built image ref, the one format this build has.
 func SnapshotCheckpoint(ref string) control.Checkpoint {
 	return control.Checkpoint{Ref: ref, Format: snapshotCheckpointFormat, Capabilities: []string{"workspace"}}
-}
-
-// SnapshotCapability is the self-hosted spelling of a CURRENT snapshot's
-// affinity to the runner that built it: appended to an environment's
-// requirements on the way out of a store, stripped on the way in. A later
-// plan replaces it with a portable checkpoint locator and deletes it.
-func SnapshotCapability(holder control.RunnerID) string {
-	return snapshotCapabilityPrefix + string(holder)
-}
-
-// StripSnapshotCapabilities returns caps without any snapshot affinity. A
-// store owns that capability the way it owns the cache it describes, so a
-// caller's copy of it — read back out and written straight in again — is
-// dropped rather than persisted.
-func StripSnapshotCapabilities(caps []string) []string {
-	if caps == nil {
-		return nil
-	}
-	out := make([]string, 0, len(caps))
-	for _, c := range caps {
-		if strings.HasPrefix(c, snapshotCapabilityPrefix) {
-			continue
-		}
-		out = append(out, c)
-	}
-	return out
 }
 
 // randHex returns n random bytes, hex-encoded (2n hex characters), sourced

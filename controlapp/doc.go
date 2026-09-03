@@ -31,6 +31,16 @@
 // protocol packages; this package references those contracts and never
 // duplicates them.
 //
+// Every command commits its mutation and the event that describes it in one
+// control.UnitOfWork: the service opens the unit, makes every repository and
+// recorder call on the context it hands back, and wakes the scheduler only
+// after the unit returns, so a host with transactions makes the two writes one
+// commit and a host without them (an in-memory store) runs the closure
+// directly. Placement asks the host's control.CheckpointLocator where an
+// environment's cached checkpoint can boot, prefers those runners, and falls
+// back to any eligible runner with a rebuild from the environment's own image
+// — a cache is a head start, never a pin.
+//
 // Adapter failures are normalized at every port boundary: portError maps any
 // error a port returns into the closed control sentinel vocabulary, so an
 // adapter's SQL, connection string, or provider text can never leave this

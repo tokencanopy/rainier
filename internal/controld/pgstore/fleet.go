@@ -59,7 +59,7 @@ func (r pgFleet) UpsertRunner(ctx context.Context, pool control.PoolID, run cont
 	if !run.LastSeenAt.IsZero() {
 		lastSeen = &run.LastSeenAt
 	}
-	ct, err := r.s.pool.Exec(ctx, `
+	ct, err := r.s.q(ctx).Exec(ctx, `
 		INSERT INTO runners (pool_id, name, capacity_used, capacity_total, connected, generation, capabilities, last_seen_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (pool_id, name) DO UPDATE SET
@@ -82,7 +82,7 @@ func (r pgFleet) SetRunnerConnected(ctx context.Context, pool control.PoolID, id
 	if pool == "" {
 		return control.ErrInvalid
 	}
-	ct, err := r.s.pool.Exec(ctx,
+	ct, err := r.s.q(ctx).Exec(ctx,
 		`UPDATE runners SET connected = $3, last_seen_at = now() WHERE pool_id = $1 AND name = $2`,
 		string(pool), string(id), connected)
 	if err != nil {
@@ -98,7 +98,7 @@ func (r pgFleet) ListRunners(ctx context.Context, pool control.PoolID) ([]contro
 	if pool == "" {
 		return nil, control.ErrInvalid
 	}
-	rows, err := r.s.pool.Query(ctx,
+	rows, err := r.s.q(ctx).Query(ctx,
 		`SELECT `+runnerCols+` FROM runners WHERE pool_id = $1 ORDER BY name ASC`, string(pool))
 	if err != nil {
 		return nil, unavailable("list runners", err)
@@ -150,7 +150,7 @@ func (r pgFleet) OldestQueued(ctx context.Context, pool control.PoolID) ([]contr
 // any failure into the contract's sentinel, naming the operation and nothing
 // of the statement.
 func (r pgFleet) querySessions(ctx context.Context, op, sql string, args ...any) ([]control.Session, error) {
-	rows, err := r.s.pool.Query(ctx, sql, args...)
+	rows, err := r.s.q(ctx).Query(ctx, sql, args...)
 	if err != nil {
 		return nil, unavailable(op, err)
 	}

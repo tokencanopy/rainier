@@ -1473,3 +1473,51 @@ func TestAttachWithRetryReconnectsFromTheRenderedCursor(t *testing.T) {
 		}
 	}
 }
+
+// TestEnvCapabilityFlagsReachTheWire pins the repeatable `--capability` flag
+// to the `capabilities` array the server reads: create sends every one the
+// operator passed, in order, and update sends the field only when it was
+// actually passed (an absent flag leaves an environment's requirements
+// alone, which is not the same request as clearing them).
+func TestEnvCapabilityFlagsReachTheWire(t *testing.T) {
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBody = nil
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusCreated)
+		}
+		if _, err := w.Write([]byte(`{"environment":{"id":"env_test"}}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	t.Setenv("RAINIER_CONFIG", filepath.Join(dir, "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_test"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runEnvCreate([]string{"dev", "--image", "img:1",
+		"--capability", "gpu", "--capability", "docker.rootless"}); err != nil {
+		t.Fatalf("env create: %v", err)
+	}
+	wantCaps := []any{"gpu", "docker.rootless"}
+	if got, ok := gotBody["capabilities"].([]any); !ok || !slices.Equal(got, wantCaps) {
+		t.Errorf("create capabilities = %#v, want %v", gotBody["capabilities"], wantCaps)
+	}
+
+	if err := runEnvUpdate([]string{"dev", "--capability", "gpu"}); err != nil {
+		t.Fatalf("env update: %v", err)
+	}
+	if got, ok := gotBody["capabilities"].([]any); !ok || !slices.Equal(got, []any{"gpu"}) {
+		t.Errorf("update capabilities = %#v, want [gpu]", gotBody["capabilities"])
+	}
+	if len(gotBody) != 1 {
+		t.Errorf("patch = %#v, want it to carry only the field that was passed", gotBody)
+	}
+}

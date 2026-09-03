@@ -61,7 +61,7 @@ func (s *Store) EnsureWorkspace(ctx context.Context, ws control.WorkspaceID) err
 	if ws == "" {
 		return control.ErrInvalid
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO workspaces (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`, string(ws)); err != nil {
+	if _, err := s.q(ctx).Exec(ctx, `INSERT INTO workspaces (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`, string(ws)); err != nil {
 		return unavailable("ensure workspace", err)
 	}
 	return nil
@@ -75,7 +75,7 @@ func (s *Store) EnvironmentByName(ctx context.Context, ws control.WorkspaceID, n
 		return "", control.ErrInvalid
 	}
 	var id string
-	err := s.pool.QueryRow(ctx,
+	err := s.q(ctx).QueryRow(ctx,
 		`SELECT id FROM environments WHERE workspace_id = $1 AND name = $2`, string(ws), name).Scan(&id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -93,13 +93,37 @@ func (s *Store) SnapshotRunner(ctx context.Context, ws control.WorkspaceID, id c
 		return "", control.ErrInvalid
 	}
 	var holder string
-	err := s.pool.QueryRow(ctx,
+	err := s.q(ctx).QueryRow(ctx,
 		`SELECT snapshot_runner FROM environments WHERE workspace_id = $1 AND id = $2`, string(ws), string(id)).Scan(&holder)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", control.ErrNotFound
 		}
 		return "", unavailable("snapshot runner", err)
+	}
+	return control.RunnerID(holder), nil
+}
+
+// SnapshotHolder names the runner holding ref's snapshot in ws, "" when no
+// environment's CURRENT cache has it. The staleness test is in the statement
+// (snapshot_hash = setup_hash) rather than in Go: a cache whose environment's
+// setup has moved on is not an answer to "where can this checkpoint boot",
+// and a row this query cannot reach is a row no code path here can decide to
+// use anyway.
+func (s *Store) SnapshotHolder(ctx context.Context, ws control.WorkspaceID, ref string) (control.RunnerID, error) {
+	if ws == "" || ref == "" {
+		return "", control.ErrInvalid
+	}
+	var holder string
+	err := s.q(ctx).QueryRow(ctx,
+		`SELECT snapshot_runner FROM environments
+		 WHERE workspace_id = $1 AND snapshot_ref = $2 AND snapshot_hash = setup_hash LIMIT 1`,
+		string(ws), ref).Scan(&holder)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", unavailable("snapshot holder", err)
 	}
 	return control.RunnerID(holder), nil
 }
@@ -114,7 +138,7 @@ func (s *Store) NextRunnerGeneration(ctx context.Context, pool control.PoolID, i
 		return 0, control.ErrInvalid
 	}
 	var generation int64
-	err := s.pool.QueryRow(ctx, `
+	err := s.q(ctx).QueryRow(ctx, `
 		INSERT INTO runners (pool_id, name, generation) VALUES ($1, $2, 1)
 		ON CONFLICT (pool_id, name) DO UPDATE SET generation = runners.generation + 1
 		RETURNING generation`, string(pool), string(id)).Scan(&generation)

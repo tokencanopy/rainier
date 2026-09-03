@@ -8,12 +8,14 @@ package runner
 import "encoding/json"
 
 // ProtocolVersion is the wire version a runner announces and controld checks
-// before it accepts any command from that connection. It is fixed at 1:
-// capability negotiation and a rolling-version window are deferred to a
-// later plan, so version 1 does not itself negotiate anything. An announce
-// whose value controld does not speak is fatal to the connection: controld
-// closes it with a close reason naming both the announced and the expected
-// version.
+// before it accepts any command from that connection. It is 1: capability
+// negotiation rides on additive fields of this version — a runner announces
+// its capabilities and controld answers with an accept naming the generation
+// and the capabilities it took — so a runner that sends none is judged
+// exactly as before, and a rolling-version window is still deferred to the
+// compatibility ADR. An announce whose value controld does not speak is
+// fatal to the connection: controld closes it with a close reason naming
+// both the announced and the expected version.
 const ProtocolVersion = 1
 
 // RPCEnvelope is one message of the session RPC — the bidirectional
@@ -77,6 +79,20 @@ type FromRunner struct {
 	// back down. Session names which sandbox it came from; without it a
 	// response has nowhere to be routed.
 	RPC *RPCEnvelope `json:"rpc,omitempty"`
+	// Capabilities are the portable runtime capabilities this runner claims
+	// on an announce: lowercase tokens such as "gpu" or "docker.rootless".
+	// Absent means none — an old runner is a runner with no capabilities,
+	// and every environment that requires one simply never lands on it.
+	Capabilities []string `json:"capabilities,omitempty"` // announce
+	// Generation is the runner generation controld granted in its accept,
+	// echoed on later events and results so a report from a superseded
+	// connection can be fenced by the store rather than by the socket it
+	// arrived on. Zero means "the connection's" (an old runner).
+	Generation uint64 `json:"generation,omitempty"` // event, result
+	// PlacementGeneration echoes, on an event about a session, the value the
+	// create that started its sandbox carried. Zero for an old runner or a
+	// session created before the runner learned it.
+	PlacementGeneration uint64 `json:"placement_generation,omitempty"` // event
 }
 
 // SessionInfo is one session's line in a FromRunner "announce": the stable
@@ -96,7 +112,11 @@ type ToRunner struct {
 	// "destroy" is the whole teardown (container + workspace);
 	// "remove_workspace" takes only the volume, for a session whose container
 	// the crash path already removed and whose workspace it deliberately kept.
-	Type    string  `json:"type"` // "create"|"destroy"|"remove_workspace"|"suspend"|"resume"|"snapshot"|"prepull"|"dial_attach"|"session_rpc"
+	//
+	// "accept" is controld's answer to an announce, sent before any command:
+	// the generation this connection acts under and the announced
+	// capabilities controld will schedule on.
+	Type    string  `json:"type"` // "accept"|"create"|"destroy"|"remove_workspace"|"suspend"|"resume"|"snapshot"|"prepull"|"dial_attach"|"session_rpc"
 	ReqID   uint64  `json:"req_id,omitempty"`
 	Session string  `json:"session,omitempty"`
 	Spec    *Spec   `json:"spec,omitempty"`   // create
@@ -115,6 +135,18 @@ type ToRunner struct {
 	// content-addressed by controld (rainier-env:<envID>-<setupHash>) so the
 	// same environment resolves to the same ref on every runner.
 	Ref string `json:"ref,omitempty"`
+	// PlacementGeneration is the session's placement generation on a create;
+	// the runner keeps it with the sandbox and echoes it on every event about
+	// that session.
+	PlacementGeneration uint64 `json:"placement_generation,omitempty"` // create
+	// Generation is the runner generation controld grants this connection in
+	// its accept. The runner stamps it on every result and event it sends
+	// afterwards.
+	Generation uint64 `json:"generation,omitempty"` // accept
+	// Capabilities are the announced capabilities controld accepted and will
+	// schedule on — the host's own spellings are not echoed, since they are
+	// not claims the runner made.
+	Capabilities []string `json:"capabilities,omitempty"` // accept
 }
 
 // RepoSpec is one repository a session clones at boot, fully resolved by

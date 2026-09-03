@@ -23,6 +23,15 @@
 - Go gates run serially. Use `GOCACHE=/private/tmp/rainier-scope-gocache`.
 - Commit messages follow the repository style (`feat:`/`refactor:` prefix, imperative subject, a body that says why) and end with the attribution trailers the reviewer supplies at commit time. Workers do not commit; they leave the tree ready and report.
 
+## Execution notes (as run, 2026-09-02/03)
+
+The plan was executed as rainier #35 (Task 1) and #38 (Tasks 2–5). Three decisions taken during review adjusted the text above and stand as the record:
+
+- **The `Store` interface was staged, not widened in Task 2.** Adding the accessors to `Store` in Task 2 would have broken `cmd/controld` before pgstore implemented them in Task 3. Task 2 introduced `HostStore` and a separate `Repositories` interface (the three accessors) and had `NewMemStore` return their union (`MemStore`); Task 4 made `Store` that union once both stores satisfied it; Task 5 dropped the old methods. `Store = HostStore + Repositories` is the final shape.
+- **The environment listing keeps its snapshot holder through the host lookup.** The Task 4 table's row for `handleListEnvironments` (mislabelled there as "the secret-in-use check") would, taken literally, have shown a snapshot's holder only while the snapshot is current; the wire has always shown the column stale or not. The listing reads each holder with the same `HostStore.SnapshotRunner` call the single view uses, so the two cannot disagree.
+- **Tasks ran in parallel where files were disjoint.** Task 2 → (Task 3 pgstore ‖ Task 5a, the test-seeding half of Task 5) → Task 4 → Task 5b (twin deletion, 0008, the empty allowlist). Task 4 was built on top of the migrated tests and re-pointed the tests' interception wrappers at the accessor path itself, since rewiring production onto the ports is what made the twin-typed overrides stop intercepting.
+- **The guard had been passing silently with an empty allowlist** under macOS bash 3.2 (`"${allowlist[@]}"` on an empty array); Task 5b fixed the expansion and the review proved the guard fires on an injected duplicate.
+
 ## What "mandatory workspace scope" means here
 
 A self-hosted installation is still exactly one workspace (`ws_self_hosted`) running exactly one pool (`pool_self_hosted`), as in O8. What changes is where that fact lives: today it is a constant the adapters *check* on the way into a single-tenant store; after this plan it is a column every tenant row *carries*, a key every query *requires*, and a composite every uniqueness constraint *includes*. The install workspace is provisioned by the migration and by `NewMemStore`, and `controld.New` re-asserts it (`EnsureWorkspace`) so a store from any source is usable. The hosted cell gets the same repository contract with real workspace IDs; it also gets `controlapp/repotest`, which is the proof its own store must pass.

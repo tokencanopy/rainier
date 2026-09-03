@@ -232,6 +232,48 @@ func TestCreateSession(t *testing.T) {
 		}
 	})
 
+	// The create and the event describing it are one unit of work through the
+	// whole stack: one HTTP call leaves exactly one event about the session,
+	// carrying the placement generation the stored row opened. This runs over
+	// the in-memory store because it is the store the rest of this file uses;
+	// that the same rows reach SQL inside one transaction is pgstore_test.go's
+	// assertion, not this one's.
+	t.Run("the create and its event are one committed unit", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, tok := loginUser(t, st, "alice", "member")
+
+		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", tok,
+			map[string]any{"name": "dev1"}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202; body=%s", resp.StatusCode, raw)
+		}
+		var body sessionEnvelope
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+
+		var about []control.Event
+		for _, e := range st.Events() {
+			if e.Resource.ID == body.Session.ID {
+				about = append(about, e)
+			}
+		}
+		if len(about) != 1 {
+			t.Fatalf("recorded %d events about the session, want exactly 1", len(about))
+		}
+		ev := about[0]
+		if ev.Action != control.ActionCreate || ev.Resource.Kind != control.ResourceSession {
+			t.Errorf("event = %s %s, want create session", ev.Action, ev.Resource.Kind)
+		}
+		if ev.WorkspaceID != installWorkspace || ev.Resource.WorkspaceID != installWorkspace {
+			t.Errorf("event workspace = %q/%q, want %q", ev.WorkspaceID, ev.Resource.WorkspaceID, installWorkspace)
+		}
+		if ev.PlacementGeneration != 1 {
+			t.Errorf("placement generation = %d, want 1 (the generation the create opened)", ev.PlacementGeneration)
+		}
+	})
+
 	t.Run("unknown field is 400 invalid_request", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		_, tok := loginUser(t, st, "alice", "member")
@@ -470,6 +512,9 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		}
 	})
 
+	// D16: the image a session runs is decided at placement, where the
+	// holder is known. The create answers with the environment's image; the
+	// placement onto vm1, which holds the snapshot, resolves it to the ref.
 	t.Run("a current cache dispatches the snapshot with no setup", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
 		env := seedEnv(t, st, control.Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
@@ -477,8 +522,8 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		cacheEnvSnapshot(t, st, env, ref, "vm1")
 
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "e4", "environment": "cached"})
-		if row := getSession(t, st, got.ID); row.Spec.Image != ref {
-			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.Spec.Image, ref)
+		if got.Image != "env-img:1" {
+			t.Errorf("the created session's view shows image %q, want the environment's env-img:1 until it is placed", got.Image)
 		}
 		spec := nextCreate(t, f).Spec
 		if spec.Image != ref {
@@ -488,20 +533,18 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 			t.Errorf("spec setup = %q/%d, want none — the cached image IS the finished setup",
 				spec.Setup, spec.SetupTimeoutSec)
 		}
+		// The create is out, so the placement that resolved it has committed.
+		if row := getSession(t, st, got.ID); row.Spec.Image != ref {
+			t.Errorf("stored resolved_image = %q, want the snapshot %q once placed on its holder", row.Spec.Image, ref)
+		}
 	})
 
-	// D3: a current cache is the image the session runs, whoever holds it and
-	// whatever room they have. The cache is a per-runner local image, not a
-	// registry, so the affinity that used to be a fallback ("rebuild from the
-	// plain image anywhere") became a placement pin instead: the environment
-	// carries the capability snapshot:<runner> and the session waits for that
-	// runner rather than booting a different image somewhere else.
-	//
-	// Both halves are asserted: the image the create resolves to, and where
-	// the scheduler will (not) put it. The other half of the pin — a create
-	// dispatched to the holder even when a roomier runner is standing by — is
-	// sched_test.go's TestCacheTiebreakPrefersTheSnapshotHolder.
-	t.Run("a cache whose holder has no free slot still resolves to the snapshot", func(t *testing.T) {
+	// D17 restores the pre-O8 rule O8's D3 traded away: the cache is a
+	// per-runner local image, not a registry, so a holder that cannot take
+	// the session right now is not a cache hit at all — the session boots the
+	// environment's image and rebuilds its setup somewhere that has room. A
+	// cache is a head start, never a pin.
+	t.Run("a cache whose holder has no free slot falls back to image and setup", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		joinRunner(t, s, ts, runnerScript{Name: "vm1", Used: 1, Total: 1}) // the holder, full
 		f2 := joinRunner(t, s, ts, runnerScript{Name: "vm2", Total: 2})
@@ -513,40 +556,28 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		cacheEnvSnapshot(t, st, env, ref, "vm1")
 
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "e5", "environment": "cached"})
-		if row := getSession(t, st, got.ID); row.Spec.Image != ref {
-			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.Spec.Image, ref)
+		cmd := nextCreate(t, f2)
+		if cmd.Spec.Image != "env-img:1" || cmd.Spec.Setup != "echo hi" {
+			t.Fatalf("spec = %+v, want the plain image rebuilt with its setup on vm2", cmd.Spec)
 		}
-		// D3, the placement half: vm2 has two free slots and is never
-		// offered the session, because the image it would boot exists only
-		// on vm1. The session waits for vm1 instead.
-		time.Sleep(150 * time.Millisecond)
-		if row := getSession(t, st, got.ID); row.State != control.StateQueued || row.RunnerID != "" {
-			t.Fatalf("session = %q on %q, want still queued and unplaced (pinned to the full holder)", row.State, row.RunnerID)
+		if row := getSession(t, st, got.ID); row.Spec.Image != "env-img:1" {
+			t.Errorf("stored resolved_image = %q, want the plain image", row.Spec.Image)
 		}
-		wantNothingQueued(t, s, f2)
 	})
 
-	t.Run("a cache whose holder is disconnected still resolves to the snapshot", func(t *testing.T) {
-		s, st, ts := newTestControld(t)
-		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
-		startRun(t, s)
-		_, tok := loginUser(t, st, "alice", "member")
-
-		const ref = "rainier-env:cached-0123456789ab"
+	t.Run("a cache whose holder is disconnected falls back to image and setup", func(t *testing.T) {
+		st, ts, f, tok := oneRunnerFleet(t)
 		env := seedEnv(t, st, control.Environment{Name: "cached", Image: "env-img:1", Setup: "echo hi"})
-		cacheEnvSnapshot(t, st, env, ref, "vm-gone")
+		cacheEnvSnapshot(t, st, env, "rainier-env:cached-0123456789ab", "vm-gone")
 
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "e6", "environment": "cached"})
-		if row := getSession(t, st, got.ID); row.Spec.Image != ref {
-			t.Errorf("stored resolved_image = %q, want the snapshot %q", row.Spec.Image, ref)
+		spec := nextCreate(t, f).Spec
+		if spec.Image != "env-img:1" || spec.Setup != "echo hi" {
+			t.Fatalf("spec = %+v, want the plain image rebuilt with its setup", spec)
 		}
-		// D3 again, with the holder absent rather than full: no connected
-		// runner advertises snapshot:vm-gone, so nothing is placed at all.
-		time.Sleep(150 * time.Millisecond)
-		if row := getSession(t, st, got.ID); row.State != control.StateQueued || row.RunnerID != "" {
-			t.Fatalf("session = %q on %q, want still queued and unplaced (its holder is gone)", row.State, row.RunnerID)
+		if row := getSession(t, st, got.ID); row.Spec.Image != "env-img:1" {
+			t.Errorf("stored resolved_image = %q, want the plain image", row.Spec.Image)
 		}
-		wantNothingQueued(t, s, f)
 	})
 
 	t.Run("a snapshot built from superseded setup is not used", func(t *testing.T) {
@@ -1656,6 +1687,7 @@ func TestDeleteSession(t *testing.T) {
 		// waiting for another reconnect would leave capacity occupied forever.
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Used: 1, Total: 4,
 			Sessions: []runner.SessionInfo{{ID: id, State: "running"}}})
+		drainAccept(t, f)
 		first := f.nextCmd(t)
 		if first.Type != "destroy" || first.Session != id || first.ReqID == 0 {
 			t.Fatalf("first command = %+v, want tracked destroy of %s", first, id)
@@ -3259,7 +3291,7 @@ func TestCreateEnvironment(t *testing.T) {
 		}
 		assertKeySet(t, string(outer["environment"]),
 			"id", "name", "image", "setup", "setup_hash", "init", "init_timeout_sec", "egress_allow", "secret_refs",
-			"connectors", "placement", "setup_timeout_sec", "snapshot_ref", "snapshot_runner",
+			"connectors", "placement", "capabilities", "setup_timeout_sec", "snapshot_ref", "snapshot_runner",
 			"snapshot_hash", "created_at", "updated_at")
 	})
 
@@ -3525,7 +3557,7 @@ func TestListEnvironments(t *testing.T) {
 		}
 		assertKeySet(t, string(arr[0]),
 			"id", "name", "image", "setup", "setup_hash", "init", "init_timeout_sec", "egress_allow", "secret_refs",
-			"connectors", "placement", "setup_timeout_sec", "snapshot_ref", "snapshot_runner",
+			"connectors", "placement", "capabilities", "setup_timeout_sec", "snapshot_ref", "snapshot_runner",
 			"snapshot_hash", "created_at", "updated_at")
 	})
 
@@ -4234,6 +4266,7 @@ func TestCreateDurableBeforeDispatch(t *testing.T) {
 			t.Fatalf("CreateSession never recorded a commit time for %s", id)
 		}
 
+		drainAccept(t, f)
 		cmd := f.nextCmd(t)
 		dispatchAt := time.Now()
 		if cmd.Type != "create" || cmd.Session != id {
@@ -4263,6 +4296,7 @@ func TestCreateDurableBeforeDispatch(t *testing.T) {
 		}
 		id := body.Session.ID
 
+		drainAccept(t, f)
 		cmd := f.nextCmd(t) // reaches the runner; never answered
 		if cmd.Type != "create" || cmd.Session != id {
 			t.Fatalf("got %+v, want create of %s", cmd, id)
@@ -4276,4 +4310,109 @@ func TestCreateDurableBeforeDispatch(t *testing.T) {
 			t.Fatalf("state = %q, want creating or queued (never lost)", got.State)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// environments: portable capabilities (plan 8, D18)
+// ---------------------------------------------------------------------------
+
+// TestEnvironmentCapabilities pins the field an operator uses to say what a
+// runner must be able to do before this environment's sessions land on it:
+// it round-trips through create, get and update, renders as [] rather than
+// null when there is none, and is validated by the same token rule a runner's
+// own announced capabilities are.
+func TestEnvironmentCapabilities(t *testing.T) {
+	t.Run("round-trips through create, get and update", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+
+		created := createEnv(t, ts, adminTok, envCreateBody("dev", map[string]any{
+			"capabilities": []string{"gpu", "docker.rootless"},
+		}))
+		if !slices.Equal(created.Capabilities, []string{"gpu", "docker.rootless"}) {
+			t.Fatalf("created capabilities = %v, want [gpu docker.rootless]", created.Capabilities)
+		}
+		if got := getEnv(t, ts, adminTok, created.ID); !slices.Equal(got.Capabilities, created.Capabilities) {
+			t.Fatalf("read back = %v, want %v", got.Capabilities, created.Capabilities)
+		}
+
+		resp := doJSON(t, ts, http.MethodPatch, "/v0/environments/"+created.ID, adminTok,
+			map[string]any{"capabilities": []string{"gpu"}}, nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("PATCH status = %d, want 200; body=%s", resp.StatusCode, raw)
+		}
+		if got := getEnv(t, ts, adminTok, created.ID); !slices.Equal(got.Capabilities, []string{"gpu"}) {
+			t.Fatalf("after the patch = %v, want [gpu]", got.Capabilities)
+		}
+
+		// The pin and the portable requirements are independent fields: a
+		// patch that names one must leave the other exactly as it was.
+		resp = doJSON(t, ts, http.MethodPatch, "/v0/environments/"+created.ID, adminTok,
+			map[string]any{"placement": "vm1"}, nil)
+		readBody(t, resp)
+		after := getEnv(t, ts, adminTok, created.ID)
+		if after.Placement != "vm1" || !slices.Equal(after.Capabilities, []string{"gpu"}) {
+			t.Fatalf("placement/capabilities = %q/%v, want vm1/[gpu]", after.Placement, after.Capabilities)
+		}
+	})
+
+	t.Run("an environment with none renders [] and never null", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doJSON(t, ts, http.MethodPost, "/v0/environments", adminTok, envCreateBody("dev", nil), nil)
+		raw := readBody(t, resp)
+		var outer map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(raw), &outer); err != nil {
+			t.Fatalf("decode: %v; body=%s", err, raw)
+		}
+		var env map[string]json.RawMessage
+		if err := json.Unmarshal(outer["environment"], &env); err != nil {
+			t.Fatalf("decode environment: %v", err)
+		}
+		if string(env["capabilities"]) != "[]" {
+			t.Fatalf("capabilities = %s, want []", env["capabilities"])
+		}
+	})
+
+	t.Run("a capability that is not a token is 400", func(t *testing.T) {
+		_, st, ts := newTestControld(t)
+		_, adminTok := loginUser(t, st, "root", "admin")
+		resp := doJSON(t, ts, http.MethodPost, "/v0/environments", adminTok,
+			envCreateBody("dev", map[string]any{"capabilities": []string{"GPU"}}), nil)
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, raw)
+		}
+		if !strings.Contains(raw, "capabilities") {
+			t.Fatalf("body = %s, want it to name the capabilities field", raw)
+		}
+	})
+}
+
+// TestQueueReasonNamesAMissingCapability: a session that cannot be placed
+// because no connected runner claims what its environment requires says so,
+// naming the first requirement nothing in the fleet advertises. The pinned
+// runner's own reason keeps precedence — a pin is the more specific answer.
+func TestQueueReasonNamesAMissingCapability(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	_, adminTok := loginUser(t, st, "root", "admin")
+	joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+
+	env := createEnv(t, ts, adminTok, envCreateBody("gpu-env", map[string]any{
+		"capabilities": []string{"gpu"},
+	}))
+	owner, tok := loginUser(t, st, "alice", "member")
+	seedSession(t, st, control.Session{ID: "sess_wants_gpu", CreatorID: control.ActorID(owner.ID),
+		State: control.StateQueued, EnvironmentID: control.EnvironmentID(env.ID)})
+
+	resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_wants_gpu", tok, nil, nil)
+	raw := readBody(t, resp)
+	var body sessionEnvelope
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, raw)
+	}
+	if got, want := body.Session.QueueReason, "waiting for a runner with capability gpu"; got != want {
+		t.Fatalf("queue_reason = %q, want %q", got, want)
+	}
 }

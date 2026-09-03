@@ -37,9 +37,9 @@ type SessionOptions struct {
 	Wake         func(control.PoolID)
 	Fleet        control.FleetRepository
 	Transport    control.RunnerTransport
-	// UnitOfWork is the host's atomicity. The service holds it so a command's
-	// mutation and the event describing it can commit together; nothing in
-	// this task opens a unit yet.
+	// UnitOfWork is the host's atomicity: every command's mutation and the
+	// event describing it run inside one Run, so they commit together or not
+	// at all. Wake is called only after that unit commits.
 	UnitOfWork control.UnitOfWork
 }
 
@@ -85,8 +85,9 @@ func NewSessionService(o SessionOptions) (*SessionService, error) {
 
 // CreateSession authorizes the create, replays a matching idempotency key when
 // one exists, resolves the environment within the authoritative workspace,
-// selects the eligible pool with the most free capacity, stores the queued
-// row, records one event, and only then wakes the chosen pool.
+// selects the eligible pool with the most free capacity, and stores the
+// queued row and its event in one unit of work, waking the chosen pool only
+// once that unit has committed.
 func (s *SessionService) CreateSession(ctx context.Context, scope control.Scope, cmd control.CreateSession) (control.Session, error) {
 	if err := scope.Validate(); err != nil {
 		return control.Session{}, control.ErrInvalid
@@ -156,19 +157,28 @@ func (s *SessionService) CreateSession(ctx context.Context, scope control.Scope,
 		LastEventAt:         now,
 	}
 
-	stored, err := s.sessions.CreateSession(ctx, scope.WorkspaceID, row)
-	if err != nil {
-		switch {
-		case errors.Is(err, control.ErrConflict):
-			return control.Session{}, control.ErrConflict
-		case errors.Is(err, control.ErrNotFound):
-			return control.Session{}, control.ErrNotFound
-		default:
-			return control.Session{}, control.ErrUnavailable
+	// The row and the event describing it are one fact: they commit together
+	// or neither of them does. The scheduler is woken only after that unit
+	// commits, so it never chases a session the store does not have.
+	var stored control.Session
+	if err := s.uow.Run(ctx, func(ctx context.Context) error {
+		var err error
+		stored, err = s.sessions.CreateSession(ctx, scope.WorkspaceID, row)
+		if err != nil {
+			switch {
+			case errors.Is(err, control.ErrConflict):
+				return control.ErrConflict
+			case errors.Is(err, control.ErrNotFound):
+				return control.ErrNotFound
+			default:
+				return control.ErrUnavailable
+			}
 		}
-	}
-
-	if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionCreate, sessionResource(stored)); err != nil {
+		// The generation the STORED row carries: a create opens the session's
+		// first placement generation.
+		return recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionCreate,
+			sessionResource(stored), stored.PlacementGeneration)
+	}); err != nil {
 		return control.Session{}, err
 	}
 	s.wake(stored.PoolID)
@@ -223,14 +233,16 @@ func portableSpecFor(cmd control.CreateSession, env control.Environment) control
 		spec.EgressAllow = cloneStrings(cmd.Spec.EgressAllow)
 		return spec
 	}
-	switch {
-	case cmd.Spec.Image != "":
+	if cmd.Spec.Image != "" {
 		// An override boots its own image. The snapshot was built from the
 		// environment's image and setup, so it cannot stand in for this one.
 		spec.Image = cmd.Spec.Image
-	case runsCachedSnapshot(env):
-		spec.Image = env.Snapshot.Ref
-	default:
+	} else {
+		// Never the snapshot ref, however current the cache is: a create does
+		// not know where that checkpoint can boot, and a stored ref no runner
+		// with room can resolve is a session pinned to one machine. The
+		// placement asks the host's CheckpointLocator and writes back the
+		// image it resolved (control.TransitionOpts.Image).
 		spec.Image = env.Image
 	}
 	spec.EgressAllow = unionHosts(env.EgressAllow, cmd.Spec.EgressAllow)
@@ -238,7 +250,8 @@ func portableSpecFor(cmd control.CreateSession, env control.Environment) control
 }
 
 // runsCachedSnapshot reports whether env's cached snapshot is current and
-// therefore the image a session from it should boot.
+// therefore the image a session from it should boot where that snapshot can
+// be booted. The scheduler asks; a create never does.
 func runsCachedSnapshot(env control.Environment) bool {
 	return env.Snapshot.Ref != "" && env.SnapshotHash == env.SetupHash
 }
@@ -296,21 +309,30 @@ func sessionResource(row control.Session) control.Resource {
 	}
 }
 
-// recordEvent records one provider-neutral event after a successful mutation.
-// An event-recording failure maps to ErrUnavailable while the persisted row
-// remains authoritative.
-func recordEvent(ctx context.Context, ids control.IDGenerator, events control.EventRecorder, clock control.Clock, scope control.Scope, action control.Action, res control.Resource) error {
+// recordEvent records one provider-neutral event for a mutation made in the
+// same unit of work, on the ctx that unit handed it — the event and the
+// mutation it describes commit together or not at all. An event-recording
+// failure maps to ErrUnavailable, which fails the unit and rolls the mutation
+// back with it.
+//
+// placementGeneration is the session placement generation the event happened
+// under, as the row holds it AFTER the mutation, so usage is attributed to
+// exactly one generation; it is zero for an event about any other resource
+// (an environment has no placement).
+func recordEvent(ctx context.Context, ids control.IDGenerator, events control.EventRecorder, clock control.Clock,
+	scope control.Scope, action control.Action, res control.Resource, placementGeneration uint64) error {
 	id := ids.NewEventID()
 	if id == "" {
 		return control.ErrUnavailable
 	}
 	if err := events.Record(ctx, control.Event{
-		ID:          id,
-		WorkspaceID: scope.WorkspaceID,
-		ActorID:     scope.Actor.ID,
-		Action:      action,
-		Resource:    res,
-		At:          clock.Now(),
+		ID:                  id,
+		WorkspaceID:         scope.WorkspaceID,
+		ActorID:             scope.Actor.ID,
+		Action:              action,
+		Resource:            res,
+		At:                  clock.Now(),
+		PlacementGeneration: placementGeneration,
 	}); err != nil {
 		return control.ErrUnavailable
 	}
@@ -422,14 +444,20 @@ func (s *SessionService) DeleteSession(ctx context.Context, scope control.Scope,
 	case row.State == control.StateCreating:
 		return control.ErrConflict
 	case row.State == control.StateQueued:
-		if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, []control.SessionState{control.StateQueued}, control.StateCanceled, control.TransitionOpts{}); err != nil {
-			if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
-				return control.ErrUnavailable
+		if err := s.uow.Run(ctx, func(ctx context.Context) error {
+			if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, []control.SessionState{control.StateQueued}, control.StateCanceled, control.TransitionOpts{}); err != nil {
+				if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
+					return control.ErrUnavailable
+				}
+				// The row moved on or is gone: there is no mutation of ours
+				// to describe, so the unit commits nothing and succeeds.
+				return nil
 			}
-			s.wake(row.PoolID)
-			return nil
-		}
-		if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionDelete, sessionResource(row)); err != nil {
+			// A cancel names no runner, so the row's generation is what it
+			// was when we read it.
+			return recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionDelete,
+				sessionResource(row), row.PlacementGeneration)
+		}); err != nil {
 			return err
 		}
 		s.wake(row.PoolID)
@@ -452,14 +480,19 @@ func (s *SessionService) DeleteSession(ctx context.Context, scope control.Scope,
 	if row.State == control.StateFailed {
 		from = []control.SessionState{control.StateFailed}
 	}
-	if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, from, control.StateDestroyed, control.TransitionOpts{}); err != nil {
-		if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
-			return control.ErrUnavailable
+	// The runner dispatch above is a transport call, not a store write, and
+	// stays outside the unit; the store transition and its event are inside
+	// one.
+	if err := s.uow.Run(ctx, func(ctx context.Context) error {
+		if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, from, control.StateDestroyed, control.TransitionOpts{}); err != nil {
+			if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
+				return control.ErrUnavailable
+			}
+			return nil
 		}
-		s.wake(row.PoolID)
-		return nil
-	}
-	if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionDelete, sessionResource(row)); err != nil {
+		return recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionDelete,
+			sessionResource(row), row.PlacementGeneration)
+	}); err != nil {
 		return err
 	}
 	s.wake(row.PoolID)
@@ -495,14 +528,18 @@ func (s *SessionService) SuspendSession(ctx context.Context, scope control.Scope
 	if !cmd.Warm {
 		to = control.StateSuspendedCold
 	}
-	if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, []control.SessionState{control.StateRunning}, to, control.TransitionOpts{}); err != nil {
-		if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
-			return control.Session{}, control.ErrUnavailable
+	if err := s.uow.Run(ctx, func(ctx context.Context) error {
+		if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, []control.SessionState{control.StateRunning}, to, control.TransitionOpts{}); err != nil {
+			if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
+				return control.ErrUnavailable
+			}
+			return nil
 		}
-		s.wake(row.PoolID)
-		return s.authoritative(ctx, scope.WorkspaceID, cmd.ID)
-	}
-	if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionSuspend, sessionResource(row)); err != nil {
+		// A suspend names no runner: the sandbox stays where it is, so the
+		// row's placement generation is the one we read.
+		return recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionSuspend,
+			sessionResource(row), row.PlacementGeneration)
+	}); err != nil {
 		return control.Session{}, err
 	}
 	s.wake(row.PoolID)
@@ -552,14 +589,28 @@ func (s *SessionService) ResumeSession(ctx context.Context, scope control.Scope,
 	if row.State == control.StateSuspendedCold {
 		opts.RunnerID = &row.RunnerID
 	}
-	if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, []control.SessionState{row.State}, control.StateRunning, opts); err != nil {
-		if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
-			return control.Session{}, control.ErrUnavailable
+	if err := s.uow.Run(ctx, func(ctx context.Context) error {
+		if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, []control.SessionState{row.State}, control.StateRunning, opts); err != nil {
+			if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
+				return control.ErrUnavailable
+			}
+			return nil
 		}
-		s.wake(row.PoolID)
-		return s.authoritative(ctx, scope.WorkspaceID, cmd.ID)
-	}
-	if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionResume, sessionResource(row)); err != nil {
+		// A cold resume's transition named a runner, so the repository opened
+		// a new placement generation for the sandbox it starts. The event
+		// belongs to the generation the row has AFTER the mutation, which
+		// only a re-read inside this same unit knows.
+		recorded := row
+		if opts.RunnerID != nil {
+			cur, err := s.sessions.GetSession(ctx, scope.WorkspaceID, cmd.ID)
+			if err != nil {
+				return control.ErrUnavailable
+			}
+			recorded = cur
+		}
+		return recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionResume,
+			sessionResource(recorded), recorded.PlacementGeneration)
+	}); err != nil {
 		return control.Session{}, err
 	}
 	s.wake(row.PoolID)
@@ -617,7 +668,13 @@ func (s *SessionService) SnapshotSession(ctx context.Context, scope control.Scop
 	if res.Detail == "" {
 		return control.Checkpoint{}, control.ErrUnavailable
 	}
-	if err := recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionSnapshot, sessionResource(row)); err != nil {
+	// A snapshot's only write is its event; it still commits as a unit, so a
+	// host that cannot commit answers ErrUnavailable rather than handing back
+	// a checkpoint no history records.
+	if err := s.uow.Run(ctx, func(ctx context.Context) error {
+		return recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionSnapshot,
+			sessionResource(row), row.PlacementGeneration)
+	}); err != nil {
 		return control.Checkpoint{}, err
 	}
 	return control.Checkpoint{Ref: res.Detail, Format: "rainier-runner-v0", Capabilities: []string{"workspace"}}, nil

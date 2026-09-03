@@ -1,10 +1,7 @@
 package controld
 
 import (
-	"bytes"
 	"context"
-	"errors"
-	"log"
 	"strings"
 	"testing"
 	"time"
@@ -56,7 +53,7 @@ func TestEligiblePoolsSumsConnectedRunners(t *testing.T) {
 	if got[0].CapacityUsed != 3 || got[0].CapacityTotal != 6 {
 		t.Fatalf("capacity = %d/%d, want 3/6", got[0].CapacityUsed, got[0].CapacityTotal)
 	}
-	want := []string{"placement:runner-a", "snapshot:runner-a", "placement:runner-b", "snapshot:runner-b"}
+	want := []string{"placement:runner-a", "placement:runner-b"}
 	if strings.Join(got[0].Capabilities, ",") != strings.Join(want, ",") {
 		t.Fatalf("capabilities = %v, want %v", got[0].Capabilities, want)
 	}
@@ -92,68 +89,12 @@ func TestIDGeneratorMintsDistinctPrefixedIDs(t *testing.T) {
 	}
 }
 
-// The recorder is the one place an application event meets a log, so it is
-// also the place a session name, image, or error could leak into one. It
-// logs three opaque fields and nothing else.
-func TestLogRecorderLogsOnlyActionKindAndID(t *testing.T) {
-	var buf bytes.Buffer
-	out, flags := log.Writer(), log.Flags()
-	log.SetOutput(&buf)
-	log.SetFlags(0)
-	t.Cleanup(func() {
-		log.SetOutput(out)
-		log.SetFlags(flags)
-	})
-
-	err := logRecorder{}.Record(context.Background(), control.Event{
-		ID:          "evt_example",
-		WorkspaceID: installWorkspace,
-		ActorID:     "usr_example",
-		Action:      control.ActionCreate,
-		Resource: control.Resource{
-			Kind: control.ResourceSession, WorkspaceID: installWorkspace,
-			ID: "sess_example", CreatorID: "usr_example",
-		},
-		At:    time.Now(),
-		Usage: control.Usage{AgentTokenCount: 42},
-	})
-	if err != nil {
-		t.Fatalf("Record must never fail: %v", err)
-	}
-	line := strings.TrimSpace(buf.String())
-	if line != "controld: event create session sess_example" {
-		t.Fatalf("logged %q", line)
-	}
-}
-
 func TestSystemClockReportsWallTime(t *testing.T) {
 	before := time.Now()
 	got := systemClock{}.Now()
 	after := time.Now()
 	if got.Before(before) || got.After(after) {
 		t.Fatalf("Now() = %v, outside [%v, %v]", got, before, after)
-	}
-}
-
-// A self-hosted installation has no transactions to open: the unit of work is
-// the closure itself, run on the context it was handed, and fn's error is the
-// answer unchanged. That is what the port permits a host without transactions
-// to do, and Task 2 replaces it with the store's real one.
-func TestDirectUnitOfWorkRunsTheClosureOnTheSameContext(t *testing.T) {
-	ctx := context.WithValue(context.Background(), userContextKey{}, User{ID: "usr_example"})
-	var inner context.Context
-	if err := (directUnitOfWork{}).Run(ctx, func(c context.Context) error {
-		inner = c
-		return nil
-	}); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if inner != ctx {
-		t.Fatal("Run handed fn a context of its own; a host without transactions carries nothing")
-	}
-	boom := errors.New("safe context only")
-	if err := (directUnitOfWork{}).Run(ctx, func(context.Context) error { return boom }); !errors.Is(err, boom) {
-		t.Fatalf("Run returned %v, want fn's own error unchanged", err)
 	}
 }
 

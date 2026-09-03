@@ -141,6 +141,10 @@ type sessionRenderer struct {
 	// once per request and only if some queued session's pin asks for it.
 	free     map[string]int
 	freeDone bool
+	// caps is the union of every connected runner's capabilities, on the same
+	// once-per-request terms and for the same reason.
+	caps     map[string]bool
+	capsDone bool
 }
 
 // renderer returns a fresh per-request renderer. The scope it reads
@@ -190,22 +194,87 @@ func (r *sessionRenderer) environment(id string) *control.Environment {
 	return env
 }
 
-// queueReason explains a queued session its environment's placement pin is
-// holding back: the pinned runner is not connected to this replica, or has no
-// free slot, and until one of those changes the scheduler will keep passing
+// queueReason explains a queued session its environment's requirements are
+// holding back: the pinned runner is not connected to this replica or has no
+// free slot, or no connected runner claims a capability the environment
+// requires — and until one of those changes the scheduler will keep passing
 // this session over (design §4.6). Everything else — a session that is not
-// queued, an unpinned environment, a pin that could be honored right now —
-// has no reason to give, and says nothing rather than guessing.
+// queued, an environment that requires nothing, requirements that could be
+// honored right now — has no reason to give, and says nothing rather than
+// guessing.
 //
-// The pin is read off the environment's portable requirements: control names
-// no runner, so an operator's `placement` is carried as the capability
-// "placement:<runner>" (adapt_scope.go).
+// The pin answers first when both apply: it names one runner, which is the
+// more specific and more actionable of the two answers. Both are read off the
+// environment's portable requirements: control names no runner, so an
+// operator's `placement` is carried as the capability "placement:<runner>"
+// (adapt_scope.go), and everything without a host prefix beside it is a
+// capability a runner has to advertise.
 func (r *sessionRenderer) queueReason(row control.Session, env control.Environment) string {
-	pin := capabilityValue(env.Requirements.Capabilities, placementCapabilityPrefix)
-	if row.State != control.StateQueued || pin == "" || r.runnerHasRoom(pin) {
+	if row.State != control.StateQueued {
 		return ""
 	}
-	return "waiting for runner " + pin
+	pin := capabilityValue(env.Requirements.Capabilities, placementCapabilityPrefix)
+	if pin != "" && !r.runnerHasRoom(pin) {
+		return "waiting for runner " + pin
+	}
+	if want := r.missingCapability(env.Requirements.Capabilities); want != "" {
+		return "waiting for a runner with capability " + want
+	}
+	return ""
+}
+
+// missingCapability returns the first portable capability in reqs that no
+// connected runner advertises, or "" when the fleet covers them all. It
+// answers in requirement order because that is the order the operator wrote,
+// and it is the first unmet one that is worth naming — a list of everything
+// missing tells an operator nothing more about what to do next.
+//
+// The host's own spellings are skipped: a pin has its own, better sentence
+// above, and a snapshot affinity is never a reason to queue (the scheduler
+// treats it as a preference, not a requirement).
+func (r *sessionRenderer) missingCapability(reqs []string) string {
+	wanted := portableCapabilities(reqs)
+	if len(wanted) == 0 {
+		return ""
+	}
+	advertised := r.fleetCapabilities()
+	for _, c := range wanted {
+		if !advertised[c] {
+			return c
+		}
+	}
+	return ""
+}
+
+// fleetCapabilities is the union of what every CONNECTED runner claims,
+// computed at most once per request. Connected is the same filter the
+// scheduler places under, so the reason a session is given and the reason it
+// is actually being passed over are the same fact.
+//
+// A store that cannot answer yields an empty set, which renders the
+// waiting-for-a-capability line. That is the safer way to be wrong, for the
+// same reason freeSlots gives: it explains a session that is in fact about to
+// be placed, rather than silently explaining nothing about one that is stuck.
+func (r *sessionRenderer) fleetCapabilities() map[string]bool {
+	if r.capsDone {
+		return r.caps
+	}
+	r.capsDone = true
+	r.caps = map[string]bool{}
+	rows, err := r.srv.st.Fleet().ListRunners(r.ctx, installPool)
+	if err != nil {
+		log.Printf("controld: rendering a session view: listing runners: %v", err)
+		return r.caps
+	}
+	for _, row := range rows {
+		if !row.Connected {
+			continue
+		}
+		for _, c := range row.Capabilities {
+			r.caps[c] = true
+		}
+	}
+	return r.caps
 }
 
 // runnerHasRoom reports whether name is connected to this replica AND has a
@@ -1088,6 +1157,7 @@ type environmentView struct {
 	SecretRefs      []string          `json:"secret_refs"`
 	Connectors      []json.RawMessage `json:"connectors"`
 	Placement       string            `json:"placement"`
+	Capabilities    []string          `json:"capabilities"`
 	SetupTimeoutSec int               `json:"setup_timeout_sec"`
 	SnapshotRef     string            `json:"snapshot_ref"`
 	SnapshotRunner  string            `json:"snapshot_runner"`
@@ -1111,6 +1181,9 @@ type environmentsEnvelope struct {
 // "placement:<runner>" (adapt_scope.go) and read back out of it here, and
 // `snapshot_runner` — which the control model does not carry at all — is
 // passed in by the handler, which read it off the store row for the view.
+// `capabilities` shares Requirements with the pin and is the rest of it: what
+// this environment needs a runner to be able to DO, with the host's own
+// spellings of WHERE (placement:, snapshot:) filtered back out.
 func environmentJSON(e control.Environment, snapshotRunner string) environmentView {
 	return environmentView{
 		ID:              string(e.ID),
@@ -1124,6 +1197,7 @@ func environmentJSON(e control.Environment, snapshotRunner string) environmentVi
 		SecretRefs:      emptyIfNil(e.SecretRefs),
 		Connectors:      connectorsJSON(e.Connectors),
 		Placement:       capabilityValue(e.Requirements.Capabilities, placementCapabilityPrefix),
+		Capabilities:    emptyIfNil(portableCapabilities(e.Requirements.Capabilities)),
 		SetupTimeoutSec: e.SetupTimeoutSec,
 		SnapshotRef:     e.Snapshot.Ref,
 		SnapshotRunner:  snapshotRunner,
@@ -1374,6 +1448,7 @@ type createEnvironmentRequest struct {
 	SecretRefs      []string        `json:"secret_refs,omitempty"`
 	Connectors      json.RawMessage `json:"connectors,omitempty"`
 	Placement       string          `json:"placement,omitempty"`
+	Capabilities    []string        `json:"capabilities,omitempty"`
 	SetupTimeoutSec int             `json:"setup_timeout_sec,omitempty"`
 }
 
@@ -1391,6 +1466,7 @@ type patchEnvironmentRequest struct {
 	SecretRefs      *[]string       `json:"secret_refs,omitempty"`
 	Connectors      json.RawMessage `json:"connectors,omitempty"`
 	Placement       *string         `json:"placement,omitempty"`
+	Capabilities    *[]string       `json:"capabilities,omitempty"`
 	SetupTimeoutSec *int            `json:"setup_timeout_sec,omitempty"`
 }
 
@@ -1474,15 +1550,21 @@ func (s *Server) snapshotRunnerOf(ctx context.Context, id control.EnvironmentID)
 	return string(holder)
 }
 
-// placementRequirements is the portable spelling of an operator's runner pin:
-// control.Environment names no runner, so `placement` round-trips through the
-// capability "placement:<runner>" (adapt_scope.go). An empty placement is no
-// capability at all rather than an empty one.
-func placementRequirements(placement string) control.Requirements {
-	if placement == "" {
-		return control.Requirements{}
+// environmentRequirements composes an environment's one requirements list out
+// of the two halves the wire keeps apart: the operator's runner pin, which
+// control.Environment cannot name directly and so round-trips through the
+// capability "placement:<runner>" (adapt_scope.go), and the portable
+// capabilities the operator asked for. The pin goes first, so the list reads
+// where-then-what, and environmentJSON takes the two halves back out by the
+// same rule. No pin and no capabilities is no requirements at all rather than
+// an empty list.
+func environmentRequirements(placement string, capabilities []string) control.Requirements {
+	var caps []string
+	if placement != "" {
+		caps = append(caps, placementCapabilityPrefix+placement)
 	}
-	return control.Requirements{Capabilities: []string{placementCapabilityPrefix + placement}}
+	caps = append(caps, capabilities...)
+	return control.Requirements{Capabilities: caps}
 }
 
 // handleCreateEnvironment serves POST /v0/environments (admin): validate the
@@ -1498,6 +1580,10 @@ func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request,
 	}
 	if bad := validateEnvironmentBasics(req.Name, req.Image, req.SetupTimeoutSec, req.InitTimeoutSec); bad != "" {
 		writeErr(w, http.StatusBadRequest, "invalid_request", bad)
+		return
+	}
+	if err := validateCapabilities("capabilities", req.Capabilities); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	conns, err := validateConnectors(req.Connectors)
@@ -1519,7 +1605,7 @@ func (s *Server) handleCreateEnvironment(w http.ResponseWriter, r *http.Request,
 		EgressAllow:     req.EgressAllow,
 		SecretRefs:      req.SecretRefs,
 		Connectors:      conns,
-		Requirements:    placementRequirements(req.Placement),
+		Requirements:    environmentRequirements(req.Placement, req.Capabilities),
 		SetupTimeoutSec: req.SetupTimeoutSec,
 	})
 	if err != nil {
@@ -1682,11 +1768,26 @@ func (s *Server) handleUpdateEnvironment(w http.ResponseWriter, r *http.Request,
 		}
 		cmd.SecretRefs = req.SecretRefs
 	}
-	// The pin is set only when the patch names it; leaving Requirements nil is
-	// what keeps an untouched placement (and the snapshot affinity beside it)
-	// exactly as the store has it.
-	if req.Placement != nil {
-		reqs := placementRequirements(*req.Placement)
+	// Requirements are one field on the row and two on the wire, so a patch
+	// that names either half is rebuilt from the merged pair — otherwise
+	// setting `capabilities` would erase a placement nobody asked to change.
+	// Naming neither leaves Requirements nil, which is what keeps an
+	// untouched placement (and the snapshot affinity beside it) exactly as
+	// the store has it.
+	if req.Placement != nil || req.Capabilities != nil {
+		placement := capabilityValue(cur.Requirements.Capabilities, placementCapabilityPrefix)
+		if req.Placement != nil {
+			placement = *req.Placement
+		}
+		capabilities := portableCapabilities(cur.Requirements.Capabilities)
+		if req.Capabilities != nil {
+			if err := validateCapabilities("capabilities", *req.Capabilities); err != nil {
+				writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
+				return
+			}
+			capabilities = *req.Capabilities
+		}
+		reqs := environmentRequirements(placement, capabilities)
 		cmd.Requirements = &reqs
 	}
 

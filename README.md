@@ -84,6 +84,7 @@ bin/rainier env create dev --image node:22 \
   --setup-file ./setup.sh --secret-ref GH_TOKEN \
   --egress registry.npmjs.org,github.com
 bin/rainier env ls                                      # name, id, image, cached
+bin/rainier env create gpu-dev --image node:22 --capability gpu   # only lands on a runner that announced gpu
 bin/rainier new --name box2 --env dev                   # ...starts from it
 ```
 

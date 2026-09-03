@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -104,6 +105,10 @@ type runnerScript struct {
 	Sessions []runner.SessionInfo
 	Used     int
 	Total    int
+	// Capabilities are the portable capabilities this fake claims on its
+	// announce. Empty is an old runner: it claims none, and controld
+	// registers only the two capabilities the host spells for its name.
+	Capabilities []string
 }
 
 // fakeRunner is a scripted runnerd: it dials /v0/runners/connect, writes one
@@ -148,7 +153,8 @@ func startFakeRunner(t *testing.T, ts *httptest.Server, sc runnerScript) *fakeRu
 		total: sc.Total,
 	}
 	t.Cleanup(f.close)
-	f.write(t, runner.FromRunner{Type: "announce", Proto: proto, Runner: sc.Name, Sessions: sc.Sessions})
+	f.write(t, runner.FromRunner{Type: "announce", Proto: proto, Runner: sc.Name, Sessions: sc.Sessions,
+		Capabilities: sc.Capabilities})
 	go f.readLoop()
 	return f
 }
@@ -233,6 +239,19 @@ func (f *fakeRunner) close() {
 	f.closeOnce.Do(func() { f.c.CloseNow() })
 }
 
+// drainAccept takes the accept controld sends every registered runner before
+// any command (D19) off the front of the command stream, so a fixture that
+// asserts on the FIRST command it is sent keeps asserting on a command. The
+// tests that care about the accept itself read it with nextCmd instead.
+func drainAccept(t *testing.T, f *fakeRunner) runner.ToRunner {
+	t.Helper()
+	cmd := f.nextCmd(t)
+	if cmd.Type != "accept" {
+		t.Fatalf("first message from controld = %+v, want an accept", cmd)
+	}
+	return cmd
+}
+
 // ghostSession is announced by tests that need a reconcile-finished signal:
 // controld's destroy for it is enqueued at the very end of reconcile, so
 // receiving that destroy proves reconcile has run to completion.
@@ -240,6 +259,7 @@ const ghostSession = "sess_reconcile_probe"
 
 func awaitReconciled(t *testing.T, f *fakeRunner) {
 	t.Helper()
+	drainAccept(t, f)
 	cmd := f.nextCmd(t)
 	if cmd.Type != "destroy" || cmd.Session != ghostSession {
 		t.Fatalf("reconcile probe: got %+v, want destroy of %s", cmd, ghostSession)
@@ -260,6 +280,7 @@ func joinRunner(t *testing.T, s *Server, ts *httptest.Server, sc runnerScript) *
 	sc.Sessions = append(append([]runner.SessionInfo{}, sc.Sessions...), runner.SessionInfo{ID: probe, State: "running"})
 	f := startFakeRunner(t, ts, sc)
 	waitConnected(t, s, sc.Name)
+	drainAccept(t, f)
 	cmd := f.nextCmd(t)
 	if cmd.Type != "destroy" || cmd.Session != probe {
 		t.Fatalf("reconcile probe on %s: got %+v, want destroy of %s", sc.Name, cmd, probe)
@@ -622,6 +643,7 @@ func TestReconcileTable(t *testing.T) {
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
 			Sessions: []runner.SessionInfo{{ID: id, State: "running"}}})
 
+		drainAccept(t, f)
 		cmd := f.nextCmd(t)
 		if cmd.Type != "destroy" || cmd.Session != id {
 			t.Fatalf("got %+v, want destroy of %s", cmd, id)
@@ -637,6 +659,7 @@ func TestReconcileTable(t *testing.T) {
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
 			Sessions: []runner.SessionInfo{{ID: "sess_ghost", State: "running"}}})
 
+		drainAccept(t, f)
 		cmd := f.nextCmd(t)
 		if cmd.Type != "destroy" || cmd.Session != "sess_ghost" {
 			t.Fatalf("got %+v, want destroy of sess_ghost", cmd)
@@ -654,6 +677,7 @@ func TestReconcileTable(t *testing.T) {
 		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
 			Sessions: []runner.SessionInfo{{ID: id, State: "running"}}})
 
+		drainAccept(t, f)
 		cmd := f.nextCmd(t)
 		if cmd.Type != "destroy" || cmd.Session != id {
 			t.Fatalf("got %+v, want destroy of %s", cmd, id)
@@ -693,6 +717,7 @@ func TestDispatchCorrelatesResults(t *testing.T) {
 	s, _, ts := newTestControld(t)
 	f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4})
 	waitConnected(t, s, "vm1")
+	drainAccept(t, f)
 
 	type outcome struct {
 		res runner.FromRunner
@@ -986,6 +1011,7 @@ func TestReconnectReplacesConn(t *testing.T) {
 		return nil
 	})
 
+	drainAccept(t, second)
 	errc := make(chan error, 1)
 	go func() {
 		_, err := s.transport.Dispatch(context.Background(), installPool, "vm1",
@@ -1891,4 +1917,169 @@ func TestRunnerGenerationFencesAStaleSocket(t *testing.T) {
 			t.Fatalf("error = %q, want %q", got.Error, "runner reported dead")
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// capability negotiation (plan 8, D19)
+// ---------------------------------------------------------------------------
+
+// TestAnnouncedCapabilities: what a runner claims about itself is validated,
+// unioned with the two capabilities the HOST spells for its name, persisted,
+// and acknowledged — the accept being the first thing that runner ever hears.
+func TestAnnouncedCapabilities(t *testing.T) {
+	t.Run("the announced set is unioned with the host's own and accepted first", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
+			Capabilities: []string{"gpu", "docker.rootless"}})
+		waitConnected(t, s, "vm1")
+
+		acc := f.nextCmd(t)
+		if acc.Type != "accept" {
+			t.Fatalf("first message = %+v, want an accept before any command", acc)
+		}
+		if acc.Generation != 1 {
+			t.Fatalf("accept Generation = %d, want 1", acc.Generation)
+		}
+		if !slices.Equal(acc.Capabilities, []string{"gpu", "docker.rootless"}) {
+			t.Fatalf("accept Capabilities = %v, want the announced pair", acc.Capabilities)
+		}
+
+		want := append(runnerCapabilities("vm1"), "gpu", "docker.rootless")
+		wantCapabilities := func(when string) {
+			t.Helper()
+			eventually(t, 3*time.Second, func() error {
+				rows, err := st.Fleet().ListRunners(context.Background(), installPool)
+				if err != nil {
+					return err
+				}
+				if len(rows) != 1 {
+					return fmt.Errorf("ListRunners = %+v, want 1 runner", rows)
+				}
+				if !slices.Equal(rows[0].Capabilities, want) {
+					return fmt.Errorf("%s: capabilities = %v, want %v", when, rows[0].Capabilities, want)
+				}
+				return nil
+			})
+		}
+		wantCapabilities("at registration")
+
+		// Capacity rides every message, and the heartbeat that carries it
+		// rewrites the runner's row: what the runner announced has to survive
+		// that write, or a fleet would forget it the moment it did any work.
+		wantEventHandled(t, st, f, "sess_heartbeat")
+		wantCapabilities("after a heartbeat")
+	})
+
+	for _, tc := range []struct {
+		name string
+		caps []string
+	}{
+		{"a host-prefixed capability is refused", []string{"placement:other"}},
+		{"a capability that is not a token is refused", []string{"GPU"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, st, ts := newTestControld(t)
+			f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4, Capabilities: tc.caps})
+
+			err := f.waitClosed(t)
+			var ce websocket.CloseError
+			if !errors.As(err, &ce) {
+				t.Fatalf("conn ended with %v, want a websocket close", err)
+			}
+			if !strings.Contains(ce.Reason, "registration refused") {
+				t.Fatalf("close reason = %q, want it to name a refused registration", ce.Reason)
+			}
+			rows, err := st.Fleet().ListRunners(context.Background(), installPool)
+			if err != nil {
+				t.Fatalf("ListRunners: %v", err)
+			}
+			for _, r := range rows {
+				if r.Connected {
+					t.Fatalf("a refused runner is in the fleet as connected: %+v", r)
+				}
+			}
+		})
+	}
+}
+
+// TestEventGenerationSource: an event says which generation it was produced
+// under, and that claim is what fences it. One that names a generation the
+// store has moved past is refused; one that names none is applied under the
+// connection's own, exactly as before this plan.
+func TestEventGenerationSource(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	joinRunner(t, s, ts, runnerScript{Name: "runner-a", Total: 4}) // generation 1
+	joinRunner(t, s, ts, runnerScript{Name: "runner-a", Total: 4}) // generation 2
+
+	live := newRunnerConn("runner-a", nil)
+	live.gen = 2
+
+	id := "sess_evgen"
+	seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateCreating, RunnerID: "runner-a"})
+
+	// The connection is current, but the message itself claims generation 1.
+	s.applyRunnerEvent(context.Background(), live,
+		runner.FromRunner{Type: "event", Session: id, State: "dead", Generation: 1})
+	if got := getSession(t, st, id); got.State != control.StateCreating {
+		t.Fatalf("state = %q, want still creating — an event claiming a superseded generation was applied", got.State)
+	}
+
+	// The same event carrying no generation is the old runner's message, and
+	// takes the connection's.
+	s.applyRunnerEvent(context.Background(), live,
+		runner.FromRunner{Type: "event", Session: id, State: "dead"})
+	wantState(t, st, id, control.StateDead)
+}
+
+// TestEventPlacementGenerationIsFenced: a report echoing the placement
+// generation its create carried is applied only while the session is still on
+// that placement. The session's own authority, beside the runner's.
+func TestEventPlacementGenerationIsFenced(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	joinRunner(t, s, ts, runnerScript{Name: "runner-a", Total: 4})
+
+	rc := newRunnerConn("runner-a", nil)
+	rc.gen = 1
+
+	id := "sess_pgfence"
+	row := seedSession(t, st, control.Session{ID: control.SessionID(id), State: control.StateCreating,
+		RunnerID: "runner-a", PlacementGeneration: 3})
+	if row.PlacementGeneration != 3 {
+		t.Fatalf("seeded row is at placement generation %d, want 3", row.PlacementGeneration)
+	}
+	// The session was requeued and placed again since this sandbox started,
+	// so the runner's create carried 2 while the row has moved to 3.
+	stale := uint64(2)
+
+	s.applyRunnerEvent(context.Background(), rc,
+		runner.FromRunner{Type: "event", Session: id, State: "dead", PlacementGeneration: stale})
+	if got := getSession(t, st, id); got.State != control.StateCreating {
+		t.Fatalf("state = %q, want still creating — an event from a superseded placement was applied", got.State)
+	}
+
+	s.applyRunnerEvent(context.Background(), rc,
+		runner.FromRunner{Type: "event", Session: id, State: "dead", PlacementGeneration: row.PlacementGeneration})
+	wantState(t, st, id, control.StateDead)
+}
+
+// TestCreateCarriesThePlacementGeneration: the create a placed session is
+// dispatched with names the generation that placement opened, so every event
+// the sandbox produces can be matched against the row.
+func TestCreateCarriesThePlacementGeneration(t *testing.T) {
+	s, st, ts := newTestControld(t)
+	startRun(t, s)
+	f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
+
+	id := "sess_pgcreate"
+	seedQueued(t, st, id, 0)
+	s.fleet.Wake(installPool)
+
+	cmd := nextCreate(t, f)
+	if cmd.Session != id {
+		t.Fatalf("create = %+v, want one for %s", cmd, id)
+	}
+	row := getSession(t, st, id)
+	if cmd.PlacementGeneration == 0 || cmd.PlacementGeneration != row.PlacementGeneration {
+		t.Fatalf("create PlacementGeneration = %d, want the row's %d", cmd.PlacementGeneration, row.PlacementGeneration)
+	}
 }

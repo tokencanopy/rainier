@@ -754,3 +754,179 @@ func TestCreateSpecSendsSetupUnlessTheRowBootsTheSnapshot(t *testing.T) {
 		})
 	}
 }
+
+// TestDispatchCreateCarriesThePlacementGeneration: the create tells the
+// runner which placement generation the sandbox it is about to start belongs
+// to, and the value is the row's AS PLACED — read back from the repository
+// after the transition that named the runner opened it, never the (already
+// one-behind) copy the caller was handed.
+func TestDispatchCreateCarriesThePlacementGeneration(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.st.seedRunner(fleetSeededRunner("vm1", 2, 0, true))
+	row := control.Session{
+		ID: "sess_pg", WorkspaceID: "ws_example", State: control.StateCreating,
+		PoolID: "pool_example", RunnerID: "vm1", PlacementGeneration: 3,
+		Spec: control.PortableSpec{Image: "img:latest"},
+	}
+	fx.st.seedSession(row)
+
+	// What drainPool holds after its Transition returns: the row as it was
+	// BEFORE the placement, one generation behind the store.
+	stale := row
+	stale.PlacementGeneration = 2
+	fx.service.dispatchCreate(context.Background(), "pool_example", stale, "vm1", nil)
+
+	dispatched := fx.transport.dispatchedCommands()
+	if len(dispatched) != 1 {
+		t.Fatalf("dispatched %d commands, want 1", len(dispatched))
+	}
+	if got := dispatched[0].PlacementGeneration; got != 3 {
+		t.Fatalf("create PlacementGeneration = %d, want 3 (the row as placed)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: portable checkpoint placement (D16, D17)
+// ---------------------------------------------------------------------------
+
+// fleetCachedEnv is the environment the placement cases share: a current
+// snapshot (SnapshotHash == SetupHash) built from image and setup.
+func fleetCachedEnv() control.Environment {
+	return control.Environment{
+		ID: "env_example", WorkspaceID: "ws_example", Name: "cached",
+		Image: "env-img:1", Setup: "echo hi", SetupHash: "h1", SnapshotHash: "h1",
+		Snapshot: control.Checkpoint{Ref: "snap:1", Format: "rainier-runner-v0"},
+	}
+}
+
+// fleetCachedQueued is a session created from that environment as
+// portableSpecFor now stores it: the environment's own image, never the
+// snapshot ref, because nothing knows where the snapshot lives until the
+// session is placed.
+func fleetCachedQueued(env control.Environment) control.Session {
+	return control.Session{
+		ID: "sess_cached", WorkspaceID: "ws_example", State: control.StateQueued,
+		PoolID: "pool_example", EnvironmentID: env.ID,
+		Spec:                control.PortableSpec{Image: env.Image},
+		PlacementGeneration: 1,
+		CreatedAt:           time.Now().Add(-time.Hour),
+	}
+}
+
+// fleetOneCreate waits for exactly one dispatched create and returns it.
+func fleetOneCreate(t *testing.T, fx *fleetFixture) runner.ToRunner {
+	t.Helper()
+	var cmd runner.ToRunner
+	fleetEventually(t, 2*time.Second, func() error {
+		for _, c := range fx.transport.dispatchedCommands() {
+			if c.Type == "create" {
+				cmd = c
+				return nil
+			}
+		}
+		return fmt.Errorf("no create dispatched yet")
+	})
+	return cmd
+}
+
+// TestPlacementPrefersTheSnapshotHolder: both runners have room; the locator
+// admits only runner_a, so the session lands there booting the snapshot with
+// no setup — even though runner_b has more free capacity.
+func TestPlacementPrefersTheSnapshotHolder(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.checkpoints.location = control.CheckpointLocation{Runners: []control.RunnerID{"runner_a"}}
+	fx.st.seedRunner(fleetSeededRunner("runner_a", 4, 3, true)) // 1 free
+	fx.st.seedRunner(fleetSeededRunner("runner_b", 4, 0, true)) // 4 free
+	env := fleetCachedEnv()
+	fx.st.seedEnv(env)
+	fx.st.seedSession(fleetCachedQueued(env))
+
+	fleetRunFixture(t, fx)
+	fx.service.Wake("pool_example")
+
+	cmd := fleetOneCreate(t, fx)
+	if cmd.Spec == nil || cmd.Spec.Image != "snap:1" {
+		t.Fatalf("dispatched spec = %+v, want the snapshot snap:1", cmd.Spec)
+	}
+	if cmd.Spec.Setup != "" {
+		t.Fatalf("dispatched setup = %q, want none — the snapshot IS the finished setup", cmd.Spec.Setup)
+	}
+	row := fleetGetSessionState(t, fx, "ws_example", "sess_cached")
+	if row.RunnerID != "runner_a" {
+		t.Fatalf("placed on %q, want the holder runner_a", row.RunnerID)
+	}
+	if row.Spec.Image != "snap:1" {
+		t.Fatalf("stored image = %q, want the snapshot snap:1", row.Spec.Image)
+	}
+	if row.PlacementGeneration != 2 {
+		t.Fatalf("placement generation = %d, want 2", row.PlacementGeneration)
+	}
+}
+
+// TestPlacementFallsBackWhenTheHolderIsFull (D17): the holder has no room, so
+// the session boots the environment's image WITH setup on the other runner
+// rather than waiting for a cache that is a head start, never a pin.
+func TestPlacementFallsBackWhenTheHolderIsFull(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.checkpoints.location = control.CheckpointLocation{Runners: []control.RunnerID{"runner_a"}}
+	fx.st.seedRunner(fleetSeededRunner("runner_a", 1, 1, true)) // the holder, full
+	fx.st.seedRunner(fleetSeededRunner("runner_b", 4, 0, true))
+	env := fleetCachedEnv()
+	fx.st.seedEnv(env)
+	fx.st.seedSession(fleetCachedQueued(env))
+
+	fleetRunFixture(t, fx)
+	fx.service.Wake("pool_example")
+
+	cmd := fleetOneCreate(t, fx)
+	if cmd.Spec == nil || cmd.Spec.Image != "env-img:1" {
+		t.Fatalf("dispatched spec = %+v, want the environment's image env-img:1", cmd.Spec)
+	}
+	if cmd.Spec.Setup != "echo hi" {
+		t.Fatalf("dispatched setup = %q, want the environment's setup — this boot rebuilds it", cmd.Spec.Setup)
+	}
+	row := fleetGetSessionState(t, fx, "ws_example", "sess_cached")
+	if row.RunnerID != "runner_b" {
+		t.Fatalf("placed on %q, want runner_b (the holder had no room)", row.RunnerID)
+	}
+	if row.Spec.Image != "env-img:1" {
+		t.Fatalf("stored image = %q, want the environment's image", row.Spec.Image)
+	}
+	if row.PlacementGeneration != 2 {
+		t.Fatalf("placement generation = %d, want 2", row.PlacementGeneration)
+	}
+}
+
+// TestPortableCheckpointBootsAnywhere: a locator that answers Portable admits
+// every candidate, so the ordinary most-free pick wins and still boots the
+// snapshot with no setup.
+func TestPortableCheckpointBootsAnywhere(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.checkpoints.location = control.CheckpointLocation{Portable: true}
+	fx.st.seedRunner(fleetSeededRunner("runner_a", 4, 3, true)) // 1 free
+	fx.st.seedRunner(fleetSeededRunner("runner_b", 4, 0, true)) // 4 free
+	env := fleetCachedEnv()
+	fx.st.seedEnv(env)
+	fx.st.seedSession(fleetCachedQueued(env))
+
+	fleetRunFixture(t, fx)
+	fx.service.Wake("pool_example")
+
+	cmd := fleetOneCreate(t, fx)
+	if cmd.Spec == nil || cmd.Spec.Image != "snap:1" {
+		t.Fatalf("dispatched spec = %+v, want the snapshot snap:1", cmd.Spec)
+	}
+	if cmd.Spec.Setup != "" {
+		t.Fatalf("dispatched setup = %q, want none", cmd.Spec.Setup)
+	}
+	row := fleetGetSessionState(t, fx, "ws_example", "sess_cached")
+	if row.RunnerID != "runner_b" {
+		t.Fatalf("placed on %q, want runner_b (most free, and the checkpoint is portable)", row.RunnerID)
+	}
+	if row.Spec.Image != "snap:1" {
+		t.Fatalf("stored image = %q, want the snapshot snap:1", row.Spec.Image)
+	}
+	if row.PlacementGeneration != 2 {
+		t.Fatalf("placement generation = %d, want 2", row.PlacementGeneration)
+	}
+}

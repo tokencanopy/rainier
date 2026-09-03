@@ -21,7 +21,14 @@ type sessionEntry struct {
 	// and by then the Spec is long gone. Sorted at capture, so a snapshot's
 	// strip list is the same on every call.
 	envKeys []string
-	hub     *relay.Hub // set when sessiond registers; nil until then
+	// placementGen is the session placement generation the create that
+	// started this sandbox carried (protocol/runner: ToRunner.PlacementGeneration).
+	// It is kept beside the sandbox because every event about the session
+	// echoes it, which is what lets controld fence a report from a sandbox
+	// the session has since been re-placed away from. Zero is "the create
+	// carried none" — an old controld — and fences nothing.
+	placementGen uint64
+	hub          *relay.Hub // set when sessiond registers; nil until then
 }
 
 type registry struct {
@@ -177,6 +184,20 @@ func (r *registry) envKeys(id string) []string {
 		return nil
 	}
 	return slices.Clone(e.envKeys)
+}
+
+// placementGeneration returns the placement generation an entry's create
+// carried, or zero for a session this runner does not (or no longer) holds —
+// the same answer an old controld's create leaves behind, and zero fences
+// nothing either way. Read under the lock like every other entry field.
+func (r *registry) placementGeneration(id string) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.items[id]
+	if !ok {
+		return 0
+	}
+	return e.placementGen
 }
 
 // hubDied is called when a session's relay hub dies (its conn closed). It

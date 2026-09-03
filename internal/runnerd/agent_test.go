@@ -875,3 +875,110 @@ func TestAgentCreateWithoutSetupLeavesTheSpecEmpty(t *testing.T) {
 		t.Fatalf("Spec = %+v, want no setup and no env for a cached-image create", calls[0])
 	}
 }
+
+// ---------------------------------------------------------------------------
+// capability negotiation (plan 8, D19): what the runner claims, what controld
+// grants, and the two generations every later message carries
+// ---------------------------------------------------------------------------
+
+// TestAgentAnnouncesItsCapabilities pins the operator's configured
+// capabilities onto the announce verbatim and in order. They are claims about
+// this runner and nothing else, so the agent neither invents nor reorders
+// them; controld is where they are validated.
+func TestAgentAnnouncesItsCapabilities(t *testing.T) {
+	rd := New(driver.NewFake(4), "", "", "")
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	caps := []string{"gpu", "docker.rootless"}
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1",
+		Capabilities: caps})
+
+	ann := fc.nextConn(t).readAnnounce(t)
+	if !slices.Equal(ann.Capabilities, caps) {
+		t.Fatalf("announce Capabilities = %v, want %v", ann.Capabilities, caps)
+	}
+}
+
+// TestAgentStampsTheAcceptedGeneration: before an accept the runner has no
+// granted authority and says so (zero — "the connection's"); after one, every
+// result and event it sends carries the generation controld granted, which is
+// what lets the store fence a report that outlived its own connection.
+func TestAgentStampsTheAcceptedGeneration(t *testing.T) {
+	rd := New(newCreateTrackingFake(4), "", "", "")
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1"})
+
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+
+	msg := runner.ToRunner{Type: "create", ReqID: 1, Session: "sess_gen", Spec: &runner.Spec{Image: "img"}}
+	conn.send(t, msg)
+	if res := conn.readMsg(t); !res.OK || res.Generation != 0 {
+		t.Fatalf("result before any accept = %+v, want ok with Generation 0", res)
+	}
+
+	conn.send(t, runner.ToRunner{Type: "accept", Generation: 7, Capabilities: []string{"gpu"}})
+
+	// The same create again: idempotent, so it answers with a result AND
+	// re-fires the session's state as an event — two messages that must both
+	// carry the granted generation.
+	msg.ReqID = 2
+	conn.send(t, msg)
+	res := conn.readMsg(t)
+	if !res.OK || res.ReqID != 2 || res.Generation != 7 {
+		t.Fatalf("result after the accept = %+v, want ok req_id=2 Generation=7", res)
+	}
+	evt := conn.readMsg(t)
+	if evt.Type != "event" || evt.Session != "sess_gen" || evt.Generation != 7 {
+		t.Fatalf("event after the accept = %+v, want event{sess_gen} at Generation 7", evt)
+	}
+}
+
+// TestAgentEchoesThePlacementGeneration: the create that starts a sandbox
+// carries the session's placement generation, the runner keeps it with that
+// sandbox, and every event about it echoes it — so a report from a sandbox
+// the session has already re-placed elsewhere is fenced by the session's own
+// authority. A session created without one echoes nothing.
+func TestAgentEchoesThePlacementGeneration(t *testing.T) {
+	rd := New(newCreateTrackingFake(4), "", "", "")
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1"})
+
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+
+	for _, tc := range []struct {
+		name    string
+		session string
+		gen     uint64
+	}{
+		{"a create that carried one", "sess_placed", 3},
+		{"a create that carried none", "sess_unplaced", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := runner.ToRunner{Type: "create", ReqID: 1, Session: tc.session,
+				PlacementGeneration: tc.gen, Spec: &runner.Spec{Image: "img"}}
+			conn.send(t, msg)
+			if res := conn.readMsg(t); !res.OK {
+				t.Fatalf("create result = %+v, want ok", res)
+			}
+			msg.ReqID = 2
+			conn.send(t, msg)
+			if res := conn.readMsg(t); !res.OK {
+				t.Fatalf("idempotent create result = %+v, want ok", res)
+			}
+			evt := conn.readMsg(t)
+			if evt.Type != "event" || evt.Session != tc.session || evt.PlacementGeneration != tc.gen {
+				t.Fatalf("event = %+v, want event{%s} at PlacementGeneration %d", evt, tc.session, tc.gen)
+			}
+		})
+	}
+}

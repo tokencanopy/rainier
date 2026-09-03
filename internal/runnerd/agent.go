@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -26,6 +27,21 @@ type AgentConfig struct {
 	Token       string
 	RunnerName  string
 	ProxyURL    string // forwarded into every driver.Spec (egress R4)
+	// Capabilities are the portable capabilities this runner announces —
+	// claims about itself and nothing else (a GPU it has, a rootless docker
+	// it runs). They are passed through verbatim: controld validates them
+	// and answers with the set it accepted. Empty announces none.
+	Capabilities []string
+}
+
+// agentSessionState is one control connection's negotiated state. Today that
+// is the runner generation controld granted in its accept: zero until one
+// arrives (an unaccepted connection claims no authority, which the wire
+// spells as "the connection's"), and read by the writer on every message the
+// runner sends afterwards. Atomic because the accept is handled on the
+// reader while events fire from session goroutines.
+type agentSessionState struct {
+	generation atomic.Uint64
 }
 
 // jitter returns a random duration in [0, d/2) — timing spread, not security.
@@ -103,11 +119,26 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 		writerDone.Wait()
 	}()
 
+	ag := &agentSessionState{}
 	out := make(chan runner.FromRunner, 64)
 	send := func(m runner.FromRunner) {
 		cctx, ccancel := context.WithTimeout(ctx, 5*time.Second)
 		m.Used, m.Total, _ = s.drv.Capacity(cctx) // best-effort; piggybacked on every message
 		ccancel()
+		// The two generations every report carries (D19), stamped in the one
+		// place every report passes through. The runner's own is whatever
+		// controld granted this connection; the session's is the one its
+		// create carried, which the registry has kept beside the sandbox.
+		// Both are zero until they are known, and zero fences nothing.
+		switch m.Type {
+		case "event":
+			m.Generation = ag.generation.Load()
+			if m.Session != "" {
+				m.PlacementGeneration = s.reg.placementGeneration(m.Session)
+			}
+		case "result":
+			m.Generation = ag.generation.Load()
+		}
 		select {
 		case out <- m:
 		default: // drop under absurd backlog; a later announce restores truth
@@ -133,7 +164,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 
 	used, total, _ := s.drv.Capacity(ctx)
 	ann := runner.FromRunner{Type: "announce", Proto: runner.ProtocolVersion, Runner: cfg.RunnerName,
-		Sessions: s.Announce(), Used: used, Total: total}
+		Sessions: s.Announce(), Used: used, Total: total, Capabilities: cfg.Capabilities}
 	if err := wsjson.Write(connCtx, c, ann); err != nil {
 		return err
 	}
@@ -170,15 +201,33 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 		if err := wsjson.Read(connCtx, c, &m); err != nil {
 			return err
 		}
-		go s.execute(ctx, m, send, cfg) // ops are slow (docker); never block the reader
+		if m.Type == "accept" {
+			// Handled on the reader itself, not in a goroutine of its own:
+			// the accept is this connection's negotiated state, and every
+			// message read after it must already carry the generation it
+			// grants. A goroutine would make that ordering a race.
+			s.execute(ctx, m, send, cfg, ag)
+			continue
+		}
+		go s.execute(ctx, m, send, cfg, ag) // ops are slow (docker); never block the reader
 	}
 }
 
 // execute runs one ToRunner command and reports its result via send. Called
 // in its own goroutine per inbound message (agentSession's read loop) so a
-// slow docker op never blocks the next command from being read.
-func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runner.FromRunner), cfg AgentConfig) {
+// slow docker op never blocks the next command from being read — except for
+// the "accept", which the reader runs inline because it is negotiation, not
+// work, and everything read after it depends on it having happened.
+func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runner.FromRunner), cfg AgentConfig, ag *agentSessionState) {
 	switch m.Type {
+	case "accept":
+		// controld's answer to the announce, and the first thing it sends.
+		// It grants this connection a generation; from here on every result
+		// and event says which authority produced it. The capabilities are
+		// informational — the set controld will schedule on, which is this
+		// runner's own claims minus anything it refused.
+		ag.generation.Store(m.Generation)
+		log.Printf("agent: accepted at generation %d with %d capabilities", m.Generation, len(m.Capabilities))
 	case "create":
 		var spec driver.Spec
 		var allow []string
@@ -208,7 +257,10 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 		// one or a concurrent one) already claimed the id; either way the
 		// desired state — a session exists under this id — is reached, so
 		// it's reported the same as a fresh success.
-		err := s.CreateWithID(ctx, m.Session, spec, allow)
+		// The create's placement generation travels with the sandbox, not
+		// with this command: every event about this session echoes it, long
+		// after the create is over.
+		err := s.createWithID(ctx, m.Session, spec, allow, m.PlacementGeneration)
 		ok := err == nil || errors.Is(err, errSessionExists)
 		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: ok, Detail: errTextUnless(err, errSessionExists)})
 		if errors.Is(err, errSessionExists) {

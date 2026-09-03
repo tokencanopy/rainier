@@ -295,7 +295,18 @@ ok "controld healthy (migrations applied against $PG_CONTAINER)"
 step "fleet (egressd + dial-mode runnerd)"
 # ---------------------------------------------------------------------------
 FLEET_STARTED=1
-CONTROLD_URL="$CONTROLD_WS" RAINIER_RUNNER_TOKEN="$RUNNER_TOKEN" RUNNER_NAME="${RUNNER_NAME:-vm-local}" \
+# The runner's name is hoisted out of the call so the capability scene below
+# can assert WHICH runner a session landed on; fleet-up.sh reads it from the
+# environment exactly as it did when it was a command prefix.
+RUNNER_NAME="${RUNNER_NAME:-vm-local}"
+export RUNNER_NAME
+# One portable capability, announced by this runner and required by an
+# environment further down (D19). It travels as RAINIER_RUNNER_CAPABILITIES
+# because fleet-up.sh owns runnerd's argv; runnerd reads the variable as the
+# default of its repeatable --capability flag.
+FLEET_CAPABILITY=e2e.gpu
+CONTROLD_URL="$CONTROLD_WS" RAINIER_RUNNER_TOKEN="$RUNNER_TOKEN" \
+  RAINIER_RUNNER_CAPABILITIES="$FLEET_CAPABILITY" \
   ./scripts/fleet-up.sh
 waitfor "grep -q 'runner .* connected' $CONTROLD_LOG" 30 "runner join" \
   || fail "the runner never joined the fleet; see $CONTROLD_LOG and /tmp/runnerd.log"
@@ -659,6 +670,58 @@ waitfor '[ -z "$(state_of "$SID1")" ] && [ -z "$(state_of "$SID2")" ]' 60 "both 
 ./bin/rainier secret rm "$SECRET_NAME" >/dev/null || fail "secret rm"
 rm -f "$SETUP_FILE"
 ok "environment and secret deleted once nothing referenced them"
+
+# --- capability negotiation, both directions (D18/D19). The fleet's one
+# runner announced "$FLEET_CAPABILITY" on its dial, controld accepted it and
+# persisted it beside the two capabilities it spells for the runner's own
+# name, and the scheduler matches an environment's requirements against that
+# set. Two environments prove both answers: one requiring what the fleet has,
+# whose session lands on that runner, and one requiring what nothing
+# advertises, whose session stays queued and SAYS SO.
+CAP_ENV="e2e-cap-$$"
+NOCAP_ENV="e2e-nocap-$$"
+MISSING_CAPABILITY=e2e.none
+
+CAP_ENV_ID=$(./bin/rainier env create "$CAP_ENV" \
+  --image rainier-session:latest --capability "$FLEET_CAPABILITY")
+case "$CAP_ENV_ID" in
+  env_*) ok "created environment $CAP_ENV requiring $FLEET_CAPABILITY ($CAP_ENV_ID)" ;;
+  *) fail "env create --capability printed \"$CAP_ENV_ID\", want an env_ id" ;;
+esac
+./bin/rainier env show "$CAP_ENV" > /tmp/rainier-e2e-cap-env.json
+grep -q "\"$FLEET_CAPABILITY\"" /tmp/rainier-e2e-cap-env.json \
+  || fail "env show does not carry capabilities: $(cat /tmp/rainier-e2e-cap-env.json)"
+
+CAP_SID=$(./bin/rainier new --detach --name "$CAP_ENV-session" --env "$CAP_ENV")
+case "$CAP_SID" in sess_*) ;; *) fail "new --env $CAP_ENV printed \"$CAP_SID\"" ;; esac
+waitfor '[ "$(state_of "$CAP_SID")" = running ]' 120 "the capability-matched session" \
+  || fail "$CAP_SID never reached running (state: $(state_of "$CAP_SID")); the runner advertises $FLEET_CAPABILITY — see $CONTROLD_LOG"
+CAP_RUNNER=$(./bin/rainier ls | cell "$CAP_SID" RUNNER REACHABLE)
+[ "$CAP_RUNNER" = "$RUNNER_NAME" ] \
+  || fail "$CAP_SID is running on \"$CAP_RUNNER\", want $RUNNER_NAME (the runner that announced $FLEET_CAPABILITY)"
+ok "a session from an environment requiring $FLEET_CAPABILITY landed on $RUNNER_NAME"
+
+./bin/rainier env create "$NOCAP_ENV" \
+  --image rainier-session:latest --capability "$MISSING_CAPABILITY" >/dev/null \
+  || fail "env create --capability $MISSING_CAPABILITY"
+NOCAP_SID=$(./bin/rainier new --detach --name "$NOCAP_ENV-session" --env "$NOCAP_ENV")
+case "$NOCAP_SID" in sess_*) ;; *) fail "new --env $NOCAP_ENV printed \"$NOCAP_SID\"" ;; esac
+# The STATE column carries the queue reason in parentheses (sessionStateCell),
+# which is where a human meets it.
+nocap_state() { ./bin/rainier ls | cell "$NOCAP_SID" STATE RUNNER; }
+waitfor '[ "$(nocap_state)" = "queued (waiting for a runner with capability '"$MISSING_CAPABILITY"')" ]' \
+  30 "the queue reason naming $MISSING_CAPABILITY" \
+  || fail "$NOCAP_SID reads \"$(nocap_state)\", want queued naming the missing capability $MISSING_CAPABILITY"
+ok "a session requiring $MISSING_CAPABILITY stays queued and names the capability nothing advertises"
+
+./bin/rainier rm "$CAP_SID" >/dev/null
+./bin/rainier rm "$NOCAP_SID" >/dev/null
+waitfor '[ -z "$(state_of "$CAP_SID")" ] && [ -z "$(state_of "$NOCAP_SID")" ]' 60 "both capability sessions to go" \
+  || fail "the capability scene's sessions are still listed after rm"
+./bin/rainier env rm "$CAP_ENV" | grep -q removed || fail "env rm $CAP_ENV did not report removal"
+./bin/rainier env rm "$NOCAP_ENV" | grep -q removed || fail "env rm $NOCAP_ENV did not report removal"
+rm -f /tmp/rainier-e2e-cap-env.json
+ok "the capability scene's environments and sessions are cleaned up"
 
 # ---------------------------------------------------------------------------
 step "github rehearsal (real clone, commit and push against a throwaway repo)"

@@ -67,6 +67,7 @@ func cases() []suiteCase {
 		{"S8 guarded transition and placement generation", casePlacementGeneration},
 		{"S9 provenance writes", caseSessionProvenance},
 		{"S10 controller generation", caseControllerGeneration},
+		{"S11 a placement transition records the resolved image", caseTransitionImage},
 
 		{"E1 environment round trip", caseEnvironmentRoundTrip},
 		{"E2 an environment name is unique per workspace", caseEnvironmentName},
@@ -670,6 +671,59 @@ func casePlacementGeneration(t *testing.T, s Stores) {
 	}
 }
 
+// caseTransitionImage (S11) pins the image a placement resolved. The image a
+// session runs is decided where the holder is known — at placement — so the
+// transition that names the runner carries it, and the same statement writes
+// both. A transition that names no image leaves the spec exactly as it found
+// it, and neither answer disturbs the generation rule S8 pins.
+func caseTransitionImage(t *testing.T, s Stores) {
+	ctx := context.Background()
+	row := mustCreate(t, s, Alpha, control.Session{ID: "sess_example", CreatorID: "act_a",
+		Spec: control.PortableSpec{Image: "img:1"}, State: control.StateQueued, PoolID: PoolA})
+	if row.Spec.Image != "img:1" {
+		t.Fatalf("created image = %q, want img:1", row.Spec.Image)
+	}
+
+	placed := control.RunnerID("runner_a")
+	resolved := "snap:1"
+	if err := s.Sessions.Transition(ctx, Alpha, row.ID, []control.SessionState{control.StateQueued},
+		control.StateCreating, control.TransitionOpts{RunnerID: &placed, Image: &resolved}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Sessions.GetSession(ctx, Alpha, row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Image != "snap:1" {
+		t.Fatalf("after a placement that resolved an image: image = %q, want snap:1", got.Spec.Image)
+	}
+	if got.RunnerID != placed || got.PlacementGeneration != 2 {
+		t.Fatalf("the image must not disturb the placement: runner %q gen %d, want runner_a gen 2",
+			got.RunnerID, got.PlacementGeneration)
+	}
+
+	// No image named: the spec keeps the one the placement before it wrote.
+	if err := s.Sessions.Transition(ctx, Alpha, row.ID, []control.SessionState{control.StateCreating},
+		control.StateRunning, control.TransitionOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.Sessions.GetSession(ctx, Alpha, row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Image != "snap:1" {
+		t.Fatalf("a transition naming no image moved it to %q", got.Spec.Image)
+	}
+	if got.PlacementGeneration != 2 {
+		t.Fatalf("generation = %d, want 2", got.PlacementGeneration)
+	}
+
+	// The rest of the spec is not this option's to touch.
+	if !slices.Equal(got.Spec.Cmd, row.Spec.Cmd) || !slices.Equal(got.Spec.EgressAllow, row.Spec.EgressAllow) {
+		t.Fatalf("the resolved image rewrote the rest of the spec: %+v", got.Spec)
+	}
+}
+
 // caseSessionProvenance (S9) pins the two unguarded observation writes: they
 // move their own column and the edit clock, and leave the lifecycle clock
 // alone, because neither is a lifecycle event.
@@ -818,7 +872,7 @@ func caseEnvironmentRoundTrip(t *testing.T, s Stores) {
 	want.WorkspaceID = Alpha
 	sameEnvironment(t, "created row", created, want)
 	if created.Snapshot.Ref != "" || created.Snapshot.Format != "" || created.SnapshotHash != "" {
-		t.Fatalf("a fresh environment has no snapshot: %+v / %q", created.Snapshot, created.SnapshotHash)
+		t.Fatalf("a fresh environment must have no snapshot; got %+v / %q", created.Snapshot, created.SnapshotHash)
 	}
 	if created.SetupHash != "h1" {
 		t.Fatalf("SetupHash = %q, want the caller's h1 — the repository computes none", created.SetupHash)
@@ -917,7 +971,7 @@ func caseEnvironmentUpdateIgnoresCache(t *testing.T, s Stores) {
 	ctx := context.Background()
 	env := mustCreateEnv(t, s, Alpha, fixtureEnvironment("env_a", "dev"))
 	if err := s.Environments.SetEnvironmentSnapshot(ctx, Alpha, env.ID, "h1", "snap:1", "runner_a"); err != nil {
-		t.Fatalf("snapshot: %v", err)
+		t.Fatalf("SetEnvironmentSnapshot: %v", err)
 	}
 	cached, err := s.Environments.GetEnvironment(ctx, Alpha, env.ID)
 	if err != nil {
@@ -950,16 +1004,17 @@ func caseEnvironmentUpdateIgnoresCache(t *testing.T, s Stores) {
 }
 
 // caseEnvironmentSnapshot (E6) pins the compare-and-set that keeps a snapshot
-// honest, and the affinity capability a CURRENT snapshot lends the
-// environment: emitted while the hash still matches, gone the moment it does
-// not.
+// honest. A store records the snapshot and its hash and nothing else: where
+// the snapshot can boot is the host's checkpoint locator's answer, not a
+// capability a store invents, so the environment's requirements come back
+// exactly as they were written.
 func caseEnvironmentSnapshot(t *testing.T, s Stores) {
 	ctx := context.Background()
 	env := mustCreateEnv(t, s, Alpha, fixtureEnvironment("env_a", "dev"))
 	stored := slices.Clone(env.Requirements.Capabilities)
 
 	if err := s.Environments.SetEnvironmentSnapshot(ctx, Alpha, env.ID, "h1", "snap:1", "runner_a"); err != nil {
-		t.Fatalf("snapshot: %v", err)
+		t.Fatalf("SetEnvironmentSnapshot: %v", err)
 	}
 	cached, err := s.Environments.GetEnvironment(ctx, Alpha, env.ID)
 	if err != nil {
@@ -968,9 +1023,8 @@ func caseEnvironmentSnapshot(t *testing.T, s Stores) {
 	if cached.Snapshot.Ref != "snap:1" || cached.Snapshot.Format == "" || cached.SnapshotHash != "h1" {
 		t.Fatalf("snapshot not recorded: %+v / %q", cached.Snapshot, cached.SnapshotHash)
 	}
-	wantCaps := append(slices.Clone(stored), "snapshot:runner_a")
-	if !slices.Equal(cached.Requirements.Capabilities, wantCaps) {
-		t.Fatalf("capabilities = %q, want the stored ones then %q", cached.Requirements.Capabilities, "snapshot:runner_a")
+	if !slices.Equal(cached.Requirements.Capabilities, stored) {
+		t.Fatalf("capabilities = %q, want exactly the stored ones %q — a store invents none", cached.Requirements.Capabilities, stored)
 	}
 
 	if err := s.Environments.SetEnvironmentSnapshot(ctx, Alpha, env.ID, "h9", "snap:2", "runner_b"); !errors.Is(err, control.ErrStale) {
@@ -982,8 +1036,8 @@ func caseEnvironmentSnapshot(t *testing.T, s Stores) {
 	}
 	sameEnvironment(t, "after a losing snapshot", after, cached)
 
-	// Once the setup hash moves on, the snapshot is stale and stops holding
-	// the environment to the runner that built it.
+	// Once the setup hash moves on, the snapshot is stale — and the
+	// requirements are still only what was written.
 	upd := after
 	upd.SetupHash = "h2"
 	if _, err := s.Environments.UpdateEnvironment(ctx, Alpha, upd); err != nil {
@@ -994,7 +1048,7 @@ func caseEnvironmentSnapshot(t *testing.T, s Stores) {
 		t.Fatal(err)
 	}
 	if !slices.Equal(moved.Requirements.Capabilities, stored) {
-		t.Fatalf("a stale snapshot must stop pinning: capabilities = %q, want %q", moved.Requirements.Capabilities, stored)
+		t.Fatalf("capabilities = %q, want the stored ones %q", moved.Requirements.Capabilities, stored)
 	}
 
 	if err := s.Environments.SetEnvironmentSnapshot(ctx, Alpha, "env_nosuch", "h1", "snap:3", "runner_a"); !errors.Is(err, control.ErrNotFound) {

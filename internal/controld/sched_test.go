@@ -4,8 +4,9 @@
 // spec it builds are controlapp.FleetService's now. What survives here is the
 // half those tests could only ever prove from the outside — that controld's
 // adapters hand the service a fleet it can actually place on, over real
-// websockets, with the runner pins spelled as the capabilities Task 1 encodes
-// (placement:<name>, snapshot:<name>).
+// websockets, with an explicit runner pin spelled as the capability Task 1
+// encodes (placement:<name>) and a snapshot's affinity answered by the
+// installation's checkpoint locator.
 //
 // Every test that called createSpec, dispatchCreate, pickRunner,
 // pickForSession, or drainQueue directly is either covered by a named
@@ -159,15 +160,14 @@ func startRun(t *testing.T, s *Server) {
 //     rule spelled as a capability requirement, plus the two integration tests
 //     below that drive it through a real fleet.
 //   - TestPickForSession's snapshot rows (the holder wins over more capacity,
-//     and wins a lexicographic tie) -> the same capability filter, driven end
-//     to end by TestCacheTiebreakPrefersTheSnapshotHolder below.
+//     and wins a lexicographic tie) -> controlapp TestPlacementPrefersTheSnapshotHolder,
+//     driven end to end by TestCacheTiebreakPrefersTheSnapshotHolder below.
 //   - TestPickForSession's two FALLBACK rows ("a full snapshot holder falls
 //     back to the normal pick", "a disconnected snapshot holder falls back to
-//     the normal pick") are DELETED under deviation D3: a snapshot is a local
-//     image, not a registry entry, so the affinity became a pin. Their
-//     replacement is the D3 half of TestCacheTiebreakPrefersTheSnapshotHolder
-//     and the two restored api_test.go cases, which assert the session stays
-//     queued instead.
+//     the normal pick") are back under deviation D17, which restores what O8's
+//     D3 traded away: controlapp TestPlacementFallsBackWhenTheHolderIsFull and
+//     the two api_test.go cases that assert the fallback boots the plain image
+//     with its setup on the runner that has room.
 
 // TestPlacementPinPlacesOnThePinnedRunner drives the pin through the real
 // scheduler: vm1 has strictly more free capacity, so the session landing on
@@ -247,9 +247,10 @@ func TestPlacementPinQueuesWhenTheRunnerHasNoRoom(t *testing.T) {
 	})
 }
 
-// TestCacheTiebreakPrefersTheSnapshotHolder drives rule 6 through the real
-// scheduler: vm1 has more free capacity, but the session's resolved image is
-// a snapshot that exists only in vm2's local image store.
+// TestCacheTiebreakPrefersTheSnapshotHolder drives the holder preference
+// through the real scheduler and this installation's checkpoint locator: vm1
+// has more free capacity, but the environment's snapshot exists only in vm2's
+// local image store, so the session goes there and resolves to the ref.
 func TestCacheTiebreakPrefersTheSnapshotHolder(t *testing.T) {
 	s, st, ts := newTestControld(t)
 	f1 := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
@@ -261,8 +262,9 @@ func TestCacheTiebreakPrefersTheSnapshotHolder(t *testing.T) {
 	const ref = "rainier-env:cached-0123456789ab"
 	env = cacheEnvSnapshot(t, st, env, ref, "vm2")
 
+	// Stored as a create stores it now (D16): the environment's own image.
 	seedSession(t, st, control.Session{ID: "sess_cached", State: control.StateQueued, Name: "cached1",
-		EnvironmentID: env.ID, Spec: control.PortableSpec{Image: ref}, CreatedAt: time.Now().Add(-time.Hour)})
+		EnvironmentID: env.ID, Spec: control.PortableSpec{Image: env.Image}, CreatedAt: time.Now().Add(-time.Hour)})
 
 	startRun(t, s)
 
@@ -270,6 +272,9 @@ func TestCacheTiebreakPrefersTheSnapshotHolder(t *testing.T) {
 		got := getSession(t, st, "sess_cached")
 		if got.State != control.StateCreating || got.RunnerID != "vm2" {
 			return fmt.Errorf("session = %q on %q, want creating on vm2 (the snapshot holder)", got.State, got.RunnerID)
+		}
+		if got.Spec.Image != ref {
+			return fmt.Errorf("resolved image = %q, want the snapshot %q the holder has", got.Spec.Image, ref)
 		}
 		return nil
 	})

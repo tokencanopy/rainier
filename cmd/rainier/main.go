@@ -274,6 +274,7 @@ type environment struct {
 	SecretRefs      []string          `json:"secret_refs"`
 	Connectors      []json.RawMessage `json:"connectors"`
 	Placement       string            `json:"placement"`
+	Capabilities    []string          `json:"capabilities"`
 	SetupTimeoutSec int               `json:"setup_timeout_sec"`
 	SnapshotRef     string            `json:"snapshot_ref"`
 	SnapshotRunner  string            `json:"snapshot_runner"`
@@ -300,6 +301,7 @@ type createEnvironmentRequest struct {
 	SecretRefs      []string        `json:"secret_refs,omitempty"`
 	Connectors      json.RawMessage `json:"connectors,omitempty"`
 	Placement       string          `json:"placement,omitempty"`
+	Capabilities    []string        `json:"capabilities,omitempty"`
 	SetupTimeoutSec int             `json:"setup_timeout_sec,omitempty"`
 }
 
@@ -1276,6 +1278,7 @@ flags for create and update:
   --egress a.com,b.com       default egress allowlist ("" clears it)
   --secret-ref NAME          team secret to inject; repeatable ("" clears them)
   --placement RUNNER         pin this environment's sessions to one runner
+  --capability NAME          require a runner capability (e.g. gpu); repeatable
   --setup-timeout-sec N      how long setup may run (0 = server default)
   --connector-json '<json>'  a connector object, or an array of them; repeatable
   --from-devcontainer [dir]  take --image from a devcontainer.json (create only)
@@ -1332,6 +1335,7 @@ type envFlags struct {
 	initTimeout  *int
 	name         *string
 	secretRefs   stringsFlag
+	capabilities stringsFlag
 	connectors   stringsFlag
 	devcontainer optionalPathFlag
 }
@@ -1347,6 +1351,8 @@ func registerEnvFlags(fs *flag.FlagSet, forUpdate bool) *envFlags {
 		initTimeout: fs.Int("init-timeout-sec", 0, "how long the init script may run (0 = server default)"),
 	}
 	fs.Var(&f.secretRefs, "secret-ref", "name of a team secret to inject; repeatable")
+	fs.Var(&f.capabilities, "capability",
+		"a capability a runner must advertise before this environment's sessions land on it; repeatable")
 	fs.Var(&f.connectors, "connector-json", "a connector object, or an array of them, as raw JSON; repeatable")
 	if forUpdate {
 		f.name = fs.String("name", "", "new name for this environment")
@@ -1414,6 +1420,7 @@ func runEnvCreate(args []string) error {
 		SecretRefs:      nonEmpty(f.secretRefs),
 		Connectors:      connectors,
 		Placement:       *f.placement,
+		Capabilities:    nonEmpty(f.capabilities),
 		SetupTimeoutSec: *f.timeout,
 	}
 	var resp environmentEnvelope
@@ -1533,6 +1540,9 @@ func runEnvUpdate(args []string) error {
 	if passed["placement"] {
 		patch["placement"] = *f.placement
 	}
+	if passed["capability"] {
+		patch["capabilities"] = nonEmpty(f.capabilities)
+	}
 	if passed["setup-timeout-sec"] {
 		patch["setup_timeout_sec"] = *f.timeout
 	}
@@ -1540,7 +1550,7 @@ func runEnvUpdate(args []string) error {
 		patch["init_timeout_sec"] = *f.initTimeout
 	}
 	if len(patch) == 0 {
-		return fmt.Errorf("nothing to update: pass at least one of --name, --image, --setup-file, --init-file, --egress, --secret-ref, --connector-json, --placement, --setup-timeout-sec, --init-timeout-sec")
+		return fmt.Errorf("nothing to update: pass at least one of --name, --image, --setup-file, --init-file, --egress, --secret-ref, --connector-json, --placement, --capability, --setup-timeout-sec, --init-timeout-sec")
 	}
 
 	cfg, err := requireLogin()
