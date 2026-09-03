@@ -5,6 +5,7 @@ import (
 	"context"
 	"embed"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +22,14 @@ var migrationFS embed.FS
 // version is recorded in a single transaction, so a failed migration leaves
 // schema_migrations untouched for that version.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	return migrateTo(ctx, pool, math.MaxInt)
+}
+
+// migrateTo is Migrate with a ceiling: it stops after maxVersion instead of
+// running to head. Nothing in production wants a half-migrated schema — this
+// exists so a migration test can build the database exactly as the release
+// before it left it, and then watch the next migration run against real rows.
+func migrateTo(ctx context.Context, pool *pgxpool.Pool, maxVersion int) error {
 	if _, err := pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
 		version int PRIMARY KEY,
 		applied_at timestamptz NOT NULL DEFAULT now()
@@ -51,7 +60,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		if err != nil {
 			return fmt.Errorf("pgstore: %s: %w", name, err)
 		}
-		if version <= maxApplied {
+		if version <= maxApplied || version > maxVersion {
 			continue
 		}
 		sql, err := migrationFS.ReadFile("migrations/" + name)

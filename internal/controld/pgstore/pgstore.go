@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/internal/controld"
 )
 
@@ -60,7 +61,28 @@ func (s *Store) execAdmin(ctx context.Context, sql string) error {
 	return err
 }
 
-var _ controld.Store = (*Store)(nil)
+// Sessions, Environments, and Fleet are the three control repository ports,
+// each a view over this store's own rows rather than a copy of them: the
+// sessions Sessions() creates are the sessions Fleet() places, which is what
+// makes one Store satisfy the whole repository contract (controlapp/repotest).
+func (s *Store) Sessions() control.SessionRepository { return pgSessions{s} }
+
+func (s *Store) Environments() control.EnvironmentRepository { return pgEnvironments{s} }
+
+func (s *Store) Fleet() control.FleetRepository { return pgFleet{s} }
+
+var (
+	// The old single-tenant surface, the host's own persistence, and the
+	// three control repositories: one store, three contracts, until Task 5
+	// deletes the first of them.
+	_ controld.Store        = (*Store)(nil)
+	_ controld.HostStore    = (*Store)(nil)
+	_ controld.Repositories = (*Store)(nil)
+
+	_ control.SessionRepository     = pgSessions{}
+	_ control.EnvironmentRepository = pgEnvironments{}
+	_ control.FleetRepository       = pgFleet{}
+)
 
 // --- users & tokens ---------------------------------------------------
 
@@ -484,7 +506,7 @@ func (s *Store) UpsertRunner(ctx context.Context, r controld.Runner) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO runners (name, capacity_used, capacity_total, connected, last_seen_at)
 		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (name) DO UPDATE SET
+		ON CONFLICT (pool_id, name) DO UPDATE SET
 			capacity_used = EXCLUDED.capacity_used,
 			capacity_total = EXCLUDED.capacity_total,
 			connected = EXCLUDED.connected,
@@ -999,4 +1021,27 @@ func decodeCursor(cursor string) (createdAtNano int64, id string, err error) {
 		return 0, "", fmt.Errorf("pgstore: invalid cursor: %w", err)
 	}
 	return nano, id, nil
+}
+
+// encodeEnvironmentCursor and decodeEnvironmentCursor implement
+// ListEnvironments's opaque page cursor: base64 raw-URL encoding of
+// "<id>|<name>". Rows are ordered (name, id) ascending; the id leads the
+// encoding because an environment id never contains a "|" and a name may, so
+// the split stays unambiguous. It is byte-compatible with memstore's cursor
+// of the same shape, because the two stores answer the same contract suite
+// and a cursor minted by one has to read as the same position in the other.
+func encodeEnvironmentCursor(name string, id control.EnvironmentID) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(string(id) + "|" + name))
+}
+
+func decodeEnvironmentCursor(cursor string) (name string, id control.EnvironmentID, err error) {
+	raw, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return "", "", fmt.Errorf("pgstore: invalid cursor: %w", control.ErrInvalid)
+	}
+	rawID, rawName, ok := strings.Cut(string(raw), "|")
+	if !ok {
+		return "", "", fmt.Errorf("pgstore: invalid cursor: %w", control.ErrInvalid)
+	}
+	return rawName, control.EnvironmentID(rawID), nil
 }
