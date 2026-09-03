@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1519,5 +1520,282 @@ func TestEnvCapabilityFlagsReachTheWire(t *testing.T) {
 	}
 	if len(gotBody) != 1 {
 		t.Errorf("patch = %#v, want it to carry only the field that was passed", gotBody)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// hosted login (--cloud), contexts, workspaces
+// ---------------------------------------------------------------------------
+
+// hostedWorkspace is one row of the hosted edge's GET /v0/workspaces.
+type hostedWorkspace struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Role string `json:"role"`
+}
+
+// hostedEdgeScript configures the fake hosted edge below: how many exchange
+// polls answer 202 before the token arrives, what the workspace listing
+// holds, and whether the attempt has lapsed.
+type hostedEdgeScript struct {
+	pending    int
+	workspaces []hostedWorkspace
+	expired    bool
+}
+
+// newHostedEdge is the hosted auth wire, scripted: POST /v0/auth/login-attempts
+// mints an attempt (201 + Location), the exchange answers 202 with a
+// Retry-After while the human is still in the browser and 200 with the token
+// pair once they are done (410 login_expired if the attempt lapsed), and
+// GET /v0/workspaces answers a Bearer.
+func newHostedEdge(t *testing.T, script hostedEdgeScript) (*httptest.Server, func() string) {
+	t.Helper()
+	var deviceName string
+	polls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/auth/login-attempts":
+			var body struct {
+				DeviceName string `json:"device_name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode login-attempt body: %v", err)
+			}
+			deviceName = body.DeviceName
+			w.Header().Set("Location", "/v0/auth/login-attempts/la_example")
+			w.WriteHeader(http.StatusCreated)
+			io.WriteString(w, `{"id":"la_example","browser_path":"/login/la_example",`+
+				`"poll_token":"tok_poll_example","expires_at":"`+
+				time.Now().Add(10*time.Minute).UTC().Format(time.RFC3339)+
+				`","poll_interval_seconds":1}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/auth/login-attempts/la_example/exchange":
+			var body struct {
+				PollToken string `json:"poll_token"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode exchange body: %v", err)
+			}
+			if body.PollToken != "tok_poll_example" {
+				t.Errorf("exchange poll_token = %q, want the one the attempt minted", body.PollToken)
+			}
+			if script.expired {
+				w.WriteHeader(http.StatusGone)
+				io.WriteString(w, `{"error":{"code":"login_expired","message":"this login attempt has expired"}}`)
+				return
+			}
+			if polls < script.pending {
+				polls++
+				w.Header().Set("Retry-After", "2")
+				w.WriteHeader(http.StatusAccepted)
+				return
+			}
+			io.WriteString(w, `{"token_type":"Bearer","access_token":"tok_access_example",`+
+				`"access_expires_at":"2026-09-02T00:10:00Z","refresh_token":"tok_refresh_example",`+
+				`"refresh_expires_at":"2026-09-09T00:00:00Z"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/workspaces":
+			if r.Header.Get("Authorization") != "Bearer tok_access_example" {
+				w.WriteHeader(http.StatusUnauthorized)
+				io.WriteString(w, `{"error":{"code":"unauthenticated","message":"bearer token required"}}`)
+				return
+			}
+			if err := json.NewEncoder(w).Encode(map[string]any{"workspaces": script.workspaces}); err != nil {
+				t.Errorf("encode workspaces: %v", err)
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"error":{"code":"not_found","message":"no such route"}}`)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	return ts, func() string { return deviceName }
+}
+
+func edgeHost(t *testing.T, rawURL string) string {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("parse edge URL: %v", err)
+	}
+	return u.Host
+}
+
+// TestCloudLoginStoresTheHostedContext walks the documented flow end to end:
+// start the attempt, print the URL the human opens, poll while the answer is
+// 202, then store the pair in a context named after the edge. With exactly
+// one workspace there is nothing to choose, so the context carries it.
+func TestCloudLoginStoresTheHostedContext(t *testing.T) {
+	edge, deviceName := newHostedEdge(t, hostedEdgeScript{
+		pending:    2,
+		workspaces: []hostedWorkspace{{ID: "ws_example", Name: "acme", Role: "owner"}},
+	})
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("RAINIER_NO_BROWSER", "1")
+
+	var slept []time.Duration
+	out, err := captureStdout(t, func() error {
+		return runCloudLoginSleep(edge.URL, "laptop-example", "", func(d time.Duration) {
+			slept = append(slept, d)
+		})
+	})
+	if err != nil {
+		t.Fatalf("login --cloud: %v", err)
+	}
+	if deviceName() != "laptop-example" {
+		t.Errorf("device_name = %q, want the one --device-name named", deviceName())
+	}
+	if want := edge.URL + "/login/la_example"; !strings.Contains(out, want) {
+		t.Errorf("login output = %q, want the browser URL %q", out, want)
+	}
+	if strings.Contains(out, "tok_") {
+		t.Errorf("login output carries token material: %q", out)
+	}
+	// poll_interval_seconds was 1; the CLI never polls faster than 2s.
+	if len(slept) != 2 || slept[0] != 2*time.Second || slept[1] != 2*time.Second {
+		t.Errorf("poll waits = %v, want two 2s waits", slept)
+	}
+
+	saved, err := cli.Load()
+	if err != nil {
+		t.Fatalf("cli.Load: %v", err)
+	}
+	name := edgeHost(t, edge.URL)
+	if saved.Current != name {
+		t.Errorf("current context = %q, want %q", saved.Current, name)
+	}
+	got := saved.Contexts[name]
+	want := cli.Context{
+		Server: edge.URL, Token: "tok_access_example", Workspace: "ws_example",
+		RefreshToken: "tok_refresh_example", AccessExpiresAt: "2026-09-02T00:10:00Z",
+	}
+	if got != want {
+		t.Errorf("stored context = %+v, want %+v", got, want)
+	}
+}
+
+// TestCloudLoginWithSeveralWorkspacesLeavesTheChoice: the CLI never picks a
+// workspace for you when there is more than one — it prints them and names
+// the command that chooses.
+func TestCloudLoginWithSeveralWorkspacesLeavesTheChoice(t *testing.T) {
+	edge, _ := newHostedEdge(t, hostedEdgeScript{workspaces: []hostedWorkspace{
+		{ID: "ws_example", Name: "acme", Role: "owner"},
+		{ID: "ws_other_example", Name: "beta", Role: "member"},
+	}})
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("RAINIER_NO_BROWSER", "1")
+
+	out, err := captureStdout(t, func() error { return runLogin([]string{"--cloud", edge.URL}) })
+	if err != nil {
+		t.Fatalf("login --cloud: %v", err)
+	}
+	for _, want := range []string{"ws_example", "acme", "owner", "ws_other_example", "beta", "member", "rainier workspace use"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("login output = %q, want it to contain %q", out, want)
+		}
+	}
+	saved, err := cli.Load()
+	if err != nil {
+		t.Fatalf("cli.Load: %v", err)
+	}
+	if ws := saved.Contexts[edgeHost(t, edge.URL)].Workspace; ws != "" {
+		t.Errorf("workspace = %q, want it left unset until the user chooses", ws)
+	}
+}
+
+// TestCloudLoginReportsAnExpiredAttempt: an attempt that lapsed before the
+// human finished is a 410, and the CLI says so instead of polling forever.
+func TestCloudLoginReportsAnExpiredAttempt(t *testing.T) {
+	edge, _ := newHostedEdge(t, hostedEdgeScript{expired: true})
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("RAINIER_NO_BROWSER", "1")
+
+	_, err := captureStdout(t, func() error {
+		return runCloudLoginSleep(edge.URL, "laptop-example", "", func(time.Duration) {})
+	})
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("login --cloud against a lapsed attempt = %v, want an expiry message", err)
+	}
+}
+
+// TestContextSubcommand: list, current, use, remove — the whole surface of
+// switching between a self-hosted controld and a hosted edge.
+func TestContextSubcommand(t *testing.T) {
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var cfg cli.Config
+	cfg.SetContext("default", cli.Context{Server: "https://controld.example.test", Token: "tok_example"})
+	cfg.SetContext("edge.example.test", cli.Context{
+		Server: "https://edge.example.test", Token: "tok_example",
+		RefreshToken: "tok_refresh_example", Workspace: "ws_example",
+	})
+	if err := cli.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := captureStdout(t, func() error { return runContext([]string{"list"}) })
+	if err != nil {
+		t.Fatalf("context list: %v", err)
+	}
+	for _, want := range []string{"default", "edge.example.test", "ws_example", "https://controld.example.test"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("context list = %q, want it to contain %q", out, want)
+		}
+	}
+	if strings.Contains(out, "tok_") {
+		t.Errorf("context list printed token material: %q", out)
+	}
+
+	out, err = captureStdout(t, func() error { return runContext([]string{"current"}) })
+	if err != nil || strings.TrimSpace(out) != "edge.example.test" {
+		t.Fatalf("context current = %q (%v), want edge.example.test", out, err)
+	}
+
+	if _, err := captureStdout(t, func() error { return runContext([]string{"use", "default"}) }); err != nil {
+		t.Fatalf("context use: %v", err)
+	}
+	saved, _ := cli.Load()
+	if saved.Current != "default" || saved.ServerURL != "https://controld.example.test" {
+		t.Fatalf("after `context use default`, config = %+v", saved)
+	}
+
+	if err := runContext([]string{"use", "nope.example.test"}); err == nil {
+		t.Errorf("context use of an unknown name = nil, want a refusal")
+	}
+
+	if _, err := captureStdout(t, func() error { return runContext([]string{"remove", "edge.example.test"}) }); err != nil {
+		t.Fatalf("context remove: %v", err)
+	}
+	saved, _ = cli.Load()
+	if _, ok := saved.Contexts["edge.example.test"]; ok {
+		t.Errorf("context remove left %q behind", "edge.example.test")
+	}
+}
+
+// TestWorkspaceUseValidatesAgainstTheEdge: the id has to be one of the
+// caller's, checked against the edge, so a typo fails here rather than as an
+// unexplainable 403 on the next command.
+func TestWorkspaceUseValidatesAgainstTheEdge(t *testing.T) {
+	edge, _ := newHostedEdge(t, hostedEdgeScript{workspaces: []hostedWorkspace{
+		{ID: "ws_example", Name: "acme", Role: "owner"},
+	}})
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var cfg cli.Config
+	cfg.SetContext("edge.example.test", cli.Context{
+		Server: edge.URL, Token: "tok_access_example", RefreshToken: "tok_refresh_example",
+	})
+	if err := cli.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runWorkspace([]string{"use", "ws_typo_example"})
+	if err == nil || !strings.Contains(err.Error(), "ws_typo_example") {
+		t.Fatalf("workspace use of an unknown id = %v, want a refusal naming it", err)
+	}
+
+	if _, err := captureStdout(t, func() error { return runWorkspace([]string{"use", "ws_example"}) }); err != nil {
+		t.Fatalf("workspace use: %v", err)
+	}
+	saved, _ := cli.Load()
+	if ws := saved.Contexts["edge.example.test"].Workspace; ws != "ws_example" {
+		t.Fatalf("stored workspace = %q, want ws_example", ws)
 	}
 }

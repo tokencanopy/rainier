@@ -10,6 +10,7 @@ import (
 	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/controlapp"
 	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/v0wire"
 )
 
 // launchMaterial is the self-hosted controlapp.LaunchMaterialResolver: given a
@@ -141,7 +142,7 @@ func sessionRepoRefs(row control.Session, env *control.Environment) ([]control.R
 		if c.Type != "github" {
 			continue
 		}
-		gc, err := decodeGitHubConnector(c.Raw)
+		gc, err := v0wire.DecodeGitHubConnector(c.Raw)
 		if err != nil {
 			return nil, fmt.Errorf("connectors[%d]: %w", i, err)
 		}

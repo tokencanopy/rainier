@@ -77,19 +77,6 @@ func rawOrNil(s string) json.RawMessage {
 	return json.RawMessage(s)
 }
 
-// srpcPending reports how many entries a runner connection's session-RPC
-// table still holds — every test that ends a call asserts this is back to
-// zero, because a pending entry that outlives its call is a leak no timeout
-// would ever clean up.
-func srpcPending(t *testing.T, s *Server, runner string) int {
-	t.Helper()
-	rc := s.conn(runner)
-	if rc == nil {
-		t.Fatalf("runner %q has no connection", runner)
-	}
-	return rc.srpc.len()
-}
-
 // ---------------------------------------------------------------------------
 // controld-initiated: where the downward half's tests went
 //
@@ -99,10 +86,10 @@ func srpcPending(t *testing.T, s *Server, runner string) int {
 // followed rather than assumed:
 //
 //   - TestSessionRPCRoundTrip           → controlapp TestSessionRPCSuccess (the
-//     request's shape and the decoded answer) and adapt_transport_test.go
+//     request's shape and the decoded answer) and runnerplane/plane_test.go
 //     TestTransportDispatchSessionRPCCorrelatesByEnvelopeID (the envelope-ID
 //     correlation over one connection, ReqID left at 0, table cleaned up).
-//   - TestSessionRPCTimesOut            → adapt_transport_test.go
+//   - TestSessionRPCTimesOut            → runnerplane/plane_test.go
 //     TestTransportDispatchFailuresAreUnavailableWithoutRunnerText, case "no
 //     answer before OpTimeout".
 //   - TestSessionRPCFailsFastOnConnDeath → the same test's "connection closed"
@@ -116,14 +103,15 @@ func srpcPending(t *testing.T, s *Server, runner string) int {
 //   - TestSessionRPCsCorrelateOutOfOrder → controlapp
 //     TestSessionRPCConcurrentOutOfOrder, over the same per-call id.
 //   - TestSessionRPCUnreachable         → "runner is not connected here" is
-//     adapt_transport_test.go's "unknown runner" case; "session is placed
+//     runnerplane/plane_test.go's "unknown runner" case; "session is placed
 //     nowhere" and "no such session" are the attachment service's reads now
 //     (controlapp TestWorkspaceDiffRequiresRunning and
 //     TestAttachTerminalRejections), and files_test.go's readiness subtests
 //     pin the 404/503/502 those become on the wire.
 //
-// TestOrphanSessionRPCResponseIsDropped stays, rewritten against the transport
-// adapter: what it is about is this file's own routing, not the caller.
+// TestOrphanSessionRPCResponseIsDropped moved to runnerplane/plane_test.go
+// with the routing it is about: an unmatched "resp" is dropped by the plane's
+// per-connection table, not by anything this file still owns.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -162,49 +150,6 @@ func TestSandboxRequestIsAnswered(t *testing.T) {
 	}
 	if !strings.Contains(body.Error, "unknown method") || !strings.Contains(body.Error, "no_such_method") {
 		t.Fatalf("error = %q, want it to name the unknown method", body.Error)
-	}
-}
-
-// TestOrphanSessionRPCResponseIsDropped: a response whose id nobody is waiting
-// on (its caller timed out, or the sandbox is confused) is logged and dropped.
-// What must NOT happen is the connection's reader dying with it — proven by
-// the ordinary RPC that still round-trips right after.
-func TestOrphanSessionRPCResponseIsDropped(t *testing.T) {
-	s, st, ts := newTestControld(t)
-	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
-	id := sandboxSession(t, st, "sess_orphan", "vm1")
-
-	f.write(t, runner.FromRunner{Type: "session_req", Session: id,
-		RPC: &runner.RPCEnvelope{ID: 999, Method: "resp", OK: true, Payload: json.RawMessage(`{"stale":true}`)}})
-	// A malformed session_req (no envelope at all) is dropped the same way.
-	f.write(t, runner.FromRunner{Type: "session_req", Session: id})
-
-	type answer struct {
-		Pong string `json:"pong"`
-	}
-	errc := make(chan runner.FromRunner, 1)
-	go func() {
-		res, err := runnerTransport{srv: s}.Dispatch(context.Background(), installPool, "vm1",
-			runner.ToRunner{Type: "session_rpc", Session: id,
-				RPC: &runner.RPCEnvelope{ID: 7, Method: "ping"}})
-		if err != nil {
-			t.Errorf("dispatch after an orphan response: %v", err)
-		}
-		errc <- res
-	}()
-	cmd := nextSessionRPC(t, f)
-	f.answerRPC(t, cmd, true, `{"pong":"yes"}`)
-
-	res := <-errc
-	if res.Type != "session_req" || res.RPC == nil || res.RPC.ID != 7 || !res.RPC.OK {
-		t.Fatalf("answer = %+v, want the ok resp for envelope 7", res)
-	}
-	var got answer
-	if err := json.Unmarshal(res.RPC.Payload, &got); err != nil || got.Pong != "yes" {
-		t.Fatalf("payload = %s (%v), want the sandbox's own answer", res.RPC.Payload, err)
-	}
-	if n := srpcPending(t, s, "vm1"); n != 0 {
-		t.Fatalf("%d pending entries after the answer landed, want 0", n)
 	}
 }
 

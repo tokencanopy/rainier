@@ -20,6 +20,7 @@ import (
 
 	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/v0wire"
 )
 
 // ---------------------------------------------------------------------------
@@ -212,7 +213,7 @@ func TestCreateSession(t *testing.T) {
 		if loc := resp.Header.Get("Location"); !strings.HasPrefix(loc, "/v0/sessions/sess_") {
 			t.Errorf("Location = %q, want /v0/sessions/sess_...", loc)
 		}
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -248,7 +249,7 @@ func TestCreateSession(t *testing.T) {
 		if resp.StatusCode != http.StatusAccepted {
 			t.Fatalf("status = %d, want 202; body=%s", resp.StatusCode, raw)
 		}
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -322,7 +323,7 @@ func TestCreateSession(t *testing.T) {
 		hdr := map[string]string{"Idempotency-Key": "idem-1"}
 
 		firstRaw := readBody(t, doJSON(t, ts, http.MethodPost, "/v0/sessions", tok, map[string]any{"name": "once"}, hdr))
-		var firstBody sessionEnvelope
+		var firstBody v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(firstRaw), &firstBody); err != nil {
 			t.Fatalf("decode first: %v; body=%s", err, firstRaw)
 		}
@@ -332,7 +333,7 @@ func TestCreateSession(t *testing.T) {
 		if second.StatusCode != http.StatusAccepted {
 			t.Fatalf("replay status = %d, want 202; body=%s", second.StatusCode, secondRaw)
 		}
-		var secondBody sessionEnvelope
+		var secondBody v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(secondRaw), &secondBody); err != nil {
 			t.Fatalf("decode second: %v; body=%s", err, secondRaw)
 		}
@@ -360,7 +361,7 @@ func TestCreateSession(t *testing.T) {
 		if strings.Contains(raw, `"cmd":null`) || strings.Contains(raw, `"egress_allow":null`) {
 			t.Fatalf("nil slice rendered as JSON null: %s", raw)
 		}
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -410,14 +411,14 @@ func TestCreateSession(t *testing.T) {
 
 // createWithEnv POSTs a create body and returns the decoded session, failing
 // the test unless it was accepted.
-func createWithEnv(t *testing.T, ts *httptest.Server, tok string, body map[string]any) sessionView {
+func createWithEnv(t *testing.T, ts *httptest.Server, tok string, body map[string]any) v0wire.SessionView {
 	t.Helper()
 	resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", tok, body, nil)
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("POST /v0/sessions status = %d, want 202; body=%s", resp.StatusCode, raw)
 	}
-	var env sessionEnvelope
+	var env v0wire.SessionEnvelope
 	if err := json.Unmarshal([]byte(raw), &env); err != nil {
 		t.Fatalf("decode: %v; body=%s", err, raw)
 	}
@@ -1081,7 +1082,7 @@ func TestCreateSessionDispatchesInit(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// sessionJSON's two derived fields: "environment" and "queue_reason"
+// v0wire.RenderSession's two derived fields: "environment" and "queue_reason"
 // ---------------------------------------------------------------------------
 
 // envReadCountingStore counts GetEnvironment calls, so the list handler's
@@ -1125,7 +1126,7 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_env1", tok, nil, nil)
 		raw := readBody(t, resp)
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -1145,7 +1146,7 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_orphan", tok, nil, nil)
 		raw := readBody(t, resp)
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -1163,7 +1164,7 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_wait", tok, nil, nil)
 		raw := readBody(t, resp)
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -1185,7 +1186,7 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_soon", tok, nil, nil)
 		raw := readBody(t, resp)
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -1204,7 +1205,7 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_full", tok, nil, nil)
 		raw := readBody(t, resp)
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -1227,7 +1228,7 @@ func TestSessionEnvironmentAndQueueReason(t *testing.T) {
 		before := cst.reads()
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions", tok, nil, nil)
 		raw := readBody(t, resp)
-		var body sessionsEnvelope
+		var body v0wire.SessionsEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -1296,7 +1297,7 @@ func TestListSessions(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
 		}
-		var body sessionsEnvelope
+		var body v0wire.SessionsEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -1319,7 +1320,7 @@ func TestListSessions(t *testing.T) {
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions?all=true", tok, nil, nil)
 		raw := readBody(t, resp)
-		var body sessionsEnvelope
+		var body v0wire.SessionsEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -1345,7 +1346,7 @@ func TestListSessions(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
 		}
-		var body sessionsEnvelope
+		var body v0wire.SessionsEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -1418,7 +1419,7 @@ func TestGetSession(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
 		}
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -1457,7 +1458,7 @@ func TestGetSession(t *testing.T) {
 
 		resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_reach", tok, nil, nil)
 		raw := readBody(t, resp)
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -1881,7 +1882,7 @@ func TestSuspendSession(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
 		}
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -1914,7 +1915,7 @@ func TestSuspendSession(t *testing.T) {
 
 		resp := (<-resc).resp
 		raw := readBody(t, resp)
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -2036,7 +2037,7 @@ func TestSuspendSession(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200 (the runner op did execute); body=%s", resp.StatusCode, raw)
 		}
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -2081,7 +2082,7 @@ func TestResumeSession(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
 		}
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -2212,7 +2213,7 @@ func TestResumeSession(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200 (the runner op did execute); body=%s", resp.StatusCode, raw)
 		}
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -2915,7 +2916,9 @@ func TestListCredentials(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// connector vocabulary (unit): validateConnectors
+// connector vocabulary: the accept/reject table is v0wire's own
+// (v0wire/wire_test.go). What stays here is the shared JSON these handler
+// tests build environment bodies out of.
 // ---------------------------------------------------------------------------
 
 // The four connector shapes the v0 vocabulary defines, one canonical example
@@ -2935,146 +2938,6 @@ func connectorArray(elems ...string) json.RawMessage {
 	return json.RawMessage("[" + strings.Join(elems, ",") + "]")
 }
 
-func TestValidateConnectors(t *testing.T) {
-	t.Run("absent and empty both mean no connectors", func(t *testing.T) {
-		got, err := validateConnectors(nil)
-		if err != nil || len(got) != 0 {
-			t.Fatalf("validateConnectors(nil) = %+v, %v; want none, nil", got, err)
-		}
-		got, err = validateConnectors(json.RawMessage(`[]`))
-		if err != nil || len(got) != 0 {
-			t.Fatalf("validateConnectors([]) = %+v, %v; want none, nil", got, err)
-		}
-	})
-
-	t.Run("one of each type is accepted, type decoded and bytes kept verbatim", func(t *testing.T) {
-		want := []string{ghConnJSON, filesConnJSON, tunnelConnJSON, browserConnJSON}
-		wantTypes := []string{"github", "files", "tunnel", "browser"}
-
-		got, err := validateConnectors(connectorArray(want...))
-		if err != nil {
-			t.Fatalf("validateConnectors: %v", err)
-		}
-		if len(got) != len(want) {
-			t.Fatalf("got %d connectors, want %d", len(got), len(want))
-		}
-		for i := range got {
-			if got[i].Type != wantTypes[i] {
-				t.Errorf("connector %d type = %q, want %q", i, got[i].Type, wantTypes[i])
-			}
-			// Raw is never empty and never re-rendered: the stores diverge on
-			// how they persist an empty Raw, so the API must keep that case
-			// out of reachable space entirely.
-			if string(got[i].Raw) != want[i] {
-				t.Errorf("connector %d raw = %s, want %s", i, got[i].Raw, want[i])
-			}
-		}
-	})
-
-	t.Run("a github connector may omit base_branch (it defaults to main)", func(t *testing.T) {
-		const in = `{"type":"github","repo":"acme/widgets"}`
-		got, err := validateConnectors(connectorArray(in))
-		if err != nil {
-			t.Fatalf("validateConnectors: %v", err)
-		}
-		// The default is a decode-time value, not a stored one: the bytes
-		// stay exactly as the client wrote them.
-		if len(got) != 1 || string(got[0].Raw) != in {
-			t.Fatalf("got %+v, want the original bytes kept verbatim", got)
-		}
-		gh, err := decodeGitHubConnector(json.RawMessage(in))
-		if err != nil {
-			t.Fatalf("decodeGitHubConnector: %v", err)
-		}
-		if gh.BaseBranch == nil || *gh.BaseBranch != "main" {
-			t.Errorf("base_branch = %v, want the default main filled in", gh.BaseBranch)
-		}
-	})
-
-	t.Run("a dot-leading repository name is still a repository name", func(t *testing.T) {
-		// The path specials are refused, but `.github` is a real and extremely
-		// common repository, and a dotted directory under /workspace is still
-		// under /workspace. Refusing it would close nothing.
-		for _, in := range []string{
-			`{"type":"github","repo":"acme/.github"}`,
-			`{"type":"github","repo":"acme/dot.name"}`,
-			`{"type":"github","repo":"acme/with-dash"}`,
-			`{"type":"github","repo":"acme/_under"}`,
-		} {
-			if _, err := validateConnectors(connectorArray(in)); err != nil {
-				t.Errorf("validateConnectors(%s) = %v, want it accepted", in, err)
-			}
-		}
-	})
-
-	t.Run("rejections name what was wrong", func(t *testing.T) {
-		cases := []struct {
-			name, in, want string
-		}{
-			{"not an array", `{"type":"browser","tier":"dedicated"}`, "array"},
-			{"element is not an object", `["github"]`, "connectors[0]"},
-			{"missing type", `[{"repo":"acme/widgets"}]`, "type"},
-			{"unknown type", `[{"type":"gitlab","repo":"acme/widgets"}]`, "gitlab"},
-			{"unknown type is named even in a later element", `[` + ghConnJSON + `,{"type":"gitlab"}]`, "gitlab"},
-			{"unknown field on github", `[{"type":"github","repo":"x/y","extra":1}]`, "extra"},
-			{"unknown field on files", `[{"type":"files","paths":["a"],"recursive":true}]`, "recursive"},
-			{"unknown field on tunnel", `[{"type":"tunnel","name":"n","target_host":"h","target_port":1,"proto":"tcp"}]`, "proto"},
-			{"unknown field on browser", `[{"type":"browser","tier":"dedicated","profile":"x"}]`, "profile"},
-			{"repo without an owner", `[{"type":"github","repo":"widgets"}]`, "repo"},
-			{"repo with a space", `[{"type":"github","repo":"acme/wid gets"}]`, "repo"},
-			{"repo with a path segment too many", `[{"type":"github","repo":"acme/widgets/deep"}]`, "repo"},
-			// The name becomes a directory component under /workspace, so the
-			// two path specials are refused HERE rather than left to git's
-			// accident of declining a non-empty clone destination.
-			{"repo named ..", `[{"type":"github","repo":"acme/.."}]`, "repo"},
-			{"repo named .", `[{"type":"github","repo":"acme/."}]`, "repo"},
-			{"owner named ..", `[{"type":"github","repo":"../widgets"}]`, "repo"},
-			{"repo starting with a dash", `[{"type":"github","repo":"acme/-widgets"}]`, "repo"},
-			{"owner starting with a dash", `[{"type":"github","repo":"-acme/widgets"}]`, "repo"},
-			{"explicitly empty base_branch", `[{"type":"github","repo":"a/b","base_branch":""}]`, "base_branch"},
-			{"files with no paths", `[{"type":"files","paths":[]}]`, "paths"},
-			{"files with a missing paths key", `[{"type":"files"}]`, "paths"},
-			{"files with an empty path", `[{"type":"files","paths":["ok",""]}]`, "paths"},
-			{"tunnel without a name", `[{"type":"tunnel","target_host":"h","target_port":22}]`, "name"},
-			{"tunnel without a host", `[{"type":"tunnel","name":"n","target_port":22}]`, "target_host"},
-			{"tunnel port 0", `[{"type":"tunnel","name":"n","target_host":"h","target_port":0}]`, "target_port"},
-			{"tunnel port 65536", `[{"type":"tunnel","name":"n","target_host":"h","target_port":65536}]`, "target_port"},
-			{"tunnel port negative", `[{"type":"tunnel","name":"n","target_host":"h","target_port":-1}]`, "target_port"},
-			{"browser with an unknown tier", `[{"type":"browser","tier":"daily"}]`, "tier"},
-			{"browser with no tier", `[{"type":"browser"}]`, "tier"},
-		}
-		for _, tc := range cases {
-			t.Run(tc.name, func(t *testing.T) {
-				got, err := validateConnectors(json.RawMessage(tc.in))
-				if err == nil {
-					t.Fatalf("validateConnectors(%s) = %+v, want an error", tc.in, got)
-				}
-				if !strings.Contains(err.Error(), tc.want) {
-					t.Errorf("error = %q, want it to mention %q", err, tc.want)
-				}
-			})
-		}
-	})
-
-	t.Run("boundary ports are accepted", func(t *testing.T) {
-		for _, port := range []int{1, 65535} {
-			in := fmt.Sprintf(`{"type":"tunnel","name":"n","target_host":"h","target_port":%d}`, port)
-			if _, err := validateConnectors(connectorArray(in)); err != nil {
-				t.Errorf("port %d: %v", port, err)
-			}
-		}
-	})
-
-	t.Run("both browser tiers are accepted", func(t *testing.T) {
-		for _, tier := range []string{"dedicated", "extension"} {
-			in := fmt.Sprintf(`{"type":"browser","tier":%q}`, tier)
-			if _, err := validateConnectors(connectorArray(in)); err != nil {
-				t.Errorf("tier %s: %v", tier, err)
-			}
-		}
-	})
-}
-
 // ---------------------------------------------------------------------------
 // environments: shared test helpers
 // ---------------------------------------------------------------------------
@@ -3091,14 +2954,14 @@ func envCreateBody(name string, over map[string]any) map[string]any {
 
 // createEnv POSTs body as tok and fails the test unless it is a 201,
 // returning the decoded environment.
-func createEnv(t *testing.T, ts *httptest.Server, tok string, body map[string]any) environmentView {
+func createEnv(t *testing.T, ts *httptest.Server, tok string, body map[string]any) v0wire.EnvironmentView {
 	t.Helper()
 	resp := doJSON(t, ts, http.MethodPost, "/v0/environments", tok, body, nil)
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("POST /v0/environments status = %d, want 201; body=%s", resp.StatusCode, raw)
 	}
-	var env environmentEnvelope
+	var env v0wire.EnvironmentEnvelope
 	if err := json.Unmarshal([]byte(raw), &env); err != nil {
 		t.Fatalf("decode: %v; body=%s", err, raw)
 	}
@@ -3106,14 +2969,14 @@ func createEnv(t *testing.T, ts *httptest.Server, tok string, body map[string]an
 }
 
 // getEnv GETs ref and fails unless it is a 200, returning the environment.
-func getEnv(t *testing.T, ts *httptest.Server, tok, ref string) environmentView {
+func getEnv(t *testing.T, ts *httptest.Server, tok, ref string) v0wire.EnvironmentView {
 	t.Helper()
 	resp := doRequest(t, ts, http.MethodGet, "/v0/environments/"+ref, tok, nil, nil)
 	raw := readBody(t, resp)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("GET /v0/environments/%s status = %d, want 200; body=%s", ref, resp.StatusCode, raw)
 	}
-	var env environmentEnvelope
+	var env v0wire.EnvironmentEnvelope
 	if err := json.Unmarshal([]byte(raw), &env); err != nil {
 		t.Fatalf("decode: %v; body=%s", err, raw)
 	}
@@ -3200,7 +3063,7 @@ func TestCreateEnvironment(t *testing.T) {
 		if resp.StatusCode != http.StatusCreated {
 			t.Fatalf("status = %d, want 201; body=%s", resp.StatusCode, raw)
 		}
-		var env environmentEnvelope
+		var env v0wire.EnvironmentEnvelope
 		if err := json.Unmarshal([]byte(raw), &env); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -3519,7 +3382,7 @@ func TestListEnvironments(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
 		}
-		var body environmentsEnvelope
+		var body v0wire.EnvironmentsEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -3636,7 +3499,7 @@ func TestUpdateEnvironment(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
 		}
-		var env environmentEnvelope
+		var env v0wire.EnvironmentEnvelope
 		if err := json.Unmarshal([]byte(raw), &env); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -3670,7 +3533,7 @@ func TestUpdateEnvironment(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
 		}
-		var env environmentEnvelope
+		var env v0wire.EnvironmentEnvelope
 		if err := json.Unmarshal([]byte(raw), &env); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -3699,7 +3562,7 @@ func TestUpdateEnvironment(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
 		}
-		var env environmentEnvelope
+		var env v0wire.EnvironmentEnvelope
 		if err := json.Unmarshal([]byte(raw), &env); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -3733,7 +3596,7 @@ func TestUpdateEnvironment(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
 		}
-		var env environmentEnvelope
+		var env v0wire.EnvironmentEnvelope
 		if err := json.Unmarshal([]byte(raw), &env); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -3760,7 +3623,7 @@ func TestUpdateEnvironment(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, raw)
 		}
-		var env environmentEnvelope
+		var env v0wire.EnvironmentEnvelope
 		if err := json.Unmarshal([]byte(raw), &env); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -4038,7 +3901,7 @@ func TestListRunners(t *testing.T) {
 			if resp.StatusCode != http.StatusOK {
 				return fmt.Errorf("status = %d; body=%s", resp.StatusCode, raw)
 			}
-			var body runnersEnvelope
+			var body v0wire.RunnersEnvelope
 			if err := json.Unmarshal([]byte(raw), &body); err != nil {
 				return err
 			}
@@ -4071,7 +3934,7 @@ func TestListRunners(t *testing.T) {
 		eventually(t, 3*time.Second, func() error {
 			resp := doRequest(t, ts, http.MethodGet, "/v0/runners", tok, nil, nil)
 			raw = readBody(t, resp)
-			var body runnersEnvelope
+			var body v0wire.RunnersEnvelope
 			if err := json.Unmarshal([]byte(raw), &body); err != nil {
 				return err
 			}
@@ -4255,7 +4118,7 @@ func TestCreateDurableBeforeDispatch(t *testing.T) {
 		if resp.StatusCode != http.StatusAccepted {
 			t.Fatalf("status = %d, want 202; body=%s", resp.StatusCode, raw)
 		}
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -4290,7 +4153,7 @@ func TestCreateDurableBeforeDispatch(t *testing.T) {
 
 		resp := doJSON(t, ts, http.MethodPost, "/v0/sessions", tok, map[string]any{"name": "durable2", "image": "img:latest"}, nil)
 		raw := readBody(t, resp)
-		var body sessionEnvelope
+		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(raw), &body); err != nil {
 			t.Fatalf("decode: %v; body=%s", err, raw)
 		}
@@ -4408,11 +4271,45 @@ func TestQueueReasonNamesAMissingCapability(t *testing.T) {
 
 	resp := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_wants_gpu", tok, nil, nil)
 	raw := readBody(t, resp)
-	var body sessionEnvelope
+	var body v0wire.SessionEnvelope
 	if err := json.Unmarshal([]byte(raw), &body); err != nil {
 		t.Fatalf("decode: %v; body=%s", err, raw)
 	}
 	if got, want := body.Session.QueueReason, "waiting for a runner with capability gpu"; got != want {
 		t.Fatalf("queue_reason = %q, want %q", got, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the host's refinement of ErrUnavailable
+//
+// The sentinel table itself is v0wire's (v0wire/wire_test.go). What is pinned
+// here is the half that cannot leave: which runner is connected to THIS
+// replica.
+// ---------------------------------------------------------------------------
+
+// connectedMap is the smallest control.RunnerTransport a status test needs.
+type connectedMap map[control.RunnerID]bool
+
+func (m connectedMap) Connected(_ control.PoolID, id control.RunnerID) bool { return m[id] }
+func (connectedMap) Dispatch(context.Context, control.PoolID, control.RunnerID, runner.ToRunner) (runner.FromRunner, error) {
+	return runner.FromRunner{}, control.ErrUnavailable
+}
+
+func TestUnavailableStatusRefinesByRunnerConnectivity(t *testing.T) {
+	s := &Server{transport: connectedMap{"runner-a": true}}
+	placedOnDisconnected := control.Session{ID: "sess_example", RunnerID: "runner-b"}
+	if status, code, _ := s.unavailableStatus(placedOnDisconnected); status != http.StatusBadGateway || code != "runner_unreachable" {
+		t.Fatalf("disconnected runner = %d %s", status, code)
+	}
+	placedOnConnected := control.Session{ID: "sess_example", RunnerID: "runner-a"}
+	if status, code, msg := s.unavailableStatus(placedOnConnected); status != http.StatusBadGateway || code != "runner_unreachable" || msg != "runner did not respond" {
+		t.Fatalf("connected runner that did not answer = %d %s %q", status, code, msg)
+	}
+	if status, code, _ := s.unavailableStatus(control.Session{ID: "sess_example"}); status != http.StatusInternalServerError || code != "internal" {
+		t.Fatalf("unplaced = %d %s", status, code)
+	}
+	if status, _, _ := (&Server{}).unavailableStatus(placedOnDisconnected); status != http.StatusBadGateway {
+		t.Fatalf("no transport composed = %d", status)
 	}
 }

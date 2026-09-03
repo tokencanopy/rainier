@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # check-public-control.sh — guards the public control package.
 #
-# 1. Import hygiene: the control and controlapp packages and their tests may
-#    not import any internal/ path, HTTP/WebSocket, SQL/pgx, Docker, GitHub
-#    SDK, cloud SDK, billing package, or provider-named package.
+# 1. Import hygiene: the control and controlapp packages, the public wire and
+#    plane packages, and their tests may not import any internal/ path,
+#    SQL/pgx, Docker, GitHub SDK, cloud SDK, billing package, or
+#    provider-named package. HTTP and WebSocket are refused too, except for
+#    the packages whose whole subject is an HTTP/WebSocket surface (see
+#    http_ok below).
 # 2. Duplicate-model inventory: exported identifiers that also exist in
 #    internal/controld are the definitions the extraction lanes will migrate.
 #    They are ALLOWED only while named in the allowlist below (the exact
@@ -26,22 +29,67 @@ test -d controlapp/repotest
 test -f controlapp/repotest/doc.go
 go list ./controlapp/repotest >/dev/null
 
+test -d v0wire
+test -f v0wire/doc.go
+go list ./v0wire >/dev/null
+
+test -d attachplane
+test -f attachplane/doc.go
+go list ./attachplane >/dev/null
+
+test -d runnerplane
+test -f runnerplane/doc.go
+go list ./runnerplane >/dev/null
+
 # ---------------------------------------------------------------------------
 # 1. import hygiene
 # ---------------------------------------------------------------------------
 # The same table is applied to every public application package — including
 # controlapp/repotest, the repository contract suite a hosted store must pass,
-# which is public precisely so a host outside this repository can run it. The
-# failure message names which package pulled the forbidden import in.
+# which is public precisely so a host outside this repository can run it, and
+# v0wire (the /v0/ JSON wire a hosted cell serves from its own router), and
+# the two planes (attachplane, runnerplane). The failure message names which
+# package pulled the forbidden import in.
+#
+# Rows are relaxed only where a package's whole subject is the thing the row
+# forbids: net/http for the wire and the planes (v0wire renders responses and
+# decodes bodies; a plane IS an endpoint), WebSocket for the planes only, and
+# internal/relay for attachplane only — the runner side of the attach hop,
+# which attachplane's tests pin its own conn against (its shipped code does
+# not import it). Every other row applies to every package unchanged, and the
+# application packages above the wire and the planes get no relaxation.
 bad_imports=0
-for pkg in control controlapp controlapp/repotest; do
+for pkg in control controlapp controlapp/repotest v0wire attachplane runnerplane; do
+  http_ok=0; ws_ok=0; relay_ok=0
+  case "$pkg" in
+    v0wire)      http_ok=1 ;;
+    attachplane) http_ok=1; ws_ok=1; relay_ok=1 ;;
+    runnerplane) http_ok=1; ws_ok=1 ;;
+  esac
   while IFS= read -r imp; do
     [[ -z "$imp" ]] && continue
     lower="$(printf '%s' "$imp" | tr '[:upper:]' '[:lower:]')"
     case "$lower" in
-      *rainier/internal/*)   reason="internal/ path" ;;
-      *net/http*)            reason="HTTP server" ;;
-      *coder/websocket*)     reason="WebSocket" ;;
+      *rainier/internal/*)
+        if [[ "$relay_ok" == "1" && "$lower" == *rainier/internal/relay ]]; then
+          continue
+        fi
+        reason="internal/ path" ;;
+      *rainier/controlapp*)
+        case "$pkg" in
+          attachplane|runnerplane) reason="controlapp (a plane is composed beside it, never over it)" ;;
+          *) continue ;;
+        esac ;;
+      *net/http*)
+        if [[ "$http_ok" == "1" ]]; then
+          continue
+        fi
+        reason="HTTP server" ;;
+      *coder/websocket*)
+        if [[ "$ws_ok" == "1" ]]; then
+          continue
+        fi
+        reason="WebSocket" ;;
       *database/sql*)        reason="SQL" ;;
       *jackc/pgx*)           reason="pgx" ;;
       *docker*)              reason="Docker" ;;

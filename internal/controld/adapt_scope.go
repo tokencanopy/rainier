@@ -3,10 +3,10 @@ package controld
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"strings"
 
 	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/runnerplane"
 )
 
 // A self-hosted installation is exactly one workspace running exactly one
@@ -35,35 +35,27 @@ func runnerCapabilities(name string) []string {
 	return []string{placementCapabilityPrefix + name}
 }
 
-// The capability token rule, and the one this installation applies to every
-// capability that is not the host's own: a lowercase token, at most 32 of
-// them on any one claim, and never a host prefix. It is deliberately narrow —
-// a capability is matched by exact string equality across a fleet of runners
-// nobody re-deploys at once, so a spelling that varies by case or whitespace
-// is a placement that silently never happens.
-const maxCapabilities = 32
-
-var capabilityToken = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
-
-// validateCapabilities applies that rule to caps, returning a client-facing
-// sentence naming the first thing wrong with it. what names the list in that
-// sentence, so the same rule can answer for an environment's field and for a
-// runner's announce without either message claiming to be the other.
+// validateCapabilities applies the ONE capability token rule to the
+// capabilities an operator writes on an environment, returning a
+// client-facing sentence naming the first thing wrong with it. The rule is
+// the runner plane's, exported once as runnerplane.ValidCapability and
+// applied there to what a runner announces, so an environment's field and a
+// runner's announce are judged identically; what names the list in the
+// sentence, so neither message claims to be the other.
 //
-// Host prefixes are refused rather than ignored: the two capabilities
-// controld spells for a runner's own name are the HOST's claims about it
-// (adapt_scope.go, store.go), and a runner or an operator that could write
-// one could pin any environment to any runner.
+// Host prefixes are refused rather than ignored: the capability spelled for a
+// runner's own name is the HOST's claim about it, and a runner or an operator
+// that could write one could pin any environment to any runner.
 func validateCapabilities(what string, caps []string) error {
-	if len(caps) > maxCapabilities {
-		return fmt.Errorf("%s: at most %d are allowed, got %d", what, maxCapabilities, len(caps))
+	if len(caps) > runnerplane.MaxCapabilities {
+		return fmt.Errorf("%s: at most %d are allowed, got %d", what, runnerplane.MaxCapabilities, len(caps))
 	}
 	seen := make(map[string]bool, len(caps))
 	for _, c := range caps {
 		switch {
 		case strings.Contains(c, ":"):
 			return fmt.Errorf("%s: %q carries a host prefix, which only controld may claim", what, clip(c))
-		case !capabilityToken.MatchString(c):
+		case !runnerplane.ValidCapability(c):
 			return fmt.Errorf("%s: %q must match [a-z0-9][a-z0-9._-]{0,63}", what, clip(c))
 		case seen[c]:
 			return fmt.Errorf("%s: %q is listed twice", what, clip(c))

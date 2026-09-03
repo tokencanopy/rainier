@@ -202,6 +202,9 @@ process: `kill` it. Sessions survive both (that is the whole point).
 ```bash
 make build                                          # local bin/rainier
 ./bin/rainier login --from-gh --server http://rainier-1:9090
+# The CLI keeps named contexts (`rainier context list`); this login lands in
+# "default" unless --context names another, and a hosted edge is a separate
+# context via `rainier login --cloud https://<edge>` (README, "Hosted login").
 ./bin/rainier new --name box1 --image rainier-session:latest
 # → prints the id, then attaches: you are in the container's shell
 #   Ctrl-] detaches; the session keeps running

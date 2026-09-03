@@ -76,7 +76,13 @@ func TestConfigRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got != want {
+	// Config carries named contexts now, so it is no longer comparable with
+	// ==; what a round trip has to preserve is the context that was written
+	// and the accessors every command reads it through.
+	if ctx, ok := got.Active(); !ok || ctx.Server != want.ServerURL || ctx.Token != want.Token {
+		t.Fatalf("Load() active context = %+v (ok=%v), want %+v", ctx, ok, want)
+	}
+	if got.ServerURL != want.ServerURL || got.Token != want.Token {
 		t.Fatalf("Load() = %+v, want %+v", got, want)
 	}
 }
@@ -96,7 +102,7 @@ func TestConfigOwnerIDRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got != want {
+	if got.ServerURL != want.ServerURL || got.Token != want.Token || got.OwnerID != want.OwnerID {
 		t.Fatalf("Load() = %+v, want %+v", got, want)
 	}
 }
@@ -126,7 +132,7 @@ func TestLoadMissingFileReturnsZeroValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got != (Config{}) {
+	if len(got.Contexts) != 0 || got.Current != "" || got.ServerURL != "" || got.Token != "" {
 		t.Fatalf("Load() = %+v, want zero value", got)
 	}
 }
@@ -1111,5 +1117,263 @@ func TestSmokeCLIAgainstRealControld(t *testing.T) {
 	}
 	if !strings.Contains(out, "[detached at seq") {
 		t.Fatalf("attach output = %q, want the detach status line", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// named contexts, the workspace header, and the hosted refresh
+// ---------------------------------------------------------------------------
+
+// TestLegacyConfigMigratesIntoTheDefaultContext pins the upgrade path: a
+// config written by an earlier rainier is a single unnamed server, and it
+// must keep working — read as the "default" context, answered through the
+// same accessors every command already uses, and rewritten in the new shape
+// the first time anything saves.
+func TestLegacyConfigMigratesIntoTheDefaultContext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("RAINIER_CONFIG", path)
+	legacy := `{
+  "server_url": "https://controld.example.test",
+  "token": "tok_example",
+  "owner_id": "usr_example"
+}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.Current != DefaultContext {
+		t.Errorf("current context = %q, want %q", got.Current, DefaultContext)
+	}
+	ctx, ok := got.Active()
+	if !ok {
+		t.Fatalf("Load() = %+v, want an active context", got)
+	}
+	want := Context{Server: "https://controld.example.test", Token: "tok_example", OwnerID: "usr_example"}
+	if ctx != want {
+		t.Errorf("active context = %+v, want %+v", ctx, want)
+	}
+	if got.ServerURL != want.Server || got.Token != want.Token || got.OwnerID != want.OwnerID {
+		t.Errorf("legacy accessors = %q/%q/%q, want the active context's", got.ServerURL, got.Token, got.OwnerID)
+	}
+
+	// Saving it back writes the new shape — the one every later Load reads
+	// without migrating anything.
+	if err := Save(got); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantJSON := `{
+  "current": "default",
+  "contexts": {
+    "default": {
+      "server_url": "https://controld.example.test",
+      "token": "tok_example",
+      "owner_id": "usr_example"
+    }
+  }
+}`
+	if string(data) != wantJSON {
+		t.Errorf("re-saved config =\n%s\nwant\n%s", data, wantJSON)
+	}
+}
+
+// TestWorkspaceHeaderIsSentOnlyWhenTheContextNamesOne: a hosted context is
+// scoped to one workspace and every request says so; a self-hosted context
+// has none and must not invent one.
+func TestWorkspaceHeaderIsSentOnlyWhenTheContextNamesOne(t *testing.T) {
+	var mu sync.Mutex
+	var seen []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, r.Header.Get("Rainier-Workspace"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{}`)
+	}))
+	defer ts.Close()
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var cfg Config
+	cfg.SetContext(DefaultContext, Context{Server: ts.URL, Token: "tok_example"})
+	if err := NewClient(cfg).Do(http.MethodGet, "/v0/sessions", nil, nil); err != nil {
+		t.Fatalf("self-hosted request: %v", err)
+	}
+	cfg.SetContext("edge.example.test", Context{Server: ts.URL, Token: "tok_example", Workspace: "ws_example"})
+	if err := NewClient(cfg).Do(http.MethodGet, "/v0/sessions", nil, nil); err != nil {
+		t.Fatalf("hosted request: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != 2 || seen[0] != "" || seen[1] != "ws_example" {
+		t.Fatalf("Rainier-Workspace headers = %q, want [\"\" \"ws_example\"]", seen)
+	}
+}
+
+// hostedRefreshServer answers /v0/auth/refresh with a rotated pair for the
+// one refresh token it considers live, and 401s everything else — the
+// single-use rotation the hosted edge implements.
+func hostedRefreshServer(t *testing.T, live string, apiStatus func(auth string) int) (*httptest.Server, func() int) {
+	t.Helper()
+	var mu sync.Mutex
+	refreshes := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v0/auth/refresh" {
+			var body struct {
+				RefreshToken string `json:"refresh_token"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode refresh body: %v", err)
+			}
+			mu.Lock()
+			refreshes++
+			mu.Unlock()
+			if body.RefreshToken != live {
+				w.WriteHeader(http.StatusUnauthorized)
+				io.WriteString(w, `{"error":{"code":"credential_replayed","message":"that refresh token was already used"}}`)
+				return
+			}
+			io.WriteString(w, `{"token_type":"Bearer","access_token":"tok_access_rotated",`+
+				`"access_expires_at":"2026-09-02T00:10:00Z","refresh_token":"tok_refresh_rotated",`+
+				`"refresh_expires_at":"2026-09-09T00:00:00Z"}`)
+			return
+		}
+		if status := apiStatus(r.Header.Get("Authorization")); status != http.StatusOK {
+			w.WriteHeader(status)
+			io.WriteString(w, `{"error":{"code":"unauthenticated","message":"bearer token required"}}`)
+			return
+		}
+		io.WriteString(w, `{"sessions":[]}`)
+	}))
+	t.Cleanup(ts.Close)
+	return ts, func() int { mu.Lock(); defer mu.Unlock(); return refreshes }
+}
+
+// TestOneTransparentRefreshOnUnauthorized: a hosted access token expires
+// while the CLI is in use. The client refreshes once, saves the rotated pair
+// (the old refresh token is now spent), and retries the original request —
+// the user sees nothing.
+func TestOneTransparentRefreshOnUnauthorized(t *testing.T) {
+	ts, refreshes := hostedRefreshServer(t, "tok_refresh_example", func(auth string) int {
+		if auth == "Bearer tok_access_rotated" {
+			return http.StatusOK
+		}
+		return http.StatusUnauthorized
+	})
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var cfg Config
+	cfg.SetContext("edge.example.test", Context{
+		Server: ts.URL, Token: "tok_access_stale", RefreshToken: "tok_refresh_example",
+		Workspace: "ws_example", AccessExpiresAt: "2026-09-01T00:00:00Z",
+	})
+	if err := Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := NewClient(loaded).Do(http.MethodGet, "/v0/sessions", nil, nil); err != nil {
+		t.Fatalf("Do after a transparent refresh: %v", err)
+	}
+	if n := refreshes(); n != 1 {
+		t.Errorf("refresh calls = %d, want exactly 1", n)
+	}
+
+	saved, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := saved.Contexts["edge.example.test"]
+	want := Context{
+		Server: ts.URL, Token: "tok_access_rotated", RefreshToken: "tok_refresh_rotated",
+		Workspace: "ws_example", AccessExpiresAt: "2026-09-02T00:10:00Z",
+	}
+	if got != want {
+		t.Errorf("saved context = %+v, want the rotated pair %+v", got, want)
+	}
+}
+
+// TestASecondUnauthorizedGivesUp: one refresh, one retry, then stop. A
+// client that kept refreshing would loop against an edge that has revoked
+// the session.
+func TestASecondUnauthorizedGivesUp(t *testing.T) {
+	ts, refreshes := hostedRefreshServer(t, "tok_refresh_example", func(string) int {
+		return http.StatusUnauthorized
+	})
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var cfg Config
+	cfg.SetContext("edge.example.test", Context{Server: ts.URL, Token: "tok_access_stale", RefreshToken: "tok_refresh_example"})
+	if err := Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, _ := Load()
+
+	err := NewClient(loaded).Do(http.MethodGet, "/v0/sessions", nil, nil)
+	if !errors.Is(err, ErrLoginAgain) {
+		t.Fatalf("Do error = %v, want ErrLoginAgain", err)
+	}
+	if n := refreshes(); n != 1 {
+		t.Errorf("refresh calls = %d, want exactly 1", n)
+	}
+	if strings.Contains(err.Error(), "tok_") {
+		t.Errorf("error text carries token material: %q", err)
+	}
+}
+
+// TestReplayedRefreshTokenGivesUp: the edge answers a reused refresh token
+// with 401 credential_replayed. That is not retryable — the whole chain is
+// revoked — so the CLI says so in the one sentence it has for it.
+func TestReplayedRefreshTokenGivesUp(t *testing.T) {
+	ts, refreshes := hostedRefreshServer(t, "tok_refresh_live", func(string) int {
+		return http.StatusUnauthorized
+	})
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var cfg Config
+	cfg.SetContext("edge.example.test", Context{Server: ts.URL, Token: "tok_access_stale", RefreshToken: "tok_refresh_spent"})
+	if err := Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, _ := Load()
+
+	err := NewClient(loaded).Do(http.MethodGet, "/v0/sessions", nil, nil)
+	if !errors.Is(err, ErrLoginAgain) {
+		t.Fatalf("Do error = %v, want ErrLoginAgain", err)
+	}
+	if n := refreshes(); n != 1 {
+		t.Errorf("refresh calls = %d, want exactly 1", n)
+	}
+}
+
+// TestSelfHostedContextDoesNotRefresh: a self-hosted context has no refresh
+// token, so a 401 is the answer, verbatim, not the start of a token dance.
+func TestSelfHostedContextDoesNotRefresh(t *testing.T) {
+	ts, refreshes := hostedRefreshServer(t, "unused", func(string) int {
+		return http.StatusUnauthorized
+	})
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var cfg Config
+	cfg.SetContext(DefaultContext, Context{Server: ts.URL, Token: "tok_example"})
+
+	var apiErr *APIError
+	err := NewClient(cfg).Do(http.MethodGet, "/v0/sessions", nil, nil)
+	if !errors.As(err, &apiErr) || apiErr.Code != "unauthenticated" {
+		t.Fatalf("Do error = %v, want the server's own unauthenticated error", err)
+	}
+	if n := refreshes(); n != 0 {
+		t.Errorf("refresh calls = %d, want none for a self-hosted context", n)
 	}
 }
