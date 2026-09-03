@@ -59,6 +59,17 @@ func RunHost(t *testing.T, open func(t *testing.T) controld.HostStore) {
 			}
 		}
 	}
+	// A store records events as well as it keeps rows: the two are one
+	// write, so the recorder is the same object the lookups are on. A store
+	// that does not carry it is failed here rather than silently skipped.
+	recorder := func(t *testing.T, st controld.HostStore) control.EventRecorder {
+		t.Helper()
+		r, ok := st.(control.EventRecorder)
+		if !ok {
+			t.Fatalf("a host store must also record events; %T does not", st)
+		}
+		return r
+	}
 
 	t.Run("user upsert is stable by github id", func(t *testing.T) {
 		st := open(t)
@@ -436,6 +447,101 @@ func RunHost(t *testing.T, open func(t *testing.T) controld.HostStore) {
 		}
 		if holder, err := st.SnapshotRunner(ctx, hostWorkspace, env.ID); err != nil || holder != "runner_a" {
 			t.Fatalf("holder after the hash moved = %q, %v; want runner_a still", holder, err)
+		}
+	})
+
+	// SnapshotHolder is the direct answer to "where can this ref boot": the
+	// runner holding it while the cache is still current, and nobody at all
+	// once the environment's setup hash moves on. A stale cache pins a
+	// session to no runner — that is the difference between this lookup and
+	// SnapshotRunner, which reports the column stale or not.
+	t.Run("snapshot holder answers for a current cache only", func(t *testing.T) {
+		st := open(t)
+		envs := ports(t, st).Environments()
+		provision(t, st, hostWorkspace, hostOtherWS)
+
+		env, err := envs.CreateEnvironment(ctx, hostWorkspace, control.Environment{
+			ID: "env_a", Name: "dev", Image: "img:1", Setup: "make deps", SetupHash: "h1"})
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if holder, err := st.SnapshotHolder(ctx, hostWorkspace, "snap:1"); err != nil || holder != "" {
+			t.Fatalf("holder before any snapshot = %q, %v; want no holder", holder, err)
+		}
+
+		if err := envs.SetEnvironmentSnapshot(ctx, hostWorkspace, env.ID, "h1", "snap:1", "runner_a"); err != nil {
+			t.Fatalf("snapshot: %v", err)
+		}
+		if holder, err := st.SnapshotHolder(ctx, hostWorkspace, "snap:1"); err != nil || holder != "runner_a" {
+			t.Fatalf("holder = %q, %v; want runner_a", holder, err)
+		}
+		// A ref nobody built, and another workspace's view of one that was
+		// built, are both "no holder" rather than an error.
+		if holder, err := st.SnapshotHolder(ctx, hostWorkspace, "snap:other"); err != nil || holder != "" {
+			t.Fatalf("holder of an unknown ref = %q, %v; want no holder", holder, err)
+		}
+		if holder, err := st.SnapshotHolder(ctx, hostOtherWS, "snap:1"); err != nil || holder != "" {
+			t.Fatalf("another workspace's holder = %q, %v; want no holder", holder, err)
+		}
+
+		// The setup hash moves on: the cache is stale, and a stale cache
+		// holds nothing.
+		moved := env
+		moved.SetupHash = "h2"
+		moved.Setup = "make deps && make build"
+		if _, err := envs.UpdateEnvironment(ctx, hostWorkspace, moved); err != nil {
+			t.Fatalf("update: %v", err)
+		}
+		if holder, err := st.SnapshotHolder(ctx, hostWorkspace, "snap:1"); err != nil || holder != "" {
+			t.Fatalf("holder after the hash moved = %q, %v; want no holder", holder, err)
+		}
+
+		// Neither an unscoped question nor an empty ref is a question this
+		// lookup can answer.
+		if _, err := st.SnapshotHolder(ctx, "", "snap:1"); !errors.Is(err, control.ErrInvalid) {
+			t.Fatalf("empty workspace: err = %v, want control.ErrInvalid", err)
+		}
+		if _, err := st.SnapshotHolder(ctx, hostWorkspace, ""); !errors.Is(err, control.ErrInvalid) {
+			t.Fatalf("empty ref: err = %v, want control.ErrInvalid", err)
+		}
+	})
+
+	// Recording an event is a write like any other: its id is an identity
+	// somebody either holds or does not, and it lands in a workspace that
+	// has to exist. What a store then does with the row is its own business
+	// — this suite pins the answers, not the storage.
+	t.Run("recording an event", func(t *testing.T) {
+		st := open(t)
+		rec := recorder(t, st)
+		provision(t, st, hostWorkspace, hostOtherWS)
+
+		at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+		ev := func(id string, ws control.WorkspaceID, resource string) control.Event {
+			return control.Event{
+				ID: control.EventID(id), WorkspaceID: ws, ActorID: "act_a", Action: control.ActionCreate,
+				Resource: control.Resource{Kind: control.ResourceSession, WorkspaceID: ws, ID: resource, CreatorID: "act_a"},
+				At:       at, PlacementGeneration: 2,
+				Usage: control.Usage{CPUTimeSeconds: 1.5, MemoryByteSeconds: 2, StorageBytes: 3, NetworkBytes: 4, AgentTokenCount: 5},
+			}
+		}
+		for _, e := range []control.Event{
+			ev("evt_example", hostWorkspace, "sess_example"),
+			ev("evt_second", hostWorkspace, "sess_second"),
+			ev("evt_beta", hostOtherWS, "sess_beta"),
+		} {
+			if err := rec.Record(ctx, e); err != nil {
+				t.Fatalf("Record(%s): %v", e.ID, err)
+			}
+		}
+
+		// An id is an identity: the same one twice is somebody else already
+		// holding it, not a second fact.
+		if err := rec.Record(ctx, ev("evt_example", hostWorkspace, "sess_example")); !errors.Is(err, control.ErrConflict) {
+			t.Fatalf("duplicate event id: err = %v, want control.ErrConflict", err)
+		}
+		// A workspace that does not exist is somewhere the event cannot land.
+		if err := rec.Record(ctx, ev("evt_nowhere", "ws_nosuch", "sess_example")); !errors.Is(err, control.ErrNotFound) {
+			t.Fatalf("unknown workspace: err = %v, want control.ErrNotFound", err)
 		}
 	})
 

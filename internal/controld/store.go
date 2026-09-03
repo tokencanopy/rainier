@@ -69,13 +69,22 @@ type Credential struct {
 }
 
 // Store is controld's persistence interface: the host's own persistence
-// (HostStore) and the three control repository ports (Repositories). There is
-// no third surface — sessions, environments, and runners exist once, as
-// control types, and every caller reaches them through the ports.
-// memstore (this package) and pgstore both implement it; storetest.RunHost
-// pins the host half's semantics, controlapp/repotest the ports'.
+// (HostStore), the host's atomicity and event record (control.UnitOfWork and
+// control.EventRecorder), and the three control repository ports
+// (Repositories). There is no third surface — sessions, environments, and
+// runners exist once, as control types, and every caller reaches them through
+// the ports.
+//
+// The unit of work and the recorder are on the store rather than beside it
+// because they are the same write: an event is durable exactly when the
+// mutation it describes is, which only the thing holding the transaction can
+// promise. memstore (this package) and pgstore both implement it;
+// storetest.RunHost pins the host half's semantics, controlapp/repotest the
+// ports'.
 type Store interface {
 	HostStore
+	control.UnitOfWork
+	control.EventRecorder
 	Repositories
 }
 
@@ -115,6 +124,13 @@ type HostStore interface {
 	// when there is none — stale or not, because the wire has always shown
 	// the column. It decides nothing.
 	SnapshotRunner(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID) (control.RunnerID, error)
+	// SnapshotHolder names the runner holding the snapshot with ref in ws,
+	// "" when no environment's current cache has it. A cache whose hash no
+	// longer matches its environment's setup hash is stale and holds
+	// nothing, which is the difference between this and SnapshotRunner: this
+	// one is asked where a checkpoint can boot, and a stale image is not an
+	// answer to that. An empty workspace or ref is control.ErrInvalid.
+	SnapshotHolder(ctx context.Context, ws control.WorkspaceID, ref string) (control.RunnerID, error)
 	// NextRunnerGeneration opens a new generation for id in pool and returns
 	// it: 1 for a runner never seen, else one more than stored. It is the
 	// only writer of the generation the fleet repository fences on.
@@ -131,11 +147,16 @@ type Repositories interface {
 	Fleet() control.FleetRepository
 }
 
-// MemStore is the shape the in-memory store has: Store itself, the union of
-// the host's own persistence and the three control repositories. It stays as
-// its own name because every test helper is written in terms of it.
+// MemStore is the shape the in-memory store has: Store itself, plus the one
+// window no durable store owes anybody. It stays as its own name because
+// every test helper is written in terms of it.
 type MemStore interface {
 	Store
+	// Events returns a copy of every event recorded so far, in the order it
+	// was recorded. It exists for tests above the store: nothing in the
+	// process consumes an event, and the in-memory store is the durable home
+	// of nothing, so keeping them costs only what a test then reads back.
+	Events() []control.Event
 }
 
 // snapshotCheckpointFormat is the format every self-hosted environment

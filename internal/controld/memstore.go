@@ -40,6 +40,15 @@ type memStore struct {
 	snapshots map[environmentKey]control.RunnerID
 	runners   map[runnerKey]*control.Runner
 
+	// events is every event recorded so far, in order, kept only so a test
+	// above the store can read back what a command recorded. Nothing in the
+	// process consumes one.
+	events []control.Event
+	// eventIDs is the identity half of the same list: an event id is
+	// somebody's identity exactly once, and scanning the slice for it would
+	// make recording quadratic in a long-running process.
+	eventIDs map[control.EventID]struct{}
+
 	// Identity and the vault are the host's, not a tenant's: users and
 	// credentials are the installation's operators, and the OSS vault is
 	// installation-wide. None of the four is workspace-keyed.
@@ -95,6 +104,7 @@ func NewMemStore() MemStore {
 		environments:  map[environmentKey]*control.Environment{},
 		snapshots:     map[environmentKey]control.RunnerID{},
 		runners:       map[runnerKey]*control.Runner{},
+		eventIDs:      map[control.EventID]struct{}{},
 		users:         map[string]*User{},
 		usersByGitHub: map[int64]string{},
 		tokens:        map[string]string{},
@@ -325,6 +335,13 @@ func (r memSessions) Transition(ctx context.Context, ws control.WorkspaceID, id 
 	}
 	if opts.Error != nil {
 		s.Error = *opts.Error
+	}
+	// The image a placement resolved: the cached checkpoint on a runner that
+	// holds it, else the environment's own. It moves with the state because
+	// it is decided by the same act — nothing else may write it, and a
+	// transition that names none leaves the spec alone.
+	if opts.Image != nil {
+		s.Spec.Image = *opts.Image
 	}
 	now := time.Now()
 	s.UpdatedAt = now
@@ -759,6 +776,47 @@ func (r memFleet) OldestQueued(ctx context.Context, pool control.PoolID) ([]cont
 }
 
 // ---------------------------------------------------------------------------
+// the unit of work and the event record
+// ---------------------------------------------------------------------------
+
+// Run is control.UnitOfWork for a store with no transactions to open: it
+// calls fn with the context it was handed and returns fn's error unchanged.
+// The port permits exactly this — a host without transactions runs fn
+// directly — and an in-memory store is the durable home of nothing, so there
+// is nothing here for a rollback to undo that anybody was promised.
+func (m *memStore) Run(ctx context.Context, fn func(context.Context) error) error {
+	return fn(ctx)
+}
+
+// Record keeps one event. Its id is an identity somebody either holds or
+// does not (control.ErrConflict), and it lands in a workspace that has to
+// exist (control.ErrNotFound) — the same two answers the durable store gives,
+// because the suite that pins them runs against both.
+func (m *memStore) Record(ctx context.Context, e control.Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.workspaces[e.WorkspaceID]; !ok {
+		return control.ErrNotFound
+	}
+	if _, ok := m.eventIDs[e.ID]; ok {
+		return control.ErrConflict
+	}
+	m.eventIDs[e.ID] = struct{}{}
+	m.events = append(m.events, e)
+	return nil
+}
+
+// Events returns a copy of everything recorded, in order. control.Event holds
+// no reference type — every member is a string, a number, or a time — so the
+// fresh slice is the whole copy, and nothing a caller writes through reaches
+// back into the store.
+func (m *memStore) Events() []control.Event {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return slices.Clone(m.events)
+}
+
+// ---------------------------------------------------------------------------
 // host lookups
 // ---------------------------------------------------------------------------
 
@@ -798,6 +856,28 @@ func (m *memStore) SnapshotRunner(ctx context.Context, ws control.WorkspaceID, i
 		return "", control.ErrNotFound
 	}
 	return m.snapshots[key], nil
+}
+
+// SnapshotHolder names the runner holding ref's snapshot in ws, "" when no
+// environment's CURRENT cache has it. A cache whose hash no longer matches
+// its environment's setup hash is stale, and a stale image is not an answer
+// to "where can this checkpoint boot" — so the scan requires the two to
+// agree, exactly as environmentView does before it lends out the affinity.
+func (m *memStore) SnapshotHolder(ctx context.Context, ws control.WorkspaceID, ref string) (control.RunnerID, error) {
+	if ws == "" || ref == "" {
+		return "", control.ErrInvalid
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for key, e := range m.environments {
+		if key.ws != ws || e.Snapshot.Ref != ref || e.SnapshotHash != e.SetupHash {
+			continue
+		}
+		if holder := m.snapshots[key]; holder != "" {
+			return holder, nil
+		}
+	}
+	return "", nil
 }
 
 func (m *memStore) NextRunnerGeneration(ctx context.Context, pool control.PoolID, id control.RunnerID) (uint64, error) {

@@ -270,10 +270,11 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	if want := embeddedMigrationVersions(t); !slices.Equal(applied, want) {
 		t.Fatalf("schema_migrations = %v, want every embedded migration in order %v", applied, want)
 	}
-	// This release's head is 8: a database that stopped at 0003 runs the
-	// expand step (0007) and the contract step (0008) in the same start.
-	if head := applied[len(applied)-1]; head != 8 {
-		t.Fatalf("head migration = %d, want 8", head)
+	// This release's head is 9: a database that stopped at 0003 runs the
+	// expand step (0007), the contract step (0008), and the events table
+	// (0009) in the same start.
+	if head := applied[len(applied)-1]; head != 9 {
+		t.Fatalf("head migration = %d, want 9", head)
 	}
 
 	// The legacy session survived, and its new columns read as "never exited"
@@ -345,7 +346,7 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	// the expand step (0007) and the contract step (0008) is a one-way ALTER
 	// or DROP, so a second application would fail loudly rather than
 	// silently — the assertion is that the version set is unchanged (through
-	// 8) and the rows still read.
+	// 9) and the rows still read.
 	if err := Migrate(ctx, st.pool); err != nil {
 		t.Fatalf("Migrate twice: %v", err)
 	}
@@ -578,5 +579,134 @@ func TestNextRunnerGenerationSurvivesReopen(t *testing.T) {
 	b := reopen(t, dbDSN)
 	if got, err := b.NextRunnerGeneration(ctx, "pool_a", "runner_a"); err != nil || got != 3 {
 		t.Fatalf("after reopen gen = %d, %v; want 3", got, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the unit of work and the events table (O10)
+// ---------------------------------------------------------------------------
+
+// TestRunIsAtomic: a unit that creates a session, records its event, and
+// then fails leaves neither the row nor the event.
+func TestRunIsAtomic(t *testing.T) {
+	st := freshStore(t, startPostgres(t), t.Name())
+	ctx := context.Background()
+	if err := st.EnsureWorkspace(ctx, "ws_alpha"); err != nil {
+		t.Fatal(err)
+	}
+	boom := errors.New("boom")
+	err := st.Run(ctx, func(ctx context.Context) error {
+		if _, err := st.Sessions().CreateSession(ctx, "ws_alpha", control.Session{ID: "sess_example", CreatorID: "act_a", State: control.StateQueued, PoolID: "pool_a"}); err != nil {
+			return err
+		}
+		if err := st.Record(ctx, control.Event{ID: "evt_example", WorkspaceID: "ws_alpha", ActorID: "act_a", Action: control.ActionCreate,
+			Resource: control.Resource{Kind: control.ResourceSession, WorkspaceID: "ws_alpha", ID: "sess_example", CreatorID: "act_a"}, At: time.Now()}); err != nil {
+			return err
+		}
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("Run returned %v, want fn's own error", err)
+	}
+	if _, err := st.Sessions().GetSession(ctx, "ws_alpha", "sess_example"); !errors.Is(err, control.ErrNotFound) {
+		t.Fatalf("the row survived the rollback: %v", err)
+	}
+	var n int
+	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM events`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("%d events survived the rollback", n)
+	}
+}
+
+// TestRunNestsAndCommitsOnce: an inner Run joins the outer one; the write
+// is visible only after the outer commit.
+func TestRunNestsAndCommitsOnce(t *testing.T) {
+	st := freshStore(t, startPostgres(t), t.Name())
+	ctx := context.Background()
+	if err := st.EnsureWorkspace(ctx, "ws_alpha"); err != nil {
+		t.Fatal(err)
+	}
+	err := st.Run(ctx, func(outer context.Context) error {
+		if err := st.Run(outer, func(inner context.Context) error {
+			_, err := st.Sessions().CreateSession(inner, "ws_alpha", control.Session{ID: "sess_example", CreatorID: "act_a", State: control.StateQueued, PoolID: "pool_a"})
+			return err
+		}); err != nil {
+			return err
+		}
+		// Not yet visible outside the unit.
+		if _, err := st.Sessions().GetSession(ctx, "ws_alpha", "sess_example"); !errors.Is(err, control.ErrNotFound) {
+			t.Fatalf("uncommitted row visible outside: %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Sessions().GetSession(ctx, "ws_alpha", "sess_example"); err != nil {
+		t.Fatalf("committed row missing: %v", err)
+	}
+}
+
+// TestRecordedEventsLandInTheirWorkspace reads the rows back the one way the
+// portable host contract cannot: in SQL. storetest.RunHost pins what Record
+// answers; this pins that the row is actually there, in the workspace the
+// event named, with the fixed fields the outbox consumer will read.
+func TestRecordedEventsLandInTheirWorkspace(t *testing.T) {
+	st := freshStore(t, startPostgres(t), t.Name())
+	ctx := context.Background()
+	for _, ws := range []control.WorkspaceID{"ws_alpha", "ws_beta"} {
+		if err := st.EnsureWorkspace(ctx, ws); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	for _, e := range []control.Event{
+		{ID: "evt_example", WorkspaceID: "ws_alpha", ActorID: "act_a", Action: control.ActionCreate,
+			Resource: control.Resource{Kind: control.ResourceSession, WorkspaceID: "ws_alpha", ID: "sess_example", CreatorID: "act_a"},
+			At:       at, PlacementGeneration: 2,
+			Usage: control.Usage{CPUTimeSeconds: 1.5, MemoryByteSeconds: 2, StorageBytes: 3, NetworkBytes: 4, AgentTokenCount: 5}},
+		{ID: "evt_second", WorkspaceID: "ws_alpha", ActorID: "act_a", Action: control.ActionDelete,
+			Resource: control.Resource{Kind: control.ResourceSession, WorkspaceID: "ws_alpha", ID: "sess_example", CreatorID: "act_a"},
+			At:       at},
+		{ID: "evt_beta", WorkspaceID: "ws_beta", ActorID: "act_b", Action: control.ActionCreate,
+			Resource: control.Resource{Kind: control.ResourceEnvironment, WorkspaceID: "ws_beta", ID: "env_example", CreatorID: "act_b"},
+			At:       at},
+	} {
+		if err := st.Record(ctx, e); err != nil {
+			t.Fatalf("Record(%s): %v", e.ID, err)
+		}
+	}
+
+	for ws, want := range map[string]int{"ws_alpha": 2, "ws_beta": 1} {
+		var n int
+		if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM events WHERE workspace_id = $1`, ws).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != want {
+			t.Fatalf("%s holds %d events, want %d", ws, n, want)
+		}
+	}
+
+	var (
+		actor, action, kind, resource, creator string
+		gen                                    int64
+		cpu                                    float64
+		mem, storage, network, tokens          int64
+	)
+	if err := st.pool.QueryRow(ctx, `SELECT actor_id, action, resource_kind, resource_id, resource_creator_id,
+		placement_generation, cpu_time_seconds, memory_byte_seconds, storage_bytes, network_bytes, agent_token_count
+		FROM events WHERE id = $1`, "evt_example").Scan(&actor, &action, &kind, &resource, &creator,
+		&gen, &cpu, &mem, &storage, &network, &tokens); err != nil {
+		t.Fatal(err)
+	}
+	if actor != "act_a" || action != string(control.ActionCreate) || kind != string(control.ResourceSession) ||
+		resource != "sess_example" || creator != "act_a" || gen != 2 {
+		t.Fatalf("fixed fields: %q %q %q %q %q %d", actor, action, kind, resource, creator, gen)
+	}
+	if cpu != 1.5 || mem != 2 || storage != 3 || network != 4 || tokens != 5 {
+		t.Fatalf("usage columns: %v %d %d %d %d", cpu, mem, storage, network, tokens)
 	}
 }

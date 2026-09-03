@@ -147,7 +147,7 @@ func (r pgSessions) CreateSession(ctx context.Context, ws control.WorkspaceID, s
 	// becomes one and a resumed import keeps its own), no controller has
 	// attached yet, and nothing has exited — so controller_generation and
 	// child_exit_code are simply not written and take their defaults.
-	row := r.s.pool.QueryRow(ctx, `
+	row := r.s.q(ctx).QueryRow(ctx, `
 		INSERT INTO sessions (id, workspace_id, owner_id, name, image, cmd, egress_allow, repos, state,
 			pool_id, runner, placement_generation, idempotency_key, error, environment_id, setup_hash,
 			created_at, updated_at, last_event_at)
@@ -188,7 +188,7 @@ func (r pgSessions) GetSession(ctx context.Context, ws control.WorkspaceID, id c
 	if ws == "" {
 		return control.Session{}, control.ErrInvalid
 	}
-	row := r.s.pool.QueryRow(ctx,
+	row := r.s.q(ctx).QueryRow(ctx,
 		`SELECT `+sessionCols+` FROM sessions WHERE workspace_id = $1 AND id = $2`, string(ws), string(id))
 	out, err := scanControlSession(row)
 	if err != nil {
@@ -207,7 +207,7 @@ func (r pgSessions) SessionByIDem(ctx context.Context, ws control.WorkspaceID, c
 	if key == "" {
 		return control.Session{}, control.ErrNotFound
 	}
-	row := r.s.pool.QueryRow(ctx, `SELECT `+sessionCols+` FROM sessions
+	row := r.s.q(ctx).QueryRow(ctx, `SELECT `+sessionCols+` FROM sessions
 		WHERE workspace_id = $1 AND owner_id = $2 AND idempotency_key = $3`, string(ws), string(creator), key)
 	out, err := scanControlSession(row)
 	if err != nil {
@@ -246,7 +246,7 @@ func (r pgSessions) ListSessions(ctx context.Context, ws control.WorkspaceID, q 
 		fmt.Fprintf(&sb, " LIMIT $%d", len(args))
 	}
 
-	rows, err := r.s.pool.Query(ctx, sb.String(), args...)
+	rows, err := r.s.q(ctx).Query(ctx, sb.String(), args...)
 	if err != nil {
 		return nil, "", unavailable("list sessions", err)
 	}
@@ -275,11 +275,16 @@ func (r pgSessions) ListSessions(ctx context.Context, ws control.WorkspaceID, q 
 	return out, next, nil
 }
 
-// Transition is one statement: the guard, the columns, and the placement
-// generation move together or not at all. The generation advances exactly
-// when the transition names a runner to run on — a placement, an adoption, a
-// cold resume — and stands still when it names none or clears the one it has,
-// because clearing a placement ends a generation rather than opening one.
+// Transition is one statement: the guard, the columns, the resolved image,
+// and the placement generation move together or not at all. The generation
+// advances exactly when the transition names a runner to run on — a
+// placement, an adoption, a cold resume — and stands still when it names none
+// or clears the one it has, because clearing a placement ends a generation
+// rather than opening one. The image is the placement's answer to which image
+// this session actually runs (the cached checkpoint on a runner that holds
+// it, else the environment's own), so it is written by the same statement
+// that names the runner; a transition that carries none leaves the column
+// alone.
 func (r pgSessions) Transition(ctx context.Context, ws control.WorkspaceID, id control.SessionID, from []control.SessionState, to control.SessionState, opts control.TransitionOpts) error {
 	if ws == "" {
 		return control.ErrInvalid
@@ -294,15 +299,16 @@ func (r pgSessions) Transition(ctx context.Context, ws control.WorkspaceID, id c
 		runner = &next
 	}
 
-	ct, err := r.s.pool.Exec(ctx, `
+	ct, err := r.s.q(ctx).Exec(ctx, `
 		UPDATE sessions
 		SET state = $1,
 		    runner = COALESCE($2::text, runner),
 		    placement_generation = placement_generation + CASE WHEN $2::text IS NOT NULL AND $2::text <> '' THEN 1 ELSE 0 END,
 		    error = COALESCE($3::text, error),
+		    image = COALESCE($7::text, image),
 		    updated_at = now(), last_event_at = now()
 		WHERE workspace_id = $4 AND id = $5 AND state = ANY($6)`,
-		string(to), runner, opts.Error, string(ws), string(id), fromStrs)
+		string(to), runner, opts.Error, string(ws), string(id), fromStrs, opts.Image)
 	if err != nil {
 		return unavailable("transition", err)
 	}
@@ -325,7 +331,7 @@ func (r pgSessions) SetSessionSetupHash(ctx context.Context, ws control.Workspac
 	// last_event_at is deliberately left alone: provenance is not a lifecycle
 	// event, and a session's liveness clock must not tick for a bookkeeping
 	// write.
-	ct, err := r.s.pool.Exec(ctx,
+	ct, err := r.s.q(ctx).Exec(ctx,
 		`UPDATE sessions SET setup_hash = $1, updated_at = now() WHERE workspace_id = $2 AND id = $3`,
 		hash, string(ws), string(id))
 	if err != nil {
@@ -344,7 +350,7 @@ func (r pgSessions) SetChildExitCode(ctx context.Context, ws control.WorkspaceID
 	// Like the setup hash: the child exiting is an observation about the
 	// process inside the container, not a transition of the session, which
 	// stays attachable afterwards.
-	ct, err := r.s.pool.Exec(ctx,
+	ct, err := r.s.q(ctx).Exec(ctx,
 		`UPDATE sessions SET child_exit_code = $1, updated_at = now() WHERE workspace_id = $2 AND id = $3`,
 		code, string(ws), string(id))
 	if err != nil {
@@ -365,7 +371,7 @@ func (r pgSessions) NextControllerGeneration(ctx context.Context, ws control.Wor
 		return 0, control.ErrInvalid
 	}
 	var generation int64
-	err := r.s.pool.QueryRow(ctx, `
+	err := r.s.q(ctx).QueryRow(ctx, `
 		UPDATE sessions SET controller_generation = controller_generation + 1, updated_at = now()
 		WHERE workspace_id = $1 AND id = $2
 		RETURNING controller_generation`, string(ws), string(id)).Scan(&generation)

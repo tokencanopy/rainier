@@ -67,6 +67,7 @@ func cases() []suiteCase {
 		{"S8 guarded transition and placement generation", casePlacementGeneration},
 		{"S9 provenance writes", caseSessionProvenance},
 		{"S10 controller generation", caseControllerGeneration},
+		{"S11 a placement transition records the resolved image", caseTransitionImage},
 
 		{"E1 environment round trip", caseEnvironmentRoundTrip},
 		{"E2 an environment name is unique per workspace", caseEnvironmentName},
@@ -667,6 +668,59 @@ func casePlacementGeneration(t *testing.T, s Stores) {
 
 	if err := s.Sessions.Transition(ctx, Alpha, "sess_nosuch", control.NonTerminal, control.StateDead, control.TransitionOpts{}); !errors.Is(err, control.ErrNotFound) {
 		t.Fatalf("transition of an unknown id: err = %v, want ErrNotFound", err)
+	}
+}
+
+// caseTransitionImage (S11) pins the image a placement resolved. The image a
+// session runs is decided where the holder is known — at placement — so the
+// transition that names the runner carries it, and the same statement writes
+// both. A transition that names no image leaves the spec exactly as it found
+// it, and neither answer disturbs the generation rule S8 pins.
+func caseTransitionImage(t *testing.T, s Stores) {
+	ctx := context.Background()
+	row := mustCreate(t, s, Alpha, control.Session{ID: "sess_example", CreatorID: "act_a",
+		Spec: control.PortableSpec{Image: "img:1"}, State: control.StateQueued, PoolID: PoolA})
+	if row.Spec.Image != "img:1" {
+		t.Fatalf("created image = %q, want img:1", row.Spec.Image)
+	}
+
+	placed := control.RunnerID("runner_a")
+	resolved := "snap:1"
+	if err := s.Sessions.Transition(ctx, Alpha, row.ID, []control.SessionState{control.StateQueued},
+		control.StateCreating, control.TransitionOpts{RunnerID: &placed, Image: &resolved}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Sessions.GetSession(ctx, Alpha, row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Image != "snap:1" {
+		t.Fatalf("after a placement that resolved an image: image = %q, want snap:1", got.Spec.Image)
+	}
+	if got.RunnerID != placed || got.PlacementGeneration != 2 {
+		t.Fatalf("the image must not disturb the placement: runner %q gen %d, want runner_a gen 2",
+			got.RunnerID, got.PlacementGeneration)
+	}
+
+	// No image named: the spec keeps the one the placement before it wrote.
+	if err := s.Sessions.Transition(ctx, Alpha, row.ID, []control.SessionState{control.StateCreating},
+		control.StateRunning, control.TransitionOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.Sessions.GetSession(ctx, Alpha, row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Spec.Image != "snap:1" {
+		t.Fatalf("a transition naming no image moved it to %q", got.Spec.Image)
+	}
+	if got.PlacementGeneration != 2 {
+		t.Fatalf("generation = %d, want 2", got.PlacementGeneration)
+	}
+
+	// The rest of the spec is not this option's to touch.
+	if !slices.Equal(got.Spec.Cmd, row.Spec.Cmd) || !slices.Equal(got.Spec.EgressAllow, row.Spec.EgressAllow) {
+		t.Fatalf("the resolved image rewrote the rest of the spec: %+v", got.Spec)
 	}
 }
 

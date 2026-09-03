@@ -204,7 +204,7 @@ func (r pgEnvironments) CreateEnvironment(ctx context.Context, ws control.Worksp
 	// would quietly disagree with whoever built the snapshot. The three
 	// snapshot columns are left at their defaults — a new environment has no
 	// cache, and only SetEnvironmentSnapshot ever writes one.
-	row := r.s.pool.QueryRow(ctx, `
+	row := r.s.q(ctx).QueryRow(ctx, `
 		INSERT INTO environments (id, workspace_id, name, image, setup, setup_hash, init, init_timeout_sec,
 			egress_allow, secret_refs, connectors, requirements, setup_timeout_sec, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
@@ -231,7 +231,7 @@ func (r pgEnvironments) GetEnvironment(ctx context.Context, ws control.Workspace
 	if ws == "" {
 		return control.Environment{}, control.ErrInvalid
 	}
-	row := r.s.pool.QueryRow(ctx,
+	row := r.s.q(ctx).QueryRow(ctx,
 		`SELECT `+environmentCols+` FROM environments WHERE workspace_id = $1 AND id = $2`, string(ws), string(id))
 	out, err := scanControlEnvironment(row)
 	if err != nil {
@@ -264,7 +264,7 @@ func (r pgEnvironments) ListEnvironments(ctx context.Context, ws control.Workspa
 		fmt.Fprintf(&sb, " LIMIT $%d", len(args))
 	}
 
-	rows, err := r.s.pool.Query(ctx, sb.String(), args...)
+	rows, err := r.s.q(ctx).Query(ctx, sb.String(), args...)
 	if err != nil {
 		return nil, "", unavailable("list environments", err)
 	}
@@ -304,7 +304,7 @@ func (r pgEnvironments) UpdateEnvironment(ctx context.Context, ws control.Worksp
 		return control.Environment{}, fmt.Errorf("pgstore: update environment: encode: %w", control.ErrInvalid)
 	}
 
-	row := r.s.pool.QueryRow(ctx, `
+	row := r.s.q(ctx).QueryRow(ctx, `
 		UPDATE environments SET
 			name = $3, image = $4, setup = $5, setup_hash = $6, init = $7, init_timeout_sec = $8,
 			egress_allow = $9, secret_refs = $10, connectors = $11, requirements = $12,
@@ -331,7 +331,7 @@ func (r pgEnvironments) DeleteEnvironment(ctx context.Context, ws control.Worksp
 	if ws == "" {
 		return control.ErrInvalid
 	}
-	ct, err := r.s.pool.Exec(ctx,
+	ct, err := r.s.q(ctx).Exec(ctx,
 		`DELETE FROM environments WHERE workspace_id = $1 AND id = $2`, string(ws), string(id))
 	if err != nil {
 		return unavailable("delete environment", err)
@@ -357,7 +357,7 @@ func (r pgEnvironments) CountSessionsByEnvironment(ctx context.Context, ws contr
 		sql += ` AND state = ANY($3)`
 	}
 	var n int
-	if err := r.s.pool.QueryRow(ctx, sql, args...).Scan(&n); err != nil {
+	if err := r.s.q(ctx).QueryRow(ctx, sql, args...).Scan(&n); err != nil {
 		return 0, unavailable("count sessions by environment", err)
 	}
 	return n, nil
@@ -370,7 +370,7 @@ func (r pgEnvironments) SetEnvironmentSnapshot(ctx context.Context, ws control.W
 	if ws == "" {
 		return control.ErrInvalid
 	}
-	ct, err := r.s.pool.Exec(ctx, `
+	ct, err := r.s.q(ctx).Exec(ctx, `
 		UPDATE environments
 		SET snapshot_ref = $4, snapshot_runner = $5, snapshot_hash = $3, updated_at = now()
 		WHERE workspace_id = $1 AND id = $2 AND setup_hash = $3`,

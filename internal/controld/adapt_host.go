@@ -97,36 +97,24 @@ func (directUnitOfWork) Run(ctx context.Context, fn func(context.Context) error)
 // build — nothing here can pull a snapshot to a second runner.
 type pinnedCheckpoints struct{ st Store }
 
-// LocateCheckpoint names the runner holding cp, or nowhere. It finds the
-// environment whose current cache carries cp.Ref and asks the store which
-// runner built it; an environment with no holder, a ref no environment of ws
-// carries, and an empty ref are all "nowhere", which tells the caller to boot
-// without the checkpoint rather than to fail. A store that cannot answer is
-// the error, because "nowhere" would silently rebuild what is already cached.
+// LocateCheckpoint names the runner holding cp, or nowhere. It is one store
+// lookup by ref: a cache nobody holds, a cache whose environment's setup has
+// moved on, a ref no environment of ws carries, and an empty ref are all
+// "nowhere", which tells the caller to boot without the checkpoint rather
+// than to fail. A store that cannot answer is the error, because "nowhere"
+// would silently rebuild what is already cached.
 func (p pinnedCheckpoints) LocateCheckpoint(ctx context.Context, ws control.WorkspaceID, cp control.Checkpoint) (control.CheckpointLocation, error) {
 	if cp.Ref == "" {
 		return control.CheckpointLocation{}, nil
 	}
-	// A listing, until the store gains the direct lookup: an installation has
-	// a handful of environments, and the scheduler asks once per queued row.
-	rows, _, err := p.st.Environments().ListEnvironments(ctx, ws, control.EnvironmentQuery{})
+	holder, err := p.st.SnapshotHolder(ctx, ws, cp.Ref)
 	if err != nil {
 		return control.CheckpointLocation{}, err
 	}
-	for _, env := range rows {
-		if env.Snapshot.Ref != cp.Ref {
-			continue
-		}
-		holder, err := p.st.SnapshotRunner(ctx, ws, env.ID)
-		if err != nil {
-			return control.CheckpointLocation{}, err
-		}
-		if holder == "" {
-			return control.CheckpointLocation{}, nil
-		}
-		return control.CheckpointLocation{Runners: []control.RunnerID{holder}}, nil
+	if holder == "" {
+		return control.CheckpointLocation{}, nil
 	}
-	return control.CheckpointLocation{}, nil
+	return control.CheckpointLocation{Runners: []control.RunnerID{holder}}, nil
 }
 
 // systemClock is control.Clock against the wall clock.
