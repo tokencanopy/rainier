@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
+	"github.com/tokencanopy/rainier/controlapp"
 	"github.com/tokencanopy/rainier/internal/cli"
 	"github.com/tokencanopy/rainier/protocol/terminal"
 	"github.com/tokencanopy/rainier/protocol/workspace"
@@ -1797,5 +1799,379 @@ func TestWorkspaceUseValidatesAgainstTheEdge(t *testing.T) {
 	saved, _ := cli.Load()
 	if ws := saved.Contexts["edge.example.test"].Workspace; ws != "ws_example" {
 		t.Fatalf("stored workspace = %q, want ws_example", ws)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// agent login | ls | logout
+//
+// Every fixture here reads its provider off controlapp.AgentProviders(): the
+// plan's rule is that a provider is named in exactly one place in this
+// repository, and a test that spelled one would be a second copy of the table.
+// ---------------------------------------------------------------------------
+
+// agentCall is one request the fake server saw: enough to assert what the CLI
+// sent and in what order, and nothing about the response.
+type agentCall struct {
+	method string
+	path   string
+	body   map[string]any
+}
+
+// agentServer serves the four routes `agent login` drives — GET /v0/agents,
+// POST /v0/sessions, DELETE /v0/sessions/{id}, DELETE /v0/agents/{provider} —
+// answering the agent listing from a script: the first GET gets agents[0], the
+// second agents[1], and so on (the last is repeated if the CLI asks again).
+// It records every call.
+func agentServer(t *testing.T, agents []string) (*httptest.Server, *[]agentCall) {
+	t.Helper()
+	var calls []agentCall
+	gets := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := agentCall{method: r.Method, path: r.URL.Path}
+		if r.Body != nil {
+			raw, _ := io.ReadAll(r.Body)
+			if len(raw) > 0 {
+				if err := json.Unmarshal(raw, &call.body); err != nil {
+					t.Errorf("decode %s %s body: %v; body=%s", r.Method, r.URL.Path, err, raw)
+				}
+			}
+		}
+		calls = append(calls, call)
+
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/agents":
+			i := min(gets, len(agents)-1)
+			gets++
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, agents[i])
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/sessions":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_example", State: "queued"}})
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	return ts, &calls
+}
+
+// agentsBody renders one GET /v0/agents answer with a single provider logged
+// in at version, taken from the table.
+func agentsBody(t *testing.T, version uint64) string {
+	t.Helper()
+	rows := controlapp.AgentProviders()
+	if len(rows) < 2 {
+		t.Fatalf("the provider table has %d rows; these tests need two", len(rows))
+	}
+	out := make([]string, 0, len(rows))
+	for i, p := range rows {
+		if i == 0 && version > 0 {
+			out = append(out, fmt.Sprintf(
+				`{"provider":%q,"status":"logged_in","since":"2026-01-02T03:04:05Z","version":%d,"workspaces":["ws_example"]}`,
+				p.Name, version))
+			continue
+		}
+		out = append(out, fmt.Sprintf(
+			`{"provider":%q,"status":"none","version":0,"workspaces":["ws_example"]}`, p.Name))
+	}
+	return `{"agents":[` + strings.Join(out, ",") + `]}`
+}
+
+// useAgentServer points the CLI's config at ts and stubs the attach that
+// `agent login` performs, returning the ids it was asked to attach to. The
+// attach itself is `new`'s (attachWithRetry) and is exercised by its own
+// tests; what these tests are about is the arc around it.
+func useAgentServer(t *testing.T, ts *httptest.Server) *[]string {
+	t.Helper()
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_example"}); err != nil {
+		t.Fatal(err)
+	}
+	var attached []string
+	saved := agentLoginAttach
+	agentLoginAttach = func(cfg cli.Config, id string, since uint64) error {
+		attached = append(attached, id)
+		return nil
+	}
+	t.Cleanup(func() { agentLoginAttach = saved })
+	return &attached
+}
+
+// answerPrompt feeds one line to the confirmation prompt.
+func answerPrompt(t *testing.T, line string) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	saved := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = saved; r.Close() })
+	go func() {
+		io.WriteString(w, line)
+		w.Close()
+	}()
+}
+
+// TestAgentLoginCreatesTheLoginSessionAndReportsTheNewVersion is the whole
+// arc: read the version custody holds BEFORE anything is created, create a
+// throwaway session running the provider's own login command with no
+// repositories, attach, remove the session, and report the version that moved.
+func TestAgentLoginCreatesTheLoginSessionAndReportsTheNewVersion(t *testing.T) {
+	p := controlapp.AgentProviders()[0]
+	ts, calls := agentServer(t, []string{agentsBody(t, 0), agentsBody(t, 1)})
+	attached := useAgentServer(t, ts)
+
+	out, err := captureStdout(t, func() error {
+		return runAgentLogin([]string{p.Name, "--env", "env-example"})
+	})
+	if err != nil {
+		t.Fatalf("agent login: %v; out=%s", err, out)
+	}
+
+	want := []struct{ method, path string }{
+		{http.MethodGet, "/v0/agents"},
+		{http.MethodPost, "/v0/sessions"},
+		{http.MethodDelete, "/v0/sessions/sess_example"},
+		{http.MethodGet, "/v0/agents"},
+	}
+	if len(*calls) != len(want) {
+		t.Fatalf("calls = %+v, want %d in order %+v", *calls, len(want), want)
+	}
+	for i, w := range want {
+		if (*calls)[i].method != w.method || (*calls)[i].path != w.path {
+			t.Errorf("call %d = %s %s, want %s %s", i, (*calls)[i].method, (*calls)[i].path, w.method, w.path)
+		}
+	}
+	if !slices.Equal(*attached, []string{"sess_example"}) {
+		t.Errorf("attached to %v, want the created session once", *attached)
+	}
+
+	body := (*calls)[1].body
+	if got := body["environment"]; got != "env-example" {
+		t.Errorf("environment = %v, want the named environment", got)
+	}
+	cmd, _ := body["cmd"].([]any)
+	gotCmd := make([]string, 0, len(cmd))
+	for _, c := range cmd {
+		gotCmd = append(gotCmd, c.(string))
+	}
+	if !slices.Equal(gotCmd, p.LoginCmd) {
+		t.Errorf("cmd = %v, want the provider's own login command %v", gotCmd, p.LoginCmd)
+	}
+	repos, ok := body["repos"]
+	if !ok {
+		t.Errorf("body = %v, want an explicit empty repos so nothing clones", body)
+	} else if list, isList := repos.([]any); !isList || len(list) != 0 {
+		t.Errorf("repos = %v, want an explicit empty list", repos)
+	}
+	name, _ := body["name"].(string)
+	if !strings.HasPrefix(name, "agent-login-"+p.Name+"-") {
+		t.Errorf("name = %q, want agent-login-<provider>-<hex>", name)
+	}
+	if suffix := strings.TrimPrefix(name, "agent-login-"+p.Name+"-"); len(suffix) != 4 {
+		t.Errorf("name = %q, want a four-hex-character suffix", name)
+	}
+	if !strings.Contains(out, "logged in as of 2026-01-02T03:04:05Z (v1)") {
+		t.Errorf("output = %q, want the login reported with its version", out)
+	}
+}
+
+// A login the person did not finish is reported as such — the version custody
+// holds is the same one it held before the session existed — and the session
+// is removed all the same.
+func TestAgentLoginReportsAVersionThatDidNotMove(t *testing.T) {
+	p := controlapp.AgentProviders()[0]
+	ts, calls := agentServer(t, []string{agentsBody(t, 1)})
+	useAgentServer(t, ts)
+
+	out, err := captureStdout(t, func() error {
+		return runAgentLogin([]string{p.Name, "--env", "env-example"})
+	})
+	if err != nil {
+		t.Fatalf("agent login: %v; out=%s", err, out)
+	}
+	if !strings.Contains(out, "login did not complete: the agent wrote no credential") {
+		t.Errorf("output = %q, want the unfinished-login sentence", out)
+	}
+	var removed bool
+	for _, c := range *calls {
+		if c.method == http.MethodDelete && c.path == "/v0/sessions/sess_example" {
+			removed = true
+		}
+	}
+	if !removed {
+		t.Errorf("calls = %+v, want the login session removed even when nothing was written", *calls)
+	}
+}
+
+// An unknown provider is refused before any request: the CLI knows the table,
+// so a typo costs nothing and reaches nothing.
+func TestAgentLoginRefusesAnUnknownProviderWithoutARequest(t *testing.T) {
+	ts, calls := agentServer(t, []string{agentsBody(t, 0)})
+	useAgentServer(t, ts)
+
+	_, err := captureStdout(t, func() error {
+		return runAgentLogin([]string{"provider_example", "--env", "env-example"})
+	})
+	if err == nil {
+		t.Fatal("agent login accepted a provider that is not in the table")
+	}
+	for _, p := range controlapp.AgentProviders() {
+		if !strings.Contains(err.Error(), p.Name) {
+			t.Errorf("error = %q, want it to name the supported provider %q", err, p.Name)
+		}
+	}
+	if len(*calls) != 0 {
+		t.Errorf("calls = %+v, want none", *calls)
+	}
+}
+
+// --env is required, and the refusal says why an environment is needed at all.
+func TestAgentLoginRequiresAnEnvironment(t *testing.T) {
+	p := controlapp.AgentProviders()[0]
+	ts, calls := agentServer(t, []string{agentsBody(t, 0)})
+	useAgentServer(t, ts)
+
+	_, err := captureStdout(t, func() error { return runAgentLogin([]string{p.Name}) })
+	if err == nil {
+		t.Fatal("agent login ran without --env")
+	}
+	const want = "the provider's CLI has to be in the image: name an environment that has it with --env"
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err, want)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("calls = %+v, want none", *calls)
+	}
+}
+
+// `agent ls` renders every provider the server named, in the order it named
+// them, with a dash for a provider nobody has logged in.
+func TestAgentLsRendersTheTable(t *testing.T) {
+	ts, calls := agentServer(t, []string{agentsBody(t, 2)})
+	useAgentServer(t, ts)
+
+	out, err := captureStdout(t, func() error { return runAgentLs(nil) })
+	if err != nil {
+		t.Fatalf("agent ls: %v", err)
+	}
+	if len(*calls) != 1 || (*calls)[0].path != "/v0/agents" {
+		t.Fatalf("calls = %+v, want one GET /v0/agents", *calls)
+	}
+	for _, want := range []string{"PROVIDER", "STATUS", "SINCE", "WORKSPACES", "logged_in", "none", "ws_example"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output missing %q:\n%s", want, out)
+		}
+	}
+	rows := controlapp.AgentProviders()
+	first, second := strings.Index(out, rows[0].Name), strings.Index(out, rows[1].Name)
+	if first < 0 || second < 0 || first > second {
+		t.Errorf("providers are not in table order:\n%s", out)
+	}
+	if !strings.Contains(out, "\t-\t") && !strings.Contains(out, " -  ") && !strings.Contains(out, " - ") {
+		t.Errorf("output has no dash for the absent since:\n%s", out)
+	}
+}
+
+// The CLI decodes only the fields it displays, so a field this version does
+// not know about — including one a future or misbehaving server used to carry
+// something it should not have — never reaches a terminal or a CI log.
+func TestAgentLsRendersNothingItDoesNotKnow(t *testing.T) {
+	p := controlapp.AgentProviders()[0]
+	body := fmt.Sprintf(`{"agents":[{"provider":%q,"status":"logged_in","since":"2026-01-02T03:04:05Z",`+
+		`"version":1,"workspaces":["ws_example"],"files":{"x":"credential_example"}}]}`, p.Name)
+	ts, _ := agentServer(t, []string{body})
+	useAgentServer(t, ts)
+
+	out, err := captureStdout(t, func() error { return runAgentLs(nil) })
+	if err != nil {
+		t.Fatalf("agent ls: %v", err)
+	}
+	if strings.Contains(out, "credential_example") {
+		t.Fatalf("the table rendered a field it does not know:\n%s", out)
+	}
+}
+
+// `agent logout` says what a logout costs before it does it, and a plain "no"
+// at the prompt sends nothing.
+func TestAgentLogoutPrompts(t *testing.T) {
+	p := controlapp.AgentProviders()[0]
+	caveat := "this logs " + p.Name + " out of every workspace you are in; " +
+		"a running agent keeps what it holds until it exits"
+
+	t.Run("declined at the prompt", func(t *testing.T) {
+		ts, calls := agentServer(t, []string{agentsBody(t, 1)})
+		useAgentServer(t, ts)
+		answerPrompt(t, "n\n")
+
+		out, err := captureStdout(t, func() error { return runAgentLogout([]string{p.Name}) })
+		if err != nil {
+			t.Fatalf("agent logout: %v", err)
+		}
+		if !strings.Contains(out, caveat) {
+			t.Errorf("output = %q, want the caveat", out)
+		}
+		if !strings.Contains(out, "continue? [y/N]") {
+			t.Errorf("output = %q, want the prompt", out)
+		}
+		if len(*calls) != 0 {
+			t.Errorf("calls = %+v, want none after a refusal", *calls)
+		}
+	})
+
+	t.Run("accepted at the prompt", func(t *testing.T) {
+		ts, calls := agentServer(t, []string{agentsBody(t, 1)})
+		useAgentServer(t, ts)
+		answerPrompt(t, "y\n")
+
+		out, err := captureStdout(t, func() error { return runAgentLogout([]string{p.Name}) })
+		if err != nil {
+			t.Fatalf("agent logout: %v", err)
+		}
+		if len(*calls) != 1 || (*calls)[0].method != http.MethodDelete || (*calls)[0].path != "/v0/agents/"+p.Name {
+			t.Fatalf("calls = %+v, want one DELETE /v0/agents/%s", *calls, p.Name)
+		}
+		if !strings.Contains(out, "logged out of "+p.Name) {
+			t.Errorf("output = %q, want the confirmation", out)
+		}
+	})
+
+	t.Run("--yes skips the prompt but not the caveat", func(t *testing.T) {
+		ts, calls := agentServer(t, []string{agentsBody(t, 1)})
+		useAgentServer(t, ts)
+
+		out, err := captureStdout(t, func() error { return runAgentLogout([]string{p.Name, "--yes"}) })
+		if err != nil {
+			t.Fatalf("agent logout --yes: %v", err)
+		}
+		if strings.Contains(out, "continue? [y/N]") {
+			t.Errorf("output = %q, want no prompt under --yes", out)
+		}
+		if !strings.Contains(out, caveat) {
+			t.Errorf("output = %q, want the caveat even under --yes", out)
+		}
+		if len(*calls) != 1 || (*calls)[0].method != http.MethodDelete {
+			t.Fatalf("calls = %+v, want one DELETE", *calls)
+		}
+	})
+}
+
+// An unknown provider is refused locally here too — `logout` reaches custody,
+// and a typo must not become a request that looks like one.
+func TestAgentLogoutRefusesAnUnknownProviderWithoutARequest(t *testing.T) {
+	ts, calls := agentServer(t, []string{agentsBody(t, 1)})
+	useAgentServer(t, ts)
+
+	_, err := captureStdout(t, func() error { return runAgentLogout([]string{"provider_example", "--yes"}) })
+	if err == nil {
+		t.Fatal("agent logout accepted a provider that is not in the table")
+	}
+	if len(*calls) != 0 {
+		t.Errorf("calls = %+v, want none", *calls)
 	}
 }

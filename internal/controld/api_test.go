@@ -151,6 +151,8 @@ func TestHandlerRouteShape(t *testing.T) {
 		{http.MethodGet, "/v0/secrets"},
 		{http.MethodDelete, "/v0/secrets/name_test"},
 		{http.MethodGet, "/v0/credentials"},
+		{http.MethodGet, "/v0/agents"},
+		{http.MethodDelete, "/v0/agents/provider_example"},
 		{http.MethodPost, "/v0/environments"},
 		{http.MethodGet, "/v0/environments"},
 		{http.MethodGet, "/v0/environments/env_test"},

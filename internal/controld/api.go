@@ -895,6 +895,85 @@ func (s *Server) handleListCredentials(w http.ResponseWriter, r *http.Request, u
 }
 
 // ---------------------------------------------------------------------------
+// agents: GET /v0/agents, DELETE /v0/agents/{provider}
+// ---------------------------------------------------------------------------
+
+// handleListAgents serves GET /v0/agents: which coding agents this person can
+// log in, which of them they have, and where each login reaches.
+//
+// Like GET /v0/credentials and unlike every other listing on this API, it is
+// not team-visible — the service can only answer about the caller, because
+// controlapp.AgentCredentialService.List has no parameter for anybody else.
+// The workspaces on every row are the installation's one workspace: a
+// self-hosted controld IS one workspace (adapt_scope.go), which is exactly
+// why `rainier agent logout` can promise "every workspace you are in" here
+// without a membership index.
+//
+// No byte of a credential can reach this response: the service returns
+// controlapp.AgentCredentialStatus values, which carry a provider, a version,
+// and a timestamp and have nowhere to put a file.
+func (s *Server) handleListAgents(w http.ResponseWriter, r *http.Request, u User) {
+	ctx := withUser(r.Context(), u)
+	statuses, err := s.agents.List(ctx, userScope(u))
+	if err != nil {
+		log.Printf("controld: list agent credentials for user %s: %v", u.ID, err)
+		writeAgentErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v0wire.RenderAgents(statuses, []control.WorkspaceID{installWorkspace}))
+}
+
+// handleLogoutAgent serves DELETE /v0/agents/{provider}: destroy the caller's
+// own set for that agent, then tell their running sessions to drop the copy
+// they hold.
+//
+// It is idempotent — 204 whether or not there was a set — for the same reason
+// the service's revoke is: "there is no credential" is the state the caller
+// asked for either way, and a 404 for an already-empty provider would make a
+// second logout look like a failure. An unknown provider is different: that
+// is a name this build has no row for, and it is 404 rather than "already
+// logged out", which would be a lie about a thing that does not exist.
+func (s *Server) handleLogoutAgent(w http.ResponseWriter, r *http.Request, u User) {
+	ctx := withUser(r.Context(), u)
+	if err := s.agents.Logout(ctx, userScope(u), r.PathValue("provider")); err != nil {
+		// The provider name is the caller's own path segment and safe to log;
+		// nothing else on this path is.
+		log.Printf("controld: agent logout for user %s: %v", u.ID, err)
+		writeAgentErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// writeAgentErr answers a custody refusal.
+//
+// Two things are deliberate. The MESSAGE is the refusal's own fixed sentence
+// (controlapp.AgentRefusalSentence), never the error's text: an error custody
+// did not author has no sentence, and falls through to
+// v0wire.WriteControlError's fixed mapping rather than being rendered. The
+// STATUS is v0wire.StatusFor's, with exactly one substitution — an unknown
+// provider carries control.ErrInvalid, because to the service it IS an
+// invalid argument, but on this route it arrives as a path segment naming a
+// resource, and a resource this build has no row for is not found. The status
+// is still read off the same table; nothing here invents a code.
+func writeAgentErr(w http.ResponseWriter, err error) {
+	sentence, ok := controlapp.AgentRefusalSentence(err)
+	if !ok {
+		v0wire.WriteControlError(w, err)
+		return
+	}
+	mapped := err
+	if errors.Is(err, controlapp.ErrUnknownAgentProvider) {
+		mapped = control.ErrNotFound
+	}
+	status, code, _ := v0wire.StatusFor(mapped)
+	if status == 0 {
+		return
+	}
+	v0wire.WriteError(w, status, code, sentence)
+}
+
+// ---------------------------------------------------------------------------
 // environments: POST/GET /v0/environments, GET/PATCH/DELETE /v0/environments/{id}
 // ---------------------------------------------------------------------------
 

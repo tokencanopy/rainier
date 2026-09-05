@@ -359,6 +359,25 @@ func (s *Server) Handler() http.Handler {
 	// there is no write route at all — a credential is stored by logging in.
 	mux.HandleFunc("GET /v0/credentials", s.requireUser(s.handleListCredentials))
 
+	// Agent logins are per-user for the same reason credentials are, and more
+	// strongly: a coding agent's login is one person's subscription, so no
+	// workspace role reaches it and the service refuses an owner or an admin
+	// who tries (controlapp.ErrAgentCredentialNotYours). There is no write
+	// route — a set is stored by logging in inside a session, never by
+	// posting one here.
+	//
+	// No membership hook calls AgentCredentialService.Withdraw in this
+	// composition, and that is a fact about self-hosted controld rather than
+	// a gap: membership never changes at runtime here. A person's role is
+	// read from the --admins/--members allowlists at every login (auth.go's
+	// roleFor), so removing somebody is an operator editing those flags and
+	// restarting the process — there is no request, event, or store write on
+	// which a withdrawal could be triggered. Withdraw exists for the host
+	// that DOES have a runtime membership path: a hosted cell calls it from
+	// its own, which is why it lives on the service and not on a route here.
+	mux.HandleFunc("GET /v0/agents", s.requireUser(s.handleListAgents))
+	mux.HandleFunc("DELETE /v0/agents/{provider}", s.requireUser(s.handleLogoutAgent))
+
 	// Environments belong to the whole team, so like secrets they have no
 	// owner to fall back on: mutations are admin-only, reads team-visible
 	// (design §4.5). The {id} routes take an id or a name.
