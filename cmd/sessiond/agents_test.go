@@ -974,3 +974,35 @@ func redactForFailure(s, run string) string {
 	end := min(len(s), i+60)
 	return fmt.Sprintf("… %s …", strings.ReplaceAll(s[start:end], run, "***"))
 }
+
+// TestChildExitFlushesWithoutWaitingForTheTick: the moment the agent exits,
+// what it wrote is put — not two seconds later. The login session's process
+// exiting is what tells the CLI to remove the session, and a device-code login
+// exits right after it writes its file, so the tick alone would lose exactly
+// the credential the person just produced.
+func TestChildExitFlushesWithoutWaitingForTheTick(t *testing.T) {
+	e := agentTestEntry(t)
+	h := newFakeAgentHost(t)
+	h.setFetch(0, nil)
+	events := make(chan []byte, 8)
+	a := newTestAgentSync(h, []agentEntry{e}, events)
+	a.boot()
+
+	writeAgentFixture(t, e, agentFileName, agentFixture)
+	a.flush()
+
+	puts := h.putRecords()
+	if len(puts) != 1 {
+		t.Fatalf("%d put(s) after the flush, want exactly 1 without any tick", len(puts))
+	}
+	if puts[0].Files[agentFileName] != agentFixture {
+		t.Fatalf("the flushed put did not carry the written file")
+	}
+	// A flush with nothing new is silent, and the loop's next tick has
+	// nothing left to send either.
+	a.flush()
+	a.tick(time.Now())
+	if n := h.putCount(); n != 1 {
+		t.Fatalf("%d put(s) after a second flush and a tick, want the original 1", n)
+	}
+}

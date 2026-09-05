@@ -170,6 +170,13 @@ func main() {
 		<-s.Exited()
 		code := s.ExitCode()
 		log.Printf("child exited with code %d; sessiond stays up for viewers", code)
+		// The agent's last write goes up NOW, not on the next tick: the CLI
+		// may remove this session the moment it learns the process ended,
+		// and a login that exits right after writing its file is the normal
+		// shape of a device-code login (agents.go, flush).
+		if agents != nil {
+			agents.flush()
+		}
 		// Reported upstream, not acted on: the session deliberately outlives
 		// its child so viewers can still read the scrollback, and this is the
 		// only place in the whole system that knows what the agent's exit

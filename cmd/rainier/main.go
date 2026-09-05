@@ -1665,6 +1665,17 @@ the agent, the session is removed and the login stays.`
 // remove → report) without a terminal on the other end.
 var agentLoginAttach = attachWithRetry
 
+// agentLoginSettle is how long `agent login` waits, once the login session's
+// process has exited, for custody to record the credential before it removes
+// the session. The session's exit is the same instant sessiond puts the
+// agent's last write; removing the session in that same instant would race
+// it. The wait ends the moment the version moves. agentLoginPoll is how often
+// it asks; tests shorten both.
+var (
+	agentLoginSettle = 10 * time.Second
+	agentLoginPoll   = 500 * time.Millisecond
+)
+
 func runAgent(args []string) error {
 	// The synthetic "test" provider is off unless the host turned it on, and
 	// BOTH ends have to agree about the table: the end-to-end suite's controld
@@ -1754,6 +1765,15 @@ func runAgentLogin(args []string) error {
 	fmt.Println(created.ID)
 
 	attachErr := agentLoginAttach(cfg, created.ID, terminal.SinceAll)
+	// Give custody the moment it needs. sessiond puts the agent's last write
+	// as the process exits, which is the same event that ended the attach;
+	// the session is removed only once custody has moved, or once the settle
+	// bound says the agent wrote nothing.
+	after, rowErr := agentRow(c, p.Name)
+	for deadline := time.Now().Add(agentLoginSettle); rowErr == nil && after.Version == before.Version && time.Now().Before(deadline); {
+		time.Sleep(agentLoginPoll)
+		after, rowErr = agentRow(c, p.Name)
+	}
 	if err := c.Do(http.MethodDelete, "/v0/sessions/"+created.ID, nil, nil); err != nil {
 		// The removal failing is worth saying and is not worth losing the
 		// login over: the credential is already in custody either way, and
@@ -1763,10 +1783,15 @@ func runAgentLogin(args []string) error {
 	if attachErr != nil {
 		return attachErr
 	}
-
-	after, err := agentRow(c, p.Name)
-	if err != nil {
-		return err
+	if rowErr != nil {
+		return rowErr
+	}
+	if after.Version == before.Version {
+		// One more look after the removal: the shutdown put is sessiond's
+		// last resort, and it lands as the container stops.
+		if again, err := agentRow(c, p.Name); err == nil {
+			after = again
+		}
 	}
 	if after.Version == before.Version {
 		// Deliberately not an error: `agent login` did everything it set out

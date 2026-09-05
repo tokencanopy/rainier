@@ -1898,6 +1898,9 @@ func useAgentServer(t *testing.T, ts *httptest.Server) *[]string {
 		return nil
 	}
 	t.Cleanup(func() { agentLoginAttach = saved })
+	settle, poll := agentLoginSettle, agentLoginPoll
+	agentLoginSettle, agentLoginPoll = 30*time.Millisecond, 5*time.Millisecond
+	t.Cleanup(func() { agentLoginSettle, agentLoginPoll = settle, poll })
 	return &attached
 }
 
@@ -1936,8 +1939,11 @@ func TestAgentLoginCreatesTheLoginSessionAndReportsTheNewVersion(t *testing.T) {
 	want := []struct{ method, path string }{
 		{http.MethodGet, "/v0/agents"},
 		{http.MethodPost, "/v0/sessions"},
-		{http.MethodDelete, "/v0/sessions/sess_example"},
+		// Custody is read BEFORE the session is removed: the exit that ended
+		// the attach is the same instant sessiond puts the agent's last write,
+		// and the removal waits for the version to move.
 		{http.MethodGet, "/v0/agents"},
+		{http.MethodDelete, "/v0/sessions/sess_example"},
 	}
 	if len(*calls) != len(want) {
 		t.Fatalf("calls = %+v, want %d in order %+v", *calls, len(want), want)

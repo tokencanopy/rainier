@@ -565,6 +565,15 @@ func (a *agentSync) tick(now time.Time) {
 	}
 }
 
+// flush is one synchronous pass over every home, run the moment the agent
+// exits. The last thing an agent wrote is usually the thing worth keeping,
+// and a login command that writes its file and exits at once — which is
+// exactly what a device-code login does — would otherwise race the
+// two-second tick against the CLI removing the session it just logged in
+// from. Safe beside the loop: the two take the same lock, and whichever runs
+// second finds the set already put.
+func (a *agentSync) flush() { a.tick(time.Now()) }
+
 // syncOne is one home's pass: notice a change cheaply, and only then read.
 //
 // The stat is what keeps this affordable at a two-second interval — a set is
