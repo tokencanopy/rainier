@@ -280,6 +280,7 @@ SECRETS_KEY="$(openssl rand -hex 32)"
 # controld reads as the default of each flag; on the command line they would
 # be readable in ps by every user on the host.
 RAINIER_DB="$DSN" RAINIER_RUNNER_TOKEN="$RUNNER_TOKEN" RAINIER_SECRETS_KEY="$SECRETS_KEY" \
+RAINIER_E2E_TEST_AGENT=1 \
 ./bin/controld --listen "${CONTROLD_HOST}:${CONTROLD_PORT}" --external-url "$CONTROLD_HTTP" \
   --admins "$ADMIN" >"$CONTROLD_LOG" 2>&1 &
 echo $! > "$CONTROLD_PID"
@@ -724,6 +725,121 @@ rm -f /tmp/rainier-e2e-cap-env.json
 ok "the capability scene's environments and sessions are cleaned up"
 
 # ---------------------------------------------------------------------------
+step "agent credential home (login → custody → a fresh home → refresh → snapshot → logout)"
+# ---------------------------------------------------------------------------
+# OSS plan #17: a coding agent's login, made once, reaches every later session.
+# The e2e's controld offers the synthetic "test" provider (RAINIER_E2E_TEST_AGENT
+# on both the server and the CLI): its "login" is a local write of the literal
+# credential_example into the provider's own file, so the whole path — the
+# mount, sessiond's fetch and put, custody, the downward revoke — is proven with
+# no real account and no real credential anywhere near this script.
+#
+# The proof that the SECOND session got its file from custody rather than from
+# the runner's volume is the volume's removal in between: this fleet has one
+# runner, so "boots on the other runner" is replaced by "boots with no home
+# volume at all", which is the same fact (the file can only have come down the
+# RPC) and a stricter one.
+export RAINIER_E2E_TEST_AGENT=1
+AGENT_LOGIN_OUT=/tmp/rainier-e2e-agent-login.txt
+AGENT_PROBE_OUT=/tmp/rainier-e2e-agent-probe.txt
+AGENT_CRED_PATH=/rainier/agents/test/credential.json
+
+# agent_row FIELD — one cell of `rainier agent ls` for the test provider.
+agent_row() { ./bin/rainier agent ls | cell test "$1" ""; }
+agent_status()  { ./bin/rainier agent ls | cell test STATUS SINCE; }
+agent_version() { ./bin/rainier agent ls | cell test VERSION WORKSPACES; }
+
+[ "$(agent_status)" = "none" ] || fail "before any login, agent ls shows test as \"$(agent_status)\", want none"
+ok "agent ls lists the test provider with status none before any login"
+
+# --- the login. `agent login` creates a session running the provider's own
+# login command and attaches to it, the way a person would; the synthetic
+# command writes the file and exits at once, and sessiond's sync puts the set
+# within its two-second tick. The attach is driven through a FIFO like every
+# attach in this script, so the detach key goes out when custody has actually
+# moved and not after a fixed sleep; the CLI then removes the login session and
+# reports what it found.
+AGENT_FIFO=/tmp/rainier-e2e-agent.fifo
+rm -f "$AGENT_FIFO"; mkfifo "$AGENT_FIFO"
+: > "$AGENT_LOGIN_OUT"
+./bin/rainier agent login test --env "$ENV_NAME" <"$AGENT_FIFO" >"$AGENT_LOGIN_OUT" 2>&1 &
+AGENT_LOGIN_JOB=$!
+exec 7>"$AGENT_FIFO"
+waitfor '[ "$(agent_version)" = "1" ]' 90 "custody to reach version 1 after the synthetic login" \
+  || { printf '\035' >&7; exec 7>&-; wait "$AGENT_LOGIN_JOB" 2>/dev/null || true; cat "$AGENT_LOGIN_OUT" >&2; fail "custody never reached version 1; agent ls: $(./bin/rainier agent ls | tr '\n' '|')"; }
+printf '\035' >&7                # Ctrl-]: detach; the CLI removes the session and reports
+exec 7>&-
+wait "$AGENT_LOGIN_JOB" 2>/dev/null || true
+rm -f "$AGENT_FIFO"
+grep -q "logged in as of" "$AGENT_LOGIN_OUT" \
+  || { cat "$AGENT_LOGIN_OUT" >&2; fail "agent login did not report a completed login"; }
+! grep -q credential_example "$AGENT_LOGIN_OUT" || fail "agent login echoed the credential"
+[ "$(agent_status)" = "logged_in" ] || fail "after the login, agent ls shows \"$(agent_status)\", want logged_in"
+ok "agent login test completed: custody at v1, the CLI reported it, nothing echoed the credential"
+./bin/rainier ls | grep -q "agent-login-test" && fail "the login session was not removed after the login"
+ok "the login session was removed once the login was reported"
+
+# --- the home volume goes away, so the next session can only get the file
+# from custody. The volume's name is a hash the control plane minted (never an
+# account id); this fleet has exactly one person and one workspace, so there is
+# exactly one.
+AGENT_VOL=$(docker volume ls -q | grep '^rainier-agents-' | head -1)
+[ -n "$AGENT_VOL" ] || fail "no rainier-agents-* volume exists after a login session ran"
+docker volume rm "$AGENT_VOL" >/dev/null || fail "could not remove the home volume $AGENT_VOL (still mounted?)"
+ok "removed the home volume $AGENT_VOL so the next boot has nothing local to read"
+
+# --- the second session: a plain session from the same environment. Its agents
+# stage fetches the set at boot and writes it into a freshly prepared home.
+AGENT_SID=$(./bin/rainier new --detach --name "$ENV_NAME-agent" --env "$ENV_NAME")
+case "$AGENT_SID" in sess_*) ;; *) fail "new --env printed \"$AGENT_SID\", want a sess_ id" ;; esac
+waitfor '[ "$(state_of "$AGENT_SID")" = running ]' 120 "the second agent session" \
+  || fail "$AGENT_SID never reached running (state: $(state_of "$AGENT_SID"))"
+attach_probe "$AGENT_SID" "cat $AGENT_CRED_PATH; echo; echo cred-probe-done" "$AGENT_PROBE_OUT" 'cred-probe-done' 60 \
+  || { cat -v "$AGENT_PROBE_OUT" >&2; fail "the second session never answered the credential probe"; }
+grep -q '^credential_example' "$AGENT_PROBE_OUT" \
+  || { cat -v "$AGENT_PROBE_OUT" >&2; fail "the second session's home does not hold the credential custody handed down"; }
+ok "a session booted after the volume was gone holds the credential: it came from custody, not the runner"
+docker volume ls -q | grep -q '^rainier-agents-' || fail "the second session did not recreate a home volume"
+attach_probe "$AGENT_SID" "stat -c %a $AGENT_CRED_PATH; echo mode-probe-done" "$AGENT_PROBE_OUT" 'mode-probe-done' 30 \
+  || fail "the mode probe never answered"
+grep -q '^600' "$AGENT_PROBE_OUT" || { cat -v "$AGENT_PROBE_OUT" >&2; fail "the credential file is not mode 0600"; }
+ok "the fetched credential file is 0600"
+
+# --- a refresh: the agent (here, the shell) rewrites its credential; the sync
+# notices within its tick and custody moves to v2.
+attach_probe "$AGENT_SID" "printf credential_example2 > $AGENT_CRED_PATH; echo rewrite-done" "$AGENT_PROBE_OUT" 'rewrite-done' 30 \
+  || fail "the rewrite probe never answered"
+waitfor '[ "$(agent_version)" = "2" ]' 15 "custody to reach version 2 after the rewrite" \
+  || fail "custody stayed at v$(agent_version) after the credential was rewritten"
+ok "a rewritten credential reached custody as v2 within the sync interval"
+
+# --- the snapshot: the environment's cached image was committed from a session
+# that had the home mounted, and docker commit excludes volumes, so nothing
+# under the mount point can be in it. SNAP_REF is the environments phase's.
+docker run --rm --entrypoint sh "$SNAP_REF" -c "test ! -e $AGENT_CRED_PATH && test -z \"\$(ls -A /rainier/agents 2>/dev/null)\"" \
+  || fail "the environment snapshot $SNAP_REF carries something under /rainier/agents"
+ok "the environment snapshot carries nothing under the agent home"
+
+# --- logout: custody is destroyed and the live session's copy is removed by
+# the downward revoke within the sync interval.
+./bin/rainier agent logout test --yes >"$AGENT_LOGIN_OUT" 2>&1 || { cat "$AGENT_LOGIN_OUT" >&2; fail "agent logout failed"; }
+grep -q "logged out of test" "$AGENT_LOGIN_OUT" || fail "agent logout printed \"$(cat "$AGENT_LOGIN_OUT")\""
+[ "$(agent_status)" = "none" ] || fail "after logout, agent ls shows \"$(agent_status)\", want none"
+waitfor "attach_probe '$AGENT_SID' 'test -e $AGENT_CRED_PATH && echo still-present || echo revoke-probe-absent' '$AGENT_PROBE_OUT' 'revoke-probe-(absent|still)' 20 && grep -q revoke-probe-absent '$AGENT_PROBE_OUT'" 15 "the live session to drop the credential" \
+  || { cat -v "$AGENT_PROBE_OUT" >&2; fail "the live session still holds the credential after logout"; }
+ok "agent logout: custody gone, and the live session's copy removed by the downward revoke"
+
+# --- hygiene: no credential byte in any log the stack wrote.
+for logf in "$CONTROLD_LOG" /tmp/runnerd.log /tmp/egressd.log; do
+  [ -f "$logf" ] || continue
+  ! grep -q 'credential_example' "$logf" || fail "$logf contains the credential"
+done
+ok "no log line holds the credential"
+
+./bin/rainier rm "$AGENT_SID" >/dev/null 2>&1 || true
+unset RAINIER_E2E_TEST_AGENT
+
+# ---------------------------------------------------------------------------
 step "github rehearsal (real clone, commit and push against a throwaway repo)"
 # ---------------------------------------------------------------------------
 # Plan 5's whole delivery path against real GitHub: an environment with a
@@ -1069,7 +1185,7 @@ case "$EGRESS_RC" in
 esac
 
 echo
-echo "e2e-fleet: ALL CHECKS PASSED (login, new, ls, attach, suspend, resume, rm, environments$([ "$GH_PHASE" = 1 ] && echo ", github rehearsal")$([ "$EGRESS_RC" = 0 ] && echo ", egress R4"))"
+echo "e2e-fleet: ALL CHECKS PASSED (login, new, ls, attach, suspend, resume, rm, environments, agent credential home$([ "$GH_PHASE" = 1 ] && echo ", github rehearsal")$([ "$EGRESS_RC" = 0 ] && echo ", egress R4"))"
 if [ "$GH_PHASE" = "0" ]; then
   echo "e2e-fleet: the github rehearsal was SKIPPED — $GH_SKIP"
 fi

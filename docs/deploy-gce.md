@@ -515,7 +515,50 @@ reads), but a credential is one person's GitHub identity: `rainier creds` shows
 only your own, and a session mints only from *its owner's* vault row. There is
 no API for reading somebody else's credential status, deliberately.
 
-## 9. Rehearse locally first
+## 9. Agent logins (the credential home)
+
+A coding agent needs a writable place for its configuration and its login,
+and a session's rootfs is read-only. Every session a person starts therefore
+mounts an **agent home**: one docker volume per (person, workspace), named
+`rainier-agents-<hash>` so `docker volume ls` on the runner discloses no
+account, prepared once by the same CAP_CHOWN-only job the workspace volume
+gets, mounted at `/rainier/agents`, and never removed by a session's
+teardown. Each agent finds its subdirectory through its own variable —
+`CLAUDE_CONFIG_DIR=/rainier/agents/claude`, `CODEX_HOME=/rainier/agents/codex`
+— so the tool is unmodified and does not know it is in Rainier.
+
+The login itself is the vendor's own, run inside a session:
+
+```bash
+./bin/rainier agent login claude --env web   # web has the agent installed
+# Claude Code: /login, choose the subscription, paste the code back; /exit
+./bin/rainier agent ls
+```
+
+`sessiond` keeps the provider's credential file equal to a sealed copy in
+controld's database (the `agent_credentials` table, AES-GCM under
+`RAINIER_SECRETS_KEY` with the user, provider, and version bound as
+additional authenticated data): fetched at boot before the agent starts, put
+within two seconds of every change, removed by `agent logout`. A runner too
+old to mount the home fails the session's boot with the sentence that names
+the upgrade; a control plane that cannot be reached at boot is a note, and
+the agent starts and asks for a login. What you will see on the runner:
+
+```bash
+docker volume ls | grep rainier-agents-      # one per (person, workspace)
+grep 'home "' /tmp/runnerd.log                # names, sizes, and versions; never bytes
+```
+
+The egress allowlist of every session gains the agent's own hosts at
+dispatch (`api.anthropic.com` and the OAuth host for Claude Code,
+`chatgpt.com` and the device-login host for Codex), the same way a clone
+adds the git hosts. Two things to know from the first live run: Claude
+Code refuses a proxy URL whose password is empty, which is why the driver's
+proxy URL carries a placeholder password since v0.0.3; and the claude.ai
+connectors bypass the proxy and cost about a minute of retries per start
+unless `ENABLE_CLAUDEAI_MCP_SERVERS=false` is set in the environment.
+
+## 10. Rehearse locally first
 
 `./scripts/e2e-fleet.sh` (or `make e2e`) runs this entire flow — postgres,
 controld, dial-mode runnerd, and the real CLI through login/new/ls/attach/
