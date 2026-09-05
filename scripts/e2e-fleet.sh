@@ -740,6 +740,17 @@ step "agent credential home (login → custody → a fresh home → refresh → 
 # volume at all", which is the same fact (the file can only have come down the
 # RPC) and a stricter one.
 export RAINIER_E2E_TEST_AGENT=1
+# Its own environment: the environments phase removed ENV_NAME on its way out,
+# and this phase wants a snapshot of its own to inspect anyway. The setup
+# script writes one image-visible marker so the environment caches, which is
+# what makes "the snapshot carries nothing under the home" a real assertion
+# about an image that was committed from a session with the home mounted.
+AGENT_ENV_NAME="e2e-agent-$$"
+AGENT_SETUP_FILE=/tmp/rainier-e2e-agent-setup.sh
+printf '%s\n' '#!/bin/sh' 'echo agent-env > /opt/rainier-env/agent-env-marker' > "$AGENT_SETUP_FILE"
+AGENT_ENV_ID=$(./bin/rainier env create "$AGENT_ENV_NAME" --image rainier-session:latest --setup-file "$AGENT_SETUP_FILE" --egress example.com)
+case "$AGENT_ENV_ID" in env_*) ok "created environment $AGENT_ENV_NAME ($AGENT_ENV_ID) for the agent phase" ;; *) fail "env create printed \"$AGENT_ENV_ID\", want an env_ id" ;; esac
+agent_env_cached() { ./bin/rainier env ls | cell "$AGENT_ENV_NAME" CACHED ""; }
 AGENT_LOGIN_OUT=/tmp/rainier-e2e-agent-login.txt
 AGENT_PROBE_OUT=/tmp/rainier-e2e-agent-probe.txt
 AGENT_CRED_PATH=/rainier/agents/test/credential.json
@@ -762,9 +773,11 @@ ok "agent ls lists the test provider with status none before any login"
 AGENT_FIFO=/tmp/rainier-e2e-agent.fifo
 rm -f "$AGENT_FIFO"; mkfifo "$AGENT_FIFO"
 : > "$AGENT_LOGIN_OUT"
-./bin/rainier agent login test --env "$ENV_NAME" <"$AGENT_FIFO" >"$AGENT_LOGIN_OUT" 2>&1 &
+./bin/rainier agent login test --env "$AGENT_ENV_NAME" <"$AGENT_FIFO" >"$AGENT_LOGIN_OUT" 2>&1 &
 AGENT_LOGIN_JOB=$!
-exec 7>"$AGENT_FIFO"
+# Opened read-write so the open itself can never block on a reader that has
+# already gone (a CLI that refused the request and exited).
+exec 7<>"$AGENT_FIFO"
 waitfor '[ "$(agent_version)" = "1" ]' 90 "custody to reach version 1 after the synthetic login" \
   || { printf '\035' >&7; exec 7>&-; wait "$AGENT_LOGIN_JOB" 2>/dev/null || true; cat "$AGENT_LOGIN_OUT" >&2; fail "custody never reached version 1; agent ls: $(./bin/rainier agent ls | tr '\n' '|')"; }
 printf '\035' >&7                # Ctrl-]: detach; the CLI removes the session and reports
@@ -790,7 +803,7 @@ ok "removed the home volume $AGENT_VOL so the next boot has nothing local to rea
 
 # --- the second session: a plain session from the same environment. Its agents
 # stage fetches the set at boot and writes it into a freshly prepared home.
-AGENT_SID=$(./bin/rainier new --detach --name "$ENV_NAME-agent" --env "$ENV_NAME")
+AGENT_SID=$(./bin/rainier new --detach --name "$AGENT_ENV_NAME-second" --env "$AGENT_ENV_NAME")
 case "$AGENT_SID" in sess_*) ;; *) fail "new --env printed \"$AGENT_SID\", want a sess_ id" ;; esac
 waitfor '[ "$(state_of "$AGENT_SID")" = running ]' 120 "the second agent session" \
   || fail "$AGENT_SID never reached running (state: $(state_of "$AGENT_SID"))"
@@ -813,11 +826,15 @@ waitfor '[ "$(agent_version)" = "2" ]' 15 "custody to reach version 2 after the 
   || fail "custody stayed at v$(agent_version) after the credential was rewritten"
 ok "a rewritten credential reached custody as v2 within the sync interval"
 
-# --- the snapshot: the environment's cached image was committed from a session
-# that had the home mounted, and docker commit excludes volumes, so nothing
-# under the mount point can be in it. SNAP_REF is the environments phase's.
-docker run --rm --entrypoint sh "$SNAP_REF" -c "test ! -e $AGENT_CRED_PATH && test -z \"\$(ls -A /rainier/agents 2>/dev/null)\"" \
-  || fail "the environment snapshot $SNAP_REF carries something under /rainier/agents"
+# --- the snapshot: this environment's cached image was committed from the
+# login session (the first to run its setup), which had the home mounted, and
+# docker commit excludes volumes, so nothing under the mount point can be in it.
+waitfor '[ "$(agent_env_cached)" = yes ]' 120 "the agent environment to cache its snapshot" \
+  || fail "$AGENT_ENV_NAME never cached a snapshot; see $CONTROLD_LOG"
+AGENT_SNAP_REF=$(grep -m1 "controld: environment $AGENT_ENV_ID cached as " "$CONTROLD_LOG" | sed 's/.* cached as \([^ ]*\) on .*/\1/')
+[ -n "$AGENT_SNAP_REF" ] || fail "controld never logged a cache for $AGENT_ENV_ID"
+docker run --rm --entrypoint sh "$AGENT_SNAP_REF" -c "test ! -e $AGENT_CRED_PATH && test -z \"\$(ls -A /rainier/agents 2>/dev/null)\"" \
+  || fail "the environment snapshot $AGENT_SNAP_REF carries something under /rainier/agents"
 ok "the environment snapshot carries nothing under the agent home"
 
 # --- logout: custody is destroyed and the live session's copy is removed by
@@ -837,6 +854,7 @@ done
 ok "no log line holds the credential"
 
 ./bin/rainier rm "$AGENT_SID" >/dev/null 2>&1 || true
+./bin/rainier env rm "$AGENT_ENV_NAME" >/dev/null 2>&1 || true
 unset RAINIER_E2E_TEST_AGENT
 
 # ---------------------------------------------------------------------------
