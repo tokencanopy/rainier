@@ -1060,17 +1060,43 @@ func TestDockerSnapshotStripsSecretsAndSetupChannel(t *testing.T) {
 // no cache just means the next session runs setup again. No daemon needed.
 func TestDockerCommitArgsRejectsAMalformedStripKey(t *testing.T) {
 	for _, bad := range []string{"", "K=V", "HAS SPACE"} {
-		if _, err := commitArgs("cid", "ref", []string{"FINE", bad}); err == nil {
+		if _, err := commitArgs("cid", "ref", []string{"FINE", bad}, ""); err == nil {
 			t.Errorf("commitArgs accepted strip key %q; want an error", bad)
 		}
 	}
-	args, err := commitArgs("cid", "ref", []string{"A", "B"})
+	args, err := commitArgs("cid", "ref", []string{"A", "B"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{"commit", "--change", "ENV A=", "--change", "ENV B=", "cid", "ref"}
 	if !reflect.DeepEqual(args, want) {
 		t.Errorf("commitArgs = %v, want %v", args, want)
+	}
+}
+
+// TestDockerCommitArgsPinTheBaseImageCommand: `docker commit` records the
+// container's own Cmd into the image, and the session that builds an
+// environment's cache is not always a shell — a login session runs the
+// agent's login command and exits. The base image's command, as docker
+// renders it, is pinned back on the way in; an image with no command ("null")
+// pins nothing.
+func TestDockerCommitArgsPinTheBaseImageCommand(t *testing.T) {
+	args, err := commitArgs("cid", "ref", []string{"A"}, `["--","bash","-i"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"commit", "--change", `CMD ["--","bash","-i"]`, "--change", "ENV A=", "cid", "ref"}
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("commitArgs = %v, want %v", args, want)
+	}
+	for _, none := range []string{"", "null", " null\n"} {
+		args, err := commitArgs("cid", "ref", nil, none)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(args, []string{"commit", "cid", "ref"}) {
+			t.Errorf("commitArgs with base command %q = %v, want no CMD change", none, args)
+		}
 	}
 }
 

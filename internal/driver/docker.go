@@ -696,7 +696,22 @@ func (d *Docker) Snapshot(ctx context.Context, id, ref string, stripEnv []string
 	if ref == "" {
 		ref = d.generatedSnapshotRef(id)
 	}
-	args, err := commitArgs(id, ref, stripEnv)
+	// The committed image must boot the SAME command the environment's image
+	// does, not whatever this container happened to run. `docker commit`
+	// records the container's own Cmd into the image, and the session that
+	// builds an environment's cache is not always a shell: a login session
+	// runs the agent's login command and exits, and without this every later
+	// session from the cache would boot that login instead of the shell. So
+	// the base image's Cmd is read back and pinned on the way in.
+	base, err := dockerRun(ctx, "inspect", "-f", "{{.Config.Image}}", id)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("snapshot: reading the base image of %s: %w", id, err)
+	}
+	cmd, err := dockerRun(ctx, "inspect", "-f", "{{json .Config.Cmd}}", base)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("snapshot: reading the command of image %s: %w", base, err)
+	}
+	args, err := commitArgs(id, ref, stripEnv, cmd)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -706,8 +721,11 @@ func (d *Docker) Snapshot(ctx context.Context, id, ref string, stripEnv []string
 	return Snapshot{Ref: ref}, nil
 }
 
-// commitArgs builds the `docker commit` argv, one `--change "ENV K="` per key
-// to be stripped (see Driver.Snapshot for what and why).
+// commitArgs builds the `docker commit` argv: one `--change "ENV K="` per key
+// to be stripped (see Driver.Snapshot for what and why), and one
+// `--change "CMD <json>"` pinning baseCmd — the base image's command as
+// `docker inspect` renders it — so the container's own command does not become
+// the image's. An empty or "null" baseCmd (an image with no CMD) pins nothing.
 //
 // A malformed key ABORTS the snapshot rather than being skipped. Skipping is
 // the tempting move and it is exactly wrong: the keys that arrive here are an
@@ -715,9 +733,12 @@ func (d *Docker) Snapshot(ctx context.Context, id, ref string, stripEnv []string
 // publishes that secret inside the cached image — the failure this whole
 // parameter exists to prevent. No snapshot at all just means the next session
 // runs the setup script again: slow, never unsafe.
-func commitArgs(id, ref string, stripEnv []string) ([]string, error) {
-	args := make([]string, 0, 3+2*len(stripEnv))
+func commitArgs(id, ref string, stripEnv []string, baseCmd string) ([]string, error) {
+	args := make([]string, 0, 5+2*len(stripEnv))
 	args = append(args, "commit")
+	if baseCmd = strings.TrimSpace(baseCmd); baseCmd != "" && baseCmd != "null" {
+		args = append(args, "--change", "CMD "+baseCmd)
+	}
 	for _, k := range stripEnv {
 		if k == "" || strings.ContainsAny(k, "= \t\n") {
 			return nil, fmt.Errorf("snapshot %s: cannot strip environment key %q: a key may not be empty or contain '=' or whitespace", ref, k)
