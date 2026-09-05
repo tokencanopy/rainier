@@ -85,7 +85,7 @@ func TestDockerDriverContract(t *testing.T) {
 // which they read (BusyBox wget and curl read lowercase, many Go/Node tools
 // read uppercase), so both must be present rather than just one. The proxy
 // URL itself carries the session id as URL userinfo
-// (http://<session-id>:@host:port, Task 13 egress R4): curl-family tools
+// (http://<session-id>:rainier@host:port, Task 13 egress R4; the placeholder password is what lets Claude Code use the proxy at all): curl-family tools
 // send that automatically as `Proxy-Authorization: Basic
 // base64(session-id:)` on every CONNECT, which is the only way a plain
 // env-var proxy flow can carry identity for egressd's allowlist lookup at
@@ -126,7 +126,7 @@ func TestDockerCreateInjectsProxyEnv(t *testing.T) {
 			env[k] = v
 		}
 	}
-	const wantProxy = "http://sproxy:@proxy.internal:3128"
+	const wantProxy = "http://sproxy:rainier@proxy.internal:3128"
 	// NO_PROXY carries the dial URL's host ("x", from DialURL above) on top
 	// of the base list: sessiond's register dial must never be sent through
 	// the proxy. See noProxyFor.
@@ -159,7 +159,7 @@ func TestWithSessionUserinfo(t *testing.T) {
 		sessionID string
 		want      string
 	}{
-		{"normal case", "http://proxy.internal:3128", "sess-1", "http://sess-1:@proxy.internal:3128"},
+		{"normal case", "http://proxy.internal:3128", "sess-1", "http://sess-1:rainier@proxy.internal:3128"},
 		{"empty session id leaves the URL unchanged", "http://proxy.internal:3128", "", "http://proxy.internal:3128"},
 		{
 			// Control characters are invalid in a URL and make url.Parse fail
@@ -378,7 +378,7 @@ func TestDockerRunArgs(t *testing.T) {
 			ProxyURL: "http://proxy.internal:3128",
 			Env:      map[string]string{"ZED": "3", "ALPHA": "1", "MID": "2"},
 		}, "img:1")
-		proxyURL := "http://sess-2:@proxy.internal:3128"
+		proxyURL := "http://sess-2:rainier@proxy.internal:3128"
 		noProxy := noProxyBase + ",runnerd:8080"
 		want := []string{
 			"RAINIER_DIAL=ws://runnerd:8080/register",
@@ -1005,7 +1005,7 @@ func TestDockerSnapshotStripsSecretsAndSetupChannel(t *testing.T) {
 			t.Fatalf("the container's own env does not contain %q, so this test proves nothing:\n%s", want, before)
 		}
 	}
-	if !strings.Contains(before, "sstrip:@egressd") {
+	if !strings.Contains(before, "sstrip:rainier@egressd") {
 		t.Fatalf("the proxy URL carries no session-id userinfo, so stripping it would prove nothing:\n%s", before)
 	}
 
