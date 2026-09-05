@@ -252,6 +252,24 @@ A managed hosted cloud service of Project Rainier is launching soon. We are acti
 
 To join the pilot program or discuss partnerships, email **[josh@tokencanopy.com](mailto:josh@tokencanopy.com)**.
 
+## Brand assets
+
+Logos live in [`assets/`](assets). The mark is a peak chevron in a rounded
+square, carried over from the earlier AgentDrive system and recolored to the
+lockup's palette — deep navy `#043D6A`, ice blue `#B8DEF2`.
+
+| File | Use |
+| --- | --- |
+| `project-rainier-lockup.png` | Full lockup with wordmark. README hero, docs, slides. |
+| `rainier-icon.svg` | Square icon, ice blue on navy. Source of truth for the icon PNGs. |
+| `rainier-icon-512.png`, `rainier-icon-1024.png` | Rasterized square icon — app icons, connector listings, avatars. |
+| `rainier-mark.svg` | Bare mark, navy on transparent. Source of truth for the mark PNGs. |
+| `rainier-mark-512.png`, `rainier-mark-1024.png` | Rasterized bare mark, transparent — favicons, watermarks, dark or light grounds. |
+| `tokencanopy-emblem.svg` | Token Canopy org emblem. Company-level use, not product. |
+
+The PNGs are generated from the SVGs; edit the SVG and re-render rather than
+retouching a PNG.
+
 ## License
 
 [Apache-2.0](LICENSE)
