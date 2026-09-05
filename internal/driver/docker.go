@@ -446,15 +446,27 @@ func noProxyFor(dialURL string) string {
 }
 
 // withSessionUserinfo embeds sessionID as base's URL userinfo
-// (http://<session-id>:@host:port), so curl-family tools reading it from a
-// plain HTTP_PROXY/HTTPS_PROXY env var send it automatically as HTTP Basic
-// auth on the CONNECT request — the only channel such tools have for
-// carrying identity at all. Falls back to base unchanged if sessionID is
+// (http://<session-id>:rainier@host:port), so curl-family tools reading it
+// from a plain HTTP_PROXY/HTTPS_PROXY env var send it automatically as HTTP
+// Basic auth on the CONNECT request — the only channel such tools have for
+// carrying identity at all. The password is a fixed placeholder, not a
+// secret: egressd reads the username half and ignores the rest. It is
+// non-empty because at least one client that matters (Claude Code, both the
+// native and the npm build, verified 2026-09-05) treats a proxy URL whose
+// userinfo has an EMPTY password as unusable and reports "Connection error"
+// without ever dialing the proxy — while the same URL with any password at all
+// goes straight through. An empty password is what url.UserPassword(id, "")
+// renders as "id:@", and it cost a day to find, so the placeholder is spelled
+// once here and the tests pin it. Falls back to base unchanged if sessionID is
 // empty or base fails to parse, rather than panicking or emitting a mangled
 // URL to `docker run -e`: an unmodified base URL with no userinfo still
 // egresses through the proxy, it just won't carry an identity egressd's
 // allowlist can match — a safe (default-deny) direction to fail in, not a
 // silent bypass.
+// proxyUserinfoPassword is the placeholder password in every session's proxy
+// URL; see withSessionUserinfo for why it must not be empty.
+const proxyUserinfoPassword = "rainier"
+
 func withSessionUserinfo(base, sessionID string) string {
 	if sessionID == "" {
 		return base
@@ -463,7 +475,7 @@ func withSessionUserinfo(base, sessionID string) string {
 	if err != nil {
 		return base
 	}
-	u.User = url.UserPassword(sessionID, "")
+	u.User = url.UserPassword(sessionID, proxyUserinfoPassword)
 	return u.String()
 }
 

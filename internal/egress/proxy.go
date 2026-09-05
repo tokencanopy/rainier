@@ -4,7 +4,7 @@
 // header, either a literal Bearer token (the session id) or — the form a
 // plain HTTP_PROXY/HTTPS_PROXY env var actually produces, since curl/wget
 // have no way to set a literal header from an env var — HTTP Basic auth
-// decoded from the proxy URL's userinfo (http://<session-id>:@host:port),
+// decoded from the proxy URL's userinfo (http://<session-id>:<ignored>@host:port),
 // added for egress R4's env-var proxy flow (Task 13; see
 // sessionFromProxyAuth). A CONNECT that carries no usable identity is answered
 // with a 407 challenge rather than a refusal, because a client that waits to be
