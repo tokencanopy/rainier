@@ -57,6 +57,10 @@ type memStore struct {
 	tokens        map[string]string // token hash -> user id
 	secrets       map[string]*secretRow
 	credentials   map[credKey]*Credential
+	// agentCredentials is the same vault's other table: one sealed agent
+	// credential set per (user, provider), keyed the same way and holding no
+	// workspace, exactly as the schema does.
+	agentCredentials map[credKey]*AgentCredential
 }
 
 var _ MemStore = (*memStore)(nil)
@@ -110,6 +114,8 @@ func NewMemStore() MemStore {
 		tokens:        map[string]string{},
 		secrets:       map[string]*secretRow{},
 		credentials:   map[credKey]*Credential{},
+
+		agentCredentials: map[credKey]*AgentCredential{},
 	}
 }
 
@@ -1073,6 +1079,83 @@ func (m *memStore) ListCredentials(ctx context.Context, userID string) ([]Creden
 			continue
 		}
 		out = append(out, cloneCredential(*c))
+	}
+	m.mu.Unlock()
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Provider < out[j].Provider })
+	return out, nil
+}
+
+// cloneAgentCredential returns a deep copy: the two sealed byte slices are
+// reallocated, so nothing a caller holds can reach back into the store's row.
+func cloneAgentCredential(c AgentCredential) AgentCredential {
+	cp := c
+	cp.Ciphertext = bytes.Clone(c.Ciphertext)
+	cp.Nonce = bytes.Clone(c.Nonce)
+	return cp
+}
+
+func (m *memStore) GetAgentCredential(ctx context.Context, userID, provider string) (AgentCredential, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c, ok := m.agentCredentials[credKey{userID, provider}]
+	if !ok {
+		return AgentCredential{}, control.ErrNotFound
+	}
+	return cloneAgentCredential(*c), nil
+}
+
+// PutAgentCredential holds the version guard the port describes: the write
+// lands only when c.Version is one past what is stored. The whole check and
+// write happen under the one mutex, which is this store's version of the
+// single SQL statement pgstore uses — a racing put sees the row the winner
+// left and is told to try again, rather than storing a blob sealed for a
+// version the row will never have.
+func (m *memStore) PutAgentCredential(ctx context.Context, c AgentCredential) (uint64, error) {
+	if c.UserID == "" || c.Provider == "" {
+		return 0, control.ErrInvalid
+	}
+	if c.Version == 0 {
+		return 0, control.ErrInvalid
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var stored uint64
+	if prev, ok := m.agentCredentials[credKey{c.UserID, c.Provider}]; ok {
+		stored = prev.Version
+	}
+	if c.Version != stored+1 {
+		return 0, control.ErrConflict
+	}
+	if c.UpdatedAt.IsZero() {
+		c.UpdatedAt = time.Now()
+	}
+	cp := cloneAgentCredential(c)
+	m.agentCredentials[credKey{c.UserID, c.Provider}] = &cp
+	return cp.Version, nil
+}
+
+func (m *memStore) DeleteAgentCredential(ctx context.Context, userID, provider string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// No ErrNotFound: a revoke of what is not there has already achieved
+	// what it asked for.
+	delete(m.agentCredentials, credKey{userID, provider})
+	return nil
+}
+
+func (m *memStore) ListAgentCredentials(ctx context.Context, userID string) ([]AgentCredential, error) {
+	m.mu.Lock()
+	out := make([]AgentCredential, 0)
+	for key, c := range m.agentCredentials {
+		if key.userID != userID {
+			continue
+		}
+		// The sealed bytes are never copied out of a listing — the same
+		// promise pgstore keeps by not selecting the columns at all.
+		out = append(out, AgentCredential{UserID: c.UserID, Provider: c.Provider,
+			Version: c.Version, UpdatedAt: c.UpdatedAt})
 	}
 	m.mu.Unlock()
 

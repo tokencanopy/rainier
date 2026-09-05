@@ -16,12 +16,19 @@ import (
 // Losing the key loses secret values and nothing else — every other row in
 // the database is plaintext.
 //
-// This file is the whole cryptographic surface, deliberately: three
-// functions, stdlib only, no key derivation, no versioning byte, no
-// additional authenticated data. v0 has exactly one key and one algorithm,
-// and a scheme nobody can misread is worth more here than one that's ready
-// for a rotation story that hasn't been designed yet (design §5 makes v0
-// rotation a manual re-PUT).
+// This file is the whole cryptographic surface, deliberately: stdlib only,
+// one key, one algorithm, no key derivation and no versioning byte. v0 has
+// exactly one key, and a scheme nobody can misread is worth more here than
+// one that's ready for a rotation story that hasn't been designed yet
+// (design §5 makes v0 rotation a manual re-PUT).
+//
+// Seal/Open are the plain pair a secret and a git credential use. SealAAD/
+// OpenAAD are the same primitive with additional authenticated data — bytes
+// that are neither encrypted nor stored, but without which the ciphertext
+// does not open. That is how the agent vault binds a row to the (user,
+// provider, version) it belongs to. Seal and Open ARE SealAAD and OpenAAD
+// with a nil aad, so there is still exactly one code path and every value
+// sealed before the pair existed still opens.
 const (
 	// secretsKeyHexLen is the exact length of RAINIER_SECRETS_KEY: 64 hex
 	// characters, which is 32 bytes, which is AES-256. Anything else is a
@@ -76,6 +83,20 @@ func ParseSecretsKey(hexKey string) ([32]byte, error) {
 // repeated nonce under one GCM key is a total break, not a degradation, so
 // this function has no "caller supplies the nonce" variant to misuse.
 func Seal(key [32]byte, plaintext []byte) (ciphertext, nonce []byte, err error) {
+	return SealAAD(key, plaintext, nil)
+}
+
+// SealAAD is Seal with additional authenticated data: aad is not encrypted
+// and not stored, but the ciphertext will not open without exactly the same
+// bytes. It is how a sealed row is BOUND to the identity it was sealed for —
+// the agent vault binds (user, provider, version), so a row copied to another
+// person, another provider, or another version is not a credential, it is
+// noise that fails authentication (agentvault.go).
+//
+// A nil aad is identical to Seal, which is why the two share this
+// implementation rather than growing a second one: a value sealed before this
+// function existed still opens, and always will.
+func SealAAD(key [32]byte, plaintext, aad []byte) (ciphertext, nonce []byte, err error) {
 	aead, err := newGCM(key)
 	if err != nil {
 		return nil, nil, err
@@ -84,7 +105,7 @@ func Seal(key [32]byte, plaintext []byte) (ciphertext, nonce []byte, err error) 
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, nil, fmt.Errorf("controld: generating secret nonce: %w", err)
 	}
-	return aead.Seal(nil, nonce, plaintext, nil), nonce, nil
+	return aead.Seal(nil, nonce, plaintext, aad), nonce, nil
 }
 
 // Open decrypts and authenticates a value sealed by Seal. Every failure —
@@ -92,6 +113,14 @@ func Seal(key [32]byte, plaintext []byte) (ciphertext, nonce []byte, err error) 
 // is errSecretAuth, and no failure ever returns partial plaintext: GCM
 // authenticates before this function has anything to hand back.
 func Open(key [32]byte, ciphertext, nonce []byte) ([]byte, error) {
+	return OpenAAD(key, ciphertext, nonce, nil)
+}
+
+// OpenAAD is Open for a value sealed by SealAAD: it authenticates aad along
+// with the ciphertext, so the WRONG aad is indistinguishable from the wrong
+// key or a tampered byte — one flat errSecretAuth, and never partial
+// plaintext.
+func OpenAAD(key [32]byte, ciphertext, nonce, aad []byte) ([]byte, error) {
 	aead, err := newGCM(key)
 	if err != nil {
 		return nil, err
@@ -99,7 +128,7 @@ func Open(key [32]byte, ciphertext, nonce []byte) ([]byte, error) {
 	if len(nonce) != aead.NonceSize() {
 		return nil, errSecretAuth
 	}
-	plaintext, err := aead.Open(nil, nonce, ciphertext, nil)
+	plaintext, err := aead.Open(nil, nonce, ciphertext, aad)
 	if err != nil {
 		return nil, errSecretAuth
 	}

@@ -145,6 +145,12 @@ type Server struct {
 	environments *controlapp.EnvironmentService
 	fleet        *controlapp.FleetService
 	attachments  *controlapp.AttachmentService
+	// agents is custody of the operators' coding-agent logins: the service
+	// that answers the two upward RPC methods a sandbox's agent stage calls,
+	// and that a logout drives downward. It is composed over the same
+	// authorizer as everything else, and over the fleet secrets key by way of
+	// the agent vault.
+	agents *controlapp.AgentCredentialService
 
 	// transport is the runner plane behind the control.RunnerTransport port
 	// (plane.Transport()) and broker the dial-back attach pairing behind
@@ -293,7 +299,20 @@ func (s *Server) compose() error {
 	if err != nil {
 		return fmt.Errorf("controld: composing the attachment service: %w", err)
 	}
+	// Custody is composed LAST because it is composed over the attachment
+	// service: a downward revoke travels the same session RPC a workspace
+	// diff does, and there is exactly one implementation of that seam.
+	//
+	// No workspace lister is supplied, and that is the whole truth here
+	// rather than a gap: a self-hosted installation is exactly one workspace
+	// (adapt_scope.go), so the scope's own workspace IS every workspace this
+	// host has, which is what `rainier agent logout` promises.
+	agentSvc := controlapp.NewAgentCredentialService(
+		NewAgentVault(s.st, s.cfg.SecretsKey), auth, sessions, attachSvc,
+		controlapp.WithAgentPlacement(installPlacement()))
+
 	s.fleet, s.sessions, s.environments, s.attachments = fleetSvc, sessionSvc, envSvc, attachSvc
+	s.agents = agentSvc
 	return nil
 }
 
