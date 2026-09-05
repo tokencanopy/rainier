@@ -1,4 +1,5 @@
-.PHONY: test build demo e2e verify module-path protocols control
+.PHONY: test build demo e2e verify module-path protocols control npm-test
+
 test:
 	go test ./...
 build:
@@ -23,3 +24,6 @@ control:
 
 verify: module-path protocols control test build
 	go vet ./...
+
+npm-test:
+	cd npm && npm test

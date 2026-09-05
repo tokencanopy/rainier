@@ -59,6 +59,25 @@ status table), each behind a small host interface that self-hosted
 
 ## Quickstart
 
+### Install the CLI beta (no Go required)
+
+```sh
+npx @tokencanopy/rainier@beta --help
+# Or install for daily use:
+npm install -g @tokencanopy/rainier@beta
+rainier --help
+```
+
+Requires Node.js 22+ and macOS/Linux on arm64 or x64. First use downloads and
+verifies the pinned native binary; later runs reuse it from a per-user cache.
+See [npm installation details](npm/README.md) or download a
+[standalone v0.0.3 binary](https://github.com/tokencanopy/rainier/releases/tag/v0.0.3).
+You still need access to a Rainier deployment; this package does not provision
+one. With npm or a standalone binary, use `rainier` instead of `bin/rainier`
+in the examples below.
+
+### Build from source and connect
+
 ```bash
 make build
 
