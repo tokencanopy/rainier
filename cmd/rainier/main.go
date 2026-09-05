@@ -1820,13 +1820,13 @@ func runAgentLs(args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "PROVIDER\tSTATUS\tSINCE\tWORKSPACES")
+	fmt.Fprintln(w, "PROVIDER\tSTATUS\tSINCE\tVERSION\tWORKSPACES")
 	for _, a := range rows {
 		since := "-"
 		if a.Since != "" {
 			since = formatAge(a.Since)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", a.Provider, a.Status, since,
+		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", a.Provider, a.Status, since, a.Version,
 			dashIfEmpty(strings.Join(a.Workspaces, ",")))
 	}
 	return w.Flush()

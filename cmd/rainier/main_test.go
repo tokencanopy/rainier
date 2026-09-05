@@ -2069,7 +2069,7 @@ func TestAgentLsRendersTheTable(t *testing.T) {
 	if len(*calls) != 1 || (*calls)[0].path != "/v0/agents" {
 		t.Fatalf("calls = %+v, want one GET /v0/agents", *calls)
 	}
-	for _, want := range []string{"PROVIDER", "STATUS", "SINCE", "WORKSPACES", "logged_in", "none", "ws_example"} {
+	for _, want := range []string{"PROVIDER", "STATUS", "SINCE", "VERSION", "WORKSPACES", "logged_in", "none", "ws_example"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
