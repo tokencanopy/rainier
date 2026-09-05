@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/controlapp"
 	"github.com/tokencanopy/rainier/protocol/runner"
 	"github.com/tokencanopy/rainier/v0wire"
 )
@@ -487,7 +488,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		if spec.Env["GH_TOKEN"] != "ghp_resolved_value" {
 			t.Errorf("spec.Env = %v, want GH_TOKEN decrypted", spec.Env)
 		}
-		if !slices.Equal(spec.EgressAllow, []string{"api.github.com"}) {
+		if !slices.Equal(declaredEgress(spec.EgressAllow), []string{"api.github.com"}) {
 			t.Errorf("spec.EgressAllow = %v, want the environment's", spec.EgressAllow)
 		}
 	})
@@ -627,7 +628,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1", EgressAllow: []string{"api.github.com"}})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "e9", "environment": "dev", "egress_allow": []string{"pypi.org"}})
-		if got := nextCreate(t, f).Spec.EgressAllow; !slices.Equal(got, []string{"api.github.com", "pypi.org"}) {
+		if got := nextCreate(t, f).Spec.EgressAllow; !slices.Equal(declaredEgress(got), []string{"api.github.com", "pypi.org"}) {
 			t.Fatalf("spec.EgressAllow = %v, want the environment's list extended by the session's", got)
 		}
 	})
@@ -718,8 +719,13 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 			t.Errorf("stored row = %+v, want no environment_id and the caller's own image", row)
 		}
 		spec := nextCreate(t, f).Spec
-		if spec.Image != "ubuntu:latest" || spec.Setup != "" || spec.SetupTimeoutSec != 0 || spec.Env != nil {
+		if spec.Image != "ubuntu:latest" || spec.Setup != "" || spec.SetupTimeoutSec != 0 {
 			t.Fatalf("spec = %+v, want exactly the pre-environments create", spec)
+		}
+		// Nothing from an environment reaches it. The agent home does, on
+		// every create a person makes, so what is left after it is nothing.
+		if got := len(spec.Env) - len(controlapp.AgentsEnv(controlapp.AgentProviders())); got != 0 {
+			t.Fatalf("spec.Env = %v, want only the agent home's variables", spec.Env)
 		}
 	})
 }
@@ -797,7 +803,7 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 		// caller or the environment declared — the hosts a clone needs are the
 		// launch material's knowledge, added where the clone is ordered.
 		wantEgress := []string{"pypi.org", "github.com", "codeload.github.com", "objects.githubusercontent.com"}
-		if !slices.Equal(spec.EgressAllow, wantEgress) {
+		if !slices.Equal(declaredEgress(spec.EgressAllow), wantEgress) {
 			t.Errorf("spec.EgressAllow = %v, want %v", spec.EgressAllow, wantEgress)
 		}
 		if row := getSession(t, st, got.ID); !slices.Equal(row.Spec.EgressAllow, []string{"pypi.org"}) {
@@ -813,7 +819,7 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "dup", "environment": "dev"})
 		want := []string{"github.com", "codeload.github.com", "objects.githubusercontent.com"}
-		if got := nextCreate(t, f).Spec.EgressAllow; !slices.Equal(got, want) {
+		if got := nextCreate(t, f).Spec.EgressAllow; !slices.Equal(declaredEgress(got), want) {
 			t.Errorf("spec.EgressAllow = %v, want %v", got, want)
 		}
 	})
@@ -847,7 +853,7 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 			t.Errorf("spec attribution = %q/%q, want none for a session that clones nothing",
 				spec.GitAuthorName, spec.GitAuthorEmail)
 		}
-		if !slices.Equal(spec.EgressAllow, []string{"pypi.org"}) {
+		if !slices.Equal(declaredEgress(spec.EgressAllow), []string{"pypi.org"}) {
 			t.Errorf("spec.EgressAllow = %v, want the environment's untouched", spec.EgressAllow)
 		}
 	})
@@ -899,7 +905,7 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 			t.Errorf("spec.GitAuthorEmail = %q, want %q", spec.GitAuthorEmail, noreplyFor(u))
 		}
 		wantEgress := []string{"github.com", "codeload.github.com", "objects.githubusercontent.com"}
-		if !slices.Equal(spec.EgressAllow, wantEgress) {
+		if !slices.Equal(declaredEgress(spec.EgressAllow), wantEgress) {
 			t.Errorf("spec.EgressAllow = %v, want %v", spec.EgressAllow, wantEgress)
 		}
 		// D6: the row carries what the caller declared, which here is nothing.
@@ -4312,4 +4318,19 @@ func TestUnavailableStatusRefinesByRunnerConnectivity(t *testing.T) {
 	if status, _, _ := (&Server{}).unavailableStatus(placedOnDisconnected); status != http.StatusBadGateway {
 		t.Fatalf("no transport composed = %d", status)
 	}
+}
+
+// declaredEgress drops the hosts every create carries for the coding agents in
+// the session's agent home, leaving what the caller and the environment
+// actually declared — which is what the scenes above are about. It reads the
+// hosts off the control plane's provider table rather than listing them,
+// because that table is the one place allowed to name an agent.
+func declaredEgress(hosts []string) []string {
+	var agent []string
+	for _, p := range controlapp.AgentProviders() {
+		agent = append(agent, p.Egress...)
+	}
+	return slices.DeleteFunc(slices.Clone(hosts), func(h string) bool {
+		return slices.Contains(agent, h)
+	})
 }

@@ -280,3 +280,48 @@ func TestUnknownFieldsTolerated(t *testing.T) {
 		t.Fatalf("state lost: %+v", m)
 	}
 }
+
+// TestHomeMountRoundTrip pins the agent home's wire tags and, just as
+// importantly, its absence: the field is additive at ProtocolVersion 1, so a
+// create that mounts no home has to marshal to exactly the bytes a Plan 1-5
+// peer already expects. It also pins the three agent-credential method names,
+// which are wire words a sandbox and a control plane agree on by string.
+func TestHomeMountRoundTrip(t *testing.T) {
+	in := runner.ToRunner{Type: "create", ReqID: 21, Session: "sess_example",
+		Spec: &runner.Spec{Image: "img", Home: &runner.HomeMount{
+			Volume: "rainier-agents-0123456789abcdef", Path: "/rainier/agents"}}}
+	b, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantHome = `"home":{"volume":"rainier-agents-0123456789abcdef","path":"/rainier/agents"}`
+	if !strings.Contains(string(b), wantHome) {
+		t.Fatalf("home tags wrong on the wire: %s", b)
+	}
+	var out runner.ToRunner
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Spec == nil || out.Spec.Home == nil ||
+		out.Spec.Home.Volume != in.Spec.Home.Volume || out.Spec.Home.Path != in.Spec.Home.Path {
+		t.Fatalf("round trip mangled the home: %+v", out.Spec)
+	}
+
+	// No home, no key: the golden create of TestPublicRunnerWireShapes stays
+	// byte-for-byte what it was.
+	nb, err := json.Marshal(runner.Spec{Image: "img"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(nb), `"home"`) {
+		t.Fatalf("a spec with no home leaked a home key: %s", nb)
+	}
+
+	if runner.MethodFetchAgentCredentials != "fetch_agent_credentials" ||
+		runner.MethodPutAgentCredentials != "put_agent_credentials" ||
+		runner.MethodRevokeAgentCredentials != "revoke_agent_credentials" {
+		t.Fatalf("agent credential method names moved: %q %q %q",
+			runner.MethodFetchAgentCredentials, runner.MethodPutAgentCredentials,
+			runner.MethodRevokeAgentCredentials)
+	}
+}
