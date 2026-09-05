@@ -41,12 +41,13 @@ import (
 // /workspace is a persistent volume — anything written here outlives the
 // session that wrote it.
 
-// The three stage names. They are wire-visible: they travel in
-// ControlEvent.Stage and controld composes a session's error text out of them.
+// The stage names. They are wire-visible: they travel in ControlEvent.Stage
+// and controld composes a session's error text out of them.
 const (
-	stageSetup = "setup"
-	stageClone = "clone"
-	stageInit  = "init"
+	stageSetup  = "setup"
+	stageClone  = "clone"
+	stageAgents = "agents"
+	stageInit   = "init"
 )
 
 // The chain's files, all in the session's own .rainier directory beside the
@@ -54,10 +55,24 @@ const (
 const (
 	clonesScriptName = "clones.sh"
 	cloneRCName      = "clone.rc"
-	initScriptName   = "init.sh"
-	initRCName       = "init.rc"
-	gitConfigName    = "gitconfig"
+	agentsScriptName = "agents.sh"
+	agentsRCName     = "agents.rc"
+	// agentsDoneName is the marker sessiond writes when the agent homes are as
+	// ready as they are going to get, and the file the agents stage waits for.
+	// It lives beside the rc files, on the same persistent volume, which is why
+	// prepareAgentsStage clears it first.
+	agentsDoneName = "agents.done"
+	initScriptName = "init.sh"
+	initRCName     = "init.rc"
+	gitConfigName  = "gitconfig"
 )
+
+// agentStageWaitSeconds bounds how long the agents stage waits for those homes
+// before it starts the agent anyway. It is generous — the fetch it waits on is
+// bounded by the RPC's own timeout, and may first wait out a relay that is
+// still dialing — and it is a bound at all only so that a sessiond which never
+// got to write the marker cannot hold a session shut.
+const agentStageWaitSeconds = 60
 
 // workspaceRoot is where the driver mounts the session's volume, and therefore
 // where a repo whose Dir is relative (every one controld resolves — Dir is the
@@ -123,6 +138,12 @@ type bootEnv struct {
 	ReposB64     string
 	InitB64      string
 	InitTimeout  string
+	// AgentsB64 is the agent-home manifest: which providers this session has a
+	// home for, where each one's directory is, and which files inside it are
+	// the credential set (see agents.go). It carries paths and names only —
+	// never a credential — which is why it can travel in the environment at
+	// all.
+	AgentsB64 string
 
 	GitAuthorName  string
 	GitAuthorEmail string
@@ -139,14 +160,22 @@ func bootEnvFromOS() bootEnv {
 		ReposB64:       os.Getenv("RAINIER_REPOS_B64"),
 		InitB64:        os.Getenv("RAINIER_INIT_B64"),
 		InitTimeout:    os.Getenv("RAINIER_INIT_TIMEOUT"),
+		AgentsB64:      os.Getenv("RAINIER_AGENTS_B64"),
 		GitAuthorName:  os.Getenv("RAINIER_GIT_AUTHOR_NAME"),
 		GitAuthorEmail: os.Getenv("RAINIER_GIT_AUTHOR_EMAIL"),
 	}
 }
 
 // any reports whether this environment asks for any stage at all.
+//
+// The agent manifest counts: a session with nothing but homes still gets a
+// chain, because the agents stage is what makes the agent wait for them. That
+// is a real change in shape for a scratch session with a creator — it now boots
+// behind the wrapper where it used to be the agent itself — and it is the
+// design's intent: a home nobody waited for is a login that lands after the
+// agent already read its configuration.
 func (e bootEnv) any() bool {
-	return e.SetupB64 != "" || e.ReposB64 != "" || e.InitB64 != ""
+	return e.SetupB64 != "" || e.ReposB64 != "" || e.InitB64 != "" || e.AgentsB64 != ""
 }
 
 // git reports whether git will run in this session — the clone stage, or an
@@ -325,6 +354,21 @@ func prepareBoot(dir, root string, env bootEnv) ([]bootStage, []envVar, error) {
 			Timeout:    timeout,
 		})
 	}
+	// The agent homes, after the clone and before init. That order is the
+	// design's: the homes are the agent's, and the init hook may itself run the
+	// agent, so both it and the exec at the end of the chain must find them
+	// filled. The stage waits for work sessiond does over the session RPC while
+	// the stages above ran (agents.go); the ONE outcome that fails it is a
+	// runner too old to mount the home at all.
+	if entries := agentEntries(env); len(entries) > 0 {
+		st, err := prepareAgentsStage(dir, entries)
+		if err != nil {
+			return nil, nil, err
+		}
+		stages = append(stages, st)
+		vars = append(vars, agentHomeVars(entries)...)
+	}
+
 	if env.InitB64 != "" {
 		script, err := base64.StdEncoding.DecodeString(env.InitB64)
 		if err != nil {

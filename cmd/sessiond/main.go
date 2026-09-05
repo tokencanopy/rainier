@@ -24,6 +24,7 @@ import (
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/internal/server"
 	"github.com/tokencanopy/rainier/internal/session"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 func main() {
@@ -114,6 +115,11 @@ func main() {
 	// helper) reaches it. Handler registration happens here, at boot, for the
 	// same reason.
 	var rpc *rpcDispatcher
+	// agents keeps this session's agent homes equal to the control plane's
+	// custody for as long as the session lives. It stays nil when the create
+	// carried no manifest — a session with no creator, or an older controld —
+	// and then nothing in agents.go runs at all.
+	var agents *agentSync
 	if *dial != "" {
 		rpc = newRPCDispatcher()
 		startAgentSocket(context.Background(), agentSocketPath, rpc, events)
@@ -135,6 +141,24 @@ func main() {
 			log.Fatalf("boot chain: %v", err)
 		}
 		argv = chainArgv(chainEnv, stages, argv)
+
+		// The agent homes. The fetch that fills them runs on its own goroutine,
+		// concurrently with the stages above, because it needs the relay that
+		// only comes up once the session is running — the chain's agents stage
+		// is what makes the agent wait for it (agents.go). The downward revoke
+		// is registered beside the file handlers and for the same reason: a
+		// logout can arrive on the connection's first frame.
+		//
+		// The manifest is decoded here and separately inside prepareBoot, the
+		// way files.go decodes the repository list separately from the clone
+		// stage: the two consume the same fact for different purposes, and
+		// threading one through would couple the boot chain to the sync's
+		// lifetime.
+		if entries := agentEntries(bootEnvironment); len(entries) > 0 {
+			agents = newAgentSync(rpc, entries, events)
+			rpc.RegisterRPCHandler(runner.MethodRevokeAgentCredentials, agents.handleRevoke)
+			agents.start(setupDir + "/" + agentsDoneName)
+		}
 	}
 
 	s, err := session.New(session.Config{Argv: argv, Cols: *cols, Rows: *rows, LogPath: *logPath}, session.StartProc)
@@ -146,6 +170,13 @@ func main() {
 		<-s.Exited()
 		code := s.ExitCode()
 		log.Printf("child exited with code %d; sessiond stays up for viewers", code)
+		// The agent's last write goes up NOW, not on the next tick: the CLI
+		// may remove this session the moment it learns the process ended,
+		// and a login that exits right after writing its file is the normal
+		// shape of a device-code login (agents.go, flush).
+		if agents != nil {
+			agents.flush()
+		}
 		// Reported upstream, not acted on: the session deliberately outlives
 		// its child so viewers can still read the scrollback, and this is the
 		// only place in the whole system that knows what the agent's exit
@@ -167,6 +198,15 @@ func main() {
 		// Graceful: ask the agent to exit; the exit path closes viewers and the
 		// process ends when the child is reaped. Give it a moment, then hard-exit.
 		s.Stop()
+		// The last thing an agent wrote is usually the thing worth keeping — a
+		// login completed seconds before the session was torn down — and the
+		// sync's two-second tick must not be what decides whether it survives.
+		// Placed after Stop so the child already has its signal while this
+		// runs, and bounded by the RPC's own timeout so a control plane that
+		// has gone away cannot hold the shutdown open.
+		if agents != nil {
+			agents.close()
+		}
 		select {
 		case <-s.Exited():
 		case <-time.After(5 * time.Second):

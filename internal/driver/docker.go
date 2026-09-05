@@ -39,27 +39,41 @@ const (
 // from the container's label without any state of its own.
 func workspaceVolume(sessionID string) string { return workspaceVolumePrefix + sessionID }
 
-// initWorkspaceScript prepares a freshly created workspace volume so the
+// initVolumeScript prepares a freshly created volume mounted at path so the
 // unprivileged session user can actually write to it. Both halves are load
 // bearing, and both were established empirically against docker 29:
 //
 //   - chown: a new named volume's root is root:root 0755, so a container
-//     running as --user 1000:1000 gets a workspace it can only read. Nothing
+//     running as --user 1000:1000 gets a directory it can only read. Nothing
 //     in `docker run` sets volume ownership, so it takes a container to do it.
 //
 //   - mkdir: docker only "initializes" a volume that is EMPTY at mount time,
 //     and part of that initialization is copying the ownership of the image's
-//     directory at the mount point. `-w /workspace` makes docker create that
-//     directory in the image's rootfs (root:root 0755) when the image has none
-//     — which then lands back on the volume and silently undoes the chown.
-//     Seeding one directory makes the volume non-empty, so the initialization
-//     never fires again and the ownership sticks. (Verified both ways: without
-//     the seed and with -w, the session container sees root:root 0755 and
-//     cannot write; with it, 1000:1000 and it can.)
+//     directory at the mount point. Docker creates that directory in the
+//     image's rootfs (root:root 0755) when the image has none — `-w /workspace`
+//     forces it for the workspace, a bind of a path the image lacks forces it
+//     for any other mount — which then lands back on the volume and silently
+//     undoes the chown. Seeding one directory makes the volume non-empty, so
+//     the initialization never fires again and the ownership sticks. (Verified
+//     both ways for the workspace: without the seed and with -w, the session
+//     container sees root:root 0755 and cannot write; with it, 1000:1000 and
+//     it can.)
 //
-// The seeded directory is /workspace/.rainier, which Plan 4's setup pipeline
-// wants anyway for its script and exit-code files.
-const initWorkspaceScript = "mkdir -p " + workspaceMount + "/.rainier && chown -R " + sessionUser + " " + workspaceMount
+// The seeded directory is .rainier under the mount point. For the workspace
+// that is /workspace/.rainier, which Plan 4's setup pipeline wants anyway for
+// its script and exit-code files; for the agent home it is a marker and
+// nothing else, but the second half above is exactly as load bearing there —
+// an empty home volume would be re-initialized from the image's root-owned
+// mount point on every boot, and no agent could ever write its configuration.
+func initVolumeScript(path string) string {
+	return "mkdir -p " + path + "/.rainier && chown -R " + sessionUser + " " + path
+}
+
+// initWorkspaceScript is initVolumeScript for the workspace mount, named
+// because the workspace's is the instance with a second reason to exist (the
+// .rainier directory Plan 4 writes its script into) and the one the argv tests
+// pin. A var only because a const cannot call a function; nothing assigns it.
+var initWorkspaceScript = initVolumeScript(workspaceMount)
 
 type Docker struct {
 	opts       DockerOpts
@@ -91,6 +105,12 @@ func (d *Docker) Create(ctx context.Context, spec Spec) (Handle, error) {
 	if err := checkScriptSizes(spec); err != nil {
 		return Handle{}, err
 	}
+	// Likewise for a half-specified agent home: naming the broken field costs
+	// nothing here, and the alternative is a `docker run -v :/path` whose
+	// error names nothing a reader could act on.
+	if err := checkHome(spec.Home); err != nil {
+		return Handle{}, err
+	}
 	used, total, err := d.Capacity(ctx)
 	if err != nil {
 		return Handle{}, err
@@ -118,16 +138,35 @@ func (d *Docker) Create(ctx context.Context, spec Spec) (Handle, error) {
 		}
 		createdVolume = created
 	}
+	// Don't leave a workspace volume behind for a container that never
+	// started: nothing would ever name it again. Only one THIS call created —
+	// a volume that was already there holds an earlier session's work, and a
+	// failed create is no reason to throw that away.
+	//
+	// The agent home is never rolled back, whether this call created it or
+	// not. It is not the session's (see Spec.Home), a concurrent create for
+	// the same person and workspace may already be mounting it, and a volume
+	// prepared and left empty is exactly what the next create expects to find.
+	rollback := func() {
+		if createdVolume {
+			dockerRun(ctx, "volume", "rm", "-f", workspaceVolume(spec.SessionID))
+		}
+	}
+	if _, ok := spec.Home.mount(); ok {
+		// Same reason the workspace volume is made explicitly: `docker run -v`
+		// would create one implicitly, and an implicitly created volume is
+		// never initialized — so the home would arrive root-owned and every
+		// agent in the session would fail to write its configuration into a
+		// directory it can only read.
+		if _, err := d.ensureVolume(ctx, spec.Home.Volume, spec.Home.Path, image); err != nil {
+			rollback()
+			return Handle{}, err
+		}
+	}
 
 	id, err := dockerRun(ctx, d.runArgs(spec, image)...)
 	if err != nil {
-		if createdVolume {
-			// Don't leave a volume behind for a container that never started:
-			// nothing would ever name it again. Only one this call created —
-			// a volume that was already there holds an earlier session's work,
-			// and a failed create is no reason to throw that away.
-			dockerRun(ctx, "volume", "rm", "-f", workspaceVolume(spec.SessionID))
-		}
+		rollback()
 		return Handle{}, err
 	}
 	return Handle{ID: id, State: StateRunning}, nil
@@ -135,30 +174,39 @@ func (d *Docker) Create(ctx context.Context, spec Spec) (Handle, error) {
 
 // ensureWorkspaceVolume makes sessionID's workspace volume exist and be
 // writable by the session user, reporting whether this call created it.
-//
-// An existing volume is left strictly alone — that is the cold-park and
-// restart path, where the volume holds the session's files and re-running the
-// init would be at best a no-op and at worst a recursive chown over the user's
-// work. image is used only as the vehicle for the one-shot init container: it
-// is the one image guaranteed to be present (the session is about to run it),
-// so initialization adds no new image dependency to the fleet.
 func (d *Docker) ensureWorkspaceVolume(ctx context.Context, sessionID, image string) (created bool, err error) {
-	name := workspaceVolume(sessionID)
+	return d.ensureVolume(ctx, workspaceVolume(sessionID), workspaceMount, image)
+}
+
+// ensureVolume makes name exist and be writable by the session user at mount,
+// reporting whether this call created it. Shared by the workspace volume and
+// the agent home because the two need exactly the same thing done to them —
+// created if absent, chowned once, and then never touched again — and a
+// second copy of it would be a second place for the chown to be forgotten.
+//
+// An existing volume is left strictly alone. For the workspace that is the
+// cold-park and restart path, where the volume holds the session's files; for
+// the agent home it is every session after the first, where the volume holds
+// the credential set a person logged in with once. Re-running the init would
+// be at best a no-op and at worst a recursive chown over their work.
+func (d *Docker) ensureVolume(ctx context.Context, name, mount, image string) (created bool, err error) {
 	if _, err := dockerRun(ctx, "volume", "inspect", "-f", "{{.Name}}", name); err == nil {
 		return false, nil
 	}
 	if _, err := dockerRun(ctx, "volume", "create", name); err != nil {
-		return false, fmt.Errorf("create workspace volume %s: %w", name, err)
+		return false, fmt.Errorf("create volume %s: %w", name, err)
 	}
-	if _, err := dockerRun(ctx, workspaceInitArgs(name, image)...); err != nil {
+	if _, err := dockerRun(ctx, volumeInitArgs(name, mount, image)...); err != nil {
+		// A volume that exists but was never chowned is worse than none: the
+		// next create would find it and skip the init forever.
 		dockerRun(ctx, "volume", "rm", "-f", name)
-		return false, fmt.Errorf("initialize workspace volume %s (the image must provide sh and chown): %w", name, err)
+		return false, fmt.Errorf("initialize volume %s at %s (the image must provide sh and chown): %w", name, mount, err)
 	}
 	return true, nil
 }
 
-// workspaceInitArgs is the one-shot `docker run` that prepares a freshly
-// created workspace volume (see initWorkspaceScript for what and why).
+// volumeInitArgs is the one-shot `docker run` that prepares a freshly created
+// volume (see initVolumeScript for what and why).
 //
 // Root — chowning a volume takes it — but root with nothing else: no network,
 // read-only rootfs, no privilege escalation, and every Linux capability
@@ -166,17 +214,26 @@ func (d *Docker) ensureWorkspaceVolume(ctx context.Context, sessionID, image str
 // entrypoint never runs; `sh -c` with a fixed script does. Session images are
 // user-supplied, so this is the one uid-0 window in the driver and it is worth
 // keeping as narrow as it can be made.
-func workspaceInitArgs(volume, image string) []string {
+//
+// image is used only as the vehicle for the job: it is the one image
+// guaranteed to be present (the session is about to run it), so preparing a
+// volume adds no new image dependency to the fleet.
+func volumeInitArgs(volume, mount, image string) []string {
 	return []string{"run", "--rm",
 		"--network", "none",
 		"--user", "0:0",
 		"--security-opt", "no-new-privileges",
 		"--cap-drop", "ALL", "--cap-add", "CHOWN",
 		"--read-only",
-		"-v", volume + ":" + workspaceMount,
+		"-v", volume + ":" + mount,
 		"--entrypoint", "sh", image,
-		"-c", initWorkspaceScript,
+		"-c", initVolumeScript(mount),
 	}
+}
+
+// workspaceInitArgs is volumeInitArgs for the workspace mount.
+func workspaceInitArgs(volume, image string) []string {
+	return volumeInitArgs(volume, workspaceMount, image)
 }
 
 func (d *Docker) runArgs(spec Spec, image string) []string {
@@ -223,6 +280,19 @@ func (d *Docker) runArgs(spec Spec, image string) []string {
 		// "rainier-ws-" into every such container, and point -w at a path
 		// nothing backs.
 		args = append(args, "-v", workspaceVolume(spec.SessionID)+":"+workspaceMount, "-w", workspaceMount)
+	}
+	if mount, ok := spec.Home.mount(); ok {
+		// The second and last writable path a session has, after the workspace
+		// — and deliberately not its working directory. An agent's
+		// configuration and credential set live here; the person's work does
+		// not, and the two must not be confused, because the workspace goes
+		// into checkpoints and archives and this must never follow it there.
+		//
+		// After the workspace mount so the argv reads in the order the two
+		// matter, and before the network flag so every -v stays grouped ahead
+		// of the runtime wiring — `docker run` cares only that all of it
+		// precedes the image.
+		args = append(args, "-v", mount)
 	}
 	if d.opts.Network != "" {
 		args = append(args, "--network", d.opts.Network)
@@ -419,6 +489,13 @@ func withSessionUserinfo(base, sessionID string) string {
 // container goes, because afterwards there is nothing left to ask; and the
 // volume is removed AFTER, because docker refuses to remove a volume any
 // container still references, stopped ones included.
+//
+// The agent home is not removed here, and nothing in this driver removes one.
+// It is keyed by (creator, workspace), not by session: other sessions of the
+// same person in the same workspace may be mounted on it at this moment, and
+// taking it would log every one of them out of every agent they had signed
+// in. Nothing reconstructs its name from a container either — the only place
+// it appears is the mount the create was handed.
 func (d *Docker) Destroy(ctx context.Context, id string) error {
 	sessionID := d.sessionIDOf(ctx, id)
 	if err := d.DestroyContainer(ctx, id); err != nil {
@@ -619,7 +696,22 @@ func (d *Docker) Snapshot(ctx context.Context, id, ref string, stripEnv []string
 	if ref == "" {
 		ref = d.generatedSnapshotRef(id)
 	}
-	args, err := commitArgs(id, ref, stripEnv)
+	// The committed image must boot the SAME command the environment's image
+	// does, not whatever this container happened to run. `docker commit`
+	// records the container's own Cmd into the image, and the session that
+	// builds an environment's cache is not always a shell: a login session
+	// runs the agent's login command and exits, and without this every later
+	// session from the cache would boot that login instead of the shell. So
+	// the base image's Cmd is read back and pinned on the way in.
+	base, err := dockerRun(ctx, "inspect", "-f", "{{.Config.Image}}", id)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("snapshot: reading the base image of %s: %w", id, err)
+	}
+	cmd, err := dockerRun(ctx, "inspect", "-f", "{{json .Config.Cmd}}", base)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("snapshot: reading the command of image %s: %w", base, err)
+	}
+	args, err := commitArgs(id, ref, stripEnv, cmd)
 	if err != nil {
 		return Snapshot{}, err
 	}
@@ -629,8 +721,11 @@ func (d *Docker) Snapshot(ctx context.Context, id, ref string, stripEnv []string
 	return Snapshot{Ref: ref}, nil
 }
 
-// commitArgs builds the `docker commit` argv, one `--change "ENV K="` per key
-// to be stripped (see Driver.Snapshot for what and why).
+// commitArgs builds the `docker commit` argv: one `--change "ENV K="` per key
+// to be stripped (see Driver.Snapshot for what and why), and one
+// `--change "CMD <json>"` pinning baseCmd — the base image's command as
+// `docker inspect` renders it — so the container's own command does not become
+// the image's. An empty or "null" baseCmd (an image with no CMD) pins nothing.
 //
 // A malformed key ABORTS the snapshot rather than being skipped. Skipping is
 // the tempting move and it is exactly wrong: the keys that arrive here are an
@@ -638,9 +733,12 @@ func (d *Docker) Snapshot(ctx context.Context, id, ref string, stripEnv []string
 // publishes that secret inside the cached image — the failure this whole
 // parameter exists to prevent. No snapshot at all just means the next session
 // runs the setup script again: slow, never unsafe.
-func commitArgs(id, ref string, stripEnv []string) ([]string, error) {
-	args := make([]string, 0, 3+2*len(stripEnv))
+func commitArgs(id, ref string, stripEnv []string, baseCmd string) ([]string, error) {
+	args := make([]string, 0, 5+2*len(stripEnv))
 	args = append(args, "commit")
+	if baseCmd = strings.TrimSpace(baseCmd); baseCmd != "" && baseCmd != "null" {
+		args = append(args, "--change", "CMD "+baseCmd)
+	}
 	for _, k := range stripEnv {
 		if k == "" || strings.ContainsAny(k, "= \t\n") {
 			return nil, fmt.Errorf("snapshot %s: cannot strip environment key %q: a key may not be empty or contain '=' or whitespace", ref, k)

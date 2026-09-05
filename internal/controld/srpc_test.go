@@ -2,7 +2,9 @@
 package controld
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"log"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/controlapp"
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
@@ -483,5 +486,302 @@ func TestSandboxRequestsDoNotBlockTheRunnerReader(t *testing.T) {
 	closeRelease()
 	if answer := nextSessionRPC(t, f); answer.RPC.ID != 7 {
 		t.Fatalf("answer id = %d, want 7 once the handler was released", answer.RPC.ID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// sandbox-initiated: agent credentials
+//
+// The two upward methods that keep a person's coding-agent login equal on
+// both sides of the sandbox boundary. Everything below drives them through
+// the real transport — a fake runner's session_req, forwarded exactly as
+// runnerd forwards one — so what is proven is the wire, not a method call.
+//
+// No provider is spelled here. The names come off controlapp's table, which
+// is the only place in the repository that has one.
+// ---------------------------------------------------------------------------
+
+// agentCredentialFixture is the bytes every case below stores and reads back.
+// It is not a credential, it is the WORD for one, so that the hygiene tests
+// can assert its absence and mean something by it.
+const agentCredentialFixture = "credential_example"
+
+// agentProviderRow returns the first table row and the first file it
+// allowlists, plus a name that is definitely NOT on it.
+func agentProviderRow(t *testing.T) (name, file string) {
+	t.Helper()
+	rows := controlapp.AgentProviders()
+	if len(rows) == 0 || len(rows[0].Files) == 0 {
+		t.Fatal("the provider table has no row with a file to store")
+	}
+	return rows[0].Name, rows[0].Files[0]
+}
+
+// agentRPCBody reads one answer envelope's three mutually exclusive bodies.
+func agentRPCBody(t *testing.T, env *runner.RPCEnvelope) (version uint64, files map[string][]byte, errText string) {
+	t.Helper()
+	var body struct {
+		Version uint64            `json:"version"`
+		Files   map[string][]byte `json:"files"`
+		Error   string            `json:"error"`
+	}
+	if len(env.Payload) > 0 {
+		if err := json.Unmarshal(env.Payload, &body); err != nil {
+			t.Fatalf("decoding the answer payload: %v", err)
+		}
+	}
+	return body.Version, body.Files, body.Error
+}
+
+// TestSessionRequestAnswersFetchAndPut is the custody loop's controld half
+// end to end: a sandbox asks at boot and is told the truth (nothing yet), the
+// person's agent writes its file and the sandbox puts it, and the next boot's
+// fetch hands the same bytes back at the version the put returned.
+//
+// The shapes are pinned as BYTES where the far side reads them as bytes: the
+// agent stage in sessiond reads "version" and "files", and a renamed field
+// here would break the agent home in every session rather than fail a build.
+func TestSessionRequestAnswersFetchAndPut(t *testing.T) {
+	provider, file := agentProviderRow(t)
+	s, st, ts := newTestControld(t)
+	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
+	u := seedVaultUser(t, st, 6100, "alice")
+	id := sandboxSessionFor(t, st, "sess_agent_ok", "vm1", u.ID)
+
+	// Boot with no login: an ANSWER, not a refusal. The agent starts and asks
+	// the person to log in, which is the truthful state.
+	f.sandboxRequest(t, id, 51, runner.MethodFetchAgentCredentials, `{"provider":"`+provider+`"}`)
+	cmd := nextSessionRPC(t, f)
+	if cmd.RPC.ID != 51 || !cmd.RPC.OK {
+		_, _, errText := agentRPCBody(t, cmd.RPC)
+		t.Fatalf("the first fetch = %+v (%q), want an ok:true answer", cmd.RPC, errText)
+	}
+	if got, want := string(cmd.RPC.Payload), `{"version":0,"files":{}}`; got != want {
+		t.Fatalf("empty fetch payload = %s, want %s", got, want)
+	}
+
+	// The person logs in; the sandbox puts what the agent wrote.
+	encoded := base64.StdEncoding.EncodeToString([]byte(agentCredentialFixture))
+	f.sandboxRequest(t, id, 52, runner.MethodPutAgentCredentials,
+		`{"provider":"`+provider+`","files":{"`+file+`":"`+encoded+`"},"version":0}`)
+	cmd = nextSessionRPC(t, f)
+	if cmd.RPC.ID != 52 || !cmd.RPC.OK {
+		_, _, errText := agentRPCBody(t, cmd.RPC)
+		t.Fatalf("the put = %+v (%q), want an ok:true answer", cmd.RPC, errText)
+	}
+	if got, want := string(cmd.RPC.Payload), `{"version":1}`; got != want {
+		t.Fatalf("put payload = %s, want %s", got, want)
+	}
+
+	// A second boot — the whole point of custody — finds the login already
+	// there, at the version the put reported.
+	f.sandboxRequest(t, id, 53, runner.MethodFetchAgentCredentials, `{"provider":"`+provider+`"}`)
+	cmd = nextSessionRPC(t, f)
+	if cmd.RPC.ID != 53 || !cmd.RPC.OK {
+		t.Fatalf("the second fetch = %+v, want an ok:true answer", cmd.RPC)
+	}
+	version, files, _ := agentRPCBody(t, cmd.RPC)
+	if version != 1 {
+		t.Fatalf("fetched version = %d, want 1", version)
+	}
+	if got := files[file]; string(got) != agentCredentialFixture {
+		t.Fatalf("fetched %d bytes for %q, want the %d the put sent", len(got), file, len(agentCredentialFixture))
+	}
+	// A second put advances the version: that is how `rainier agent ls` and
+	// the sandbox's own baseline tell a fresh login from a stale one.
+	f.sandboxRequest(t, id, 54, runner.MethodPutAgentCredentials,
+		`{"provider":"`+provider+`","files":{"`+file+`":"`+encoded+`"},"version":1}`)
+	cmd = nextSessionRPC(t, f)
+	if got, want := string(cmd.RPC.Payload), `{"version":2}`; !cmd.RPC.OK || got != want {
+		t.Fatalf("second put payload = %s, want %s", got, want)
+	}
+}
+
+// TestSessionRequestRefusesAnAgentCredentialItMustNot walks every refusal the
+// two methods have, and asserts the same thing about each: the answer is
+// ok:false, it carries a fixed sentence, and it carries NOTHING ELSE — no
+// version a sandbox could record as a baseline, and no byte of anybody's set.
+func TestSessionRequestRefusesAnAgentCredentialItMustNot(t *testing.T) {
+	provider, file := agentProviderRow(t)
+	encoded := base64.StdEncoding.EncodeToString([]byte(agentCredentialFixture))
+	oversize := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("x"), controlapp.AgentCredentialSetMaxBytes+1))
+
+	for _, tc := range []struct {
+		name    string
+		method  string
+		payload string
+		// seed returns the session id to ask about, having arranged whatever
+		// makes this case refuse.
+		seed func(t *testing.T, s *Server, st MemStore) string
+		want string
+	}{
+		{
+			name: "a session placed on another runner", method: runner.MethodFetchAgentCredentials,
+			payload: `{"provider":"` + provider + `"}`,
+			seed: func(t *testing.T, s *Server, st MemStore) string {
+				u := seedVaultUser(t, st, 6101, "alice")
+				return sandboxSessionFor(t, st, "sess_agent_elsewhere", "vm2", u.ID)
+			},
+			want: "this session is not placed on the runner that asked",
+		},
+		{
+			name: "a session nobody has", method: runner.MethodFetchAgentCredentials,
+			payload: `{"provider":"` + provider + `"}`,
+			seed:    func(t *testing.T, s *Server, st MemStore) string { return "sess_agent_ghost" },
+			want:    "no such session",
+		},
+		{
+			name: "a session with no creator", method: runner.MethodFetchAgentCredentials,
+			payload: `{"provider":"` + provider + `"}`,
+			seed: func(t *testing.T, s *Server, st MemStore) string {
+				// Written straight through the store: seedSession supplies a
+				// creator, and this is the row nothing in the API produces.
+				if _, err := st.Sessions().CreateSession(context.Background(), installWorkspace,
+					control.Session{ID: "sess_agent_ownerless", State: control.StateRunning, PoolID: installPool, RunnerID: "vm1"}); err != nil {
+					t.Fatalf("seeding an ownerless session: %v", err)
+				}
+				return "sess_agent_ownerless"
+			},
+			want: "this session has no creator to fetch an agent credential for",
+		},
+		{
+			name: "a creator who is no longer an operator here", method: runner.MethodFetchAgentCredentials,
+			payload: `{"provider":"` + provider + `"}`,
+			seed: func(t *testing.T, s *Server, st MemStore) string {
+				return sandboxSessionFor(t, st, "sess_agent_stranger", "vm1", "usr_no_such_operator")
+			},
+			want: "your workspace membership no longer allows this",
+		},
+		{
+			name: "a provider outside the table", method: runner.MethodFetchAgentCredentials,
+			payload: `{"provider":"provider_example"}`,
+			seed: func(t *testing.T, s *Server, st MemStore) string {
+				u := seedVaultUser(t, st, 6102, "alice")
+				return sandboxSessionFor(t, st, "sess_agent_unknown_provider", "vm1", u.ID)
+			},
+			want: "unknown agent provider",
+		},
+		{
+			name: "a set over the cap", method: runner.MethodPutAgentCredentials,
+			payload: `{"provider":"` + provider + `","files":{"` + file + `":"` + oversize + `"}}`,
+			seed: func(t *testing.T, s *Server, st MemStore) string {
+				u := seedVaultUser(t, st, 6103, "alice")
+				return sandboxSessionFor(t, st, "sess_agent_oversize", "vm1", u.ID)
+			},
+			want: "the agent credential set is too large",
+		},
+		{
+			name: "a file name off the allowlist", method: runner.MethodPutAgentCredentials,
+			payload: `{"provider":"` + provider + `","files":{"../../workspace/notes":"` + encoded + `"}}`,
+			seed: func(t *testing.T, s *Server, st MemStore) string {
+				u := seedVaultUser(t, st, 6104, "alice")
+				return sandboxSessionFor(t, st, "sess_agent_traversal", "vm1", u.ID)
+			},
+			want: "that file is not part of this agent's credential set",
+		},
+		{
+			// Valid JSON, wrong shape. A body that is not JSON at all cannot
+			// be built here — the envelope's payload is a json.RawMessage and
+			// the transport refuses to marshal one — and the sandbox's own
+			// encoder is under the same constraint, so this IS the malformed
+			// request that can actually arrive.
+			name: "a body that is not the shape", method: runner.MethodPutAgentCredentials,
+			payload: `{"provider":7,"files":"not_a_map"}`,
+			seed: func(t *testing.T, s *Server, st MemStore) string {
+				u := seedVaultUser(t, st, 6105, "alice")
+				return sandboxSessionFor(t, st, "sess_agent_garbage", "vm1", u.ID)
+			},
+			want: "the agent credential request could not be decoded",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, st, ts := newTestControld(t)
+			f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
+			id := tc.seed(t, s, st)
+
+			f.sandboxRequest(t, id, 61, tc.method, tc.payload)
+			cmd := nextSessionRPC(t, f)
+			if cmd.RPC.ID != 61 || cmd.RPC.OK {
+				t.Fatalf("answer = %+v, want an ok:false resp for id 61", cmd.RPC)
+			}
+			version, files, errText := agentRPCBody(t, cmd.RPC)
+			if errText != tc.want {
+				t.Fatalf("error = %q, want %q", errText, tc.want)
+			}
+			if version != 0 || len(files) != 0 {
+				t.Fatalf("a refusal carried version %d and %d files", version, len(files))
+			}
+			if strings.Contains(string(cmd.RPC.Payload), agentCredentialFixture) ||
+				strings.Contains(string(cmd.RPC.Payload), encoded) {
+				t.Fatalf("a refusal carried a credential: %s", cmd.RPC.Payload)
+			}
+		})
+	}
+}
+
+// TestNoCredentialByteReachesALogOrError holds the plan's hygiene rule where
+// it is easiest to break. controld's logs are the fleet's most-copied
+// artifact — pasted into issues, shipped to an aggregator — and an agent
+// credential that reaches one has escaped custody for good.
+//
+// It drives every path that has a set in scope: the empty fetch, the put, the
+// fetch that hands it back, and two refusals.
+//
+// What it scans for needs saying. The full fixture is checked as-is. Its
+// THREE-BYTE runs are checked in the form the bytes actually travel in —
+// base64, inside the RPC payload — because that is the shape a partial leak
+// would take, and because a three-byte scan of the plaintext would fire on
+// the honest words the log is written in: "agent credential" contains "cre",
+// "red", "ent", "ial" and the rest of them. A scan that cannot pass is not an
+// assertion, it is a broken test that would be deleted at the first failure.
+func TestNoCredentialByteReachesALogOrError(t *testing.T) {
+	provider, file := agentProviderRow(t)
+	sink := captureLogs(t)
+	s, st, ts := newTestControld(t)
+	f := joinRunner(t, s, ts, runnerScript{Name: "vm1"})
+	u := seedVaultUser(t, st, 6200, "alice")
+	id := sandboxSessionFor(t, st, "sess_agent_quiet", "vm1", u.ID)
+	encoded := base64.StdEncoding.EncodeToString([]byte(agentCredentialFixture))
+
+	f.sandboxRequest(t, id, 71, runner.MethodFetchAgentCredentials, `{"provider":"`+provider+`"}`)
+	if cmd := nextSessionRPC(t, f); !cmd.RPC.OK {
+		t.Fatalf("the empty fetch was refused: %s", cmd.RPC.Payload)
+	}
+	f.sandboxRequest(t, id, 72, runner.MethodPutAgentCredentials,
+		`{"provider":"`+provider+`","files":{"`+file+`":"`+encoded+`"}}`)
+	if cmd := nextSessionRPC(t, f); !cmd.RPC.OK {
+		t.Fatalf("the put was refused: %s", cmd.RPC.Payload)
+	}
+	f.sandboxRequest(t, id, 73, runner.MethodFetchAgentCredentials, `{"provider":"`+provider+`"}`)
+	if cmd := nextSessionRPC(t, f); !cmd.RPC.OK {
+		t.Fatalf("the second fetch was refused: %s", cmd.RPC.Payload)
+	}
+	// Two refusals, which are the arms that build a message out of what went
+	// wrong and are therefore the ones most likely to quote the value.
+	f.sandboxRequest(t, id, 74, runner.MethodPutAgentCredentials,
+		`{"provider":"`+provider+`","files":{"file_example_off_the_list":"`+encoded+`"}}`)
+	if cmd := nextSessionRPC(t, f); cmd.RPC.OK {
+		t.Fatal("a file off the allowlist was stored")
+	}
+	// The undecodable body CARRIES the fixture, which is the case worth
+	// asserting: a decode error's own text quotes the bytes it choked on, so
+	// wrapping one into a log line would publish the credential.
+	f.sandboxRequest(t, id, 75, runner.MethodPutAgentCredentials,
+		`{"provider":"`+provider+`","files":"`+encoded+`"}`)
+	if cmd := nextSessionRPC(t, f); cmd.RPC.OK {
+		t.Fatal("an undecodable body was stored")
+	}
+
+	got := sink.String()
+	if strings.Contains(got, agentCredentialFixture) {
+		t.Fatalf("the credential fixture reached the log:\n%s", got)
+	}
+	if strings.Contains(got, encoded) {
+		t.Fatalf("the encoded credential reached the log:\n%s", got)
+	}
+	for i := 0; i+3 <= len(encoded); i++ {
+		if run := encoded[i : i+3]; strings.Contains(got, run) {
+			t.Fatalf("a 3-byte run of the encoded credential (%q, at offset %d) reached the log:\n%s", run, i, got)
+		}
 	}
 }

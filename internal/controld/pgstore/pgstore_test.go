@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/controlapp"
 	"github.com/tokencanopy/rainier/controlapp/repotest"
 	"github.com/tokencanopy/rainier/internal/controld"
 	"github.com/tokencanopy/rainier/internal/controld/storetest"
@@ -270,11 +271,11 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	if want := embeddedMigrationVersions(t); !slices.Equal(applied, want) {
 		t.Fatalf("schema_migrations = %v, want every embedded migration in order %v", applied, want)
 	}
-	// This release's head is 9: a database that stopped at 0003 runs the
-	// expand step (0007), the contract step (0008), and the events table
-	// (0009) in the same start.
-	if head := applied[len(applied)-1]; head != 9 {
-		t.Fatalf("head migration = %d, want 9", head)
+	// This release's head is 10: a database that stopped at 0003 runs the
+	// expand step (0007), the contract step (0008), the events table
+	// (0009), and the agent credentials table (0010) in the same start.
+	if head := applied[len(applied)-1]; head != 10 {
+		t.Fatalf("head migration = %d, want 10", head)
 	}
 
 	// The legacy session survived, and its new columns read as "never exited"
@@ -478,6 +479,65 @@ func TestPGStoreRepositories(t *testing.T) {
 			Provision:    st.EnsureWorkspace,
 		}
 	})
+}
+
+// agentTestSecretsKey is the fleet key the agent vault seals under in these
+// tests. It is a fixed non-zero 32 bytes; nothing about the contract depends
+// on its value, only on it being the same one for the life of a case.
+var agentTestSecretsKey = func() [32]byte {
+	key, err := controld.ParseSecretsKey(strings.Repeat("ab", 32))
+	if err != nil {
+		panic(err)
+	}
+	return key
+}()
+
+// TestPGStoreAgentCredentials runs the custody contract over the Postgres
+// store, through the same self-hosted vault the server composes. It is the
+// same suite the in-memory store passes, which is the point: a person's agent
+// login behaves identically on both, or one of them is wrong.
+//
+// The two people the suite writes as are inserted first: agent_credentials
+// references users(id) ON DELETE CASCADE, so a set cannot exist for somebody
+// this installation has never seen — which is the property the foreign key is
+// there for, and the reason the suite exports its two ids.
+func TestPGStoreAgentCredentials(t *testing.T) {
+	dsn := startPostgres(t)
+	repotest.RunAgentCredentialStore(t, func(t *testing.T) controlapp.AgentCredentialStore {
+		st := freshStore(t, dsn, t.Name())
+		for i, id := range []control.ActorID{repotest.AgentUser, repotest.AgentOther} {
+			mustExec(t, st.pool, `INSERT INTO users (id, github_id, login, role) VALUES ($1, $2, $3, 'member')`,
+				string(id), int64(7000+i), fmt.Sprintf("octocat-example-%d", i))
+		}
+		return controld.NewAgentVault(st, agentTestSecretsKey)
+	})
+}
+
+// TestPGStoreAgentCredentialsCascadeWithTheirOperator: removing an operator
+// removes their agent logins with them, the same way it already removes their
+// tokens and their git credential. Nothing in this build deletes a user, but
+// the schema is where that promise lives, and a migration that dropped the
+// reference would break it silently.
+func TestPGStoreAgentCredentialsCascadeWithTheirOperator(t *testing.T) {
+	ctx := context.Background()
+	st := freshStore(t, startPostgres(t), "agentcascade")
+	mustExec(t, st.pool, `INSERT INTO users (id, github_id, login, role) VALUES ('user_example', 7100, 'octocat-example', 'member')`)
+
+	vault := controld.NewAgentVault(st, agentTestSecretsKey)
+	provider := controlapp.AgentProviders()[0].Name
+	if _, err := vault.PutAgentCredentials(ctx, repotest.AgentUser, provider,
+		map[string][]byte{"file_example": []byte("credential_example")}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	mustExec(t, st.pool, `DELETE FROM users WHERE id = 'user_example'`)
+
+	set, err := vault.FetchAgentCredentials(ctx, repotest.AgentUser, provider)
+	if err != nil {
+		t.Fatalf("fetch after the operator was removed: %v", err)
+	}
+	if set.Version != 0 || len(set.Files) != 0 {
+		t.Fatalf("the set outlived its operator: version %d with %d files", set.Version, len(set.Files))
+	}
 }
 
 // TestPGStoreHost runs the host-side contract: identity, the vault, and the

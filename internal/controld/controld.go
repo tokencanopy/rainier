@@ -145,6 +145,12 @@ type Server struct {
 	environments *controlapp.EnvironmentService
 	fleet        *controlapp.FleetService
 	attachments  *controlapp.AttachmentService
+	// agents is custody of the operators' coding-agent logins: the service
+	// that answers the two upward RPC methods a sandbox's agent stage calls,
+	// and that a logout drives downward. It is composed over the same
+	// authorizer as everything else, and over the fleet secrets key by way of
+	// the agent vault.
+	agents *controlapp.AgentCredentialService
 
 	// transport is the runner plane behind the control.RunnerTransport port
 	// (plane.Transport()) and broker the dial-back attach pairing behind
@@ -293,7 +299,20 @@ func (s *Server) compose() error {
 	if err != nil {
 		return fmt.Errorf("controld: composing the attachment service: %w", err)
 	}
+	// Custody is composed LAST because it is composed over the attachment
+	// service: a downward revoke travels the same session RPC a workspace
+	// diff does, and there is exactly one implementation of that seam.
+	//
+	// No workspace lister is supplied, and that is the whole truth here
+	// rather than a gap: a self-hosted installation is exactly one workspace
+	// (adapt_scope.go), so the scope's own workspace IS every workspace this
+	// host has, which is what `rainier agent logout` promises.
+	agentSvc := controlapp.NewAgentCredentialService(
+		NewAgentVault(s.st, s.cfg.SecretsKey), auth, sessions, attachSvc,
+		controlapp.WithAgentPlacement(installPlacement()))
+
 	s.fleet, s.sessions, s.environments, s.attachments = fleetSvc, sessionSvc, envSvc, attachSvc
+	s.agents = agentSvc
 	return nil
 }
 
@@ -339,6 +358,25 @@ func (s *Server) Handler() http.Handler {
 	// own rows and nobody else's (not even an admin's view of them), and
 	// there is no write route at all — a credential is stored by logging in.
 	mux.HandleFunc("GET /v0/credentials", s.requireUser(s.handleListCredentials))
+
+	// Agent logins are per-user for the same reason credentials are, and more
+	// strongly: a coding agent's login is one person's subscription, so no
+	// workspace role reaches it and the service refuses an owner or an admin
+	// who tries (controlapp.ErrAgentCredentialNotYours). There is no write
+	// route — a set is stored by logging in inside a session, never by
+	// posting one here.
+	//
+	// No membership hook calls AgentCredentialService.Withdraw in this
+	// composition, and that is a fact about self-hosted controld rather than
+	// a gap: membership never changes at runtime here. A person's role is
+	// read from the --admins/--members allowlists at every login (auth.go's
+	// roleFor), so removing somebody is an operator editing those flags and
+	// restarting the process — there is no request, event, or store write on
+	// which a withdrawal could be triggered. Withdraw exists for the host
+	// that DOES have a runtime membership path: a hosted cell calls it from
+	// its own, which is why it lives on the service and not on a route here.
+	mux.HandleFunc("GET /v0/agents", s.requireUser(s.handleListAgents))
+	mux.HandleFunc("DELETE /v0/agents/{provider}", s.requireUser(s.handleLogoutAgent))
 
 	// Environments belong to the whole team, so like secrets they have no
 	// owner to fall back on: mutations are admin-only, reads team-visible

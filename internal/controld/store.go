@@ -67,6 +67,58 @@ type Credential struct {
 	UpdatedAt                       time.Time
 }
 
+// AgentCredential is one person's sealed credential set for one coding
+// agent, keyed by (UserID, Provider) — one row per person per agent, and no
+// workspace anywhere in it. That is the whole shape of "log in once and every
+// workspace has it": the projection into workspaces happens above the store,
+// at delivery, where membership is re-checked.
+//
+// Ciphertext/Nonce are opaque here exactly as a Credential's are: the store
+// never interprets them, and sealing happens above it (agentvault.go). Version
+// counts puts and is part of what the ciphertext is sealed AGAINST, so a row
+// whose version was edited no longer opens — see PutAgentCredential for the
+// contract that keeps the two in step. No method on this type, and no error
+// any store returns about one, may carry a credential value.
+type AgentCredential struct {
+	UserID, Provider  string
+	Ciphertext, Nonce []byte
+	Version           uint64
+	UpdatedAt         time.Time
+}
+
+// AgentCredentialRows is the slice of a store an agent vault needs: four
+// methods over one table, and nothing else. It is named because the vault
+// takes it rather than the whole HostStore — custody has no business reaching
+// a bearer token or a session row, and a port sized to the job is how that
+// stays true.
+type AgentCredentialRows interface {
+	// GetAgentCredential returns the row, or control.ErrNotFound.
+	GetAgentCredential(ctx context.Context, userID, provider string) (AgentCredential, error)
+	// PutAgentCredential inserts or replaces the row and returns the stored
+	// version.
+	//
+	// c.Version is the version the CALLER has already sealed c.Ciphertext
+	// for, and the write succeeds only when it is exactly one more than the
+	// stored row's (or when there is no stored row). Anything else is
+	// control.ErrConflict and nothing changes. That guard is what makes the
+	// stored version always the version the ciphertext was sealed against,
+	// under concurrency: two sessions of one person racing each other cannot
+	// both land on the same version, and the loser re-reads, re-seals, and
+	// tries again rather than storing a blob that will never open.
+	//
+	// A c.Version of 0 is control.ErrInvalid: versions start at 1, and 0 is
+	// the wire's word for "there is no set".
+	PutAgentCredential(ctx context.Context, c AgentCredential) (version uint64, err error)
+	// DeleteAgentCredential removes the row. Deleting what is not there is a
+	// nil error: "there is no credential" is the state either way.
+	DeleteAgentCredential(ctx context.Context, userID, provider string) error
+	// ListAgentCredentials returns userID's rows ordered by provider, with
+	// Ciphertext and Nonce left NIL. A listing renders a status — provider,
+	// version, timestamp — so it never reads the sealed bytes at all, which
+	// is a stronger guarantee than clearing them afterwards would be.
+	ListAgentCredentials(ctx context.Context, userID string) ([]AgentCredential, error)
+}
+
 // Store is controld's persistence interface: the host's own persistence
 // (HostStore), the host's atomicity and event record (control.UnitOfWork and
 // control.EventRecorder), and the three control repository ports
@@ -114,6 +166,11 @@ type HostStore interface {
 	SetCredentialStatus(ctx context.Context, userID, provider, status string) error
 	TouchCredentialUsed(ctx context.Context, userID, provider string) error
 	ListCredentials(ctx context.Context, userID string) ([]Credential, error)
+
+	// The agent credential rows, in the same vault the git credential lives
+	// in and under the same discipline. They are embedded rather than listed
+	// so the narrow port and the wide one cannot drift apart.
+	AgentCredentialRows
 
 	// EnvironmentByName resolves a name inside ws to the id the service is
 	// then asked for. The name index is a locator, never authority: the

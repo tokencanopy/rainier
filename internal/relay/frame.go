@@ -83,7 +83,7 @@ type ControlEvent struct {
 	// through without parsing it.
 	Payload json.RawMessage `json:"payload,omitempty"`
 	// Stage names which stage of the session's boot chain failed on a
-	// "stage_failed": "setup", "clone", or "init". Sessiond does not send it
+	// "stage_failed": "setup", "clone", "agents", or "init". Sessiond does not send it
 	// yet — the boot chain that has stages is a later task — but the field is
 	// defined here, with the rest of the vocabulary, so that the sender and
 	// the runnerd that decodes it are agreeing on one shape rather than two

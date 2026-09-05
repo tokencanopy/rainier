@@ -18,6 +18,52 @@ import "encoding/json"
 // both the announced and the expected version.
 const ProtocolVersion = 1
 
+// The three session-RPC methods that keep a coding agent's credential set
+// equal to the control plane's sealed copy. They are wire words: a sandbox
+// registers handlers under exactly these names and a control plane answers
+// them, so they are declared once here rather than spelled at each end.
+//
+// None of them names a provider in its shape — a provider is a string the
+// control plane's table defines and both ends merely carry — and none of them
+// puts a credential anywhere a forwarder reads: files travel base64 inside the
+// opaque payload, and a refusal is the usual {"error": sentence} on ok:false.
+const (
+	// MethodFetchAgentCredentials is sandbox → control plane, at boot:
+	// {"provider": "..."} → {"version": n, "files": {name: base64}}. Version
+	// 0 with no files is the truthful answer for a person who has not logged
+	// that agent in; it is an answer, not a refusal, and the agent starts
+	// anyway and asks them to log in.
+	MethodFetchAgentCredentials = "fetch_agent_credentials"
+	// MethodPutAgentCredentials is sandbox → control plane, whenever the
+	// allowlisted files change: {"provider": "...", "files": {name: base64},
+	// "version": n} → {"version": n+1}. The version the sandbox sends is the
+	// one it last saw, so custody can tell a fresh login from a replay of a
+	// set that has since been revoked.
+	MethodPutAgentCredentials = "put_agent_credentials"
+	// MethodRevokeAgentCredentials is control plane → sandbox, on a logout or
+	// a membership that went away: {"provider": "..."} → {}. The sandbox
+	// removes that provider's allowlisted files and forgets its baseline, so
+	// a later login inside the same session is a new set rather than a re-put
+	// of the revoked one.
+	MethodRevokeAgentCredentials = "revoke_agent_credentials"
+)
+
+// HomeMount is the agent home a create mounts into a sandbox: one writable
+// volume per (creator, workspace), landing at Path, inside which each coding
+// agent gets its own subdirectory. It is what makes "log in once" true across
+// sessions — a credential set lives in the volume, never in the image, the
+// workspace, a checkpoint, or the environment — and it is the only writable
+// place a session has outside its workspace.
+//
+// Volume is opaque on purpose. A volume name is visible to anyone with a
+// shell on the runner, and an account identifier is not something to print
+// there, so the control plane hands down a hash (controlapp.AgentHomeVolume)
+// and the runner treats it as a name to mount, never as something to parse.
+type HomeMount struct {
+	Volume string `json:"volume"`
+	Path   string `json:"path"`
+}
+
 // RPCEnvelope is one message of the session RPC — the bidirectional
 // request/response channel that reaches all the way into a sandbox. It rides
 // a ToRunner "session_rpc" going down and a FromRunner "session_req" coming
@@ -213,6 +259,14 @@ type Spec struct {
 	// Env is injected into the container's environment. Values are secrets
 	// as often as not, so this field is never logged verbatim.
 	Env map[string]string `json:"env,omitempty"`
+	// Home is the agent home this session mounts: the (creator, workspace)
+	// volume every coding agent keeps its own configuration and credential
+	// set under. Absent on a create for a session with no creator, and on
+	// every create a control plane older than this field ever sent — which is
+	// why it is additive at ProtocolVersion 1 and omitempty: a runner that
+	// does not know the field mounts nothing and the session's agents simply
+	// ask for a login, which is the truthful state, not a failure.
+	Home *HomeMount `json:"home,omitempty"`
 }
 
 // Attach is the dial_attach block of a ToRunner: controld tells the runner

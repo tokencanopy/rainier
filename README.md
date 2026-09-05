@@ -99,6 +99,36 @@ short-lived — the CLI refreshes them silently and re-saves the rotated pair, a
 only says "log in again" when that is genuinely the remaining step. Set
 `RAINIER_NO_BROWSER=1` on a headless box to print the URL without opening it.
 
+### Agent login
+
+A coding agent inside a session — Claude Code, Codex — is logged in once and
+stays logged in: in every later session, in every workspace you are a member
+of, on any runner.
+
+```bash
+bin/rainier agent login claude --env dev   # a session running the agent's own login; finish it, then exit
+bin/rainier agent ls                       # PROVIDER  STATUS  SINCE  WORKSPACES
+bin/rainier agent logout claude            # everywhere, at once
+```
+
+`agent login` is an ordinary session whose only job is the vendor's own login
+flow, attached to your terminal: Claude Code prints its sign-in URL and asks
+for the code back, Codex uses a device code. The environment you name has to
+have the agent installed. When you exit, the CLI removes that session and
+reports whether a credential was stored.
+
+What makes this work is the **agent home**: every session a person starts
+mounts one writable volume per workspace at `/rainier/agents`, and each agent
+is pointed at its own subdirectory through the variable it already honors
+(`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). The agent's credential file lives there,
+and `sessiond` keeps it equal to a sealed copy the control plane holds:
+fetched at boot, put whenever the agent rewrites it (a background token
+refresh included), removed when you log out. The credential is never in the
+workspace, an environment snapshot, the process environment, a create, or a
+log. Everything provider-specific is one row in `controlapp/agents.go`; a
+third agent is a row plus its probes.
+
+
 `rainier new` attaches immediately by default so you watch the agent boot;
 `--detach` opts out. `rainier attach` is state-aware: a suspended session is
 resumed first, and an established viewer reconnects after transient network or

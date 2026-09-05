@@ -403,11 +403,39 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 	spec.GitAuthorName = material.GitAuthorName
 	spec.GitAuthorEmail = material.GitAuthorEmail
 	spec.Env = cloneMap(material.Environment)
+	// The agent home is the creator's, in this workspace: every session they
+	// start there mounts the same volume, and that sameness is the whole of
+	// "log in once". A session with no creator gets none of this — a home
+	// belongs to a person, there is nobody to name, and a variable pointing
+	// at a directory that was never mounted, or an egress hole for a login
+	// that cannot happen, would be a claim the create cannot keep.
+	var providers []AgentProvider
+	if row.CreatorID != "" {
+		providers = AgentProviders()
+		spec.Home = &runner.HomeMount{
+			Volume: AgentHomeVolume(row.WorkspaceID, row.CreatorID),
+			Path:   HomeMountPath,
+		}
+		// The agents' variables go in FIRST and the resolved material over
+		// them: they are defaults derived from a table, while the resolver's
+		// environment is the host's own decision, which the documented
+		// last-wins rule says beats a default.
+		agentEnv := AgentsEnv(providers)
+		for k, v := range spec.Env {
+			agentEnv[k] = v
+		}
+		spec.Env = agentEnv
+	}
 	// The session row stores only the egress its caller or environment
 	// declared; the hosts the resolved material needs are the resolver's
 	// knowledge and are added here, at dispatch, so the row and the view a
-	// human reads off it never claim a host nobody asked for.
+	// human reads off it never claim a host nobody asked for. The providers'
+	// hosts — what an agent's login, refresh, and inference reach — join last
+	// for the same reason, so a host a human named still reads first.
 	spec.EgressAllow = unionHosts(spec.EgressAllow, material.EgressAllow)
+	for _, p := range providers {
+		spec.EgressAllow = unionHosts(spec.EgressAllow, p.Egress)
+	}
 	return &spec, ""
 }
 

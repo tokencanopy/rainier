@@ -297,3 +297,46 @@ func TestNoCredentialByteReachesALogOrError(t *testing.T)
 ## Honest sizing
 
 Five worker tasks after a half-day of probes. Task 1 first (everything reads its types); Tasks 2 and 3 in parallel after it; Task 4 after 1; Task 5 after 4. Tasks 3 and 4 are substantial; 1, 2, and 5 are moderate. About three days at three workers with the reviewer gating, plus the live phase and the tag.
+
+## Execution record (2026-09-05)
+
+Tasks 1–5 were built by one worker each and reviewed, with every gate re-run
+independently, on the integration branch `feat/agent-credential-home`. What
+the execution decided that the plan above left open, or decided differently:
+
+- **The agents stage is a wait, not the work.** The fetch is a session RPC and
+  the relay that carries it exists only once the session runs, so `sessiond`
+  fetches on its own goroutine while the earlier stages run and the stage
+  script waits on a marker (`/workspace/.rainier/agents.done`), bounded at
+  60 s so a silent control plane can never hold a session shut. Every session
+  with a creator now boots behind the chain wrapper, scratch sessions
+  included.
+- **Boot notes are not surfaced yet.** `sessiond` emits `{"kind":"agent_note"}`
+  on a refused or timed-out fetch, but runnerd drops an unknown control kind;
+  routing it needs `internal/relay`, runnerd, and controld changes this plan
+  did not include. `GET /v0/agents` therefore has no `note` field and `agent
+  ls` shows none. A later change adds the field when the note has a path.
+- **Custody assigns the version under a compare-and-set.** The vault reads the
+  row, seals for `stored+1` with (user, provider, version) as additional
+  authenticated data, and writes with a version guard; a conflict re-reads and
+  re-seals. Two concurrent puts cannot land on one version and a row's
+  ciphertext and its version can never disagree. `seal.go` gained an AAD pair;
+  `Seal`/`Open` are that pair with nil, so every earlier sealed value opens.
+- **Membership is checked as `ActionAttach` on the creator's own session**, so
+  the frozen `control` contract gained no action. Self-hosted controld has no
+  runtime membership change, so no withdrawal hook exists there; a hosted cell
+  calls `Withdraw` from its own membership path.
+- **`agent login` exits 0 when the login did not complete**: it prints the
+  sentence, since the CLI did what it set out to do and a person who quit the
+  agent is an outcome rather than a CLI failure. The CLI and the e2e's controld
+  both honor `RAINIER_E2E_TEST_AGENT=1` so the synthetic provider can be logged
+  in from the client side.
+- **The live phase proves custody by removing the volume.** The fleet e2e runs
+  one runner, so "a second session on the other runner boots with the file"
+  became "the home volume is removed between the login session and the next
+  one": the file can then only have come down the RPC, which is the same fact
+  and a stricter one.
+- **A5 was resolved outside this plan** (`fix/proxy-userinfo-password`): the
+  driver's proxy URL carried an empty password, which Claude Code refuses. With
+  a placeholder password both builds answer a model call through egressd in
+  seconds; the fix reaches the Dedicated runner artifacts with `v0.0.3`.

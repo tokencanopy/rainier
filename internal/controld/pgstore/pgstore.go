@@ -346,6 +346,104 @@ func (s *Store) ListCredentials(ctx context.Context, userID string) ([]controld.
 	return out, rows.Err()
 }
 
+// --- agent credentials ------------------------------------------------------
+//
+// Custody of a person's coding-agent logins (migration 0010). The sealed
+// bytes are opaque here exactly as a git credential's are, and one property
+// beyond that is this table's own: version is part of what the bytes were
+// sealed against (agentvault.go), so the row's version and its ciphertext can
+// never be allowed to drift apart. PutAgentCredential is the single statement
+// that keeps them together.
+
+func (s *Store) GetAgentCredential(ctx context.Context, userID, provider string) (controld.AgentCredential, error) {
+	c := controld.AgentCredential{UserID: userID, Provider: provider}
+	// The version is scanned as int64 and converted, the way every other
+	// bigint-backed generation in this package is: pgx maps the column to
+	// Go's signed 64-bit type, and the conversion is where the package says
+	// so once rather than relying on a driver's coercion.
+	var version int64
+	err := s.q(ctx).QueryRow(ctx,
+		`SELECT ciphertext, nonce, version, updated_at FROM agent_credentials WHERE user_id = $1 AND provider = $2`,
+		userID, provider).Scan(&c.Ciphertext, &c.Nonce, &version, &c.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controld.AgentCredential{}, control.ErrNotFound
+		}
+		// The identity is enough to find the row, and the message carries no
+		// value — the same discipline UpsertCredential is written under, and
+		// for the same reason: this error is logged.
+		return controld.AgentCredential{}, fmt.Errorf("pgstore: get agent credential for provider %q: %w", provider, err)
+	}
+	c.Version = uint64(version)
+	return c, nil
+}
+
+// PutAgentCredential writes the row in ONE statement whose WHERE is the
+// version guard: the update fires only when the stored version is exactly one
+// behind the version the caller sealed for, so two concurrent puts cannot
+// both win and neither can leave a ciphertext sealed against a version the
+// row does not have. A guard that did not fire returns no row, which is
+// control.ErrConflict — the caller re-reads, re-seals, and tries again.
+func (s *Store) PutAgentCredential(ctx context.Context, c controld.AgentCredential) (uint64, error) {
+	if c.UserID == "" || c.Provider == "" || c.Version == 0 {
+		return 0, control.ErrInvalid
+	}
+	var version int64
+	err := s.q(ctx).QueryRow(ctx, `
+		INSERT INTO agent_credentials (user_id, provider, ciphertext, nonce, version, updated_at)
+		VALUES ($1, $2, $3, $4, $5, now())
+		ON CONFLICT (user_id, provider) DO UPDATE SET
+			ciphertext = EXCLUDED.ciphertext,
+			nonce      = EXCLUDED.nonce,
+			version    = EXCLUDED.version,
+			updated_at = now()
+		WHERE agent_credentials.version = EXCLUDED.version - 1
+		RETURNING version`,
+		c.UserID, c.Provider, c.Ciphertext, c.Nonce, int64(c.Version)).Scan(&version)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, control.ErrConflict
+		}
+		return 0, fmt.Errorf("pgstore: put agent credential for provider %q: %w", c.Provider, err)
+	}
+	return uint64(version), nil
+}
+
+func (s *Store) DeleteAgentCredential(ctx context.Context, userID, provider string) error {
+	// No RowsAffected check: a revoke of what is not there has already
+	// achieved what it asked for, and reporting ErrNotFound would make an
+	// idempotent operation fail on its second call.
+	if _, err := s.q(ctx).Exec(ctx,
+		`DELETE FROM agent_credentials WHERE user_id = $1 AND provider = $2`, userID, provider); err != nil {
+		return fmt.Errorf("pgstore: delete agent credential for provider %q: %w", provider, err)
+	}
+	return nil
+}
+
+// ListAgentCredentials does not select ciphertext or nonce at all. Clearing
+// them after the scan would be a promise this code keeps; not reading them is
+// a promise the QUERY keeps, which survives someone editing the loop below.
+func (s *Store) ListAgentCredentials(ctx context.Context, userID string) ([]controld.AgentCredential, error) {
+	rows, err := s.q(ctx).Query(ctx,
+		`SELECT provider, version, updated_at FROM agent_credentials WHERE user_id = $1 ORDER BY provider ASC`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("pgstore: list agent credentials: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]controld.AgentCredential, 0)
+	for rows.Next() {
+		c := controld.AgentCredential{UserID: userID}
+		var version int64
+		if err := rows.Scan(&c.Provider, &version, &c.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("pgstore: list agent credentials: %w", err)
+		}
+		c.Version = uint64(version)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // --- cursor ---------------------------------------------------------------
 
 // encodeCursor and decodeCursor implement ListSessions's opaque page

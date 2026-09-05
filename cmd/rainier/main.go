@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -24,6 +25,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/tokencanopy/rainier/controlapp"
 	"github.com/tokencanopy/rainier/internal/attachio"
 	"github.com/tokencanopy/rainier/internal/cli"
 	"github.com/tokencanopy/rainier/protocol/terminal"
@@ -69,6 +71,8 @@ func main() {
 		err = runPull(rest)
 	case "creds":
 		err = runCreds(rest)
+	case "agent":
+		err = runAgent(rest)
 	case "secret":
 		err = runSecret(rest)
 	case "env":
@@ -110,6 +114,7 @@ commands:
   push     <local-dir> <id|name>:<path>
   pull     <id|name>:<path> <local-dir>
   creds
+  agent    login <provider> --env NAME | ls | logout <provider> [--yes]
   secret   set <NAME> [--value V] | ls | rm <NAME>
   env      create <name> [flags] | ls | show <ref> | update <ref> [flags] | rm <ref>
   context  list | use <name> | current | remove <name>
@@ -163,6 +168,18 @@ more than one session, your own is preferred when it's the only one of the
 matches that's yours (login records who you are); otherwise the name is
 rejected as ambiguous and every matching session's id and owner are listed
 so you can pass the id explicitly.`)
+
+	// The provider list is read off the table rather than typed here: a
+	// third coding agent is a row in controlapp/agents.go, and a usage line
+	// that named them by hand would be the second place to remember.
+	fmt.Fprintf(os.Stderr, `
+agent login <provider> opens a throwaway session that runs the agent's own
+login flow — nothing is pasted anywhere and no credential passes through this
+CLI. Finish the login, exit the agent, and every later session of yours starts
+already logged in. --env names an environment whose image carries that
+provider's CLI. "agent ls" shows what you have logged in and where it reaches;
+"agent logout <provider>" destroys it everywhere. Providers: %s.
+`, strings.Join(agentProviderNames(), ", "))
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +266,40 @@ type createSessionRequest struct {
 	Cmd         []string `json:"cmd,omitempty"`
 	EgressAllow []string `json:"egress_allow,omitempty"`
 	Environment string   `json:"environment,omitempty"`
+	// Repos overrides the repositories the environment's connectors declare.
+	// A POINTER to the slice, because the server draws a distinction a plain
+	// `[]repoRequest` with omitempty cannot express: absent inherits the
+	// environment's repositories, an explicit empty array clones nothing.
+	// `agent login` is the one caller that needs the second — a login session
+	// has no business holding anybody's source.
+	Repos *[]repoRequest `json:"repos,omitempty"`
+}
+
+// repoRequest is one entry of that array, mirroring v0wire.RepoRequest.
+type repoRequest struct {
+	Repo       string  `json:"repo"`
+	BaseBranch *string `json:"base_branch,omitempty"`
+}
+
+// agent mirrors one element of GET /v0/agents: which coding agent, whether
+// this person has logged it in, when custody last saw it move, and the
+// workspaces the login reaches. Like `credential` and `secret` there is no
+// field for a value, because the API has none either — a listing that could
+// carry a credential is the thing this whole feature exists to avoid.
+//
+// Since is a string rather than a time: the server renders it null for a
+// provider nobody has logged in, and a JSON null decodes into a string as the
+// empty one, which is exactly what the table renders as "-".
+type agent struct {
+	Provider   string   `json:"provider"`
+	Status     string   `json:"status"`
+	Since      string   `json:"since"`
+	Version    uint64   `json:"version"`
+	Workspaces []string `json:"workspaces"`
+}
+
+type agentsEnvelope struct {
+	Agents []agent `json:"agents"`
 }
 
 type suspendRequest struct {
@@ -1043,15 +1094,11 @@ func runNew(args []string) error {
 		body.EgressAllow = strings.Split(*egress, ",")
 	}
 
-	var resp sessionEnvelope
-	key := *idempotencyKey
-	if key == "" {
-		key = cli.RandHex(8)
-	}
-	if err := c.Do(http.MethodPost, "/v0/sessions", body, &resp, cli.IdempotencyKey(key)); err != nil {
+	created, err := createSession(c, body, *idempotencyKey)
+	if err != nil {
 		return err
 	}
-	fmt.Println(resp.Session.ID)
+	fmt.Println(created.ID)
 
 	if *detach {
 		return nil
@@ -1062,7 +1109,24 @@ func runNew(args []string) error {
 	// created seconds ago has a log measured in kilobytes, so replaying it
 	// from the first entry costs nothing and is the only way the user sees
 	// what happened before they got here.
-	return attachWithRetry(cfg, resp.Session.ID, terminal.SinceAll)
+	return attachWithRetry(cfg, created.ID, terminal.SinceAll)
+}
+
+// createSession posts one create and returns the session it made. It is the
+// one place this CLI creates a session — `new` and `agent login` differ in
+// what they put in the body, never in how they send it — and it is where the
+// idempotency key is settled: a caller with a recovery key of its own passes
+// it, and everybody else gets a fresh one, since only the caller knows which
+// invocations are retries of the same intent.
+func createSession(c *cli.Client, body createSessionRequest, idempotencyKey string) (session, error) {
+	if idempotencyKey == "" {
+		idempotencyKey = cli.RandHex(8)
+	}
+	var resp sessionEnvelope
+	if err := c.Do(http.MethodPost, "/v0/sessions", body, &resp, cli.IdempotencyKey(idempotencyKey)); err != nil {
+		return session{}, err
+	}
+	return resp.Session, nil
 }
 
 // attachWithRetry is `new`'s "attach immediately and stream everything"
@@ -1570,6 +1634,321 @@ func splitRemote(spec string) (ref, path string, err error) {
 func progressPrinter(verb string) func(done, total int64) {
 	return func(done, total int64) {
 		fmt.Fprintf(os.Stderr, "\r%s", cli.ProgressLine(verb, done, total))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// agent login / ls / logout
+//
+// One person logs a coding agent in once, inside an ordinary session, and
+// every later session of theirs — in any workspace they belong to, on any
+// runner — starts with that agent already authenticated. These three verbs
+// are the whole client surface of that: the login flow is the AGENT's own,
+// unmodified, and no credential passes through this CLI in either direction.
+// ---------------------------------------------------------------------------
+
+const agentUsage = `usage: rainier agent <login|ls|logout> [args]
+
+  agent login <provider> --env NAME   log the agent in, once, for every workspace
+  agent ls                            what you have logged in, and where it reaches
+  agent logout <provider> [--yes]     destroy that login everywhere
+
+The login runs inside a throwaway session: the agent's own login flow, on your
+screen, with nothing pasted anywhere. --env names an environment whose image
+has that provider's CLI in it — Rainier does not install one. When you exit
+the agent, the session is removed and the login stays.`
+
+// agentLoginAttach is how `agent login` attaches to the session it created:
+// attachWithRetry, exactly as `new` does — the same stream-everything attach,
+// the same retry while the session is still starting. It is a variable only
+// so this CLI's own tests can drive the arc around it (create → attach →
+// remove → report) without a terminal on the other end.
+var agentLoginAttach = attachWithRetry
+
+// agentLoginSettle is how long `agent login` waits, once the login session's
+// process has exited, for custody to record the credential before it removes
+// the session. The session's exit is the same instant sessiond puts the
+// agent's last write; removing the session in that same instant would race
+// it. The wait ends the moment the version moves. agentLoginPoll is how often
+// it asks; tests shorten both.
+var (
+	agentLoginSettle = 10 * time.Second
+	agentLoginPoll   = 500 * time.Millisecond
+)
+
+func runAgent(args []string) error {
+	// The synthetic "test" provider is off unless the host turned it on, and
+	// BOTH ends have to agree about the table: the end-to-end suite's controld
+	// enables it, and `agent login` refuses a provider it does not know before
+	// sending anything, so a client that could not see the row would refuse
+	// the very login the suite exists to prove. Reading the same variable the
+	// suite sets is what keeps the two ends in step; an operator's CLI, which
+	// sets nothing, never sees the row.
+	if os.Getenv("RAINIER_E2E_TEST_AGENT") == "1" {
+		controlapp.EnableTestAgentProvider = true
+	}
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, agentUsage)
+		os.Exit(2)
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "login":
+		return runAgentLogin(rest)
+	case "ls":
+		return runAgentLs(rest)
+	case "logout":
+		return runAgentLogout(rest)
+	case "-h", "--help", "help":
+		fmt.Fprintln(os.Stderr, agentUsage)
+		return nil
+	default:
+		fmt.Fprintf(os.Stderr, "rainier agent: unknown subcommand %q\n%s\n", sub, agentUsage)
+		os.Exit(2)
+		return nil
+	}
+}
+
+// runAgentLogin runs the provider's own login flow in a throwaway session and
+// reports what custody holds afterwards.
+//
+// The version is read BEFORE the session is created, and that ordering is the
+// whole test for "did this work": a person who opened the agent, thought
+// better of it, and quit has left custody exactly where it was, and the only
+// honest thing to say is that nothing was written. Comparing against a
+// version read after the fact would call every such exit a success.
+//
+// The session is removed whether the attach ended cleanly or not. It exists
+// for one login and holds no work; leaving it running would leave a session
+// whose whole purpose is over.
+func runAgentLogin(args []string) error {
+	fs := flag.NewFlagSet("agent login", flag.ExitOnError)
+	env := fs.String("env", "", "environment whose image carries this provider's CLI")
+	fs.Parse(reorderArgs(fs, args))
+	p, err := agentProviderNamed(requireAgentProvider(fs, "rainier agent login <provider> [--env NAME]"))
+	if err != nil {
+		return err
+	}
+	// Rainier does not install an agent, and a session started from no
+	// environment runs the stock image, which has no agent CLI installed
+	// in it. Refusing here — before a session is created that could only fail
+	// — says the thing the person needs to hear.
+	if *env == "" {
+		return errors.New("the provider's CLI has to be in the image: name an environment that has it with --env")
+	}
+
+	cfg, err := requireLogin()
+	if err != nil {
+		return err
+	}
+	c := cli.NewClient(cfg)
+
+	before, err := agentRow(c, p.Name)
+	if err != nil {
+		return err
+	}
+
+	created, err := createSession(c, createSessionRequest{
+		// Four hex characters: enough that two logins started in the same
+		// minute do not collide on a name, short enough to read.
+		Name:        fmt.Sprintf("agent-login-%s-%s", p.Name, cli.RandHex(2)),
+		Environment: *env,
+		Cmd:         p.LoginCmd,
+		// Explicitly empty, never absent: an environment that declares
+		// repositories would otherwise clone them into a session that exists
+		// only to hold a login flow.
+		Repos: &[]repoRequest{},
+	}, "")
+	if err != nil {
+		return err
+	}
+	fmt.Println(created.ID)
+
+	attachErr := agentLoginAttach(cfg, created.ID, terminal.SinceAll)
+	// Give custody the moment it needs. sessiond puts the agent's last write
+	// as the process exits, which is the same event that ended the attach;
+	// the session is removed only once custody has moved, or once the settle
+	// bound says the agent wrote nothing.
+	after, rowErr := agentRow(c, p.Name)
+	for deadline := time.Now().Add(agentLoginSettle); rowErr == nil && after.Version == before.Version && time.Now().Before(deadline); {
+		time.Sleep(agentLoginPoll)
+		after, rowErr = agentRow(c, p.Name)
+	}
+	if err := c.Do(http.MethodDelete, "/v0/sessions/"+created.ID, nil, nil); err != nil {
+		// The removal failing is worth saying and is not worth losing the
+		// login over: the credential is already in custody either way, and
+		// the session is one `rainier rm` away.
+		fmt.Fprintf(os.Stderr, "could not remove the login session %s: %v\n", created.ID, err)
+	}
+	if attachErr != nil {
+		return attachErr
+	}
+	if rowErr != nil {
+		return rowErr
+	}
+	if after.Version == before.Version {
+		// One more look after the removal: the shutdown put is sessiond's
+		// last resort, and it lands as the container stops.
+		if again, err := agentRow(c, p.Name); err == nil {
+			after = again
+		}
+	}
+	if after.Version == before.Version {
+		// Deliberately not an error: `agent login` did everything it set out
+		// to do, and a person who exited without finishing is an outcome, not
+		// a failure. There is no note to relay — sessiond's boot notes are
+		// not routed to the control plane yet — so the CLI says only what it
+		// can establish itself.
+		fmt.Println("login did not complete: the agent wrote no credential")
+		return nil
+	}
+	fmt.Printf("logged in as of %s (v%d)\n", dashIfEmpty(after.Since), after.Version)
+	return nil
+}
+
+func runAgentLs(args []string) error {
+	fs := flag.NewFlagSet("agent ls", flag.ExitOnError)
+	fs.Parse(args)
+
+	cfg, err := requireLogin()
+	if err != nil {
+		return err
+	}
+	rows, err := fetchAgents(cli.NewClient(cfg))
+	if err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "PROVIDER\tSTATUS\tSINCE\tVERSION\tWORKSPACES")
+	for _, a := range rows {
+		since := "-"
+		if a.Since != "" {
+			since = formatAge(a.Since)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", a.Provider, a.Status, since, a.Version,
+			dashIfEmpty(strings.Join(a.Workspaces, ",")))
+	}
+	return w.Flush()
+}
+
+// runAgentLogout destroys one login and tells the person what that costs
+// before it happens. Both halves of the caveat are true and neither is
+// obvious: the credential is keyed by person and agent, not by workspace, so
+// a logout reaches every workspace at once; and a session already running
+// holds its own copy on disk until the revoke reaches it or it exits.
+func runAgentLogout(args []string) error {
+	fs := flag.NewFlagSet("agent logout", flag.ExitOnError)
+	yes := fs.Bool("yes", false, "skip the confirmation prompt (for scripts)")
+	fs.Parse(reorderArgs(fs, args))
+	p, err := agentProviderNamed(requireAgentProvider(fs, "rainier agent logout <provider> [--yes]"))
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("this logs %s out of every workspace you are in; "+
+		"a running agent keeps what it holds until it exits\n", p.Name)
+	if !*yes {
+		ok, err := confirm("continue? [y/N] ")
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Println("canceled")
+			return nil
+		}
+	}
+
+	cfg, err := requireLogin()
+	if err != nil {
+		return err
+	}
+	if err := cli.NewClient(cfg).Do(http.MethodDelete, "/v0/agents/"+url.PathEscape(p.Name), nil, nil); err != nil {
+		return err
+	}
+	fmt.Printf("logged out of %s\n", p.Name)
+	return nil
+}
+
+// fetchAgents reads GET /v0/agents: one row per provider the server knows,
+// in its table's order.
+func fetchAgents(c *cli.Client) ([]agent, error) {
+	var resp agentsEnvelope
+	if err := c.Do(http.MethodGet, "/v0/agents", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Agents, nil
+}
+
+// agentRow reads one provider's row. A server that does not name the provider
+// at all answers the zero row — version 0, no since — which is the same thing
+// "you have not logged in" means, and lets the caller compare versions
+// without a second failure mode.
+func agentRow(c *cli.Client, provider string) (agent, error) {
+	rows, err := fetchAgents(c)
+	if err != nil {
+		return agent{}, err
+	}
+	for _, a := range rows {
+		if a.Provider == provider {
+			return a, nil
+		}
+	}
+	return agent{Provider: provider, Status: "none"}, nil
+}
+
+// agentProviderNamed resolves a provider name against the table, refusing an
+// unknown one before any request is made. A typo costs nothing and reaches
+// nothing — and the refusal names what this build does support, which is the
+// only place a person can find that out.
+func agentProviderNamed(name string) (controlapp.AgentProvider, error) {
+	for _, p := range controlapp.AgentProviders() {
+		if p.Name == name {
+			return p, nil
+		}
+	}
+	return controlapp.AgentProvider{}, fmt.Errorf("unknown agent provider %q; this build supports: %s",
+		name, strings.Join(agentProviderNames(), ", "))
+}
+
+// agentProviderNames is the table's names in its own order, for a usage line
+// and a refusal.
+func agentProviderNames() []string {
+	rows := controlapp.AgentProviders()
+	names := make([]string, 0, len(rows))
+	for _, p := range rows {
+		names = append(names, p.Name)
+	}
+	return names
+}
+
+// requireAgentProvider pulls the <provider> positional, exiting with usage
+// (exit 2) rather than panicking when it is absent — requireRef's shape, with
+// its own usage line since a provider is not a session ref.
+func requireAgentProvider(fs *flag.FlagSet, usage string) string {
+	args := fs.Args()
+	if len(args) < 1 {
+		fmt.Fprintf(os.Stderr, "usage: %s\n", usage)
+		os.Exit(2)
+	}
+	return args[0]
+}
+
+// confirm asks one yes/no question and reads the answer from stdin. Anything
+// but an explicit yes is a no — including end-of-file, which is what a script
+// that forgot --yes looks like, and which must not be read as consent to
+// destroy a login.
+func confirm(question string) (bool, error) {
+	fmt.Print(question)
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, fmt.Errorf("reading the answer: %w", err)
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true, nil
+	default:
+		return false, nil
 	}
 }
 

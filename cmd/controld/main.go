@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/tokencanopy/rainier/controlapp"
 	"github.com/tokencanopy/rainier/internal/controld"
 	"github.com/tokencanopy/rainier/internal/controld/pgstore"
 )
@@ -26,6 +27,18 @@ func main() {
 		"64 hex characters (32 bytes) team secrets are encrypted with at rest (required; or set RAINIER_SECRETS_KEY; generate with: openssl rand -hex 32)")
 	githubAPI := flag.String("github-api", envDefault("RAINIER_GITHUB_API", "https://api.github.com"), "GitHub API base URL")
 	flag.Parse()
+
+	// RAINIER_E2E_TEST_AGENT adds the synthetic "test" agent provider to the
+	// table this controld offers: a row whose login is a local file write, so
+	// the live-fleet e2e can prove the whole credential path — mount, fetch,
+	// put, revoke — with no real account and no real credential anywhere. It
+	// is read here, once, before anything is served, and it is deliberately
+	// not a flag: a production controld has no reason to offer it, and an
+	// operator who sets it by hand gets a log line saying so.
+	if os.Getenv("RAINIER_E2E_TEST_AGENT") != "" {
+		controlapp.EnableTestAgentProvider = true
+		log.Print("controld: RAINIER_E2E_TEST_AGENT is set; offering the synthetic \"test\" agent provider")
+	}
 
 	// Every flag above accepts its RAINIER_* env var as a default (flag.String's
 	// default itself, via envDefault) — an explicit flag on the command line

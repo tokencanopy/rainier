@@ -1060,17 +1060,43 @@ func TestDockerSnapshotStripsSecretsAndSetupChannel(t *testing.T) {
 // no cache just means the next session runs setup again. No daemon needed.
 func TestDockerCommitArgsRejectsAMalformedStripKey(t *testing.T) {
 	for _, bad := range []string{"", "K=V", "HAS SPACE"} {
-		if _, err := commitArgs("cid", "ref", []string{"FINE", bad}); err == nil {
+		if _, err := commitArgs("cid", "ref", []string{"FINE", bad}, ""); err == nil {
 			t.Errorf("commitArgs accepted strip key %q; want an error", bad)
 		}
 	}
-	args, err := commitArgs("cid", "ref", []string{"A", "B"})
+	args, err := commitArgs("cid", "ref", []string{"A", "B"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []string{"commit", "--change", "ENV A=", "--change", "ENV B=", "cid", "ref"}
 	if !reflect.DeepEqual(args, want) {
 		t.Errorf("commitArgs = %v, want %v", args, want)
+	}
+}
+
+// TestDockerCommitArgsPinTheBaseImageCommand: `docker commit` records the
+// container's own Cmd into the image, and the session that builds an
+// environment's cache is not always a shell — a login session runs the
+// agent's login command and exits. The base image's command, as docker
+// renders it, is pinned back on the way in; an image with no command ("null")
+// pins nothing.
+func TestDockerCommitArgsPinTheBaseImageCommand(t *testing.T) {
+	args, err := commitArgs("cid", "ref", []string{"A"}, `["--","bash","-i"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"commit", "--change", `CMD ["--","bash","-i"]`, "--change", "ENV A=", "cid", "ref"}
+	if !reflect.DeepEqual(args, want) {
+		t.Errorf("commitArgs = %v, want %v", args, want)
+	}
+	for _, none := range []string{"", "null", " null\n"} {
+		args, err := commitArgs("cid", "ref", nil, none)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(args, []string{"commit", "cid", "ref"}) {
+			t.Errorf("commitArgs with base command %q = %v, want no CMD change", none, args)
+		}
 	}
 }
 
@@ -1136,5 +1162,407 @@ func TestCreateRejectsAnOversizedSetup(t *testing.T) {
 	// daemon (the docker driver's next step would be a real `docker run`).
 	if _, err := NewFake(4).Create(ctx, Spec{SessionID: "sess-ok", Setup: strings.Repeat("x", MaxSetupBytes)}); err != nil {
 		t.Errorf("a setup script exactly at the limit was rejected: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the agent home mount
+// ---------------------------------------------------------------------------
+
+// The synthetic home a test create carries. The volume name is opaque on
+// purpose — the control plane hands down a hash of (workspace, creator), and
+// the driver treats it as a name to mount and never as something to parse —
+// so these are exactly as meaningless as a real one.
+const (
+	testHomeVolume = "rainier-agents-0123456789abcdef"
+	testHomePath   = "/rainier/agents"
+)
+
+// countPairs reports how many times args carries `flag value` adjacently.
+// hasFlag answers "at all", which cannot catch a mount emitted twice — and a
+// repeated -v is exactly the shape a careless append produces.
+func countPairs(args []string, flag, value string) int {
+	n := 0
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag && args[i+1] == value {
+			n++
+		}
+	}
+	return n
+}
+
+// indexOfPair returns the position of the first `flag value` pair, or -1.
+func indexOfPair(args []string, flag, value string) int {
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == flag && args[i+1] == value {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestRunArgsMountTheHome pins where the agent home lands in the `docker run`
+// argv. Position is not cosmetic here: the mounts have to precede the network
+// flag and the image the way every other -v does, and the home must never
+// displace -w, which stays on the workspace — the home is where an agent keeps
+// its configuration, not where the session works.
+func TestRunArgsMountTheHome(t *testing.T) {
+	d := NewDocker(DockerOpts{Image: "img:default", Network: "rainier-int", TotalSlots: 8, Label: "rainier.session"})
+	home := &HomeMount{Volume: testHomeVolume, Path: testHomePath}
+
+	t.Run("once, after the workspace and before the network", func(t *testing.T) {
+		args := d.runArgs(Spec{SessionID: "sess_example", DialURL: "ws://x", Home: home}, "img:1")
+		mount := testHomeVolume + ":" + testHomePath
+		if n := countPairs(args, "-v", mount); n != 1 {
+			t.Fatalf("-v %s appears %d times, want exactly 1: %v", mount, n, args)
+		}
+		ws := indexOfPair(args, "-v", "rainier-ws-sess_example:"+workspaceMount)
+		at := indexOfPair(args, "-v", mount)
+		net := indexOfPair(args, "--network", "rainier-int")
+		if ws < 0 {
+			t.Fatalf("the workspace mount is gone: %v", args)
+		}
+		if at < ws {
+			t.Errorf("the home mount at %d precedes the workspace mount at %d: %v", at, ws, args)
+		}
+		if net < 0 || at > net {
+			t.Errorf("the home mount at %d does not precede --network at %d: %v", at, net, args)
+		}
+		if !hasFlag(args, "-w", workspaceMount) {
+			t.Errorf("the home mount displaced -w %s: %v", workspaceMount, args)
+		}
+		// Nothing about the hardening changes for a session with a home: it is
+		// one more volume, not a relaxation.
+		for _, fl := range []string{"--read-only", "-d"} {
+			if !slicesContains(args, fl) {
+				t.Errorf("a create with a home lost %s: %v", fl, args)
+			}
+		}
+	})
+
+	t.Run("no home, no mount", func(t *testing.T) {
+		// The old-control-plane and no-creator case. Every existing golden in
+		// TestDockerRunArgs is this case, so it has to be byte-identical to
+		// what it was before the field existed.
+		args := d.runArgs(Spec{SessionID: "sess_example", DialURL: "ws://x"}, "img:1")
+		for _, a := range args {
+			if strings.Contains(a, "rainier-agents-") || strings.Contains(a, testHomePath) {
+				t.Fatalf("a spec with no home produced %q: %v", a, args)
+			}
+		}
+	})
+
+	t.Run("a half-specified home mounts nothing", func(t *testing.T) {
+		// `docker run -v :/rainier/agents` is a daemon-side syntax error whose
+		// message names nothing useful. runArgs stays total and emits no
+		// mount; Create is where a malformed home becomes an error naming the
+		// field (TestCreateRejectsAHalfSpecifiedHome).
+		for _, h := range []*HomeMount{{Volume: testHomeVolume}, {Path: testHomePath}} {
+			args := d.runArgs(Spec{SessionID: "sess_example", DialURL: "ws://x", Home: h}, "img:1")
+			for i := 0; i < len(args)-1; i++ {
+				if args[i] == "-v" && strings.HasPrefix(args[i+1], testHomeVolume+":") {
+					t.Errorf("home %+v produced a mount: %v", h, args)
+				}
+				if args[i] == "-v" && strings.HasSuffix(args[i+1], ":"+testHomePath) {
+					t.Errorf("home %+v produced a mount: %v", h, args)
+				}
+			}
+		}
+	})
+}
+
+// TestCreateRejectsAHalfSpecifiedHome: a HomeMount missing either half is a
+// control-plane defect, and the cheapest place to say so is before the first
+// side effect — the same reason an oversized setup script is rejected there.
+func TestCreateRejectsAHalfSpecifiedHome(t *testing.T) {
+	f := newFakeDocker()
+	f.install(t)
+	d := NewDocker(DockerOpts{Image: "img:default", TotalSlots: 8, Label: "rainier.test"})
+	for _, h := range []*HomeMount{{Volume: testHomeVolume}, {Path: testHomePath}, {}} {
+		if _, err := d.Create(context.Background(), Spec{SessionID: "sess_example", Home: h}); err == nil {
+			t.Errorf("Create with home %+v = nil error, want a refusal", h)
+		}
+	}
+	if len(f.calls) != 0 {
+		t.Errorf("a refused create still talked to docker: %v", f.calls)
+	}
+}
+
+// fakeDocker records every docker argv the driver builds and answers the few
+// queries the create and destroy paths make. It exists because the volume
+// bookkeeping this task adds — created once, initialized once, never removed
+// by a teardown — is a statement about which commands run and which do NOT,
+// and "did not run" is not observable from a live daemon's end state.
+type fakeDocker struct {
+	calls   [][]string
+	volumes map[string]bool
+	label   string // the session id `docker inspect` reports back
+}
+
+func newFakeDocker() *fakeDocker { return &fakeDocker{volumes: map[string]bool{}} }
+
+func (f *fakeDocker) run(ctx context.Context, args ...string) (string, error) {
+	f.calls = append(f.calls, append([]string(nil), args...))
+	if len(args) == 0 {
+		return "", nil
+	}
+	sub := ""
+	if len(args) > 1 {
+		sub = args[1]
+	}
+	last := args[len(args)-1]
+	switch {
+	case args[0] == "ps":
+		return "", nil // nothing running: capacity is free
+	case args[0] == "volume" && sub == "inspect":
+		if f.volumes[last] {
+			return last, nil
+		}
+		// The shape dockerRun wraps a failed command in — ensureVolume only
+		// asks whether the error is nil, but a realistic one keeps the fake
+		// honest if that ever changes.
+		return "", errors.New("docker volume inspect " + last + ": exit status 1: Error response from daemon: No such object: " + last)
+	case args[0] == "volume" && sub == "create":
+		f.volumes[last] = true
+		return last, nil
+	case args[0] == "volume" && sub == "rm":
+		delete(f.volumes, last)
+		return "", nil
+	case args[0] == "inspect":
+		return f.label, nil
+	case args[0] == "run" && slicesContains(args, "-d"):
+		return "container_example", nil
+	}
+	return "", nil
+}
+
+// install swaps the package's docker exec for the duration of one test.
+func (f *fakeDocker) install(t *testing.T) {
+	t.Helper()
+	prev := dockerRun
+	dockerRun = f.run
+	t.Cleanup(func() { dockerRun = prev })
+}
+
+// initJobs returns every recorded one-shot init container for volume at mount.
+func (f *fakeDocker) initJobs(volume, mount string) [][]string {
+	var out [][]string
+	for _, c := range f.calls {
+		if len(c) > 0 && c[0] == "run" && hasFlag(c, "-v", volume+":"+mount) && hasFlag(c, "--user", "0:0") {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// volumeCreates counts `docker volume create <name>` calls.
+func (f *fakeDocker) volumeCreates(name string) int {
+	n := 0
+	for _, c := range f.calls {
+		if len(c) == 3 && c[0] == "volume" && c[1] == "create" && c[2] == name {
+			n++
+		}
+	}
+	return n
+}
+
+// mentions reports whether any call in calls carries needle in any argument.
+func mentions(calls [][]string, needle string) []string {
+	for _, c := range calls {
+		for _, a := range c {
+			if strings.Contains(a, needle) {
+				return c
+			}
+		}
+	}
+	return nil
+}
+
+// TestHomeVolumeIsPreparedOnceAndChowned: the home volume is created and
+// chowned by the create that first needs it and by no create after, because
+// the second one's volume already holds the first session's login — a
+// recursive chown over it would be pointless at best, and the volume create
+// would be a lie about what is there.
+//
+// The init job is the driver's one uid-0 window (see workspaceInitArgs), so
+// every clamp on it is asserted here for the home exactly as
+// TestWorkspaceInitArgs asserts it for the workspace.
+func TestHomeVolumeIsPreparedOnceAndChowned(t *testing.T) {
+	f := newFakeDocker()
+	f.install(t)
+	d := NewDocker(DockerOpts{Image: "img:default", TotalSlots: 8, Label: "rainier.test"})
+	home := &HomeMount{Volume: testHomeVolume, Path: testHomePath}
+	ctx := context.Background()
+
+	if _, err := d.Create(ctx, Spec{SessionID: "sess_example", DialURL: "ws://x", Home: home}); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	if n := f.volumeCreates(testHomeVolume); n != 1 {
+		t.Fatalf("`volume create %s` ran %d times on the first create, want 1: %v", testHomeVolume, n, f.calls)
+	}
+	jobs := f.initJobs(testHomeVolume, testHomePath)
+	if len(jobs) != 1 {
+		t.Fatalf("the home init job ran %d times on the first create, want 1: %v", len(jobs), f.calls)
+	}
+	job := jobs[0]
+	for _, pair := range [][2]string{
+		{"--network", "none"},                       // it has no business reaching anything
+		{"--user", "0:0"},                           // chowning a volume takes root
+		{"--security-opt", "no-new-privileges"},     //
+		{"--cap-drop", "ALL"},                       // ...but root with no capabilities
+		{"--cap-add", "CHOWN"},                      // ...except the single one it needs
+		{"-v", testHomeVolume + ":" + testHomePath}, // the volume it exists to prepare
+		{"--entrypoint", "sh"},                      // the image's own entrypoint must not run
+		{"-c", initVolumeScript(testHomePath)},      //
+	} {
+		if !hasFlag(job, pair[0], pair[1]) {
+			t.Errorf("the home init job lost %s %s: %v", pair[0], pair[1], job)
+		}
+	}
+	if caps := flagValues(job, "--cap-add"); len(caps) != 1 || caps[0] != "CHOWN" {
+		t.Errorf("the home init job adds capabilities %v, want CHOWN alone", caps)
+	}
+	for _, fl := range []string{"--rm", "--read-only"} {
+		if !slicesContains(job, fl) {
+			t.Errorf("the home init job lost %s: %v", fl, job)
+		}
+	}
+	// The prepared volume is what the session actually mounts.
+	ran := false
+	for _, c := range f.calls {
+		if len(c) > 0 && c[0] == "run" && slicesContains(c, "-d") && hasFlag(c, "-v", testHomeVolume+":"+testHomePath) {
+			ran = true
+		}
+	}
+	if !ran {
+		t.Errorf("the session container did not mount the prepared home: %v", f.calls)
+	}
+
+	// A second session of the same creator in the same workspace: same home
+	// volume, a workspace volume of its own.
+	mark := len(f.calls)
+	if _, err := d.Create(ctx, Spec{SessionID: "sess_example2", DialURL: "ws://x", Home: home}); err != nil {
+		t.Fatalf("second create: %v", err)
+	}
+	if n := f.volumeCreates(testHomeVolume); n != 1 {
+		t.Errorf("`volume create %s` ran %d times across two creates, want 1: %v", testHomeVolume, n, f.calls[mark:])
+	}
+	if jobs := f.initJobs(testHomeVolume, testHomePath); len(jobs) != 1 {
+		t.Errorf("the home init job ran %d times across two creates, want 1: %v", len(jobs), f.calls[mark:])
+	}
+	// ...and "once" is per volume, not per driver: the second session's own
+	// workspace is prepared exactly as the first one's was.
+	if n := f.volumeCreates("rainier-ws-sess_example2"); n != 1 {
+		t.Errorf("the second session's workspace volume was created %d times, want 1: %v", n, f.calls[mark:])
+	}
+	if jobs := f.initJobs("rainier-ws-sess_example2", workspaceMount); len(jobs) != 1 {
+		t.Errorf("the second session's workspace init ran %d times, want 1: %v", len(jobs), f.calls[mark:])
+	}
+}
+
+// TestDestroyLeavesTheHome: the home belongs to the (creator, workspace), not
+// to the session mounted on it. A teardown that took it would log every other
+// session of that person in that workspace out — including ones running right
+// now on this runner — which is the opposite of what "log in once" promises.
+func TestDestroyLeavesTheHome(t *testing.T) {
+	f := newFakeDocker()
+	f.install(t)
+	f.label = "sess_example"
+	d := NewDocker(DockerOpts{Image: "img:default", TotalSlots: 8, Label: "rainier.test"})
+	ctx := context.Background()
+
+	h, err := d.Create(ctx, Spec{SessionID: "sess_example", DialURL: "ws://x",
+		Home: &HomeMount{Volume: testHomeVolume, Path: testHomePath}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mark := len(f.calls)
+	if err := d.Destroy(ctx, h.ID); err != nil {
+		t.Fatal(err)
+	}
+	teardown := f.calls[mark:]
+	if c := mentions(teardown, testHomeVolume); c != nil {
+		t.Errorf("Destroy named the home volume: %v", c)
+	}
+	if !f.volumes[testHomeVolume] {
+		t.Error("Destroy removed the home volume")
+	}
+	// The session's own workspace still goes, which is the half Destroy is for.
+	if mentions(teardown, "rainier-ws-sess_example") == nil {
+		t.Errorf("Destroy did not remove the session's workspace volume: %v", teardown)
+	}
+	if f.volumes["rainier-ws-sess_example"] {
+		t.Error("Destroy left the session's workspace volume behind")
+	}
+
+	// And the second act of an explicit teardown does not reach it either.
+	mark = len(f.calls)
+	if err := d.RemoveWorkspace(ctx, "sess_example"); err != nil {
+		t.Fatal(err)
+	}
+	if c := mentions(f.calls[mark:], testHomeVolume); c != nil {
+		t.Errorf("RemoveWorkspace named the home volume: %v", c)
+	}
+	mark = len(f.calls)
+	if err := d.DestroyContainer(ctx, h.ID); err != nil {
+		t.Fatal(err)
+	}
+	if c := mentions(f.calls[mark:], testHomeVolume); c != nil {
+		t.Errorf("DestroyContainer named the home volume: %v", c)
+	}
+}
+
+// TestSnapshotExcludesTheHome is the mechanical proof of the promise a
+// credential set rests on: `docker commit` captures the container's writable
+// layer and NOT its volumes, so nothing a person's agent wrote under the home
+// can reach an environment's cached image — which is shared with every other
+// member of the workspace and, for a registry-backed cache, published.
+//
+// It has to be docker-backed. The exclusion is the daemon's behavior, not this
+// driver's: there is no argv that would show it, and a test that asserted one
+// would pass while the real commit did whatever it liked.
+func TestSnapshotExcludesTheHome(t *testing.T) {
+	dockerAvailable(t)
+	d := NewDocker(DockerOpts{Image: "alpine:3.20", Network: "bridge", TotalSlots: 8, Label: "rainier.test"})
+	d.defaultCmd = []string{"sleep", "3600"}
+	ctx := context.Background()
+	// Registered BEFORE the container cleanup so it runs AFTER it (defers are
+	// LIFO): docker refuses to remove a volume a container still references,
+	// -f or not. The home outlives every session mounted on it — which is the
+	// property under test — so this is the only thing that will ever remove
+	// the one this test made.
+	defer dockerRun(ctx, "volume", "rm", "-f", testHomeVolume)
+	defer d.destroyAllLabeled(ctx)
+
+	h, err := d.Create(ctx, Spec{Name: "thome", SessionID: "sess_example", DialURL: "ws://x",
+		Home: &HomeMount{Volume: testHomeVolume, Path: testHomePath}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// As the session user, into the home — which proves the chown landed as
+	// well: an unwritable home is the failure mode this whole init job exists
+	// to prevent, and it would make the exclusion assertion below vacuous.
+	probe := testHomePath + "/probe"
+	if _, err := dockerRun(ctx, "exec", "-u", sessionUser, h.ID, "sh", "-c", "echo home_example > "+probe); err != nil {
+		t.Fatalf("the session user cannot write to its own home: %v", err)
+	}
+	if out, err := dockerRun(ctx, "exec", h.ID, "cat", probe); err != nil || out != "home_example" {
+		t.Fatalf("read back %q, %v; want home_example", out, err)
+	}
+
+	ref := "rainier-test-home-snap:1"
+	defer dockerRun(ctx, "image", "rm", "-f", ref)
+	if _, err := d.Snapshot(ctx, h.ID, ref, nil); err != nil {
+		t.Fatal(err)
+	}
+	out, err := dockerRun(ctx, "run", "--rm", "--entrypoint", "sh", ref, "-c",
+		"[ -e "+probe+" ] && echo present || echo absent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "absent" {
+		t.Fatalf("the committed image reports %q at %s: a credential set reached an environment image", out, probe)
 	}
 }

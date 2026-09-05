@@ -70,6 +70,7 @@ import (
 	"github.com/coder/websocket/wsjson"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/tokencanopy/rainier/controlapp"
 	"github.com/tokencanopy/rainier/internal/attachio"
 	"github.com/tokencanopy/rainier/internal/cli"
 	"github.com/tokencanopy/rainier/internal/controld"
@@ -2137,14 +2138,21 @@ func TestEnvSetupStreamsAndCaches(t *testing.T) {
 	if len(strips) != 1 {
 		t.Fatalf("driver saw %d snapshot(s) on %s, want exactly one: %v", len(strips), holder, strips)
 	}
-	wantStrip := []string{
-		"ENV_TOKEN",
+	// The create also injects the agent home's variables — the directory each
+	// coding agent keeps its configuration in, and the manifest naming those
+	// directories — and they are stripped for the same reason as the rest: a
+	// committed image must not point a later session's agents at the build
+	// session's home. The expectation is read off the provider table, not
+	// spelled here, so this scene never names an agent.
+	injected := append(agentEnvKeys(), "ENV_TOKEN")
+	sort.Strings(injected)
+	wantStrip := append(injected,
 		"RAINIER_SETUP_B64", "RAINIER_SETUP_TIMEOUT",
 		"RAINIER_REPOS_B64", "RAINIER_INIT_B64", "RAINIER_INIT_TIMEOUT",
 		"RAINIER_GIT_AUTHOR_NAME", "RAINIER_GIT_AUTHOR_EMAIL",
 		"RAINIER_DIAL", "RAINIER_SESSION",
 		"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy",
-	}
+	)
 	if !slices.Equal(strips[0], wantStrip) {
 		t.Fatalf("snapshot strip list = %v, want %v", strips[0], wantStrip)
 	}
@@ -2510,8 +2518,15 @@ func TestConnectorSessionMintsAndReportsDiff(t *testing.T) {
 				spec.EgressAllow, host)
 		}
 	}
-	if got := len(spec.EgressAllow); got != 4 {
-		t.Fatalf("dispatched Spec.EgressAllow = %v (%d hosts), want exactly the environment's one plus the three git hosts, deduped", spec.EgressAllow, got)
+	// Every create for a person also carries the hosts their coding agents
+	// reach, from the same dispatch-time union; what is left after those is
+	// what this scene is about, and it is exactly four.
+	agentHosts := agentEgressHosts()
+	declared := slices.DeleteFunc(slices.Clone(spec.EgressAllow), func(h string) bool {
+		return slices.Contains(agentHosts, h)
+	})
+	if got := len(declared); got != 4 {
+		t.Fatalf("dispatched Spec.EgressAllow = %v (%d hosts besides the agents'), want exactly the environment's one plus the three git hosts, deduped", declared, got)
 	}
 	if gotAllow := rows[created.ID].EgressAllow; !slices.Equal(gotAllow, []string{"registry.example.com"}) {
 		t.Fatalf("session egress_allow = %v, want exactly what the environment declared", gotAllow)
@@ -2865,4 +2880,26 @@ func readTree(t *testing.T, root string) map[string]string {
 		t.Fatalf("reading %s: %v", root, err)
 	}
 	return out
+}
+
+// agentEnvKeys and agentEgressHosts read the two scenes' expectations off the
+// control plane's provider table instead of restating it. That is not just
+// convenience: the table is the ONE place in this repository allowed to name a
+// coding agent, and a suite that hard-coded "the two agents' variables" would
+// be a second place — and a scene that fails the day a third row lands, for no
+// reason anyone would want.
+func agentEnvKeys() []string {
+	var keys []string
+	for k := range controlapp.AgentsEnv(controlapp.AgentProviders()) {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func agentEgressHosts() []string {
+	var hosts []string
+	for _, p := range controlapp.AgentProviders() {
+		hosts = append(hosts, p.Egress...)
+	}
+	return hosts
 }

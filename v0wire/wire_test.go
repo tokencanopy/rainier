@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/controlapp"
 	"github.com/tokencanopy/rainier/v0wire"
 )
 
@@ -792,4 +793,124 @@ func TestEnvironmentRequirementsRoundTrip(t *testing.T) {
 			t.Fatalf("PlacementOf = %q, want empty", got)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// the agent view: GET /v0/agents
+// ---------------------------------------------------------------------------
+
+// agentsGolden builds the expected envelope from the PROVIDER TABLE rather
+// than from names spelled here. The plan's rule is that a provider is named
+// in exactly one place in this repository (controlapp/agents.go), and a
+// golden that spelled two of them would be a second copy of the table that
+// nobody would remember to update. What is pinned is the shape: the key set,
+// the key order, the values, and the fact that a row with no credential still
+// carries a "since" key, rendered null.
+//
+// logged is the index of the one provider the fixture has logged in; every
+// other row is "none".
+func agentsGolden(t *testing.T, logged int, since string, version uint64, workspaces []string) string {
+	t.Helper()
+	ws, err := json.Marshal(workspaces)
+	if err != nil {
+		t.Fatalf("marshal workspaces: %v", err)
+	}
+	if workspaces == nil {
+		ws = []byte("[]")
+	}
+	rows := make([]string, 0, 4)
+	for i, p := range controlapp.AgentProviders() {
+		if i == logged {
+			rows = append(rows, fmt.Sprintf(
+				`{"provider":%q,"status":"logged_in","since":%q,"version":%d,"workspaces":%s}`,
+				p.Name, since, version, ws))
+			continue
+		}
+		rows = append(rows, fmt.Sprintf(
+			`{"provider":%q,"status":"none","since":null,"version":0,"workspaces":%s}`, p.Name, ws))
+	}
+	return `{"agents":[` + strings.Join(rows, ",") + `]}`
+}
+
+// TestAgentsEnvelopeGoldenJSON pins both statuses in one body: the first
+// provider in the table is logged in and carries a version and an RFC 3339
+// "since"; every other provider is present, says "none", and renders its
+// "since" as null. Every provider in the table appears — the listing answers
+// "what could you log in to, and have you", not "what have you logged in to".
+func TestAgentsEnvelopeGoldenJSON(t *testing.T) {
+	rows := controlapp.AgentProviders()
+	if len(rows) < 2 {
+		t.Fatalf("the provider table has %d rows; this golden needs a logged-in one and a none one", len(rows))
+	}
+	statuses := []controlapp.AgentCredentialStatus{
+		{Provider: rows[0].Name, Version: 3, UpdatedAt: at(5)},
+	}
+	env := v0wire.RenderAgents(statuses, []control.WorkspaceID{"ws_example"})
+	golden(t, env, agentsGolden(t, 0, "2026-01-02T03:04:05Z", 3, []string{"ws_example"}))
+	keySet(t, env, "agents")
+	// The key set is identical on both rows, populated or not — the rule
+	// every view in this package holds (doc.go).
+	keySet(t, env.Agents[0], "provider", "status", "since", "version", "workspaces")
+	keySet(t, env.Agents[1], "provider", "status", "since", "version", "workspaces")
+}
+
+// A caller with no credential at all still gets every provider, and every
+// row's "since" is null — the empty case the CLI's table renders as "-".
+func TestAgentsEnvelopeWithNothingLoggedIn(t *testing.T) {
+	env := v0wire.RenderAgents(nil, []control.WorkspaceID{"ws_example"})
+	golden(t, env, agentsGolden(t, -1, "", 0, []string{"ws_example"}))
+	if len(env.Agents) != len(controlapp.AgentProviders()) {
+		t.Fatalf("agents = %d rows, want one per provider", len(env.Agents))
+	}
+}
+
+// A nil workspace list renders as [] and never as null, the rule every list
+// on this wire follows.
+func TestAgentsEnvelopeNormalizesTheWorkspaceList(t *testing.T) {
+	golden(t, v0wire.RenderAgents(nil, nil), agentsGolden(t, -1, "", 0, nil))
+}
+
+// Timestamps are UTC RFC 3339 like every other timestamp on this wire, and
+// sub-second precision is dropped rather than leaking a store's resolution
+// into a rendered body.
+func TestAgentsEnvelopeRendersSinceAsUTCSeconds(t *testing.T) {
+	rows := controlapp.AgentProviders()
+	east := time.FixedZone("TEST", 2*60*60)
+	statuses := []controlapp.AgentCredentialStatus{
+		{Provider: rows[0].Name, Version: 3, UpdatedAt: at(5).Add(500 * time.Millisecond).In(east)},
+	}
+	golden(t, v0wire.RenderAgents(statuses, []control.WorkspaceID{"ws_example"}),
+		agentsGolden(t, 0, "2026-01-02T03:04:05Z", 3, []string{"ws_example"}))
+}
+
+// A status for a provider this build does not have a row for is dropped
+// rather than rendered: the table is what the listing enumerates, and a
+// stored set for a retired provider is not something a client can act on.
+func TestAgentsEnvelopeIgnoresAProviderOutsideTheTable(t *testing.T) {
+	env := v0wire.RenderAgents([]controlapp.AgentCredentialStatus{
+		{Provider: "provider_example", Version: 9, UpdatedAt: at(5)},
+	}, []control.WorkspaceID{"ws_example"})
+	golden(t, env, agentsGolden(t, -1, "", 0, []string{"ws_example"}))
+}
+
+// The view has nowhere to put a credential, and no row of it aliases another
+// row's workspace list.
+func TestAgentViewCarriesNoCredentialAndNoSharedSlice(t *testing.T) {
+	env := v0wire.RenderAgents(nil, []control.WorkspaceID{"ws_example"})
+	if len(env.Agents) < 2 {
+		t.Fatalf("agents = %d rows, want at least two", len(env.Agents))
+	}
+	env.Agents[0].Workspaces[0] = "credential_example"
+	if env.Agents[1].Workspaces[0] != "ws_example" {
+		t.Fatalf("rows share one workspace slice: %v", env.Agents[1].Workspaces)
+	}
+	raw, err := json.Marshal(v0wire.RenderAgents([]controlapp.AgentCredentialStatus{
+		{Provider: controlapp.AgentProviders()[0].Name, Version: 1, UpdatedAt: at(5)},
+	}, []control.WorkspaceID{"ws_example"}))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "credential_example") {
+		t.Fatalf("the rendered envelope carries credential bytes: %s", raw)
+	}
 }
