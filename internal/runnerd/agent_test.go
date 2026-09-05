@@ -982,3 +982,51 @@ func TestAgentEchoesThePlacementGeneration(t *testing.T) {
 		})
 	}
 }
+
+// TestAgentCreateCarriesTheAgentHome: the home is one more field controld
+// resolved and this runner hands to the driver — a volume name and a path,
+// copied and neither parsed nor defaulted. Absent stays absent: a session with
+// no creator, and every create a control plane older than the field sent, must
+// reach the driver with nothing to mount rather than with an empty instruction
+// the driver would have to guess about.
+func TestAgentCreateCarriesTheAgentHome(t *testing.T) {
+	fd := newCreateTrackingFake(4)
+	rd := New(fd, "", "", "")
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1"})
+
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+
+	conn.send(t, runner.ToRunner{Type: "create", ReqID: 1, Session: "sess_example", Spec: &runner.Spec{
+		Image: "img",
+		Home:  &runner.HomeMount{Volume: "rainier-agents-0123456789abcdef", Path: "/rainier/agents"},
+	}})
+	if res := conn.readMsg(t); !res.OK {
+		t.Fatalf("create result = %+v, want ok", res)
+	}
+	calls := fd.createCalls()
+	if len(calls) != 1 {
+		t.Fatalf("Create called %d times, want 1", len(calls))
+	}
+	want := &driver.HomeMount{Volume: "rainier-agents-0123456789abcdef", Path: "/rainier/agents"}
+	if got := calls[0].Home; !reflect.DeepEqual(got, want) {
+		t.Errorf("Spec.Home = %+v, want %+v", got, want)
+	}
+
+	conn.send(t, runner.ToRunner{Type: "create", ReqID: 2, Session: "sess_example2",
+		Spec: &runner.Spec{Image: "img"}})
+	if res := conn.readMsg(t); !res.OK {
+		t.Fatalf("create result = %+v, want ok", res)
+	}
+	calls = fd.createCalls()
+	if len(calls) != 2 {
+		t.Fatalf("Create called %d times, want 2", len(calls))
+	}
+	if calls[1].Home != nil {
+		t.Errorf("a create with no home reached the driver with %+v, want nil", calls[1].Home)
+	}
+}

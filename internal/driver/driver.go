@@ -59,6 +59,62 @@ type Spec struct {
 	// credential; the token never rides the environment block at all.
 	GitAuthorName  string
 	GitAuthorEmail string
+	// Home is the agent home this session mounts: one writable volume per
+	// (creator, workspace), landing at Path, inside which each coding agent
+	// keeps its own configuration under its own subdirectory. It is the only
+	// writable place a session has outside its workspace, and it is what makes
+	// a login survive the session that performed it.
+	//
+	// The volume is NOT the session's. It outlives every session mounted on
+	// it, is shared by every concurrent session the same person runs in the
+	// same workspace on this runner, and no teardown here removes it — see
+	// Driver.Destroy.
+	//
+	// nil means "mount nothing", which is the honest state for a session with
+	// no creator and for every create a control plane older than the field
+	// sent. The session's agents then simply ask for a login.
+	Home *HomeMount
+}
+
+// HomeMount names the agent home volume and where it lands in the container.
+// The driver keeps its own copy of the wire's type for the same reason it
+// keeps its own Spec and RepoSpec: this package is the sandbox boundary and
+// must not depend on the control-plane vocabulary.
+//
+// Volume is opaque here on purpose. It is a hash the control plane minted
+// (controlapp.AgentHomeVolume) precisely so a volume name — readable by anyone
+// with a shell on the runner — does not spell out whose account it holds. The
+// driver mounts it and never parses it.
+type HomeMount struct {
+	Volume string
+	Path   string
+}
+
+// mount returns the `docker run -v` value for the home, and whether there is
+// one to emit. A nil or half-specified home yields no mount: `-v :/path` and
+// `-v vol:` are daemon-side syntax errors whose messages name nothing a reader
+// could act on, so the argv builder stays total and Create is where a
+// half-specified home becomes an error naming the field (see checkHome).
+func (h *HomeMount) mount() (string, bool) {
+	if h == nil || h.Volume == "" || h.Path == "" {
+		return "", false
+	}
+	return h.Volume + ":" + h.Path, true
+}
+
+// checkHome rejects a HomeMount missing either half, before Create touches
+// anything with a side effect — the same bargain checkScriptSizes makes. A
+// present-but-incomplete home is a defect upstream, and the alternative to
+// naming it here is a session that boots with no home at all and an agent
+// that asks for a login the person already performed.
+func checkHome(h *HomeMount) error {
+	if h == nil {
+		return nil
+	}
+	if h.Volume == "" || h.Path == "" {
+		return fmt.Errorf("agent home is incomplete: volume %q, path %q — both are required", h.Volume, h.Path)
+	}
+	return nil
 }
 
 // RepoSpec is one repository a session clones, mirroring rwire.RepoSpec field
@@ -179,6 +235,11 @@ type Driver interface {
 	// existing (`rainier rm`). It is DestroyContainer followed by
 	// RemoveWorkspace, and it is the only one of the three that takes a
 	// workspace away as a side effect of removing a container.
+	//
+	// The agent home (Spec.Home) is NOT taken. It belongs to the (creator,
+	// workspace), not to this session: other sessions of the same person in
+	// the same workspace may be mounted on it right now, and removing it
+	// would log them all out of every agent they had signed in.
 	Destroy(ctx context.Context, id string) error
 	// DestroyContainer removes the container and NOTHING else — the session's
 	// workspace volume survives.

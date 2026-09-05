@@ -22,7 +22,14 @@ func dockerPath() (string, error) {
 	return "", fmt.Errorf("docker CLI not found on PATH or at %s", fallback)
 }
 
-func dockerRun(ctx context.Context, args ...string) (string, error) {
+// dockerRun runs one docker CLI command. It is a variable rather than a plain
+// function so a test can record the argv a driver method builds without a
+// daemon, which is the only way to assert what did NOT run — a volume created
+// once and not twice, a teardown that never names the agent home. Nothing
+// outside a test replaces it, and the tests that do restore it.
+var dockerRun = execDocker
+
+func execDocker(ctx context.Context, args ...string) (string, error) {
 	bin, err := dockerPath()
 	if err != nil {
 		return "", err

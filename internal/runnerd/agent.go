@@ -245,6 +245,7 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 				Repos: driverRepos(m.Spec.Repos),
 				Init:  m.Spec.Init, InitTimeoutSec: m.Spec.InitTimeoutSec,
 				GitAuthorName: m.Spec.GitAuthorName, GitAuthorEmail: m.Spec.GitAuthorEmail,
+				Home: driverHome(m.Spec.Home),
 			}
 			allow = m.Spec.EgressAllow
 		}
@@ -567,4 +568,22 @@ func driverRepos(repos []runner.RepoSpec) []driver.RepoSpec {
 		}
 	}
 	return out
+}
+
+// driverHome converts the wire's agent home into the driver's, for the same
+// reason and in the same way driverRepos converts the repo list: two
+// deliberately identical, deliberately separate types across the boundary
+// between the control-plane vocabulary and the sandbox. A copy and nothing
+// else — this runner does not parse the volume name (it is a hash, and there
+// is nothing in it to read), does not default the path, and does not check
+// whether either exists.
+//
+// A nil home stays nil: a session whose create carried none — one with no
+// creator, or one from a control plane older than the field — must reach the
+// driver with nothing to mount rather than with an empty mount instruction.
+func driverHome(h *runner.HomeMount) *driver.HomeMount {
+	if h == nil {
+		return nil
+	}
+	return &driver.HomeMount{Volume: h.Volume, Path: h.Path}
 }
