@@ -807,20 +807,20 @@ AGENT_SID=$(./bin/rainier new --detach --name "$AGENT_ENV_NAME-second" --env "$A
 case "$AGENT_SID" in sess_*) ;; *) fail "new --env printed \"$AGENT_SID\", want a sess_ id" ;; esac
 waitfor '[ "$(state_of "$AGENT_SID")" = running ]' 120 "the second agent session" \
   || fail "$AGENT_SID never reached running (state: $(state_of "$AGENT_SID"))"
-attach_probe "$AGENT_SID" "cat $AGENT_CRED_PATH; echo; echo cred-probe-done" "$AGENT_PROBE_OUT" 'cred-probe-done' 60 \
+attach_probe "$AGENT_SID" "cat $AGENT_CRED_PATH; echo; echo cred-probe-d\"\"one" "$AGENT_PROBE_OUT" 'cred-probe-done' 60 \
   || { cat -v "$AGENT_PROBE_OUT" >&2; fail "the second session never answered the credential probe"; }
-grep -q '^credential_example' "$AGENT_PROBE_OUT" \
+grep -q 'credential_example' "$AGENT_PROBE_OUT" \
   || { cat -v "$AGENT_PROBE_OUT" >&2; fail "the second session's home does not hold the credential custody handed down"; }
 ok "a session booted after the volume was gone holds the credential: it came from custody, not the runner"
 docker volume ls -q | grep -q '^rainier-agents-' || fail "the second session did not recreate a home volume"
-attach_probe "$AGENT_SID" "stat -c %a $AGENT_CRED_PATH; echo mode-probe-done" "$AGENT_PROBE_OUT" 'mode-probe-done' 30 \
+attach_probe "$AGENT_SID" "stat -c %a $AGENT_CRED_PATH; echo mode-probe-d\"\"one" "$AGENT_PROBE_OUT" 'mode-probe-done' 30 \
   || fail "the mode probe never answered"
-grep -q '^600' "$AGENT_PROBE_OUT" || { cat -v "$AGENT_PROBE_OUT" >&2; fail "the credential file is not mode 0600"; }
+grep -q 600 "$AGENT_PROBE_OUT" || { cat -v "$AGENT_PROBE_OUT" >&2; fail "the credential file is not mode 0600"; }
 ok "the fetched credential file is 0600"
 
 # --- a refresh: the agent (here, the shell) rewrites its credential; the sync
 # notices within its tick and custody moves to v2.
-attach_probe "$AGENT_SID" "printf credential_example2 > $AGENT_CRED_PATH; echo rewrite-done" "$AGENT_PROBE_OUT" 'rewrite-done' 30 \
+attach_probe "$AGENT_SID" "printf credential_example2 > $AGENT_CRED_PATH; echo rewrite-d\"\"one" "$AGENT_PROBE_OUT" 'rewrite-done' 30 \
   || fail "the rewrite probe never answered"
 waitfor '[ "$(agent_version)" = "2" ]' 15 "custody to reach version 2 after the rewrite" \
   || fail "custody stayed at v$(agent_version) after the credential was rewritten"
@@ -842,7 +842,14 @@ ok "the environment snapshot carries nothing under the agent home"
 ./bin/rainier agent logout test --yes >"$AGENT_LOGIN_OUT" 2>&1 || { cat "$AGENT_LOGIN_OUT" >&2; fail "agent logout failed"; }
 grep -q "logged out of test" "$AGENT_LOGIN_OUT" || fail "agent logout printed \"$(cat "$AGENT_LOGIN_OUT")\""
 [ "$(agent_status)" = "none" ] || fail "after logout, agent ls shows \"$(agent_status)\", want none"
-waitfor "attach_probe '$AGENT_SID' 'test -e $AGENT_CRED_PATH && echo still-present || echo revoke-probe-absent' '$AGENT_PROBE_OUT' 'revoke-probe-(absent|still)' 20 && grep -q revoke-probe-absent '$AGENT_PROBE_OUT'" 15 "the live session to drop the credential" \
+# The probe's typed text must not itself match the pattern (attach_probe's
+# rule), hence the split words: the shell prints revoke-absent, the echo of
+# the command line does not.
+revoke_probe() {
+  attach_probe "$AGENT_SID" "test -e $AGENT_CRED_PATH && echo revoke-still-pre\"\"sent || echo revoke-ab\"\"sent" "$AGENT_PROBE_OUT" 'revoke-(still-present|absent)' 20 \
+    && grep -q revoke-absent "$AGENT_PROBE_OUT"
+}
+waitfor revoke_probe 15 "the live session to drop the credential" \
   || { cat -v "$AGENT_PROBE_OUT" >&2; fail "the live session still holds the credential after logout"; }
 ok "agent logout: custody gone, and the live session's copy removed by the downward revoke"
 
