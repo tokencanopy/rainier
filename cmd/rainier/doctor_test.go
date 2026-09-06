@@ -305,3 +305,10 @@ func TestDoctorRedactsBeforeTruncation(t *testing.T) {
 		t.Fatalf("credential prefix leaked: %q", out.String())
 	}
 }
+
+func TestDoctorPreservesServiceRetryAfter(t *testing.T) {
+	got := readinessError(&cli.APIError{Status: 503, RetryAfter: "30", Message: "untrusted secret"})
+	if !strings.Contains(got, "server error (503)") || !strings.Contains(got, "Retry-After: 30 seconds") || strings.Contains(got, "untrusted") {
+		t.Fatalf("%s", got)
+	}
+}

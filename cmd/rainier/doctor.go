@@ -291,6 +291,12 @@ func readinessError(err error) string {
 	}
 	var api *cli.APIError
 	if errors.As(err, &api) {
+		retry := ""
+		if n, e := strconv.ParseUint(api.RetryAfter, 10, 32); e == nil {
+			retry = fmt.Sprintf("; Retry-After: %d seconds", n)
+		} else if when, e := http.ParseTime(api.RetryAfter); e == nil {
+			retry = "; Retry-After: " + when.UTC().Format(http.TimeFormat)
+		}
 		switch api.Status {
 		case 401:
 			return "authentication rejected (401); log in again (rainier help login)"
@@ -299,16 +305,10 @@ func readinessError(err error) string {
 		case 404:
 			return "endpoint unavailable; compatibility not established (404); ask your administrator"
 		case 429:
-			retry := ""
-			if n, e := strconv.ParseUint(api.RetryAfter, 10, 32); e == nil {
-				retry = fmt.Sprintf("; Retry-After: %d seconds", n)
-			} else if when, e := http.ParseTime(api.RetryAfter); e == nil {
-				retry = "; Retry-After: " + when.UTC().Format(http.TimeFormat)
-			}
 			return "rate limited (429); wait before retrying" + retry
 		default:
 			if api.Status >= 500 {
-				return fmt.Sprintf("server error (%d); ask your administrator or retry later", api.Status)
+				return fmt.Sprintf("server error (%d); ask your administrator or retry later", api.Status) + retry
 			}
 			return fmt.Sprintf("unexpected HTTP status (%d); verify the configured server with your administrator", api.Status)
 		}
