@@ -15,6 +15,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 
 	"github.com/tokencanopy/rainier/internal/attachio"
 	"github.com/tokencanopy/rainier/internal/cli"
@@ -114,5 +115,31 @@ func TestAttachFinalFailureClearsMouseModesWithoutBreakingReconnect(t *testing.T
 		if enabled, seen := modes[mode]; !seen || enabled {
 			t.Errorf("mouse mode %s remains enabled after final reconnect failure; terminal output %q", mode, output)
 		}
+	}
+}
+
+func TestAttachFinalFailureDiscardsQueuedTTYInput(t *testing.T) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer master.Close()
+	defer slave.Close()
+	oldIn, oldOut := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = slave, slave
+	defer func() { os.Stdin, os.Stdout = oldIn, oldOut }()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := master.Write([]byte("synthetic_queued_input\n")); err != nil {
+			t.Error(err)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer ts.Close()
+	if err := attachWithRetryBudget(cli.Config{ServerURL: ts.URL, Token: "synthetic"}, "sess_synthetic", 0, func(time.Duration) {}, 0); err == nil {
+		t.Fatal("expected rejected attach")
+	}
+	fds := []unix.PollFd{{Fd: int32(slave.Fd()), Events: unix.POLLIN}}
+	if ready, err := unix.Poll(fds, 0); err != nil || ready != 0 {
+		t.Fatalf("outage input still queued for local shell: ready=%d err=%v", ready, err)
 	}
 }

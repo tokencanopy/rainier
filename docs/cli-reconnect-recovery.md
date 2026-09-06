@@ -22,6 +22,10 @@ is needed. Existing cloud sessions are not modified.
   latest refresh token under the same lock. Bound refresh and lock waiting.
 - Pin the original named context's server and owner. Removing/replacing that
   context stops recovery instead of resurrecting it or borrowing another login.
+- Login and context/workspace edits use that same config lock and read the latest
+  file inside it. Refresh persistence checks the exchanged credential generation;
+  file replacement is atomic so readers never see a partial token pair. A new
+  login arriving during an exchange wins after the older exchange finishes.
 - A second401, refused refresh,403, or ordinary policy close stops recovery.
   The gateway's exact policy-close reason `attach lease expired; reattach` alone
   invites a fresh edge authorization decision. It never authorizes access itself.
@@ -30,8 +34,11 @@ is needed. Existing cloud sessions are not modified.
 - Cursor advances only after rendered output. Transient recovery keeps emulator
   modes because missed-output replay need not include their original enables.
   Final terminal handoff disables mouse/focus/bracketed-paste modes, restores
-  cursor visibility/style, and never clears screen or scrollback. Non-TTY output
-  receives no added terminal reset sequences.
+  cursor visibility/text attributes, and never clears screen or scrollback.
+  Queued TTY input is discarded, but piped input is untouched. Non-TTY output
+  receives no added terminal reset sequences. Interrupt/termination signals
+  cancel dial, refresh, and retry waits and unwind through this same cleanup;
+  connected Ctrl-C remains ordinary remote terminal input.
 
 Alternatives rejected: longer token/lease lifetimes only postpone the failure and
 weaken revocation bounds; retrying every401 indefinitely masks revoked access;
@@ -44,7 +51,8 @@ Regression tests use real loopback WebSocket connections and PTYs for expiry,
 successive renewals, saved-token adoption, bounded refusal, exact output replay,
 and final mode cleanup. Credential tests cover removed/replaced contexts and
 cancellation while a sibling holds the config lock. Run `make verify` plus
-focused race tests. A separately gated process test uses the built CLI and real
+focused race tests. PTY subprocess tests exercise actual Ctrl-C during both
+upgrade and refresh, plus connected Ctrl-C forwarding. A separately gated process test uses the built CLI and real
 sessiond with a synthetic hosted-auth proxy; it is not a deployed-edge test.
 
 This does not guarantee VM-loss recovery, unlimited local scrollback, or recovery

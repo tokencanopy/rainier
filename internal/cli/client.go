@@ -74,7 +74,12 @@ func NewClient(cfg Config) *Client {
 	}
 	c := &Client{Base: ctx.Server, Token: ctx.Token, Workspace: ctx.Workspace, RefreshToken: ctx.RefreshToken}
 	if ctx.Hosted() {
-		c.SaveTokens = func(p TokenPair) error { return saveRotated(name, ctx, p) }
+		c.SaveTokens = func(p TokenPair) error {
+			c.mu.Lock()
+			previous := c.RefreshToken
+			c.mu.Unlock()
+			return saveRotated(name, ctx, previous, p)
+		}
 		c.LoadTokens = func() (TokenPair, bool) { return loadStored(name, ctx) }
 	}
 	return c
@@ -116,18 +121,18 @@ func loadStored(name string, original Context) (TokenPair, bool) {
 	return TokenPair{AccessToken: ctx.Token, RefreshToken: ctx.RefreshToken, AccessExpiresAt: ctx.AccessExpiresAt}, true
 }
 
-func saveRotated(name string, original Context, p TokenPair) error {
+func saveRotated(name string, original Context, previousRefresh string, p TokenPair) error {
 	cfg, err := Load()
 	if err != nil {
 		return err
 	}
 	ctx, ok := cfg.Contexts[name]
-	if !ok || ctx.Server != original.Server || ctx.OwnerID != original.OwnerID {
+	if !ok || ctx.Server != original.Server || ctx.OwnerID != original.OwnerID || ctx.RefreshToken != previousRefresh {
 		return ErrLoginAgain
 	}
 	ctx.Token, ctx.RefreshToken, ctx.AccessExpiresAt = p.AccessToken, p.RefreshToken, p.AccessExpiresAt
 	cfg.UpdateContext(name, ctx)
-	return Save(cfg)
+	return writeConfig(cfg) // refresh already owns the config lock
 }
 
 // Option adjusts one Do call's request before it's sent — the
@@ -363,12 +368,11 @@ func (c *Client) refreshLocked(ctx context.Context) error {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, errBodyLimit)).Decode(&pair); err != nil {
 		return fmt.Errorf("refreshing the session: %w", err)
 	}
-	if pair.AccessToken == "" {
+	if pair.AccessToken == "" || pair.RefreshToken == "" {
 		return ErrLoginAgain
 	}
 
 	c.mu.Lock()
-	c.Token, c.RefreshToken = pair.AccessToken, pair.RefreshToken
 	save := c.SaveTokens
 	c.mu.Unlock()
 	if save != nil {
@@ -376,6 +380,9 @@ func (c *Client) refreshLocked(ctx context.Context) error {
 			return fmt.Errorf("saving the refreshed session: %w", err)
 		}
 	}
+	c.mu.Lock()
+	c.Token, c.RefreshToken = pair.AccessToken, pair.RefreshToken
+	c.mu.Unlock()
 	return nil
 }
 

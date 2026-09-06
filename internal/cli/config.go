@@ -5,6 +5,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"maps"
 	"os"
@@ -198,24 +199,73 @@ func Load() (Config, error) {
 // Save writes c to the config file, creating its directory (0700) if
 // necessary. The file itself is 0600: it carries bearer tokens.
 //
-// A caller that set ServerURL/Token/OwnerID directly (the pre-contexts way,
-// which `rainier login` still is) has its values folded into the current
+// A caller that set ServerURL/Token/OwnerID directly (the pre-contexts way)
+// has its values folded into the current
 // context — that, and not a second write path, is what keeps those callers
 // correct. The legacy fields themselves are never written back: what Save
-// leaves on disk is always the current shape.
+// leaves on disk is always the current shape. Save serializes a complete
+// replacement with credential refresh; use UpdateConfig for edits to existing
+// configuration so a stale copy cannot overwrite a newer credential pair.
 func Save(c Config) error {
+	if err := prepareConfigDir(); err != nil {
+		return err
+	}
+	return withConfigLock(context.Background(), func() error { return writeConfig(c) })
+}
+
+// UpdateConfig applies one edit to the latest config under the same lock as
+// credential refresh. Use it for read-modify-write changes: loading a Config and
+// saving that stale copy could overwrite a sibling's freshly rotated tokens.
+// The callback must not perform network I/O or call Save/UpdateConfig. An edit
+// error leaves the file unchanged; successful writes replace it atomically.
+func UpdateConfig(edit func(*Config) error) error {
+	if err := prepareConfigDir(); err != nil {
+		return err
+	}
+	return withConfigLock(context.Background(), func() error {
+		c, err := Load()
+		if err != nil {
+			return err
+		}
+		if err := edit(&c); err != nil {
+			return err
+		}
+		return writeConfig(c)
+	})
+}
+
+func prepareConfigDir() error {
 	path, err := configPath()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	return os.MkdirAll(filepath.Dir(path), 0o700)
+}
+
+// writeConfig requires the config lock. Rename prevents unlocked readers from
+// observing a truncated or half-written token pair.
+func writeConfig(c Config) error {
+	path, err := configPath()
+	if err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(c.normalized(), "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	f, err := os.CreateTemp(filepath.Dir(path), ".rainier-config-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }
 
 // normalized is the value Save writes: a copy (the caller's map is never
