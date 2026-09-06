@@ -1030,3 +1030,58 @@ func TestAgentCreateCarriesTheAgentHome(t *testing.T) {
 		t.Errorf("a create with no home reached the driver with %+v, want nil", calls[1].Home)
 	}
 }
+
+// TestAgentRedialsWhenTheControlSocketGoesSilent pins the runner's half of the
+// heartbeat. A control-plane instance replaced behind a load balancer leaves
+// the runner's socket half-open: nothing arrives and nothing errors, and a
+// runner that only redials on an error is off the fleet until the kernel's
+// keepalive gives up. Here the fake controld accepts the connection, reads the
+// announce, and then never reads again, so no ping is ever answered — and the
+// runner must dial a second connection on its own.
+func TestAgentRedialsWhenTheControlSocketGoesSilent(t *testing.T) {
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "", "")
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1",
+		PingInterval: 30 * time.Millisecond, PingTimeout: 150 * time.Millisecond})
+
+	conn1 := fc.nextConn(t)
+	conn1.readAnnounce(t) // and then silence: no Read, so no pong ever goes back
+
+	conn2 := fc.nextConn(t)
+	conn2.readAnnounce(t)
+}
+
+// TestAgentKeepsAnAnsweringControlSocket is the other half: a peer that keeps
+// reading answers every ping, and the runner must not redial. The fake reads
+// continuously for longer than several ping intervals; a second connection in
+// that window would mean the liveness check is dropping healthy sockets.
+func TestAgentKeepsAnAnsweringControlSocket(t *testing.T) {
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "", "")
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1",
+		PingInterval: 30 * time.Millisecond, PingTimeout: 150 * time.Millisecond})
+
+	conn1 := fc.nextConn(t)
+	conn1.readAnnounce(t)
+	readCtx, stopReading := context.WithCancel(context.Background())
+	defer stopReading()
+	go func() {
+		for {
+			if _, _, err := conn1.c.Read(readCtx); err != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-fc.conns:
+		t.Fatal("the runner redialed a control socket whose peer was answering every ping")
+	case <-time.After(600 * time.Millisecond):
+	}
+}
