@@ -541,3 +541,54 @@ func equalSets(a, b []string) bool {
 	}
 	return true
 }
+
+// Removing the last workspace must send an empty JSON list, not null. The edge
+// distinguishes an absent field (leave the selection alone) from a present one
+// (replace it), so a null here would be read as "no selection field" by a
+// stricter decoder and quietly leave the workspace shared.
+func TestConnectionUnshareTheLastWorkspaceSendsAnEmptyList(t *testing.T) {
+	srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{
+		Provider: "github", Login: "octocat", AccessMode: "selected",
+		Workspaces: []string{"ws_dogfood"}, CreatedAt: "2026-09-01T00:00:00Z",
+	}}
+	ts := srv.start()
+	hostedContext(t, ts.URL, "ws_dogfood")
+
+	if _, err := captureStdout(t, func() error { return runConnectionShare([]string{"github"}, false) }); err != nil {
+		t.Fatalf("connection unshare: %v", err)
+	}
+	if len(srv.patched) != 1 {
+		t.Fatalf("PATCH count = %d, want 1", len(srv.patched))
+	}
+	raw, ok := srv.patched[0]["workspaces"]
+	if !ok {
+		t.Fatal("PATCH omitted the workspaces field entirely")
+	}
+	list, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("PATCH workspaces = %#v, want an empty JSON list", raw)
+	}
+	if len(list) != 0 {
+		t.Errorf("PATCH workspaces = %v, want empty", list)
+	}
+}
+
+// The flag may precede the positional; reorderArgs is what makes that work, and
+// a person types it both ways.
+func TestConnectionShareAcceptsTheFlagBeforeTheProvider(t *testing.T) {
+	srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{
+		Provider: "github", Login: "octocat", AccessMode: "selected",
+		Workspaces: []string{}, CreatedAt: "2026-09-01T00:00:00Z",
+	}}
+	ts := srv.start()
+	hostedContext(t, ts.URL, "ws_dogfood")
+
+	if _, err := captureStdout(t, func() error {
+		return runConnectionShare([]string{"--workspace", "ws_other", "github"}, true)
+	}); err != nil {
+		t.Fatalf("connection share: %v", err)
+	}
+	if got := workspaceSet(t, srv.patched[0]); !equalSets(got, []string{"ws_other"}) {
+		t.Errorf("PATCH workspaces = %v, want ws_other", got)
+	}
+}
