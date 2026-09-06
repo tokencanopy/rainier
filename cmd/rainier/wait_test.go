@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,8 +92,13 @@ func TestInitialAttachPreservesAuthErrors(t *testing.T) {
 }
 
 func TestWaitGuidanceBoundsDiagnosticsAndUnsafeIDs(t *testing.T) {
-	calls := 0
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; <-r.Context().Done() }))
+	var calls atomic.Int32
+	handlerDone := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		<-r.Context().Done()
+		handlerDone <- struct{}{}
+	}))
 	defer ts.Close()
 	cfg := cli.Config{ServerURL: ts.URL, Token: "tok_example"}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
@@ -102,9 +108,14 @@ func TestWaitGuidanceBoundsDiagnosticsAndUnsafeIDs(t *testing.T) {
 	if time.Since(start) > time.Second || !strings.Contains(err.Error(), "timeout") {
 		t.Fatalf("%v", err)
 	}
-	before := calls
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("timed-out request handler did not complete")
+	}
+	before := calls.Load()
 	err = initialAttachGuidance(context.Background(), cfg, "sess_bad; touch /tmp/example", 0)
-	if calls != before || strings.Contains(err.Error(), "touch") || !strings.Contains(err.Error(), "rainier ls") {
+	if calls.Load() != before || strings.Contains(err.Error(), "touch") || !strings.Contains(err.Error(), "rainier ls") {
 		t.Fatalf("unsafe id guidance: %v", err)
 	}
 }
