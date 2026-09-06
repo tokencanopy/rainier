@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -71,6 +72,22 @@ func safeServer(raw string) string {
 	return safeTerminal(u.Scheme + "://" + u.Host)
 }
 
+var diagnosticURL = regexp.MustCompile(`(?i)(?:https?|wss?)://[^\s]+`)
+
+func diagnosticText(cfg cli.Config, text string) string {
+	secrets := []string{cfg.Token}
+	for _, active := range cfg.Contexts {
+		secrets = append(secrets, active.Token, active.RefreshToken)
+	}
+	for _, secret := range secrets {
+		if secret != "" {
+			text = strings.ReplaceAll(text, secret, "[redacted]")
+		}
+	}
+	text = diagnosticURL.ReplaceAllStringFunc(text, safeServer)
+	return safeTerminal(text)
+}
+
 // readinessHTTP bounds response size without changing shared client decoding or
 // refresh semantics. Redirects are refused: diagnostic probes must stay on the
 // configured server and must not forward workspace scope to another origin.
@@ -101,14 +118,7 @@ func doctorReport(ctx context.Context, cfg cli.Config, w io.Writer) error {
 	defer cancel()
 	active, ok := cfg.Active()
 	report := func(level, check, message string) {
-		for _, c := range cfg.Contexts {
-			for _, secret := range []string{c.Token, c.RefreshToken} {
-				if secret != "" {
-					message = strings.ReplaceAll(message, secret, "[redacted]")
-				}
-			}
-		}
-		fmt.Fprintf(w, "%s %s: %s\n", level, check, safeTerminal(message))
+		fmt.Fprintf(w, "%s %s: %s\n", level, check, diagnosticText(cfg, message))
 	}
 	if !ok || active.Token == "" || active.Server == "" {
 		report("FAIL", "config", "no active login; run rainier login with your server URL (rainier help login)")
@@ -119,7 +129,7 @@ func doctorReport(ctx context.Context, cfg cli.Config, w io.Writer) error {
 		report("FAIL", "config", "invalid server URL; use a server URL without credentials, query, or fragment (rainier help login)")
 		return errDoctorFailed
 	}
-	report("PASS", "config", "context "+safeTerminal(cfg.ActiveName())+"; server "+safeServer(active.Server))
+	report("PASS", "config", "context "+cfg.ActiveName()+"; server "+safeServer(active.Server))
 	if active.Hosted() && active.Workspace == "" {
 		report("FAIL", "workspace", "no workspace selected; use rainier workspace use <id> from your login's workspace list")
 		return errDoctorFailed

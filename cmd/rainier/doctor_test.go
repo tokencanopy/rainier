@@ -290,3 +290,18 @@ func TestDoctorRedirectAndBodyBound(t *testing.T) {
 		})
 	}
 }
+
+func TestDoctorRedactsBeforeTruncation(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(doctorFixture))
+	defer ts.Close()
+	secret := strings.Repeat("private", 40)
+	cfg := cli.Config{}
+	cfg.SetContext(secret, cli.Context{Server: ts.URL, Token: secret})
+	var out bytes.Buffer
+	if err := doctorReport(context.Background(), cfg, &out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "private") {
+		t.Fatalf("credential prefix leaked: %q", out.String())
+	}
+}

@@ -59,6 +59,11 @@ status table), each behind a small host interface that self-hosted
 
 ## Quickstart
 
+You need a reachable Rainier server, an account with access, and an administrator
+who has connected a runner with available capacity. Rainier does not provision
+these prerequisites through the CLI. Follow the [CLI onboarding guide](docs/cli-quickstart.md)
+for either installation method and for diagnosing a waiting session.
+
 `rainier --help` gives a compact command overview; `rainier help <command>`
 and `<command> --help` give details. `rainier help all` retains the full guide.
 `rainier version` (or `--version`) reports the build version. Source checkouts
@@ -76,9 +81,12 @@ make build
 # Point the CLI at your controld and log in with your GitHub identity.
 # --from-gh borrows the token from the `gh` CLI; --token <t> and
 # --client-id <id> (device flow) are the alternatives.
-bin/rainier login --from-gh --server http://rainier-1:9090
+bin/rainier login --from-gh --server https://rainier.example.invalid # replace with your server URL
+bin/rainier doctor                                          # required checks must pass
+bin/rainier env ls                                          # choose an environment available on your server
+bin/rainier agent ls                                        # inspect coding-agent login status
 
-bin/rainier new --name box1 --image rainier-session:latest   # creates, then attaches
+bin/rainier new --name box1 --env dev                        # replace dev with your environment; creates, then attaches
 bin/rainier ls                                               # id, name, env, state, runner, reachable, age
 bin/rainier attach box1                                      # resumes if needed; Ctrl-] detaches
 bin/rainier suspend box1 && bin/rainier resume box1
@@ -90,9 +98,10 @@ bin/rainier rm box1
 A hosted rainier logs in through the browser instead of a GitHub token:
 
 ```bash
-bin/rainier login --cloud https://edge.example.test   # prints (and opens) a URL
+bin/rainier login --cloud https://edge.example.invalid # replace with your hosted URL; prints and opens sign-in
 bin/rainier context list                              # every server this CLI knows
 bin/rainier workspace use ws_example                  # when the account has several
+bin/rainier doctor
 ```
 
 `login --cloud` starts a login attempt, prints the URL you finish signing in

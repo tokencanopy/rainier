@@ -1149,6 +1149,10 @@ func attachWithRetry(cfg cli.Config, id string, since uint64) error {
 }
 
 func attachWithRetrySleep(cfg cli.Config, id string, since uint64, sleep func(time.Duration)) error {
+	return attachWithRetryBudget(cfg, id, since, sleep, 60*time.Second)
+}
+
+func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(time.Duration), initialWait time.Duration) error {
 	wsURL := wsURLFor(cfg.ServerURL, id)
 	header := http.Header{"Authorization": {"Bearer " + cfg.Token}}
 	// The terminal stream is scoped like every other request on a hosted
@@ -1156,8 +1160,9 @@ func attachWithRetrySleep(cfg cli.Config, id string, since uint64, sleep func(ti
 	if ctx, ok := cfg.Active(); ok && ctx.Workspace != "" {
 		header.Set("Rainier-Workspace", ctx.Workspace)
 	}
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(initialWait)
 	established := false
+	waiting := false
 	backoff := 100 * time.Millisecond
 
 	for {
@@ -1191,10 +1196,16 @@ func attachWithRetrySleep(cfg cli.Config, id string, since uint64, sleep func(ti
 			continue
 		}
 
-		if !errors.Is(err, attachio.ErrSessionNotReady) || !time.Now().Before(deadline) {
+		if !errors.Is(err, attachio.ErrSessionNotReady) {
 			return err
 		}
-		fmt.Println("waiting for session…")
+		if !time.Now().Before(deadline) {
+			return initialAttachGuidance(context.Background(), cfg, id, since)
+		}
+		if !waiting {
+			fmt.Println("waiting for session… (Ctrl-C stops waiting and keeps the session)")
+			waiting = true
+		}
 		sleep(500 * time.Millisecond)
 	}
 }
