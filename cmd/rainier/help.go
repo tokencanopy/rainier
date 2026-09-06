@@ -129,7 +129,9 @@ An environment image must already include the coding agent you want to run.
 
 Open the current terminal screen; resume a suspended session when necessary.
 Ctrl-] detaches and keeps the session. Transient established-stream disconnects
-reconnect from the last rendered sequence. --since 0 replays the full event log;
+and hosted lease renewals reconnect from the last rendered sequence. Hosted
+credentials refresh automatically; revoked access still requires login.
+--since 0 replays the full event log;
 --since N resumes after N. Run rainier doctor if the session keeps waiting.
 Use a sess_ id directly, or a session name. Ambiguous names require an id.`
 	case "doctor":

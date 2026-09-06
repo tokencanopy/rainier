@@ -143,6 +143,13 @@ After the first successful attach, `rainier` retries:
 - pure transport failures;
 - HTTP 429, 502, 503, and 504 responses.
 
+Hosted-auth amendment: an upgrade401 may adopt/refresh the original context's
+credentials and retry once, including on the initial upgrade. A second401 or a
+refused refresh requires login again. The exact hosted policy-close reason
+`attach lease expired; reattach` invites a fresh authorization decision; other
+policy closes remain permanent. See [reconnect recovery](../../cli-reconnect-recovery.md)
+for the token-locking, context-pinning, and final terminal-cleanup invariants.
+
 Other HTTP responses are permanent and return immediately. Backoff starts at
 100 ms and doubles to a 2 s cap. The CLI prints one connection-lost line and a
 short retry status; the next screen/output visibly confirms reconnection. It

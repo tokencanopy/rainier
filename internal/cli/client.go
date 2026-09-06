@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 )
 
 // requestIDBytes/idempotencyKeyBytes both render as 16 hex characters —
@@ -50,7 +51,8 @@ type Client struct {
 	// refresh the client asks it whether another process has already
 	// rotated the pair, and adopts that pair instead of spending a refresh
 	// token the edge would treat as replayed. Nil for a client with no
-	// context of its own.
+	// context of its own. False means the original context is no longer
+	// available and recovery must stop rather than recreate it.
 	LoadTokens func() (TokenPair, bool)
 
 	// mu guards Token and RefreshToken across a refresh: a rotated pair
@@ -72,8 +74,13 @@ func NewClient(cfg Config) *Client {
 	}
 	c := &Client{Base: ctx.Server, Token: ctx.Token, Workspace: ctx.Workspace, RefreshToken: ctx.RefreshToken}
 	if ctx.Hosted() {
-		c.SaveTokens = func(p TokenPair) error { return saveRotated(name, p) }
-		c.LoadTokens = func() (TokenPair, bool) { return loadStored(name) }
+		c.SaveTokens = func(p TokenPair) error {
+			c.mu.Lock()
+			previous := c.RefreshToken
+			c.mu.Unlock()
+			return saveRotated(name, ctx, previous, p)
+		}
+		c.LoadTokens = func() (TokenPair, bool) { return loadStored(name, ctx) }
 	}
 	return c
 }
@@ -102,27 +109,30 @@ var ErrLoginAgain = errors.New("session expired: log in again with `rainier logi
 // loadStored reads the pair the named context holds on disk right now. It
 // is the other half of saveRotated: what one process saved, another reads
 // before it decides whether a refresh is still needed.
-func loadStored(name string) (TokenPair, bool) {
+func loadStored(name string, original Context) (TokenPair, bool) {
 	cfg, err := Load()
 	if err != nil {
 		return TokenPair{}, false
 	}
 	ctx, ok := cfg.Contexts[name]
-	if !ok || ctx.RefreshToken == "" {
+	if !ok || ctx.RefreshToken == "" || ctx.Server != original.Server || ctx.OwnerID != original.OwnerID {
 		return TokenPair{}, false
 	}
 	return TokenPair{AccessToken: ctx.Token, RefreshToken: ctx.RefreshToken, AccessExpiresAt: ctx.AccessExpiresAt}, true
 }
 
-func saveRotated(name string, p TokenPair) error {
+func saveRotated(name string, original Context, previousRefresh string, p TokenPair) error {
 	cfg, err := Load()
 	if err != nil {
 		return err
 	}
-	ctx := cfg.Contexts[name]
+	ctx, ok := cfg.Contexts[name]
+	if !ok || ctx.Server != original.Server || ctx.OwnerID != original.OwnerID || ctx.RefreshToken != previousRefresh {
+		return ErrLoginAgain
+	}
 	ctx.Token, ctx.RefreshToken, ctx.AccessExpiresAt = p.AccessToken, p.RefreshToken, p.AccessExpiresAt
 	cfg.UpdateContext(name, ctx)
-	return Save(cfg)
+	return writeConfig(cfg) // refresh already owns the config lock
 }
 
 // Option adjusts one Do call's request before it's sent — the
@@ -248,7 +258,7 @@ func (c *Client) send(ctx context.Context, method, path string, in any, opts ...
 	if !canRefresh {
 		return nil, err
 	}
-	if rerr := c.refresh(ctx); rerr != nil {
+	if rerr := c.RefreshAfterUnauthorized(ctx); rerr != nil {
 		return nil, rerr
 	}
 	resp, err = c.attempt(ctx, method, path, in, opts...)
@@ -265,6 +275,24 @@ func unauthorized(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.Status == http.StatusUnauthorized
 }
 
+// RefreshAfterUnauthorized recovers credentials after a server rejects an
+// access token. HTTP requests and terminal upgrades use the same locked
+// reload/rotation path, so another CLI's saved pair is adopted before spending
+// a single-use refresh token. The caller must retry its rejected operation at
+// most once before requiring login again; a successful connection starts a new
+// recovery interval. No refresh credential, or a refused refresh, returns
+// ErrLoginAgain. Transport and persistence errors are returned without retrying
+// an exchange whose single-use token may already have been consumed.
+func (c *Client) RefreshAfterUnauthorized(ctx context.Context) error {
+	c.mu.Lock()
+	canRefresh := c.RefreshToken != ""
+	c.mu.Unlock()
+	if !canRefresh {
+		return ErrLoginAgain
+	}
+	return c.refresh(ctx)
+}
+
 // refresh exchanges the stored refresh token for a new pair and installs it.
 // The edge rotates the refresh token on every use, so the new one is saved
 // before the retry: losing it would strand the context on a token that is
@@ -276,11 +304,15 @@ func (c *Client) refresh(ctx context.Context) error {
 	}
 	// Under the config lock: the reload and the refresh are one step, so a
 	// sibling process cannot rotate the pair between them.
-	return withConfigLock(func() error {
+	return withConfigLock(ctx, func() error {
 		c.mu.Lock()
 		rt := c.RefreshToken
 		c.mu.Unlock()
-		if stored, ok := c.LoadTokens(); ok && stored.RefreshToken != rt && stored.AccessToken != "" {
+		stored, ok := c.LoadTokens()
+		if !ok {
+			return ErrLoginAgain // removed, unreadable, or replaced context
+		}
+		if stored.RefreshToken != rt && stored.AccessToken != "" {
 			// Another process already rotated this context's pair. Its
 			// access token is the live one; ours is spent. Adopt theirs and
 			// send no refresh: the edge would call ours a replay and revoke
@@ -288,6 +320,11 @@ func (c *Client) refresh(ctx context.Context) error {
 			c.mu.Lock()
 			c.Token, c.RefreshToken = stored.AccessToken, stored.RefreshToken
 			c.mu.Unlock()
+			// A laptop may wake after even the sibling's newer access token
+			// expired. Rotate its unspent refresh token under this same lock.
+			if expires, err := time.Parse(time.RFC3339, stored.AccessExpiresAt); err == nil && !time.Now().Before(expires) {
+				return c.refreshLocked(ctx)
+			}
 			return nil
 		}
 		return c.refreshLocked(ctx)
@@ -331,12 +368,11 @@ func (c *Client) refreshLocked(ctx context.Context) error {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, errBodyLimit)).Decode(&pair); err != nil {
 		return fmt.Errorf("refreshing the session: %w", err)
 	}
-	if pair.AccessToken == "" {
+	if pair.AccessToken == "" || pair.RefreshToken == "" {
 		return ErrLoginAgain
 	}
 
 	c.mu.Lock()
-	c.Token, c.RefreshToken = pair.AccessToken, pair.RefreshToken
 	save := c.SaveTokens
 	c.mu.Unlock()
 	if save != nil {
@@ -344,6 +380,9 @@ func (c *Client) refreshLocked(ctx context.Context) error {
 			return fmt.Errorf("saving the refreshed session: %w", err)
 		}
 	}
+	c.mu.Lock()
+	c.Token, c.RefreshToken = pair.AccessToken, pair.RefreshToken
+	c.mu.Unlock()
 	return nil
 }
 
