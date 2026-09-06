@@ -1377,3 +1377,45 @@ func TestSelfHostedContextDoesNotRefresh(t *testing.T) {
 		t.Errorf("refresh calls = %d, want none for a self-hosted context", n)
 	}
 }
+
+// TestASiblingProcessRotatingThePairIsAdoptedNotReplayed pins the two-terminal
+// case. The edge rotates the refresh token on every use and revokes the whole
+// family when a spent one comes back, so two rainier processes sharing one
+// config must not both spend the pair they loaded at start. The second client
+// finds the rotated pair on disk under the config lock and adopts it, making
+// exactly one refresh call between them and keeping both logged in.
+func TestASiblingProcessRotatingThePairIsAdoptedNotReplayed(t *testing.T) {
+	ts, refreshes := hostedRefreshServer(t, "tok_refresh_example", func(auth string) int {
+		if auth == "Bearer tok_access_rotated" {
+			return http.StatusOK
+		}
+		return http.StatusUnauthorized
+	})
+
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var cfg Config
+	cfg.SetContext("edge.example.test", Context{
+		Server: ts.URL, Token: "tok_access_stale", RefreshToken: "tok_refresh_example", Workspace: "ws_example",
+	})
+	if err := Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, second := NewClient(loaded), NewClient(loaded) // two processes, one config
+
+	if err := first.Do(http.MethodGet, "/v0/sessions", nil, nil); err != nil {
+		t.Fatalf("first client: %v", err)
+	}
+	if err := second.Do(http.MethodGet, "/v0/sessions", nil, nil); err != nil {
+		t.Fatalf("second client after the first rotated the pair: %v", err)
+	}
+	if n := refreshes(); n != 1 {
+		t.Errorf("refresh calls = %d, want exactly 1: the second client must adopt, not replay", n)
+	}
+	if second.Token != "tok_access_rotated" || second.RefreshToken != "tok_refresh_rotated" {
+		t.Errorf("second client holds (%q, %q), want the rotated pair", second.Token, second.RefreshToken)
+	}
+}

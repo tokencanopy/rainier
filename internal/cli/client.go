@@ -46,6 +46,12 @@ type Client struct {
 	Workspace    string
 	RefreshToken string
 	SaveTokens   func(TokenPair) error
+	// LoadTokens re-reads the pair the context holds on disk. Before a
+	// refresh the client asks it whether another process has already
+	// rotated the pair, and adopts that pair instead of spending a refresh
+	// token the edge would treat as replayed. Nil for a client with no
+	// context of its own.
+	LoadTokens func() (TokenPair, bool)
 
 	// mu guards Token and RefreshToken across a refresh: a rotated pair
 	// replaces both at once, and a request in flight must not be sent with
@@ -67,6 +73,7 @@ func NewClient(cfg Config) *Client {
 	c := &Client{Base: ctx.Server, Token: ctx.Token, Workspace: ctx.Workspace, RefreshToken: ctx.RefreshToken}
 	if ctx.Hosted() {
 		c.SaveTokens = func(p TokenPair) error { return saveRotated(name, p) }
+		c.LoadTokens = func() (TokenPair, bool) { return loadStored(name) }
 	}
 	return c
 }
@@ -92,6 +99,21 @@ var ErrLoginAgain = errors.New("session expired: log in again with `rainier logi
 
 // saveRotated writes a rotated hosted pair back into the named context,
 // leaving every other context — and which one is current — alone.
+// loadStored reads the pair the named context holds on disk right now. It
+// is the other half of saveRotated: what one process saved, another reads
+// before it decides whether a refresh is still needed.
+func loadStored(name string) (TokenPair, bool) {
+	cfg, err := Load()
+	if err != nil {
+		return TokenPair{}, false
+	}
+	ctx, ok := cfg.Contexts[name]
+	if !ok || ctx.RefreshToken == "" {
+		return TokenPair{}, false
+	}
+	return TokenPair{AccessToken: ctx.Token, RefreshToken: ctx.RefreshToken, AccessExpiresAt: ctx.AccessExpiresAt}, true
+}
+
 func saveRotated(name string, p TokenPair) error {
 	cfg, err := Load()
 	if err != nil {
@@ -249,6 +271,32 @@ func unauthorized(err error) bool {
 // already spent. A 401 here — credential_replayed, expired, revoked — is
 // terminal.
 func (c *Client) refresh(ctx context.Context) error {
+	if c.LoadTokens == nil {
+		return c.refreshLocked(ctx)
+	}
+	// Under the config lock: the reload and the refresh are one step, so a
+	// sibling process cannot rotate the pair between them.
+	return withConfigLock(func() error {
+		c.mu.Lock()
+		rt := c.RefreshToken
+		c.mu.Unlock()
+		if stored, ok := c.LoadTokens(); ok && stored.RefreshToken != rt && stored.AccessToken != "" {
+			// Another process already rotated this context's pair. Its
+			// access token is the live one; ours is spent. Adopt theirs and
+			// send no refresh: the edge would call ours a replay and revoke
+			// the family for both of us.
+			c.mu.Lock()
+			c.Token, c.RefreshToken = stored.AccessToken, stored.RefreshToken
+			c.mu.Unlock()
+			return nil
+		}
+		return c.refreshLocked(ctx)
+	})
+}
+
+// refreshLocked is the exchange itself; the caller holds whatever lock the
+// context needs.
+func (c *Client) refreshLocked(ctx context.Context) error {
 	c.mu.Lock()
 	rt := c.RefreshToken
 	c.mu.Unlock()
