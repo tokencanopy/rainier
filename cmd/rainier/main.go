@@ -52,6 +52,8 @@ func main() {
 	switch cmd {
 	case "login":
 		err = runLogin(rest)
+	case "doctor":
+		err = runDoctor(rest)
 	case "new":
 		err = runNew(rest)
 	case "ls":
