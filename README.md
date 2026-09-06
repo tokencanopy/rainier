@@ -72,6 +72,10 @@ status through `scripts/build.sh`. Direct, unstamped `go build` and source archi
 report plain `dev` rather than trusting potentially incorrect enclosing-repository
 metadata. Release builds can supply the actual release tag, for example:
 
+Explicit linker flags (in `GOFLAGS` or arguments to `scripts/build.sh`) take
+precedence over automatic source stamping. Supply `main.version` to identify a
+release; otherwise that custom build reports plain `dev`.
+
 ```bash
 # Replace vX.Y.Z with the release being built; this does not publish anything.
 go build -ldflags '-X main.version=vX.Y.Z' -o bin/rainier ./cmd/rainier

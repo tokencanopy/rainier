@@ -129,10 +129,11 @@ func main() { fmt.Println("rainier " + buildVersion()) }
 		}
 		return strings.TrimSpace(string(out))
 	}
-	check := func(dir, want string) {
+	check := func(dir, want string, env ...string) {
 		t.Helper()
 		cmd := exec.Command("make", "build")
 		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), env...)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("make build: %v\n%s", err, out)
 		}
@@ -169,4 +170,7 @@ func main() { fmt.Println("rainier " + buildVersion()) }
 		write(filepath.Join(archive, path), string(data))
 	}
 	check(archive, "rainier dev")
+	// Explicit linker customization owns the version, just as with go build.
+	check(worktree, "rainier v9.8.7-synthetic", "GOFLAGS=-ldflags=-X=main.version=v9.8.7-synthetic")
+	check(worktree, "rainier dev", "GOFLAGS=-ldflags=-s")
 }
