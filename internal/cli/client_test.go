@@ -1242,7 +1242,7 @@ func hostedRefreshServer(t *testing.T, live string, apiStatus func(auth string) 
 				return
 			}
 			io.WriteString(w, `{"token_type":"Bearer","access_token":"tok_access_rotated",`+
-				`"access_expires_at":"2026-09-02T00:10:00Z","refresh_token":"tok_refresh_rotated",`+
+				`"access_expires_at":"2099-09-02T00:10:00Z","refresh_token":"tok_refresh_rotated",`+
 				`"refresh_expires_at":"2026-09-09T00:00:00Z"}`)
 			return
 		}
@@ -1297,7 +1297,7 @@ func TestOneTransparentRefreshOnUnauthorized(t *testing.T) {
 	got := saved.Contexts["edge.example.test"]
 	want := Context{
 		Server: ts.URL, Token: "tok_access_rotated", RefreshToken: "tok_refresh_rotated",
-		Workspace: "ws_example", AccessExpiresAt: "2026-09-02T00:10:00Z",
+		Workspace: "ws_example", AccessExpiresAt: "2099-09-02T00:10:00Z",
 	}
 	if got != want {
 		t.Errorf("saved context = %+v, want the rotated pair %+v", got, want)

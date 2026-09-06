@@ -454,6 +454,12 @@ func retryableWebSocketReadError(err error) bool {
 		return false
 	}
 	switch websocket.CloseStatus(err) {
+	case websocket.StatusPolicyViolation:
+		// The hosted gateway deliberately ends its authorization lease. Only
+		// this exact wire reason invites a fresh edge authorization decision;
+		// ordinary policy denials must remain terminal, never an endless retry.
+		var closeErr websocket.CloseError
+		return errors.As(err, &closeErr) && closeErr.Reason == "attach lease expired; reattach"
 	case -1, websocket.StatusNoStatusRcvd, websocket.StatusAbnormalClosure,
 		websocket.StatusGoingAway, websocket.StatusInternalError,
 		websocket.StatusServiceRestart, websocket.StatusTryAgainLater,

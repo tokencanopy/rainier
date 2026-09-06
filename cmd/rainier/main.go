@@ -30,6 +30,7 @@ import (
 	"github.com/tokencanopy/rainier/internal/cli"
 	"github.com/tokencanopy/rainier/protocol/terminal"
 	"github.com/tokencanopy/rainier/protocol/workspace"
+	"golang.org/x/term"
 )
 
 // devicePollTimeout bounds a single poll request to GitHub's device-flow
@@ -1141,9 +1142,9 @@ func createSession(c *cli.Client, body createSessionRequest, idempotencyKey stri
 // treated as fatal. attachio.Run's dial wraps that specific failure —
 // controld's 503 session_not_ready before the websocket upgrade — as a
 // *attachio.DialError matching errors.Is(err, attachio.ErrSessionNotReady);
-// any other error (including a *DialError for some other status) is
-// treated as fatal immediately rather than burning the retry budget on a
-// failure that will never resolve itself.
+// a hosted401 gets one credential recovery and retry. Other initial errors
+// return immediately instead of spending the readiness budget. Once connected,
+// transient failures and explicit hosted lease renewals resume at the cursor.
 func attachWithRetry(cfg cli.Config, id string, since uint64) error {
 	return attachWithRetrySleep(cfg, id, since, time.Sleep)
 }
@@ -1153,8 +1154,15 @@ func attachWithRetrySleep(cfg cli.Config, id string, since uint64, sleep func(ti
 }
 
 func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(time.Duration), initialWait time.Duration) error {
+	// Emulator modes are not termios. Keep them across cursor-only reconnects
+	// (which need not replay their enable sequences), but never leave the local
+	// shell interpreting mouse movement as typed input on final return.
+	if term.IsTerminal(int(os.Stdout.Fd())) {
+		defer restoreAttachTerminal(os.Stdout)
+	}
+	c := cli.NewClient(cfg)
 	wsURL := wsURLFor(cfg.ServerURL, id)
-	header := http.Header{"Authorization": {"Bearer " + cfg.Token}}
+	header := http.Header{}
 	// The terminal stream is scoped like every other request on a hosted
 	// context: the edge routes it by the same header.
 	if ctx, ok := cfg.Active(); ok && ctx.Workspace != "" {
@@ -1164,8 +1172,10 @@ func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(t
 	established := false
 	waiting := false
 	backoff := 100 * time.Millisecond
+	authRetried := false
 
 	for {
+		header.Set("Authorization", "Bearer "+c.Token)
 		attemptStarted := time.Now()
 		outcome, err := attachio.Run(context.Background(), wsURL, header, since)
 		if err == nil {
@@ -1176,6 +1186,7 @@ func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(t
 			// local stdout. Resume after it: never repaint the whole terminal and
 			// never skip output the user had not actually seen.
 			established = true
+			authRetried = false
 			since = outcome.LastSeq
 			if time.Since(attemptStarted) >= 10*time.Second {
 				backoff = 100 * time.Millisecond
@@ -1184,6 +1195,21 @@ func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(t
 			sleep(backoff)
 			backoff = nextAttachBackoff(backoff)
 			continue
+		}
+
+		var dialErr *attachio.DialError
+		if errors.As(err, &dialErr) && dialErr.Status == http.StatusUnauthorized && c.RefreshToken != "" {
+			if authRetried {
+				return cli.ErrLoginAgain
+			}
+			authRetried = true
+			refreshCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			refreshErr := c.RefreshAfterUnauthorized(refreshCtx)
+			cancel()
+			if refreshErr != nil {
+				return refreshErr
+			}
+			continue // same session, workspace, and last rendered cursor
 		}
 
 		if established {
@@ -1210,6 +1236,13 @@ func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(t
 	}
 }
 
+// restoreAttachTerminal relinquishes remote application input modes without
+// clearing the screen or scrollback. Only the overall attach lifetime owns this
+// cleanup; doing it after every transport attempt breaks a still-running TUI.
+func restoreAttachTerminal(out io.Writer) {
+	fmt.Fprint(out, "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?1004l\x1b[?2004l\x1b[?25h\x1b[0m")
+}
+
 func nextAttachBackoff(current time.Duration) time.Duration {
 	next := current * 2
 	if next > 2*time.Second {
@@ -1219,8 +1252,8 @@ func nextAttachBackoff(current time.Duration) time.Duration {
 }
 
 // retryableAttachError is deliberately narrow. Once a viewer has connected,
-// transport failures and transient gateway statuses can recover; auth,
-// authorization, not-found, protocol, and local-terminal failures cannot and
+// transport failures and transient gateway statuses can recover; authentication
+// has its own bounded recovery above. Authorization, not-found, protocol, and local-terminal failures cannot and
 // must not become an infinite loop. A plain websocket transport failure is a
 // *url.Error, while an HTTP response is attachio.DialError.
 func retryableAttachError(err error) bool {
