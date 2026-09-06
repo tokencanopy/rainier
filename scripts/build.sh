@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Stamp the source tree, not an enclosing repository discovered by the Go tool.
+set -euo pipefail
+build_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$build_root"
+build_revision=''
+build_dirty=false
+build_git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [[ "$build_git_root" == "$build_root" ]] &&
+   build_revision="$(git rev-parse --verify HEAD 2>/dev/null)" &&
+   build_status="$(git status --porcelain --untracked-files=normal)"; then
+  if [[ -n "$build_status" ]]; then build_dirty=true; fi
+else
+  # Source archives (including ones inside another repo) are not that repo's HEAD.
+  build_revision=''
+fi
+# Explicit linker flags take precedence rather than being silently replaced.
+# Leave versioning to those flags; without a supplied version the CLI says dev.
+build_stamp=true
+build_go_flags="$(go env GOFLAGS)"
+if [[ "$build_go_flags" == *-ldflags* ]]; then build_stamp=false; fi
+for build_arg in "$@"; do
+  case "$build_arg" in -ldflags|-ldflags=*) build_stamp=false;; esac
+done
+if [[ "$build_stamp" == true ]]; then
+  set -- "-ldflags=-X main.sourceRevision=$build_revision -X main.sourceDirty=$build_dirty" "$@"
+fi
+CGO_ENABLED="${CGO_ENABLED:-0}" go build -buildvcs=false "$@"

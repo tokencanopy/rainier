@@ -135,9 +135,16 @@ type APIError struct {
 	// an expired credential (401) from an ordinary refusal that happens to
 	// share a code, and it is not part of Error's text.
 	Status int
+	// RetryAfter is transport guidance, preserved separately from untrusted prose.
+	RetryAfter string
 }
 
-func (e *APIError) Error() string { return e.Code + ": " + e.Message }
+func (e *APIError) Error() string {
+	if e.Code == "" {
+		return e.Message
+	}
+	return e.Code + ": " + e.Message
+}
 
 // RandHex returns n random bytes rendered as 2n lowercase hex characters —
 // used for X-Request-Id (below) and by cmd/rainier for a fresh
@@ -270,7 +277,7 @@ func (c *Client) refresh(ctx context.Context) error {
 		return ErrLoginAgain
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("refreshing the session: unexpected response: %d", resp.StatusCode)
+		return &APIError{Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After"), Message: fmt.Sprintf("refreshing the session: unexpected response: %d", resp.StatusCode)}
 	}
 	var pair TokenPair
 	if err := json.NewDecoder(io.LimitReader(resp.Body, errBodyLimit)).Decode(&pair); err != nil {
@@ -351,9 +358,9 @@ func (c *Client) attempt(ctx context.Context, method, path string, in any, opts 
 			if len(text) > clip {
 				text = text[:clip]
 			}
-			return nil, fmt.Errorf("unexpected response: %d %s", resp.StatusCode, text)
+			return nil, &APIError{Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After"), Message: fmt.Sprintf("unexpected response: %d %s", resp.StatusCode, text)}
 		}
-		return nil, &APIError{Code: env.Error.Code, Message: env.Error.Message, Status: resp.StatusCode}
+		return nil, &APIError{Code: env.Error.Code, Message: env.Error.Message, Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After")}
 	}
 	return resp, nil
 }
