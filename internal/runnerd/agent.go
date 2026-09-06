@@ -32,6 +32,35 @@ type AgentConfig struct {
 	// it runs). They are passed through verbatim: controld validates them
 	// and answers with the set it accepted. Empty announces none.
 	Capabilities []string
+	// PingInterval and PingTimeout are the runner's half of the heartbeat:
+	// how often it asks the control plane whether the socket is still
+	// answered, and how long it waits before treating silence as a gone
+	// peer and redialing. Zero means the defaults below.
+	PingInterval time.Duration
+	PingTimeout  time.Duration
+}
+
+// The default liveness bounds. Together they bound how long a runner keeps
+// believing in a control connection its peer has stopped answering: the
+// control plane's heartbeat bound tells the cell when a runner is gone, and
+// this tells the runner when the cell is.
+const (
+	defaultAgentPingInterval = 20 * time.Second
+	defaultAgentPingTimeout  = 10 * time.Second
+)
+
+func (cfg AgentConfig) pingInterval() time.Duration {
+	if cfg.PingInterval > 0 {
+		return cfg.PingInterval
+	}
+	return defaultAgentPingInterval
+}
+
+func (cfg AgentConfig) pingTimeout() time.Duration {
+	if cfg.PingTimeout > 0 {
+		return cfg.PingTimeout
+	}
+	return defaultAgentPingTimeout
 }
 
 // agentSessionState is one control connection's negotiated state. Today that
@@ -196,6 +225,33 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 		}
 	}()
 
+	// Liveness. The read loop below only learns the peer is gone when the
+	// socket returns an error, and behind a load balancer it may never: a
+	// control-plane instance replaced underneath us leaves this end half-open,
+	// and a runner that waits for the error waits for the kernel's keepalive,
+	// which is minutes to hours. So this end asks. A ping the peer does not
+	// answer within the bound ends the session, and RunAgent redials.
+	writerDone.Add(1)
+	go func() {
+		defer writerDone.Done()
+		ticker := time.NewTicker(cfg.pingInterval())
+		defer ticker.Stop()
+		for {
+			select {
+			case <-connCtx.Done():
+				return
+			case <-ticker.C:
+				pctx, pcancel := context.WithTimeout(connCtx, cfg.pingTimeout())
+				err := c.Ping(pctx)
+				pcancel()
+				if err != nil && connCtx.Err() == nil {
+					log.Printf("controld conn silent for %s; treating it as gone", cfg.pingTimeout())
+					cancel()
+					return
+				}
+			}
+		}
+	}()
 	for {
 		var m runner.ToRunner
 		if err := wsjson.Read(connCtx, c, &m); err != nil {
