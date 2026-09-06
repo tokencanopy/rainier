@@ -44,6 +44,9 @@ func main() {
 		os.Exit(2)
 	}
 	cmd, rest := os.Args[1], os.Args[2:]
+	if handleHelpVersion(cmd, rest) {
+		return
+	}
 
 	var err error
 	switch cmd {
@@ -95,7 +98,7 @@ func main() {
 	}
 }
 
-func printUsage() {
+func printManual() {
 	fmt.Fprintln(os.Stderr, `usage: rainier <command> [flags]
 
 commands:

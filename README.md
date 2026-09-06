@@ -59,6 +59,17 @@ status table), each behind a small host interface that self-hosted
 
 ## Quickstart
 
+`rainier --help` gives a compact command overview; `rainier help <command>`
+and `<command> --help` give details. `rainier help all` retains the full guide.
+`rainier version` (or `--version`) reports the build version. Source checkouts
+report `dev` with available revision metadata; release builds can supply the
+actual release tag, for example:
+
+```bash
+# Replace vX.Y.Z with the release being built; this does not publish anything.
+go build -ldflags '-X main.version=vX.Y.Z' -o bin/rainier ./cmd/rainier
+```
+
 ```bash
 make build
 
