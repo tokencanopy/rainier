@@ -50,6 +50,11 @@ func TestDoctorReadiness(t *testing.T) {
 		{name: "malformed identity", path: "/v0/me", body: `{}`, want: "malformed", fail: true},
 		{name: "malformed runners", path: "/v0/runners", body: `{"bad":"shape"}`, want: "malformed", fail: true},
 		{name: "no env", path: "/v0/environments", body: `{"environments":[]}`, want: "WARN environments"},
+		{name: "malformed environment", path: "/v0/environments", body: `{"environments":[{}]}`, want: "coding-agent readiness incomplete"},
+		{name: "malformed agent", path: "/v0/agents", body: `{"agents":[{"status":"logged_in"}]}`, want: "coding-agent readiness incomplete"},
+		{name: "trailing JSON garbage", path: "/v0/me", body: `{"user":{"id":"usr_example"}} garbage`, want: "malformed", fail: true},
+		{name: "optional environment forbidden", path: "/v0/environments", status: 403, want: "WARN environments"},
+		{name: "optional agent forbidden", path: "/v0/agents", status: 403, want: "WARN agents"},
 		{name: "no login", path: "/v0/agents", body: `{"agents":[{"provider":"codex","status":"none"}]}`, want: "coding-agent readiness incomplete"},
 		{name: "optional unsupported", path: "/v0/agents", status: 404, want: "endpoint unavailable; compatibility not established"},
 		{name: "unauthorized", path: "/v0/me", status: 401, want: "authentication rejected (401)", fail: true},
@@ -310,5 +315,22 @@ func TestDoctorPreservesServiceRetryAfter(t *testing.T) {
 	got := readinessError(&cli.APIError{Status: 503, RetryAfter: "30", Message: "untrusted secret"})
 	if !strings.Contains(got, "server error (503)") || !strings.Contains(got, "Retry-After: 30 seconds") || strings.Contains(got, "untrusted") {
 		t.Fatalf("%s", got)
+	}
+}
+
+func TestDiagnosticTextNormalizesBeforeRedacting(t *testing.T) {
+	cfg := cli.Config{}
+	cfg.SetContext("example", cli.Context{Token: "tok_synthetic", RefreshToken: "tok_synthetic_refresh_suffix"})
+	for _, input := range []string{
+		"ht\u200btps://user:password_synthetic@example.invalid/path?token=query_synthetic",
+		"tok_\x1bsynthetic",
+		"tok_synthetic_refresh_suffix",
+	} {
+		got := diagnosticText(cfg, input)
+		for _, forbidden := range []string{"password_synthetic", "query_synthetic", "tok_synthetic", "refresh_suffix", "\x1b", "\u200b"} {
+			if strings.Contains(got, forbidden) {
+				t.Fatalf("%q leaked %q", got, forbidden)
+			}
+		}
 	}
 }

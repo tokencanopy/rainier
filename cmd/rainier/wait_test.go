@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -105,5 +106,39 @@ func TestWaitGuidanceBoundsDiagnosticsAndUnsafeIDs(t *testing.T) {
 	err = initialAttachGuidance(context.Background(), cfg, "sess_bad; touch /tmp/example", 0)
 	if calls != before || strings.Contains(err.Error(), "touch") || !strings.Contains(err.Error(), "rainier ls") {
 		t.Fatalf("unsafe id guidance: %v", err)
+	}
+}
+
+func TestWaitGuidanceRedactsRotatedCredentials(t *testing.T) {
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/auth/refresh":
+			fmt.Fprint(w, `{"access_token":"rotated_access_synthetic","refresh_token":"rotated_refresh_synthetic"}`)
+		case "/v0/sessions/sess_example":
+			if r.Header.Get("Authorization") == "Bearer old_access_synthetic" {
+				w.WriteHeader(401)
+				fmt.Fprint(w, `{"error":{"code":"expired"}}`)
+				return
+			}
+			json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_example", State: "queued", QueueReason: "old_access_synthetic old_refresh_synthetic rotated_access_synthetic rotated_refresh_synthetic"}})
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+	cfg := cli.Config{}
+	cfg.SetContext("example", cli.Context{Server: ts.URL, Token: "old_access_synthetic", RefreshToken: "old_refresh_synthetic", Workspace: "ws_example"})
+	if err := cli.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	err := initialAttachGuidance(context.Background(), cfg, "sess_example", 0)
+	for _, secret := range []string{"old_access_synthetic", "old_refresh_synthetic", "rotated_access_synthetic", "rotated_refresh_synthetic"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("leaked %s: %v", secret, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "rainier attach sess_example") {
+		t.Fatalf("missing recovery %v", err)
 	}
 }

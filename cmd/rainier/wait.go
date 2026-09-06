@@ -50,7 +50,7 @@ func initialAttachGuidance(ctx context.Context, cfg cli.Config, id string, since
 			if row.QueueReason != "" {
 				// Queue text is server-owned prose. Redact known credentials before
 				// stripping terminal controls or truncating it; never render row.Error.
-				explanation += "; server queue reason: " + diagnosticText(cfg, row.QueueReason)
+				explanation += "; server queue reason: " + diagnosticText(cfg, row.QueueReason, c.Token, c.RefreshToken)
 			} else {
 				runners, probeErr := fetchReadinessRunners(ctx, c)
 				if probeErr != nil {

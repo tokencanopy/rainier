@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -49,10 +51,7 @@ func runDoctor(args []string) error {
 func safeTerminal(s string) string {
 	var b strings.Builder
 	n := 0
-	for _, r := range s {
-		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-			continue
-		}
+	for _, r := range stripDiagnosticControls(s) {
 		if n >= 180 {
 			b.WriteString("...")
 			break
@@ -63,28 +62,47 @@ func safeTerminal(s string) string {
 	return b.String()
 }
 
+func stripDiagnosticControls(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 func safeServer(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
 		return "invalid server URL"
 	}
 	// Paths, queries, fragments, and userinfo can all contain credentials.
-	return safeTerminal(u.Scheme + "://" + u.Host)
+	// Final normalization, redaction, and truncation belong to diagnosticText.
+	return u.Scheme + "://" + u.Host
 }
 
 var diagnosticURL = regexp.MustCompile(`(?i)(?:https?|wss?)://[^\s]+`)
 
-func diagnosticText(cfg cli.Config, text string) string {
-	secrets := []string{cfg.Token}
+func diagnosticText(cfg cli.Config, text string, currentTokens ...string) string {
+	// Normalize before matching: otherwise removing a control after redaction
+	// could reconstruct a token or credential-bearing URL in the final output.
+	text = stripDiagnosticControls(text)
+	secrets := append([]string{cfg.Token}, currentTokens...)
 	for _, active := range cfg.Contexts {
 		secrets = append(secrets, active.Token, active.RefreshToken)
 	}
+	for i := range secrets {
+		secrets[i] = stripDiagnosticControls(secrets[i])
+	}
+	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
+	// Remove URL credentials/paths first, even when a short credential happens
+	// to match a URL's scheme. Then redact longest credentials before prefixes.
+	text = diagnosticURL.ReplaceAllStringFunc(text, safeServer)
 	for _, secret := range secrets {
 		if secret != "" {
 			text = strings.ReplaceAll(text, secret, "[redacted]")
 		}
 	}
-	text = diagnosticURL.ReplaceAllStringFunc(text, safeServer)
 	return safeTerminal(text)
 }
 
@@ -99,10 +117,24 @@ type readinessTransport struct{ base http.RoundTripper }
 
 func (t readinessTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(r)
-	if err == nil {
-		resp.Body = http.MaxBytesReader(nil, resp.Body, 1<<20)
+	if err != nil {
+		return resp, err
 	}
-	return resp, err
+	resp.Body = http.MaxBytesReader(nil, resp.Body, 1<<20)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// Readiness requires exactly one bounded JSON document. Keep the shared
+		// client's decoding contract unchanged for other commands and transfers.
+		data, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if !json.Valid(data) {
+			return nil, errMalformedReadiness
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(data))
+	}
+	return resp, nil
 }
 
 func readinessGET(ctx context.Context, c *cli.Client, path string, out any) error {
@@ -117,8 +149,13 @@ func doctorReport(ctx context.Context, cfg cli.Config, w io.Writer) error {
 	ctx, cancel := context.WithTimeout(ctx, doctorTimeout)
 	defer cancel()
 	active, ok := cfg.Active()
+	var currentClient *cli.Client
 	report := func(level, check, message string) {
-		fmt.Fprintf(w, "%s %s: %s\n", level, check, diagnosticText(cfg, message))
+		var currentTokens []string
+		if currentClient != nil {
+			currentTokens = []string{currentClient.Token, currentClient.RefreshToken}
+		}
+		fmt.Fprintf(w, "%s %s: %s\n", level, check, diagnosticText(cfg, message, currentTokens...))
 	}
 	if !ok || active.Token == "" || active.Server == "" {
 		report("FAIL", "config", "no active login; run rainier login with your server URL (rainier help login)")
@@ -140,6 +177,7 @@ func doctorReport(ctx context.Context, cfg cli.Config, w io.Writer) error {
 		report("PASS", "workspace", "self-hosted context; server determines scope")
 	}
 	c := cli.NewClient(cfg)
+	currentClient = c
 	c.HTTP = readinessHTTP()
 	var me struct {
 		User userView `json:"user"`
@@ -177,6 +215,14 @@ func doctorReport(ctx context.Context, cfg cli.Config, w io.Writer) error {
 	if err == nil && envs.Environments == nil {
 		err = errMalformedReadiness
 	}
+	if err == nil {
+		for _, env := range envs.Environments {
+			if env.ID == "" || env.Name == "" || env.Image == "" {
+				err = errMalformedReadiness
+				break
+			}
+		}
+	}
 	if err != nil {
 		report("WARN", "environments", readinessError(err))
 		incomplete = true
@@ -186,7 +232,7 @@ func doctorReport(ctx context.Context, cfg cli.Config, w io.Writer) error {
 	} else {
 		report("PASS", "environments", fmt.Sprintf("%d available; inspect with rainier env ls and rainier env show <name>", len(envs.Environments)))
 	}
-	if readinessAuthFailure(err) {
+	if errors.Is(err, cli.ErrLoginAgain) || isHTTPStatus(err, 401) {
 		report("FAIL", "authentication", "environment access rejected; check your login/workspace with the administrator")
 		return errDoctorFailed
 	}
@@ -197,6 +243,10 @@ func doctorReport(ctx context.Context, cfg cli.Config, w io.Writer) error {
 	}
 	loggedIn := 0
 	for _, a := range agents.Agents {
+		if a.Provider == "" || (a.Status != "logged_in" && a.Status != "none") {
+			err = errMalformedReadiness
+			break
+		}
 		if a.Status == "logged_in" {
 			loggedIn++
 		}
