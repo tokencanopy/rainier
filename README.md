@@ -67,8 +67,10 @@ for either installation method and for diagnosing a waiting session.
 `rainier --help` gives a compact command overview; `rainier help <command>`
 and `<command> --help` give details. `rainier help all` retains the full guide.
 `rainier version` (or `--version`) reports the build version. Source checkouts
-report `dev` with available revision metadata; release builds can supply the
-actual release tag, for example:
+report `dev`; `make build` stamps the actual source worktree's revision and dirty
+status through `scripts/build.sh`. Direct, unstamped `go build` and source archives
+report plain `dev` rather than trusting potentially incorrect enclosing-repository
+metadata. Release builds can supply the actual release tag, for example:
 
 ```bash
 # Replace vX.Y.Z with the release being built; this does not publish anything.

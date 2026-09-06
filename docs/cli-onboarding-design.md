@@ -11,7 +11,12 @@ without changing session lifecycle or adding provisioning.
 
 Keep stdlib flags and existing CLI/client boundaries. Add command help and version
 dispatch before any config or network access; rehome the existing manual details.
-Use `runtime/debug` build information and an optional linker-injected version.
+`make build` uses `scripts/build.sh` to stamp the actual source worktree's revision
+and dirty status. It disables automatic Go VCS stamping: on the supported local
+toolchain that discovery can identify the enclosing checkout instead of a nested
+worktree. Direct unstamped builds and source archives report plain `dev`. Explicit
+linker-injected release versions take precedence. A synthetic nested-worktree
+build regression checks clean/dirty attribution and the source-archive fallback.
 
 `doctor` loads only the active config, then uses `cli.NewClient` and `DoContext`
 against existing `/v0/me`, `/v0/runners`, `/v0/environments`, and `/v0/agents`.

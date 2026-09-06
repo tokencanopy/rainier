@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"runtime/debug"
 	"strings"
 )
 
@@ -11,32 +10,23 @@ import (
 // Source builds must never impersonate a published release.
 var version string
 
+// scripts/build.sh supplies these from the source worktree. Go's automatic
+// VCS discovery can instead identify an enclosing checkout for nested worktrees.
+var sourceRevision, sourceDirty string
+
 func buildVersion() string {
 	if version != "" {
 		return version
 	}
-	if info, ok := debug.ReadBuildInfo(); ok {
-		revision, dirty := "", false
-		for _, setting := range info.Settings {
-			if setting.Key == "vcs.revision" {
-				revision = setting.Value
-			}
-			if setting.Key == "vcs.modified" {
-				dirty = setting.Value == "true"
-			}
+	if sourceRevision != "" {
+		revision := sourceRevision
+		if len(revision) > 12 {
+			revision = revision[:12]
 		}
-		if revision != "" {
-			if len(revision) > 12 {
-				revision = revision[:12]
-			}
-			if dirty {
-				revision += ", modified"
-			}
-			return "dev (" + revision + ")"
+		if sourceDirty == "true" {
+			revision += ", modified"
 		}
-		if info.Main.Version != "" && info.Main.Version != "(devel)" {
-			return info.Main.Version
-		}
+		return "dev (" + revision + ")"
 	}
 	return "dev"
 }
