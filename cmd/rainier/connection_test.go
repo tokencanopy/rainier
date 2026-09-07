@@ -33,6 +33,8 @@ type connectionServer struct {
 	// the window a second client's PATCH lands in. It is how the lost-update
 	// test reproduces a race deterministically instead of hoping for one.
 	afterGet func()
+	// afterPatch simulates a concurrent edit before the response is read.
+	afterPatch func()
 	// patchHeaders records the headers of every PATCH, so a test can assert
 	// what precondition the client was able to send — today, none.
 	patchHeaders []http.Header
@@ -80,6 +82,9 @@ func (s *connectionServer) start() *httptest.Server {
 				next = append(next, v.(string))
 			}
 			s.connection.Workspaces = next
+			if s.afterPatch != nil {
+				s.afterPatch()
+			}
 			if err := json.NewEncoder(w).Encode(*s.connection); err != nil {
 				s.t.Errorf("encode connection: %v", err)
 			}
@@ -616,10 +621,9 @@ func TestConnectionShareAcceptsTheFlagBeforeTheProvider(t *testing.T) {
 // selection outright, and the API offers no precondition to make the write
 // conditional on the snapshot still being current.
 //
-// These two tests pin that, so the limitation stays a documented fact rather
-// than an assumption. If the hosted API ever grows an ETag, a revision field,
-// or an If-Match, the second test fails and this file is where the CLI gets
-// taught to send it.
+// These stub tests record the current client behavior, not the hosted server
+// contract. Adding a validator to the real API will not make them fail; that
+// change needs server contract tests and corresponding client support.
 
 // A workspace another client shares while our share is in flight is dropped by
 // our PATCH. This is a real lost update, not a theoretical one — and the point
@@ -656,10 +660,9 @@ func TestConnectionShareLosesAConcurrentUpdate(t *testing.T) {
 	}
 }
 
-// The API exposes nothing a client could use to make the write conditional.
-// If this ever fails, the connect surface grew a precondition and share/unshare
-// should start sending it.
-func TestConnectionPatchCarriesNoPreconditionBecauseNoneExists(t *testing.T) {
+// With a validator-free stub response, the client sends only a workspace
+// replacement. This test makes no assertion about the real server contract.
+func TestConnectionPatchRequestShapeWithoutValidator(t *testing.T) {
 	srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{
 		Provider: "github", Login: "octocat", AccessMode: "selected",
 		Workspaces: []string{}, CreatedAt: "2026-09-01T00:00:00Z",
@@ -677,12 +680,10 @@ func TestConnectionPatchCarriesNoPreconditionBecauseNoneExists(t *testing.T) {
 	// Asserting the absence keeps the limitation visible in the test suite.
 	for _, header := range []string{"If-Match", "If-Unmodified-Since", "If-None-Match"} {
 		if v := srv.patchHeaders[0].Get(header); v != "" {
-			t.Errorf("PATCH carried %s: %q — if the API now supports it, update "+
-				"TestConnectionShareLosesAConcurrentUpdate too", header, v)
+			t.Errorf("PATCH unexpectedly carried %s: %q", header, v)
 		}
 	}
-	// And the wire shape a client would have to read a validator from carries
-	// no version, revision, or etag field.
+	// The outgoing body contains only the workspace replacement.
 	for _, field := range []string{"version", "revision", "etag", "updated_at"} {
 		if _, ok := srv.patched[0][field]; ok {
 			t.Errorf("PATCH body carried a %q precondition field", field)
@@ -702,9 +703,9 @@ func TestConnectionPatchCarriesNoPreconditionBecauseNoneExists(t *testing.T) {
 // tests hold that line, since the failure mode — a share silently reverting
 // another terminal's login or workspace switch — is invisible until it bites.
 
-// A connection command leaves the config file byte-identical. Nothing it does
-// is a config edit, so nothing it does may land in that file.
-func TestConnectionCommandsDoNotWriteConfig(t *testing.T) {
+// With valid access tokens, these commands leave config byte-identical.
+// Authentication recovery may legitimately persist rotated tokens via Client.
+func TestConnectionCommandsWithValidTokensDoNotWriteConfig(t *testing.T) {
 	srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{
 		Provider: "github", Login: "octocat", AccessMode: "selected",
 		Workspaces: []string{"ws_other"}, CreatedAt: "2026-09-01T00:00:00Z",
@@ -783,5 +784,62 @@ func TestConnectionShareDoesNotRevertASiblingsNewerLogin(t *testing.T) {
 	// against, not the one the sibling moved to mid-flight.
 	if got := workspaceSet(t, srv.patched[0]); !equalSets(got, []string{"ws_dogfood"}) {
 		t.Errorf("PATCH workspaces = %v, want [ws_dogfood]", got)
+	}
+}
+
+func TestConnectionUnshareAfterLeavingWorkspace(t *testing.T) {
+	for _, memberships := range []string{`{"workspaces":[]}`, twoWorkspaces} {
+		t.Run(memberships, func(t *testing.T) {
+			srv := &connectionServer{t: t, workspaces: memberships, connection: &connectionView{
+				Provider: "github", Login: "octocat", AccessMode: "selected",
+				Workspaces: []string{"ws_left", "ws_other"},
+			}}
+			ts := srv.start()
+			hostedContext(t, ts.URL, "ws_left")
+			_, err := captureStdout(t, func() error { return runConnectionShare([]string{"github", "--workspace", "ws_left"}, false) })
+			if err != nil {
+				t.Fatalf("unshare after leaving: %v", err)
+			}
+			if !equalSets(srv.connection.Workspaces, []string{"ws_other"}) {
+				t.Fatalf("selection = %v, want [ws_other]", srv.connection.Workspaces)
+			}
+		})
+	}
+}
+
+func TestConnectionEditChecksConfirmedState(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		add        bool
+		mode       string
+		workspaces []string
+	}{
+		{"unshare switched to all", false, "all", []string{"ws_other"}},
+		{"unshare restored concurrently", false, "selected", []string{"ws_dogfood", "ws_other"}},
+		{"share removed concurrently", true, "selected", []string{"ws_other"}},
+		{"unknown response mode", false, "future", []string{"ws_other"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			current := []string{"ws_dogfood", "ws_other"}
+			if tc.add {
+				current = []string{"ws_other"}
+			}
+			srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{
+				Provider: "github", Login: "octocat", AccessMode: "selected", Workspaces: current,
+			}}
+			srv.afterPatch = func() { srv.connection.AccessMode = tc.mode; srv.connection.Workspaces = tc.workspaces }
+			ts := srv.start()
+			hostedContext(t, ts.URL, "ws_dogfood")
+			out, err := captureStdout(t, func() error { return runConnectionShare([]string{"github"}, tc.add) })
+			if err == nil {
+				t.Fatalf("reported success for unconfirmed edit: %s", out)
+			}
+			if !strings.Contains(err.Error(), "rainier connection ls") {
+				t.Errorf("missing recovery guidance: %v", err)
+			}
+			if strings.Contains(out, "stopped ") || strings.Contains(out, "shared your ") {
+				t.Errorf("false success: %s", out)
+			}
+		})
 	}
 }

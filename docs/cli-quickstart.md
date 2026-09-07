@@ -71,17 +71,20 @@ rainier connection share github     # let your current workspace use it
 ```
 
 `share` and `unshare` change only the workspace you name — your current one,
-or `--workspace <id>` for another you belong to — keeping the other workspaces
-the connection reached when the command read it. Neither changes the access
+or `--workspace <id>` — keeping the other workspaces the connection reached
+when the command read it. Neither changes the access
 mode, so neither can widen the connection to all your workspaces. Neither
-prints a credential: on this side the CLI never has one. Use `rainier help
-connection` for the rest.
+prints a GitHub credential: on this side the CLI never has one. Sharing requires
+current membership; unsharing can remove a saved grant after you leave its
+workspace. Use `rainier help connection` for the rest.
 
 The API replaces the connection's whole workspace list rather than adding to
 it, and offers no conditional write, so the CLI reads the list and sends back
-an edited copy. A change another client makes in between is overwritten. This
-only arises if you edit one connection from two places at once; the workspace
-list each command prints is the one the server confirmed.
+an edited copy. A change another client makes in between is overwritten,
+including restoring a grant they removed. Avoid concurrent edits of the same connection. The CLI
+checks the returned access mode and selection before reporting success, but
+that response is still a snapshot. If it does not confirm the requested change,
+the command fails and asks you to inspect `rainier connection ls`.
 
 ## Choose an environment and sign in to your coding agent
 

@@ -46,14 +46,14 @@ import (
 // surface offers no way to close that window — GET returns no ETag, the
 // connection carries no version or revision, the wire body has no field to
 // echo back, and SetWorkspaces takes no expected-version argument — so this is
-// a property of the API, not a shortcut taken here. Two regression tests in
-// connection_test.go pin both halves; if a precondition ever appears, they are
-// where the CLI learns to send it.
+// a property of the API, not a shortcut taken here. The stub tests in
+// connection_test.go record the client behavior; they do not detect changes
+// to the hosted API contract.
 //
 // Single-developer dogfood is the setting this ships into, where two
 // simultaneous edits of one person's own connection are not a realistic
-// concern. The commands therefore print the selection the server came back
-// with rather than reporting a delta they cannot vouch for.
+// concern. The commands check the returned mode and selection before reporting
+// success. That response is still a snapshot, not a concurrency guarantee.
 
 const connectionUsage = `usage: rainier connection <ls|share|unshare> [args]
 
@@ -67,15 +67,16 @@ starts shared with nothing, so sessions cannot clone or push until you share
 it with the workspace they run in.
 
 --workspace defaults to your current workspace ("rainier workspace use" picks
-it). Sharing and unsharing change only the workspace you name, keeping the
-other workspaces the connection reached when the command read it. Neither
+it). Sharing requires current membership; unsharing also lets you remove a
+saved grant after leaving a workspace. Both keep the other workspaces the
+connection reached when the command read it. Neither
 command changes the access mode, and neither prints a credential — the CLI
 never sees one.
 
 The change is read-then-replace: this API has no add or remove verb and no
 conditional write, so a change made by another client in between is
-overwritten. Editing one connection from two places at once is the only way to
-hit that; the printed workspace list is what the server confirmed.`
+overwritten, including restoring a grant another client removed. Avoid editing
+one connection from two places at once; the printed list is a server snapshot.`
 
 // connectionProviders is the set of providers a connection command will act
 // on. It is a list rather than a constant because the API is a list for the
@@ -263,6 +264,10 @@ func runConnectionShare(args []string, add bool) error {
 			provider, provider, provider)
 	}
 
+	if connection.AccessMode != accessSelected {
+		return fmt.Errorf("connection %s: unsupported access mode %q; inspect it with `rainier connection ls`", verb, connection.AccessMode)
+	}
+
 	next, changed := applyWorkspaceSelection(connection.Workspaces, target.ID, add)
 	if !changed {
 		if add {
@@ -285,10 +290,16 @@ func runConnectionShare(args []string, add bool) error {
 		return connectionError(err, provider, verb, cfg)
 	}
 
+	// The server can observe another edit before it constructs this response.
+	// Never report an effective access change contradicted by that snapshot.
+	if updated.AccessMode != accessSelected || slices.Contains(updated.Workspaces, target.ID) != add {
+		return fmt.Errorf("connection %s: the server response did not confirm the requested access for %s (access mode: %s). The selection may have changed concurrently; inspect it with `rainier connection ls` before trying again", verb, target.ID, updated.AccessMode)
+	}
+
 	if add {
-		fmt.Printf("shared your %s connection (%s) with %s\n", provider, connection.Login, describeWorkspace(target))
+		fmt.Printf("shared your %s connection (%s) with %s\n", provider, updated.Login, describeWorkspace(target))
 	} else {
-		fmt.Printf("stopped %s using your %s connection (%s)\n", describeWorkspace(target), provider, connection.Login)
+		fmt.Printf("removed %s from your %s connection (%s) workspace selection\n", describeWorkspace(target), provider, updated.Login)
 	}
 	fmt.Printf("workspaces now: %s\n", dashIfEmpty(strings.Join(updated.Workspaces, ", ")))
 	return nil
@@ -318,7 +329,8 @@ func applyWorkspaceSelection(current []string, id string, add bool) ([]string, b
 }
 
 // resolveConnectionWorkspace decides which workspace the command acts on and
-// proves the caller is in it.
+// requires membership for additions. Removals may target a workspace the
+// caller has left: the personal connection is still theirs to narrow.
 //
 // Selecting a workspace is intent, not authorization — the broker re-checks
 // membership at every delivery — so the server would accept an id the person
@@ -341,6 +353,10 @@ func resolveConnectionWorkspace(c *cli.Client, currentWorkspace, requested, verb
 	}
 	if i := slices.IndexFunc(spaces, func(w workspaceView) bool { return w.ID == id }); i >= 0 {
 		return spaces[i], nil
+	}
+
+	if verb == "unshare" {
+		return workspaceView{ID: id}, nil
 	}
 
 	ids := make([]string, 0, len(spaces))
