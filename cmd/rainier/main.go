@@ -1216,7 +1216,8 @@ func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(t
 			if time.Since(attemptStarted) >= 10*time.Second {
 				backoff = 100 * time.Millisecond
 			}
-			fmt.Printf("[reconnecting in %s…]\n", backoff)
+			// The remote app still owns the screen and cursor. Local status
+			// text here would corrupt its next cursor-relative output frame.
 			wait(backoff)
 			backoff = nextAttachBackoff(backoff)
 			continue
@@ -1241,7 +1242,6 @@ func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(t
 			if !retryableAttachError(err) {
 				return err
 			}
-			fmt.Printf("[reconnecting in %s…]\n", backoff)
 			wait(backoff)
 			backoff = nextAttachBackoff(backoff)
 			continue

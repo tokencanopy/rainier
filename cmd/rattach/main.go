@@ -36,6 +36,9 @@ func main() {
 		log.Fatal(err)
 	}
 	if outcome.Reason == attachio.Disconnected {
+		// Unlike the product CLI, this one-shot client is handing the
+		// terminal back rather than resuming the remote application's screen.
+		fmt.Printf("\r\n[connection lost at seq %d]\r\n", outcome.LastSeq)
 		fmt.Printf("[rattach --since %d to resume]\n", outcome.LastSeq)
 	}
 }

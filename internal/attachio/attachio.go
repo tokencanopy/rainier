@@ -1,9 +1,11 @@
-// Package attachio is the raw-mode terminal attach loop, extracted verbatim
+// Package attachio is the raw-mode terminal attach loop, extracted
 // from cmd/rattach: raw mode (tty stdin only), SIGWINCH-driven resize,
 // Ctrl-] detach, and sequence-number tracking for --since resume. It is the
 // one place that contract lives, so cmd/rattach and cmd/rainier's `attach`
-// (and `new`'s auto-attach) share identical behavior — same status lines,
-// same resize-first handshake, same detach key.
+// (and `new`'s auto-attach) share the same resize-first handshake, detach key,
+// and final detach/exit messages. A reconnectable disconnect returns its
+// cursor silently: only the caller knows whether the terminal is being handed
+// back to a shell or must remain untouched for cursor-relative replay.
 //
 // Restructuring note: rattach's original loop called os.Exit(0) from its
 // reader goroutine the instant the connection dropped or the session
@@ -11,9 +13,8 @@
 // a library. Run below never exits the process: it returns nil on a clean
 // detach/disconnect/session-exit (the same three cases rattach used to
 // os.Exit(0) on) and a non-nil error otherwise (dial failure, raw-mode
-// setup failure). The printed status lines and their exact text are
-// unchanged; only how the loop hands control back changed. This is the one
-// intentional internal restructuring the extraction makes.
+// setup failure). Final detach/exit messages retain their original text;
+// disconnect diagnostics belong to the one-shot caller, not the live stream.
 package attachio
 
 import (
@@ -196,17 +197,16 @@ func RestoreTerminal(stdin, stdout *os.File) error {
 // was accepted and never used. One place decides now, and it is the place
 // that dials.
 //
-// It prints the exact status lines rattach always has:
+// It prints final terminal-handoff status lines:
 //
 //	"\r\n[detached at seq %d; session still running]\r\n"
-//	"\r\n[connection lost at seq %d]\r\n"
 //	"\r\n[session process exited: %d]\r\n"
 //
 // Raw mode is entered only when os.Stdin is a real tty; a non-tty stdin
 // (piped input, a test) skips raw mode entirely and announces a fixed
 // 80x24 size so the server's resize-first contract is still satisfied.
 //
-// Run returns an explicit Outcome for all three status lines above and a
+// Run returns an explicit Outcome for detach, disconnect, and process exit, and a
 // non-nil error for anything that keeps the loop from starting (the dial or
 // putting the terminal in raw mode). It stops every stdin/stdout goroutine
 // before returning, so a caller may safely start another Run after a
@@ -354,7 +354,6 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 				stdoutMu.Lock()
 				restore()
 				seq := lastSeq.Load()
-				fmt.Fprintf(stdout, "\r\n[connection lost at seq %d]\r\n", seq)
 				stdoutMu.Unlock()
 				finish(Outcome{Reason: Disconnected, LastSeq: seq}, nil)
 				return

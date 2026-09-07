@@ -1470,10 +1470,9 @@ func TestAttachWithRetryReconnectsFromTheRenderedCursor(t *testing.T) {
 	if !slices.Equal(resumedQueries, []string{"17", "17"}) {
 		t.Fatalf("reconnect cursors = %v, want [17 17]", resumedQueries)
 	}
-	for _, want := range []string{"before-drop", "after-drop", "reconnecting"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("attach output missing %q:\n%s", want, out)
-		}
+	const wantOutput = "before-dropafter-drop\r\n[session process exited: 0]\r\n"
+	if out != wantOutput {
+		t.Errorf("attach output = %q, want uninterrupted remote bytes and final exit %q", out, wantOutput)
 	}
 }
 
