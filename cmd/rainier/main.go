@@ -124,6 +124,7 @@ commands:
   pull     <id|name>:<path> <local-dir>
   creds
   connection ls | share <provider> [--workspace ID] | unshare <provider> [--workspace ID]
+             | reconnect <provider>
   agent    login <provider> --env NAME | ls | logout <provider> [--yes]
   secret   set <NAME> [--value V] | ls | rm <NAME>
   env      create <name> [flags] | ls | show <ref> | update <ref> [flags] | rm <ref>
@@ -160,7 +161,9 @@ reaches; a new connection reaches none of them, so
   rainier connection share github
 
 lets your current workspace use it and "connection unshare github" removes
-that workspace from the selection. Unsharing also works after you leave a
+that workspace from the selection. "connection reconnect github" replaces the
+browser authorization and restores the previous access mode and workspace
+selection after it succeeds. Unsharing also works after you leave a
 workspace; sharing requires current membership. Both change only the workspace
 you name, keeping the others the connection reached when the command read it, and neither ever prints a
 credential: the CLI never has one to print. The API replaces the whole
@@ -735,7 +738,7 @@ type workspacesEnvelope struct {
 }
 
 func runCloudLogin(edgeURL, deviceName, contextName string) error {
-	return runCloudLoginSleep(edgeURL, deviceName, contextName, time.Sleep)
+	return runCloudLoginContext(context.Background(), edgeURL, deviceName, contextName, nil)
 }
 
 // runCloudLoginSleep is runCloudLogin with the wait between polls injected,
@@ -743,6 +746,14 @@ func runCloudLogin(edgeURL, deviceName, contextName string) error {
 // interval — is exactly what a test needs to pin, and it must not cost the
 // test the real seconds.
 func runCloudLoginSleep(edgeURL, deviceName, contextName string, sleep func(time.Duration)) error {
+	return runCloudLoginContext(context.Background(), edgeURL, deviceName, contextName, sleep)
+}
+
+// runCloudLoginContext is the hosted browser login bound to its caller's
+// lifetime. Reconnect uses it after a terminal DELETE, so an interrupt must
+// return through reconnect's stage-aware recovery instead of stranding the
+// command inside an uncancelable poll.
+func runCloudLoginContext(ctx context.Context, edgeURL, deviceName, contextName string, sleep func(time.Duration)) error {
 	base := strings.TrimRight(edgeURL, "/")
 	u, err := url.Parse(base)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
@@ -759,7 +770,7 @@ func runCloudLoginSleep(edgeURL, deviceName, contextName string, sleep func(time
 	}
 
 	var attempt loginAttempt
-	if _, err := edgePost(base+"/v0/auth/login-attempts",
+	if _, err := edgePostContext(ctx, base+"/v0/auth/login-attempts",
 		map[string]string{"device_name": deviceName}, &attempt); err != nil {
 		return fmt.Errorf("starting the login: %w", err)
 	}
@@ -772,12 +783,12 @@ func runCloudLoginSleep(edgeURL, deviceName, contextName string, sleep func(time
 	openBrowser(browseURL)
 	fmt.Println("Waiting for the browser…")
 
-	pair, err := pollLoginAttempt(base, attempt, sleep)
+	pair, err := pollLoginAttemptContext(ctx, base, attempt, sleep)
 	if err != nil {
 		return err
 	}
 
-	if err := cli.UpdateConfig(func(cfg *cli.Config) error {
+	if err := cli.UpdateConfigContext(ctx, func(cfg *cli.Config) error {
 		ctx := cfg.Contexts[contextName]
 		ctx.Server, ctx.Token = base, pair.AccessToken
 		ctx.RefreshToken, ctx.AccessExpiresAt = pair.RefreshToken, pair.AccessExpiresAt
@@ -788,7 +799,7 @@ func runCloudLoginSleep(edgeURL, deviceName, contextName string, sleep func(time
 	}
 	fmt.Printf("logged in to %s (context %s)\n", u.Host, contextName)
 
-	return selectWorkspace(contextName)
+	return selectWorkspaceContext(ctx, contextName)
 }
 
 // selectWorkspace finishes a hosted login: one workspace is the answer and
@@ -796,11 +807,18 @@ func runCloudLoginSleep(edgeURL, deviceName, contextName string, sleep func(time
 // from, because picking for them would silently attach every later command to
 // the wrong team; none is said plainly, since the next step is in the browser.
 func selectWorkspace(contextName string) error {
+	return selectWorkspaceContext(context.Background(), contextName)
+}
+
+func selectWorkspaceContext(ctx context.Context, contextName string) error {
 	cfg, err := cli.Load()
 	if err != nil {
 		return err
 	}
-	spaces, err := listWorkspaces(cli.NewClient(cfg))
+	if !cfg.Use(contextName) {
+		return cli.ErrLoginAgain
+	}
+	spaces, err := listWorkspacesContext(ctx, cli.NewClient(cfg))
 	if err != nil {
 		return fmt.Errorf("listing workspaces: %w", err)
 	}
@@ -809,7 +827,7 @@ func selectWorkspace(contextName string) error {
 		fmt.Println("no workspaces yet — create one in the browser, then run `rainier workspace use <id>`")
 		return nil
 	case 1:
-		return setWorkspace(contextName, spaces[0])
+		return setWorkspaceContext(ctx, contextName, spaces[0])
 	default:
 		fmt.Println("workspaces:")
 		printWorkspaces(spaces)
@@ -823,7 +841,11 @@ func selectWorkspace(contextName string) error {
 // writing back a copy loaded before that would strand the context on a
 // refresh token the edge has already spent.
 func setWorkspace(contextName string, w workspaceView) error {
-	if err := cli.UpdateConfig(func(cfg *cli.Config) error {
+	return setWorkspaceContext(context.Background(), contextName, w)
+}
+
+func setWorkspaceContext(ctx context.Context, contextName string, w workspaceView) error {
+	if err := cli.UpdateConfigContext(ctx, func(cfg *cli.Config) error {
 		ctx, ok := cfg.Contexts[contextName]
 		if !ok {
 			return cli.ErrLoginAgain
@@ -839,12 +861,19 @@ func setWorkspace(contextName string, w workspaceView) error {
 }
 
 func listWorkspaces(c *cli.Client) ([]workspaceView, error) {
+	return listWorkspacesContext(context.Background(), c)
+}
+
+func listWorkspacesContext(ctx context.Context, c *cli.Client) ([]workspaceView, error) {
 	var spaces []workspaceView
 	path := "/v0/workspaces"
 	seen := map[string]bool{}
 	for {
 		var resp workspacesEnvelope
-		if err := c.Do(http.MethodGet, path, nil, &resp); err != nil {
+		requestCtx, cancel := context.WithTimeout(ctx, edgeRequestTimeout)
+		err := c.DoContext(requestCtx, http.MethodGet, path, nil, &resp)
+		cancel()
+		if err != nil {
 			return nil, err
 		}
 		spaces = append(spaces, resp.Workspaces...)
@@ -872,6 +901,10 @@ func printWorkspaces(spaces []workspaceView) {
 // means the human is still working; 200 carries the token pair; 410 means the
 // attempt lapsed, which is also what the deadline means locally.
 func pollLoginAttempt(base string, attempt loginAttempt, sleep func(time.Duration)) (cli.TokenPair, error) {
+	return pollLoginAttemptContext(context.Background(), base, attempt, sleep)
+}
+
+func pollLoginAttemptContext(ctx context.Context, base string, attempt loginAttempt, sleep func(time.Duration)) (cli.TokenPair, error) {
 	interval := time.Duration(attempt.PollIntervalSeconds) * time.Second
 	interval = min(max(interval, minPollInterval), maxPollInterval)
 	deadline := time.Now().Add(loginAttemptFallbackTTL)
@@ -883,7 +916,7 @@ func pollLoginAttempt(base string, attempt loginAttempt, sleep func(time.Duratio
 	body := map[string]string{"poll_token": attempt.PollToken}
 	for {
 		var pair cli.TokenPair
-		status, err := edgePost(path, body, &pair)
+		status, err := edgePostContext(ctx, path, body, &pair)
 		switch {
 		case err == nil && status == http.StatusOK && pair.AccessToken != "":
 			return pair, nil
@@ -899,7 +932,20 @@ func pollLoginAttempt(base string, attempt loginAttempt, sleep func(time.Duratio
 		if !time.Now().Before(deadline) {
 			return cli.TokenPair{}, errLoginExpired(base)
 		}
-		sleep(interval)
+		if sleep != nil {
+			sleep(interval)
+			if err := ctx.Err(); err != nil {
+				return cli.TokenPair{}, err
+			}
+		} else {
+			timer := time.NewTimer(interval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return cli.TokenPair{}, ctx.Err()
+			case <-timer.C:
+			}
+		}
 	}
 }
 
@@ -913,7 +959,11 @@ func errLoginExpired(base string) error {
 // as the API's error envelope, so a 410 arrives as a *cli.APIError the caller
 // can recognize without reading prose.
 func edgePost(fullURL string, in, out any) (int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), edgeRequestTimeout)
+	return edgePostContext(context.Background(), fullURL, in, out)
+}
+
+func edgePostContext(parent context.Context, fullURL string, in, out any) (int, error) {
+	ctx, cancel := context.WithTimeout(parent, edgeRequestTimeout)
 	defer cancel()
 
 	b, err := json.Marshal(in)

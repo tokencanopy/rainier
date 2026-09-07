@@ -219,10 +219,17 @@ func Save(c Config) error {
 // The callback must not perform network I/O or call Save/UpdateConfig. An edit
 // error leaves the file unchanged; successful writes replace it atomically.
 func UpdateConfig(edit func(*Config) error) error {
+	return UpdateConfigContext(context.Background(), edit)
+}
+
+// UpdateConfigContext is UpdateConfig with cancellation covering the config
+// lock. Browser-backed commands use it so an interrupt cannot leave the CLI
+// waiting forever behind another process that owns the lock.
+func UpdateConfigContext(ctx context.Context, edit func(*Config) error) error {
 	if err := prepareConfigDir(); err != nil {
 		return err
 	}
-	return withConfigLock(context.Background(), func() error {
+	return withConfigLock(ctx, func() error {
 		c, err := Load()
 		if err != nil {
 			return err
