@@ -6,15 +6,12 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,25 +23,8 @@ import (
 const doctorTimeout = 15 * time.Second
 const readinessRequestTimeout = 4 * time.Second
 
-var errDoctorFailed = errors.New("basic session readiness failed; follow the actions above, then run rainier doctor")
+var errDoctorFailed = errors.New("basic session readiness failed; follow the actions above, then run rainier status")
 var errMalformedReadiness = errors.New("malformed readiness response")
-
-func runDoctor(args []string) error {
-	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
-	fs.Parse(args)
-	if fs.NArg() != 0 {
-		fmt.Fprintln(os.Stderr, "usage: rainier doctor")
-		os.Exit(2)
-	}
-	cfg, err := cli.Load()
-	if err != nil {
-		fmt.Fprintln(os.Stdout, "FAIL config: cannot read config; repair the config file or run rainier login with your server URL")
-		return errDoctorFailed
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), doctorTimeout)
-	defer cancel()
-	return doctorReport(ctx, cfg, os.Stdout)
-}
 
 // safeTerminal is intentionally bounded and removes terminal controls and bidi
 // formatting. Callers must still avoid passing credentials or raw response bodies.
@@ -91,19 +71,12 @@ func diagnosticText(cfg cli.Config, text string, currentTokens ...string) string
 	for _, active := range cfg.Contexts {
 		secrets = append(secrets, active.Token, active.RefreshToken)
 	}
-	for i := range secrets {
-		secrets[i] = stripDiagnosticControls(secrets[i])
-	}
-	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
 	// Remove URL credentials/paths first, even when a short credential happens
-	// to match a URL's scheme. Then redact longest credentials before prefixes.
+	// to match a URL's scheme. redactAll then does the credentials in one pass:
+	// a loop of ReplaceAll can match a later secret inside the marker an
+	// earlier one just wrote, which nests markers instead of redacting.
 	text = diagnosticURL.ReplaceAllStringFunc(text, safeServer)
-	for _, secret := range secrets {
-		if secret != "" {
-			text = strings.ReplaceAll(text, secret, "[redacted]")
-		}
-	}
-	return safeTerminal(text)
+	return safeTerminal(redactAll(text, secrets))
 }
 
 // readinessHTTP bounds response size without changing shared client decoding or
@@ -255,10 +228,10 @@ func doctorReport(ctx context.Context, cfg cli.Config, w io.Writer) error {
 		report("WARN", "agents", readinessError(err))
 		incomplete = true
 	} else if loggedIn == 0 {
-		report("WARN", "agents", "no agent login stored; run rainier agent ls, then rainier agent login <provider> --env <name>")
+		report("WARN", "agents", "no agent login stored; run rainier agent status, then rainier agent login <provider>")
 		incomplete = true
 	} else {
-		report("PASS", "agents", fmt.Sprintf("%d stored login(s); provider validity and installed CLI are not checked (rainier agent ls)", loggedIn))
+		report("PASS", "agents", fmt.Sprintf("%d stored login(s); provider validity and installed CLI are not checked (rainier agent status)", loggedIn))
 	}
 	// Optional route permission/absence does not invalidate basic shell sessions.
 	if errors.Is(err, cli.ErrLoginAgain) || isHTTPStatus(err, 401) {
@@ -334,10 +307,10 @@ func readinessError(err error) string {
 		return "authentication rejected; log in again (rainier help login)"
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		return "timeout; check server connectivity and rerun rainier doctor"
+		return "timeout; check server connectivity and rerun rainier status"
 	}
 	if errors.Is(err, context.Canceled) {
-		return "request cancelled; rerun rainier doctor when ready"
+		return "request cancelled; rerun rainier status when ready"
 	}
 	var api *cli.APIError
 	if errors.As(err, &api) {
@@ -373,7 +346,7 @@ func readinessError(err error) string {
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
-		return "timeout; check server connectivity and rerun rainier doctor"
+		return "timeout; check server connectivity and rerun rainier status"
 	}
 	var syntax *json.SyntaxError
 	var field *json.UnmarshalTypeError
