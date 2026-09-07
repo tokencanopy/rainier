@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tokencanopy/rainier/internal/cli"
 )
@@ -26,6 +28,8 @@ type connectionServer struct {
 
 	// patched is every PATCH body received, in order.
 	patched []map[string]any
+	// deleted counts terminal connection revocations.
+	deleted int
 	// status, when set, is returned for PATCH instead of applying it.
 	status int
 	// listStatus, when set, is returned for GET /v0/connections.
@@ -87,12 +91,24 @@ func (s *connectionServer) start() *httptest.Server {
 				next = append(next, v.(string))
 			}
 			s.connection.Workspaces = next
+			if mode, ok := body["access_mode"].(string); ok {
+				s.connection.AccessMode = mode
+			}
 			if s.afterPatch != nil {
 				s.afterPatch()
 			}
 			if err := json.NewEncoder(w).Encode(*s.connection); err != nil {
 				s.t.Errorf("encode connection: %v", err)
 			}
+		case r.URL.Path == "/v0/connections/github" && r.Method == http.MethodDelete:
+			if s.connection == nil {
+				w.WriteHeader(http.StatusNotFound)
+				io.WriteString(w, `{"error":{"code":"not_found","message":"resource not found"}}`)
+				return
+			}
+			s.deleted++
+			s.connection = nil
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 			io.WriteString(w, `{"error":{"code":"not_found","message":"resource not found"}}`)
@@ -252,6 +268,170 @@ func TestConnectionUnsharePreservesTheOtherWorkspaces(t *testing.T) {
 	}
 	if got := workspaceSet(t, srv.patched[0]); !equalSets(got, []string{"ws_other"}) {
 		t.Errorf("PATCH workspaces = %v, want ws_other alone", got)
+	}
+}
+
+func TestConnectionReconnectPreservesSelectedWorkspacePolicy(t *testing.T) {
+	srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{
+		Provider: "github", Login: "octocat", AccessMode: "selected",
+		Workspaces: []string{"ws_dogfood", "ws_other"}, CreatedAt: "2026-09-01T00:00:00Z",
+	}}
+	ts := srv.start()
+	hostedContext(t, ts.URL, "ws_dogfood")
+
+	login := func(edgeURL, deviceName, contextName string) error {
+		if edgeURL != ts.URL || contextName != "dogfood" {
+			t.Fatalf("login target = %q/%q, want %q/dogfood", edgeURL, contextName, ts.URL)
+		}
+		if srv.deleted != 1 || srv.connection != nil {
+			t.Fatal("browser login started before the old connection was revoked")
+		}
+		srv.connection = &connectionView{Provider: "github", Login: "monalisa", AccessMode: "selected", Workspaces: []string{}}
+		return nil
+	}
+
+	out, err := captureStdout(t, func() error {
+		return runConnectionReconnectWith([]string{"github"}, login, func(time.Duration) {}, 2)
+	})
+	if err != nil {
+		t.Fatalf("connection reconnect: %v", err)
+	}
+	if srv.deleted != 1 || len(srv.patched) != 1 {
+		t.Fatalf("delete/PATCH counts = %d/%d, want 1/1", srv.deleted, len(srv.patched))
+	}
+	if got := workspaceSet(t, srv.patched[0]); !equalSets(got, []string{"ws_dogfood", "ws_other"}) {
+		t.Fatalf("restored workspaces = %v, want both previous grants", got)
+	}
+	if got := srv.patched[0]["access_mode"]; got != "selected" {
+		t.Fatalf("restored access_mode = %v, want selected", got)
+	}
+	if !strings.Contains(out, "monalisa") || !strings.Contains(out, "restored") {
+		t.Errorf("success output did not name the new login and restored policy:\n%s", out)
+	}
+}
+
+func TestConnectionReconnectPreservesAllAccessModeAndSavedSelection(t *testing.T) {
+	srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{
+		Provider: "github", Login: "octocat", AccessMode: "all", Workspaces: []string{"ws_other"},
+	}}
+	ts := srv.start()
+	hostedContext(t, ts.URL, "ws_dogfood")
+	login := func(string, string, string) error {
+		srv.connection = &connectionView{Provider: "github", Login: "octocat", AccessMode: "selected", Workspaces: []string{}}
+		return nil
+	}
+
+	if _, err := captureStdout(t, func() error {
+		return runConnectionReconnectWith([]string{"github"}, login, func(time.Duration) {}, 2)
+	}); err != nil {
+		t.Fatalf("connection reconnect: %v", err)
+	}
+	if got := srv.patched[0]["access_mode"]; got != "all" {
+		t.Fatalf("restored access_mode = %v, want all", got)
+	}
+	if got := workspaceSet(t, srv.patched[0]); !equalSets(got, []string{"ws_other"}) {
+		t.Fatalf("saved selection = %v, want ws_other", got)
+	}
+}
+
+func TestConnectionReconnectRefusesInvalidSnapshotBeforeRevoking(t *testing.T) {
+	for _, tc := range []connectionView{
+		{Provider: "github", AccessMode: "future", Workspaces: []string{}},
+		{Provider: "github", AccessMode: "selected", Workspaces: nil},
+	} {
+		srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &tc}
+		ts := srv.start()
+		hostedContext(t, ts.URL, "ws_dogfood")
+		loginCalled := false
+		_, err := captureStdout(t, func() error {
+			return runConnectionReconnectWith([]string{"github"}, func(string, string, string) error {
+				loginCalled = true
+				return nil
+			}, func(time.Duration) {}, 1)
+		})
+		if err == nil {
+			t.Fatal("invalid connection snapshot was reconnected")
+		}
+		if srv.deleted != 0 || loginCalled {
+			t.Fatalf("invalid snapshot caused delete/login = %d/%v", srv.deleted, loginCalled)
+		}
+	}
+}
+
+func TestConnectionReconnectFailureAfterRevokeNamesRecovery(t *testing.T) {
+	srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{
+		Provider: "github", Login: "octocat", AccessMode: "selected", Workspaces: []string{"ws_dogfood", "ws_other"},
+	}}
+	ts := srv.start()
+	hostedContext(t, ts.URL, "ws_dogfood")
+
+	_, err := captureStdout(t, func() error {
+		return runConnectionReconnectWith([]string{"github"}, func(string, string, string) error {
+			return errors.New("browser login stopped")
+		}, func(time.Duration) {}, 1)
+	})
+	if err == nil {
+		t.Fatal("failed browser login reported reconnect success")
+	}
+	for _, want := range []string{"disconnected", "ws_dogfood", "ws_other", "connection share github"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("recovery error missing %q: %v", want, err)
+		}
+	}
+	if srv.deleted != 1 || len(srv.patched) != 0 {
+		t.Fatalf("delete/PATCH counts = %d/%d, want 1/0", srv.deleted, len(srv.patched))
+	}
+}
+
+func TestConnectionReconnectTimesOutWaitingForBrowserConnection(t *testing.T) {
+	srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{
+		Provider: "github", Login: "octocat", AccessMode: "selected", Workspaces: []string{"ws_dogfood"},
+	}}
+	ts := srv.start()
+	hostedContext(t, ts.URL, "ws_dogfood")
+	sleeps := 0
+
+	_, err := captureStdout(t, func() error {
+		return runConnectionReconnectWith([]string{"github"}, func(string, string, string) error { return nil }, func(time.Duration) { sleeps++ }, 2)
+	})
+	if err == nil || !strings.Contains(err.Error(), "did not finish") {
+		t.Fatalf("wait error = %v, want bounded browser timeout", err)
+	}
+	if sleeps != 1 {
+		t.Fatalf("sleeps = %d, want 1 between two polls", sleeps)
+	}
+}
+
+func TestConnectionReconnectRefusesWhenNothingIsConnected(t *testing.T) {
+	srv := &connectionServer{t: t, workspaces: twoWorkspaces}
+	ts := srv.start()
+	hostedContext(t, ts.URL, "ws_dogfood")
+	loginCalled := false
+
+	_, err := captureStdout(t, func() error {
+		return runConnectionReconnectWith([]string{"github"}, func(string, string, string) error {
+			loginCalled = true
+			return nil
+		}, func(time.Duration) {}, 1)
+	})
+	if err == nil || !strings.Contains(err.Error(), "not connected") {
+		t.Fatalf("reconnect without a connection = %v, want ordinary connect guidance", err)
+	}
+	if loginCalled || srv.deleted != 0 {
+		t.Fatalf("missing connection caused login/delete = %v/%d", loginCalled, srv.deleted)
+	}
+}
+
+func TestConnectionReconnectRefusesSelfHostedContext(t *testing.T) {
+	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	if err := cli.Save(cli.Config{ServerURL: "http://127.0.0.1:1", Token: "rnr_test"}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := captureStdout(t, func() error {
+		return runConnectionReconnectWith([]string{"github"}, func(string, string, string) error { return nil }, func(time.Duration) {}, 1)
+	})
+	if err == nil || !strings.Contains(err.Error(), "not a hosted one") {
+		t.Fatalf("self-hosted reconnect = %v, want hosted-only refusal", err)
 	}
 }
 
@@ -428,6 +608,9 @@ func TestConnectionRequiresLogin(t *testing.T) {
 	for _, run := range []func() error{
 		func() error { return runConnectionLs(nil) },
 		func() error { return runConnectionShare([]string{"github"}, true) },
+		func() error {
+			return runConnectionReconnectWith([]string{"github"}, func(string, string, string) error { return nil }, func(time.Duration) {}, 1)
+		},
 	} {
 		_, err := captureStdout(t, run)
 		if err == nil || !strings.Contains(err.Error(), "not logged in") {
@@ -459,6 +642,9 @@ func TestConnectionShareRejectsAnUnknownProvider(t *testing.T) {
 	}
 	if got, err := connectionProviderNamed("github", "share"); err != nil || got != "github" {
 		t.Errorf("connectionProviderNamed(github) = %q, %v", got, err)
+	}
+	if _, err := connectionProviderNamed("gitlab", "reconnect"); err == nil || !strings.Contains(err.Error(), "unknown provider") {
+		t.Errorf("want reconnect to reject an unknown provider, got %v", err)
 	}
 }
 

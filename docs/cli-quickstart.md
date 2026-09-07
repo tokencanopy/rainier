@@ -68,6 +68,7 @@ clone until you share it with one:
 ```bash
 rainier connection ls               # provider, GitHub login, access mode, workspaces
 rainier connection share github     # let your current workspace use it
+rainier connection reconnect github # authorize again, preserving access after success
 ```
 
 `share` and `unshare` change only the workspace you name — your current one,
@@ -77,6 +78,13 @@ mode, so neither can widen the connection to all your workspaces. Neither
 prints a GitHub credential: on this side the CLI never has one. Sharing requires
 current membership; unsharing can remove a saved grant after you leave its
 workspace. Use `rainier help connection` for the rest.
+
+Use `connection reconnect` when Rainier requests new GitHub permissions or the
+authorization itself needs replacing. It revokes the old connection before the
+browser flow because the hosted API allows one live connection per account,
+then restores the prior access mode and workspace selection after the new
+connection appears. Do not interrupt it: abandoning the browser leaves GitHub
+disconnected, and the CLI prints the saved workspace IDs and recovery commands.
 
 The API replaces the connection's whole workspace list rather than adding to
 it, and offers no conditional write, so the CLI reads the list and sends back

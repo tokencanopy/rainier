@@ -124,6 +124,7 @@ commands:
   pull     <id|name>:<path> <local-dir>
   creds
   connection ls | share <provider> [--workspace ID] | unshare <provider> [--workspace ID]
+             | reconnect <provider>
   agent    login <provider> --env NAME | ls | logout <provider> [--yes]
   secret   set <NAME> [--value V] | ls | rm <NAME>
   env      create <name> [flags] | ls | show <ref> | update <ref> [flags] | rm <ref>
@@ -160,7 +161,9 @@ reaches; a new connection reaches none of them, so
   rainier connection share github
 
 lets your current workspace use it and "connection unshare github" removes
-that workspace from the selection. Unsharing also works after you leave a
+that workspace from the selection. "connection reconnect github" replaces the
+browser authorization and restores the previous access mode and workspace
+selection after it succeeds. Unsharing also works after you leave a
 workspace; sharing requires current membership. Both change only the workspace
 you name, keeping the others the connection reached when the command read it, and neither ever prints a
 credential: the CLI never has one to print. The API replaces the whole
