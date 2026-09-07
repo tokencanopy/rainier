@@ -1,4 +1,8 @@
-.PHONY: test build demo e2e verify module-path protocols control
+.PHONY: test build demo e2e verify module-path protocols control session-image session-image-smoke session-image-verify
+
+DOCKER ?= docker
+SESSION_IMAGE ?= rainier-session:smoke
+
 test:
 	go test ./...
 build:
@@ -20,6 +24,31 @@ protocols:
 
 control:
 	./scripts/check-public-control.sh
+
+# session-image builds the image a hosted session actually runs — the same
+# Dockerfile rainier-cloud's runner-artifacts workflow builds and publishes.
+# It pulls a large Debian base and downloads a pinned toolchain, so the first
+# build is minutes and gigabytes; later ones are layer cache.
+#
+# BASE_IMAGE defaults to a linux/amd64 digest because that is what the hosted
+# Dedicated runners run. On an arm64 machine, pass the tag instead of building
+# the amd64 image under emulation:
+#
+#   make session-image BUILD_ARGS='--build-arg BASE_IMAGE=node:22-bookworm'
+#
+# and understand that the result is then pinned by a tag, not a digest, and is
+# a development convenience rather than something to publish.
+session-image:
+	$(DOCKER) build $(BUILD_ARGS) -t "$(SESSION_IMAGE)" .
+
+# session-image-smoke does the part `--version` cannot: it builds, runs,
+# installs and serves inside containers wearing the driver's real restrictions
+# — uid 1000, read-only rootfs, noexec /tmp, no network at all. See the header
+# of the script.
+session-image-smoke:
+	DOCKER="$(DOCKER)" ./scripts/session-image-smoke.sh "$(SESSION_IMAGE)"
+
+session-image-verify: session-image session-image-smoke
 
 verify: module-path protocols control test build
 	go vet ./...

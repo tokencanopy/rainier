@@ -33,6 +33,7 @@ Autonomous coding agents (Claude Code, Codex, Gemini CLI, and others) are transf
 Rainier is currently at **v0 (terminal happy path)**. One `controld` (Postgres-backed REST + WebSocket API, GitHub identity, least-loaded placement, credential vault) fronts N `runnerd` VMs that dial it outbound, and the `rainier` CLI drives the whole fleet. Sessions clone your repositories at boot and push back as you.
 
 - **Deployment Guide:** [`docs/deploy-gce.md`](docs/deploy-gce.md)
+- **Session Image:** [`docs/session-image.md`](docs/session-image.md) — the default coding environment every session runs, what is in it, and how it is pinned and smoke tested
 - **Architecture Specs:**
   - [Rainier Overview](docs/superpowers/specs/2026-08-27-rainier-design.md)
   - [Control Plane (`controld`)](docs/superpowers/specs/2026-08-28-plan3-controld-design.md)
@@ -244,6 +245,8 @@ go test ./...                    # unit + contract suites (no services needed)
 go test ./internal/e2e/ -race    # in-process e2e scenes: chaos, environments, git
 make e2e                         # full stack on docker, driven by the real CLI
 ./scripts/egress-check.sh        # egress R4 acceptance (exit 3 = skipped on VM-backed docker)
+make session-image               # build the session image (docs/session-image.md)
+make session-image-smoke         # functional image smoke: builds, installs, servers, agents
 ```
 
 The store contract suite runs against memstore by default and against

@@ -1,0 +1,20 @@
+# The session image's build context. The Dockerfile's build stage does
+# `COPY . .` to compile sessiond, so everything reachable from here lands in a
+# layer of the intermediate image; what is excluded is excluded because it is
+# either large, machine-local, or something that must never be near an image.
+#
+# Nothing here is a security control on its own — the final stage copies exactly
+# one file out of the build stage — but a context that carries a developer's
+# worktrees, binaries and logs makes the build slower and the layers harder to
+# reason about, and `.git` in particular carries every branch of the repository
+# into a build that needs none of it.
+.git
+.gitignore
+.dockerignore
+.worktrees/
+.superpowers/
+bin/
+artifacts/
+*.log
+docs/
+assets/
