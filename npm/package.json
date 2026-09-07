@@ -1,0 +1,17 @@
+{
+  "name": "@tokencanopy/rainier",
+  "version": "0.0.8",
+  "description": "Rainier CLI: persistent remote coding-agent sessions",
+  "type": "module",
+  "bin": { "rainier": "cli.js" },
+  "files": ["cli.js", "runtime.js", "release.js", "README.md", "LICENSE"],
+  "engines": { "node": ">=22" },
+  "os": ["darwin", "linux"],
+  "cpu": ["arm64", "x64"],
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "git+https://github.com/tokencanopy/rainier.git", "directory": "npm" },
+  "homepage": "https://github.com/tokencanopy/rainier#readme",
+  "bugs": { "url": "https://github.com/tokencanopy/rainier/issues" },
+  "publishConfig": { "access": "public", "tag": "beta", "registry": "https://registry.npmjs.org/" },
+  "scripts": { "test": "node --test test/*.test.js" }
+}
