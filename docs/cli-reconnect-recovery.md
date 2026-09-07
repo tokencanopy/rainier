@@ -54,10 +54,11 @@ lose scrollback. An out-of-band prolonged-outage indicator is a future UI
 decision, not a reason to write into the remote application's screen.
 
 Input handling during recovery remains a separate limitation: termios returns
-to cooked mode between attempts, so typed input or enabled mouse reports can
+to cooked mode between attempts, so typed input or enabled mouse/focus reports can
 echo locally and disturb the screen. Queued TTY input is discarded before the
 next stream, but that cannot undo local echo. Keeping input ownership across
-retry backoff requires a separate change and an input-during-outage PTY test.
+retry backoff requires a separate change and PTY tests for typed input and
+terminal-generated reports during an outage.
 
 Alternatives rejected: longer token/lease lifetimes only postpone the failure and
 weaken revocation bounds; retrying every401 indefinitely masks revoked access;
