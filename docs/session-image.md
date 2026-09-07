@@ -190,12 +190,38 @@ are outside this image's scope and neither is worked around here.
 
    The shape that fits what already exists is the one the git helper already
    has: a per-invocation mint over the session RPC, handed to `gh` in its own
-   process environment and nowhere else, so the token's life is one command.
-   That is a control-plane and sessiond change, and it belongs with the GitHub
-   connection work, not here.
+   process environment as a proposed delivery mechanism. This does not make a
+   copied token expire when the command exits, nor isolate it from same-UID
+   processes. Actual scope, expiry/revocation, exposure and audit need design
+   review before this is implemented. That control-plane/sessiond work is not
+   approved or delivered by this image change.
 
 Until both land, the working path from a session is unchanged and complete for
 everything except opening the PR itself: `git push` through the brokered
 credential, then open the PR from the compare link GitHub prints, or from a
 laptop. The image half of "`gh` works" is done; the integration half is
 tracked separately.
+
+## Qualification repairs and rollout gate
+
+The image pre-seeds `/workspace/.rainier` before giving the directory to UID
+1000. Docker copies both to a fresh volume. This keeps compatibility with the
+deployed initializer, which has only CAP_CHOWN and cannot create a directory
+in an empty UID-1000-owned 0755 mount. Broadening initializer privileges or
+changing workspace ownership would weaken or alter the existing contract;
+seeding avoids both. A Docker-gated test calls the real initializer against the
+built candidate and then checks repeated mounts as the session user.
+
+The smoke assertion requires both exit success and the expected output;
+timeout, signal, and marker-then-failure regressions guard its trustworthiness.
+Claude/Codex version output must match the Dockerfile pins, and gh's expected
+unauthenticated result must not be a timeout or crash.
+
+The OSS `Session image qualification` workflow builds the exact default base
+on native linux/amd64 and runs both the driver regression and functional smoke.
+It does not publish images or deploy anything. Keep its successful commit/run
+with the artifact being published. ARM builds using BASE_IMAGE overrides are
+useful local diagnostics, not qualification of the shipping AMD64 image.
+Authenticated agent workloads and cold dependency downloads under hosted
+egress policy remain a separate no-setup environment gate on approved canary
+capacity; never replace a runner holding active work to obtain that evidence.

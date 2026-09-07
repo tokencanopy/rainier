@@ -1,11 +1,58 @@
 package driver
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestSessionImageSeedsWorkspace(t *testing.T) {
+	if !strings.Contains(sessionDockerfile(t), "mkdir -p /opt/rainier-env/bin /workspace/.rainier") {
+		t.Fatal("seed /workspace/.rainier before chown: the deployed CAP_CHOWN-only initializer cannot mkdir in an empty uid-1000-owned mount")
+	}
+}
+
+// Run against the built candidate, not Alpine: ownership copied from this
+// image is precisely the boundary that a generic Docker fixture cannot test.
+func TestSessionImageInitializesFreshWorkspace(t *testing.T) {
+	image := os.Getenv("RAINIER_SESSION_IMAGE")
+	if image == "" {
+		t.Skip("set RAINIER_SESSION_IMAGE to exercise the built candidate with Docker")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	volume := fmt.Sprintf("rainier-image-contract-%d", time.Now().UnixNano())
+	d := NewDocker(DockerOpts{Image: image})
+	created, err := d.ensureVolume(ctx, volume, workspaceMount, image)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("expected a fresh volume")
+	}
+	t.Cleanup(func() {
+		cleanupCtx, stop := context.WithTimeout(context.Background(), 20*time.Second)
+		defer stop()
+		if _, err := dockerRun(cleanupCtx, "volume", "rm", volume); err != nil {
+			t.Error(err)
+		}
+	})
+	// Two mounts prove the seed survives and ownership is not reset on reuse.
+	for i := 0; i < 2; i++ {
+		out, err := dockerRun(ctx, "run", "--rm", "--network", "none",
+			"--user", sessionUser, "--security-opt", "no-new-privileges",
+			"--cap-drop", "ALL", "--read-only", "-v", volume+":"+workspaceMount,
+			"--entrypoint", "/bin/sh", image, "-c",
+			"test -d /workspace/.rainier && touch /workspace/.rainier/probe && echo workspace-ready")
+		if err != nil || strings.TrimSpace(out) != "workspace-ready" {
+			t.Fatalf("mount %d: output=%q error=%v", i, out, err)
+		}
+	}
+}
 
 // The session image and this driver are two halves of one contract, and only
 // one half is written in Go. The driver runs every container as

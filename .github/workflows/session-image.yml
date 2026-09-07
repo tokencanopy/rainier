@@ -1,0 +1,37 @@
+name: Session image qualification
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - images/session/**
+      - scripts/session-image-*.sh
+      - internal/driver/image*test.go
+      - .github/workflows/session-image.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build exact shipping architecture and base
+        run: docker build --platform linux/amd64 -t rainier-session:qualify .
+      - name: Exercise deployed initializer against the candidate
+        env:
+          RAINIER_SESSION_IMAGE: rainier-session:qualify
+        run: go test ./internal/driver -run '^(TestSessionImage|TestImageSmoke)' -count=1
+      - name: Functional smoke with no network or credentials
+        run: make session-image-smoke SESSION_IMAGE=rainier-session:qualify
+      - name: Image size
+        run: docker image inspect -f '{{.Size}} bytes; {{.Architecture}}' rainier-session:qualify

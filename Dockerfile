@@ -164,9 +164,13 @@ RUN printf '%s\n' \
 # is the platform's own agent, and it isn't.
 RUN groupmod --new-name rainier node \
     && usermod --login rainier --home /home/rainier --move-home node \
-    && mkdir -p /opt/rainier-env/bin /workspace /rainier/agents \
+    && mkdir -p /opt/rainier-env/bin /workspace/.rainier /rainier/agents \
     && chown -R 1000:1000 /opt/rainier-env /workspace \
     && chmod 0755 /rainier /rainier/agents
+
+# Pre-seed the workspace before Docker copies its uid-1000 ownership to a
+# fresh volume. The deployed initializer has CAP_CHOWN, not DAC_OVERRIDE: it
+# can chown the seed, but cannot mkdir in an empty user-owned 0755 mount.
 
 # The realized inventory, for whoever has to answer "what was in the image we
 # ran on the 6th" from a digest alone. A target list is not evidence; this is.

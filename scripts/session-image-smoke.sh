@@ -113,16 +113,13 @@ probe_setup() {
 $1" 2>&1
 }
 
-# check <name> <expected substring> <program>
-check() {
-  local name=$1 want=$2 prog=$3 out
-  out=$(probe "$prog")
-  if [ "${out#*"$want"}" != "$out" ]; then
-    ok "$name"
-  else
-    bad "$name" "wanted \"$want\", got: $(printf '%s' "$out" | tr '\n' '|' | tail -c 400)"
-  fi
-}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/session-image-checks.sh"
+CLAUDE_VERSION=$(sed -n 's/^ARG CLAUDE_CODE_VERSION=//p' "$SCRIPT_DIR/../Dockerfile")
+CODEX_VERSION=$(sed -n 's/^ARG CODEX_VERSION=//p' "$SCRIPT_DIR/../Dockerfile")
+for version in "$CLAUDE_VERSION" "$CODEX_VERSION"; do
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "missing or invalid agent version pin" >&2; exit 2; }
+done
 
 echo "== $IMAGE"
 echo
@@ -226,13 +223,13 @@ echo
 echo "-- the agents start"
 # --version says a file exists. --help makes the program parse its own
 # configuration, which is what actually fails when $HOME is read-only.
-check "claude reports its pinned version" "Claude Code" 'timeout 90 claude --version'
+check "claude reports its pinned version" "$CLAUDE_VERSION (Claude Code)" 'timeout 90 claude --version'
 check "claude starts with a read-only \$HOME" "claude-started" \
   'timeout 90 claude --help >/dev/null 2>&1 && echo claude-started'
 check "claude's config directory is redirected onto a writable mount" "claude-config-writable" \
   'case "$CLAUDE_CONFIG_DIR" in /rainier/agents/*) ;; *) echo "NOT-ON-MOUNT $CLAUDE_CONFIG_DIR"; exit 1;; esac
    mkdir -p "$CLAUDE_CONFIG_DIR" && touch "$CLAUDE_CONFIG_DIR/.probe" && echo claude-config-writable'
-check "codex reports its pinned version" "codex-cli" 'timeout 90 codex --version'
+check "codex reports its pinned version" "codex-cli $CODEX_VERSION" 'timeout 90 codex --version'
 check "codex starts with a read-only \$HOME" "codex-started" \
   'timeout 90 codex --help >/dev/null 2>&1 && echo codex-started'
 check "codex's home is redirected onto a writable mount" "codex-home-writable" \
@@ -367,8 +364,11 @@ check "gh is executable and reports its version" "gh version" 'gh --version'
 # Deliberately an "it runs" check and not an "it is signed in" one: nothing in
 # an image can be authenticated, and a session's GitHub credential is minted per
 # git operation by sessiond's helper, which gh does not consult.
-check "gh runs its auth check and answers honestly" "gh-auth-ran" \
-  'timeout 30 gh auth status >/dev/null 2>&1; echo gh-auth-ran'
+check "gh reports unauthenticated without timing out" "not logged into any GitHub hosts" '
+  status=0
+  out=$(timeout 30 gh auth status 2>&1) || status=$?
+  [ "$status" -eq 1 ] || { printf "unexpected gh exit: %s\n" "$status"; exit 1; }
+  printf "%s\n" "$out"'
 check "an OpenSSH client is present" "OpenSSH" 'ssh -V 2>&1'
 check "ripgrep, jq and the GNU text tools are the real ones" "tools-ok" '
   rg --version >/dev/null || { echo "no rg"; exit 1; }
