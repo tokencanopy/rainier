@@ -154,6 +154,8 @@ check "the rootfs is read-only" "ro-ok" \
 check "the session user cannot rewrite sessiond" "sessiond-protected" \
   'if echo x > /usr/local/bin/sessiond 2>/dev/null; then echo sessiond-WRITABLE; else echo sessiond-protected; fi'
 check "sessiond is root-owned" "root root" 'stat -c "%U %G" /usr/local/bin/sessiond'
+check "the gh wrapper and real binary are root-owned" "root root|root root" '
+  printf "%s|%s" "$(stat -c "%U %G" /usr/local/bin/gh)" "$(stat -c "%U %G" /usr/local/libexec/rainier/gh)"'
 check "the agents a session runs are root-owned too" "agents-root-owned" '
   bad=0
   for f in claude codex gh go node npm python3 uv; do
@@ -356,6 +358,15 @@ check "git makes a commit" "git-ok" '
   git -c user.email=smoke@example.invalid -c user.name=smoke commit -qm x
   [ "$(git rev-list --count HEAD)" = 1 ] && echo git-ok'
 check "gh is executable and reports its version" "gh version" 'gh --version'
+check "managed gh version runs offline without a socket" "gh version" 'RAINIER_SESSION=sess_test gh --version'
+check "wrapped gh receives only a synthetic socket credential" "synthetic-gh-token" '
+  rm -f /workspace/.rainier/agent.sock
+  python3 -c "import json,socket; s=socket.socket(socket.AF_UNIX); s.bind(\"/workspace/.rainier/agent.sock\"); s.listen(1); c,_=s.accept(); json.load(c.makefile(\"r\")); c.sendall(b\"{\\\"ok\\\":true,\\\"payload\\\":{\\\"token\\\":\\\"synthetic-gh-token\\\"}}\\n\"); c.close(); s.close()" &
+  p=$!
+  for _ in $(seq 40); do test -S /workspace/.rainier/agent.sock && break; sleep 0.05; done
+  out=$(RAINIER_SESSION=sess_test GH_TOKEN=old GITHUB_TOKEN=older gh auth token)
+  wait "$p"
+  test "$out" = synthetic-gh-token && echo "$out"'
 # Deliberately an "it runs" check and not an "it is signed in" one: nothing in
 # an image can be authenticated, and a session's GitHub credential is minted per
 # git operation by sessiond's helper, which gh does not consult.

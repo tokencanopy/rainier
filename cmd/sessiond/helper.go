@@ -231,9 +231,10 @@ func mintCredential(sockPath string, timeout time.Duration) (string, error) {
 	if err := json.NewEncoder(c).Encode(socketRequest{Method: mintMethod, Payload: json.RawMessage(`{}`)}); err != nil {
 		return "", fmt.Errorf("rainier: asking sessiond for a GitHub credential: %w", err)
 	}
+	bounded := &io.LimitedReader{R: c, N: (16 << 10) + 1}
 	var resp socketResponse
-	if err := json.NewDecoder(c).Decode(&resp); err != nil {
-		return "", fmt.Errorf("rainier: no answer from sessiond within %s (%w)", timeout, err)
+	if err := json.NewDecoder(bounded).Decode(&resp); err != nil || bounded.N <= 1 {
+		return "", errors.New("credential response unavailable")
 	}
 	if !resp.OK {
 		if resp.Error != "" {
