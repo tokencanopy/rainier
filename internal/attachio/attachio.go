@@ -168,6 +168,20 @@ func ScanDetach(buf []byte) int {
 	return -1
 }
 
+// RestoreTerminal relinquishes remote emulator input modes and discards queued
+// TTY input before returning to the local shell. Call only after the entire
+// attach lifetime (all reconnect attempts) and after Run has joined its pumps:
+// cursor-only replay need not repeat the remote application's mode enables.
+// It does not clear screen/scrollback or read/discard piped input. Output resets
+// are emitted only to a TTY; write/flush failures are returned together.
+func RestoreTerminal(stdin, stdout *os.File) error {
+	var err error
+	if term.IsTerminal(int(stdout.Fd())) {
+		_, err = fmt.Fprint(stdout, "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?1004l\x1b[?2004l\x1b[?25h\x1b[0m")
+	}
+	return errors.Join(err, discardPendingInput(stdin))
+}
+
 // Run dials wsURL with header (nil for no extra headers — e.g. rattach's
 // direct-to-sessiond/runnerd use, non-nil to carry an Authorization bearer
 // against controld), performs the resize-first contract, and pipes the
@@ -454,6 +468,12 @@ func retryableWebSocketReadError(err error) bool {
 		return false
 	}
 	switch websocket.CloseStatus(err) {
+	case websocket.StatusPolicyViolation:
+		// The hosted gateway deliberately ends its authorization lease. Only
+		// this exact wire reason invites a fresh edge authorization decision;
+		// ordinary policy denials must remain terminal, never an endless retry.
+		var closeErr websocket.CloseError
+		return errors.As(err, &closeErr) && closeErr.Reason == "attach lease expired; reattach"
 	case -1, websocket.StatusNoStatusRcvd, websocket.StatusAbnormalClosure,
 		websocket.StatusGoingAway, websocket.StatusInternalError,
 		websocket.StatusServiceRestart, websocket.StatusTryAgainLater,

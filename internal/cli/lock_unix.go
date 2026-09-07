@@ -3,8 +3,11 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"os"
 	"syscall"
+	"time"
 )
 
 // withConfigLock runs fn while holding an advisory lock beside the config
@@ -15,7 +18,7 @@ import (
 // The lock is per config path, taken for the refresh alone, and released
 // when fn returns; a process that dies holding it releases it with its file
 // descriptor.
-func withConfigLock(fn func() error) error {
+func withConfigLock(ctx context.Context, fn func() error) error {
 	path, err := configPath()
 	if err != nil {
 		return err
@@ -25,8 +28,26 @@ func withConfigLock(fn func() error) error {
 		return err
 	}
 	defer f.Close()
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return err
+	// Nonblocking acquisition keeps the refresh deadline meaningful even
+	// while a sibling process is waiting on its own network exchange.
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
 	}
 	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 	return fn()

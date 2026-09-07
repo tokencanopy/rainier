@@ -17,11 +17,13 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -491,13 +493,15 @@ func runLogin(args []string) error {
 	// An older controld that does not send an id leaves whatever is already
 	// cached alone: a refresh of a GitHub credential is no reason to forget
 	// who the caller is.
-	ctx := cfg.Contexts[target]
-	ctx.Server, ctx.Token = serverURL, resp.Token
-	if resp.User.ID != "" {
-		ctx.OwnerID = resp.User.ID
-	}
-	cfg.SetContext(target, ctx)
-	if err := cli.Save(cfg); err != nil {
+	if err := cli.UpdateConfig(func(latest *cli.Config) error {
+		ctx := latest.Contexts[target]
+		ctx.Server, ctx.Token = serverURL, resp.Token
+		if resp.User.ID != "" {
+			ctx.OwnerID = resp.User.ID
+		}
+		latest.SetContext(target, ctx)
+		return nil
+	}); err != nil {
 		return fmt.Errorf("saving config: %w", err)
 	}
 
@@ -769,12 +773,13 @@ func runCloudLoginSleep(edgeURL, deviceName, contextName string, sleep func(time
 		return err
 	}
 
-	cfg, _ := cli.Load() // a missing config is exactly what a first login expects
-	ctx := cfg.Contexts[contextName]
-	ctx.Server, ctx.Token = base, pair.AccessToken
-	ctx.RefreshToken, ctx.AccessExpiresAt = pair.RefreshToken, pair.AccessExpiresAt
-	cfg.SetContext(contextName, ctx)
-	if err := cli.Save(cfg); err != nil {
+	if err := cli.UpdateConfig(func(cfg *cli.Config) error {
+		ctx := cfg.Contexts[contextName]
+		ctx.Server, ctx.Token = base, pair.AccessToken
+		ctx.RefreshToken, ctx.AccessExpiresAt = pair.RefreshToken, pair.AccessExpiresAt
+		cfg.SetContext(contextName, ctx)
+		return nil
+	}); err != nil {
 		return fmt.Errorf("saving config: %w", err)
 	}
 	fmt.Printf("logged in to %s (context %s)\n", u.Host, contextName)
@@ -814,14 +819,15 @@ func selectWorkspace(contextName string) error {
 // writing back a copy loaded before that would strand the context on a
 // refresh token the edge has already spent.
 func setWorkspace(contextName string, w workspaceView) error {
-	cfg, err := cli.Load()
-	if err != nil {
-		return err
-	}
-	ctx := cfg.Contexts[contextName]
-	ctx.Workspace = w.ID
-	cfg.UpdateContext(contextName, ctx)
-	if err := cli.Save(cfg); err != nil {
+	if err := cli.UpdateConfig(func(cfg *cli.Config) error {
+		ctx, ok := cfg.Contexts[contextName]
+		if !ok {
+			return cli.ErrLoginAgain
+		}
+		ctx.Workspace = w.ID
+		cfg.UpdateContext(contextName, ctx)
+		return nil
+	}); err != nil {
 		return fmt.Errorf("saving config: %w", err)
 	}
 	fmt.Printf("workspace: %s (%s)\n", w.ID, w.Name)
@@ -1024,10 +1030,13 @@ func runContext(args []string) error {
 		if len(rest) != 2 {
 			return fmt.Errorf("usage: rainier context use <name>")
 		}
-		if !cfg.Use(rest[1]) {
-			return fmt.Errorf("no context named %s; `rainier context list` shows the ones there are", rest[1])
-		}
-		if err := cli.Save(cfg); err != nil {
+		if err := cli.UpdateConfig(func(latest *cli.Config) error {
+			if !latest.Use(rest[1]) {
+				return fmt.Errorf("no context named %s; `rainier context list` shows the ones there are", rest[1])
+			}
+			cfg = *latest
+			return nil
+		}); err != nil {
 			return fmt.Errorf("saving config: %w", err)
 		}
 		fmt.Printf("context: %s (%s)\n", rest[1], cfg.ServerURL)
@@ -1037,10 +1046,12 @@ func runContext(args []string) error {
 		if len(rest) != 2 {
 			return fmt.Errorf("usage: rainier context remove <name>")
 		}
-		if !cfg.RemoveContext(rest[1]) {
-			return fmt.Errorf("no context named %s; `rainier context list` shows the ones there are", rest[1])
-		}
-		if err := cli.Save(cfg); err != nil {
+		if err := cli.UpdateConfig(func(latest *cli.Config) error {
+			if !latest.RemoveContext(rest[1]) {
+				return fmt.Errorf("no context named %s; `rainier context list` shows the ones there are", rest[1])
+			}
+			return nil
+		}); err != nil {
 			return fmt.Errorf("saving config: %w", err)
 		}
 		fmt.Printf("removed context %s\n", rest[1])
@@ -1168,11 +1179,11 @@ func createSession(c *cli.Client, body createSessionRequest, idempotencyKey stri
 // treated as fatal. attachio.Run's dial wraps that specific failure —
 // controld's 503 session_not_ready before the websocket upgrade — as a
 // *attachio.DialError matching errors.Is(err, attachio.ErrSessionNotReady);
-// any other error (including a *DialError for some other status) is
-// treated as fatal immediately rather than burning the retry budget on a
-// failure that will never resolve itself.
+// a hosted401 gets one credential recovery and retry. Other initial errors
+// return immediately instead of spending the readiness budget. Once connected,
+// transient failures and explicit hosted lease renewals resume at the cursor.
 func attachWithRetry(cfg cli.Config, id string, since uint64) error {
-	return attachWithRetrySleep(cfg, id, since, time.Sleep)
+	return attachWithRetrySleep(cfg, id, since, nil)
 }
 
 func attachWithRetrySleep(cfg cli.Config, id string, since uint64, sleep func(time.Duration)) error {
@@ -1180,8 +1191,27 @@ func attachWithRetrySleep(cfg cli.Config, id string, since uint64, sleep func(ti
 }
 
 func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(time.Duration), initialWait time.Duration) error {
+	// Emulator modes are not termios. Keep them across cursor-only reconnects
+	// (which need not replay their enable sequences), but never leave the local
+	// shell interpreting mouse movement as typed input on final return.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	defer attachio.RestoreTerminal(os.Stdin, os.Stdout)
+	wait := func(d time.Duration) {
+		if sleep != nil {
+			sleep(d) // deterministic test clock; production waits are cancelable
+			return
+		}
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+		case <-timer.C:
+		}
+	}
+	c := cli.NewClient(cfg)
 	wsURL := wsURLFor(cfg.ServerURL, id)
-	header := http.Header{"Authorization": {"Bearer " + cfg.Token}}
+	header := http.Header{}
 	// The terminal stream is scoped like every other request on a hosted
 	// context: the edge routes it by the same header.
 	if ctx, ok := cfg.Active(); ok && ctx.Workspace != "" {
@@ -1191,10 +1221,15 @@ func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(t
 	established := false
 	waiting := false
 	backoff := 100 * time.Millisecond
+	authRetried := false
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		header.Set("Authorization", "Bearer "+c.Token)
 		attemptStarted := time.Now()
-		outcome, err := attachio.Run(context.Background(), wsURL, header, since)
+		outcome, err := attachio.Run(ctx, wsURL, header, since)
 		if err == nil {
 			if outcome.Reason != attachio.Disconnected {
 				return nil
@@ -1203,14 +1238,30 @@ func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(t
 			// local stdout. Resume after it: never repaint the whole terminal and
 			// never skip output the user had not actually seen.
 			established = true
+			authRetried = false
 			since = outcome.LastSeq
 			if time.Since(attemptStarted) >= 10*time.Second {
 				backoff = 100 * time.Millisecond
 			}
 			fmt.Printf("[reconnecting in %s…]\n", backoff)
-			sleep(backoff)
+			wait(backoff)
 			backoff = nextAttachBackoff(backoff)
 			continue
+		}
+
+		var dialErr *attachio.DialError
+		if errors.As(err, &dialErr) && dialErr.Status == http.StatusUnauthorized && c.RefreshToken != "" {
+			if authRetried {
+				return cli.ErrLoginAgain
+			}
+			authRetried = true
+			refreshCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			refreshErr := c.RefreshAfterUnauthorized(refreshCtx)
+			cancel()
+			if refreshErr != nil {
+				return refreshErr
+			}
+			continue // same session, workspace, and last rendered cursor
 		}
 
 		if established {
@@ -1218,7 +1269,7 @@ func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(t
 				return err
 			}
 			fmt.Printf("[reconnecting in %s…]\n", backoff)
-			sleep(backoff)
+			wait(backoff)
 			backoff = nextAttachBackoff(backoff)
 			continue
 		}
@@ -1227,13 +1278,13 @@ func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(t
 			return err
 		}
 		if !time.Now().Before(deadline) {
-			return initialAttachGuidance(context.Background(), cfg, id, since)
+			return initialAttachGuidance(ctx, cfg, id, since)
 		}
 		if !waiting {
 			fmt.Println("waiting for session… (Ctrl-C stops waiting and keeps the session)")
 			waiting = true
 		}
-		sleep(500 * time.Millisecond)
+		wait(500 * time.Millisecond)
 	}
 }
 
@@ -1246,9 +1297,9 @@ func nextAttachBackoff(current time.Duration) time.Duration {
 }
 
 // retryableAttachError is deliberately narrow. Once a viewer has connected,
-// transport failures and transient gateway statuses can recover; auth,
-// authorization, not-found, protocol, and local-terminal failures cannot and
-// must not become an infinite loop. A plain websocket transport failure is a
+// transport failures and transient gateway statuses can recover; authentication
+// has its own bounded recovery above. Authorization, not-found, protocol, and
+// local-terminal failures must not become an infinite loop. A plain transport failure is a
 // *url.Error, while an HTTP response is attachio.DialError.
 func retryableAttachError(err error) bool {
 	var dialErr *attachio.DialError

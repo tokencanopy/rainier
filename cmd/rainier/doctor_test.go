@@ -108,6 +108,7 @@ func TestDoctorReadiness(t *testing.T) {
 func TestDoctorDeadlineIncludesRefresh(t *testing.T) {
 	for _, refresh := range []bool{false, true} {
 		t.Run(fmt.Sprint(refresh), func(t *testing.T) {
+			t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
 			cancelled := make(chan struct{}, 1)
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				io.Copy(io.Discard, r.Body)
@@ -126,6 +127,9 @@ func TestDoctorDeadlineIncludesRefresh(t *testing.T) {
 				active.RefreshToken = "refresh_example"
 			}
 			cfg.SetContext("example", active)
+			if err := cli.Save(cfg); err != nil {
+				t.Fatal(err)
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 			defer cancel()
 			var out bytes.Buffer

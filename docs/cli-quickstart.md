@@ -115,6 +115,18 @@ removing the session. Run `rainier doctor`, follow its guidance, and reattach wi
 the printed session id. A queue reason can identify a runner/capability constraint;
 otherwise the CLI reports only observed capacity or says the cause is unknown.
 Transient disconnects after a successful attach continue to reconnect from the
-last rendered sequence.
+last rendered sequence. Leave the terminal open when your laptop sleeps: the
+remote process continues, and the CLI reconnects and replays missed output when
+connectivity returns. The hosted gateway also periodically renews terminal
+authorization; this uses the same reconnect path, not a new coding session.
+
+On an expired hosted access token, the CLI adopts credentials already rotated by
+another CLI or refreshes the saved pair, then retries the upgrade. It keeps the
+original session, server, and workspace. Revoked login or denied workspace access
+still stops recovery. If refresh cannot complete, reconnect with
+`rainier attach box1 --since 0`; follow login guidance if required. An ambiguous
+failed refresh exchange is not retried automatically because refresh tokens are
+single-use. Terminal input modes are cleaned up on final return to the shell,
+without clearing local scrollback.
 
 `rainier rm <id|name>` destroys a session when you deliberately want to remove it.
