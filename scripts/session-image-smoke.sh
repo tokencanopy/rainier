@@ -89,6 +89,7 @@ probe() {
     -e CLAUDE_CONFIG_DIR=/rainier/agents/claude \
     -e CODEX_HOME=/rainier/agents/codex \
     --entrypoint timeout "$IMAGE" -k 10 "$PROBE_TIMEOUT" /bin/bash -c "set -uo pipefail
+$(declare -f expect_refusal)
 $1" 2>&1
 }
 
@@ -110,6 +111,7 @@ probe_setup() {
     -v "$WS_VOL:/workspace" -v "$HOME_VOL:/rainier/agents" \
     -w /workspace \
     --entrypoint timeout "$IMAGE" -k 10 "$PROBE_TIMEOUT" /bin/bash -c "set -uo pipefail
+$(declare -f expect_refusal)
 $1" 2>&1
 }
 
@@ -173,27 +175,19 @@ check "the environment install prefix belongs to the session user" "prefix-owned
 # ordinary session: an ordinary session's rootfs is read-only and this
 # directory is on it. Asserting it in the read-only probe would either fail on
 # a correct image or, worse, pass on a broken one.
-out=$(probe_setup 'mkdir -p /opt/rainier-env/bin && printf "#!/bin/sh\n" > /opt/rainier-env/bin/probe && chmod +x /opt/rainier-env/bin/probe && echo prefix-writable')
-case "$out" in
-  *prefix-writable*) ok "an environment's setup script can install into the prefix" ;;
-  *) bad "an environment's setup script can install into the prefix" \
-         "nothing a setup installs could then be cached; got: $(printf '%s' "$out" | tr '\n' '|' | tail -c 300)" ;;
-esac
+check "an environment's setup script can install into the prefix" "prefix-writable" \
+  'mkdir -p /opt/rainier-env/bin && printf "#!/bin/sh\n" > /opt/rainier-env/bin/probe && chmod +x /opt/rainier-env/bin/probe && echo prefix-writable' probe_setup
 # And the boundary the prefix exists to draw: even with the rootfs writable,
 # the platform's own PID 1 and the agents beside it are not the setup script's
 # to replace.
-out=$(probe_setup 'if echo x > /usr/local/bin/sessiond 2>/dev/null; then echo SESSIOND-WRITABLE; else echo sessiond-held; fi')
-case "$out" in
-  *sessiond-held*) ok "a setup script still cannot rewrite sessiond or the agents" ;;
-  *) bad "a setup script still cannot rewrite sessiond or the agents" \
-         "a setup-carrying container runs with a writable rootfs; /usr/local must stay root-owned. got: $(printf '%s' "$out" | tr '\n' '|' | tail -c 300)" ;;
-esac
+check "a setup script still cannot rewrite sessiond" "sessiond-held" \
+  'if echo x > /usr/local/bin/sessiond 2>/dev/null; then echo SESSIOND-WRITABLE; else echo sessiond-held; fi' probe_setup
 check "no sudo is installed" "no-sudo" \
   'if command -v sudo >/dev/null 2>&1; then echo SUDO-PRESENT; else echo no-sudo; fi'
 # Debian ships su and mount setuid; no-new-privileges is what makes that
 # harmless, and this asserts the outcome rather than the file mode.
-check "a setuid binary cannot escalate to root" "no-escalation" \
-  'out=$(timeout 10 su root -c id </dev/null 2>&1); case "$out" in *"uid=0"*) echo "ESCALATED: $out";; *) echo no-escalation;; esac'
+check "a setuid binary refuses escalation to root" "Authentication failure" \
+  'expect_refusal 1 "Authentication failure" timeout 10 su root -c id </dev/null'
 
 echo
 echo "-- sessiond as PID 1"
@@ -223,13 +217,14 @@ echo
 echo "-- the agents start"
 # --version says a file exists. --help makes the program parse its own
 # configuration, which is what actually fails when $HOME is read-only.
-check "claude reports its pinned version" "$CLAUDE_VERSION (Claude Code)" 'timeout 90 claude --version'
+check "claude reports its pinned version" "$CLAUDE_VERSION (Claude Code)" 'timeout 90 claude --version' probe exact
 check "claude starts with a read-only \$HOME" "claude-started" \
   'timeout 90 claude --help >/dev/null 2>&1 && echo claude-started'
 check "claude's config directory is redirected onto a writable mount" "claude-config-writable" \
   'case "$CLAUDE_CONFIG_DIR" in /rainier/agents/*) ;; *) echo "NOT-ON-MOUNT $CLAUDE_CONFIG_DIR"; exit 1;; esac
    mkdir -p "$CLAUDE_CONFIG_DIR" && touch "$CLAUDE_CONFIG_DIR/.probe" && echo claude-config-writable'
-check "codex reports its pinned version" "codex-cli $CODEX_VERSION" 'timeout 90 codex --version'
+check "codex reports its pinned version" "codex-cli $CODEX_VERSION" \
+  'mkdir -p "$CODEX_HOME" && timeout 90 codex --version' probe exact
 check "codex starts with a read-only \$HOME" "codex-started" \
   'timeout 90 codex --help >/dev/null 2>&1 && echo codex-started'
 check "codex's home is redirected onto a writable mount" "codex-home-writable" \
@@ -365,10 +360,7 @@ check "gh is executable and reports its version" "gh version" 'gh --version'
 # an image can be authenticated, and a session's GitHub credential is minted per
 # git operation by sessiond's helper, which gh does not consult.
 check "gh reports unauthenticated without timing out" "not logged into any GitHub hosts" '
-  status=0
-  out=$(timeout 30 gh auth status 2>&1) || status=$?
-  [ "$status" -eq 1 ] || { printf "unexpected gh exit: %s\n" "$status"; exit 1; }
-  printf "%s\n" "$out"'
+  expect_refusal 1 "not logged into any GitHub hosts" timeout 30 gh auth status'
 check "an OpenSSH client is present" "OpenSSH" 'ssh -V 2>&1'
 check "ripgrep, jq and the GNU text tools are the real ones" "tools-ok" '
   rg --version >/dev/null || { echo "no rg"; exit 1; }

@@ -94,6 +94,11 @@ BASE_IMAGE=node:22-bookworm'`). The toolchain script carries checksums for both
 architectures and refuses to install one architecture's binaries into the
 other's userland. CI never overrides the ARG: what ships is the digest.
 
+For the local fleet on ARM, use
+`BUILD_ARGS='--build-arg BASE_IMAGE=node:22-bookworm' make e2e`.
+Fleet startup delegates to the same image-build target and forwards that
+explicit development override. It never silently substitutes an unpinned base.
+
 This adds no general `devcontainer.json` support and is not a step toward it.
 
 ## The runtime contract this image is built against
