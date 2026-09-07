@@ -50,13 +50,16 @@ require_codex_package() {
   fi
   # Field-by-field with grep so the check needs no JSON parser in a stage that
   # has none yet, and so a manifest for another version or another CPU cannot
-  # pass by being well-formed.
-  local field
-  for field in "\"version\": *\"${version}\"" "\"target\": *\"${triple}\"" \
-               "\"layoutVersion\": *1" "\"entrypoint\": *\"bin/codex\"" \
-               "\"resourcesDir\": *\"codex-resources\"" "\"pathDir\": *\"codex-path\""; do
-    if ! grep -Eq "$field" "$manifest"; then
-      echo "codex: codex-package.json does not declare ${field}" >&2
+  # pass by being well-formed. Only the whitespace after the colon is a pattern;
+  # the values are escaped so a dot cannot match some other character.
+  local field literal
+  for field in "version:${version//./\\.}" "target:${triple//./\\.}" \
+               "layoutVersion:1" "entrypoint:bin/codex" \
+               "resourcesDir:codex-resources" "pathDir:codex-path"; do
+    literal=${field#*:}
+    case "$field" in layoutVersion:*) ;; *) literal="\"${literal}\"" ;; esac
+    if ! grep -Eq "\"${field%%:*}\": *${literal}" "$manifest"; then
+      echo "codex: codex-package.json does not declare ${field%%:*} = ${field#*:}" >&2
       return 1
     fi
   done
