@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode"
 )
 
 const rainierGitHubCLIPath = "/usr/local/libexec/rainier/gh"
@@ -25,7 +26,9 @@ func runGitHubCLI(args, env []string, mint func() (string, error), execProcess f
 	child := append([]string(nil), env...)
 	if managed && !offline {
 		token, err := mint()
-		invalid := token == "" || len(token) > 16<<10 || strings.IndexFunc(token, func(r rune) bool { return r <= 32 || r == 127 }) >= 0
+		invalid := token == "" || len(token) > 16<<10 || strings.IndexFunc(token, func(r rune) bool {
+			return r <= 32 || r == 127 || unicode.IsControl(r)
+		}) >= 0
 		if err != nil || invalid {
 			fmt.Fprintln(stderr, "rainier: GitHub credential unavailable; check your connection and workspace sharing with rainier connection ls")
 			return 1

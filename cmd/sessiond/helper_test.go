@@ -102,6 +102,35 @@ func TestMintCredentialRejectsMalformedOrOversizeSocketResponses(t *testing.T) {
 	}
 }
 
+// TestMintCredentialAcceptsOneValueBeforePeerClose pins the socket contract:
+// the helper decodes one bounded JSON value and returns without waiting for a
+// peer that keeps the connection open. It deliberately does not validate
+// unread trailing stream bytes; strict whole-stream framing would be a
+// separately compatible protocol change.
+func TestMintCredentialAcceptsOneValueBeforePeerClose(t *testing.T) {
+	start := time.Now()
+	token, err := mintCredential(rawCredentialSocket(t,
+		`{"ok":true,"payload":{"token":"synthetic-token"}}`, true), time.Second)
+	if err != nil || token != "synthetic-token" {
+		t.Fatalf("mintCredential = %q, %v; want valid token", token, err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("valid response waited %s for peer close", elapsed)
+	}
+}
+
+// TestMintCredentialAcceptsOneValueWithTrailingData documents the existing
+// one-value response boundary. The reader is bounded and malformed or
+// oversized decoded values are refused, but unread trailing bytes are not
+// exhaustively framed or validated.
+func TestMintCredentialAcceptsOneValueWithTrailingData(t *testing.T) {
+	token, err := mintCredential(rawCredentialSocket(t,
+		`{"ok":true,"payload":{"token":"synthetic-token"}} trailing-data`, false), time.Second)
+	if err != nil || token != "synthetic-token" {
+		t.Fatalf("mintCredential = %q, %v; want first valid value", token, err)
+	}
+}
+
 func TestMintCredentialDeadlineAppliesToSocketResponse(t *testing.T) {
 	path := rawCredentialSocket(t, "", true)
 	start := time.Now()

@@ -33,11 +33,11 @@ import (
 // A session with none of them is not wrapped at all and boots exactly as it did
 // before Plan 5.
 //
-// SECRET HYGIENE (design §4.3, and the one invariant this whole file exists to
-// hold): nothing here ever handles a token. The clone URLs are the plain public
-// https ones, the gitconfig names a helper rather than a credential, and the
-// only path a token takes in the entire sandbox is the credential helper's
-// stdout, straight into the git process that asked for it (see helper.go).
+// SECRET HYGIENE (design §4.3): nothing here ever handles a token. The clone
+// URLs are plain public https ones, and the gitconfig names a helper rather
+// than a credential, so Git receives a token only over its helper pipe (see
+// helper.go). The separate github-cli launcher intentionally injects GH_TOKEN
+// into its replacement gh child; it is not a guarantee tied to process exit.
 // /workspace is a persistent volume — anything written here outlives the
 // session that wrote it.
 

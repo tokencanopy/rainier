@@ -61,7 +61,9 @@ func TestGitHubCLIDenialNeverExecs(t *testing.T) {
 }
 
 func TestGitHubCLIRejectsInvalidTokensWithoutExec(t *testing.T) {
-	for _, token := range []string{"", "contains\nnewline", "contains\x7fcontrol", strings.Repeat("x", (16<<10)+1)} {
+	for _, token := range []string{
+		"", "contains\nnewline", "contains\x7fcontrol", "contains\u0085control", "contains\u009fcontrol", strings.Repeat("x", (16<<10)+1),
+	} {
 		t.Run("invalid token", func(t *testing.T) {
 			var output bytes.Buffer
 			execs := 0

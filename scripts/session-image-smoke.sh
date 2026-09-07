@@ -90,6 +90,7 @@ probe() {
     -e CODEX_HOME=/rainier/agents/codex \
     --entrypoint timeout "$IMAGE" -k 10 "$PROBE_TIMEOUT" /bin/bash -c "set -uo pipefail
 $(declare -f expect_refusal)
+$(declare -f brokered_gh_probe)
 $1" 2>&1
 }
 
@@ -112,6 +113,7 @@ probe_setup() {
     -w /workspace \
     --entrypoint timeout "$IMAGE" -k 10 "$PROBE_TIMEOUT" /bin/bash -c "set -uo pipefail
 $(declare -f expect_refusal)
+$(declare -f brokered_gh_probe)
 $1" 2>&1
 }
 
@@ -359,14 +361,7 @@ check "git makes a commit" "git-ok" '
   [ "$(git rev-list --count HEAD)" = 1 ] && echo git-ok'
 check "gh is executable and reports its version" "gh version" 'gh --version'
 check "managed gh version runs offline without a socket" "gh version" 'RAINIER_SESSION=sess_test gh --version'
-check "wrapped gh receives only a synthetic socket credential" "synthetic-gh-token" '
-  rm -f /workspace/.rainier/agent.sock
-  python3 -c "import json,socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.bind(\"/workspace/.rainier/agent.sock\"); s.listen(1); c,_=s.accept(); c.settimeout(5); req=json.loads(c.makefile(\"r\").readline()); req == {\"method\":\"mint_git_credential\",\"payload\":{}} or sys.exit(1); c.sendall(b\"{\\\"ok\\\":true,\\\"payload\\\":{\\\"token\\\":\\\"synthetic-gh-token\\\"}}\\n\"); c.close(); s.close()" &
-  p=$!
-  for _ in $(seq 40); do test -S /workspace/.rainier/agent.sock && break; sleep 0.05; done
-  out=$(RAINIER_SESSION=sess_test GH_TOKEN=old GITHUB_TOKEN=older gh auth token)
-  wait "$p"
-  test "$out" = synthetic-gh-token && echo "$out"'
+check "wrapped gh receives only a synthetic socket credential" "synthetic-gh-token" 'brokered_gh_probe'
 # Deliberately an "it runs" check and not an "it is signed in" one: nothing in
 # an image is authenticated. The preceding fixture covers sessiond's one-shot
 # brokered path without letting a real credential enter the image smoke.

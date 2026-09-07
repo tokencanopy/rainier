@@ -15,13 +15,12 @@ import (
 // by git as `sessiond git-credential-helper <operation>`. Git spawns it with the
 // request on stdin and reads the credential back off stdout.
 //
-// It is the ONLY path a token takes inside a sandbox, and it is a path with no
-// branches: the helper asks sessiond over the unix socket, sessiond asks
-// controld over the session RPC, and the answer is printed to the pipe git is
-// reading and then forgotten when this process exits. Nothing is cached, logged,
-// written to a file, or put in an environment variable — a token that reached
-// any of those would outlive the git process that needed it, on a volume that
-// outlives the session.
+// For Git operations it is the pipe-only token path: the helper asks sessiond
+// over the unix socket, sessiond asks controld over the session RPC, and the
+// answer is printed to the pipe git is reading. Nothing is cached, logged, or
+// written to a file. mintCredential is also reused by github-cli, which
+// intentionally supplies GH_TOKEN only to its replacement gh child; that
+// child and its descendants may retain or copy the ordinary access token.
 //
 // Being a subcommand of sessiond rather than a second binary is what makes that
 // affordable: the static binary is already in every image, so there is no new
@@ -231,6 +230,12 @@ func mintCredential(sockPath string, timeout time.Duration) (string, error) {
 	if err := json.NewEncoder(c).Encode(socketRequest{Method: mintMethod, Payload: json.RawMessage(`{}`)}); err != nil {
 		return "", fmt.Errorf("rainier: asking sessiond for a GitHub credential: %w", err)
 	}
+	// Decode one bounded response value without waiting for EOF: sessiond's
+	// json.Encoder writes one response, while a peer may keep the connection
+	// open. Malformed or oversized decoded values are refused. Unread trailing
+	// stream bytes are intentionally not exhaustively validated by this
+	// one-value response contract; stricter whole-stream framing needs a
+	// separately compatible protocol change.
 	bounded := &io.LimitedReader{R: c, N: (16 << 10) + 1}
 	var resp socketResponse
 	if err := json.NewDecoder(bounded).Decode(&resp); err != nil || bounded.N <= 1 {
