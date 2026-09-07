@@ -49,6 +49,40 @@ An unavailable optional endpoint means compatibility is not established. A 404
 alone is not evidence that an upgrade is required. The report does not guess a
 backend version; consult your administrator if an endpoint is missing or forbidden.
 
+## Give your sessions GitHub access
+
+How this works depends on which server you logged in to, and the two are not
+interchangeable.
+
+On a **self-hosted** server, `login` vaults a GitHub token for you. `rainier
+creds` shows what is stored — provider, status, scopes, verification and use
+times, never a value — and `rainier login --refresh github` replaces it when
+the status is `needs_refresh` or the scopes lack `repo`.
+
+On the **hosted** service there is no vault. You authorize GitHub in the
+browser, on the last step of `login --cloud`, and the service brokers a
+credential into each session; `rainier creds` says so rather than reporting an
+empty vault. A connection starts shared with no workspace, so nothing can
+clone until you share it with one:
+
+```bash
+rainier connection ls               # provider, GitHub login, access mode, workspaces
+rainier connection share github     # let your current workspace use it
+```
+
+`share` and `unshare` change only the workspace you name — your current one,
+or `--workspace <id>` for another you belong to — keeping the other workspaces
+the connection reached when the command read it. Neither changes the access
+mode, so neither can widen the connection to all your workspaces. Neither
+prints a credential: on this side the CLI never has one. Use `rainier help
+connection` for the rest.
+
+The API replaces the connection's whole workspace list rather than adding to
+it, and offers no conditional write, so the CLI reads the list and sends back
+an edited copy. A change another client makes in between is overwritten. This
+only arises if you edit one connection from two places at once; the workspace
+list each command prints is the one the server confirmed.
+
 ## Choose an environment and sign in to your coding agent
 
 ```bash

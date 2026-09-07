@@ -78,6 +78,8 @@ func main() {
 		err = runPull(rest)
 	case "creds":
 		err = runCreds(rest)
+	case "connection":
+		err = runConnection(rest)
 	case "agent":
 		err = runAgent(rest)
 	case "secret":
@@ -121,6 +123,7 @@ commands:
   push     <local-dir> <id|name>:<path>
   pull     <id|name>:<path> <local-dir>
   creds
+  connection ls | share <provider> [--workspace ID] | unshare <provider> [--workspace ID]
   agent    login <provider> --env NAME | ls | logout <provider> [--yes]
   secret   set <NAME> [--value V] | ls | rm <NAME>
   env      create <name> [flags] | ls | show <ref> | update <ref> [flags] | rm <ref>
@@ -146,6 +149,22 @@ needs_refresh means git saw that token rejected — run
 to log in again with a fresh token and clear it. Use the same command when
 "creds" shows scopes without "repo": that token can prove who you are but
 cannot do git.
+
+On a hosted rainier that vault is not how GitHub works: you connect your
+GitHub account in the browser (the last step of "login --cloud" has a Connect
+GitHub button) and the cell brokers a credential into each session. "creds"
+has nothing to show there; "connection" is the command. "connection ls" is
+what you have connected, the GitHub login it names, and the workspaces it
+reaches; a new connection reaches none of them, so
+
+  rainier connection share github
+
+lets your current workspace use it and "connection unshare github" stops it
+again. Both change only the workspace you name, keeping the others the
+connection reached when the command read it, and neither ever prints a
+credential: the CLI never has one to print. The API replaces the whole
+workspace list rather than adding to it and offers no conditional write, so
+editing one connection from two places at once loses one of the two edits.
 
 diff shows, per repository the session cloned, what its branch changed against
 the base branch it started from — git's own "--stat", read from inside the
@@ -513,6 +532,12 @@ func runLogin(args []string) error {
 // the caller, and nothing about anyone else. There is no value in the
 // response and none in this table by construction — a credential is
 // write-only at that API exactly like a secret.
+//
+// The vault is a self-hosted idea. A hosted edge neither serves that route nor
+// forwards it, so this command can only ever 404 against one, and a bare
+// "resource not found" reads as "you have no credential" — the opposite of
+// useful for a person whose GitHub connection is fine. Say which command owns
+// the question instead, before spending the round trip.
 func runCreds(args []string) error {
 	fs := flag.NewFlagSet("creds", flag.ExitOnError)
 	fs.Parse(args)
@@ -520,6 +545,10 @@ func runCreds(args []string) error {
 	cfg, err := requireLogin()
 	if err != nil {
 		return err
+	}
+	if ctx, ok := cfg.Active(); ok && ctx.Hosted() {
+		return errors.New("this is a hosted rainier, which has no credential vault: GitHub is a connection you " +
+			"authorize in the browser, and `rainier connection ls` is what shows it")
 	}
 	c := cli.NewClient(cfg)
 

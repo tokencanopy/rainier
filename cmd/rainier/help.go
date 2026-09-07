@@ -50,7 +50,8 @@ Configure:
   env          Manage reusable session environments
   agent        Log coding agents in or out; inspect status
   secret       Manage write-only environment secrets
-  creds        Inspect GitHub credential status
+  creds        Inspect GitHub credential status (self-hosted)
+  connection   Inspect a hosted GitHub connection; share it with a workspace
   context, workspace   Select your server and workspace
   version      Show CLI build version
 
@@ -181,7 +182,9 @@ This selection scopes subsequent requests; it does not create a workspace.`
 	case "diff":
 		help = "usage: rainier diff <id|name>\n\nShow git --stat for each cloned repository against its original base branch."
 	case "creds":
-		help = "usage: rainier creds\n\nShow GitHub credential provider, status, scopes and verification/use times.\nIf needs_refresh or repo scope is missing, run rainier login --refresh github."
+		help = "usage: rainier creds\n\nShow GitHub credential provider, status, scopes and verification/use times.\nIf needs_refresh or repo scope is missing, run rainier login --refresh github.\nThis reads a self-hosted server's vault. On a hosted rainier, GitHub is a\nconnection you authorize in the browser instead: see rainier help connection."
+	case "connection":
+		help = connectionUsage + "\n\nProviders: " + strings.Join(connectionProviders, ", ") + "."
 	default:
 		return false
 	}
