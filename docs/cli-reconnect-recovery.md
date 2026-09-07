@@ -42,8 +42,8 @@ is needed. Existing cloud sessions are not modified.
 - Routine recovery writes no local status text into the remote application's
   screen, on either stdout or stderr. The next remote frame may use relative
   cursor movements, so inserting even one line shifts its rendering. The same
-  quiet behavior applies throughout retry backoff; during a prolonged outage
-  the screen remains unchanged and Ctrl-C cancels waiting. Final failure,
+  quiet behavior applies throughout retry backoff: recovery emits no local
+  diagnostics, and Ctrl-C cancels waiting. Final failure,
   deliberate detach, and remote process exit still report their outcomes.
   The one-shot developer client `rattach` retains its disconnect/resume notice.
 
@@ -52,6 +52,12 @@ saving/restoring only the cursor cannot undo text overwritten or scrolled by a
 notice; forcing a full repaint changes replay semantics and may duplicate or
 lose scrollback. An out-of-band prolonged-outage indicator is a future UI
 decision, not a reason to write into the remote application's screen.
+
+Input handling during recovery remains a separate limitation: termios returns
+to cooked mode between attempts, so typed input or enabled mouse reports can
+echo locally and disturb the screen. Queued TTY input is discarded before the
+next stream, but that cannot undo local echo. Keeping input ownership across
+retry backoff requires a separate change and an input-during-outage PTY test.
 
 Alternatives rejected: longer token/lease lifetimes only postpone the failure and
 weaken revocation bounds; retrying every401 indefinitely masks revoked access;

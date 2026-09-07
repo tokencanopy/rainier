@@ -153,9 +153,11 @@ for the token-locking, context-pinning, and final terminal-cleanup invariants.
 Other HTTP responses are permanent and return immediately. Backoff starts at
 100 ms and doubles to a 2 s cap. Recovery is quiet: local connection-lost or
 retry notices would move the cursor and corrupt a TUI's next relative update.
-The screen remains unchanged during prolonged retry backoff; Ctrl-C cancels
-waiting, and final errors and deliberate detach remain visible. The one-shot
-developer client `rattach` still prints its disconnect/resume notice. The
+Recovery emits no local diagnostics during retry backoff; Ctrl-C cancels
+waiting, and final errors and deliberate detach remain visible. Cooked-mode
+input echo between attempts can still disturb the screen; preserving input
+ownership throughout recovery is deferred (see the reconnect recovery notes).
+The one-shot developer client `rattach` still prints its disconnect/resume notice. The
 product CLI does not log terminal contents. The reconnect cursor is the last
 sequence actually written to local stdout, so the user sees neither a gap nor
 a deliberate full-log replay.
