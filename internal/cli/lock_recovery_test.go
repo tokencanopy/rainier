@@ -41,3 +41,31 @@ func TestRefreshDeadlineIncludesSiblingConfigLock(t *testing.T) {
 		t.Fatal("refresh ignored cancellation while waiting for sibling's config lock")
 	}
 }
+
+func TestUpdateConfigContextCancelsWhileWaitingForSiblingLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("RAINIER_CONFIG", path)
+	f, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- UpdateConfigContext(ctx, func(*Config) error { return nil }) }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("UpdateConfigContext = %v, want context canceled", err)
+		}
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	case <-time.After(time.Second):
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		<-done
+		t.Fatal("UpdateConfigContext ignored cancellation while waiting for sibling's config lock")
+	}
+}

@@ -1,13 +1,18 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -26,19 +31,23 @@ import (
 // two answer different questions and share no columns, so they stay two
 // commands, and `creds` says so when it is pointed at a hosted context.
 //
-// Nothing here can widen access on its own. The access mode is never sent at
-// all: the all-current-and-future opt-in is §8.1's explicit user decision, and
-// a CLI that could set it as a side effect of sharing one workspace would be
-// making that decision for them.
+// Share and unshare cannot widen access on their own: they never send the
+// access mode. Reconnect is the one exception, because its whole contract is
+// to restore the exact mode the owner had already chosen before it revoked the
+// old authorization.
 //
 // What the workspace edit does and does not guarantee, precisely, because the
 // distinction matters and is easy to overstate:
 //
 // PATCH /v0/connections/{provider} REPLACES the selection; there is no add or
 // remove verb. So `share` and `unshare` are GET, edit one entry, PATCH the
-// whole set. Server-side each PATCH is atomic — the adapter takes a FOR UPDATE
-// lock on the connection row and does its delete-and-insert inside that
-// transaction, so no reader sees a partial selection and two PATCHes serialize.
+// whole set. Server-side the workspace replacement itself is atomic — the
+// adapter takes a FOR UPDATE lock on the connection row and does its
+// delete-and-insert inside that transaction, so no reader sees a partial
+// selection and two selection writes serialize. A PATCH carrying both the
+// selection and access mode is currently two store operations; reconnect
+// therefore reads back after an uncertain write and never claims restoration
+// unless the complete policy is visible.
 //
 // The CLI's read-modify-write is NOT atomic, and cannot be made so. It
 // preserves every grant present in the snapshot it read, which is what stops a
@@ -145,6 +154,7 @@ func runConnection(args []string) error {
 
 const (
 	connectionReconnectPollInterval = 2 * time.Second
+	connectionReconnectWindow       = 10 * time.Minute
 	// The browser's Connect GitHub ticket expires after ten minutes. Polling
 	// beyond it could only turn a missed authorization into an unbounded CLI.
 	connectionReconnectPollLimit = 300
@@ -162,10 +172,21 @@ type cloudLoginRunner func(edgeURL, deviceName, contextName string) error
 // after it, failures are explicit that the account is disconnected and render
 // the non-secret policy needed for recovery.
 func runConnectionReconnect(args []string) error {
-	return runConnectionReconnectWith(args, runCloudLogin, time.Sleep, connectionReconnectPollLimit)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	login := func(edgeURL, deviceName, contextName string) error {
+		loginCtx, cancel := context.WithTimeout(ctx, loginAttemptFallbackTTL)
+		defer cancel()
+		return runCloudLoginContext(loginCtx, edgeURL, deviceName, contextName, nil)
+	}
+	return runConnectionReconnectContext(ctx, args, login, nil, connectionReconnectPollLimit)
 }
 
 func runConnectionReconnectWith(args []string, login cloudLoginRunner, sleep func(time.Duration), pollLimit int) error {
+	return runConnectionReconnectContext(context.Background(), args, login, sleep, pollLimit)
+}
+
+func runConnectionReconnectContext(ctx context.Context, args []string, login cloudLoginRunner, sleep func(time.Duration), pollLimit int) error {
 	fs := flag.NewFlagSet("connection reconnect", flag.ExitOnError)
 	fs.Parse(args)
 	provider, err := connectionProviderNamed(fs.Arg(0), "reconnect")
@@ -185,10 +206,20 @@ func runConnectionReconnectWith(args []string, login cloudLoginRunner, sleep fun
 		return fmt.Errorf("connection reconnect: context %s is not a hosted one; provider connections come from `rainier login --cloud EDGE_URL`", cfg.ActiveName())
 	}
 
+	contextName := cfg.ActiveName()
+	server := strings.TrimRight(current.Server, "/")
+	if !validReconnectOpaqueID(contextName) || !validReconnectServer(server) {
+		return errors.New("connection reconnect: the active hosted context is invalid; the existing connection was not changed")
+	}
 	c := cli.NewClient(cfg)
-	rows, err := fetchConnections(c)
+	originalAccount, err := fetchConnectionAccountBounded(ctx, c)
 	if err != nil {
-		return err
+		return errors.New("connection reconnect: could not verify the current Rainier account; the existing connection was not changed")
+	}
+	freezeReconnectClient(c)
+	rows, err := fetchConnectionsBounded(ctx, c)
+	if err != nil {
+		return errors.New("connection reconnect: could not read the current GitHub connection; the existing connection was not changed")
 	}
 	i := slices.IndexFunc(rows, func(v connectionView) bool { return v.Provider == provider })
 	if i < 0 {
@@ -201,28 +232,48 @@ func runConnectionReconnectWith(args []string, login cloudLoginRunner, sleep fun
 	if previous.Workspaces == nil {
 		return errors.New("connection reconnect: server omitted the workspace selection; the existing connection was not changed")
 	}
+	if err := validateReconnectSelection(previous.Workspaces); err != nil {
+		return err
+	}
 	previous.Workspaces = append([]string{}, previous.Workspaces...)
 
 	fmt.Printf("Reconnecting replaces the stored %s authorization. If the browser flow is not completed, GitHub remains disconnected.\n", provider)
-	if err := c.Do(http.MethodDelete, "/v0/connections/"+provider, nil, nil); err != nil {
-		return connectionError(err, provider, "reconnect", cfg)
+	if err := doConnectionBounded(ctx, c, http.MethodDelete, "/v0/connections/"+provider, nil, nil); err != nil {
+		return reconnectDeleteUncertainError(provider, server, contextName, previous)
 	}
 
 	fmt.Println("Finish signing in in the browser, then choose Connect GitHub on the last step.")
-	if err := login(cfg.ServerURL, "", cfg.ActiveName()); err != nil {
-		return reconnectRecoveryError(provider, cfg, previous, err)
+	if err := login(server, "", contextName); err != nil {
+		return reconnectDisconnectedError(provider, server, contextName, previous, "the browser login did not finish")
 	}
 
-	// Login may rotate the Rainier token pair, so build the polling client from
-	// the config it just saved rather than the snapshot used for DELETE.
-	latest, err := requireLogin()
+	// Login may rotate the Rainier token pair. Reload that exact named context,
+	// never whichever context is active now: another terminal is allowed to
+	// switch Current while this browser flow is open.
+	latest, err := cli.Load()
 	if err != nil {
-		return reconnectRecoveryError(provider, cfg, previous, err)
+		return reconnectDisconnectedError(provider, server, contextName, previous, "the saved hosted context is no longer available")
 	}
-	reconnectClient := cli.NewClient(latest)
-	connected, err := waitForConnection(reconnectClient, provider, sleep, pollLimit)
+	reconnectClient, err := reconnectClientForPinnedContext(latest, contextName, server)
 	if err != nil {
-		return reconnectRecoveryError(provider, cfg, previous, err)
+		return reconnectDisconnectedError(provider, server, contextName, previous, "the saved hosted context changed during login")
+	}
+	account, err := fetchConnectionAccountBounded(ctx, reconnectClient)
+	if err != nil {
+		return reconnectDisconnectedError(provider, server, contextName, previous, "the new Rainier login could not be verified")
+	}
+	if account != originalAccount {
+		return reconnectDisconnectedError(provider, server, contextName, previous, "the browser login authenticated a different Rainier account")
+	}
+
+	waitCtx, cancelWait := context.WithTimeout(ctx, connectionReconnectWindow)
+	defer cancelWait()
+	connected, err := waitForConnection(waitCtx, reconnectClient, provider, sleep, pollLimit)
+	if err != nil {
+		return reconnectDisconnectedError(provider, server, contextName, previous, "the GitHub browser connection did not finish")
+	}
+	if !validReconnectDisplay(connected.Login) {
+		return reconnectConnectedPolicyError(provider, contextName, previous, "the replacement connection returned an invalid login")
 	}
 
 	body := struct {
@@ -230,26 +281,41 @@ func runConnectionReconnectWith(args []string, login cloudLoginRunner, sleep fun
 		Workspaces []string `json:"workspaces"`
 	}{AccessMode: previous.AccessMode, Workspaces: previous.Workspaces}
 	var restored connectionView
-	if err := reconnectClient.Do(http.MethodPatch, "/v0/connections/"+provider, body, &restored); err != nil {
-		return reconnectRecoveryError(provider, cfg, previous, err)
-	}
-	if restored.Provider != provider || restored.AccessMode != previous.AccessMode ||
-		restored.Workspaces == nil || !sameWorkspaceSelection(restored.Workspaces, previous.Workspaces) {
-		return reconnectRecoveryError(provider, cfg, previous,
-			errors.New("the server response did not confirm the saved access policy"))
+	patchErr := doConnectionBounded(ctx, reconnectClient, http.MethodPatch, "/v0/connections/"+provider, body, &restored)
+	if patchErr != nil || !reconnectPolicyConfirmed(restored, connected, previous) {
+		// A gateway can lose a successful PATCH response. Read back once before
+		// declaring repair necessary; if the edge's older two-step handler only
+		// applied part of the policy, this same read exposes that honestly.
+		rows, readErr := fetchConnectionsBounded(ctx, reconnectClient)
+		if readErr != nil {
+			return reconnectReplacementUncertainError(provider, server, contextName, previous)
+		}
+		i := slices.IndexFunc(rows, func(v connectionView) bool { return v.Provider == provider })
+		if i < 0 {
+			return reconnectDisconnectedError(provider, server, contextName, previous, "the replacement connection disappeared before its access policy was restored")
+		}
+		if !reconnectPolicyConfirmed(rows[i], connected, previous) {
+			return reconnectConnectedPolicyError(provider, contextName, previous, "the saved access policy was not confirmed")
+		}
+		restored = rows[i]
 	}
 
+	if restored.AccessMode == accessAll {
+		fmt.Printf("reconnected %s as %s and restored access to all current and future workspaces\n",
+			provider, safeReconnectDisplay(restored.Login))
+		return nil
+	}
 	fmt.Printf("reconnected %s as %s and restored %s access to %s\n",
-		provider, connected.Login, restored.AccessMode, dashIfEmpty(strings.Join(restored.Workspaces, ", ")))
+		provider, safeReconnectDisplay(restored.Login), restored.AccessMode, dashIfEmpty(strings.Join(restored.Workspaces, ", ")))
 	return nil
 }
 
-func waitForConnection(c *cli.Client, provider string, sleep func(time.Duration), pollLimit int) (connectionView, error) {
+func waitForConnection(ctx context.Context, c *cli.Client, provider string, sleep func(time.Duration), pollLimit int) (connectionView, error) {
 	if pollLimit < 1 {
 		return connectionView{}, errors.New("the GitHub browser connection did not finish")
 	}
 	for attempt := 0; attempt < pollLimit; attempt++ {
-		rows, err := fetchConnections(c)
+		rows, err := fetchConnectionsContext(ctx, c)
 		if err != nil {
 			return connectionView{}, err
 		}
@@ -257,10 +323,80 @@ func waitForConnection(c *cli.Client, provider string, sleep func(time.Duration)
 			return rows[i], nil
 		}
 		if attempt+1 < pollLimit {
-			sleep(connectionReconnectPollInterval)
+			if sleep != nil {
+				sleep(connectionReconnectPollInterval)
+				if err := ctx.Err(); err != nil {
+					return connectionView{}, err
+				}
+			} else {
+				timer := time.NewTimer(connectionReconnectPollInterval)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return connectionView{}, ctx.Err()
+				case <-timer.C:
+				}
+			}
 		}
 	}
 	return connectionView{}, errors.New("the GitHub browser connection did not finish before its ten-minute window closed")
+}
+
+func doConnectionBounded(parent context.Context, c *cli.Client, method, path string, in, out any) error {
+	ctx, cancel := context.WithTimeout(parent, edgeRequestTimeout)
+	defer cancel()
+	return c.DoContext(ctx, method, path, in, out)
+}
+
+func fetchConnectionsBounded(parent context.Context, c *cli.Client) ([]connectionView, error) {
+	ctx, cancel := context.WithTimeout(parent, edgeRequestTimeout)
+	defer cancel()
+	return fetchConnectionsContext(ctx, c)
+}
+
+func fetchConnectionAccountBounded(parent context.Context, c *cli.Client) (string, error) {
+	var me struct {
+		User userView `json:"user"`
+	}
+	if err := doConnectionBounded(parent, c, http.MethodGet, "/v0/me", nil, &me); err != nil {
+		return "", err
+	}
+	if !validReconnectOpaqueID(me.User.ID) {
+		return "", errors.New("invalid account identity")
+	}
+	return me.User.ID, nil
+}
+
+func reconnectClientForPinnedContext(cfg cli.Config, name, server string) (*cli.Client, error) {
+	ctx, ok := cfg.Contexts[name]
+	if !ok || !ctx.Hosted() || strings.TrimRight(ctx.Server, "/") != server {
+		return nil, errors.New("pinned context changed")
+	}
+	if !cfg.Use(name) {
+		return nil, errors.New("pinned context disappeared")
+	}
+	c := cli.NewClient(cfg)
+	freezeReconnectClient(c)
+	return c, nil
+}
+
+func freezeReconnectClient(c *cli.Client) {
+	// This login just minted a fresh access token, which outlives the bounded
+	// reconnect window. Do not adopt a newer token pair from disk after the
+	// live account check: a sibling browser login can replace this named
+	// context with another account while preserving its stale cached OwnerID.
+	// Refusing refresh means a 401 becomes safe recovery instead of a chance to
+	// apply the old account's policy to that sibling token family.
+	c.RefreshToken = ""
+	c.LoadTokens = nil
+	c.SaveTokens = nil
+}
+
+func reconnectPolicyConfirmed(got, connected, previous connectionView) bool {
+	return got.Provider == connected.Provider && got.Provider == previous.Provider &&
+		got.Login == connected.Login && validReconnectDisplay(got.Login) &&
+		got.AccessMode == previous.AccessMode && got.Workspaces != nil &&
+		sameWorkspaceSelection(got.Workspaces, previous.Workspaces)
 }
 
 func sameWorkspaceSelection(a, b []string) bool {
@@ -274,19 +410,128 @@ func sameWorkspaceSelection(a, b []string) bool {
 	return slices.Equal(a, b)
 }
 
-func reconnectRecoveryError(provider string, cfg cli.Config, previous connectionView, cause error) error {
+func reconnectDeleteUncertainError(provider, server, contextName string, previous connectionView) error {
 	var recovery strings.Builder
-	fmt.Fprintf(&recovery, "connection reconnect: the previous %s connection is disconnected and the replacement did not finish: %v\n", provider, cause)
-	fmt.Fprintf(&recovery, "Connect it again: rainier login --cloud %s, then choose Connect GitHub.\n", cfg.ServerURL)
+	fmt.Fprintf(&recovery, "connection reconnect: could not confirm whether the previous %s connection was disconnected.\n", provider)
+	appendReconnectContext(&recovery, contextName)
+	fmt.Fprintln(&recovery, "Check first: rainier connection ls")
+	fmt.Fprintln(&recovery, "If it is still connected, rerun this reconnect command. If it is absent, connect it again:")
+	fmt.Fprintf(&recovery, "  rainier login --cloud %s --context %s\n", shellQuote(server), shellQuote(contextName))
+	fmt.Fprintln(&recovery, "In the browser, sign in to the same Rainier account this context used before.")
+	appendReconnectPolicyRecovery(&recovery, provider, previous)
+	return errors.New(strings.TrimSpace(recovery.String()))
+}
+
+func reconnectDisconnectedError(provider, server, contextName string, previous connectionView, reason string) error {
+	var recovery strings.Builder
+	fmt.Fprintf(&recovery, "connection reconnect: %s; the previous %s connection is disconnected and no saved policy was applied.\n", reason, provider)
+	appendReconnectContext(&recovery, contextName)
+	fmt.Fprintf(&recovery, "Connect it again: rainier login --cloud %s --context %s, then choose Connect GitHub.\n", shellQuote(server), shellQuote(contextName))
+	fmt.Fprintln(&recovery, "In the browser, sign in to the same Rainier account this context used before.")
+	appendReconnectPolicyRecovery(&recovery, provider, previous)
+	return errors.New(strings.TrimSpace(recovery.String()))
+}
+
+func reconnectConnectedPolicyError(provider, contextName string, previous connectionView, reason string) error {
+	var recovery strings.Builder
+	fmt.Fprintf(&recovery, "connection reconnect: %s. GitHub is connected, but its saved access policy is not confirmed.\n", reason)
+	appendReconnectContext(&recovery, contextName)
+	fmt.Fprintln(&recovery, "Do not reconnect again. Check the current policy: rainier connection ls")
+	appendReconnectPolicyRecovery(&recovery, provider, previous)
+	return errors.New(strings.TrimSpace(recovery.String()))
+}
+
+func reconnectReplacementUncertainError(provider, server, contextName string, previous connectionView) error {
+	var recovery strings.Builder
+	fmt.Fprintf(&recovery, "connection reconnect: could not confirm whether the replacement %s connection is still live or whether its saved access policy was restored.\n", provider)
+	appendReconnectContext(&recovery, contextName)
+	fmt.Fprintln(&recovery, "Check first: rainier connection ls")
+	fmt.Fprintln(&recovery, "If it is absent, connect it again:")
+	fmt.Fprintf(&recovery, "  rainier login --cloud %s --context %s\n", shellQuote(server), shellQuote(contextName))
+	fmt.Fprintln(&recovery, "In the browser, sign in to the same Rainier account this context used before.")
+	fmt.Fprintln(&recovery, "If it is present, do not reconnect again; repair only the saved policy:")
+	appendReconnectPolicyRecovery(&recovery, provider, previous)
+	return errors.New(strings.TrimSpace(recovery.String()))
+}
+
+func appendReconnectContext(recovery *strings.Builder, contextName string) {
+	fmt.Fprintf(recovery, "Use the original context first: rainier context use %s\n", shellQuote(contextName))
+}
+
+func appendReconnectPolicyRecovery(recovery *strings.Builder, provider string, previous connectionView) {
 	if previous.AccessMode == accessAll {
-		fmt.Fprintln(&recovery, "The previous access mode was all workspaces; ask the hosted operator to restore all-workspace access after reconnecting.")
+		fmt.Fprintln(recovery, "The previous policy covered all current and future workspaces; ask the hosted operator to restore all-workspace access.")
+		if len(previous.Workspaces) > 0 {
+			fmt.Fprintf(recovery, "Its dormant saved selection was: %s\n", safeReconnectList(previous.Workspaces))
+		}
 	} else if len(previous.Workspaces) > 0 {
-		fmt.Fprintln(&recovery, "Then restore the previous workspace selection:")
+		fmt.Fprintln(recovery, "Restore the previous workspace selection:")
 		for _, workspace := range previous.Workspaces {
-			fmt.Fprintf(&recovery, "  rainier connection share %s --workspace %s\n", provider, workspace)
+			fmt.Fprintf(recovery, "  rainier connection share %s --workspace %s\n", provider, shellQuote(workspace))
 		}
 	}
-	return errors.New(strings.TrimSpace(recovery.String()))
+}
+
+func validateReconnectSelection(workspaces []string) error {
+	if len(workspaces) > 256 {
+		return errors.New("connection reconnect: invalid workspace selection from server; the existing connection was not changed")
+	}
+	seen := make(map[string]struct{}, len(workspaces))
+	for _, workspace := range workspaces {
+		if !validReconnectOpaqueID(workspace) {
+			return errors.New("connection reconnect: invalid workspace selection from server; the existing connection was not changed")
+		}
+		if _, duplicate := seen[workspace]; duplicate {
+			return errors.New("connection reconnect: invalid workspace selection from server; the existing connection was not changed")
+		}
+		seen[workspace] = struct{}{}
+	}
+	return nil
+}
+
+func validReconnectOpaqueID(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < 0x20 || value[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+func validReconnectServer(value string) bool {
+	u, err := url.Parse(value)
+	return err == nil && u.Host != "" && (u.Scheme == "https" || u.Scheme == "http") &&
+		u.User == nil && u.RawQuery == "" && u.Fragment == ""
+}
+
+func validReconnectDisplay(value string) bool {
+	return validReconnectOpaqueID(value)
+}
+
+func safeReconnectDisplay(value string) string {
+	if validReconnectDisplay(value) {
+		return value
+	}
+	return strconv.QuoteToASCII(value)
+}
+
+func safeReconnectList(values []string) string {
+	quoted := make([]string, 0, len(values))
+	for _, value := range values {
+		quoted = append(quoted, strconv.QuoteToASCII(value))
+	}
+	return strings.Join(quoted, ", ")
+}
+
+// shellQuote renders one opaque server value as one POSIX-shell argument.
+// It is used only in recovery commands; values are still validated before a
+// destructive operation, and quoting prevents printable punctuation from
+// becoming another command when copied.
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
 
 // runConnectionLs renders GET /v0/connections: one row per connected provider,
@@ -546,8 +791,12 @@ func describeWorkspace(w workspaceView) string {
 // are an operator's problem and not something the person at the keyboard can
 // fix by connecting harder, so say which it is.
 func fetchConnections(c *cli.Client) ([]connectionView, error) {
+	return fetchConnectionsContext(context.Background(), c)
+}
+
+func fetchConnectionsContext(ctx context.Context, c *cli.Client) ([]connectionView, error) {
 	var resp connectionsEnvelope
-	if err := c.Do(http.MethodGet, "/v0/connections", nil, &resp); err != nil {
+	if err := c.DoContext(ctx, http.MethodGet, "/v0/connections", nil, &resp); err != nil {
 		var apiErr *cli.APIError
 		if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound {
 			return nil, errors.New("this server has no provider connections: it is either a self-hosted rainier, " +
