@@ -1062,11 +1062,11 @@ ok "GitHub attributes the pushed commit to $GH_ACCOUNT <$GH_NOREPLY> on $GH_BRAN
 # /workspace/.rainier/agent.sock and open()s it: the count stays 0 because -l
 # prints nothing for a file it could not read, which is the right answer
 # arrived at by luck. The second is coverage — the alternative fix,
-# --exclude-dir=.rainier, is a GNU option BusyBox grep does not have (this
-# image is alpine, so `grep --exclude-dir` exits 2 with a usage message that
-# 2>/dev/null would hide, turning the whole probe into a silent 0), and it
-# would skip the workspace gitconfig, which is precisely the file a leaked
-# token would be written into.
+# --exclude-dir=.rainier, would skip the workspace gitconfig, which is
+# precisely the file a leaked token would be written into. (It is also an
+# option the session image only gained when it moved from BusyBox grep to GNU
+# grep; a probe that silently exits 2 under `2>/dev/null` is worth avoiding
+# whatever the image happens to ship.)
 GH_ATTACH3=/tmp/rainier-e2e-gh-attach3.txt
 attach_probe "$GH_SID" \
   "printf 'cfg-hits=%s ws-hits=%s env-hits=%s\n' \"\$(grep -r -l -E 'gh[pousr]_[A-Za-z0-9]|github_pat_' /workspace/$SCRATCH_REPO/.git 2>/dev/null | wc -l | tr -d ' ')\" \"\$(find /workspace -type f | xargs grep -l -E 'gh[pousr]_[A-Za-z0-9]|github_pat_' 2>/dev/null | wc -l | tr -d ' ')\" \"\$(env | grep -c -E 'gh[pousr]_[A-Za-z0-9]|github_pat_' || true)\"" \

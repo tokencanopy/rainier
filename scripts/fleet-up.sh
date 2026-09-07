@@ -3,6 +3,11 @@ set -euo pipefail
 command -v docker >/dev/null || export PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"
 command -v docker >/dev/null || { echo "docker CLI not found" >&2; exit 1; }
 
+# The session image (docs/session-image.md). It carries the whole default
+# developer toolchain, so a cold build pulls a Debian base and several hundred
+# megabytes of pinned upstream releases and takes minutes; every later run is
+# layer cache. `-q` keeps that quiet, which is the wrong trade the first time:
+# run `make session-image` once by hand if you want to watch it.
 docker build -q -t rainier-session:latest . >/dev/null
 go build -o bin/runnerd ./cmd/runnerd
 go build -o bin/egressd ./cmd/egressd

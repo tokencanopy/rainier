@@ -54,16 +54,15 @@ sleep 1 # let sessiond register and the container's network settle
 # 1. Direct egress must FAIL — internal:true means no default route out of
 # the container at all, so this must fail at the network level. The proxy
 # env vars are explicitly unset for this one check: the container has them
-# set (Task 13 injects a proxy URL into every session), and BusyBox wget
-# — discovered live while first running this script — does NOT simply
-# ignore a configured https_proxy the way the Task 13 spike assumed from an
-# unreachable-proxy probe; it sends a plain (non-CONNECT) request straight
-# to the proxy, which egressd correctly 405s. Left as-is, that 405 would
-# make this check pass on ANY platform where egressd is merely reachable —
-# including one where internal:true is NOT actually blocking the route —
-# which defeats the entire point of the check (it must fail because there
-# is no route, not because the proxy rejected an unsupported method).
-# Unsetting the proxy vars makes this a true test of the underlying route.
+# set (Task 13 injects a proxy URL into every session), and a wget that
+# honors them would be testing the proxy's answer rather than the absence of
+# a route. Discovered live on the original BusyBox-based session image, whose
+# wget did not ignore https_proxy the way the Task 13 spike assumed but sent
+# a plain (non-CONNECT) request straight to the proxy, which egressd
+# correctly 405s — and left as-is that 405 would make this check pass on ANY
+# platform where egressd is merely reachable, including one where
+# internal:true is NOT actually blocking the route. Unsetting the proxy vars
+# makes this a true test of the underlying route on any image.
 if docker exec "$cid" env -u HTTP_PROXY -u http_proxy -u HTTPS_PROXY -u https_proxy \
      wget -q -T 5 -O /dev/null https://example.com; then
   echo "FAIL: direct egress worked (internal:true is not actually enforcing)"
@@ -72,13 +71,11 @@ fi
 echo "PASS: direct egress blocked"
 
 # 2. Allowlisted host through the proxy must succeed. curl, not wget here:
-# BusyBox wget can't tunnel HTTPS through a proxy at all in this image
-# (verified in the spike — it silently ignores https_proxy and connects
-# direct, which step 1 above relies on but step 2 can't use). curl honors
-# the lowercase https_proxy the driver injects and automatically sends the
-# session id as HTTP Basic auth from the proxy URL's userinfo
-# (http://<session-id>:@host:port) — the only way a plain env-var proxy
-# flow can carry identity to egressd's allowlist at all.
+# the session image ships curl precisely so this path can be exercised (see
+# the Dockerfile), and curl honors the lowercase https_proxy the driver
+# injects and automatically sends the session id as HTTP Basic auth from the
+# proxy URL's userinfo (http://<session-id>:@host:port) — the only way a
+# plain env-var proxy flow can carry identity to egressd's allowlist at all.
 if ! docker exec "$cid" sh -c 'curl -sf -m 10 -o /dev/null https://example.com'; then
   echo "FAIL: allowlisted egress via proxy blocked"
   exit 1
