@@ -1,9 +1,13 @@
 package driver
 
 import (
+	"encoding/json"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -38,6 +42,101 @@ check example "$3" "$2" probe exact
 			}
 		})
 	}
+}
+
+// TestBrokeredGHProbeRequiresChildAndFixtureSuccess exercises the exact inner
+// smoke probe instead of reimplementing its status handling here. The fake gh
+// emits the expected marker so each failure proves the probe carries that
+// process status through to the outer check.
+func TestBrokeredGHProbeRequiresChildAndFixtureSuccess(t *testing.T) {
+	lib, err := filepath.Abs("../../scripts/session-image-checks.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name       string
+		ghStatus   string
+		serverExit string
+		pass       bool
+	}{
+		{"success", "0", "0", true},
+		{"marker then gh exit 42", "42", "0", false},
+		{"marker then fixture failure", "0", "7", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			// macOS's AF_UNIX pathname limit is shorter than t.TempDir's full
+			// test-name path. Keep all artifacts in t.TempDir while passing the
+			// fixture a short symlinked socket path.
+			shortDir := filepath.Join("/tmp", "ghp-"+strconv.Itoa(os.Getpid()))
+			if err := os.Symlink(dir, shortDir); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.Remove(shortDir) })
+			bin := filepath.Join(dir, "bin")
+			if err := os.Mkdir(bin, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(bin, "gh"), []byte("#!/bin/sh\nexec \"$RAINIER_GH_SMOKE_TEST_BINARY\" -test.run '^TestBrokeredGHProbeFakeGHHelper$'\n"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			testBinary, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("/bin/bash", "-c", `
+source "$1"
+brokered_gh_probe
+`, "brokered-gh-probe", lib)
+			cmd.Env = append(os.Environ(),
+				"PATH="+bin+":"+os.Getenv("PATH"),
+				"RAINIER_SMOKE_AGENT_SOCKET="+filepath.Join(shortDir, "agent.sock"),
+				"RAINIER_SMOKE_GH_EXIT="+tc.ghStatus,
+				"RAINIER_SMOKE_FIXTURE_EXIT="+tc.serverExit,
+				"RAINIER_GH_SMOKE_TEST_BINARY="+testBinary,
+				"RAINIER_GH_SMOKE_HELPER=1",
+			)
+			out, err := cmd.CombinedOutput()
+			if (err == nil) != tc.pass {
+				t.Fatalf("pass=%t, output=%q, err=%v", tc.pass, out, err)
+			}
+			if tc.pass && strings.TrimSpace(string(out)) != "synthetic-gh-token" {
+				t.Fatalf("success output=%q, want marker", out)
+			}
+		})
+	}
+}
+
+// TestBrokeredGHProbeFakeGHHelper is the synthetic gh process used by the
+// probe regression. It performs the actual socket request, prints the fixture
+// token, then takes the requested status so the test exercises child failure
+// masking at the probe boundary.
+func TestBrokeredGHProbeFakeGHHelper(t *testing.T) {
+	if os.Getenv("RAINIER_GH_SMOKE_HELPER") == "" {
+		return
+	}
+	c, err := net.Dial("unix", os.Getenv("RAINIER_SMOKE_AGENT_SOCKET"))
+	if err != nil {
+		os.Exit(97)
+	}
+	defer c.Close()
+	if err := json.NewEncoder(c).Encode(map[string]any{"method": "mint_git_credential", "payload": map[string]any{}}); err != nil {
+		os.Exit(98)
+	}
+	var response struct {
+		Payload struct {
+			Token string `json:"token"`
+		} `json:"payload"`
+	}
+	if err := json.NewDecoder(c).Decode(&response); err != nil || response.Payload.Token != "synthetic-gh-token" {
+		os.Exit(99)
+	}
+	fmt.Fprintln(os.Stdout, response.Payload.Token)
+	status, err := strconv.Atoi(os.Getenv("RAINIER_SMOKE_GH_EXIT"))
+	if err != nil {
+		os.Exit(96)
+	}
+	os.Exit(status)
 }
 
 func TestImageSmokeSetupExecution(t *testing.T) {

@@ -28,6 +28,12 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "github-cli" {
+		os.Exit(runGitHubCLI(os.Args[2:], os.Environ(), func() (string, error) {
+			return mintCredential(agentSocketPath, credentialHelperTimeout)
+		}, syscall.Exec, os.Stderr))
+	}
+
 	// The credential helper is this same binary, re-invoked by git from inside
 	// the sandbox (the gitconfig sessiond writes names it). It is dispatched
 	// before anything else in main runs: it spawns no child, serves no session,

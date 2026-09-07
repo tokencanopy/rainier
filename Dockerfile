@@ -108,6 +108,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=toolchain /opt/toolchain/go /usr/local/go
 COPY --from=toolchain /opt/toolchain/bin/ /usr/local/bin/
 
+# The upstream gh stays root-owned at an absolute path. Its public command is
+# a tiny wrapper that replaces itself with sessiond's per-invocation launcher.
+RUN mkdir -p /usr/local/libexec/rainier \
+    && mv /usr/local/bin/gh /usr/local/libexec/rainier/gh \
+    && printf '%s\n' '#!/bin/sh' 'exec /usr/local/bin/sessiond github-cli "$@"' > /usr/local/bin/gh \
+    && chmod 0755 /usr/local/bin/gh /usr/local/libexec/rainier/gh
+
 # Claude Code. Installed globally as root into /usr/local/lib/node_modules so
 # the session user cannot rewrite the agent it is about to run, with npm's own
 # cache kept out of the image entirely: a cache under /root would be dead weight

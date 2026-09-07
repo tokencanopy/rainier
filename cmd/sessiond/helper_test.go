@@ -4,11 +4,42 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+// rawCredentialSocket lets these tests exercise the client-side response
+// bound, which agentSocket normally never violates because it writes its own
+// small envelope.
+func rawCredentialSocket(t *testing.T, response string, holdOpen bool) string {
+	t.Helper()
+	path := socketPath(t)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		var request socketRequest
+		_ = json.NewDecoder(c).Decode(&request)
+		if response != "" {
+			_, _ = io.WriteString(c, response)
+		}
+		if holdOpen {
+			time.Sleep(time.Second)
+		}
+	}()
+	return path
+}
 
 // gitAsks composes the key=value block git writes to a credential helper's
 // stdin: one pair per line, terminated by a blank line.
@@ -54,6 +85,61 @@ func TestCredentialHelperMints(t *testing.T) {
 	}
 	if gotPayload != "" && gotPayload != "{}" {
 		t.Errorf("payload = %q, want an empty request — the mint's subject is the session, not its arguments", gotPayload)
+	}
+}
+
+func TestMintCredentialRejectsMalformedOrOversizeSocketResponses(t *testing.T) {
+	for _, response := range []string{
+		"not json\n",
+		`{"ok":true,"payload":{"token":"` + strings.Repeat("x", 16<<10) + `"}}`,
+	} {
+		t.Run("untrusted response", func(t *testing.T) {
+			_, err := mintCredential(rawCredentialSocket(t, response, false), time.Second)
+			if err == nil || strings.Contains(err.Error(), "x") {
+				t.Fatalf("error = %v, want a token-free rejection", err)
+			}
+		})
+	}
+}
+
+// TestMintCredentialAcceptsOneValueBeforePeerClose pins the socket contract:
+// the helper decodes one bounded JSON value and returns without waiting for a
+// peer that keeps the connection open. It deliberately does not validate
+// unread trailing stream bytes; strict whole-stream framing would be a
+// separately compatible protocol change.
+func TestMintCredentialAcceptsOneValueBeforePeerClose(t *testing.T) {
+	start := time.Now()
+	token, err := mintCredential(rawCredentialSocket(t,
+		`{"ok":true,"payload":{"token":"synthetic-token"}}`, true), time.Second)
+	if err != nil || token != "synthetic-token" {
+		t.Fatalf("mintCredential = %q, %v; want valid token", token, err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("valid response waited %s for peer close", elapsed)
+	}
+}
+
+// TestMintCredentialAcceptsOneValueWithTrailingData documents the existing
+// one-value response boundary. The reader is bounded and malformed or
+// oversized decoded values are refused, but unread trailing bytes are not
+// exhaustively framed or validated.
+func TestMintCredentialAcceptsOneValueWithTrailingData(t *testing.T) {
+	token, err := mintCredential(rawCredentialSocket(t,
+		`{"ok":true,"payload":{"token":"synthetic-token"}} trailing-data`, false), time.Second)
+	if err != nil || token != "synthetic-token" {
+		t.Fatalf("mintCredential = %q, %v; want first valid value", token, err)
+	}
+}
+
+func TestMintCredentialDeadlineAppliesToSocketResponse(t *testing.T) {
+	path := rawCredentialSocket(t, "", true)
+	start := time.Now()
+	_, err := mintCredential(path, 80*time.Millisecond)
+	if err == nil {
+		t.Fatal("stalled response succeeded")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("stalled response took %s, deadline was ignored", elapsed)
 	}
 }
 

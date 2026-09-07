@@ -198,6 +198,23 @@ func TestSessionImageDoesNotRelocateConfiguration(t *testing.T) {
 	}
 }
 
+func TestSessionImageWrapsGitHubCLIWithoutPersistingCredentials(t *testing.T) {
+	df := sessionDockerfile(t)
+	for _, want := range []string{
+		"mkdir -p /usr/local/libexec/rainier",
+		"mv /usr/local/bin/gh /usr/local/libexec/rainier/gh",
+		"exec /usr/local/bin/sessiond github-cli \"$@\"",
+		"chmod 0755 /usr/local/bin/gh /usr/local/libexec/rainier/gh",
+	} {
+		if !strings.Contains(df, want) {
+			t.Errorf("the Dockerfile does not install the GitHub CLI launcher contract %q", want)
+		}
+	}
+	if strings.Contains(df, "GH_TOKEN=") || strings.Contains(df, "GITHUB_TOKEN=") {
+		t.Error("the image persists a GitHub token in its environment")
+	}
+}
+
 // TestSessionImageInstallsNoEscalationPath: no-new-privileges already blocks
 // setuid escalation at runtime, and every capability is dropped. Shipping sudo
 // anyway would mean the image's safety depended entirely on flags at the call

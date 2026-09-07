@@ -13,9 +13,9 @@ import (
 	"github.com/tokencanopy/rainier/internal/relay"
 )
 
-// The agent socket is how a process INSIDE the sandbox reaches sessiond: the
-// git credential helper is invoked by git itself, with no relay conn of its
-// own, and needs an answer only controld can give. It dials this socket,
+// The agent socket is how sandbox consumers reach sessiond. Git's credential
+// helper and the github-cli launcher both use it: each has no relay conn of
+// its own and needs an answer only controld can give. It dials this socket,
 // sessiond forwards the request upstream as a session RPC, and the answer
 // comes back the same way.
 //
@@ -35,8 +35,8 @@ const (
 	// client hold a goroutine for the life of the session.
 	agentSocketDeadline = 5 * time.Second
 	// agentSocketCallTimeout bounds the upstream RPC one request turns into.
-	// The credential helper — the only caller — derives its own bound from this
-	// one (credentialHelperTimeout), so the client always outlives sessiond's
+	// Credential consumers derive their own bound from this one
+	// (credentialHelperTimeout), so the client always outlives sessiond's
 	// attempt: a client that gave up first would replace the reason for a
 	// refusal with a bare local timeout.
 	agentSocketCallTimeout = 20 * time.Second

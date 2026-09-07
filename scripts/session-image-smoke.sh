@@ -90,6 +90,7 @@ probe() {
     -e CODEX_HOME=/rainier/agents/codex \
     --entrypoint timeout "$IMAGE" -k 10 "$PROBE_TIMEOUT" /bin/bash -c "set -uo pipefail
 $(declare -f expect_refusal)
+$(declare -f brokered_gh_probe)
 $1" 2>&1
 }
 
@@ -112,6 +113,7 @@ probe_setup() {
     -w /workspace \
     --entrypoint timeout "$IMAGE" -k 10 "$PROBE_TIMEOUT" /bin/bash -c "set -uo pipefail
 $(declare -f expect_refusal)
+$(declare -f brokered_gh_probe)
 $1" 2>&1
 }
 
@@ -154,6 +156,8 @@ check "the rootfs is read-only" "ro-ok" \
 check "the session user cannot rewrite sessiond" "sessiond-protected" \
   'if echo x > /usr/local/bin/sessiond 2>/dev/null; then echo sessiond-WRITABLE; else echo sessiond-protected; fi'
 check "sessiond is root-owned" "root root" 'stat -c "%U %G" /usr/local/bin/sessiond'
+check "the gh wrapper and real binary are root-owned" "root root|root root" '
+  printf "%s|%s" "$(stat -c "%U %G" /usr/local/bin/gh)" "$(stat -c "%U %G" /usr/local/libexec/rainier/gh)"'
 check "the agents a session runs are root-owned too" "agents-root-owned" '
   bad=0
   for f in claude codex gh go node npm python3 uv; do
@@ -356,9 +360,11 @@ check "git makes a commit" "git-ok" '
   git -c user.email=smoke@example.invalid -c user.name=smoke commit -qm x
   [ "$(git rev-list --count HEAD)" = 1 ] && echo git-ok'
 check "gh is executable and reports its version" "gh version" 'gh --version'
+check "managed gh version runs offline without a socket" "gh version" 'RAINIER_SESSION=sess_test gh --version'
+check "wrapped gh receives only a synthetic socket credential" "synthetic-gh-token" 'brokered_gh_probe'
 # Deliberately an "it runs" check and not an "it is signed in" one: nothing in
-# an image can be authenticated, and a session's GitHub credential is minted per
-# git operation by sessiond's helper, which gh does not consult.
+# an image is authenticated. The preceding fixture covers sessiond's one-shot
+# brokered path without letting a real credential enter the image smoke.
 check "gh reports unauthenticated without timing out" "not logged into any GitHub hosts" '
   expect_refusal 1 "not logged into any GitHub hosts" timeout 30 gh auth status'
 check "an OpenSSH client is present" "OpenSSH" 'ssh -V 2>&1'

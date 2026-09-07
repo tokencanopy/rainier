@@ -165,11 +165,29 @@ driver's own restrictions with **no network at all**, and nothing is relaxed to
 make a check pass — a check that cannot pass under the real contract is
 reporting a real defect in the image.
 
-## `gh` is installed. It cannot open a pull request yet.
+## `gh` receives a brokered credential per invocation
 
-Installing the GitHub CLI is an image change and it is done. Making it able to
-open a PR is not an image property, and two separate things are missing. Both
-are outside this image's scope and neither is worked around here.
+`/usr/local/bin/gh` is a root-owned wrapper. It invokes sessiond's
+`github-cli` subcommand, which asks the existing session credential socket for
+a GitHub credential in a managed session and then execs the root-owned upstream
+binary at `/usr/local/libexec/rainier/gh`. The credential is inserted only as
+`GH_TOKEN` in that child environment; it is not written to the shell,
+configuration, image, or workspace. The wrapper passes normal gh commands
+through unchanged, including `gh auth token`.
+
+This narrows accidental persistence, not process isolation: gh descendants
+inherit `GH_TOKEN`, same-UID workload processes may be able to inspect it, and
+workload code can deliberately copy or print it. A managed invocation whose
+credential retrieval fails refuses to start gh rather than falling back to an
+inherited token or an interactive/config login. Top-level help and version
+forms can run offline without retrieval.
+
+Configuration-write limitations remain unchanged. `$HOME` is read-only and
+credential configuration is intentionally not moved to `/workspace`, so gh
+configuration writes or extension installation may fail under the normal
+session restrictions.
+
+API reachability remains a separate control-plane concern:
 
 1. **API egress.** A session's allowlist is the union of the environment's
    hosts, the providers' hosts, and the git hosts the clone needs
@@ -180,32 +198,10 @@ are outside this image's scope and neither is worked around here.
    `github.com` answers `200`. An environment can add the host today with
    `--egress api.github.com`; making it part of what a cloning session gets by
    default is a control-plane change.
-2. **Authentication.** A session's GitHub credential is minted per operation by
-   sessiond's git credential helper and printed only onto the pipe the asking
-   `git` process is reading (`cmd/sessiond/helper.go`). `gh` does not consult
-   git credential helpers: it reads `GH_TOKEN`/`GITHUB_TOKEN` from the
-   environment, or a token stored in its own config directory. Neither exists
-   in a session, and neither should be created by copying one in:
-   - a token in the process environment is visible to every process in the
-     container for the life of the session, and the end-to-end suite asserts
-     that nothing token-shaped is in a session's environment at all;
-   - a token in a config file under `/workspace` would ride out on every
-     checkpoint, archive and `rainier pull`;
-   - a token under `$HOME` cannot be written, because `$HOME` is read-only.
-
-   The shape that fits what already exists is the one the git helper already
-   has: a per-invocation mint over the session RPC, handed to `gh` in its own
-   process environment as a proposed delivery mechanism. This does not make a
-   copied token expire when the command exits, nor isolate it from same-UID
-   processes. Actual scope, expiry/revocation, exposure and audit need design
-   review before this is implemented. That control-plane/sessiond work is not
-   approved or delivered by this image change.
-
-Until both land, the working path from a session is unchanged and complete for
-everything except opening the PR itself: `git push` through the brokered
-credential, then open the PR from the compare link GitHub prints, or from a
-laptop. The image half of "`gh` works" is done; the integration half is
-tracked separately.
+The launcher deliberately does not make an API host reachable. Hosted launch
+material must allow `api.github.com` before authenticated gh API or PR commands
+can succeed; explicit environment egress can supply it until that independent
+control-plane change lands.
 
 ## Qualification repairs and rollout gate
 
@@ -219,8 +215,9 @@ built candidate and then checks repeated mounts as the session user.
 
 The smoke assertion requires both exit success and the expected output;
 timeout, signal, and marker-then-failure regressions guard its trustworthiness.
-Claude/Codex version output must match the Dockerfile pins, and gh's expected
-unauthenticated result must not be a timeout or crash.
+Claude/Codex version output must match the Dockerfile pins. The gh smoke checks
+offline version behavior and a synthetic socket response; it never uses a real
+credential.
 
 The OSS `Session image qualification` workflow builds the exact default base
 on native linux/amd64 and runs both the driver regression and functional smoke.
