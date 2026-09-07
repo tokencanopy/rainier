@@ -301,6 +301,9 @@ func TestReconnectProcessE2E(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	out := screen.String()
+	if strings.Contains(out, "[connection lost") || strings.Contains(out, "[reconnecting in") {
+		t.Errorf("recoverable disconnect wrote local diagnostics into the remote terminal:\n%s", out)
+	}
 	if !strings.Contains(out, "LOCAL_CLI_EXIT 0") || !strings.Contains(out, "[detached at seq") {
 		t.Fatalf("CLI did not detach cleanly:\n%s", out)
 	}
