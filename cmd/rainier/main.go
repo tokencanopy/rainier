@@ -839,11 +839,24 @@ func setWorkspace(contextName string, w workspaceView) error {
 }
 
 func listWorkspaces(c *cli.Client) ([]workspaceView, error) {
-	var resp workspacesEnvelope
-	if err := c.Do(http.MethodGet, "/v0/workspaces", nil, &resp); err != nil {
-		return nil, err
+	var spaces []workspaceView
+	path := "/v0/workspaces"
+	seen := map[string]bool{}
+	for {
+		var resp workspacesEnvelope
+		if err := c.Do(http.MethodGet, path, nil, &resp); err != nil {
+			return nil, err
+		}
+		spaces = append(spaces, resp.Workspaces...)
+		if resp.NextCursor == "" {
+			return spaces, nil
+		}
+		if seen[resp.NextCursor] {
+			return nil, errors.New("workspace listing repeated a pagination cursor")
+		}
+		seen[resp.NextCursor] = true
+		path = "/v0/workspaces?cursor=" + url.QueryEscape(resp.NextCursor)
 	}
-	return resp.Workspaces, nil
 }
 
 func printWorkspaces(spaces []workspaceView) {

@@ -19,9 +19,10 @@ import (
 // body it was sent — which is what the preservation tests assert on, since the
 // whole risk in a replace-the-set API is in the body the client builds.
 type connectionServer struct {
-	t          *testing.T
-	workspaces string
-	connection *connectionView
+	t              *testing.T
+	workspaces     string
+	workspacePages map[string]string
+	connection     *connectionView
 
 	// patched is every PATCH body received, in order.
 	patched []map[string]any
@@ -46,7 +47,11 @@ func (s *connectionServer) start() *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/v0/workspaces":
-			io.WriteString(w, s.workspaces)
+			if s.workspacePages != nil {
+				io.WriteString(w, s.workspacePages[r.URL.Query().Get("cursor")])
+			} else {
+				io.WriteString(w, s.workspaces)
+			}
 		case r.URL.Path == "/v0/connections" && r.Method == http.MethodGet:
 			if s.listStatus != 0 {
 				w.WriteHeader(s.listStatus)
@@ -839,6 +844,80 @@ func TestConnectionEditChecksConfirmedState(t *testing.T) {
 			}
 			if strings.Contains(out, "stopped ") || strings.Contains(out, "shared your ") {
 				t.Errorf("false success: %s", out)
+			}
+		})
+	}
+}
+
+func TestConnectionShareFindsMembershipOnLaterPage(t *testing.T) {
+	srv := &connectionServer{t: t, workspacePages: map[string]string{
+		"":        `{"workspaces":[{"id":"ws_other","name":"Other","role":"member"}],"next_cursor":"page+2&"}`,
+		"page+2&": `{"workspaces":[{"id":"ws_dogfood","name":"Dogfood","role":"member"}]}`,
+	}, connection: &connectionView{Provider: "github", Login: "octocat", AccessMode: "selected", Workspaces: []string{"ws_other"}}}
+	ts := srv.start()
+	hostedContext(t, ts.URL, "ws_dogfood")
+	if _, err := captureStdout(t, func() error { return runConnectionShare([]string{"github"}, true) }); err != nil {
+		t.Fatal(err)
+	}
+	if !equalSets(srv.connection.Workspaces, []string{"ws_other", "ws_dogfood"}) {
+		t.Fatalf("selection = %v", srv.connection.Workspaces)
+	}
+}
+
+func TestConnectionShareRejectsUnknownAccessMode(t *testing.T) {
+	srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{Provider: "github", AccessMode: "future"}}
+	ts := srv.start()
+	hostedContext(t, ts.URL, "ws_dogfood")
+	_, err := captureStdout(t, func() error { return runConnectionShare([]string{"github"}, true) })
+	if err == nil || !strings.Contains(err.Error(), "unsupported access mode") {
+		t.Fatalf("want unsupported mode refusal, got %v", err)
+	}
+	if len(srv.patched) != 0 {
+		t.Fatal("unknown mode was mutated")
+	}
+}
+
+func TestConnectionShareRefusesRepeatedWorkspaceCursor(t *testing.T) {
+	srv := &connectionServer{t: t, workspacePages: map[string]string{
+		"":       `{"workspaces":[],"next_cursor":"repeat"}`,
+		"repeat": `{"workspaces":[],"next_cursor":"repeat"}`,
+	}, connection: &connectionView{Provider: "github", AccessMode: "selected"}}
+	ts := srv.start()
+	hostedContext(t, ts.URL, "ws_dogfood")
+	_, err := captureStdout(t, func() error { return runConnectionShare([]string{"github"}, true) })
+	if err == nil || !strings.Contains(err.Error(), "pagination cursor") {
+		t.Fatalf("want pagination error, got %v", err)
+	}
+	if len(srv.patched) != 0 {
+		t.Fatal("mutation after failed membership listing")
+	}
+}
+
+func TestConnectionUnshareRejectsIncompleteSnapshots(t *testing.T) {
+	for _, stage := range []string{"read", "response missing selection", "response wrong provider"} {
+		t.Run(stage, func(t *testing.T) {
+			srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{
+				Provider: "github", AccessMode: "selected", Workspaces: []string{"ws_dogfood"},
+			}}
+			if stage == "read" {
+				srv.connection.Workspaces = nil
+			} else {
+				srv.afterPatch = func() {
+					if stage == "response missing selection" {
+						srv.connection.Workspaces = nil
+					} else {
+						srv.connection.Provider = "other"
+					}
+				}
+			}
+			ts := srv.start()
+			hostedContext(t, ts.URL, "ws_dogfood")
+			_, err := captureStdout(t, func() error { return runConnectionShare([]string{"github"}, false) })
+			if err == nil {
+				t.Fatal("accepted incomplete or mismatched connection snapshot")
+			}
+			if stage == "read" && len(srv.patched) != 0 {
+				t.Fatal("mutated incomplete snapshot")
 			}
 		})
 	}

@@ -268,6 +268,10 @@ func runConnectionShare(args []string, add bool) error {
 		return fmt.Errorf("connection %s: unsupported access mode %q; inspect it with `rainier connection ls`", verb, connection.AccessMode)
 	}
 
+	if connection.Workspaces == nil {
+		return fmt.Errorf("connection %s: server omitted the workspace selection; inspect it with `rainier connection ls` before trying again", verb)
+	}
+
 	next, changed := applyWorkspaceSelection(connection.Workspaces, target.ID, add)
 	if !changed {
 		if add {
@@ -292,7 +296,8 @@ func runConnectionShare(args []string, add bool) error {
 
 	// The server can observe another edit before it constructs this response.
 	// Never report an effective access change contradicted by that snapshot.
-	if updated.AccessMode != accessSelected || slices.Contains(updated.Workspaces, target.ID) != add {
+	if updated.Provider != provider || updated.Workspaces == nil ||
+		updated.AccessMode != accessSelected || slices.Contains(updated.Workspaces, target.ID) != add {
 		return fmt.Errorf("connection %s: the server response did not confirm the requested access for %s (access mode: %s). The selection may have changed concurrently; inspect it with `rainier connection ls` before trying again", verb, target.ID, updated.AccessMode)
 	}
 
