@@ -3,7 +3,12 @@ set -euo pipefail
 command -v docker >/dev/null || export PATH="/Applications/Docker.app/Contents/Resources/bin:$PATH"
 command -v docker >/dev/null || { echo "docker CLI not found" >&2; exit 1; }
 
-docker build -q -t rainier-session:latest . >/dev/null
+# The session image (docs/session-image.md). It carries the whole default
+# developer toolchain, so a cold build pulls a Debian base and several hundred
+# megabytes of pinned upstream releases and takes minutes; every later run is
+# layer cache. Reuse the build target so BUILD_ARGS also reaches local fleets
+# (notably the explicit native ARM base override; never unpin automatically).
+make session-image SESSION_IMAGE=rainier-session:latest
 go build -o bin/runnerd ./cmd/runnerd
 go build -o bin/egressd ./cmd/egressd
 go build -o bin/rattach ./cmd/rattach
