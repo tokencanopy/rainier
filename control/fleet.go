@@ -138,8 +138,10 @@ type RunnerEvent struct {
 
 // Fleet is the fleet half of the caller-facing application contract. The
 // first three methods are service-principal calls: they carry authoritative
-// bindings in their payload and never accept a user-created Scope. ListRunners
-// is an ordinary scoped query.
+// bindings in their payload and never accept a user-created Scope. A caller
+// completes a runner join by calling RegisterRunner and then ReconcileRunner;
+// scheduling is woken only after reconciliation settles the announced session
+// set. ListRunners is an ordinary scoped query.
 type Fleet interface {
 	RegisterRunner(context.Context, RunnerRegistration) (RunnerRegistrationResult, error)
 	ReconcileRunner(context.Context, RunnerSnapshot) (ReconcileResult, error)

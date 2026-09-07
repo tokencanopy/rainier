@@ -46,6 +46,10 @@ type fleetFakeStore struct {
 	getSessionErr  error
 	transitionErr  error
 
+	// sessionsOnRunnerHook lets ordering tests pause reconciliation after the
+	// runner row is current but before its announced sessions are settled.
+	sessionsOnRunnerHook func()
+
 	// staleBump simulates a concurrent higher-generation write landing
 	// between a pre-read and an upsert: when upsertErr is ErrStale and
 	// staleBump is non-zero, the runner's stored generation is advanced to
@@ -255,6 +259,9 @@ func (st *fleetFakeStore) listRunners(pool control.PoolID) ([]control.Runner, er
 }
 
 func (st *fleetFakeStore) sessionsOnRunner(pool control.PoolID, id control.RunnerID, states []control.SessionState) ([]control.Session, error) {
+	if st.sessionsOnRunnerHook != nil {
+		st.sessionsOnRunnerHook()
+	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.sessionsOnRunnerCalls++
@@ -778,8 +785,8 @@ func TestRegisterRunnerIdempotentReconnectAndReplacement(t *testing.T) {
 		if !r.Connected || r.Generation != 3 || r.CapacityUsed != 1 {
 			t.Fatalf("stored runner = %+v", r)
 		}
-		if len(fleetWakePools(fx.service)) != 1 {
-			t.Fatal("accepted reconnect did not wake the pool")
+		if len(fleetWakePools(fx.service)) != 0 {
+			t.Fatal("accepted reconnect woke the pool before its snapshot was reconciled")
 		}
 	})
 
@@ -1040,6 +1047,66 @@ func fleetGetSessionState(t *testing.T, fx *fleetFixture, ws control.WorkspaceID
 		t.Fatalf("get session %s: %v", id, err)
 	}
 	return s
+}
+
+func TestRunnerBecomesSchedulableOnlyAfterReconciliationSettles(t *testing.T) {
+	fx := newFleetFixture(t)
+	fx.st.seedSession(control.Session{
+		ID: "sess_example", WorkspaceID: "ws_example", State: control.StateCreating,
+		PoolID: "pool_example", RunnerID: "runner_example",
+	})
+
+	registered, err := fx.service.RegisterRunner(fleetCtx, control.RunnerRegistration{
+		WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+		Generation: 1, CapacityTotal: 4,
+	})
+	if err != nil || !registered.Accepted {
+		t.Fatalf("registration = %+v, %v", registered, err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	fx.st.sessionsOnRunnerHook = func() {
+		close(entered)
+		<-release
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := fx.service.ReconcileRunner(fleetCtx, control.RunnerSnapshot{
+			WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example",
+			Generation: 1, CapacityTotal: 4,
+		})
+		done <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("reconciliation never reached the session-settlement step")
+	}
+	if got := fleetWakePools(fx.service); len(got) != 0 {
+		t.Fatalf("scheduler wakes before reconciliation settled = %v, want none", got)
+	}
+
+	unblock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reconciliation did not finish after settlement was released")
+	}
+	if row := fleetGetSessionState(t, fx, "ws_example", "sess_example"); row.State != control.StateQueued || row.RunnerID != "" {
+		t.Fatalf("reconciled session = %+v, want queued and unplaced", row)
+	}
+	if got := fleetWakePools(fx.service); !slices.Equal(got, []control.PoolID{"pool_example"}) {
+		t.Fatalf("scheduler wakes after reconciliation = %v, want [pool_example]", got)
+	}
 }
 
 func TestReconcileRunnerMatrix(t *testing.T) {
