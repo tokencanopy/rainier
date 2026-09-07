@@ -1085,3 +1085,112 @@ func TestAgentKeepsAnAnsweringControlSocket(t *testing.T) {
 	case <-time.After(600 * time.Millisecond):
 	}
 }
+
+// establishAndDrop takes the agent's next dial through a full handshake —
+// announce in, accept out — and then closes it, returning the instant the
+// close was sent. That instant is what the redial gap is measured from: the
+// agent notices at or after it, so a gap measured from here can only
+// understate how long the agent actually waited, never overstate it.
+//
+// The accept is written before the close and TCP keeps their order, so the
+// agent's read loop sees the accept and only then the close. Establishment
+// is therefore reached on every one of these connections, deterministically
+// and without a sleep.
+func establishAndDrop(t *testing.T, fc *fakeControld, generation uint64) time.Time {
+	t.Helper()
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+	conn.send(t, runner.ToRunner{Type: "accept", Generation: generation})
+	conn.c.Close(websocket.StatusNormalClosure, "bye")
+	return time.Now()
+}
+
+// TestAgentRedialResetsAfterEstablishedConnection is the regression test for
+// a redial delay that only ever grew. RunAgent's backoff was initialized once
+// per process and doubled on every disconnect, with nothing anywhere putting
+// it back: a runner whose control plane routinely ends connections — an
+// hourly credential or lease expiry, a rolling deploy — reached the 30s cap
+// after six of them and redialed at 30-45s for the rest of the process's
+// life, however healthy every connection in between had been. Every session
+// on that runner reads unreachable for the whole of that gap.
+//
+// Ten consecutive established-then-dropped connections, each of which must
+// reset the delay to the floor. Under the fix every redial waits the floor
+// (20-30ms here), so the run takes well under a second. Under the old
+// behavior the waits double — 20ms, 40ms, ... — and the ninth redial alone
+// waits 5.12s, past nextConn's 5s bound, so this test fails there rather
+// than reaching the assertion below.
+func TestAgentRedialResetsAfterEstablishedConnection(t *testing.T) {
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "", "")
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{
+		ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1",
+		RedialBackoffMin: 20 * time.Millisecond,
+	})
+
+	const cycles = 10
+	var closed time.Time
+	for i := range cycles {
+		closed = establishAndDrop(t, fc, uint64(i+1))
+	}
+
+	// The gap the fleet actually sees after a routine disconnect: the floor
+	// plus its jitter (20-30ms) plus one loopback dial. The 2s bound is far
+	// above that and far below the 10.24s the tenth redial would take if the
+	// delay had kept doubling.
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+	if gap := time.Since(closed); gap > 2*time.Second {
+		t.Errorf("redial after %d established connections took %s, want at most the floor plus jitter (%s)",
+			cycles, gap, 30*time.Millisecond)
+	}
+}
+
+// TestAgentKeepsBackingOffWithoutEstablishment pins the other half of the
+// rule: the reset keys on establishment — controld's accept — and not on the
+// dial or the upgrade succeeding. Several of controld's refusals happen after
+// the websocket handshake and before any accept (a name the credential does
+// not cover, a generation its store cannot mint, a registration the fleet
+// refuses, a failed reconcile), and a store outage makes the whole fleet take
+// that path at once. Resetting on a completed dial would turn that into every
+// runner redialing at the floor for the duration; only an accept means the
+// connection was good.
+//
+// Four connections that get their announce read and are then dropped without
+// an accept. The delays double as before — 50, 100, 200 — so the fifth dial
+// must be at least 400ms behind the fourth close, where a wrongly reset delay
+// would put it at 50ms.
+func TestAgentKeepsBackingOffWithoutEstablishment(t *testing.T) {
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "", "")
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{
+		ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1",
+		RedialBackoffMin: 50 * time.Millisecond,
+	})
+
+	var closed time.Time
+	for range 4 {
+		conn := fc.nextConn(t)
+		conn.readAnnounce(t)
+		conn.c.Close(websocket.StatusNormalClosure, "bye")
+		closed = time.Now()
+	}
+
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+	// Compared against 250ms rather than the exact 400ms: the point is to
+	// separate a delay that kept doubling from one that snapped back to the
+	// 50ms floor, and only the floor is anywhere near this bound. A loaded
+	// machine can only push the real gap further above it.
+	if gap := time.Since(closed); gap < 250*time.Millisecond {
+		t.Errorf("redial after 4 unestablished connections took %s, want the backoff to have kept doubling (about 400ms)", gap)
+	}
+}

@@ -38,6 +38,12 @@ type AgentConfig struct {
 	// peer and redialing. Zero means the defaults below.
 	PingInterval time.Duration
 	PingTimeout  time.Duration
+	// RedialBackoffMin is the floor of RunAgent's redial delay: the wait
+	// before the first redial, and the value the delay returns to whenever a
+	// connection reaches establishment. Zero means the default below. The
+	// ceiling is nextBackoff's fixed 30s cap, so a floor above that is a
+	// misconfiguration — the doubling would clamp it back down.
+	RedialBackoffMin time.Duration
 }
 
 // The default liveness bounds. Together they bound how long a runner keeps
@@ -48,6 +54,12 @@ const (
 	defaultAgentPingInterval = 20 * time.Second
 	defaultAgentPingTimeout  = 10 * time.Second
 )
+
+// The redial floor. One jittered second is long enough that a control plane
+// the whole fleet is redialing at once (a roll, a restart) is not answering
+// every runner in the same instant, and short enough that a routine
+// disconnect costs a session no meaningful reachability.
+const defaultRedialBackoffMin = time.Second
 
 func (cfg AgentConfig) pingInterval() time.Duration {
 	if cfg.PingInterval > 0 {
@@ -63,14 +75,29 @@ func (cfg AgentConfig) pingTimeout() time.Duration {
 	return defaultAgentPingTimeout
 }
 
+func (cfg AgentConfig) redialBackoffMin() time.Duration {
+	if cfg.RedialBackoffMin > 0 {
+		return cfg.RedialBackoffMin
+	}
+	return defaultRedialBackoffMin
+}
+
 // agentSessionState is one control connection's negotiated state. Today that
 // is the runner generation controld granted in its accept: zero until one
 // arrives (an unaccepted connection claims no authority, which the wire
 // spells as "the connection's"), and read by the writer on every message the
-// runner sends afterwards. Atomic because the accept is handled on the
-// reader while events fire from session goroutines.
+// runner sends afterwards, plus whether that accept arrived at all. Atomic
+// because the accept is handled on the reader while events fire from session
+// goroutines.
 type agentSessionState struct {
 	generation atomic.Uint64
+	// accepted records that controld answered this connection's announce
+	// with an accept — this package's definition of an ESTABLISHED
+	// connection, and the only thing RunAgent's backoff reset keys on. It is
+	// its own flag rather than a generation != 0 test because the reset must
+	// depend on the handshake having happened, not on how the control plane
+	// happens to number the authority it grants.
+	accepted atomic.Bool
 }
 
 // jitter returns a random duration in [0, d/2) — timing spread, not security.
@@ -90,17 +117,45 @@ func nextBackoff(d time.Duration) time.Duration {
 }
 
 // RunAgent dials controld and serves its commands until ctx is canceled,
-// redialing with jittered backoff (1s..30s cap) whenever the connection
+// redialing with jittered backoff (floor..30s cap) whenever the connection
 // ends. It only returns once ctx is done — any other agentSession error is
 // logged and retried, since a runner with no control conn is still useful
 // on its local HTTP surface but should keep trying to phone home.
+//
+// The backoff returns to its floor whenever a connection was ESTABLISHED,
+// which here means exactly one thing: controld answered this connection's
+// announce with an accept. That is the control plane's own statement that
+// the fleet registered this runner, at a generation, on this socket — the
+// point past which its sessions are dispatchable. Anything that ends the
+// connection before then (a 401, a refused name, a generation the store
+// could not mint, a refused registration) leaves the delay doubling, so a
+// control plane that will not have this runner is still dialed with a
+// backing-off hand rather than once a floor-interval forever.
+//
+// Without the reset the delay only ever grows: a process that has been up
+// long enough to see six disconnects redials at the 30s cap from then on,
+// however healthy each connection in between was. Under a control plane that
+// routinely ends connections — an hourly credential or lease expiry, a
+// rolling deploy — that turns a sub-second reconnect into a 30-45s hole in
+// which every session on this runner reports unreachable and the scheduler
+// can place nothing on it. Establishment is what says the previous
+// connection was fine and the next one has no reason not to be.
+//
+// A peer that accepts and immediately drops is therefore redialed at the
+// floor rather than backing off, and that is the intended reading: a control
+// plane that keeps completing the handshake is one this runner should keep
+// returning to, and the floor's jittered second bounds the cost of being
+// wrong about that.
 func (s *Server) RunAgent(ctx context.Context, cfg AgentConfig) error {
 	s.proxyURL = cfg.ProxyURL
-	backoff := time.Second
+	backoff := cfg.redialBackoffMin()
 	for {
-		err := s.agentSession(ctx, cfg)
+		established, err := s.agentSession(ctx, cfg)
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if established {
+			backoff = cfg.redialBackoffMin()
 		}
 		log.Printf("controld conn ended: %v; redialing in %s", err, backoff)
 		select {
@@ -113,7 +168,11 @@ func (s *Server) RunAgent(ctx context.Context, cfg AgentConfig) error {
 }
 
 // agentSession dials controld once, sends the announce as the FIRST message
-// on the conn, then serves runner.ToRunner commands until the conn ends.
+// on the conn, then serves runner.ToRunner commands until the conn ends. It
+// reports whether the connection reached establishment — controld's accept
+// arrived — which is what RunAgent's backoff reset keys on. A connection
+// that never got that far reports false however far into the handshake it
+// died, including one that died before there was any state to ask.
 //
 // agentSession does not return until its writer goroutine has actually
 // stopped (writerDone.Wait(), gated by connCtx). Review round 1, finding 3:
@@ -125,11 +184,11 @@ func (s *Server) RunAgent(ctx context.Context, cfg AgentConfig) error {
 // underlying conn out from under any in-flight Read/Write using it, which is
 // what actually unblocks a stalled reader when only the write direction has
 // died (not just the writer itself).
-func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
+func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established bool, err error) {
 	hdr := http.Header{"Authorization": {"Bearer " + cfg.Token}}
 	c, _, err := websocket.Dial(ctx, cfg.ControldURL+"/v0/runners/connect", &websocket.DialOptions{HTTPHeader: hdr})
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer c.CloseNow()
 	c.SetReadLimit(16 << 20)
@@ -195,7 +254,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 	ann := runner.FromRunner{Type: "announce", Proto: runner.ProtocolVersion, Runner: cfg.RunnerName,
 		Sessions: s.Announce(), Used: used, Total: total, Capabilities: cfg.Capabilities}
 	if err := wsjson.Write(connCtx, c, ann); err != nil {
-		return err
+		return ag.accepted.Load(), err
 	}
 
 	writerDone.Add(1)
@@ -255,7 +314,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) error {
 	for {
 		var m runner.ToRunner
 		if err := wsjson.Read(connCtx, c, &m); err != nil {
-			return err
+			return ag.accepted.Load(), err
 		}
 		if m.Type == "accept" {
 			// Handled on the reader itself, not in a goroutine of its own:
@@ -283,6 +342,11 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 		// informational — the set controld will schedule on, which is this
 		// runner's own claims minus anything it refused.
 		ag.generation.Store(m.Generation)
+		// Stored after the generation, so nothing can observe an established
+		// connection whose authority is not yet readable. RunAgent reads this
+		// only once agentSession has returned, but the ordering is free and
+		// the invariant is worth not having to reason about again.
+		ag.accepted.Store(true)
 		log.Printf("agent: accepted at generation %d with %d capabilities", m.Generation, len(m.Capabilities))
 	case "create":
 		var spec driver.Spec
