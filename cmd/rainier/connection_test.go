@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -27,6 +29,13 @@ type connectionServer struct {
 	status int
 	// listStatus, when set, is returned for GET /v0/connections.
 	listStatus int
+	// afterGet runs once the list response has been written, which is exactly
+	// the window a second client's PATCH lands in. It is how the lost-update
+	// test reproduces a race deterministically instead of hoping for one.
+	afterGet func()
+	// patchHeaders records the headers of every PATCH, so a test can assert
+	// what precondition the client was able to send — today, none.
+	patchHeaders []http.Header
 }
 
 func (s *connectionServer) start() *httptest.Server {
@@ -49,7 +58,11 @@ func (s *connectionServer) start() *httptest.Server {
 			if err := json.NewEncoder(w).Encode(out); err != nil {
 				s.t.Errorf("encode connections: %v", err)
 			}
+			if s.afterGet != nil {
+				s.afterGet()
+			}
 		case strings.HasPrefix(r.URL.Path, "/v0/connections/") && r.Method == http.MethodPatch:
+			s.patchHeaders = append(s.patchHeaders, r.Header.Clone())
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				s.t.Errorf("decode patch: %v", err)
@@ -590,5 +603,185 @@ func TestConnectionShareAcceptsTheFlagBeforeTheProvider(t *testing.T) {
 	}
 	if got := workspaceSet(t, srv.patched[0]); !equalSets(got, []string{"ws_other"}) {
 		t.Errorf("PATCH workspaces = %v, want ws_other", got)
+	}
+}
+
+// --------------------------------------------------------------------------
+// What the read-modify-write actually guarantees
+// --------------------------------------------------------------------------
+//
+// share and unshare are GET /v0/connections, edit one entry, PATCH the whole
+// set. That preserves every grant present in the snapshot it read. It does NOT
+// preserve a grant another client adds after that read: PATCH replaces the
+// selection outright, and the API offers no precondition to make the write
+// conditional on the snapshot still being current.
+//
+// These two tests pin that, so the limitation stays a documented fact rather
+// than an assumption. If the hosted API ever grows an ETag, a revision field,
+// or an If-Match, the second test fails and this file is where the CLI gets
+// taught to send it.
+
+// A workspace another client shares while our share is in flight is dropped by
+// our PATCH. This is a real lost update, not a theoretical one — and the point
+// of the test is that the CLI cannot currently prevent it, so the behavior is
+// recorded rather than claimed to be safe.
+func TestConnectionShareLosesAConcurrentUpdate(t *testing.T) {
+	srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{
+		Provider: "github", Login: "octocat", AccessMode: "selected",
+		Workspaces: []string{}, CreatedAt: "2026-09-01T00:00:00Z",
+	}}
+	// A second client shares ws_other in the window between our read and our
+	// write. Our PATCH was already built from the empty snapshot.
+	srv.afterGet = func() {
+		srv.connection.Workspaces = []string{"ws_other"}
+		srv.afterGet = nil
+	}
+	ts := srv.start()
+	hostedContext(t, ts.URL, "ws_dogfood")
+
+	if _, err := captureStdout(t, func() error { return runConnectionShare([]string{"github"}, true) }); err != nil {
+		t.Fatalf("connection share: %v", err)
+	}
+	if len(srv.patched) != 1 {
+		t.Fatalf("PATCH count = %d, want 1", len(srv.patched))
+	}
+	// The PATCH carries the stale snapshot plus our entry, and nothing else:
+	// ws_other, shared moments earlier, is not in the set being written, so the
+	// write removes it. The CLI had no way to know and no way to prevent it.
+	got := workspaceSet(t, srv.patched[0])
+	if !equalSets(got, []string{"ws_dogfood"}) {
+		t.Fatalf("PATCH workspaces = %v, want exactly [ws_dogfood]. This test documents "+
+			"a lost update; if the CLI now preserves ws_other, the API gained a "+
+			"precondition and this test should assert that guarantee instead", got)
+	}
+}
+
+// The API exposes nothing a client could use to make the write conditional.
+// If this ever fails, the connect surface grew a precondition and share/unshare
+// should start sending it.
+func TestConnectionPatchCarriesNoPreconditionBecauseNoneExists(t *testing.T) {
+	srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{
+		Provider: "github", Login: "octocat", AccessMode: "selected",
+		Workspaces: []string{}, CreatedAt: "2026-09-01T00:00:00Z",
+	}}
+	ts := srv.start()
+	hostedContext(t, ts.URL, "ws_dogfood")
+
+	if _, err := captureStdout(t, func() error { return runConnectionShare([]string{"github"}, true) }); err != nil {
+		t.Fatalf("connection share: %v", err)
+	}
+	if len(srv.patchHeaders) != 1 {
+		t.Fatalf("PATCH count = %d, want 1", len(srv.patchHeaders))
+	}
+	// GET /v0/connections returns no validator, so there is nothing to echo.
+	// Asserting the absence keeps the limitation visible in the test suite.
+	for _, header := range []string{"If-Match", "If-Unmodified-Since", "If-None-Match"} {
+		if v := srv.patchHeaders[0].Get(header); v != "" {
+			t.Errorf("PATCH carried %s: %q — if the API now supports it, update "+
+				"TestConnectionShareLosesAConcurrentUpdate too", header, v)
+		}
+	}
+	// And the wire shape a client would have to read a validator from carries
+	// no version, revision, or etag field.
+	for _, field := range []string{"version", "revision", "etag", "updated_at"} {
+		if _, ok := srv.patched[0][field]; ok {
+			t.Errorf("PATCH body carried a %q precondition field", field)
+		}
+	}
+}
+
+// --------------------------------------------------------------------------
+// Compatibility with the config-locking rework (origin/main 500a243)
+// --------------------------------------------------------------------------
+//
+// That change moved every read-modify-write of the config file behind
+// cli.UpdateConfig, because loading a Config and saving that stale copy could
+// overwrite a sibling process's freshly rotated token pair. The connection
+// commands are compatible by construction: they only ever READ config
+// (requireLogin, Config.Active) and never call Save or UpdateConfig. These
+// tests hold that line, since the failure mode — a share silently reverting
+// another terminal's login or workspace switch — is invisible until it bites.
+
+// A connection command leaves the config file byte-identical. Nothing it does
+// is a config edit, so nothing it does may land in that file.
+func TestConnectionCommandsDoNotWriteConfig(t *testing.T) {
+	srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{
+		Provider: "github", Login: "octocat", AccessMode: "selected",
+		Workspaces: []string{"ws_other"}, CreatedAt: "2026-09-01T00:00:00Z",
+	}}
+	ts := srv.start()
+	hostedContext(t, ts.URL, "ws_dogfood")
+
+	path := os.Getenv("RAINIER_CONFIG")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range []func() error{
+		func() error { return runConnectionLs(nil) },
+		func() error { return runConnectionShare([]string{"github"}, true) },
+		func() error { return runConnectionShare([]string{"github"}, false) },
+	} {
+		if _, err := captureStdout(t, run); err != nil {
+			t.Fatalf("connection command: %v", err)
+		}
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("a connection command rewrote the config file.\nbefore:\n%s\nafter:\n%s", before, after)
+	}
+}
+
+// The sharper version: a sibling CLI rotates the token pair and switches the
+// workspace while our share is mid-flight. Our command must not put the values
+// it loaded at startup back on disk — that is precisely the regression
+// cli.UpdateConfig exists to prevent, and a command that never writes cannot
+// cause it.
+func TestConnectionShareDoesNotRevertASiblingsNewerLogin(t *testing.T) {
+	srv := &connectionServer{t: t, workspaces: twoWorkspaces, connection: &connectionView{
+		Provider: "github", Login: "octocat", AccessMode: "selected",
+		Workspaces: []string{}, CreatedAt: "2026-09-01T00:00:00Z",
+	}}
+	ts := srv.start()
+	hostedContext(t, ts.URL, "ws_dogfood")
+
+	// Between our read and our write, another terminal refreshes and moves to
+	// a different workspace — both legitimate, both newer than what we hold.
+	srv.afterGet = func() {
+		if err := cli.UpdateConfig(func(c *cli.Config) error {
+			ctx := c.Contexts["dogfood"]
+			ctx.Token = "rnr_access_rotated_by_sibling"
+			ctx.RefreshToken = "rnr_refresh_rotated_by_sibling"
+			ctx.Workspace = "ws_other"
+			c.UpdateContext("dogfood", ctx)
+			return nil
+		}); err != nil {
+			t.Errorf("sibling update: %v", err)
+		}
+		srv.afterGet = nil
+	}
+
+	if _, err := captureStdout(t, func() error { return runConnectionShare([]string{"github"}, true) }); err != nil {
+		t.Fatalf("connection share: %v", err)
+	}
+
+	cfg, err := cli.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := cfg.Contexts["dogfood"]
+	if ctx.Token != "rnr_access_rotated_by_sibling" || ctx.RefreshToken != "rnr_refresh_rotated_by_sibling" {
+		t.Errorf("share reverted the sibling's rotated credentials: token=%q refresh=%q", ctx.Token, ctx.RefreshToken)
+	}
+	if ctx.Workspace != "ws_other" {
+		t.Errorf("share reverted the sibling's workspace selection: %q, want ws_other", ctx.Workspace)
+	}
+	// And the share still applied to the workspace the command was resolved
+	// against, not the one the sibling moved to mid-flight.
+	if got := workspaceSet(t, srv.patched[0]); !equalSets(got, []string{"ws_dogfood"}) {
+		t.Errorf("PATCH workspaces = %v, want [ws_dogfood]", got)
 	}
 }

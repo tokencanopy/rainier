@@ -160,9 +160,11 @@ reaches; a new connection reaches none of them, so
   rainier connection share github
 
 lets your current workspace use it and "connection unshare github" stops it
-again. Both change only the workspace you name — the others you have chosen
-stay as they are — and neither ever prints a credential: the CLI never has
-one to print.
+again. Both change only the workspace you name, keeping the others the
+connection reached when the command read it, and neither ever prints a
+credential: the CLI never has one to print. The API replaces the whole
+workspace list rather than adding to it and offers no conditional write, so
+editing one connection from two places at once loses one of the two edits.
 
 diff shows, per repository the session cloned, what its branch changed against
 the base branch it started from — git's own "--stat", read from inside the

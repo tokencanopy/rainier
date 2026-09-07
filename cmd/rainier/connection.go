@@ -24,14 +24,36 @@ import (
 // two answer different questions and share no columns, so they stay two
 // commands, and `creds` says so when it is pointed at a hosted context.
 //
-// Nothing here can widen access on its own. The edge's PATCH takes the whole
-// selection at once (SetWorkspaces replaces, which is what makes narrowing
-// atomic), so `share` and `unshare` read the current selection, change exactly
-// one entry, and send the result — every other workspace the person chose
-// survives the round trip. The access mode is never sent at all: the
-// all-current-and-future opt-in is §8.1's explicit user decision, and a CLI
-// that could set it as a side effect of sharing one workspace would be making
-// that decision for them.
+// Nothing here can widen access on its own. The access mode is never sent at
+// all: the all-current-and-future opt-in is §8.1's explicit user decision, and
+// a CLI that could set it as a side effect of sharing one workspace would be
+// making that decision for them.
+//
+// What the workspace edit does and does not guarantee, precisely, because the
+// distinction matters and is easy to overstate:
+//
+// PATCH /v0/connections/{provider} REPLACES the selection; there is no add or
+// remove verb. So `share` and `unshare` are GET, edit one entry, PATCH the
+// whole set. Server-side each PATCH is atomic — the adapter takes a FOR UPDATE
+// lock on the connection row and does its delete-and-insert inside that
+// transaction, so no reader sees a partial selection and two PATCHes serialize.
+//
+// The CLI's read-modify-write is NOT atomic, and cannot be made so. It
+// preserves every grant present in the snapshot it read, which is what stops a
+// share from wiping the workspaces the person previously chose. It does not
+// preserve a grant some other client adds between that read and this write:
+// the write replaces the set, so a concurrent edit is lost. The connect
+// surface offers no way to close that window — GET returns no ETag, the
+// connection carries no version or revision, the wire body has no field to
+// echo back, and SetWorkspaces takes no expected-version argument — so this is
+// a property of the API, not a shortcut taken here. Two regression tests in
+// connection_test.go pin both halves; if a precondition ever appears, they are
+// where the CLI learns to send it.
+//
+// Single-developer dogfood is the setting this ships into, where two
+// simultaneous edits of one person's own connection are not a realistic
+// concern. The commands therefore print the selection the server came back
+// with rather than reporting a delta they cannot vouch for.
 
 const connectionUsage = `usage: rainier connection <ls|share|unshare> [args]
 
@@ -45,9 +67,15 @@ starts shared with nothing, so sessions cannot clone or push until you share
 it with the workspace they run in.
 
 --workspace defaults to your current workspace ("rainier workspace use" picks
-it). Sharing and unsharing change only the workspace you name; the others you
-have chosen are left exactly as they were. Neither command changes the access
-mode, and neither prints a credential — the CLI never sees one.`
+it). Sharing and unsharing change only the workspace you name, keeping the
+other workspaces the connection reached when the command read it. Neither
+command changes the access mode, and neither prints a credential — the CLI
+never sees one.
+
+The change is read-then-replace: this API has no add or remove verb and no
+conditional write, so a change made by another client in between is
+overwritten. Editing one connection from two places at once is the only way to
+hit that; the printed workspace list is what the server confirmed.`
 
 // connectionProviders is the set of providers a connection command will act
 // on. It is a list rather than a constant because the API is a list for the
@@ -170,11 +198,12 @@ func renderReach(c connectionView) string {
 // operation with one difference: whether the named workspace is in the set
 // that gets written back.
 //
-// The read-modify-write is what preserves the other grants, and it is the only
-// shape the API offers — PATCH replaces the whole selection. Two CLIs racing on
-// the same connection can therefore lose one of the two edits; that is the
-// hosted API's own window and not something the CLI can close from outside, so
-// the command prints the resulting selection rather than claiming a delta.
+// The read-modify-write preserves the grants in the snapshot it read, and is
+// the only shape the API offers — PATCH replaces the whole selection, and
+// there is no precondition to make the write conditional on that snapshot
+// still being current. A concurrent edit landing in between is therefore lost.
+// See the guarantee note at the top of this file; it is the API's window, not
+// one this command opened.
 func runConnectionShare(args []string, add bool) error {
 	verb := "unshare"
 	if add {
