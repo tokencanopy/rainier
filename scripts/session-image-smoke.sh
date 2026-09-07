@@ -235,6 +235,37 @@ check "codex's home is redirected onto a writable mount" "codex-home-writable" \
   'case "$CODEX_HOME" in /rainier/agents/*) ;; *) echo "NOT-ON-MOUNT $CODEX_HOME"; exit 1;; esac
    mkdir -p "$CODEX_HOME" && touch "$CODEX_HOME/.probe" && echo codex-home-writable'
 
+# Codex is a package, not a binary, and `codex --version` above is green either
+# way. These three are the difference between an image whose Codex can run a
+# turn and one that fails closed on a missing tool host the first time it needs
+# one. They ask CODEX where it resolved its own package rather than stat-ing the
+# paths we hoped it would use, and then run the tool host it named. No
+# credential and no network: doctor reports the layout offline, and its auth and
+# connectivity checks are expected to fail in here and are not read.
+check "the codex on PATH is a link into its package, not a lifted-out binary" "codex-linked" \
+  'p=$(command -v codex); [ -L "$p" ] || { echo "NOT-A-LINK $p"; exit 1; }
+   r=$(readlink -f "$p"); case "$r" in /usr/local/lib/codex/bin/codex) echo codex-linked ;;
+     *) echo "RESOLVES-ELSEWHERE $r"; exit 1 ;; esac'
+check "codex resolves its complete vendor package, with its bundled search tool" "codex-package-resolved" '
+   mkdir -p "$CODEX_HOME"
+   r=$(timeout 120 codex doctor --json 2>/dev/null) || true
+   for want in "(package /usr/local/lib/codex, bin /usr/local/lib/codex/bin," \
+               "resources /usr/local/lib/codex/codex-resources," \
+               "path /usr/local/lib/codex/codex-path)" \
+               "\"search provider\": \"bundled\"" \
+               "\"search command\": \"/usr/local/lib/codex/codex-path/rg\""; do
+     case "$r" in *"$want"*) ;; *) echo "DOCTOR-MISSING $want"; exit 1 ;; esac
+   done
+   echo codex-package-resolved'
+check "the tool host codex spawns is present and actually runs" "codex-host-runs" '
+   h=/usr/local/lib/codex/bin/codex-code-mode-host
+   [ -x "$h" ] || { echo "NO-TOOL-HOST $h"; exit 1; }
+   timeout 90 "$h" --help 2>&1 | grep -q "Usage: codex-code-mode-host" && echo codex-host-runs'
+check "the codex package is root-owned and the session user cannot rewrite it" "codex-package-protected" '
+   [ "$(stat -Lc %U /usr/local/lib/codex/bin/codex-code-mode-host)" = root ] || { echo NOT-ROOT; exit 1; }
+   if echo x > /usr/local/lib/codex/bin/codex-code-mode-host 2>/dev/null
+   then echo codex-package-WRITABLE; else echo codex-package-protected; fi'
+
 echo
 echo "-- compilers, runtimes and make"
 check "a C program compiles against the standard headers and runs" "c-ok 42" '

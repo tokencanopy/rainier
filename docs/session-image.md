@@ -22,7 +22,7 @@ Pinned by version in the `Dockerfile`, and by SHA-256 in
 
 | | |
 |---|---|
-| **Agents** | Claude Code (npm, exact version), Codex (upstream static release) |
+| **Agents** | Claude Code (npm, exact version), Codex (upstream `codex-package` archive, kept whole under `/usr/local/lib/codex`) |
 | **Source control** | `git`, `gh` (GitHub CLI), OpenSSH client |
 | **C/C++** | `build-essential` (gcc, g++, libc6-dev), `make`, `pkg-config`, `zlib1g-dev` and buildpack-deps' standard header set |
 | **Go** | the official toolchain tarball, behind a wrapper that creates its caches |
@@ -159,11 +159,58 @@ a Go program *and runs its tests* (the noexec `/tmp` case), runs Node and
 Python, drives `make`, creates venvs and installs a wheel offline, installs an
 npm dependency offline and checks the cache it used, serves HTTP from Python
 and HTTPS from Node against a certificate `curl` verifies, makes a real git
-commit, starts Claude Code and Codex with a read-only `$HOME`, and brings the
+commit, starts Claude Code and Codex with a read-only `$HOME`, asks Codex where
+it resolved its own package and runs the tool host it names, and brings the
 real entrypoint up as PID 1. Every probe runs in a container wearing the
 driver's own restrictions with **no network at all**, and nothing is relaxed to
 make a check pass — a check that cannot pass under the real contract is
 reporting a real defect in the image.
+
+## Codex is a package, not a binary
+
+The upstream `codex-package` archive is a manifest, `bin/codex`, the
+`bin/codex-code-mode-host` tool host, and bundled ripgrep, bubblewrap and zsh
+under `codex-path` and `codex-resources`. Codex finds every companion by walking
+up from the **resolved** path of its own executable until it finds
+`codex-package.json`.
+
+The image used to install `codex-${TRIPLE}.tar.gz`, which is that one executable
+and nothing else. `codex --version` was green and `codex --search` failed closed
+on a missing `/usr/local/bin/codex-code-mode-host`. Measured against the real
+`rust-v0.153.4` archive, with `codex doctor --json` reporting Codex's own
+resolution rather than ours:
+
+| Install shape | `install context` | `runtime.search` |
+|---|---|---|
+| Complete package | names `package`, `bin`, `resources`, `path` | `bundled`, the package's `codex-path/rg` |
+| `bin/codex` alone | bare `other` | `system` |
+| `bin/codex` alone, tool host **added to PATH** | **byte-for-byte identical to the row above** | `system` |
+| Complete package **minus the tool host** | still names the package — doctor does not notice | `bundled` |
+| **Symlink on PATH** → package `bin/codex` | **identical to the complete package** | `bundled` |
+
+So: the tool host goes neither on PATH nor beside sessiond in `/usr/local/bin`
+(row 3 is row 2 exactly, so PATH placement is inert); the PATH entry is a
+symlink, because Codex resolves symlinks before it looks for the package and a
+copy would leave the companions unreachable; and the layout is asserted
+separately, because row 4 passes every doctor check with the host deleted.
+
+`images/session/toolchain.sh` extracts the archive to `/opt/toolchain/lib/codex`
+and links `$BIN/codex -> ../lib/codex/bin/codex`. The link is **relative** so
+that it resolves in the toolchain stage and again after the final image copies
+both directories under `/usr/local`. The script rejects an incomplete layout —
+`require_codex_package` checks the manifest's version, target and layout fields
+and every member — so a build that lost a piece fails rather than shipping.
+
+The package is root-owned under `/usr/local`, like sessiond and the other
+agents: a session user who could rewrite the tool host could rewrite what the
+agent spawns. `/usr/local/lib/codex` is deliberately **not** the user-writable
+`/opt/rainier-env` prefix.
+
+Packaging is not the whole of Codex readiness. If bundled bubblewrap cannot
+create a namespace on a particular runner, that is a security boundary to
+diagnose and review separately; do not reach for
+`--dangerously-bypass-approvals-and-sandbox`, a privileged container,
+`seccomp=unconfined`, added capabilities or host sysctl changes to get past it.
 
 ## `gh` receives a brokered credential per invocation
 
@@ -215,7 +262,8 @@ built candidate and then checks repeated mounts as the session user.
 
 The smoke assertion requires both exit success and the expected output;
 timeout, signal, and marker-then-failure regressions guard its trustworthiness.
-Claude/Codex version output must match the Dockerfile pins. The gh smoke checks
+Claude/Codex version output must match the Dockerfile pins, and for Codex the
+version alone is explicitly not enough — see below. The gh smoke checks
 offline version behavior and a synthetic socket response; it never uses a real
 credential.
 
