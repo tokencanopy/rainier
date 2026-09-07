@@ -3,8 +3,11 @@ package main
 import (
 	"bytes"
 	"errors"
+	"os"
+	"os/exec"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -120,5 +123,62 @@ func TestGitHubCLIExecFailureIsReported(t *testing.T) {
 	}, func(string, []string, []string) error { return errors.New("synthetic exec error") }, &output)
 	if code != 1 || !strings.Contains(output.String(), "could not start GitHub CLI") || strings.Contains(output.String(), "synthetic exec error") {
 		t.Fatalf("unsafe exec failure: code=%d output=%q", code, output.String())
+	}
+}
+
+func TestGitHubCLIExecPreservesChildExitStatus(t *testing.T) {
+	cmd := runGitHubCLIExecSubprocess(t, "exit")
+	err := cmd.Run()
+	if err == nil || cmd.ProcessState.ExitCode() != 42 {
+		t.Fatalf("exit status: err=%v code=%d, want 42", err, cmd.ProcessState.ExitCode())
+	}
+}
+
+func TestGitHubCLIExecPreservesSIGINT(t *testing.T) {
+	cmd := runGitHubCLIExecSubprocess(t, "sigint")
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("SIGINT child exited successfully")
+	}
+	status, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() || status.Signal() != syscall.SIGINT {
+		t.Fatalf("status=%v, want SIGINT termination", cmd.ProcessState.Sys())
+	}
+}
+
+// runGitHubCLIExecSubprocess launches a test process which reaches the same
+// syscall.Exec boundary production uses. The callback asserts the production
+// path but replaces only the test target, so no laptop-global file is needed.
+func runGitHubCLIExecSubprocess(t *testing.T, mode string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestGitHubCLIExecSubprocessHelper$")
+	cmd.Env = append(os.Environ(), "RAINIER_GH_EXEC_HELPER="+mode)
+	return cmd
+}
+
+func TestGitHubCLIExecSubprocessHelper(t *testing.T) {
+	mode := os.Getenv("RAINIER_GH_EXEC_HELPER")
+	if mode == "" {
+		return
+	}
+	code := runGitHubCLI([]string{"--version"}, []string{"RAINIER_SESSION=sess_test"},
+		func() (string, error) { t.Fatal("offline invocation minted a credential"); return "", nil },
+		func(path string, _ []string, env []string) error {
+			if path != rainierGitHubCLIPath {
+				t.Fatalf("path=%q, want production executable path", path)
+			}
+			return syscall.Exec(os.Args[0], []string{os.Args[0], "-test.run=^TestGitHubCLIExecSubprocessTarget$"},
+				append(env, "RAINIER_GH_EXEC_TARGET="+mode))
+		}, os.Stderr)
+	t.Fatalf("runGitHubCLI returned %d after successful syscall.Exec", code)
+}
+
+func TestGitHubCLIExecSubprocessTarget(t *testing.T) {
+	switch os.Getenv("RAINIER_GH_EXEC_TARGET") {
+	case "exit":
+		os.Exit(42)
+	case "sigint":
+		_ = syscall.Kill(os.Getpid(), syscall.SIGINT)
+		select {}
 	}
 }

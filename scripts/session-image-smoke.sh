@@ -361,15 +361,15 @@ check "gh is executable and reports its version" "gh version" 'gh --version'
 check "managed gh version runs offline without a socket" "gh version" 'RAINIER_SESSION=sess_test gh --version'
 check "wrapped gh receives only a synthetic socket credential" "synthetic-gh-token" '
   rm -f /workspace/.rainier/agent.sock
-  python3 -c "import json,socket; s=socket.socket(socket.AF_UNIX); s.bind(\"/workspace/.rainier/agent.sock\"); s.listen(1); c,_=s.accept(); json.load(c.makefile(\"r\")); c.sendall(b\"{\\\"ok\\\":true,\\\"payload\\\":{\\\"token\\\":\\\"synthetic-gh-token\\\"}}\\n\"); c.close(); s.close()" &
+  python3 -c "import json,socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.bind(\"/workspace/.rainier/agent.sock\"); s.listen(1); c,_=s.accept(); c.settimeout(5); req=json.loads(c.makefile(\"r\").readline()); req == {\"method\":\"mint_git_credential\",\"payload\":{}} or sys.exit(1); c.sendall(b\"{\\\"ok\\\":true,\\\"payload\\\":{\\\"token\\\":\\\"synthetic-gh-token\\\"}}\\n\"); c.close(); s.close()" &
   p=$!
   for _ in $(seq 40); do test -S /workspace/.rainier/agent.sock && break; sleep 0.05; done
   out=$(RAINIER_SESSION=sess_test GH_TOKEN=old GITHUB_TOKEN=older gh auth token)
   wait "$p"
   test "$out" = synthetic-gh-token && echo "$out"'
 # Deliberately an "it runs" check and not an "it is signed in" one: nothing in
-# an image can be authenticated, and a session's GitHub credential is minted per
-# git operation by sessiond's helper, which gh does not consult.
+# an image is authenticated. The preceding fixture covers sessiond's one-shot
+# brokered path without letting a real credential enter the image smoke.
 check "gh reports unauthenticated without timing out" "not logged into any GitHub hosts" '
   expect_refusal 1 "not logged into any GitHub hosts" timeout 30 gh auth status'
 check "an OpenSSH client is present" "OpenSSH" 'ssh -V 2>&1'
