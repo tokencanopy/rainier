@@ -258,6 +258,11 @@ func caseAgentRevokeFence(t *testing.T, s controlapp.AgentCredentialStore, provi
 		map[string][]byte{file: agentFixtureAuth}, v); err != nil || next != 3 {
 		t.Fatalf("new login from tombstone = %d, %v; want version 3", next, err)
 	}
+	if _, err := s.PutAgentCredentials(ctx, AgentUser, provider,
+		map[string][]byte{file: agentFixtureCredential}, 1); !errors.Is(err, control.ErrConflict) {
+		t.Fatalf("pre-logout put after relogin = %v, want ErrConflict", err)
+	}
+	wantSet(t, s, AgentUser, provider, 3, map[string][]byte{file: agentFixtureAuth})
 }
 
 // wantSet asserts one fetch: the version, and the files byte for byte. A

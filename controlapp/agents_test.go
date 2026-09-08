@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // agentEnvEntry mirrors, in the test's own words, the shape AgentsEnv encodes
@@ -16,10 +17,11 @@ import (
 // of its own, and this test is the place where the two spellings are proven to
 // agree.
 type agentEnvEntry struct {
-	Provider  string             `json:"provider"`
-	Dir       string             `json:"dir"`
-	Files     []string           `json:"files"`
-	SeedFiles []agentEnvSeedFile `json:"seed_files,omitempty"`
+	CredentialProtocol uint64             `json:"credential_protocol"`
+	Provider           string             `json:"provider"`
+	Dir                string             `json:"dir"`
+	Files              []string           `json:"files"`
+	SeedFiles          []agentEnvSeedFile `json:"seed_files,omitempty"`
 }
 
 type agentEnvSeedFile struct {
@@ -186,6 +188,9 @@ func TestCreateSpecCarriesTheHome(t *testing.T) {
 		t.Fatalf("manifest has %d entries, want %d", len(entries), len(providers))
 	}
 	for i, p := range providers {
+		if entries[i].CredentialProtocol != runner.AgentCredentialProtocolVersion {
+			t.Fatalf("manifest credential protocol for %q = %d, want %d", p.Name, entries[i].CredentialProtocol, runner.AgentCredentialProtocolVersion)
+		}
 		if entries[i].Provider != p.Name {
 			t.Fatalf("manifest entry %d is %q, want %q", i, entries[i].Provider, p.Name)
 		}

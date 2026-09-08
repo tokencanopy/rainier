@@ -142,6 +142,11 @@ survivable:
   file always wins. This prevents Claude's interactive first-run login wizard
   after runner replacement without copying one workspace's mutable state into
   another. No seed is created when custody has no credential.
+- **Credential-sync rollout is fail-closed.** The agent manifest and upward
+  credential RPCs carry their own protocol version. A new control plane refuses
+  an old session process, and a new session process ignores an old manifest.
+  Deployments that introduce a new credential protocol therefore replace
+  existing sessions after publishing the matching session image.
 - **No credential, no privilege.** Nothing token-shaped is baked in, `sudo` is
   not installed, no host path is mounted, and no docker socket is anywhere near
   a session.

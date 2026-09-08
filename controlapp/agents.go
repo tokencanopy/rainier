@@ -8,6 +8,7 @@ import (
 	"slices"
 
 	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // HomeMountPath is where the agent home lands inside every session: one
@@ -136,10 +137,11 @@ func AgentHomeVolume(ws control.WorkspaceID, creator control.ActorID) string {
 // sandbox's entire view of the table — no egress, no login command, nothing
 // the sandbox has no business acting on.
 type agentManifestEntry struct {
-	Provider  string              `json:"provider"`
-	Dir       string              `json:"dir"`
-	Files     []string            `json:"files"`
-	SeedFiles []AgentHomeSeedFile `json:"seed_files,omitempty"`
+	CredentialProtocol uint64              `json:"credential_protocol"`
+	Provider           string              `json:"provider"`
+	Dir                string              `json:"dir"`
+	Files              []string            `json:"files"`
+	SeedFiles          []AgentHomeSeedFile `json:"seed_files,omitempty"`
 }
 
 // AgentsEnv is the environment every session gets so that the agents inside
@@ -158,7 +160,8 @@ func AgentsEnv(providers []AgentProvider) map[string]string {
 		dir := HomeMountPath + "/" + p.Name
 		env[p.HomeEnv] = dir
 		entries = append(entries, agentManifestEntry{
-			Provider: p.Name, Dir: dir, Files: slices.Clone(p.Files),
+			CredentialProtocol: runner.AgentCredentialProtocolVersion,
+			Provider:           p.Name, Dir: dir, Files: slices.Clone(p.Files),
 			SeedFiles: slices.Clone(p.SeedFiles),
 		})
 	}

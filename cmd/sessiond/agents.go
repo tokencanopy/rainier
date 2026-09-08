@@ -128,10 +128,11 @@ type agentSeedFile struct {
 }
 
 type agentEntry struct {
-	Provider  string          `json:"provider"`
-	Dir       string          `json:"dir"`
-	Files     []string        `json:"files"`
-	SeedFiles []agentSeedFile `json:"seed_files,omitempty"`
+	CredentialProtocol uint64          `json:"credential_protocol"`
+	Provider           string          `json:"provider"`
+	Dir                string          `json:"dir"`
+	Files              []string        `json:"files"`
+	SeedFiles          []agentSeedFile `json:"seed_files,omitempty"`
 }
 
 // agentNote is the boot note's payload: which home, and what to say about it.
@@ -215,6 +216,9 @@ func agentEntries(env bootEnv) []agentEntry {
 }
 
 func checkAgentEntry(e agentEntry) error {
+	if e.CredentialProtocol != runner.AgentCredentialProtocolVersion {
+		return fmt.Errorf("credential protocol %d is unsupported", e.CredentialProtocol)
+	}
 	if e.Provider == "" {
 		return errors.New("the row names nothing")
 	}
@@ -372,13 +376,14 @@ type agentSet struct {
 	// generation fences an RPC that began before a downward revoke. The revoke
 	// increments it while holding mu; a late fetch response is then discarded
 	// before it can put credentials or onboarding state back on disk.
-	generation   uint64
-	stamps       map[string]fileStamp
-	digest       [32]byte
-	dirty        bool
-	restoreRetry bool
-	backoff      time.Duration
-	retryAt      time.Time
+	generation       uint64
+	stamps           map[string]fileStamp
+	digest           [32]byte
+	dirty            bool
+	restoreRetry     bool
+	restoreTombstone bool
+	backoff          time.Duration
+	retryAt          time.Time
 	// noted remembers the conditions already reported, so a symlink or an
 	// oversized set is news once rather than every two seconds for the life of
 	// the session. An entry is cleared when its condition clears.
@@ -406,6 +411,7 @@ type agentSync struct {
 	backoffMin  time.Duration
 	backoffMax  time.Duration
 	maxBytes    int64
+	writeFile   func(*os.File, string, []byte) error
 
 	mu   sync.Mutex
 	sets map[string]*agentSet
@@ -427,6 +433,7 @@ func newAgentSync(rpc *rpcDispatcher, entries []agentEntry, events chan<- []byte
 		backoffMin:  agentPutBackoffMin,
 		backoffMax:  agentPutBackoffMax,
 		maxBytes:    agentSetMaxBytes,
+		writeFile:   writeAgentFileAt,
 		sets:        make(map[string]*agentSet, len(entries)),
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
@@ -481,6 +488,10 @@ func (a *agentSync) close() {
 		}
 		a.mu.Lock()
 		if set.restoreRetry {
+			if set.restoreTombstone {
+				a.mu.Unlock()
+				continue
+			}
 			files, ok := a.readSetLocked(set)
 			if !ok || !completeAgentSet(set.entry, files) {
 				a.mu.Unlock()
@@ -533,8 +544,10 @@ func (a *agentSync) fetchOne(e agentEntry) {
 	generation := set.generation
 	a.mu.Unlock()
 
-	raw, err := a.rpc.Call(runner.MethodFetchAgentCredentials,
-		map[string]string{"provider": e.Provider}, a.callTimeout)
+	raw, err := a.rpc.Call(runner.MethodFetchAgentCredentials, struct {
+		Protocol uint64 `json:"protocol"`
+		Provider string `json:"provider"`
+	}{runner.AgentCredentialProtocolVersion, e.Provider}, a.callTimeout)
 	if err != nil {
 		// A refusal's message is the far end's own sentence and a timeout's is
 		// this end's; either way it is what the person needs to read, and
@@ -566,13 +579,30 @@ func (a *agentSync) fetchOne(e agentEntry) {
 		log.Printf("home %q: discarded a credential restore superseded by a revoke", e.Provider)
 		return
 	}
+	if body.Version > 0 && len(held) == 0 {
+		removed, err := removeAgentFilesLocked(set)
+		if err != nil {
+			a.note(e.Provider, "the revoked credential set could not be removed: "+err.Error())
+			set.version = body.Version
+			set.digest = agentSetDigest(nil)
+			set.stamps = statAgentFiles(set)
+			set.dirty = false
+			set.restoreRetry = true
+			set.restoreTombstone = true
+			set.backoff = nextAgentBackoff(set.backoff, a.backoffMin, a.backoffMax)
+			set.retryAt = time.Now().Add(set.backoff)
+			return
+		}
+		log.Printf("home %q: %d file(s) removed from a restored logout", e.Provider, removed)
+	}
+
 	writtenAll := true
 	for _, name := range e.Files {
 		blob, ok := held[name]
 		if !ok {
 			continue
 		}
-		if err := writeAgentFileAt(set.dir, name, blob); err != nil {
+		if err := a.writeFile(set.dir, name, blob); err != nil {
 			a.note(e.Provider, fmt.Sprintf("%s could not be written: %v", name, err))
 			writtenAll = false
 			continue
@@ -585,6 +615,9 @@ func (a *agentSync) fetchOne(e agentEntry) {
 		set.stamps = statAgentFiles(set)
 		set.dirty = false
 		set.restoreRetry = true
+		set.restoreTombstone = false
+		set.backoff = nextAgentBackoff(set.backoff, a.backoffMin, a.backoffMax)
+		set.retryAt = time.Now().Add(set.backoff)
 		if ok {
 			set.digest = agentSetDigest(files)
 		}
@@ -611,11 +644,14 @@ func (a *agentSync) fetchOne(e agentEntry) {
 	set.stamps = statAgentFiles(set)
 	set.dirty = false
 	set.restoreRetry = false
+	set.restoreTombstone = false
+	set.backoff = 0
+	set.retryAt = time.Time{}
 }
 
-// decodeFetchedAgentSet accepts exactly the two coherent custody states: an
-// empty version-zero response, or a positive version carrying every declared
-// credential file as non-empty base64. Validation finishes before the first
+// decodeFetchedAgentSet accepts exactly three coherent custody states: an
+// empty version-zero response, a positive empty logout tombstone, or a positive
+// version carrying every declared credential file as non-empty base64. Validation finishes before the first
 // filesystem write so a malformed multi-file response cannot partially land
 // and still unlock provider onboarding.
 func decodeFetchedAgentSet(e agentEntry, version uint64, encoded map[string]string) (map[string][]byte, bool) {
@@ -705,15 +741,31 @@ func (a *agentSync) flush() { a.tick(time.Now()) }
 func (a *agentSync) syncOne(set *agentSet, now time.Time) {
 	a.mu.Lock()
 	if set.restoreRetry {
-		files, ok := a.readSetLocked(set)
-		if !ok || !completeAgentSet(set.entry, files) {
+		if now.Before(set.retryAt) {
+			a.mu.Unlock()
+			return
+		}
+		if set.restoreTombstone {
 			a.mu.Unlock()
 			a.fetchOne(set.entry)
 			return
 		}
-		// A complete local set appeared after the failed restore. That is a
+		files, ok := a.readSetLocked(set)
+		stamps := statAgentFiles(set)
+		changed := !maps.Equal(stamps, set.stamps)
+		if ok && agentSetDigest(files) != set.digest {
+			changed = true
+		}
+		if !ok || !completeAgentSet(set.entry, files) || !changed {
+			a.mu.Unlock()
+			a.fetchOne(set.entry)
+			return
+		}
+		// A complete local set changed after the failed restore. That is a
 		// login performed in this session; it wins over retrying old custody.
 		set.restoreRetry = false
+		set.backoff = 0
+		set.retryAt = time.Time{}
 	}
 	stamps := statAgentFiles(set)
 	if !maps.Equal(stamps, set.stamps) {
@@ -772,10 +824,11 @@ func (a *agentSync) putSet(set *agentSet, now time.Time) {
 		total += len(blob)
 	}
 	answer, err := a.rpc.Call(runner.MethodPutAgentCredentials, struct {
+		Protocol uint64            `json:"protocol"`
 		Provider string            `json:"provider"`
 		Files    map[string]string `json:"files"`
 		Version  uint64            `json:"version"`
-	}{provider, encoded, version}, a.callTimeout)
+	}{runner.AgentCredentialProtocolVersion, provider, encoded, version}, a.callTimeout)
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -843,24 +896,28 @@ func (a *agentSync) handleRevoke(payload []byte) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("this session has no home for %q", in.Provider)
 	}
-	removed := 0
-	for _, name := range set.entry.Files {
-		if set.dir == nil {
-			continue
-		}
-		if err := unix.Unlinkat(int(set.dir.Fd()), name, 0); err != nil {
-			if !errors.Is(err, unix.ENOENT) {
-				return nil, fmt.Errorf("%s could not be removed: %v", name, err)
-			}
-			continue
-		}
-		removed++
+	if in.Version > 0 && in.Version < set.version {
+		log.Printf("home %q: ignored delayed revoke at v%d; this session is at v%d", in.Provider, in.Version, set.version)
+		return struct{}{}, nil
 	}
 	set.generation++
+	if set.dir == nil {
+		dir, err := openAgentHome(set.entry)
+		if err != nil {
+			return nil, fmt.Errorf("this home could not be made ready: %v", err)
+		}
+		set.dir = dir
+	}
+	removed, err := removeAgentFilesLocked(set)
+	if err != nil {
+		return nil, err
+	}
 	set.version = in.Version
 	set.digest = agentSetDigest(nil)
 	set.stamps = statAgentFiles(set)
 	set.dirty = false
+	set.restoreRetry = false
+	set.restoreTombstone = false
 	set.backoff = 0
 	set.retryAt = time.Time{}
 	log.Printf("home %q: %d file(s) removed on request; this session holds nothing for it", in.Provider, removed)
@@ -955,6 +1012,23 @@ func (a *agentSync) readSetLocked(set *agentSet) (map[string][]byte, bool) {
 	}
 	delete(set.noted, "size")
 	return files, true
+}
+
+func removeAgentFilesLocked(set *agentSet) (int, error) {
+	removed := 0
+	for _, name := range set.entry.Files {
+		if set.dir == nil {
+			continue
+		}
+		if err := unix.Unlinkat(int(set.dir.Fd()), name, 0); err != nil {
+			if !errors.Is(err, unix.ENOENT) {
+				return removed, fmt.Errorf("%s could not be removed: %v", name, err)
+			}
+			continue
+		}
+		removed++
+	}
+	return removed, nil
 }
 
 // openAgentHome opens the trusted mount first, creates one direct child, and

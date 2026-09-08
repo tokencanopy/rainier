@@ -182,6 +182,13 @@ func TestAgentVaultRejectsAPutThatLogoutOvertook(t *testing.T) {
 	const user = control.ActorID("user_example")
 	st := NewMemStore()
 	v := NewAgentVault(st, testSecretsKey)
+	if _, err := v.PutAgentCredentials(ctx, user, provider, nil, 0); !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("empty direct put = %v, want ErrInvalid", err)
+	}
+	if _, err := v.PutAgentCredentials(ctx, user, provider,
+		map[string][]byte{"file_example": nil}, 0); !errors.Is(err, control.ErrInvalid) {
+		t.Fatalf("zero-length direct put = %v, want ErrInvalid", err)
+	}
 	if _, err := v.PutAgentCredentials(ctx, user, provider,
 		map[string][]byte{"file_example": []byte("credential_example")}, 0); err != nil {
 		t.Fatal(err)
@@ -200,6 +207,18 @@ func TestAgentVaultRejectsAPutThatLogoutOvertook(t *testing.T) {
 	set, err := v.FetchAgentCredentials(ctx, user, provider)
 	if err != nil || set.Version != 2 || len(set.Files) != 0 {
 		t.Fatalf("after raced logout = version %d, %d files, %v; want v2 tombstone", set.Version, len(set.Files), err)
+	}
+	if version, err := v.PutAgentCredentials(ctx, user, provider,
+		map[string][]byte{"file_example": []byte("new_login_example")}, 2); err != nil || version != 3 {
+		t.Fatalf("relogin = version %d, %v; want v3", version, err)
+	}
+	if _, err := v.PutAgentCredentials(ctx, user, provider,
+		map[string][]byte{"file_example": []byte("late_pre_logout_example")}, 1); !errors.Is(err, control.ErrConflict) {
+		t.Fatalf("pre-logout put after relogin = %v, want ErrConflict", err)
+	}
+	set, err = v.FetchAgentCredentials(ctx, user, provider)
+	if err != nil || set.Version != 3 || !bytes.Equal(set.Files["file_example"], []byte("new_login_example")) {
+		t.Fatalf("after stale put = version %d, %d files, %v; want relogin at v3", set.Version, len(set.Files), err)
 	}
 }
 

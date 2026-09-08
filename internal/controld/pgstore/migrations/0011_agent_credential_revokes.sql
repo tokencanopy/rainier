@@ -4,4 +4,5 @@
 -- tombstone keeps that version without keeping credential bytes, so a put
 -- that began before logout cannot recreate the credential afterwards.
 ALTER TABLE agent_credentials
-  ADD COLUMN IF NOT EXISTS revoked boolean NOT NULL DEFAULT false;
+  ADD COLUMN IF NOT EXISTS revoked boolean NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS last_revoked_version bigint NOT NULL DEFAULT 0;

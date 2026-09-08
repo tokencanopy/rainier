@@ -110,6 +110,14 @@ and start the new controld against it first. 0009 adds the `events` table:
 every lifecycle change writes its provider-neutral event in the same
 transaction as the row it describes; nothing in this release reads it back.
 
+Migration 0011 adds the durable agent-logout fence. Treat this migration as a
+stop-the-world control-plane upgrade: stop every old `controld` process using
+the database, start the new `controld` so it applies 0011, and do not restart an
+old binary against that database. An old process deletes the row on logout and
+would erase the fence. Publish the matching session image and replace existing
+sessions before accepting agent login/logout traffic; the credential-sync
+protocol rejects old session processes, so mixed versions fail closed.
+
 ## 4. controld
 
 The fleet token is the shared secret every runnerd presents. Generate it

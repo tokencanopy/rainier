@@ -186,6 +186,7 @@ const agentRequestMaxBytes = 128 << 10
 // remain last-writer-wins, while a value older than a logout tombstone is
 // refused so an in-flight put cannot recreate a revoked credential.
 type agentCredentialRequest struct {
+	Protocol uint64            `json:"protocol"`
 	Provider string            `json:"provider"`
 	Files    map[string][]byte `json:"files"`
 	Version  uint64            `json:"version"`
@@ -283,6 +284,10 @@ func decodeAgentRequest(env runner.RPCEnvelope) (agentCredentialRequest, *runner
 	}
 	if err := json.Unmarshal(env.Payload, &req); err != nil {
 		refusal := rpcRefusal(env.ID, "the agent credential request could not be decoded")
+		return req, &refusal
+	}
+	if req.Protocol != runner.AgentCredentialProtocolVersion {
+		refusal := rpcRefusal(env.ID, "this session must be replaced before agent credentials can sync")
 		return req, &refusal
 	}
 	return req, nil

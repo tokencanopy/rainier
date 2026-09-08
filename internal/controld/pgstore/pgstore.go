@@ -361,10 +361,10 @@ func (s *Store) GetAgentCredential(ctx context.Context, userID, provider string)
 	// bigint-backed generation in this package is: pgx maps the column to
 	// Go's signed 64-bit type, and the conversion is where the package says
 	// so once rather than relying on a driver's coercion.
-	var version int64
+	var version, lastRevokedVersion int64
 	err := s.q(ctx).QueryRow(ctx,
-		`SELECT ciphertext, nonce, version, revoked, updated_at FROM agent_credentials WHERE user_id = $1 AND provider = $2`,
-		userID, provider).Scan(&c.Ciphertext, &c.Nonce, &version, &c.Revoked, &c.UpdatedAt)
+		`SELECT ciphertext, nonce, version, revoked, last_revoked_version, updated_at FROM agent_credentials WHERE user_id = $1 AND provider = $2`,
+		userID, provider).Scan(&c.Ciphertext, &c.Nonce, &version, &c.Revoked, &lastRevokedVersion, &c.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return controld.AgentCredential{}, control.ErrNotFound
@@ -375,6 +375,7 @@ func (s *Store) GetAgentCredential(ctx context.Context, userID, provider string)
 		return controld.AgentCredential{}, fmt.Errorf("pgstore: get agent credential for provider %q: %w", provider, err)
 	}
 	c.Version = uint64(version)
+	c.LastRevokedVersion = uint64(lastRevokedVersion)
 	return c, nil
 }
 
@@ -416,13 +417,14 @@ func (s *Store) RevokeAgentCredential(ctx context.Context, userID, provider stri
 	}
 	var version int64
 	err := s.q(ctx).QueryRow(ctx, `
-		INSERT INTO agent_credentials (user_id, provider, ciphertext, nonce, version, revoked, updated_at)
-		VALUES ($1, $2, ''::bytea, ''::bytea, 1, true, now())
+		INSERT INTO agent_credentials (user_id, provider, ciphertext, nonce, version, revoked, last_revoked_version, updated_at)
+		VALUES ($1, $2, ''::bytea, ''::bytea, 1, true, 1, now())
 		ON CONFLICT (user_id, provider) DO UPDATE SET
 			ciphertext = ''::bytea,
 			nonce      = ''::bytea,
 			version    = agent_credentials.version + 1,
 			revoked    = true,
+			last_revoked_version = agent_credentials.version + 1,
 			updated_at = now()
 		RETURNING version`, userID, provider).Scan(&version)
 	if err != nil {

@@ -133,9 +133,17 @@ func (v *AgentVault) FetchAgentCredentials(ctx context.Context, user control.Act
 // read, the seal, and the write are one compare-and-set loop rather than
 // three independent steps.
 func (v *AgentVault) PutAgentCredentials(ctx context.Context, user control.ActorID, provider string, files map[string][]byte, expected uint64) (uint64, error) {
+	if len(files) == 0 {
+		return 0, control.ErrInvalid
+	}
+	for name, blob := range files {
+		if name == "" || len(blob) == 0 {
+			return 0, control.ErrInvalid
+		}
+	}
 	// Encoded once, outside the loop: the plaintext does not depend on the
 	// version, only the seal does, so a retry re-seals without rebuilding it.
-	plaintext, err := json.Marshal(agentCredentialBlob{Files: nonNilFiles(files)})
+	plaintext, err := json.Marshal(agentCredentialBlob{Files: files})
 	if err != nil {
 		return 0, errAgentCredentialSeal
 	}
@@ -146,6 +154,9 @@ func (v *AgentVault) PutAgentCredentials(ctx context.Context, user control.Actor
 		switch {
 		case err == nil:
 			stored = cur.Version
+			if expected < cur.LastRevokedVersion {
+				return 0, control.ErrConflict
+			}
 			if cur.Revoked && expected != stored {
 				return 0, control.ErrConflict
 			}
@@ -210,16 +221,4 @@ func (v *AgentVault) ListAgentCredentials(ctx context.Context, user control.Acto
 // cannot drift: one spelling, used twice.
 func agentCredentialAAD(user, provider string, version uint64) []byte {
 	return []byte(user + "\x00" + provider + "\x00" + strconv.FormatUint(version, 10))
-}
-
-// nonNilFiles turns a nil map into an empty one, so an empty set seals as
-// {"files":{}} rather than {"files":null}. A put of no files is a real state
-// — the agent removed its own credential file — and it must round-trip as
-// "logged in, holding nothing" rather than as a JSON null somebody has to
-// decide what to do with.
-func nonNilFiles(files map[string][]byte) map[string][]byte {
-	if files == nil {
-		return map[string][]byte{}
-	}
-	return files
 }
