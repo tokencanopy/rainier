@@ -163,14 +163,18 @@ SESSION SELECTORS
 
 SESSION STATES
   starting     queued or booting
-  running      up, with its process alive
-  stopped      persisted; attach brings it back
-  finished     its process exited; nothing more will run in it
-  unavailable  it cannot be reached; info says why
+  running      sandbox up; the child may have exited
+  stopped      suspended; attach brings it back
+  failed       failed or dead; info shows the API state
+  canceled / deleted   terminal records (ls --all)
+  unknown      an unrecognized API state
+
+  Process exit and runner reachability are separate facts.
+  info shows recent activity as the server-reported last event timestamp.
 
 MACHINE-READABLE OUTPUT
   --json is supported by status, ls, info, agent status, and by new --detach,
-  stop and delete. Every document carries "schema" and "version" fields.
+  stop, resume and delete. Every document carries "schema" and "version" fields.
   Output never changes shape because stdout is a pipe: --json is the only way
   to ask for JSON. Human output goes to stdout, diagnostics and errors to
   stderr. Exit 0 success, 1 operational or server failure, 2 bad invocation.
@@ -258,8 +262,7 @@ ADVANCED — diagnostics
   attach --since N   0 replays the whole event log — a failed setup's full
                      output, or a day of scrollback — and N resumes after
                      sequence N, the number a disconnect line prints. It also
-                     overrides attach's refusal to open a finished or
-                     unavailable session, which is the case it exists for.
+                     requests diagnostic replay even for terminal lifecycle states.
   status --verbose   the full readiness report: config, authentication,
                      workspace, runners, environments and agents.
   ls --verbose       ids, environments, runners, reachability, and the
@@ -297,6 +300,7 @@ type session struct {
 	ChildExitCode *int   `json:"child_exit_code"`
 	CreatedAt     string `json:"created_at"`
 	UpdatedAt     string `json:"updated_at"`
+	LastEventAt   string `json:"last_event_at"`
 }
 
 type sessionEnvelope struct {
@@ -384,12 +388,6 @@ type agent struct {
 	Since      string   `json:"since"`
 	Version    uint64   `json:"version"`
 	Workspaces []string `json:"workspaces"`
-	// LaunchCmd is the command that STARTS this agent — what `rainier new
-	// --agent` runs. No server sends it yet; decoding it here is what lets
-	// the flag start working the day one does, without this CLI ever
-	// carrying its own copy of a `claude` or `codex` command line. See
-	// docs/cli-v0-contract.md §5.3.
-	LaunchCmd []string `json:"launch_cmd,omitempty"`
 }
 
 type agentsEnvelope struct {
@@ -492,9 +490,25 @@ func runLogin(args []string) error {
 	deviceName := fs.String("device-name", "", "how this device is `named` in the hosted login attempt (default: the hostname)")
 	contextName := fs.String("context", "", "config context to write (default: \"default\" for a GitHub login, the edge host for --cloud)")
 	fs.Parse(reorderArgs(fs, args))
+	if fs.NArg() != 0 {
+		return usagef("usage: rainier login [flags]")
+	}
 
+	sources := 0
+	if *fromGH {
+		sources++
+	}
+	if *token != "" {
+		sources++
+	}
+	if *clientID != "" {
+		sources++
+	}
+	if sources > 1 {
+		return usagef("choose one of --from-gh, --token, or --client-id")
+	}
 	if *refresh != "" && !slices.Contains(refreshableProviders, *refresh) {
-		return fmt.Errorf("--refresh %s: unknown provider; rainier stores credentials for: %s",
+		return usagef("--refresh %s: unknown provider; rainier stores credentials for: %s",
 			*refresh, strings.Join(refreshableProviders, ", "))
 	}
 
@@ -503,7 +517,7 @@ func runLogin(args []string) error {
 	// refused rather than silently honoring one of them.
 	if *cloud != "" {
 		if *fromGH || *token != "" || *clientID != "" || *refresh != "" || *server != "" {
-			return fmt.Errorf("login --cloud names the hosted edge and runs the browser login; " +
+			return usagef("login --cloud names the hosted edge and runs the browser login; " +
 				"it takes none of --from-gh, --token, --client-id, --refresh or --server")
 		}
 		return finishLogin(runCloudLogin(*cloud, *deviceName, *contextName))
@@ -590,6 +604,10 @@ func runLogin(args []string) error {
 	// who the caller is.
 	if err := cli.UpdateConfig(func(latest *cli.Config) error {
 		ctx := latest.Contexts[target]
+		if ctx.Server != serverURL || (resp.User.ID != "" && ctx.OwnerID != resp.User.ID) {
+			ctx.CurrentSession = ""
+		}
+		ctx.Kind, ctx.RefreshToken, ctx.AccessExpiresAt, ctx.Workspace = "", "", "", ""
 		ctx.Server, ctx.Token = serverURL, resp.Token
 		if resp.User.ID != "" {
 			ctx.OwnerID = resp.User.ID
@@ -950,8 +968,8 @@ func runCloudLoginSleep(edgeURL, deviceName, contextName string, sleep func(time
 func runCloudLoginContext(ctx context.Context, edgeURL, deviceName, contextName string, sleep func(time.Duration)) error {
 	base := strings.TrimRight(edgeURL, "/")
 	u, err := url.Parse(base)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return fmt.Errorf("login --cloud: %q is not an http(s) URL", edgeURL)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return usagef("login --cloud requires an http(s) server URL without credentials, query, or fragment")
 	}
 	if deviceName == "" {
 		deviceName = defaultDeviceName()
@@ -984,6 +1002,10 @@ func runCloudLoginContext(ctx context.Context, edgeURL, deviceName, contextName 
 
 	if err := cli.UpdateConfigContext(ctx, func(cfg *cli.Config) error {
 		ctx := cfg.Contexts[contextName]
+		if ctx.Server != base {
+			ctx = cli.Context{}
+		}
+		ctx.OwnerID, ctx.CurrentSession = "", ""
 		ctx.Server, ctx.Token = base, pair.AccessToken
 		ctx.RefreshToken, ctx.AccessExpiresAt = pair.RefreshToken, pair.AccessExpiresAt
 		// Recorded so a later logout, which deletes both tokens, still leaves
@@ -1390,6 +1412,9 @@ func runNew(args []string) error {
 	// Two answers to "what does this session run" is a mistake, not a
 	// precedence puzzle. Refusing costs one retype; picking a winner costs a
 	// person a session that quietly did the other thing (contract §3.3).
+	if *agentName != "" && *image != "" {
+		return usagef("--agent requires the environment image; use -- CMD with --image")
+	}
 	if *agentName != "" && len(cmdArgs) > 0 {
 		return usagef("--agent %s and an explicit command both say what this session runs; pass one of them", *agentName)
 	}
@@ -1419,7 +1444,7 @@ func runNew(args []string) error {
 		resolved, resolveErr := resolveDefaultEnvironment(ctx, c)
 		switch {
 		case resolveErr == nil:
-			resolvedEnv, environmentName = resolved, resolved.Name
+			resolvedEnv, environmentName = resolved, resolved.ID
 		case !errors.Is(resolveErr, errNoDefaultEnvironment):
 			return resolveErr
 		}
@@ -1457,7 +1482,11 @@ func runNew(args []string) error {
 
 	created, err := createSession(c, body, *idempotencyKey)
 	if err != nil {
-		return newSessionError(err, workspaceNotReadyDestination(ctx, cfg, c))
+		var apiErr *cli.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "workspace_not_ready" {
+			return newSessionError(err, workspaceNotReadyDestination(ctx, cfg, c))
+		}
+		return err
 	}
 	// The id is the durable handle, so it is printed before anything can go
 	// wrong with the attach that follows — except under --json, where the
@@ -1466,7 +1495,7 @@ func runNew(args []string) error {
 	if !*asJSON {
 		fmt.Println(created.ID)
 	}
-	if err := rememberCurrentSession(created.ID); err != nil {
+	if err := rememberCurrentSession(created.ID, cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "note: could not record this session as `current`: %v\n", err)
 	}
 
@@ -1502,14 +1531,11 @@ func newSessionError(err error, destination string) error {
 	if !errors.As(err, &apiErr) || apiErr.Code != "workspace_not_ready" {
 		return err
 	}
-	message := "no session was created: this workspace does not have compute yet"
-	if apiErr.Message != "" {
-		message = "no session was created: " + apiErr.Message
-	}
+	message := "no session was created: workspace compute is not ready; run rainier status"
 	if destination != "" {
 		message += "\nContinue: " + destination
 	}
-	return errors.New(message)
+	return commandError{message: message, cause: err}
 }
 
 // environmentByRef resolves an environment name or id to its row. --agent
@@ -1560,7 +1586,7 @@ func createSession(c *cli.Client, body createSessionRequest, idempotencyKey stri
 	}
 	var resp sessionEnvelope
 	if err := c.Do(http.MethodPost, "/v0/sessions", body, &resp, cli.IdempotencyKey(idempotencyKey)); err != nil {
-		return session{}, err
+		return session{}, commandError{message: fmt.Sprintf("create was not confirmed; inspect rainier ls, or retry the same request with --idempotency-key %s", idempotencyKey), cause: err}
 	}
 	return resp.Session, nil
 }
@@ -1721,7 +1747,7 @@ func retryableAttachError(err error) bool {
 // somebody who only wants to know which of their sessions is up.
 func runLs(args []string) error {
 	fs := flag.NewFlagSet("ls", flag.ExitOnError)
-	all := fs.Bool("all", false, "include finished and unavailable history")
+	all := fs.Bool("all", false, "include canceled and deleted history")
 	verbose := fs.Bool("verbose", false, "add id, environment, runner, reachability and diagnostic state")
 	asJSON := fs.Bool("json", false, "print one machine-readable sessions document")
 	fs.Parse(reorderArgs(fs, args))
@@ -1735,21 +1761,18 @@ func runLs(args []string) error {
 	}
 	c := cli.NewClient(cfg)
 
-	rows, err := listSessions(c, *all)
+	rows, err := listSessions(c, true)
 	if err != nil {
 		return err
+	}
+	if !*all {
+		rows = slices.DeleteFunc(rows, func(s session) bool { return !activeSession(s) })
 	}
 	if *asJSON {
 		return writeSessionsJSON(os.Stdout, cfg, rows)
 	}
 	printSessions(os.Stdout, rows, *verbose)
 
-	if !*all {
-		var failed sessionsEnvelope
-		if err := c.Do(http.MethodGet, "/v0/sessions?all=true&limit=1&state=failed", nil, &failed); err == nil && len(failed.Sessions) > 0 {
-			fmt.Fprintln(os.Stderr, "note: unavailable sessions are hidden; run `rainier ls --all` to inspect or delete them")
-		}
-	}
 	return nil
 }
 
@@ -1886,13 +1909,13 @@ func runAttach(args []string) error {
 	if err := prepareAttach(c, id, replay); err != nil {
 		return err
 	}
-	// Recorded before the attach rather than after: a session a person has
-	// been sitting in for an hour is the current one from the moment they
-	// open it, and the attach only returns when they detach.
-	if err := rememberCurrentSession(id); err != nil {
-		fmt.Fprintf(os.Stderr, "note: could not record this session as `current`: %v\n", err)
+	if err := attachWithRetry(cfg, id, cursor); err != nil {
+		return err
 	}
-	return attachWithRetry(cfg, id, cursor)
+	if err := rememberCurrentSession(id, cfg); err != nil {
+		fmt.Fprintln(os.Stderr, "note: could not record this session as current")
+	}
+	return nil
 }
 
 // prepareAttach decides what `rainier attach` does about a session that is
@@ -2068,7 +2091,8 @@ func attachFlags(args []string) (ref string, cursor uint64, replay bool, err err
 
 func runResume(args []string) error {
 	fs := flag.NewFlagSet("resume", flag.ExitOnError)
-	fs.Parse(args)
+	asJSON := fs.Bool("json", false, "print one machine-readable result document")
+	fs.Parse(reorderArgs(fs, args))
 	ref, err := requireSelector(fs, "resume")
 	if err != nil {
 		return err
@@ -2082,7 +2106,10 @@ func runResume(args []string) error {
 	if err := c.Do(http.MethodPost, "/v0/sessions/"+id+"/resume", nil, &resp); err != nil {
 		return err
 	}
-	fmt.Printf("%s -> %s\n", resp.Session.ID, safeField(resp.Session.State))
+	if *asJSON {
+		return writeJSON(os.Stdout, schemaMutation, mutationDocument("resume", resp.Session.ID, true, resp.Session.State, "resume accepted"))
+	}
+	fmt.Printf("%s -> %s\n", safeField(resp.Session.ID), safeField(resp.Session.State))
 	return nil
 }
 
@@ -2315,7 +2342,7 @@ func runAgentLogin(args []string) error {
 			return fmt.Errorf("this workspace publishes no default environment, so there is no image known to carry %s's CLI. "+
 				"Run `rainier status` to see what your workspace is missing, or name one with --env", p.Name)
 		}
-		environmentName = resolved.Name
+		environmentName = resolved.ID
 	}
 
 	before, err := agentRow(c, p.Name)
@@ -2369,14 +2396,9 @@ func runAgentLogin(args []string) error {
 			after = again
 		}
 	}
-	if after.Version == before.Version {
-		// Deliberately not an error: `agent login` did everything it set out
-		// to do, and a person who exited without finishing is an outcome, not
-		// a failure. There is no note to relay — sessiond's boot notes are
-		// not routed to the control plane yet — so the CLI says only what it
-		// can establish itself.
-		fmt.Println("login did not complete: the agent wrote no credential")
-		return nil
+	if after.Version == before.Version || agentReadiness(after) != agentReady {
+		// Custody did not confirm a new usable credential. Do not report success.
+		return errors.New("login did not complete: the agent wrote no credential")
 	}
 	fmt.Printf("logged in as of %s (v%d)\n", dashIfEmpty(after.Since), after.Version)
 	return nil
@@ -2571,7 +2593,7 @@ func agentProviderNamed(name string) (controlapp.AgentProvider, error) {
 			return p, nil
 		}
 	}
-	return controlapp.AgentProvider{}, fmt.Errorf("unknown agent provider %q; this build supports: %s",
+	return controlapp.AgentProvider{}, usagef("unknown agent provider %q; this build supports: %s",
 		name, strings.Join(agentProviderNames(), ", "))
 }
 
@@ -3458,6 +3480,9 @@ const (
 
 func resolveSessionIDWithScope(c *cli.Client, myOwnerID, ref string, scope sessionResolveScope) (string, error) {
 	if strings.HasPrefix(ref, "sess_") {
+		if strings.ContainsAny(ref, "/?#%\\") || strings.TrimSpace(ref) != ref {
+			return "", usagef("invalid session id")
+		}
 		return ref, nil
 	}
 
@@ -3468,6 +3493,7 @@ func resolveSessionIDWithScope(c *cli.Client, myOwnerID, ref string, scope sessi
 	var matches []match
 
 	cursor := ""
+	seen := map[string]bool{}
 	for {
 		q := url.Values{}
 		if scope != resolveActive {
@@ -3498,6 +3524,10 @@ func resolveSessionIDWithScope(c *cli.Client, myOwnerID, ref string, scope sessi
 		if page.NextCursor == "" {
 			break
 		}
+		if seen[page.NextCursor] {
+			return "", errors.New("session listing repeated a pagination cursor")
+		}
+		seen[page.NextCursor] = true
 		cursor = page.NextCursor
 	}
 	// GET /v0/sessions is team-visible, but lifecycle commands should operate

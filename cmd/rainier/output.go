@@ -5,17 +5,30 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
 	"unicode"
 
+	"github.com/coder/websocket"
+	"github.com/tokencanopy/rainier/internal/attachio"
 	"github.com/tokencanopy/rainier/internal/cli"
+	"golang.org/x/term"
 )
 
 // ---------------------------------------------------------------------------
 // streams and exit codes (docs/cli-v0-contract.md §6.1)
 // ---------------------------------------------------------------------------
+
+// commandError carries trusted guidance while retaining machine-readable causes.
+type commandError struct {
+	message string
+	cause   error
+}
+
+func (e commandError) Error() string { return e.message }
+func (e commandError) Unwrap() error { return e.cause }
 
 // usageError is an invalid invocation: the user typed something this CLI
 // cannot act on, as opposed to something the server refused. main renders it
@@ -143,7 +156,24 @@ func stripControlsKeepingLines(s string) string {
 // should quote; the request id because it is the only handle support has on
 // one exchange out of a day's worth.
 func reportError(cfg cli.Config, w io.Writer, err error) {
-	fmt.Fprintln(w, redactSecrets(cfg, err.Error()))
+	var remote *cli.APIError
+	var closeError websocket.CloseError
+	var dial *attachio.DialError
+	var transport *url.Error
+	var guidance commandError
+	if errors.As(err, &guidance) {
+		fmt.Fprintln(w, redactSecrets(cfg, guidance.message))
+	} else if errors.As(err, &closeError) {
+		fmt.Fprintf(w, "terminal connection closed (code %d); reconnect with rainier attach\n", closeError.Code)
+	} else if errors.As(err, &dial) {
+		fmt.Fprintf(w, "terminal connection refused (HTTP %d); run rainier info for session state\n", dial.Status)
+	} else if errors.As(err, &transport) {
+		fmt.Fprintln(w, readinessError(err))
+	} else if errors.As(err, &remote) {
+		fmt.Fprintln(w, readinessError(err))
+	} else {
+		fmt.Fprintln(w, redactSecrets(cfg, err.Error()))
+	}
 	var apiErr *cli.APIError
 	if errors.As(err, &apiErr) && (apiErr.Code != "" || apiErr.RequestID != "") {
 		parts := []string{}
@@ -244,6 +274,5 @@ var isInteractive = func() bool {
 }
 
 func charDevice(f *os.File) bool {
-	fi, err := f.Stat()
-	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+	return term.IsTerminal(int(f.Fd()))
 }

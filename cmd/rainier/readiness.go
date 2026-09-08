@@ -180,7 +180,7 @@ func (o onboardingDestinations) destinationFor(status string) string {
 		return ""
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Host == "" {
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return ""
 	}
 	return raw
@@ -219,10 +219,17 @@ func resolveDefaultEnvironment(ctx context.Context, c *cli.Client) (environment,
 	if err != nil {
 		return environment{}, err
 	}
+	var marked []environment
 	for _, env := range envs {
 		if env.Default {
-			return env, nil
+			marked = append(marked, env)
 		}
+	}
+	if len(marked) == 1 {
+		return marked[0], nil
+	}
+	if len(marked) > 1 {
+		return environment{}, errNoDefaultEnvironment
 	}
 	if len(envs) == 1 {
 		return envs[0], nil
@@ -236,6 +243,14 @@ func fetchEnvironments(ctx context.Context, c *cli.Client) ([]environment, error
 	var resp environmentsEnvelope
 	if err := c.DoContext(ctx, http.MethodGet, "/v0/environments", nil, &resp); err != nil {
 		return nil, err
+	}
+	for _, env := range resp.Environments {
+		if env.ID == "" || env.Name == "" {
+			return nil, errMalformedReadiness
+		}
+	}
+	if resp.Environments == nil {
+		return nil, errMalformedReadiness
 	}
 	return resp.Environments, nil
 }
@@ -329,6 +344,5 @@ func agentLaunchCommand(ctx context.Context, c *cli.Client, env environment, pro
 	for _, launcher := range launchers {
 		names = append(names, launcher.ID)
 	}
-	return nil, errors.New("environment " + safeField(env.Name) + " cannot start " + safeField(provider) +
-		"; it carries: " + safeField(strings.Join(names, ", ")))
+	return nil, usagef("environment %s cannot start %s; it carries: %s", safeField(env.Name), safeField(provider), safeField(strings.Join(names, ", ")))
 }

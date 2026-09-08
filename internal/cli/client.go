@@ -447,12 +447,7 @@ func (c *Client) attempt(ctx context.Context, method, path string, in any, opts 
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, errBodyLimit))
 		var env errorEnvelope
 		if err := json.Unmarshal(data, &env); err != nil || env.Error.Code == "" {
-			const clip = 200
-			text := string(data)
-			if len(text) > clip {
-				text = text[:clip]
-			}
-			return nil, &APIError{Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After"), RequestID: responseRequestID(resp, requestID), Message: fmt.Sprintf("unexpected response: %d %s", resp.StatusCode, text)}
+			return nil, &APIError{Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After"), RequestID: responseRequestID(resp, requestID), Message: fmt.Sprintf("unexpected response: %d", resp.StatusCode)}
 		}
 		return nil, &APIError{Code: env.Error.Code, Message: env.Error.Message, Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After"), RequestID: responseRequestID(resp, requestID)}
 	}

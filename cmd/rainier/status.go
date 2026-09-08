@@ -44,6 +44,7 @@ type statusRow struct {
 	// different words ("ready", "connected") mean ready and several
 	// ("setup required", "unknown") do not.
 	Ready bool
+	Facts map[string]any
 }
 
 func runStatus(args []string) error {
@@ -58,6 +59,8 @@ func runStatus(args []string) error {
 }
 
 func status(ctx context.Context, verbose, asJSON bool, out, diag io.Writer) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*doctorTimeout)
+	defer cancel()
 	cfg, err := cli.Load()
 	if err != nil {
 		// An unreadable config is not a readiness answer; it is a broken
@@ -97,6 +100,8 @@ var errNotReady = errors.New("workspace is not ready; follow the actions above")
 // whose GitHub connection is down still needs to see that their compute is
 // fine.
 func collectStatus(ctx context.Context, cfg cli.Config) ([]statusRow, bool) {
+	ctx, cancel := context.WithTimeout(ctx, doctorTimeout)
+	defer cancel()
 	active, ok := cfg.Active()
 	if !ok || !active.SignedIn() {
 		return []statusRow{{
@@ -116,6 +121,9 @@ func collectStatus(ctx context.Context, cfg cli.Config) ([]statusRow, bool) {
 		User userView `json:"user"`
 	}
 	meErr := readinessGET(ctx, c, "/v0/me", &me)
+	if meErr == nil && me.User.ID == "" {
+		meErr = errMalformedReadiness
+	}
 	switch {
 	case meErr != nil:
 		add(statusRow{Label: "Signed in", Key: "signed_in", Value: "no (" + readinessError(meErr) + ")", Required: true})
@@ -139,7 +147,16 @@ func collectStatus(ctx context.Context, cfg cli.Config) ([]statusRow, bool) {
 	onboarding, _ := fetchOnboarding(ctx, c)
 
 	add(workspaceRow(ctx, c, active))
-	add(computeRow(compute, computeErr, onboarding))
+	cr := computeRow(compute, computeErr, onboarding)
+	if !active.Hosted() && !compute.Published && computeErr == nil {
+		runners, err := fetchReadinessRunners(ctx, c)
+		if err != nil {
+			cr.Value = "unknown (" + readinessError(err) + ")"
+		} else {
+			cr.Ready, cr.Value = runnerReadiness(runners)
+		}
+	}
+	add(cr)
 	add(environmentRow(ctx, c))
 	add(githubRow(ctx, c, active, onboarding))
 	rows = append(rows, agentRows(ctx, c)...)
@@ -169,7 +186,7 @@ func workspaceRow(ctx context.Context, c *cli.Client, active cli.Context) status
 	if err != nil {
 		// The id is what the requests are actually scoped by, so it is a
 		// true answer even when the name lookup failed.
-		row.Value, row.Ready = active.Workspace, true
+		row.Value = "unknown (" + readinessError(err) + ")"
 		return row
 	}
 	for _, w := range spaces {
@@ -203,10 +220,10 @@ func computeRow(compute computeState, computeErr error, onboarding onboardingDes
 		return row
 	}
 	if !compute.Published {
-		row.Value = "not enrolled (this server publishes no compute plan)"
-		row.Ready = true
+		row.Value = "unknown (this server does not publish compute readiness)"
 		return row
 	}
+	row.Facts = map[string]any{"status": compute.Status, "health": compute.Health}
 	row.Continue = onboarding.destinationFor(compute.Status)
 	if compute.ready() {
 		row.Value, row.Ready = "ready", true
@@ -248,7 +265,7 @@ func environmentRow(ctx context.Context, c *cli.Client) statusRow {
 		// Several environments and no server-published default is not a
 		// broken workspace: `rainier new --env NAME` still works, and so does
 		// a scratch session. Say which it is.
-		row.Value, row.Ready = "several available; none marked default (use --env)", true
+		row.Value = "no unambiguous default environment; configure one on the web or use new --env NAME"
 	default:
 		row.Value = "unknown (" + readinessError(err) + ")"
 	}
@@ -378,6 +395,9 @@ func writeStatusJSON(w io.Writer, cfg cli.Config, rows []statusRow, ready bool) 
 			"value":    redactSecrets(cfg, r.Value),
 			"ready":    r.Ready,
 			"required": r.Required,
+		}
+		if r.Facts != nil {
+			check["facts"] = r.Facts
 		}
 		// The destination belongs to the row that needs it, in JSON exactly as
 		// on screen: a ready row carrying a "continue" reads as an action

@@ -135,7 +135,8 @@ labelled accurately — a session somebody cancelled and one somebody deleted
 are different events with different causes, and neither is "finished".
 
 **Process.** `Exited (N)` when `child_exit_code` is present; `Running` when it
-is absent and the sandbox exists; `-` otherwise. `Running` here means the child
+is absent and the session is running; `Paused` for warm suspension and `-`
+for cold suspension or a sandbox that has not started. `Running` here means the child
 process **exists** — it does not mean it is doing anything. An agent sitting at
 a prompt and an agent mid-compile are the same fact, and the CLI does not imply
 otherwise.
@@ -214,7 +215,10 @@ rainier new [--name NAME] [--agent claude|codex] [--detach] [-- CMD ARGS...]
   scratch session, as before, so self-hosted deployments are unaffected. An
   explicit `--image` opts out: it says "run exactly this image", and folding an
   environment's setup script in underneath one is how a session fails at boot.
-- An idempotency key is generated automatically for every invocation.
+- An idempotency key is generated automatically for every invocation. If create
+  is not confirmed, the error gives that key for a retry with the same arguments
+  and `--idempotency-key KEY`; mutations are not automatically retried after
+  transport failures. Retry deletes by opaque ID, not a reusable name.
 - `-- CMD ARGS...` runs an arbitrary command, unchanged.
 - `--agent claude|codex` is resolved only from the server's launch catalog
   (§5.3). The CLI does not contain `claude` or `codex` command lines.
@@ -246,8 +250,8 @@ own `API state` beside them, timestamps, environment, and whether the session
 can currently be attached, stopped or deleted — each with the reason when the
 answer is no, so a person can tell "not yet" from "never".
 
-Failure information is included, sanitized: control characters stripped,
-credentials redacted, length bounded. Raw provider errors, terminal contents,
+Failure presence is included with fixed diagnostic guidance. Raw failure prose
+is omitted because it can contain secrets unknown to the local credential store. Raw provider errors, terminal contents,
 credentials, and internal database details are never shown.
 
 ### 3.6 `rainier attach <session>`
@@ -267,7 +271,8 @@ states and a display word groups states the endpoint treats differently.
 - an unknown state: attempted; the server decides.
 - Ctrl-] detaches locally and leaves the remote session running.
 - `--since` remains the diagnostic replay and overrides every refusal above.
-- A successful attach records `current`.
+- A successful attach records `current` when it returns; a refused connection
+  leaves it unchanged. The original context is retained across context switches.
 
 ### 3.7 `rainier stop <session>`
 
@@ -391,7 +396,8 @@ rainier agent logout <claude|codex> [--yes]
 ```
 
 - `agent login` runs the provider's own supported interactive flow in a
-  throwaway session. Nothing is pasted through the CLI.
+  throwaway session. Nothing is pasted through the CLI. An incomplete login
+  that writes no credential exits 1.
 - It uses the server-selected default environment (§5.2); an ordinary hosted
   user never types `--env`. `--env` survives as an advanced override.
 - If no compatible environment exists, that is reported as a readiness
@@ -420,8 +426,8 @@ reconnection, so `connection share|unshare|reconnect` has no caller, and
 
 ## 5. Cloud API dependencies
 
-Verified against `rainier-cloud` `origin/main` at `81d1ad3` (PR #53, "workspace
-compute enrollment, the server-owned catalog, and readiness admission").
+Verified against `rainier-cloud` `origin/main` at
+`05fbe23562292c4b69a12b0fdab2574911cd7dca`.
 
 ### 5.1 Workspace compute — **live**
 
@@ -450,8 +456,9 @@ to and whether it is reachable are two facts.
 
 A 404 or 405 means the server publishes no compute route — an older cell, a
 self-hosted `controld`, or a cell composed to sell no compute
-(`computeUnavailable` answers 404 by design). All three mean "this deployment
-sells no compute", not "unavailable", and `status` says so and stays ready.
+(`computeUnavailable` answers 404 by design). A hosted CLI cannot distinguish
+these from a missing route: it reports unknown readiness and exits 1. A
+self-hosted context checks runner connectivity and capacity instead.
 
 ### 5.2 The onboarding destination — **still missing**
 
@@ -571,7 +578,7 @@ reconstructing it from an environment's connectors.
 ### 6.2 `--json`
 
 Supported by `status`, `ls`, `info`, `agent status`, and the asynchronous
-mutation results (`new --detach`, `stop`, `delete`). Every document carries:
+mutation results (`new --detach`, `stop`, `resume`, `delete`). Every document carries:
 
 ```json
 {"schema": "rainier.v0.<kind>", "version": 1, ...}
@@ -627,3 +634,11 @@ primary journey. `rainier help <command>` gives one command's detail.
 administration, environments and secrets, contexts and workspaces, and the
 low-level transfer and snapshot operations — each under an **Advanced**
 heading. Advanced material never appears in the first-run experience.
+
+### 6.4 Additional canonical facts
+
+Session documents include `runner` and `last_event_at`; `info` labels the last
+server event separately from creation time and process state. A last event is
+not proof that an agent is actively working. Status compute checks include
+`facts.status` and `facts.health` verbatim. Missing required facts (including
+an unresolved default environment or a failed workspace lookup) fail readiness.

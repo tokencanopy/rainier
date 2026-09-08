@@ -206,9 +206,9 @@ facts — state, reachable, child_exit_code — beside the derived ones.`
 Open the session's current terminal screen. Ctrl-] detaches and leaves the
 session running. A stopped session is resumed first and waited for.
 
-A finished session says so instead of opening a screen nothing will write to;
-an unavailable one says why it cannot be reached. --since is the diagnostic
-replay and overrides both: --since 0 replays the whole event log — a failed
+A running sandbox stays attachable after its child exits. A failed session
+is attachable while its runner is reachable. --since requests diagnostic
+replay: --since 0 replays the whole event log — a failed
 setup's complete output — and --since N resumes after sequence N.
 
 Transient disconnects and hosted lease renewals reconnect from the last
@@ -284,7 +284,7 @@ chooses automatically when there is one workspace, which is the hosted v0
 case. This selection scopes subsequent requests; it does not create a
 workspace.`
 	case "resume":
-		help = `usage: rainier resume <session>
+		help = `usage: rainier resume <session> [--json]
 
 Advanced. Resume a stopped session without attaching, for automation that
 wants the two halves separately. Interactive users run rainier attach, which

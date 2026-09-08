@@ -61,11 +61,11 @@ func TestThreeDimensions(t *testing.T) {
 		},
 		{
 			"suspended warm", session{State: "suspended_warm"},
-			lifecycleStopped, processRunning, connectionUnavailable,
+			lifecycleStopped, "paused", connectionUnavailable,
 		},
 		{
 			"suspended cold", session{State: "suspended_cold"},
-			lifecycleStopped, processRunning, connectionUnavailable,
+			lifecycleStopped, processNone, connectionUnavailable,
 		},
 		{
 			"suspended with a child that exited",

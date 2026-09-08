@@ -150,17 +150,17 @@ command after `--` to run something specific, for example
 `rainier new --name box2 -- codex`. Use `--detach` to create without opening the
 terminal.
 
-`rainier ls` shows name, state and age; states are `starting`, `running`,
-`stopped`, `finished` and `unavailable`. `--all` adds finished and unavailable
-history, and `--verbose` adds ids, environments, runners and the server's own
-state. `rainier info <session>` is one session in full.
+`rainier ls` shows name, lifecycle, child process, runner connection, and age.
+A running sandbox stays Running after its child exits; the Process column
+shows the exit code. `--all` adds Canceled and Deleted records. `--verbose`
+adds ids, environments, runners, and the API state. `rainier info <session>`
+also shows the last server event time, separately from process activity.
 
 Any session command takes a name, a `sess_` id, or the word `current`, which is
 the session you last created or attached.
 
 `attach` resumes a stopped session when necessary and restores the current
-screen. A session whose process has finished says so rather than opening a
-screen nothing will write to; `rainier attach box1 --since 0` replays all
+screen, including after its child has exited; `rainier attach box1 --since 0` replays all
 recorded output and is the way to read a failed session's log.
 
 If initial attach keeps receiving 503 responses, the CLI waits about a minute,

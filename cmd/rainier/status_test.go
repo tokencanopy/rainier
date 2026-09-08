@@ -256,10 +256,10 @@ func TestStatusWithoutTheComputeRoute(t *testing.T) {
 	var out bytes.Buffer
 	rows, ready := collectStatus(context.Background(), cfg)
 	printStatus(&out, rows)
-	if !ready {
-		t.Fatalf("a server with no compute route reported not ready:\n%s", out.String())
+	if ready {
+		t.Fatalf("a hosted server with no compute route reported ready:\n%s", out.String())
 	}
-	if !strings.Contains(out.String(), "not enrolled") {
+	if !strings.Contains(out.String(), "unknown") {
 		t.Errorf("status does not say the server sells no compute:\n%s", out.String())
 	}
 	if strings.Contains(out.String(), "Continue:") {

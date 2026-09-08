@@ -116,7 +116,7 @@ func TestNewUsesTheDefaultEnvironment(t *testing.T) {
 		if _, err := captureStdout(t, func() error { return runNew([]string{"--detach", "--name", "box"}) }); err != nil {
 			t.Fatalf("new: %v", err)
 		}
-		if f.created.Environment != "hosted-default" {
+		if f.created.Environment != "env_2" {
 			t.Errorf("created with environment %q, want the server's default", f.created.Environment)
 		}
 	})
@@ -128,7 +128,7 @@ func TestNewUsesTheDefaultEnvironment(t *testing.T) {
 		if _, err := captureStdout(t, func() error { return runNew([]string{"--detach"}) }); err != nil {
 			t.Fatalf("new: %v", err)
 		}
-		if f.created.Environment != "default" {
+		if f.created.Environment != "env_1" {
 			t.Errorf("created with environment %q, want the catalog's only one", f.created.Environment)
 		}
 	})
@@ -553,7 +553,7 @@ func TestDeleteRequiresConsent(t *testing.T) {
 		// go to stderr. That is what lets `delete --json` promise the document
 		// on stdout is the only thing there (contract §6.1, §6.2).
 		stdout, prompt, err := captureBoth(t, func() error { return deleteSession("sess_x", false, false, &out) })
-		if err != nil {
+		if exitCodeFor(err) != 1 {
 			t.Fatalf("delete: %v", err)
 		}
 		if !strings.Contains(prompt, "cannot be recovered") || !strings.Contains(prompt, "continue? [y/N]") {

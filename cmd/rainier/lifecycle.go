@@ -76,6 +76,7 @@ func printInfo(w io.Writer, cfg cli.Config, s session) {
 	fmt.Fprintf(w, "API state:    %s\n", safeField(s.State))
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "Created:      %s\n", safeField(dashIfEmpty(s.CreatedAt)))
+	fmt.Fprintf(w, "Last event:   %s\n", safeField(dashIfEmpty(s.LastEventAt)))
 	fmt.Fprintf(w, "Updated:      %s\n", safeField(dashIfEmpty(s.UpdatedAt)))
 	fmt.Fprintf(w, "Environment:  %s\n", safeField(dashIfEmpty(s.Environment)))
 	if agent := sessionAgent(s); agent != "" {
@@ -90,7 +91,7 @@ func printInfo(w io.Writer, cfg cli.Config, s session) {
 		fmt.Fprintf(w, "Waiting on:   %s\n", diagnosticText(cfg, detail))
 	}
 	if s.Error != "" {
-		fmt.Fprintf(w, "Failure:      %s\n", diagnosticText(cfg, s.Error))
+		fmt.Fprintf(w, "Failure:      %s\n", "session failed; use diagnostic attach to inspect its output")
 	}
 }
 
@@ -180,7 +181,9 @@ func sessionDocument(cfg cli.Config, s session) map[string]any {
 		"child_exit_code": nil,
 		"created_at":      s.CreatedAt,
 		"updated_at":      s.UpdatedAt,
+		"last_event_at":   s.LastEventAt,
 		"environment":     s.Environment,
+		"runner":          s.Runner,
 		// Derived, additive, one key per dimension.
 		"lifecycle":  lifecycleOf(s),
 		"process":    processOf(s),
@@ -201,7 +204,7 @@ func sessionDocument(cfg cli.Config, s session) map[string]any {
 		doc["queue_reason"] = diagnosticText(cfg, s.QueueReason)
 	}
 	if s.Error != "" {
-		doc["failure"] = diagnosticText(cfg, s.Error)
+		doc["failure"] = "session failed; use diagnostic attach to inspect its output"
 	}
 	return doc
 }
@@ -411,8 +414,7 @@ func deleteSession(ref string, yes, asJSON bool, out io.Writer) error {
 			return err
 		}
 		if !ok {
-			fmt.Fprintln(os.Stderr, "canceled")
-			return nil
+			return errors.New("deletion canceled")
 		}
 	}
 
@@ -423,7 +425,7 @@ func deleteSession(ref string, yes, asJSON bool, out io.Writer) error {
 			// Already gone is the outcome that was asked for.
 			return reportDelete(out, asJSON, id, false, "session was already gone")
 		}
-		return err
+		return commandError{message: "delete was not confirmed; inspect rainier info " + safeField(id) + "; retry with rainier delete " + safeField(id) + " --yes", cause: err}
 	}
 	if status == http.StatusAccepted {
 		// Explicitly not "deleted": the server has taken the request and the

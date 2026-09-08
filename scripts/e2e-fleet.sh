@@ -351,46 +351,16 @@ case "$SID" in
   *) fail "new printed \"$SID\", want a sess_ id" ;;
 esac
 
-# TWO readers, and which one a check needs is not a detail. A plain `ls`
-# EXCLUDES the terminal states (canceled/failed/dead/destroyed) — that is what
-# `--all` is for — so state_of answers "" for a session that failed exactly as
-# it does for one that never existed. It is therefore the right reader for "is
-# it gone", and the WRONG one for "did it fail": `state_of X = failed` is a
-# condition that can never be true, so a waitfor on it always burns its whole
-# bound and then reports the state as "".
-#
-# That is not hypothetical. The stale-credential scene below waited 120s for a
-# session that had already failed in about a second, and blamed a boot chain
-# that was working (Plan 5, first live rehearsal). Anything asserting on a
-# terminal state reads state_all_of.
-#
-# These assertions are about the CONTROL PLANE's state machine — queued,
-# creating, running, suspended_cold, failed, destroyed — and the default `ls`
-# no longer shows it: its three columns are the five words a person needs.
-# `ls --verbose` is where the diagnostic state lives, so that is what the
-# fleet suite reads.
-#
-# Its columns are NAME STATE AGE ID ENV RUNNER REACHABLE DIAGNOSTIC. Fields 1
-# through 7 never contain a space (an empty cell renders as "-"), so awk's
-# default splitting addresses them exactly, and DIAGNOSTIC is last — which is
-# what lets a queue reason or an exit code, both of which contain spaces, be
-# read whole.
-#
-# state_of and state_all_of take the FIRST WORD of DIAGNOSTIC, because that
-# column is a rendered sentence and not a bare state: diagnosticState annotates
-# it with whatever the state alone leaves unanswered — "failed (exited 128)",
-# "running (exited 0)", "queued (waiting for runner rainier-gpu)". Comparing
-# the whole cell to "failed" is therefore false for every session whose agent
-# exited, which is all of them.
-diagnostic_of() { ./bin/rainier ls --verbose 2>/dev/null | awk -v id="$1" '$4 == id { $1=$2=$3=$4=$5=$6=$7=""; sub(/^ +/, ""); print }'; }
-diagnostic_all_of() { ./bin/rainier ls --all --verbose 2>/dev/null | awk -v id="$1" '$4 == id { $1=$2=$3=$4=$5=$6=$7=""; sub(/^ +/, ""); print }'; }
-runner_of()     { ./bin/rainier ls --verbose 2>/dev/null | awk -v id="$1" '$4 == id { print $6 }'; }
-state_of()      { diagnostic_of "$1" | awk '{print $1}'; }
-state_all_of()  { diagnostic_all_of "$1" | awk '{print $1}'; }
+# Read canonical JSON facts; display columns deliberately contain spaces.
+command -v jq >/dev/null || setup_error "jq not found"
+state_of() { ./bin/rainier ls --json | jq -r --arg id "$1" '.sessions[] | select(.id == $id) | .state'; }
+state_all_of() { ./bin/rainier ls --all --json | jq -r --arg id "$1" '.sessions[] | select(.id == $id) | .state'; }
+runner_of() { ./bin/rainier info "$1" --json | jq -r '.runner'; }
+diagnostic_of() { ./bin/rainier info "$1" --json | jq -r '.state + (if .queue_reason then " (" + .queue_reason + ")" else "" end)'; }
 session_state() { state_of "$SID"; }
 waitfor '[ "$(session_state)" = running ]' 90 "session running" \
   || fail "$SID never reached running (state: $(session_state)); see /tmp/runnerd.log"
-ok "session is running: $(./bin/rainier ls --verbose | awk -v id="$SID" '$4 == id')"
+ok "session is running: $(state_of "$SID")"
 
 # ---------------------------------------------------------------------------
 step "rainier ls"
@@ -442,7 +412,7 @@ step "rainier stop / resume"
 # ---------------------------------------------------------------------------
 # `stop` is always the persisted stop that releases capacity — the warm/cold
 # choice is gone from the interface, so the state to expect is suspended_cold.
-./bin/rainier stop "$SID" | grep -q "capacity released" || fail "stop did not report the session stopped"
+./bin/rainier stop "$SID" | grep -q "resources released" || fail "stop did not report the session stopped"
 [ "$(session_state)" = "suspended_cold" ] || fail "state after stop = $(session_state), want suspended_cold"
 ok "stopped (persisted, capacity released)"
 # Stopping again is the outcome that was asked for, not a failure.
@@ -774,8 +744,8 @@ AGENT_CRED_PATH=/rainier/agents/test/credential.json
 # `agent status` speaks the three words a person needs; the custody version is
 # a machine-readable detail, so it is read from --json rather than from a
 # column that no longer exists.
-agent_status()  { ./bin/rainier agent status 2>/dev/null | awk '$1 == "test" { $1=""; sub(/^ +/, ""); sub(/ +[^ ]+$/, ""); print }'; }
-agent_version() { ./bin/rainier agent status --json 2>/dev/null | tr -d ' \n' | sed -n 's/.*"provider":"test"[^}]*"version":\([0-9]*\).*/\1/p'; }
+agent_status()  { ./bin/rainier agent status --json 2>/dev/null | jq -r '.agents[] | select(.provider == "test") | .status'; }
+agent_version() { ./bin/rainier agent status --json 2>/dev/null | jq -r '.agents[] | select(.provider == "test") | .version'; }
 
 [ "$(agent_status)" = "not configured" ] || fail "before any login, agent status shows test as \"$(agent_status)\", want not configured"
 ok "agent status lists the test provider as not configured before any login"

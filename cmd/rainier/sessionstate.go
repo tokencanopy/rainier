@@ -104,8 +104,10 @@ func processOf(s session) string {
 		return processExited
 	}
 	switch s.State {
-	case "running", "suspended_warm", "suspended_cold":
+	case "running":
 		return processRunning
+	case "suspended_warm":
+		return "paused"
 	default:
 		return processNone
 	}
@@ -137,6 +139,8 @@ func displayProcess(s session) string {
 		return fmt.Sprintf("Exited (%d)", *s.ChildExitCode)
 	case processRunning:
 		return "Running"
+	case "paused":
+		return "Paused"
 	default:
 		return "-"
 	}
@@ -286,15 +290,24 @@ var errNoCurrentSession = errors.New(
 // failures are reported to the caller rather than swallowed: a `current` that
 // silently did not move is worse than one that says it could not be written,
 // because the next command would then act on the previous session.
-func rememberCurrentSession(id string) error {
+func rememberCurrentSession(id string, original ...cli.Config) error {
 	if id == "" {
 		return nil
 	}
 	return cli.UpdateConfig(func(latest *cli.Config) error {
 		name := latest.ActiveName()
+		if len(original) > 0 {
+			name = original[0].ActiveName()
+		}
 		ctx, ok := latest.Contexts[name]
 		if !ok {
 			return nil // nothing to attach the memory to; the command itself still succeeded
+		}
+		if len(original) > 0 {
+			before, ok := original[0].Active()
+			if !ok || ctx.Server != before.Server || ctx.Workspace != before.Workspace || ctx.OwnerID != before.OwnerID {
+				return errors.New("session context changed")
+			}
 		}
 		ctx.CurrentSession = id
 		latest.UpdateContext(name, ctx)

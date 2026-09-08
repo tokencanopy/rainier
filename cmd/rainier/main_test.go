@@ -383,37 +383,21 @@ func TestRmWithLegacyConfigDoesNotDiscardTerminalMatchesAcrossOwners(t *testing.
 // Default ls keeps terminal history out of the table, but a failed session
 // must not disappear without a clue. The bounded probe asks only whether one
 // failed row exists and points the user at the established --all view.
-func TestLsHintsWhenFailedSessionsAreHidden(t *testing.T) {
-	var paths []string
+func TestLsIncludesFailedWithoutConflatingReachability(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		paths = append(paths, r.URL.RequestURI())
-		w.Header().Set("Content-Type", "application/json")
-		if r.URL.Query().Get("state") == "failed" {
-			json.NewEncoder(w).Encode(sessionsEnvelope{Sessions: []session{{
-				ID: "sess_failed", Name: "broken", State: "failed",
-			}}})
-			return
+		if r.URL.Query().Get("all") != "true" {
+			t.Error("must request terminal rows to include failed sessions")
 		}
-		json.NewEncoder(w).Encode(sessionsEnvelope{})
+		json.NewEncoder(w).Encode(sessionsEnvelope{Sessions: []session{
+			{ID: "sess_failed", Name: "broken", State: "failed"},
+			{ID: "sess_deleted", Name: "removed", State: "destroyed"},
+		}})
 	}))
-	t.Cleanup(ts.Close)
-
-	t.Setenv("RAINIER_CONFIG", filepath.Join(t.TempDir(), "config.json"))
-	if err := cli.Save(cli.Config{ServerURL: ts.URL, Token: "rnr_test"}); err != nil {
-		t.Fatal(err)
-	}
-
-	_, diag, err := captureBoth(t, func() error { return runLs(nil) })
-	if err != nil {
-		t.Fatalf("ls: %v; requests=%v", err, paths)
-	}
-	// The hint is a diagnostic beside a table somebody may be parsing, so it
-	// belongs on stderr (docs/cli-v0-contract.md §6.1).
-	if !strings.Contains(diag, "rainier ls --all") {
-		t.Fatalf("ls stderr = %q, want a --all hint", diag)
-	}
-	if len(paths) != 2 || paths[0] != "/v0/sessions" || paths[1] != "/v0/sessions?all=true&limit=1&state=failed" {
-		t.Fatalf("requests = %v, want default list then bounded failed-session probe", paths)
+	defer ts.Close()
+	hostedConfig(t, ts.URL)
+	out, diag, err := captureBoth(t, func() error { return runLs(nil) })
+	if err != nil || !strings.Contains(out, "broken") || strings.Contains(out, "removed") || diag != "" {
+		t.Fatalf("list = %q, diagnostics = %q, error = %v", out, diag, err)
 	}
 }
 
@@ -442,7 +426,7 @@ func TestLsAllDoesNotPrintTheHiddenFailureHint(t *testing.T) {
 
 // The hint is supplemental. A transient failure in its second request must
 // not turn a successfully rendered session table into a failed command.
-func TestLsIgnoresHiddenFailureProbeErrors(t *testing.T) {
+func TestLsDoesNotProbeForHiddenFailures(t *testing.T) {
 	requests := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
@@ -463,7 +447,10 @@ func TestLsIgnoresHiddenFailureProbeErrors(t *testing.T) {
 
 	out, diag, err := captureBoth(t, func() error { return runLs(nil) })
 	if err != nil {
-		t.Fatalf("ls returned the optional probe error: %v", err)
+		t.Fatalf("ls: %v", err)
+	}
+	if requests != 1 {
+		t.Fatalf("listing made %d requests, want one", requests)
 	}
 	if !strings.Contains(out, "NAME") || strings.Contains(out+diag, "sessions are hidden") {
 		t.Fatalf("ls output = %q, want the table without an unproven hint", out)
@@ -1444,6 +1431,10 @@ func TestAttachWithRetryDoesNotRetryPolicyClose(t *testing.T) {
 func TestRunNewUsesSuppliedIdempotencyKey(t *testing.T) {
 	var gotKey string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v0/environments" {
+			fmt.Fprint(w, `{"environments":[]}`)
+			return
+		}
 		gotKey = r.Header.Get("Idempotency-Key")
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_synthetic", State: "queued"}})
@@ -2063,11 +2054,8 @@ func TestAgentLoginReportsAVersionThatDidNotMove(t *testing.T) {
 	out, err := captureStdout(t, func() error {
 		return runAgentLogin([]string{p.Name, "--env", "env-example"})
 	})
-	if err != nil {
-		t.Fatalf("agent login: %v; out=%s", err, out)
-	}
-	if !strings.Contains(out, "login did not complete: the agent wrote no credential") {
-		t.Errorf("output = %q, want the unfinished-login sentence", out)
+	if exitCodeFor(err) != 1 || !strings.Contains(err.Error(), "login did not complete") {
+		t.Fatalf("agent login must fail when no credential was written: %v; out=%s", err, out)
 	}
 	var removed bool
 	for _, c := range *calls {
