@@ -358,6 +358,40 @@ func TestDockerRunArgs(t *testing.T) {
 		}
 	})
 
+	t.Run("configured host security profiles apply only to session containers", func(t *testing.T) {
+		d := NewDocker(DockerOpts{
+			Image:                  "img:default",
+			Network:                "rainier-int",
+			TotalSlots:             8,
+			Label:                  "rainier.session",
+			SessionSeccompProfile:  "/etc/rainier/codex-bwrap-seccomp.json",
+			SessionAppArmorProfile: "rainier-codex-bwrap",
+		})
+		args := d.runArgs(Spec{SessionID: "sess-secure", DialURL: "ws://x"}, "img:1")
+		want := []string{
+			"seccomp=/etc/rainier/codex-bwrap-seccomp.json",
+			"apparmor=rainier-codex-bwrap",
+		}
+		if got := flagValues(args, "--security-opt"); !reflect.DeepEqual(got, append([]string{"no-new-privileges"}, want...)) {
+			t.Fatalf("--security-opt values = %v, want no-new-privileges followed by %v", got, want)
+		}
+
+		// The initializer is a separate root-only container with a single
+		// CAP_CHOWN. It must stay on Docker's default profiles: Bubblewrap never
+		// runs there, so widening that boundary has no purpose.
+		initArgs := workspaceInitArgs("rainier-ws-sess-secure", "img:1")
+		if got := flagValues(initArgs, "--security-opt"); !reflect.DeepEqual(got, []string{"no-new-privileges"}) {
+			t.Fatalf("workspace initializer --security-opt values = %v, want only no-new-privileges", got)
+		}
+	})
+
+	t.Run("empty host security profiles preserve Docker defaults", func(t *testing.T) {
+		args := d.runArgs(Spec{SessionID: "sess-default", DialURL: "ws://x"}, "img:1")
+		if got := flagValues(args, "--security-opt"); !reflect.DeepEqual(got, []string{"no-new-privileges"}) {
+			t.Fatalf("--security-opt values = %v, want only no-new-privileges", got)
+		}
+	})
+
 	t.Run("no session id means no volume and no workdir", func(t *testing.T) {
 		// A volume literally named "rainier-ws-" would be SHARED by every
 		// id-less session, and -w on a path no volume backs would leave the

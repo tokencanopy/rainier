@@ -82,10 +82,12 @@ type Docker struct {
 }
 
 type DockerOpts struct {
-	Image      string // default session image
-	Network    string // internal docker network name (created by fleet compose)
-	TotalSlots int    // capacity budget
-	Label      string // docker label key marking rainier-managed containers
+	Image                  string // default session image
+	Network                string // internal docker network name (created by fleet compose)
+	TotalSlots             int    // capacity budget
+	Label                  string // docker label key marking rainier-managed containers
+	SessionSeccompProfile  string // optional host path passed to Docker as seccomp=<path>
+	SessionAppArmorProfile string // optional loaded host profile passed as apparmor=<name>
 }
 
 func NewDocker(opts DockerOpts) *Docker {
@@ -249,6 +251,18 @@ func (d *Docker) runArgs(spec Spec, image string) []string {
 		// transferStagingDir) precisely so a 256MiB transfer is disk and not
 		// host memory.
 		"--tmpfs", "/tmp",
+	}
+	// These are host-owned policies rather than environment choices. A
+	// deployment may opt into a profile that permits a nested agent sandbox
+	// while retaining Docker's other boundaries. Keep both options off by
+	// default so self-hosted runners preserve Docker's native policy, and apply
+	// them only to the long-lived session container: volumeInitArgs is a
+	// separate, tightly scoped root helper that never launches an agent.
+	if d.opts.SessionSeccompProfile != "" {
+		args = append(args, "--security-opt", "seccomp="+d.opts.SessionSeccompProfile)
+	}
+	if d.opts.SessionAppArmorProfile != "" {
+		args = append(args, "--security-opt", "apparmor="+d.opts.SessionAppArmorProfile)
 	}
 	// The read-only rootfs is conditional on exactly one thing: whether this
 	// container has a setup script to run.
