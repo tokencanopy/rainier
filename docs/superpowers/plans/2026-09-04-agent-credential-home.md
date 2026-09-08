@@ -6,7 +6,7 @@
 
 **Architecture:** Three pieces. (1) An **agent home**: one writable docker volume per (creator, workspace), mounted at `/rainier/agents` into every session that creator runs in that workspace on that runner, with each agent pointed at its own subdirectory through the variable it already honors (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). `$HOME` and the read-only rootfs are untouched. (2) A **credential set**: the provider's allowlisted files inside that subdirectory, which `sessiond` keeps equal to the control plane's copy — fetched at boot, put on every change, emptied on a downward revoke — over the session RPC that already carries the git credential. (3) **Custody**: the control plane's sealed copy, keyed per (user, provider), one per person per agent, projected into every workspace the person is in; membership is re-checked at every delivery. Everything provider-specific is one row in a table `controlapp` owns; `sessiond`, the driver, the stores, and the RPC never spell a provider name. Self-hosted `controld` answers the RPC out of its existing sealed store; a hosted cell answers the same RPC out of its own, through the same `runnerplane.Host.SessionRequest` hook it already answers `mint_git_credential` on.
 
-**Tech Stack:** Go 1.25, `protocol/runner` (additive at version 1), `controlapp`, `internal/driver` (docker), `cmd/sessiond`, `internal/controld` (`seal.go`, `pgstore`), `v0wire`, `cmd/rainier`.
+**Tech Stack:** Go 1.25, `protocol/runner` (credential-sync capability version 1), `controlapp`, `internal/driver` (docker), `cmd/sessiond`, `internal/controld` (`seal.go`, `pgstore`), `v0wire`, `cmd/rainier`.
 
 **Spec:** `docs/superpowers/specs/2026-08-27-rainier-design.md` §4.3 (read-only rootfs, the boot chain), §8 ("Subscription login", "Agent login flows"); `2026-08-29-plan5-github-vault-design.md` §4.1 (the session RPC), §4.2 (secret hygiene); the hosted product's security requirements the OSS half must satisfy: a credential set never enters workspace files, environment, images, checkpoints, exports, or logs; mutable agent state in one workspace is not visible in another; a runner cannot request another session's credential by substituting an id. The design this plan implements is `rainier-cloud/docs/superpowers/specs/2026-09-04-agent-credential-home-design.md` (decisions of 2026-09-04: mounted home plus control-plane custody; one login reaches every workspace; Claude Code first, Codex second). This is OSS plan #17; the hosted plan consumes `v0.0.3`.
 
@@ -30,9 +30,19 @@
 | A3 | Which hosts do Claude Code login, refresh, and inference reach; which do Codex device login and inference reach? (read off egressd's log) | **Claude Code:** `api.anthropic.com` (API), `platform.claude.com` (OAuth exchange at login), `downloads.claude.ai` (self-update check), `mcp-proxy.anthropic.com` (claude.ai connectors); optional, refused harmlessly: `http-intake.logs.us5.datadoghq.com` (telemetry), `raw.githubusercontent.com` and `registry.npmjs.org` (update check). **Codex:** `auth.openai.com` (device login), `chatgpt.com` — the bare apex, which a `*.chatgpt.com` entry does not match — (inference). See A5. |
 | A4 | Two `claude` processes in two sessions sharing one config directory: both work, neither corrupts the other's credential? | **Partial.** Two concurrent `claude -p` runs sharing one config directory both started, both read the same login, and `.credentials.json` was byte-for-byte unchanged afterwards; neither completed a model call because of A5, so "both work" is proven for the credential and not yet for the API. |
 
-If A1 is "under `$HOME`", the `claude` row gains `HomeVar: "HOME"` and `sessiond` sets `HOME` for the agent process only (Task 3, "A1 false"); the mount and every other task are unchanged.
+The unused `$HOME` fallback was removed after A1 proved both supported agents keep their state under their dedicated configuration directory.
 
 **A5 (found by the probes, not planned) — RESOLVED 2026-09-05.** Under the session's `HTTPS_PROXY`, Claude Code — the native 2.1.261 build and the npm 2.1.197 build alike — completed login and the OAuth exchange but failed every model call with `Connection error` and never opened a socket toward the proxy. The cause was the proxy URL the driver injects: `http://<session-id>:@host:3128`, a username with an EMPTY password. With a bare URL the client reaches egressd and receives its 407 challenge; with `http://<session-id>:x@host:3128` both builds answer a model call in three to five seconds through the proxy, and egressd's `sessionFromProxyAuth` reads the username half and ignores the password. DNS was a red herring: the `ENOTFOUND` came from the native build's first-run connectivity check, which does resolve the host itself, and a DNS answer alone changed nothing. **The fix is one line in `internal/driver/docker.go`** (`withSessionUserinfo` now carries the placeholder password `rainier`), shipped separately from this plan so it reaches `v0.0.3`'s runner artifacts, plus a bug report to Claude Code. **Validated end to end the same day:** runnerd rebuilt from the fix on the fleet VM, a fresh session created under the corrected URL, the native build's first-run check passed through the proxy, a person completed the paste-a-code login inside the session, and `claude -p` answered a model call in seconds through egressd's audited path. The `claude` row's `Egress` stands; its `Env` gains nothing, though a deployment may set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` to skip the claude.ai connectors' retry cost.
+
+**A6 (found after rollout, resolved 2026-09-08).** A fresh agent-home volume
+restored `.credentials.json` correctly, and `claude -p` authenticated, but the
+interactive Claude Code TUI still opened its theme and login wizard. Claude
+gates that TUI on `hasCompletedOnboarding` in `.claude.json`, which is
+application state rather than the account credential. Rainier now carries a
+small non-secret seed in the provider manifest and creates the file only after
+a positive credential restore, only when absent. It does not add
+`.claude.json` to account-wide custody, because that would copy project trust,
+MCP, and other workspace-local state across workspaces.
 
 ## File structure
 
@@ -89,10 +99,10 @@ No worker. Half a day. Each probe runs in a throwaway session on rainier-1 from 
 
 **Interfaces:**
 - `runner.HomeMount{Volume string; Path string}`; `runner.Spec.Home *HomeMount` (`json:"home,omitempty"`).
-- Method names: `runner.MethodFetchAgentCredentials = "fetch_agent_credentials"`, `MethodPutAgentCredentials = "put_agent_credentials"`, `MethodRevokeAgentCredentials = "revoke_agent_credentials"`. Payloads (documented on the constants, as the mint's is): fetch `{"provider"}` → `{"version", "files": {name: base64}}`; put `{"provider", "files", "version"}` → `{"version"}`; revoke (downward) `{"provider"}` → `{}`. Refusals are `{"error": sentence}` on `ok:false`, as everywhere.
-- `controlapp.AgentProvider{Name, HomeEnv, HomeVar, Files []string, Egress []string, LoginCmd []string}`; `controlapp.AgentProviders() []AgentProvider` — `claude`, `codex`, and `test` (present only when `controlapp.EnableTestAgentProvider` is set by the host, which only the e2e's controld does).
-- `controlapp.HomeMountPath = "/rainier/agents"`; `controlapp.AgentHomeVolume(ws control.WorkspaceID, creator control.ActorID) string` = `"rainier-agents-" + hex(sha256(ws + "\x00" + creator))[:16]`; `controlapp.AgentsEnv(providers) (map[string]string)` — each provider's `HomeEnv` → `HomeMountPath/<name>`, plus `RAINIER_AGENTS_B64` = base64 JSON `[{"provider","dir","files"}]`.
-- `createSpec` sets `spec.Home` for every create with a creator, merges `AgentsEnv` into `spec.Env` *before* `material.Environment` (so a resolver's value can still override, the documented last-wins rule), and unions every provider's `Egress` into `spec.EgressAllow`.
+- Method names: `runner.MethodFetchAgentCredentials = "fetch_agent_credentials"`, `MethodPutAgentCredentials = "put_agent_credentials"`, `MethodRevokeAgentCredentials = "revoke_agent_credentials"`. Payloads (documented on the constants, as the mint's is): fetch `{"protocol": 1, "provider"}` → `{"version", "files": {name: base64}}`; put `{"protocol": 1, "provider", "files", "version"}` → `{"version"}`; revoke (downward) `{"provider", "version"}` → `{}`. The manifest carries `credential_protocol: 1`; a new control plane refuses an old session's unversioned custody request, while a new session refuses to boot from an old manifest. Existing old sessions can still read homes they already mounted, so the rollout stops old control planes, publishes the matching image, and replaces those sessions before agent login/logout traffic resumes. Refusals are `{"error": sentence}` on `ok:false`, as everywhere.
+- `controlapp.AgentProvider{Name, HomeEnv, Files []string, SeedFiles []AgentHomeSeedFile, Egress []string, LoginCmd []string}`; `controlapp.AgentProviders() []AgentProvider` — `claude`, `codex`, and `test` (present only when `controlapp.EnableTestAgentProvider` is set by the host, which only the e2e's controld does).
+- `controlapp.HomeMountPath = "/rainier/agents"`; `controlapp.AgentHomeVolume(ws control.WorkspaceID, creator control.ActorID) string` = `"rainier-agents-" + hex(sha256(ws + "\x00" + creator))[:16]`; `controlapp.AgentsEnv(providers) (map[string]string)` — each provider's `HomeEnv` → `HomeMountPath/<name>`, plus `RAINIER_AGENTS_B64` = base64 JSON `[{"credential_protocol","provider","dir","files"}]`.
+- `createSpec` sets `spec.Home` for every create with a creator, reserves the provider home variables and `RAINIER_AGENTS_B64` while merging ordinary values from `material.Environment`, and unions every provider's `Egress` into `spec.EgressAllow`.
 
 The volume key is opaque on purpose: a docker volume name is visible to anyone with `docker` on the runner, and an account id is not something to print there. The provider table is data, not code: adding a third agent is a row plus its Task 0 probes.
 
@@ -117,8 +127,8 @@ func TestAgentHomeVolumeIsOpaqueAndStable(t *testing.T) {
 func TestCreateSpecCarriesTheHome(t *testing.T) {
 	// a create for (ws_example, user_example) has Home{Volume: AgentHomeVolume(...), Path: HomeMountPath},
 	// Env[CLAUDE_CONFIG_DIR] == "/rainier/agents/claude", Env[RAINIER_AGENTS_B64] decodes to both rows,
-	// and EgressAllow contains every provider's Egress hosts once; a resolver value for
-	// CLAUDE_CONFIG_DIR wins over the table's.
+	// and EgressAllow contains every provider's Egress hosts once; resolver values cannot
+	// replace CLAUDE_CONFIG_DIR or RAINIER_AGENTS_B64.
 }
 ```
 
@@ -168,11 +178,11 @@ func TestSnapshotExcludesTheHome(t *testing.T) {
 - Modify: `cmd/sessiond/gitchain.go` (`bootEnv.AgentsB64`, the stage), `cmd/sessiond/main.go` (registration, the loop's lifecycle)
 
 **Interfaces (internal to sessiond, all provider-agnostic):**
-- `type agentEntry struct{ Provider, Dir string; Files []string }` decoded from `RAINIER_AGENTS_B64`.
+- `type agentEntry struct{ CredentialProtocol uint64; Provider, Dir string; Files []string }` decoded from `RAINIER_AGENTS_B64`; an unsupported, absent, or malformed nonempty manifest fails boot before the provider can read its persistent home.
 - The **agents stage**, after the clone stage and before init: for each entry, `mkdir -p dir` 0700 (fail the stage with the sentence `"this runner does not mount agent homes; upgrade runnerd to v0.0.3"` if `HomeMountPath` is absent or not writable), then `fetch_agent_credentials`; write each returned file 0600 via temp-and-rename; record the baseline (version, per-file size and mtime). A refusal or a timeout is a **boot note** (`{"kind":"agent_note","provider":…,"text":…}` on the events channel, the way a stage verdict travels), not a failure: the agent starts and asks for login, which is the truthful state.
 - The **sync loop** (`agentSyncInterval = 2s`): stat the allowlisted files; on any change, read them (`O_NOFOLLOW`; a symlink is skipped with a note), cap the set at `agentSetMaxBytes = 64 << 10` (over → note, no put), and if the bytes differ from the last put, `put_agent_credentials`. A failed put retries with backoff 2 s → 30 s and never blocks the agent. On shutdown, one final put bounded by the RPC timeout.
-- The **revoke handler**, registered beside the file handlers: remove the allowlisted files, reset the baseline to "nothing", answer `{}`.
-- **A1 false:** an entry may carry `"home_var": "HOME"`; `sessiond` then sets that variable to `dir + "/home"` in the *agent's* environment only (`chainArgv`'s env, not the container's).
+- The **revoke handler**, registered beside the file handlers: adopt a supplied logout version, remove the allowlisted files, and answer `{}`. A membership withdrawal omits the version, preserves the known custody baseline, and still removes files unconditionally; failed local removal retries with backoff without refetching.
+- Provider homes are addressed only by the dedicated configuration variables proven in A1; the unused `home_var` fallback is outside the manifest.
 
 - [ ] **Step 1: Write the failing tests** (the `rpc_test` fake host answers fetch/put; every case asserts no credential byte reaches the log)
 
@@ -209,13 +219,13 @@ type AgentCredentialSet struct{ Version uint64; Files map[string][]byte }
 type AgentCredentialStatus struct{ Provider string; Version uint64; UpdatedAt time.Time }
 type AgentCredentialStore interface {
 	FetchAgentCredentials(ctx, user control.ActorID, provider string) (AgentCredentialSet, error) // version 0, no files when none
-	PutAgentCredentials(ctx, user control.ActorID, provider string, files map[string][]byte) (uint64, error)
-	RevokeAgentCredentials(ctx, user control.ActorID, provider string) error                     // idempotent
+	PutAgentCredentials(ctx, user control.ActorID, provider string, files map[string][]byte, expected uint64) (uint64, error)
+	RevokeAgentCredentials(ctx, user control.ActorID, provider string) (uint64, error)           // versioned tombstone
 	ListAgentCredentials(ctx, user control.ActorID) ([]AgentCredentialStatus, error)
 }
 type AgentCredentialService struct{ /* store, control.Authorizer, *AttachmentService (for the downward revoke), SessionRepository */ }
 func (s *AgentCredentialService) AnswerFetch(ctx, row control.Session, provider string) (AgentCredentialSet, error)
-func (s *AgentCredentialService) AnswerPut(ctx, row control.Session, provider string, files map[string][]byte) (uint64, error)
+func (s *AgentCredentialService) AnswerPut(ctx, row control.Session, provider string, files map[string][]byte, expected uint64) (uint64, error)
 func (s *AgentCredentialService) Logout(ctx, sc control.Scope, provider string) error           // revoke + downward to every live session of the user
 func (s *AgentCredentialService) Withdraw(ctx, ws control.WorkspaceID, user control.ActorID) error // downward to the user's live sessions in ws; custody untouched
 func (s *AgentCredentialService) List(ctx, sc control.Scope) ([]AgentCredentialStatus, error)
@@ -224,6 +234,7 @@ func (s *AgentCredentialService) List(ctx, sc control.Scope) ([]AgentCredentialS
 The service owns the authorization, once, for both hosts: `AnswerFetch`/`AnswerPut` require the row to have a creator, the provider to be in the table, and **membership** — asked of the host's `control.Authorizer` as `ActionAttach` on the session resource in the creator's own scope, because "the creator may still attach to their own session in this workspace" is exactly "the creator is a current member of this workspace", and it needs no new action in the frozen contract. The host's `SessionRequest` guard has already established that the asking runner is the row's runner (`srpc.go` does; the hosted gateway does). `Logout` requires `sc.Actor` to be the user (an owner or admin of any workspace gets `control.ErrForbidden`: the credential is not the workspace's). The downward revoke is `AttachmentService.sessionRPC(row, MethodRevokeAgentCredentials, …)` to each live session, best effort, logged by session id only.
 
 The sealed blob is JSON `{"files": {name: base64}}`; the self-hosted `agentvault.go` seals it with `seal.go` under `RAINIER_SECRETS_KEY` with `user + "\x00" + provider + "\x00" + version` bound as additional authenticated data, so a row copied to another user, provider, or version does not open. `0010_agent_credentials.sql`: `agent_credentials(user_id text REFERENCES users ON DELETE CASCADE, provider text, ciphertext bytea, nonce bytea, version bigint NOT NULL DEFAULT 1, updated_at timestamptz, PRIMARY KEY (user_id, provider))`.
+`0011_agent_credential_revokes.sql` adds `revoked`; immutable `0012_agent_credential_revoke_fence.sql` adds and conservatively backfills `last_revoked_version`; a revoke clears the sealed bytes, advances both the row version and the durable fence, and later puts preserve the fence. Migrations 0011 and 0012 require a stop-the-world `controld` rollout because a pre-0011 binary deletes logout rows. The matching session image must be published and existing sessions replaced before login/logout traffic resumes.
 
 - [ ] **Step 1: Write the failing tests**
 

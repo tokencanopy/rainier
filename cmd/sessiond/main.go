@@ -160,7 +160,11 @@ func main() {
 		// stage: the two consume the same fact for different purposes, and
 		// threading one through would couple the boot chain to the sync's
 		// lifetime.
-		if entries := agentEntries(bootEnvironment); len(entries) > 0 {
+		entries, err := agentEntries(bootEnvironment)
+		if err != nil {
+			log.Fatalf("agent homes: %v", err)
+		}
+		if len(entries) > 0 {
 			agents = newAgentSync(rpc, entries, events)
 			rpc.RegisterRPCHandler(runner.MethodRevokeAgentCredentials, agents.handleRevoke)
 			agents.start(setupDir + "/" + agentsDoneName)

@@ -18,6 +18,12 @@ import "encoding/json"
 // both the announced and the expected version.
 const ProtocolVersion = 1
 
+// AgentCredentialProtocolVersion is the independently negotiated version of
+// the credential-sync RPCs. It lives in the session manifest and every upward
+// request, so a new control plane rejects an old sessiond rather than letting
+// pre-logout writes bypass the revoke fence during a rolling deployment.
+const AgentCredentialProtocolVersion = 1
+
 // The three session-RPC methods that keep a coding agent's credential set
 // equal to the control plane's sealed copy. They are wire words: a sandbox
 // registers handlers under exactly these names and a control plane answers
@@ -29,22 +35,23 @@ const ProtocolVersion = 1
 // opaque payload, and a refusal is the usual {"error": sentence} on ok:false.
 const (
 	// MethodFetchAgentCredentials is sandbox → control plane, at boot:
-	// {"provider": "..."} → {"version": n, "files": {name: base64}}. Version
+	// {"protocol": 1, "provider": "..."} → {"version": n, "files": {name: base64}}. Version
 	// 0 with no files is the truthful answer for a person who has not logged
 	// that agent in; it is an answer, not a refusal, and the agent starts
 	// anyway and asks them to log in.
 	MethodFetchAgentCredentials = "fetch_agent_credentials"
 	// MethodPutAgentCredentials is sandbox → control plane, whenever the
-	// allowlisted files change: {"provider": "...", "files": {name: base64},
+	// allowlisted files change: {"protocol": 1, "provider": "...", "files": {name: base64},
 	// "version": n} → {"version": n+1}. The version the sandbox sends is the
 	// one it last saw, so custody can tell a fresh login from a replay of a
 	// set that has since been revoked.
 	MethodPutAgentCredentials = "put_agent_credentials"
 	// MethodRevokeAgentCredentials is control plane → sandbox, on a logout or
-	// a membership that went away: {"provider": "..."} → {}. The sandbox
-	// removes that provider's allowlisted files and forgets its baseline, so
-	// a later login inside the same session is a new set rather than a re-put
-	// of the revoked one.
+	// a membership that went away: {"provider": "...", "version": n} → {}.
+	// Logout includes its tombstone version; membership withdrawal may omit it.
+	// The sandbox removes that provider's allowlisted files and adopts a
+	// supplied logout baseline. A withdrawal preserves its known custody
+	// baseline while deleting local files unconditionally.
 	MethodRevokeAgentCredentials = "revoke_agent_credentials"
 )
 

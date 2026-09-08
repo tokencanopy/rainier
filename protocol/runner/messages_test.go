@@ -24,6 +24,9 @@ func TestPublicRunnerWireShapes(t *testing.T) {
 	if runner.ProtocolVersion != 1 {
 		t.Fatalf("protocol version = %d, want 1", runner.ProtocolVersion)
 	}
+	if runner.AgentCredentialProtocolVersion != 1 {
+		t.Fatalf("agent credential protocol version = %d, want 1", runner.AgentCredentialProtocolVersion)
+	}
 }
 
 func TestRoundTrip(t *testing.T) {

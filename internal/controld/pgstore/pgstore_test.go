@@ -271,11 +271,12 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	if want := embeddedMigrationVersions(t); !slices.Equal(applied, want) {
 		t.Fatalf("schema_migrations = %v, want every embedded migration in order %v", applied, want)
 	}
-	// This release's head is 10: a database that stopped at 0003 runs the
+	// This release's head is 12: a database that stopped at 0003 runs the
 	// expand step (0007), the contract step (0008), the events table
-	// (0009), and the agent credentials table (0010) in the same start.
-	if head := applied[len(applied)-1]; head != 10 {
-		t.Fatalf("head migration = %d, want 10", head)
+	// (0009), the agent credentials table (0010), the tombstone (0011), and
+	// the durable revoke fence (0012) in the same start.
+	if head := applied[len(applied)-1]; head != 12 {
+		t.Fatalf("head migration = %d, want 12", head)
 	}
 
 	// The legacy session survived, and its new columns read as "never exited"
@@ -369,6 +370,40 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	}
 	if _, err := st.Sessions().GetSession(ctx, "ws_self_hosted", "sess_legacy"); err != nil {
 		t.Fatalf("the legacy session must still read after a replayed Migrate: %v", err)
+	}
+}
+
+func TestMigrate0011To0012BackfillsTheDurableRevokeFence(t *testing.T) {
+	dsn := startPostgres(t)
+	ctx := context.Background()
+	legacyDSN := freshDB(t, dsn, t.Name())
+	pool, err := pgxpool.New(ctx, legacyDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := migrateTo(ctx, pool, 11); err != nil {
+		t.Fatalf("migrate to 0011: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO users (id, github_id, login, role) VALUES ('usr_fence', 17, 'alice', 'admin')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO agent_credentials
+		(user_id, provider, ciphertext, nonce, version, revoked)
+		VALUES ('usr_fence', 'test', decode('01', 'hex'), decode('02', 'hex'), 5, false)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("migrate to head: %v", err)
+	}
+	var version, fence int64
+	var revoked bool
+	if err := pool.QueryRow(ctx, `SELECT version, revoked, last_revoked_version
+		FROM agent_credentials WHERE user_id = 'usr_fence' AND provider = 'test'`).Scan(&version, &revoked, &fence); err != nil {
+		t.Fatal(err)
+	}
+	if version != 5 || revoked || fence != 5 {
+		t.Fatalf("upgraded row = version %d, revoked %v, fence %d; want 5, false, 5", version, revoked, fence)
 	}
 }
 
@@ -526,7 +561,7 @@ func TestPGStoreAgentCredentialsCascadeWithTheirOperator(t *testing.T) {
 	vault := controld.NewAgentVault(st, agentTestSecretsKey)
 	provider := controlapp.AgentProviders()[0].Name
 	if _, err := vault.PutAgentCredentials(ctx, repotest.AgentUser, provider,
-		map[string][]byte{"file_example": []byte("credential_example")}); err != nil {
+		map[string][]byte{"file_example": []byte("credential_example")}, 0); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	mustExec(t, st.pool, `DELETE FROM users WHERE id = 'user_example'`)

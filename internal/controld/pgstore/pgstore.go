@@ -361,10 +361,10 @@ func (s *Store) GetAgentCredential(ctx context.Context, userID, provider string)
 	// bigint-backed generation in this package is: pgx maps the column to
 	// Go's signed 64-bit type, and the conversion is where the package says
 	// so once rather than relying on a driver's coercion.
-	var version int64
+	var version, lastRevokedVersion int64
 	err := s.q(ctx).QueryRow(ctx,
-		`SELECT ciphertext, nonce, version, updated_at FROM agent_credentials WHERE user_id = $1 AND provider = $2`,
-		userID, provider).Scan(&c.Ciphertext, &c.Nonce, &version, &c.UpdatedAt)
+		`SELECT ciphertext, nonce, version, revoked, last_revoked_version, updated_at FROM agent_credentials WHERE user_id = $1 AND provider = $2`,
+		userID, provider).Scan(&c.Ciphertext, &c.Nonce, &version, &c.Revoked, &lastRevokedVersion, &c.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return controld.AgentCredential{}, control.ErrNotFound
@@ -375,6 +375,7 @@ func (s *Store) GetAgentCredential(ctx context.Context, userID, provider string)
 		return controld.AgentCredential{}, fmt.Errorf("pgstore: get agent credential for provider %q: %w", provider, err)
 	}
 	c.Version = uint64(version)
+	c.LastRevokedVersion = uint64(lastRevokedVersion)
 	return c, nil
 }
 
@@ -396,6 +397,7 @@ func (s *Store) PutAgentCredential(ctx context.Context, c controld.AgentCredenti
 			ciphertext = EXCLUDED.ciphertext,
 			nonce      = EXCLUDED.nonce,
 			version    = EXCLUDED.version,
+			revoked    = false,
 			updated_at = now()
 		WHERE agent_credentials.version = EXCLUDED.version - 1
 		RETURNING version`,
@@ -409,15 +411,26 @@ func (s *Store) PutAgentCredential(ctx context.Context, c controld.AgentCredenti
 	return uint64(version), nil
 }
 
-func (s *Store) DeleteAgentCredential(ctx context.Context, userID, provider string) error {
-	// No RowsAffected check: a revoke of what is not there has already
-	// achieved what it asked for, and reporting ErrNotFound would make an
-	// idempotent operation fail on its second call.
-	if _, err := s.q(ctx).Exec(ctx,
-		`DELETE FROM agent_credentials WHERE user_id = $1 AND provider = $2`, userID, provider); err != nil {
-		return fmt.Errorf("pgstore: delete agent credential for provider %q: %w", provider, err)
+func (s *Store) RevokeAgentCredential(ctx context.Context, userID, provider string) (uint64, error) {
+	if userID == "" || provider == "" {
+		return 0, control.ErrInvalid
 	}
-	return nil
+	var version int64
+	err := s.q(ctx).QueryRow(ctx, `
+		INSERT INTO agent_credentials (user_id, provider, ciphertext, nonce, version, revoked, last_revoked_version, updated_at)
+		VALUES ($1, $2, ''::bytea, ''::bytea, 1, true, 1, now())
+		ON CONFLICT (user_id, provider) DO UPDATE SET
+			ciphertext = ''::bytea,
+			nonce      = ''::bytea,
+			version    = agent_credentials.version + 1,
+			revoked    = true,
+			last_revoked_version = agent_credentials.version + 1,
+			updated_at = now()
+		RETURNING version`, userID, provider).Scan(&version)
+	if err != nil {
+		return 0, fmt.Errorf("pgstore: revoke agent credential for provider %q: %w", provider, err)
+	}
+	return uint64(version), nil
 }
 
 // ListAgentCredentials does not select ciphertext or nonce at all. Clearing
@@ -425,7 +438,7 @@ func (s *Store) DeleteAgentCredential(ctx context.Context, userID, provider stri
 // a promise the QUERY keeps, which survives someone editing the loop below.
 func (s *Store) ListAgentCredentials(ctx context.Context, userID string) ([]controld.AgentCredential, error) {
 	rows, err := s.q(ctx).Query(ctx,
-		`SELECT provider, version, updated_at FROM agent_credentials WHERE user_id = $1 ORDER BY provider ASC`, userID)
+		`SELECT provider, version, updated_at FROM agent_credentials WHERE user_id = $1 AND revoked = false ORDER BY provider ASC`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("pgstore: list agent credentials: %w", err)
 	}

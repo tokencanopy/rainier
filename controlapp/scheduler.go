@@ -416,13 +416,14 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 			Volume: AgentHomeVolume(row.WorkspaceID, row.CreatorID),
 			Path:   HomeMountPath,
 		}
-		// The agents' variables go in FIRST and the resolved material over
-		// them: they are defaults derived from a table, while the resolver's
-		// environment is the host's own decision, which the documented
-		// last-wins rule says beats a default.
+		// Agent paths and the manifest are launch invariants: allowing resolved
+		// material to replace one would let workspace configuration redirect
+		// credential custody or replace the manifest sessiond trusts.
 		agentEnv := AgentsEnv(providers)
 		for k, v := range spec.Env {
-			agentEnv[k] = v
+			if _, reserved := agentEnv[k]; !reserved {
+				agentEnv[k] = v
+			}
 		}
 		spec.Env = agentEnv
 	}

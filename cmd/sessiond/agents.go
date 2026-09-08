@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,10 +17,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/tokencanopy/rainier/protocol/runner"
+	"golang.org/x/sys/unix"
 )
 
 // This file is sessiond's half of the agent home: the boot-time fetch that
@@ -29,9 +31,10 @@ import (
 // custody and the next boot fetched it back.
 //
 // NOTHING HERE KNOWS WHAT A PROVIDER IS. The driver injects a manifest
-// (RAINIER_AGENTS_B64) of rows that each say a name, a directory, and the file
-// names inside it that are the set; this file makes directories, writes files,
-// stats them, reads them and deletes them. Which tool the name belongs to,
+// (RAINIER_AGENTS_B64) of rows that each say a name, a directory, the file
+// names inside it that are the set, and optional non-secret files to seed after
+// a credential restore; this file makes directories, writes files, stats them,
+// reads them and deletes them. Which tool the name belongs to,
 // which variable points it at its directory, and which hosts it talks to are
 // the control plane's table (controlapp/agents.go) and are never spelled here —
 // which is what makes adding a third agent a row rather than a change to the
@@ -62,6 +65,16 @@ const (
 	// sandbox can push through this channel by writing into an allowlisted
 	// name.
 	agentSetMaxBytes = 64 << 10
+	// agentSeedFileMaxBytes keeps the provider manifest from becoming an
+	// unbounded file-write channel. Seeds are tiny non-secret compatibility
+	// markers, not another home snapshot.
+	agentSeedFileMaxBytes = 4 << 10
+	// The manifest is control-plane launch material, but sessiond still treats
+	// its environment as untrusted input. These bounds keep decoding it from
+	// becoming an allocation channel if a runner or image is misconfigured.
+	agentManifestMaxEncodedBytes = 64 << 10
+	agentManifestMaxEntries      = 16
+	agentManifestMaxSeedBytes    = 16 << 10
 	// agentCallTimeout bounds one fetch or put. It is the RPC's own existing
 	// call budget — the same one the in-sandbox socket gives a mint — because
 	// this is the same hop through the same forwarders.
@@ -84,9 +97,6 @@ const (
 	// is an EVENT, like a stage verdict — nobody answers it, and it is never a
 	// failure.
 	agentNoteKind = "agent_note"
-	// agentHomeSubdir is where a provider that ALSO writes under $HOME is
-	// pointed, inside its own directory (the A1-false path; see agentHomeVars).
-	agentHomeSubdir = "home"
 )
 
 // agentMountSentence is what a session says when the runner under it is too old
@@ -107,15 +117,22 @@ const agentMountSentence = "this runner does not mount agent homes; upgrade runn
 var agentsMountRoot = "/rainier/agents"
 
 // agentEntry is one row of RAINIER_AGENTS_B64: a provider's name, its directory
-// under the mount, the file names inside it that make up the set, and — for a
-// provider that also writes under $HOME — the variable to redirect. The JSON
+// under the mount, the file names inside it that make up the set, optional
+// non-secret files to seed after restore, and — for a provider that also writes
+// under $HOME — the variable to redirect. The JSON
 // tags mirror controlapp's manifest exactly; the two spellings are the contract
 // across the env-var channel and have to stay identical.
+type agentSeedFile struct {
+	Name     string `json:"name"`
+	Contents string `json:"contents"`
+}
+
 type agentEntry struct {
-	Provider string   `json:"provider"`
-	Dir      string   `json:"dir"`
-	Files    []string `json:"files"`
-	HomeVar  string   `json:"home_var,omitempty"`
+	CredentialProtocol uint64          `json:"credential_protocol"`
+	Provider           string          `json:"provider"`
+	Dir                string          `json:"dir"`
+	Files              []string        `json:"files"`
+	SeedFiles          []agentSeedFile `json:"seed_files,omitempty"`
 }
 
 // agentNote is the boot note's payload: which home, and what to say about it.
@@ -131,6 +148,9 @@ type agentNote struct {
 
 // decodeAgents reads the manifest: base64 of the JSON array controlapp encodes.
 func decodeAgents(b64 string) ([]agentEntry, error) {
+	if len(b64) > agentManifestMaxEncodedBytes {
+		return nil, fmt.Errorf("RAINIER_AGENTS_B64 is over %d bytes", agentManifestMaxEncodedBytes)
+	}
 	blob, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
 		return nil, fmt.Errorf("decoding RAINIER_AGENTS_B64 (%d bytes): %w", len(b64), err)
@@ -139,67 +159,110 @@ func decodeAgents(b64 string) ([]agentEntry, error) {
 	if err := json.Unmarshal(blob, &entries); err != nil {
 		return nil, fmt.Errorf("reading the home list: %w", err)
 	}
+	if len(entries) > agentManifestMaxEntries {
+		return nil, fmt.Errorf("the home list has more than %d rows", agentManifestMaxEntries)
+	}
 	return entries, nil
 }
 
-// agentEntries decodes the manifest and drops every row this sandbox will not
-// act on. An ABSENT variable means no homes and nothing in this file runs.
+// agentEntries decodes and validates the complete manifest. An ABSENT variable
+// means no homes and nothing in this file runs; any present invalid or empty
+// manifest fails boot before a provider can read a persistent home.
 //
-// An unreadable one is a LOG LINE, not a failed session — the asymmetry with
-// the repository list (gitchain.go fails the clone stage loudly) is the whole
-// posture of this mechanism: a session without its repositories is not the
-// session that was asked for, while a session without its logins is one where
-// the agent asks the person to log in. Custody never fails a boot.
+// A nonempty unreadable or unsupported manifest fails boot before the agent
+// starts. The provider environment points at the persistent home independently
+// of this decoder, so dropping a bad row would still let the agent use stale
+// credential files without a sync or revoke handler.
 //
 // The two checks on a row are not paranoia about controlapp: this manifest is
 // what decides where sessiond WRITES files and which files a revoke DELETES, so
 // a row naming a directory outside the mount, or a file name with a path in it,
 // would make either of those reach into the workspace. It costs four lines to
 // make that impossible from here.
-func agentEntries(env bootEnv) []agentEntry {
+func agentEntries(env bootEnv) ([]agentEntry, error) {
 	if env.AgentsB64 == "" {
-		return nil
+		return nil, nil
 	}
 	entries, err := decodeAgents(env.AgentsB64)
 	if err != nil {
-		log.Printf("the home list: %v; this session runs with none", err)
-		return nil
+		return nil, fmt.Errorf("the home list: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil, errors.New("the home list is present but empty")
 	}
 	out := make([]agentEntry, 0, len(entries))
+	providers := make(map[string]bool, len(entries))
+	dirs := make(map[string]bool, len(entries))
+	seedBytes := 0
 	for _, e := range entries {
-		if err := checkAgentEntry(e); err != nil {
-			log.Printf("home %q dropped: %v", e.Provider, err)
-			continue
+		if e.CredentialProtocol != runner.AgentCredentialProtocolVersion {
+			return nil, fmt.Errorf("home %q uses unsupported credential protocol %d", e.Provider, e.CredentialProtocol)
 		}
+		if err := checkAgentEntry(e); err != nil {
+			return nil, fmt.Errorf("home %q: %w", e.Provider, err)
+		}
+		if providers[e.Provider] || dirs[filepath.Clean(e.Dir)] {
+			return nil, fmt.Errorf("home %q: its provider or directory is named more than once", e.Provider)
+		}
+		for _, seed := range e.SeedFiles {
+			seedBytes += len(seed.Contents)
+		}
+		if seedBytes > agentManifestMaxSeedBytes {
+			return nil, fmt.Errorf("home %q: the home list has over %d seed bytes", e.Provider, agentManifestMaxSeedBytes)
+		}
+		providers[e.Provider] = true
+		dirs[filepath.Clean(e.Dir)] = true
 		out = append(out, e)
 	}
-	return out
+	return out, nil
 }
 
 func checkAgentEntry(e agentEntry) error {
 	if e.Provider == "" {
 		return errors.New("the row names nothing")
 	}
-	if !underAgentMount(e.Dir) {
-		return errors.New("its directory is outside the mount")
+	if !directlyUnderAgentMount(e.Dir) {
+		return errors.New("its directory is not a direct child of the mount")
 	}
 	if len(e.Files) == 0 {
 		return errors.New("the row lists no files")
 	}
+	seen := make(map[string]bool, len(e.Files)+len(e.SeedFiles))
 	for _, n := range e.Files {
-		if n == "" || n != filepath.Base(n) || n == "." || n == ".." {
+		if !bareAgentFileName(n) {
 			return fmt.Errorf("%q is not a bare file name", n)
 		}
+		if seen[n] {
+			return fmt.Errorf("%q is named more than once", n)
+		}
+		seen[n] = true
+	}
+	for _, seed := range e.SeedFiles {
+		if !bareAgentFileName(seed.Name) {
+			return fmt.Errorf("%q is not a bare seed file name", seed.Name)
+		}
+		if seen[seed.Name] {
+			return fmt.Errorf("%q is both synchronized and seeded", seed.Name)
+		}
+		if len(seed.Contents) > agentSeedFileMaxBytes {
+			return fmt.Errorf("%q seed is over %d bytes", seed.Name, agentSeedFileMaxBytes)
+		}
+		seen[seed.Name] = true
 	}
 	return nil
 }
 
-// underAgentMount reports whether dir is a directory inside the mounted home
-// and not the mount itself.
-func underAgentMount(dir string) bool {
+func bareAgentFileName(name string) bool {
+	return name != "" && name == filepath.Base(name) && name != "." && name != ".."
+}
+
+// directlyUnderAgentMount keeps every provider at one known directory entry
+// below the trusted mount. That lets file operations anchor themselves to an
+// open descriptor for the mount and refuse a provider-directory symlink.
+func directlyUnderAgentMount(dir string) bool {
 	clean := filepath.Clean(dir)
 	root := filepath.Clean(agentsMountRoot)
-	return clean != root && strings.HasPrefix(clean, root+string(filepath.Separator))
+	return filepath.Dir(clean) == root && clean != root
 }
 
 // agentMountUsable reports whether the home volume is actually mounted and
@@ -228,31 +291,6 @@ func agentMountUsable(root string) error {
 	name := probe.Name()
 	probe.Close()
 	return os.Remove(name)
-}
-
-// agentHomeVars is the A1-false path, wired but unused by today's rows: a
-// provider that ALSO writes under $HOME regardless of where its configuration
-// directory points gets that variable redirected inside its own home.
-//
-// These go into the CHAIN's environment (chainArgv's exports), which is the
-// agent's and the stages'. They are deliberately not the container's: the
-// container's environment is set by the driver for every process in it, and
-// moving $HOME for the whole sandbox would change what every unrelated tool in
-// the session does.
-func agentHomeVars(entries []agentEntry) []envVar {
-	var out []envVar
-	for _, e := range entries {
-		if e.HomeVar == "" {
-			continue
-		}
-		dir := filepath.Join(e.Dir, agentHomeSubdir)
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			log.Printf("home %q: %v", e.Provider, err)
-			continue
-		}
-		out = append(out, envVar{Name: e.HomeVar, Value: dir})
-	}
-	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -332,12 +370,20 @@ func agentsWaitScript(done string, waitSeconds int) string {
 // life of the process.
 type agentSet struct {
 	entry   agentEntry
+	dir     *os.File
 	version uint64
-	stamps  map[string]fileStamp
-	digest  [32]byte
-	dirty   bool
-	backoff time.Duration
-	retryAt time.Time
+	// generation fences an RPC that began before a downward revoke. The revoke
+	// increments it while holding mu; a late fetch response is then discarded
+	// before it can put credentials or onboarding state back on disk.
+	generation       uint64
+	stamps           map[string]fileStamp
+	digest           [32]byte
+	dirty            bool
+	restoreRetry     bool
+	restoreTombstone bool
+	cleanupRetry     bool
+	backoff          time.Duration
+	retryAt          time.Time
 	// noted remembers the conditions already reported, so a symlink or an
 	// oversized set is news once rather than every two seconds for the life of
 	// the session. An entry is cleared when its condition clears.
@@ -365,6 +411,8 @@ type agentSync struct {
 	backoffMin  time.Duration
 	backoffMax  time.Duration
 	maxBytes    int64
+	writeFile   func(*os.File, string, []byte) error
+	removeFiles func(*agentSet) (int, error)
 
 	mu   sync.Mutex
 	sets map[string]*agentSet
@@ -386,6 +434,8 @@ func newAgentSync(rpc *rpcDispatcher, entries []agentEntry, events chan<- []byte
 		backoffMin:  agentPutBackoffMin,
 		backoffMax:  agentPutBackoffMax,
 		maxBytes:    agentSetMaxBytes,
+		writeFile:   writeAgentFileAt,
+		removeFiles: removeAgentFilesLocked,
 		sets:        make(map[string]*agentSet, len(entries)),
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
@@ -439,11 +489,39 @@ func (a *agentSync) close() {
 			continue
 		}
 		a.mu.Lock()
+		if set.cleanupRetry {
+			if _, err := a.retryCleanupLocked(set, now); err != nil {
+				a.mu.Unlock()
+				continue
+			}
+			a.mu.Unlock()
+			continue
+		}
+		if set.restoreRetry {
+			if set.restoreTombstone {
+				a.mu.Unlock()
+				continue
+			}
+			files, ok := a.readSetLocked(set)
+			if !ok || !completeAgentSet(set.entry, files) {
+				a.mu.Unlock()
+				continue
+			}
+			set.restoreRetry = false
+		}
 		set.dirty = true
 		set.retryAt = time.Time{}
 		a.mu.Unlock()
 		a.putSet(set, now)
 	}
+	a.mu.Lock()
+	for _, set := range a.sets {
+		if set.dir != nil {
+			set.dir.Close()
+			set.dir = nil
+		}
+	}
+	a.mu.Unlock()
 }
 
 // boot fetches every home's set from custody and writes it to disk.
@@ -462,18 +540,24 @@ func (a *agentSync) fetchOne(e agentEntry) {
 	if set == nil {
 		return
 	}
-	if err := os.MkdirAll(e.Dir, 0o700); err != nil {
+	dir, err := openAgentHome(e)
+	if err != nil {
 		a.note(e.Provider, "this home could not be made ready: "+err.Error())
 		return
 	}
-	// An existing directory keeps the mode it was made with, and this one may
-	// have been made by an older sessiond or by the volume's own init.
-	if err := os.Chmod(e.Dir, 0o700); err != nil {
-		log.Printf("home %q: %v", e.Provider, err)
+	a.mu.Lock()
+	if set.dir != nil {
+		dir.Close()
+	} else {
+		set.dir = dir
 	}
+	generation := set.generation
+	a.mu.Unlock()
 
-	raw, err := a.rpc.Call(runner.MethodFetchAgentCredentials,
-		map[string]string{"provider": e.Provider}, a.callTimeout)
+	raw, err := a.rpc.Call(runner.MethodFetchAgentCredentials, struct {
+		Protocol uint64 `json:"protocol"`
+		Provider string `json:"provider"`
+	}{runner.AgentCredentialProtocolVersion, e.Provider}, a.callTimeout)
 	if err != nil {
 		// A refusal's message is the far end's own sentence and a timeout's is
 		// this end's; either way it is what the person needs to read, and
@@ -492,34 +576,117 @@ func (a *agentSync) fetchOne(e agentEntry) {
 		return
 	}
 
-	held := make(map[string][]byte, len(body.Files))
-	for _, name := range e.Files {
-		encoded, ok := body.Files[name]
-		if !ok {
-			continue
-		}
-		blob, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil {
-			a.note(e.Provider, fmt.Sprintf("%s came back in a form this session cannot read", name))
-			continue
-		}
-		if err := writeAgentFile(filepath.Join(e.Dir, name), blob); err != nil {
-			a.note(e.Provider, fmt.Sprintf("%s could not be written: %v", name, err))
-			continue
-		}
-		held[name] = blob
-		log.Printf("home %q: wrote %s (%d bytes) at v%d", e.Provider, name, len(blob), body.Version)
+	held, valid := decodeFetchedAgentSet(e, body.Version, body.Files)
+	if !valid {
+		a.note(e.Provider, "the credential set came back incomplete or unreadable")
+		a.rebaseOnDisk(set)
+		return
 	}
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if set.generation != generation {
+		log.Printf("home %q: discarded a credential restore superseded by a revoke", e.Provider)
+		return
+	}
+	if body.Version > 0 && len(held) == 0 {
+		removed, err := a.removeFiles(set)
+		if err != nil {
+			a.note(e.Provider, "the revoked credential set could not be removed: "+err.Error())
+			set.version = body.Version
+			set.digest = agentSetDigest(nil)
+			set.stamps = statAgentFiles(set)
+			set.dirty = false
+			set.restoreRetry = true
+			set.restoreTombstone = true
+			set.backoff = nextAgentBackoff(set.backoff, a.backoffMin, a.backoffMax)
+			set.retryAt = time.Now().Add(set.backoff)
+			return
+		}
+		log.Printf("home %q: %d file(s) removed from a restored logout", e.Provider, removed)
+	}
+
+	writtenAll := true
+	for _, name := range e.Files {
+		blob, ok := held[name]
+		if !ok {
+			continue
+		}
+		if err := a.writeFile(set.dir, name, blob); err != nil {
+			a.note(e.Provider, fmt.Sprintf("%s could not be written: %v", name, err))
+			writtenAll = false
+			continue
+		}
+		log.Printf("home %q: wrote %s (%d bytes) at v%d", e.Provider, name, len(blob), body.Version)
+	}
+	if !writtenAll {
+		files, ok := a.readSetLocked(set)
+		set.version = body.Version
+		set.stamps = statAgentFiles(set)
+		set.dirty = false
+		set.restoreRetry = true
+		set.restoreTombstone = false
+		set.backoff = nextAgentBackoff(set.backoff, a.backoffMin, a.backoffMax)
+		set.retryAt = time.Now().Add(set.backoff)
+		if ok {
+			set.digest = agentSetDigest(files)
+		}
+		return
+	}
+	if body.Version > 0 && len(held) > 0 && writtenAll {
+		for _, seed := range e.SeedFiles {
+			created, err := writeAgentFileIfAbsentAt(set.dir, seed.Name, []byte(seed.Contents))
+			if err != nil {
+				a.note(e.Provider, fmt.Sprintf("%s could not be initialized: %v", seed.Name, err))
+				continue
+			}
+			if created {
+				log.Printf("home %q: initialized %s after credential restore", e.Provider, seed.Name)
+			}
+		}
+	}
+
 	set.version = body.Version
 	// The baseline is what CUSTODY holds, not what is on disk: if the volume
 	// still carries a set from a boot whose put never landed, disk and custody
 	// differ and the loop's first pass is exactly right to send it up.
 	set.digest = agentSetDigest(held)
-	set.stamps = statAgentFiles(e)
+	set.stamps = statAgentFiles(set)
 	set.dirty = false
+	set.restoreRetry = false
+	set.restoreTombstone = false
+	set.backoff = 0
+	set.retryAt = time.Time{}
+}
+
+// decodeFetchedAgentSet accepts exactly three coherent custody states: an
+// empty version-zero response, a positive empty logout tombstone, or a positive
+// version carrying every declared credential file as non-empty base64. Validation finishes before the first
+// filesystem write so a malformed multi-file response cannot partially land
+// and still unlock provider onboarding.
+func decodeFetchedAgentSet(e agentEntry, version uint64, encoded map[string]string) (map[string][]byte, bool) {
+	if len(encoded) == 0 {
+		return map[string][]byte{}, true
+	}
+	if version == 0 {
+		return nil, false
+	}
+	if len(encoded) != len(e.Files) {
+		return nil, false
+	}
+	files := make(map[string][]byte, len(e.Files))
+	for _, name := range e.Files {
+		value, ok := encoded[name]
+		if !ok {
+			return nil, false
+		}
+		blob, err := base64.StdEncoding.DecodeString(value)
+		if err != nil || len(blob) == 0 {
+			return nil, false
+		}
+		files[name] = blob
+	}
+	return files, true
 }
 
 // rebaseOnDisk is what a home whose fetch did not answer starts from: whatever
@@ -534,7 +701,7 @@ func (a *agentSync) rebaseOnDisk(set *agentSet) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	files, ok := a.readSetLocked(set)
-	set.stamps = statAgentFiles(set.entry)
+	set.stamps = statAgentFiles(set)
 	set.dirty = false
 	if !ok {
 		return
@@ -583,7 +750,43 @@ func (a *agentSync) flush() { a.tick(time.Now()) }
 // wire for no reason.
 func (a *agentSync) syncOne(set *agentSet, now time.Time) {
 	a.mu.Lock()
-	stamps := statAgentFiles(set.entry)
+	if set.cleanupRetry {
+		if now.Before(set.retryAt) {
+			a.mu.Unlock()
+			return
+		}
+		_, _ = a.retryCleanupLocked(set, now)
+		a.mu.Unlock()
+		return
+	}
+	if set.restoreRetry {
+		if now.Before(set.retryAt) {
+			a.mu.Unlock()
+			return
+		}
+		if set.restoreTombstone {
+			a.mu.Unlock()
+			a.fetchOne(set.entry)
+			return
+		}
+		files, ok := a.readSetLocked(set)
+		stamps := statAgentFiles(set)
+		changed := !maps.Equal(stamps, set.stamps)
+		if ok && agentSetDigest(files) != set.digest {
+			changed = true
+		}
+		if !ok || !completeAgentSet(set.entry, files) || !changed {
+			a.mu.Unlock()
+			a.fetchOne(set.entry)
+			return
+		}
+		// A complete local set changed after the failed restore. That is a
+		// login performed in this session; it wins over retrying old custody.
+		set.restoreRetry = false
+		set.backoff = 0
+		set.retryAt = time.Time{}
+	}
+	stamps := statAgentFiles(set)
 	if !maps.Equal(stamps, set.stamps) {
 		set.stamps = stamps
 		set.dirty = true
@@ -594,6 +797,18 @@ func (a *agentSync) syncOne(set *agentSet, now time.Time) {
 		return
 	}
 	a.putSet(set, now)
+}
+
+func completeAgentSet(e agentEntry, files map[string][]byte) bool {
+	if len(files) != len(e.Files) {
+		return false
+	}
+	for _, name := range e.Files {
+		if len(files[name]) == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // putSet sends one home's set upward, if it is not already there.
@@ -618,7 +833,7 @@ func (a *agentSync) putSet(set *agentSet, now time.Time) {
 		a.mu.Unlock()
 		return
 	}
-	provider, version := set.entry.Provider, set.version
+	provider, version, generation := set.entry.Provider, set.version, set.generation
 	a.mu.Unlock()
 
 	encoded := make(map[string]string, len(files))
@@ -628,13 +843,18 @@ func (a *agentSync) putSet(set *agentSet, now time.Time) {
 		total += len(blob)
 	}
 	answer, err := a.rpc.Call(runner.MethodPutAgentCredentials, struct {
+		Protocol uint64            `json:"protocol"`
 		Provider string            `json:"provider"`
 		Files    map[string]string `json:"files"`
 		Version  uint64            `json:"version"`
-	}{provider, encoded, version}, a.callTimeout)
+	}{runner.AgentCredentialProtocolVersion, provider, encoded, version}, a.callTimeout)
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if set.generation != generation {
+		log.Printf("home %q: discarded a credential put superseded by a revoke", provider)
+		return
+	}
 	if err != nil {
 		set.backoff = nextAgentBackoff(set.backoff, a.backoffMin, a.backoffMax)
 		set.retryAt = now.Add(set.backoff)
@@ -671,13 +891,14 @@ func nextAgentBackoff(d, min, max time.Duration) time.Duration {
 // session that a person logged an agent out, or lost the membership that was
 // projecting their login into this workspace.
 //
-// It empties the home and forgets the baseline. Forgetting matters as much as
-// deleting: a session that kept the old digest would treat a login made
-// afterwards as "the same set we already sent" and never put it, and one that
-// kept the old version would offer custody a version that no longer exists.
+// It empties the home and adopts a supplied logout baseline. A membership
+// withdrawal carries version zero and preserves the last known custody
+// baseline while still deleting local files unconditionally. Failed deletion
+// remains fenced and retries locally; it never refetches after withdrawal.
 func (a *agentSync) handleRevoke(payload []byte) (any, error) {
 	var in struct {
 		Provider string `json:"provider"`
+		Version  uint64 `json:"version"`
 	}
 	if len(payload) > 0 {
 		if err := json.Unmarshal(payload, &in); err != nil {
@@ -694,22 +915,28 @@ func (a *agentSync) handleRevoke(payload []byte) (any, error) {
 	if !ok {
 		return nil, fmt.Errorf("this session has no home for %q", in.Provider)
 	}
-	removed := 0
-	for _, name := range set.entry.Files {
-		if err := os.Remove(filepath.Join(set.entry.Dir, name)); err != nil {
-			if !os.IsNotExist(err) {
-				return nil, fmt.Errorf("%s could not be removed: %v", name, err)
-			}
-			continue
-		}
-		removed++
+	if in.Version > 0 && in.Version < set.version {
+		log.Printf("home %q: ignored delayed revoke at v%d; this session is at v%d", in.Provider, in.Version, set.version)
+		return struct{}{}, nil
 	}
-	set.version = 0
+	set.generation++
+	// Adopt the fence before touching the filesystem. Delivery is best effort
+	// at the control plane, so a transient unlink failure must stop uploads now
+	// and be retried locally rather than leave the old baseline active.
+	if in.Version > 0 {
+		set.version = in.Version
+	}
 	set.digest = agentSetDigest(nil)
-	set.stamps = statAgentFiles(set.entry)
 	set.dirty = false
+	set.restoreRetry = false
+	set.restoreTombstone = false
+	set.cleanupRetry = true
 	set.backoff = 0
 	set.retryAt = time.Time{}
+	removed, err := a.retryCleanupLocked(set, time.Now())
+	if err != nil {
+		return nil, err
+	}
 	log.Printf("home %q: %d file(s) removed on request; this session holds nothing for it", in.Provider, removed)
 	// The ok:true answer's body. It carries nothing because there is nothing to
 	// say: the caller asked for a state, and it is that state now.
@@ -757,6 +984,32 @@ func (a *agentSync) noteOnce(set *agentSet, key, text string) {
 	a.note(set.entry.Provider, text)
 }
 
+// retryCleanupLocked retries a downward revoke locally. It never fetches:
+// version-zero membership withdrawal is deliberately unable to read custody.
+// The caller holds a.mu.
+func (a *agentSync) retryCleanupLocked(set *agentSet, now time.Time) (int, error) {
+	if set.dir == nil {
+		dir, err := openAgentHome(set.entry)
+		if err != nil {
+			set.backoff = nextAgentBackoff(set.backoff, a.backoffMin, a.backoffMax)
+			set.retryAt = now.Add(set.backoff)
+			return 0, fmt.Errorf("this home could not be made ready: %v", err)
+		}
+		set.dir = dir
+	}
+	removed, err := a.removeFiles(set)
+	if err != nil {
+		set.backoff = nextAgentBackoff(set.backoff, a.backoffMin, a.backoffMax)
+		set.retryAt = now.Add(set.backoff)
+		return removed, err
+	}
+	set.cleanupRetry = false
+	set.stamps = statAgentFiles(set)
+	set.backoff = 0
+	set.retryAt = time.Time{}
+	return removed, nil
+}
+
 // ---------------------------------------------------------------------------
 // the files
 // ---------------------------------------------------------------------------
@@ -779,19 +1032,16 @@ func (a *agentSync) readSetLocked(set *agentSet) (map[string][]byte, bool) {
 	e := set.entry
 	files := make(map[string][]byte, len(e.Files))
 	var total int64
+	if set.dir == nil {
+		return files, true
+	}
 	for _, name := range e.Files {
-		path := filepath.Join(e.Dir, name)
-		info, err := os.Lstat(path)
+		blob, err := readAgentFileAt(set.dir, name, a.maxBytes+1)
 		if err != nil {
-			continue
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			a.noteOnce(set, "link:"+name, fmt.Sprintf("%s is a link and is not part of this home", name))
-			continue
-		}
-		delete(set.noted, "link:"+name)
-		blob, err := readNoFollow(path, a.maxBytes+1)
-		if err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				delete(set.noted, "read:"+name)
+				continue
+			}
 			a.noteOnce(set, "read:"+name, fmt.Sprintf("%s could not be read (%v)", name, err))
 			continue
 		}
@@ -807,34 +1057,106 @@ func (a *agentSync) readSetLocked(set *agentSet) (map[string][]byte, bool) {
 	return files, true
 }
 
-// readNoFollow opens a path without following a final symlink and reads at most
-// limit bytes.
-func readNoFollow(path string, limit int64) ([]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+func removeAgentFilesLocked(set *agentSet) (int, error) {
+	if set.dir != nil {
+		if err := unix.Fchmod(int(set.dir.Fd()), 0o700); err != nil {
+			return 0, fmt.Errorf("the provider directory mode could not be restored: %v", err)
+		}
+	}
+	removed := 0
+	for _, name := range set.entry.Files {
+		if set.dir == nil {
+			continue
+		}
+		if err := unix.Unlinkat(int(set.dir.Fd()), name, 0); err != nil {
+			if !errors.Is(err, unix.ENOENT) {
+				return removed, fmt.Errorf("%s could not be removed: %v", name, err)
+			}
+			continue
+		}
+		removed++
+	}
+	return removed, nil
+}
+
+// openAgentHome opens the trusted mount first, creates one direct child, and
+// keeps that directory descriptor for the session's lifetime. Replacing the
+// visible child with a symlink later cannot redirect a fetch, sync, or revoke:
+// every operation below remains relative to the directory that was opened.
+func openAgentHome(e agentEntry) (*os.File, error) {
+	rootFD, err := unix.Open(agentsMountRoot, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
+	defer unix.Close(rootFD)
+	name := filepath.Base(filepath.Clean(e.Dir))
+	if err := unix.Mkdirat(rootFD, name, 0o700); err != nil && !errors.Is(err, unix.EEXIST) {
+		return nil, err
+	}
+	fd, err := unix.Openat(rootFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Fchmod(fd, 0o700); err != nil {
+		unix.Close(fd)
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), e.Dir), nil
+}
+
+// readAgentFileAt refuses links, non-regular files, and multiply-linked files.
+// The last condition prevents a workload from aliasing credential bytes into
+// a provider-local state file and having the sync upload that state.
+func readAgentFileAt(dir *os.File, name string, limit int64) ([]byte, error) {
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), name)
 	defer f.Close()
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return nil, err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		return nil, errors.New("not a regular file")
+	}
+	if stat.Nlink != 1 {
+		return nil, errors.New("has more than one link")
+	}
 	return io.ReadAll(io.LimitReader(f, limit))
 }
 
-// writeAgentFile lands one file 0600 by writing a temp file beside it and
-// renaming over it.
-//
-// The temp file is in the SAME directory — the rename has to be on one
-// filesystem, and a credential written to /tmp on the way to the home would be
-// a copy nobody removes — and it is removed on every failure path.
-func writeAgentFile(path string, blob []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".rainier-tmp-")
+// createAgentTemp makes a 0600 temporary file relative to the held provider
+// directory. Random names plus O_EXCL make concurrent sessions harmless.
+func createAgentTemp(dir *os.File, prefix string) (*os.File, string, error) {
+	for range 16 {
+		var random [8]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			return nil, "", err
+		}
+		name := prefix + hex.EncodeToString(random[:])
+		fd, err := unix.Openat(int(dir.Fd()), name,
+			unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+		if errors.Is(err, unix.EEXIST) {
+			continue
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		return os.NewFile(uintptr(fd), name), name, nil
+	}
+	return nil, "", errors.New("could not allocate a temporary file")
+}
+
+// writeAgentFileAt lands one complete 0600 file with a descriptor-relative
+// rename, so a replaced provider path cannot redirect it.
+func writeAgentFileAt(dir *os.File, name string, blob []byte) error {
+	f, tmp, err := createAgentTemp(dir, ".rainier-tmp-")
 	if err != nil {
 		return err
 	}
-	tmp := f.Name()
-	defer os.Remove(tmp)
-	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		return err
-	}
+	defer unix.Unlinkat(int(dir.Fd()), tmp, 0)
 	if _, err := f.Write(blob); err != nil {
 		f.Close()
 		return err
@@ -842,16 +1164,52 @@ func writeAgentFile(path string, blob []byte) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	return unix.Renameat(int(dir.Fd()), tmp, int(dir.Fd()), name)
+}
+
+// writeAgentFileIfAbsentAt atomically creates a non-secret provider seed
+// without replacing state another session or the agent already wrote.
+func writeAgentFileIfAbsentAt(dir *os.File, name string, blob []byte) (bool, error) {
+	f, tmp, err := createAgentTemp(dir, ".rainier-seed-")
+	if err != nil {
+		return false, err
+	}
+	defer unix.Unlinkat(int(dir.Fd()), tmp, 0)
+	if _, err := f.Write(blob); err != nil {
+		f.Close()
+		return false, err
+	}
+	if err := f.Close(); err != nil {
+		return false, err
+	}
+	if err := unix.Linkat(int(dir.Fd()), tmp, int(dir.Fd()), name, 0); err != nil {
+		if errors.Is(err, unix.EEXIST) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // statAgentFiles is the cheap half of the loop: what the allowlisted files
 // looked like, without opening any of them. A file that is not there has no
 // entry, so appearing and vanishing are both changes.
-func statAgentFiles(e agentEntry) map[string]fileStamp {
-	out := make(map[string]fileStamp, len(e.Files))
-	for _, name := range e.Files {
-		info, err := os.Lstat(filepath.Join(e.Dir, name))
+func statAgentFiles(set *agentSet) map[string]fileStamp {
+	out := make(map[string]fileStamp, len(set.entry.Files))
+	if set.dir == nil {
+		return out
+	}
+	for _, name := range set.entry.Files {
+		fd, err := unix.Openat(int(set.dir.Fd()), name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if err != nil {
+			if !errors.Is(err, unix.ENOENT) {
+				out[name] = fileStamp{size: -1, mod: -1}
+			}
+			continue
+		}
+		f := os.NewFile(uintptr(fd), name)
+		info, err := f.Stat()
+		f.Close()
 		if err != nil {
 			continue
 		}

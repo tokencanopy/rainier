@@ -8,6 +8,7 @@ import (
 	"slices"
 
 	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // HomeMountPath is where the agent home lands inside every session: one
@@ -44,28 +45,36 @@ var EnableTestAgentProvider bool
 //   - HomeEnv is the variable the agent already honors to move its
 //     configuration directory. Pointing it at the home is the entire
 //     integration: the tool is unmodified and does not know it is in Rainier.
-//   - HomeVar is the variable to set when the agent ALSO writes under $HOME
-//     regardless — empty when everything lands under HomeEnv's directory,
-//     which is the case for the rows below. sessiond sets it for the agent
-//     process only, never for the container.
 //   - Files is the allowlist of credential-bearing file names inside the
 //     provider's directory. Bare file names, never paths: this list is what
 //     the sync reads, what a revoke deletes, and what a checkpoint excludes,
 //     so a row that could name "../../workspace/x" would be a hole in all
 //     three at once.
+//   - SeedFiles is non-secret state to create only when custody restored a
+//     credential into a fresh home. It is not synchronized or revoked, and it
+//     never overwrites workspace-local state already on the volume.
 //   - Egress is the hosts the agent's login, token refresh, and inference
 //     reach, read off the egress proxy's log during the probes. Apex names
 //     are literal: an entry is not a wildcard pattern.
 //   - LoginCmd is the command `rainier agent login` runs in a throwaway
 //     session so the person completes the tool's own login flow — unmodified,
 //     with no credential pasted anywhere.
+//
+// AgentHomeSeedFile is non-secret provider state that makes a restored
+// credential usable in a fresh home. It is created only when absent and never
+// joins account-wide credential custody.
+type AgentHomeSeedFile struct {
+	Name     string `json:"name"`
+	Contents string `json:"contents"`
+}
+
 type AgentProvider struct {
-	Name     string
-	HomeEnv  string
-	HomeVar  string
-	Files    []string
-	Egress   []string
-	LoginCmd []string
+	Name      string
+	HomeEnv   string
+	Files     []string
+	SeedFiles []AgentHomeSeedFile
+	Egress    []string
+	LoginCmd  []string
 }
 
 // AgentProviders returns the provider table, in the order a manifest and an
@@ -75,9 +84,13 @@ type AgentProvider struct {
 func AgentProviders() []AgentProvider {
 	rows := []AgentProvider{
 		{
-			Name:     "claude",
-			HomeEnv:  "CLAUDE_CONFIG_DIR",
-			Files:    []string{".credentials.json"},
+			Name:    "claude",
+			HomeEnv: "CLAUDE_CONFIG_DIR",
+			Files:   []string{".credentials.json"},
+			SeedFiles: []AgentHomeSeedFile{{
+				Name:     ".claude.json",
+				Contents: `{"hasCompletedOnboarding":true}`,
+			}},
 			Egress:   []string{"api.anthropic.com", "platform.claude.com", "downloads.claude.ai", "mcp-proxy.anthropic.com"},
 			LoginCmd: []string{"claude"},
 		},
@@ -124,14 +137,11 @@ func AgentHomeVolume(ws control.WorkspaceID, creator control.ActorID) string {
 // sandbox's entire view of the table — no egress, no login command, nothing
 // the sandbox has no business acting on.
 type agentManifestEntry struct {
-	Provider string   `json:"provider"`
-	Dir      string   `json:"dir"`
-	Files    []string `json:"files"`
-	// HomeVar rides along when a row declares one, so a provider that also
-	// writes under $HOME becomes a table edit rather than a code change in
-	// sessiond. Absent for every row that does not, which is all of them
-	// today, so the bytes are exactly the three-key shape the design names.
-	HomeVar string `json:"home_var,omitempty"`
+	CredentialProtocol uint64              `json:"credential_protocol"`
+	Provider           string              `json:"provider"`
+	Dir                string              `json:"dir"`
+	Files              []string            `json:"files"`
+	SeedFiles          []AgentHomeSeedFile `json:"seed_files,omitempty"`
 }
 
 // AgentsEnv is the environment every session gets so that the agents inside
@@ -140,9 +150,9 @@ type agentManifestEntry struct {
 // watch, and delete. It carries no credential — it is a map of paths — which
 // is why it can sit in the container environment at all.
 //
-// Callers merge it into the create's environment BEFORE the resolved launch
-// material, so a host that deliberately relocates one provider still wins
-// under the documented last-wins rule.
+// The scheduler reserves these keys when it merges resolved launch material:
+// provider homes and the manifest are credential-custody boundaries, not
+// workspace-configurable environment defaults.
 func AgentsEnv(providers []AgentProvider) map[string]string {
 	env := make(map[string]string, len(providers)+1)
 	entries := make([]agentManifestEntry, 0, len(providers))
@@ -150,7 +160,9 @@ func AgentsEnv(providers []AgentProvider) map[string]string {
 		dir := HomeMountPath + "/" + p.Name
 		env[p.HomeEnv] = dir
 		entries = append(entries, agentManifestEntry{
-			Provider: p.Name, Dir: dir, Files: slices.Clone(p.Files), HomeVar: p.HomeVar,
+			CredentialProtocol: runner.AgentCredentialProtocolVersion,
+			Provider:           p.Name, Dir: dir, Files: slices.Clone(p.Files),
+			SeedFiles: slices.Clone(p.SeedFiles),
 		})
 	}
 	// json.Marshal of a slice of plain structs cannot fail, and a create is
@@ -169,6 +181,7 @@ func cloneProviders(rows []AgentProvider) []AgentProvider {
 	out := make([]AgentProvider, len(rows))
 	for i, p := range rows {
 		p.Files = slices.Clone(p.Files)
+		p.SeedFiles = slices.Clone(p.SeedFiles)
 		p.Egress = slices.Clone(p.Egress)
 		p.LoginCmd = slices.Clone(p.LoginCmd)
 		out[i] = p
