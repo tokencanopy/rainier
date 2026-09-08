@@ -1087,20 +1087,25 @@ func TestAgentKeepsAnAnsweringControlSocket(t *testing.T) {
 }
 
 // establishAndDrop takes the agent's next dial through a full handshake —
-// announce in, accept out — and then closes it, returning the instant the
-// close was sent. That instant is what the redial gap is measured from: the
-// agent notices at or after it, so a gap measured from here can only
-// understate how long the agent actually waited, never overstate it.
+// announce in, accept out — holds it open for hold, and then closes it,
+// returning the instant the close was sent.
+//
+// That instant is what the redial gap is measured from, and it is the start
+// of the gap the fleet actually sees. It precedes the agent noticing, so the
+// measured gap is the agent's own wait plus that notice latency: an upper
+// bound on the wait, never an under-report of it.
 //
 // The accept is written before the close and TCP keeps their order, so the
-// agent's read loop sees the accept and only then the close. Establishment
-// is therefore reached on every one of these connections, deterministically
-// and without a sleep.
-func establishAndDrop(t *testing.T, fc *fakeControld, generation uint64) time.Time {
+// agent's read loop sees the accept and only then the close. hold is a sleep
+// because only its lower end matters — a loaded machine overshoots it, and
+// overshooting still clears RedialResetAfter — so no scheduling delay can
+// make an established connection read as one that did not hold.
+func establishAndDrop(t *testing.T, fc *fakeControld, generation uint64, hold time.Duration) time.Time {
 	t.Helper()
 	conn := fc.nextConn(t)
 	conn.readAnnounce(t)
 	conn.send(t, runner.ToRunner{Type: "accept", Generation: generation})
+	time.Sleep(hold)
 	conn.c.Close(websocket.StatusNormalClosure, "bye")
 	return time.Now()
 }
@@ -1114,12 +1119,13 @@ func establishAndDrop(t *testing.T, fc *fakeControld, generation uint64) time.Ti
 // life, however healthy every connection in between had been. Every session
 // on that runner reads unreachable for the whole of that gap.
 //
-// Ten consecutive established-then-dropped connections, each of which must
-// reset the delay to the floor. Under the fix every redial waits the floor
-// (20-30ms here), so the run takes well under a second. Under the old
-// behavior the waits double — 20ms, 40ms, ... — and the ninth redial alone
-// waits 5.12s, past nextConn's 5s bound, so this test fails there rather
-// than reaching the assertion below.
+// Ten consecutive connections, each established and then held past
+// RedialResetAfter before being dropped, each of which must reset the delay
+// to the floor. Under the fix every redial waits the floor (20-30ms here), so
+// the run takes well under a second. Under the old behavior the waits double
+// — 20ms, 40ms, ... — and the ninth redial alone waits 5.12s, past nextConn's
+// 5s bound, so this test fails there rather than reaching the assertion
+// below.
 func TestAgentRedialResetsAfterEstablishedConnection(t *testing.T) {
 	fd := driver.NewFake(4)
 	rd := New(fd, "", "", "")
@@ -1130,12 +1136,13 @@ func TestAgentRedialResetsAfterEstablishedConnection(t *testing.T) {
 	go rd.RunAgent(ctx, AgentConfig{
 		ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1",
 		RedialBackoffMin: 20 * time.Millisecond,
+		RedialResetAfter: 5 * time.Millisecond,
 	})
 
 	const cycles = 10
 	var closed time.Time
 	for i := range cycles {
-		closed = establishAndDrop(t, fc, uint64(i+1))
+		closed = establishAndDrop(t, fc, uint64(i+1), 25*time.Millisecond)
 	}
 
 	// The gap the fleet actually sees after a routine disconnect: the floor
@@ -1192,5 +1199,73 @@ func TestAgentKeepsBackingOffWithoutEstablishment(t *testing.T) {
 	// machine can only push the real gap further above it.
 	if gap := time.Since(closed); gap < 250*time.Millisecond {
 		t.Errorf("redial after 4 unestablished connections took %s, want the backoff to have kept doubling (about 400ms)", gap)
+	}
+}
+
+// TestAgentKeepsBackingOffWhenEstablishmentDoesNotHold pins the flap brake,
+// the second half of what the reset requires. An accept is cheap to hand out
+// and does not on its own mean the connection was worth having: the control
+// plane evicts a runner's previous connection whenever a new one registers
+// under the same name (runnerplane.registerRunner), so two runnerd processes
+// configured with one runner name accept-and-evict each other indefinitely,
+// and every dial in that loop costs a generation mint and a fleet write. A
+// reset on the bare accept would hold that at the floor forever.
+//
+// Four connections accepted and dropped immediately — established, never
+// held. The delays must double exactly as if nothing had been accepted at
+// all, putting the fifth dial at least 400ms behind the fourth close where a
+// reset on the bare accept would put it at 50ms.
+func TestAgentKeepsBackingOffWhenEstablishmentDoesNotHold(t *testing.T) {
+	fd := driver.NewFake(4)
+	rd := New(fd, "", "", "")
+
+	fc := newFakeControld(t, testToken)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go rd.RunAgent(ctx, AgentConfig{
+		ControldURL: fc.wsURL(), Token: testToken, RunnerName: "vm1",
+		RedialBackoffMin: 50 * time.Millisecond,
+		RedialResetAfter: time.Hour, // nothing here can hold that long
+	})
+
+	var closed time.Time
+	for i := range 4 {
+		closed = establishAndDrop(t, fc, uint64(i+1), 0)
+	}
+
+	conn := fc.nextConn(t)
+	conn.readAnnounce(t)
+	if gap := time.Since(closed); gap < 250*time.Millisecond {
+		t.Errorf("redial after 4 accepted but unheld connections took %s, want the backoff to have kept doubling (about 400ms)", gap)
+	}
+}
+
+// TestRedialBackoffMinIsClamped pins both ends of the floor's range. A floor
+// below a nanosecond would reach mrand.Int63n with a zero bound and panic the
+// process on its first redial; a floor above the cap would put every redial
+// after a held connection above the ceiling RunAgent documents. Neither is
+// reachable from the runnerd binary today — the field has no flag — so this
+// pins the accessor rather than a live path.
+func TestRedialBackoffMinIsClamped(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  time.Duration
+		want time.Duration
+	}{
+		{"unset takes the default", 0, defaultRedialBackoffMin},
+		{"negative takes the default", -time.Second, defaultRedialBackoffMin},
+		{"below the minimum is raised", 1, minRedialBackoff},
+		{"above the cap is lowered", time.Hour, maxRedialBackoff},
+		{"in range is kept", 250 * time.Millisecond, 250 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (AgentConfig{RedialBackoffMin: tc.set}).redialBackoffMin(); got != tc.want {
+				t.Errorf("redialBackoffMin() = %s, want %s", got, tc.want)
+			}
+			// Whatever comes back must be a bound jitter can halve.
+			if got := (AgentConfig{RedialBackoffMin: tc.set}).redialBackoffMin(); got/2 <= 0 {
+				t.Errorf("redialBackoffMin() = %s, which jitter cannot halve", got)
+			}
+		})
 	}
 }

@@ -39,11 +39,19 @@ type AgentConfig struct {
 	PingInterval time.Duration
 	PingTimeout  time.Duration
 	// RedialBackoffMin is the floor of RunAgent's redial delay: the wait
-	// before the first redial, and the value the delay returns to whenever a
-	// connection reaches establishment. Zero means the default below. The
-	// ceiling is nextBackoff's fixed 30s cap, so a floor above that is a
-	// misconfiguration — the doubling would clamp it back down.
+	// before the first redial, and the value the delay returns to once a
+	// connection has held (see RedialResetAfter). Zero means the default below;
+	// anything else is clamped to [minRedialBackoff, maxRedialBackoff],
+	// because jitter cannot halve a sub-nanosecond bound and a floor above
+	// the cap would put every redial above the ceiling RunAgent documents.
 	RedialBackoffMin time.Duration
+	// RedialResetAfter is how long an established connection must last for
+	// its end to reset the redial delay to that floor. It is the brake on a
+	// peer that accepts and immediately drops: without it, two runnerd
+	// processes sharing one runner name evict each other from the control
+	// plane's registry forever at the floor, each eviction costing a
+	// generation mint and a fleet write. Zero means the default below.
+	RedialResetAfter time.Duration
 }
 
 // The default liveness bounds. Together they bound how long a runner keeps
@@ -55,11 +63,27 @@ const (
 	defaultAgentPingTimeout  = 10 * time.Second
 )
 
-// The redial floor. One jittered second is long enough that a control plane
-// the whole fleet is redialing at once (a roll, a restart) is not answering
-// every runner in the same instant, and short enough that a routine
-// disconnect costs a session no meaningful reachability.
-const defaultRedialBackoffMin = time.Second
+// The redial bounds.
+//
+// One jittered second is long enough that a control plane the whole fleet is
+// redialing at once (a roll, a restart) is not answering every runner in the
+// same instant, and short enough that a routine disconnect costs a session no
+// meaningful reachability. Ten seconds of held connection is far below any
+// routine lifetime — an hourly expiry, a deploy's minutes — and far above the
+// milliseconds an eviction flap takes to come back around, which is the whole
+// job of that bound.
+//
+// minRedialBackoff is the smallest floor this package will use rather than a
+// validation error: jitter halves its argument and math/rand panics on a
+// non-positive bound, so a floor of a nanosecond would take the process down
+// on its first redial. maxRedialBackoff is the ceiling nextBackoff clamps to,
+// named here because the floor is held to it as well.
+const (
+	defaultRedialBackoffMin = time.Second
+	defaultRedialResetAfter = 10 * time.Second
+	minRedialBackoff        = time.Millisecond
+	maxRedialBackoff        = 30 * time.Second
+)
 
 func (cfg AgentConfig) pingInterval() time.Duration {
 	if cfg.PingInterval > 0 {
@@ -76,28 +100,43 @@ func (cfg AgentConfig) pingTimeout() time.Duration {
 }
 
 func (cfg AgentConfig) redialBackoffMin() time.Duration {
-	if cfg.RedialBackoffMin > 0 {
-		return cfg.RedialBackoffMin
+	switch d := cfg.RedialBackoffMin; {
+	case d <= 0:
+		return defaultRedialBackoffMin
+	case d < minRedialBackoff:
+		return minRedialBackoff
+	case d > maxRedialBackoff:
+		return maxRedialBackoff
+	default:
+		return d
 	}
-	return defaultRedialBackoffMin
+}
+
+func (cfg AgentConfig) redialResetAfter() time.Duration {
+	if cfg.RedialResetAfter > 0 {
+		return cfg.RedialResetAfter
+	}
+	return defaultRedialResetAfter
+}
+
+// resetsBackoff reports whether a connection that reached establishment at
+// establishedAt — zero if controld never accepted it — and is ending now
+// should return RunAgent's redial delay to its floor. Both halves are
+// required: the accept says the connection was good, and the holding says it
+// was good for long enough that coming straight back is not itself the
+// problem. See RunAgent.
+func (cfg AgentConfig) resetsBackoff(establishedAt time.Time) bool {
+	return !establishedAt.IsZero() && time.Since(establishedAt) >= cfg.redialResetAfter()
 }
 
 // agentSessionState is one control connection's negotiated state. Today that
 // is the runner generation controld granted in its accept: zero until one
 // arrives (an unaccepted connection claims no authority, which the wire
 // spells as "the connection's"), and read by the writer on every message the
-// runner sends afterwards, plus whether that accept arrived at all. Atomic
-// because the accept is handled on the reader while events fire from session
-// goroutines.
+// runner sends afterwards. Atomic because the accept is handled on the
+// reader while events fire from session goroutines.
 type agentSessionState struct {
 	generation atomic.Uint64
-	// accepted records that controld answered this connection's announce
-	// with an accept — this package's definition of an ESTABLISHED
-	// connection, and the only thing RunAgent's backoff reset keys on. It is
-	// its own flag rather than a generation != 0 test because the reset must
-	// depend on the handshake having happened, not on how the control plane
-	// happens to number the authority it grants.
-	accepted atomic.Bool
 }
 
 // jitter returns a random duration in [0, d/2) — timing spread, not security.
@@ -110,8 +149,8 @@ func jitter(d time.Duration) time.Duration { return time.Duration(mrand.Int63n(i
 // instead of drifting to 32s and freezing there.
 func nextBackoff(d time.Duration) time.Duration {
 	d *= 2
-	if d > 30*time.Second {
-		d = 30 * time.Second
+	if d > maxRedialBackoff {
+		d = maxRedialBackoff
 	}
 	return d
 }
@@ -122,30 +161,39 @@ func nextBackoff(d time.Duration) time.Duration {
 // logged and retried, since a runner with no control conn is still useful
 // on its local HTTP surface but should keep trying to phone home.
 //
-// The backoff returns to its floor whenever a connection was ESTABLISHED,
-// which here means exactly one thing: controld answered this connection's
-// announce with an accept. That is the control plane's own statement that
-// the fleet registered this runner, at a generation, on this socket — the
-// point past which its sessions are dispatchable. Anything that ends the
-// connection before then (a 401, a refused name, a generation the store
-// could not mint, a refused registration) leaves the delay doubling, so a
-// control plane that will not have this runner is still dialed with a
-// backing-off hand rather than once a floor-interval forever.
+// The backoff returns to its floor when a connection was ESTABLISHED and
+// HELD. Established means one thing: controld answered this connection's
+// announce with an accept — the control plane's own statement that the fleet
+// registered this runner, at a generation, on this socket, which is the point
+// past which its sessions are dispatchable. Held means that connection then
+// lasted RedialResetAfter. Anything else leaves the delay doubling to the cap.
 //
-// Without the reset the delay only ever grows: a process that has been up
+// Without any reset the delay only ever grows: a process that has been up
 // long enough to see six disconnects redials at the 30s cap from then on,
 // however healthy each connection in between was. Under a control plane that
 // routinely ends connections — an hourly credential or lease expiry, a
 // rolling deploy — that turns a sub-second reconnect into a 30-45s hole in
 // which every session on this runner reports unreachable and the scheduler
-// can place nothing on it. Establishment is what says the previous
-// connection was fine and the next one has no reason not to be.
+// can place nothing on it. Establishment is what says the previous connection
+// was fine and the next one has no reason not to be.
 //
-// A peer that accepts and immediately drops is therefore redialed at the
-// floor rather than backing off, and that is the intended reading: a control
-// plane that keeps completing the handshake is one this runner should keep
-// returning to, and the floor's jittered second bounds the cost of being
-// wrong about that.
+// The accept and not merely a completed dial, because several of controld's
+// refusals land after the websocket handshake (a name the credential does not
+// cover, a generation its store cannot mint, a registration the fleet
+// refuses, a failed reconcile) and a store outage puts the whole fleet on
+// that path at once. Resetting on a dial would answer that outage with the
+// entire fleet redialing at the floor for its duration.
+//
+// And the holding, because an accept alone can be handed out faster than it
+// means anything. The control plane evicts a runner's previous connection
+// whenever a new one registers under the same name, so two runnerd processes
+// sharing one runner name accept-and-evict each other indefinitely — and
+// every one of those dials costs a generation mint and a fleet write. A reset
+// on the bare accept would hold that loop at the floor forever, turning a
+// misconfiguration that used to decay to one exchange per 30s into a durable
+// write storm. Requiring the connection to have lasted first leaves the
+// runner that is genuinely being served resetting (any routine lifetime is
+// orders of magnitude past the bound) and the flapping pair backing off.
 func (s *Server) RunAgent(ctx context.Context, cfg AgentConfig) error {
 	s.proxyURL = cfg.ProxyURL
 	backoff := cfg.redialBackoffMin()
@@ -169,10 +217,10 @@ func (s *Server) RunAgent(ctx context.Context, cfg AgentConfig) error {
 
 // agentSession dials controld once, sends the announce as the FIRST message
 // on the conn, then serves runner.ToRunner commands until the conn ends. It
-// reports whether the connection reached establishment — controld's accept
-// arrived — which is what RunAgent's backoff reset keys on. A connection
-// that never got that far reports false however far into the handshake it
-// died, including one that died before there was any state to ask.
+// reports whether the connection both reached establishment — controld's
+// accept arrived — and held it long enough to reset RunAgent's redial delay
+// (cfg.resetsBackoff). A connection that never got that far reports false
+// however far into the handshake it died.
 //
 // agentSession does not return until its writer goroutine has actually
 // stopped (writerDone.Wait(), gated by connCtx). Review round 1, finding 3:
@@ -254,7 +302,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 	ann := runner.FromRunner{Type: "announce", Proto: runner.ProtocolVersion, Runner: cfg.RunnerName,
 		Sessions: s.Announce(), Used: used, Total: total, Capabilities: cfg.Capabilities}
 	if err := wsjson.Write(connCtx, c, ann); err != nil {
-		return ag.accepted.Load(), err
+		return false, err // nothing can have been accepted before the announce
 	}
 
 	writerDone.Add(1)
@@ -311,12 +359,20 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 			}
 		}
 	}()
+	// When controld's accept arrived, and the zero time until it does. A
+	// plain local rather than state on ag: the accept is handled on this
+	// goroutine (below), and this goroutine is the one that returns, so
+	// nothing else ever reads or writes it.
+	var establishedAt time.Time
 	for {
 		var m runner.ToRunner
 		if err := wsjson.Read(connCtx, c, &m); err != nil {
-			return ag.accepted.Load(), err
+			return cfg.resetsBackoff(establishedAt), err
 		}
 		if m.Type == "accept" {
+			if establishedAt.IsZero() {
+				establishedAt = time.Now()
+			}
 			// Handled on the reader itself, not in a goroutine of its own:
 			// the accept is this connection's negotiated state, and every
 			// message read after it must already carry the generation it
@@ -342,11 +398,6 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 		// informational — the set controld will schedule on, which is this
 		// runner's own claims minus anything it refused.
 		ag.generation.Store(m.Generation)
-		// Stored after the generation, so nothing can observe an established
-		// connection whose authority is not yet readable. RunAgent reads this
-		// only once agentSession has returned, but the ordering is free and
-		// the invariant is worth not having to reason about again.
-		ag.accepted.Store(true)
 		log.Printf("agent: accepted at generation %d with %d capabilities", m.Generation, len(m.Capabilities))
 	case "create":
 		var spec driver.Spec
