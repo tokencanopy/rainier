@@ -110,13 +110,14 @@ and start the new controld against it first. 0009 adds the `events` table:
 every lifecycle change writes its provider-neutral event in the same
 transaction as the row it describes; nothing in this release reads it back.
 
-Migration 0011 adds the durable agent-logout fence. Treat this migration as a
+Migrations 0011 and 0012 add the tombstone and durable agent-logout fence. Treat this migration as a
 stop-the-world control-plane upgrade: stop every old `controld` process using
-the database, start the new `controld` so it applies 0011, and do not restart an
+the database, start the new `controld` so it applies 0011 and 0012, and do not restart an
 old binary against that database. An old process deletes the row on logout and
 would erase the fence. Publish the matching session image and replace existing
-sessions before accepting agent login/logout traffic; the credential-sync
-protocol rejects old session processes, so mixed versions fail closed.
+sessions before accepting agent login/logout traffic. The credential-sync
+protocol rejects old custody RPCs, but an old session can still read a home it
+already mounted; do not run mixed session-image versions through this upgrade.
 
 ## 4. controld
 

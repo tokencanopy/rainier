@@ -168,57 +168,52 @@ func decodeAgents(b64 string) ([]agentEntry, error) {
 // agentEntries decodes the manifest and drops every row this sandbox will not
 // act on. An ABSENT variable means no homes and nothing in this file runs.
 //
-// An unreadable one is a LOG LINE, not a failed session — the asymmetry with
-// the repository list (gitchain.go fails the clone stage loudly) is the whole
-// posture of this mechanism: a session without its repositories is not the
-// session that was asked for, while a session without its logins is one where
-// the agent asks the person to log in. Custody never fails a boot.
+// A nonempty unreadable or unsupported manifest fails boot before the agent
+// starts. The provider environment points at the persistent home independently
+// of this decoder, so dropping a bad row would still let the agent use stale
+// credential files without a sync or revoke handler.
 //
 // The two checks on a row are not paranoia about controlapp: this manifest is
 // what decides where sessiond WRITES files and which files a revoke DELETES, so
 // a row naming a directory outside the mount, or a file name with a path in it,
 // would make either of those reach into the workspace. It costs four lines to
 // make that impossible from here.
-func agentEntries(env bootEnv) []agentEntry {
+func agentEntries(env bootEnv) ([]agentEntry, error) {
 	if env.AgentsB64 == "" {
-		return nil
+		return nil, nil
 	}
 	entries, err := decodeAgents(env.AgentsB64)
 	if err != nil {
-		log.Printf("the home list: %v; this session runs with none", err)
-		return nil
+		return nil, fmt.Errorf("the home list: %w", err)
 	}
 	out := make([]agentEntry, 0, len(entries))
 	providers := make(map[string]bool, len(entries))
 	dirs := make(map[string]bool, len(entries))
 	seedBytes := 0
 	for _, e := range entries {
+		if e.CredentialProtocol != runner.AgentCredentialProtocolVersion {
+			return nil, fmt.Errorf("home %q uses unsupported credential protocol %d", e.Provider, e.CredentialProtocol)
+		}
 		if err := checkAgentEntry(e); err != nil {
-			log.Printf("home %q dropped: %v", e.Provider, err)
-			continue
+			return nil, fmt.Errorf("home %q: %w", e.Provider, err)
 		}
 		if providers[e.Provider] || dirs[filepath.Clean(e.Dir)] {
-			log.Printf("home %q dropped: its provider or directory is named more than once", e.Provider)
-			continue
+			return nil, fmt.Errorf("home %q: its provider or directory is named more than once", e.Provider)
 		}
 		for _, seed := range e.SeedFiles {
 			seedBytes += len(seed.Contents)
 		}
 		if seedBytes > agentManifestMaxSeedBytes {
-			log.Printf("home %q dropped: the home list has over %d seed bytes", e.Provider, agentManifestMaxSeedBytes)
-			continue
+			return nil, fmt.Errorf("home %q: the home list has over %d seed bytes", e.Provider, agentManifestMaxSeedBytes)
 		}
 		providers[e.Provider] = true
 		dirs[filepath.Clean(e.Dir)] = true
 		out = append(out, e)
 	}
-	return out
+	return out, nil
 }
 
 func checkAgentEntry(e agentEntry) error {
-	if e.CredentialProtocol != runner.AgentCredentialProtocolVersion {
-		return fmt.Errorf("credential protocol %d is unsupported", e.CredentialProtocol)
-	}
 	if e.Provider == "" {
 		return errors.New("the row names nothing")
 	}
@@ -382,6 +377,7 @@ type agentSet struct {
 	dirty            bool
 	restoreRetry     bool
 	restoreTombstone bool
+	cleanupRetry     bool
 	backoff          time.Duration
 	retryAt          time.Time
 	// noted remembers the conditions already reported, so a symlink or an
@@ -412,6 +408,7 @@ type agentSync struct {
 	backoffMax  time.Duration
 	maxBytes    int64
 	writeFile   func(*os.File, string, []byte) error
+	removeFiles func(*agentSet) (int, error)
 
 	mu   sync.Mutex
 	sets map[string]*agentSet
@@ -434,6 +431,7 @@ func newAgentSync(rpc *rpcDispatcher, entries []agentEntry, events chan<- []byte
 		backoffMax:  agentPutBackoffMax,
 		maxBytes:    agentSetMaxBytes,
 		writeFile:   writeAgentFileAt,
+		removeFiles: removeAgentFilesLocked,
 		sets:        make(map[string]*agentSet, len(entries)),
 		stop:        make(chan struct{}),
 		done:        make(chan struct{}),
@@ -487,6 +485,14 @@ func (a *agentSync) close() {
 			continue
 		}
 		a.mu.Lock()
+		if set.cleanupRetry {
+			if _, err := a.retryCleanupLocked(set, now); err != nil {
+				a.mu.Unlock()
+				continue
+			}
+			a.mu.Unlock()
+			continue
+		}
 		if set.restoreRetry {
 			if set.restoreTombstone {
 				a.mu.Unlock()
@@ -580,7 +586,7 @@ func (a *agentSync) fetchOne(e agentEntry) {
 		return
 	}
 	if body.Version > 0 && len(held) == 0 {
-		removed, err := removeAgentFilesLocked(set)
+		removed, err := a.removeFiles(set)
 		if err != nil {
 			a.note(e.Provider, "the revoked credential set could not be removed: "+err.Error())
 			set.version = body.Version
@@ -740,6 +746,15 @@ func (a *agentSync) flush() { a.tick(time.Now()) }
 // wire for no reason.
 func (a *agentSync) syncOne(set *agentSet, now time.Time) {
 	a.mu.Lock()
+	if set.cleanupRetry {
+		if now.Before(set.retryAt) {
+			a.mu.Unlock()
+			return
+		}
+		_, _ = a.retryCleanupLocked(set, now)
+		a.mu.Unlock()
+		return
+	}
 	if set.restoreRetry {
 		if now.Before(set.retryAt) {
 			a.mu.Unlock()
@@ -872,10 +887,10 @@ func nextAgentBackoff(d, min, max time.Duration) time.Duration {
 // session that a person logged an agent out, or lost the membership that was
 // projecting their login into this workspace.
 //
-// It empties the home and forgets the baseline. Forgetting matters as much as
-// deleting: a session that kept the old digest would treat a login made
-// afterwards as "the same set we already sent" and never put it, and one that
-// kept the old version would offer custody a version that no longer exists.
+// It empties the home and adopts a supplied logout baseline. A membership
+// withdrawal carries version zero and preserves the last known custody
+// baseline while still deleting local files unconditionally. Failed deletion
+// remains fenced and retries locally; it never refetches after withdrawal.
 func (a *agentSync) handleRevoke(payload []byte) (any, error) {
 	var in struct {
 		Provider string `json:"provider"`
@@ -901,25 +916,23 @@ func (a *agentSync) handleRevoke(payload []byte) (any, error) {
 		return struct{}{}, nil
 	}
 	set.generation++
-	if set.dir == nil {
-		dir, err := openAgentHome(set.entry)
-		if err != nil {
-			return nil, fmt.Errorf("this home could not be made ready: %v", err)
-		}
-		set.dir = dir
+	// Adopt the fence before touching the filesystem. Delivery is best effort
+	// at the control plane, so a transient unlink failure must stop uploads now
+	// and be retried locally rather than leave the old baseline active.
+	if in.Version > 0 {
+		set.version = in.Version
 	}
-	removed, err := removeAgentFilesLocked(set)
-	if err != nil {
-		return nil, err
-	}
-	set.version = in.Version
 	set.digest = agentSetDigest(nil)
-	set.stamps = statAgentFiles(set)
 	set.dirty = false
 	set.restoreRetry = false
 	set.restoreTombstone = false
+	set.cleanupRetry = true
 	set.backoff = 0
 	set.retryAt = time.Time{}
+	removed, err := a.retryCleanupLocked(set, time.Now())
+	if err != nil {
+		return nil, err
+	}
 	log.Printf("home %q: %d file(s) removed on request; this session holds nothing for it", in.Provider, removed)
 	// The ok:true answer's body. It carries nothing because there is nothing to
 	// say: the caller asked for a state, and it is that state now.
@@ -965,6 +978,32 @@ func (a *agentSync) noteOnce(set *agentSet, key, text string) {
 	}
 	set.noted[key] = true
 	a.note(set.entry.Provider, text)
+}
+
+// retryCleanupLocked retries a downward revoke locally. It never fetches:
+// version-zero membership withdrawal is deliberately unable to read custody.
+// The caller holds a.mu.
+func (a *agentSync) retryCleanupLocked(set *agentSet, now time.Time) (int, error) {
+	if set.dir == nil {
+		dir, err := openAgentHome(set.entry)
+		if err != nil {
+			set.backoff = nextAgentBackoff(set.backoff, a.backoffMin, a.backoffMax)
+			set.retryAt = now.Add(set.backoff)
+			return 0, fmt.Errorf("this home could not be made ready: %v", err)
+		}
+		set.dir = dir
+	}
+	removed, err := a.removeFiles(set)
+	if err != nil {
+		set.backoff = nextAgentBackoff(set.backoff, a.backoffMin, a.backoffMax)
+		set.retryAt = now.Add(set.backoff)
+		return removed, err
+	}
+	set.cleanupRetry = false
+	set.stamps = statAgentFiles(set)
+	set.backoff = 0
+	set.retryAt = time.Time{}
+	return removed, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,6 +1054,11 @@ func (a *agentSync) readSetLocked(set *agentSet) (map[string][]byte, bool) {
 }
 
 func removeAgentFilesLocked(set *agentSet) (int, error) {
+	if set.dir != nil {
+		if err := unix.Fchmod(int(set.dir.Fd()), 0o700); err != nil {
+			return 0, fmt.Errorf("the provider directory mode could not be restored: %v", err)
+		}
+	}
 	removed := 0
 	for _, name := range set.entry.Files {
 		if set.dir == nil {

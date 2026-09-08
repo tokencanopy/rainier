@@ -791,44 +791,24 @@ func encodeAgentsB64(t *testing.T, entries []agentEntry) string {
 	return base64.StdEncoding.EncodeToString(raw)
 }
 
-// TestAgentsManifestIsReadLikeTheRepositoryList: an absent variable means no
-// homes and nothing runs; an unreadable one is not allowed to fail a session
-// over custody, and a row that would write outside the mount is dropped.
-func TestAgentsManifestIsReadLikeTheRepositoryList(t *testing.T) {
+// An absent manifest means no homes. Any nonempty malformed or unsupported
+// manifest fails boot before the provider can read a persistent home without
+// the matching sync and revoke handlers.
+func TestAgentsManifestFailsClosedWhenNonemptyAndInvalid(t *testing.T) {
 	root := t.TempDir()
 	old := agentsMountRoot
 	agentsMountRoot = root
 	defer func() { agentsMountRoot = old }()
 
-	if got := agentEntries(bootEnv{}); len(got) != 0 {
-		t.Fatalf("entries = %+v with no variable, want none", got)
+	if got, err := agentEntries(bootEnv{}); err != nil || len(got) != 0 {
+		t.Fatalf("entries = %+v, %v with no variable, want none", got, err)
 	}
-	if got := agentEntries(bootEnv{AgentsB64: "not base64"}); len(got) != 0 {
-		t.Fatalf("entries = %+v for an unreadable manifest, want none", got)
-	}
-	outside := encodeAgentsB64(t, []agentEntry{
-		{Provider: "legacy", Dir: filepath.Join(root, "legacy"), Files: []string{agentFileName}},
-		{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "a", Dir: filepath.Join(root, "a"), Files: []string{agentFileName}},
-		{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "b", Dir: "/workspace/b", Files: []string{agentFileName}},
-		{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "c", Dir: filepath.Join(root, "c"), Files: []string{"../../escape"}},
-		{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "d", Dir: filepath.Join(root, "d"), Files: []string{agentFileName}, SeedFiles: []agentSeedFile{{Name: "../../escape", Contents: agentSeedFixture}}},
-		{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "e", Dir: filepath.Join(root, "e"), Files: []string{agentFileName}, SeedFiles: []agentSeedFile{{Name: agentFileName, Contents: agentSeedFixture}}},
-		{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "f", Dir: filepath.Join(root, "f"), Files: []string{agentFileName}, SeedFiles: []agentSeedFile{{Name: agentSeedName, Contents: strings.Repeat("x", agentSeedFileMaxBytes+1)}}},
-		{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "", Dir: filepath.Join(root, "g"), Files: []string{agentFileName}},
-	})
-	got := agentEntries(bootEnv{AgentsB64: outside})
-	if len(got) != 1 || got[0].Provider != "a" {
-		t.Fatalf("entries = %+v, want only the row inside the mount with a bare file name", got)
-	}
-
-	duplicates := encodeAgentsB64(t, []agentEntry{
-		{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "a", Dir: filepath.Join(root, "a"), Files: []string{agentFileName}},
-		{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "a", Dir: filepath.Join(root, "b"), Files: []string{agentFileName}},
-		{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "c", Dir: filepath.Join(root, "a"), Files: []string{agentFileName}},
-	})
-	got = agentEntries(bootEnv{AgentsB64: duplicates})
-	if len(got) != 1 || got[0].Provider != "a" || got[0].Dir != filepath.Join(root, "a") {
-		t.Fatalf("duplicate entries = %+v, want only the first unique provider and directory", got)
+	valid := encodeAgentsB64(t, []agentEntry{{
+		CredentialProtocol: runner.AgentCredentialProtocolVersion,
+		Provider:           "a", Dir: filepath.Join(root, "a"), Files: []string{agentFileName},
+	}})
+	if got, err := agentEntries(bootEnv{AgentsB64: valid}); err != nil || len(got) != 1 || got[0].Provider != "a" {
+		t.Fatalf("valid manifest = %+v, %v; want provider a", got, err)
 	}
 
 	tooMany := make([]agentEntry, agentManifestMaxEntries+1)
@@ -840,8 +820,52 @@ func TestAgentsManifestIsReadLikeTheRepositoryList(t *testing.T) {
 			Files:              []string{agentFileName},
 		}
 	}
-	if got := agentEntries(bootEnv{AgentsB64: encodeAgentsB64(t, tooMany)}); len(got) != 0 {
-		t.Fatalf("oversized manifest produced %d entries, want none", len(got))
+	for _, tc := range []struct {
+		name string
+		b64  string
+	}{
+		{"unreadable", "not base64"},
+		{"unsupported protocol", encodeAgentsB64(t, []agentEntry{{Provider: "legacy", Dir: filepath.Join(root, "legacy"), Files: []string{agentFileName}}})},
+		{"outside mount", encodeAgentsB64(t, []agentEntry{{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "b", Dir: "/workspace/b", Files: []string{agentFileName}}})},
+		{"path file", encodeAgentsB64(t, []agentEntry{{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "c", Dir: filepath.Join(root, "c"), Files: []string{"../../escape"}}})},
+		{"path seed", encodeAgentsB64(t, []agentEntry{{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "d", Dir: filepath.Join(root, "d"), Files: []string{agentFileName}, SeedFiles: []agentSeedFile{{Name: "../../escape", Contents: agentSeedFixture}}}})},
+		{"overlapping seed", encodeAgentsB64(t, []agentEntry{{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "e", Dir: filepath.Join(root, "e"), Files: []string{agentFileName}, SeedFiles: []agentSeedFile{{Name: agentFileName, Contents: agentSeedFixture}}}})},
+		{"oversized seed", encodeAgentsB64(t, []agentEntry{{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "f", Dir: filepath.Join(root, "f"), Files: []string{agentFileName}, SeedFiles: []agentSeedFile{{Name: agentSeedName, Contents: strings.Repeat("x", agentSeedFileMaxBytes+1)}}}})},
+		{"duplicate", encodeAgentsB64(t, []agentEntry{
+			{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "a", Dir: filepath.Join(root, "a"), Files: []string{agentFileName}},
+			{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "a", Dir: filepath.Join(root, "b"), Files: []string{agentFileName}},
+		})},
+		{"too many", encodeAgentsB64(t, tooMany)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, err := agentEntries(bootEnv{AgentsB64: tc.b64}); err == nil || len(got) != 0 {
+				t.Fatalf("invalid manifest produced %+v, %v; want an error and no entries", got, err)
+			}
+		})
+	}
+}
+
+func TestUnsupportedCredentialProtocolFailsBeforePersistentHomeUse(t *testing.T) {
+	root := t.TempDir()
+	old := agentsMountRoot
+	agentsMountRoot = root
+	defer func() { agentsMountRoot = old }()
+	home := filepath.Join(root, "test")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, agentFileName), []byte(agentFixture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := bootEnv{AgentsB64: encodeAgentsB64(t, []agentEntry{{
+		Provider: "test", Dir: home, Files: []string{agentFileName},
+	}})}
+	stages, _, err := prepareBoot(t.TempDir(), t.TempDir(), env)
+	if err == nil {
+		t.Fatalf("unsupported credential protocol produced stages %+v; want boot failure", stages)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, agentFileName)); statErr != nil {
+		t.Fatalf("startup validation changed the persistent file before refusing boot: %v", statErr)
 	}
 }
 
@@ -1024,8 +1048,8 @@ func TestRevokeEmptiesAndResetsTheBaseline(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.Dir, agentFileName)); !os.IsNotExist(err) {
 		t.Fatalf("the file is still there after a revoke (%v)", err)
 	}
-	if v, ok := a.baseline("test"); !ok || v != 0 {
-		t.Fatalf("baseline = %d (%v), want it reset to 0", v, ok)
+	if v, ok := a.baseline("test"); !ok || v != 7 {
+		t.Fatalf("baseline = %d (%v), want the known custody version preserved", v, ok)
 	}
 	// The empty directory is not news to put.
 	a.tick(time.Now())
@@ -1033,15 +1057,15 @@ func TestRevokeEmptiesAndResetsTheBaseline(t *testing.T) {
 		t.Fatalf("%d put(s) after a revoke, want 0", n)
 	}
 
-	// A later write is a new set, sent with the reset version.
+	// A later write is a new set, sent with the preserved custody version.
 	writeAgentFixture(t, e, agentFileName, agentFixture+"3")
 	a.tick(time.Now())
 	puts := h.putRecords()
 	if len(puts) != 1 {
 		t.Fatalf("%d put(s) after a login following a revoke, want 1", len(puts))
 	}
-	if puts[0].Version != 0 || puts[0].Files[agentFileName] != agentFixture+"3" {
-		t.Fatalf("the put = v%d with %d file(s), want the new set at v0", puts[0].Version, len(puts[0].Files))
+	if puts[0].Version != 7 || puts[0].Files[agentFileName] != agentFixture+"3" {
+		t.Fatalf("the put = v%d with %d file(s), want the new set at v7", puts[0].Version, len(puts[0].Files))
 	}
 
 	// A provider this session has no home for is refused rather than answered.
@@ -1077,6 +1101,36 @@ func TestRevokeFencesAnInFlightPutResponse(t *testing.T) {
 	}
 	if version, _ := a.baseline("test"); version != 2 {
 		t.Fatalf("baseline = %d, want revoke version 2", version)
+	}
+}
+
+func TestFailedDownwardRevokeRetriesDeletionWithoutUploading(t *testing.T) {
+	e := agentTestEntry(t)
+	h := newFakeAgentHost(t)
+	h.setFetch(1, map[string]string{agentFileName: agentFixture})
+	a := newTestAgentSync(h, []agentEntry{e}, make(chan []byte, 8))
+	a.boot()
+	failed := false
+	a.removeFiles = func(set *agentSet) (int, error) {
+		if !failed {
+			failed = true
+			return 0, errors.New("synthetic unlink failure")
+		}
+		return removeAgentFilesLocked(set)
+	}
+
+	if _, err := a.handleRevoke([]byte(`{"provider":"test","version":2}`)); err == nil {
+		t.Fatal("revoke with a synthetic unlink failure returned nil")
+	}
+	if version, _ := a.baseline("test"); version != 2 {
+		t.Fatalf("baseline after failed unlink = %d, want revoke version 2", version)
+	}
+	a.tick(time.Now().Add(a.backoffMin))
+	if _, err := os.Stat(filepath.Join(e.Dir, agentFileName)); !os.IsNotExist(err) {
+		t.Fatalf("credential remains after cleanup retry: %v", err)
+	}
+	if h.putCount() != 0 {
+		t.Fatalf("cleanup retry produced %d put(s), want none", h.putCount())
 	}
 }
 

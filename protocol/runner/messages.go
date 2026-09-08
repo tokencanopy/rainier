@@ -49,9 +49,9 @@ const (
 	// MethodRevokeAgentCredentials is control plane → sandbox, on a logout or
 	// a membership that went away: {"provider": "...", "version": n} → {}.
 	// Logout includes its tombstone version; membership withdrawal may omit it.
-	// The sandbox removes that provider's allowlisted files and adopts the
-	// supplied baseline, so an earlier in-flight put cannot undo the revoke and
-	// a later login inside the same session is a new set.
+	// The sandbox removes that provider's allowlisted files and adopts a
+	// supplied logout baseline. A withdrawal preserves its known custody
+	// baseline while deleting local files unconditionally.
 	MethodRevokeAgentCredentials = "revoke_agent_credentials"
 )
 

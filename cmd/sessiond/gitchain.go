@@ -360,7 +360,11 @@ func prepareBoot(dir, root string, env bootEnv) ([]bootStage, []envVar, error) {
 	// filled. The stage waits for work sessiond does over the session RPC while
 	// the stages above ran (agents.go); the ONE outcome that fails it is a
 	// runner too old to mount the home at all.
-	if entries := agentEntries(env); len(entries) > 0 {
+	entries, err := agentEntries(env)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(entries) > 0 {
 		st, err := prepareAgentsStage(dir, entries)
 		if err != nil {
 			return nil, nil, err
