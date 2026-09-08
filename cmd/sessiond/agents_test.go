@@ -825,6 +825,8 @@ func TestAgentsManifestFailsClosedWhenNonemptyAndInvalid(t *testing.T) {
 		b64  string
 	}{
 		{"unreadable", "not base64"},
+		{"empty array", base64.StdEncoding.EncodeToString([]byte(`[]`))},
+		{"null", base64.StdEncoding.EncodeToString([]byte(`null`))},
 		{"unsupported protocol", encodeAgentsB64(t, []agentEntry{{Provider: "legacy", Dir: filepath.Join(root, "legacy"), Files: []string{agentFileName}}})},
 		{"outside mount", encodeAgentsB64(t, []agentEntry{{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "b", Dir: "/workspace/b", Files: []string{agentFileName}}})},
 		{"path file", encodeAgentsB64(t, []agentEntry{{CredentialProtocol: runner.AgentCredentialProtocolVersion, Provider: "c", Dir: filepath.Join(root, "c"), Files: []string{"../../escape"}}})},

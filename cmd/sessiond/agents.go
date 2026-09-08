@@ -165,8 +165,9 @@ func decodeAgents(b64 string) ([]agentEntry, error) {
 	return entries, nil
 }
 
-// agentEntries decodes the manifest and drops every row this sandbox will not
-// act on. An ABSENT variable means no homes and nothing in this file runs.
+// agentEntries decodes and validates the complete manifest. An ABSENT variable
+// means no homes and nothing in this file runs; any present invalid or empty
+// manifest fails boot before a provider can read a persistent home.
 //
 // A nonempty unreadable or unsupported manifest fails boot before the agent
 // starts. The provider environment points at the persistent home independently
@@ -185,6 +186,9 @@ func agentEntries(env bootEnv) ([]agentEntry, error) {
 	entries, err := decodeAgents(env.AgentsB64)
 	if err != nil {
 		return nil, fmt.Errorf("the home list: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil, errors.New("the home list is present but empty")
 	}
 	out := make([]agentEntry, 0, len(entries))
 	providers := make(map[string]bool, len(entries))
