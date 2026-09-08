@@ -106,6 +106,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The pinned upstream releases from the toolchain stage. Root-owned, under
 # /usr/local, which the session user cannot write — see the prefix note below.
 COPY --from=toolchain /opt/toolchain/go /usr/local/go
+# Codex's vendor package travels whole, and /usr/local/bin/codex arrives from
+# the line below as the relative symlink `../lib/codex/bin/codex` that the
+# toolchain stage created — the same link, resolving to the same tree, in both
+# stages. Codex locates its tool host and its bundled search and sandbox
+# resources by walking up from the resolved path of its own executable, so the
+# package has to stay together and the PATH entry has to point into it.
+COPY --from=toolchain /opt/toolchain/lib/ /usr/local/lib/
 COPY --from=toolchain /opt/toolchain/bin/ /usr/local/bin/
 
 # The upstream gh stays root-owned at an absolute path. Its public command is
