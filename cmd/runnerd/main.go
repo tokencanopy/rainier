@@ -26,6 +26,8 @@ func main() {
 	hostname, _ := os.Hostname()
 	runnerName := flag.String("runner-name", hostname, "name this runner announces to controld")
 	proxyURL := flag.String("proxy-url", "", "egress proxy URL injected into every session (forwarded to controld dial mode)")
+	seccompProfile := flag.String("session-seccomp-profile", "", "host path to an optional seccomp profile for session containers")
+	appArmorProfile := flag.String("session-apparmor-profile", "", "name of an optional loaded AppArmor profile for session containers")
 	var capabilities capabilityFlag
 	flag.Var(&capabilities, "capability",
 		"a portable capability this runner claims (e.g. gpu); repeatable, or set RAINIER_RUNNER_CAPABILITIES to a comma-separated list")
@@ -37,7 +39,13 @@ func main() {
 		capabilities = splitCapabilities(os.Getenv("RAINIER_RUNNER_CAPABILITIES"))
 	}
 
-	drv := driver.NewDocker(driver.DockerOpts{Image: *image, Network: *network, TotalSlots: *slots})
+	drv := driver.NewDocker(driver.DockerOpts{
+		Image:                  *image,
+		Network:                *network,
+		TotalSlots:             *slots,
+		SessionSeccompProfile:  *seccompProfile,
+		SessionAppArmorProfile: *appArmorProfile,
+	})
 	// *proxyURL reaches New directly now (Task 13) so the local HTTP-only
 	// surface — today's default, and every dev/CI compose run — injects it
 	// into every driver.Spec too, not just agent (dial) mode below.
