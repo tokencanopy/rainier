@@ -44,10 +44,6 @@ var EnableTestAgentProvider bool
 //   - HomeEnv is the variable the agent already honors to move its
 //     configuration directory. Pointing it at the home is the entire
 //     integration: the tool is unmodified and does not know it is in Rainier.
-//   - HomeVar is the variable to set when the agent ALSO writes under $HOME
-//     regardless — empty when everything lands under HomeEnv's directory,
-//     which is the case for the rows below. sessiond sets it for the agent
-//     process only, never for the container.
 //   - Files is the allowlist of credential-bearing file names inside the
 //     provider's directory. Bare file names, never paths: this list is what
 //     the sync reads, what a revoke deletes, and what a checkpoint excludes,
@@ -74,7 +70,6 @@ type AgentHomeSeedFile struct {
 type AgentProvider struct {
 	Name      string
 	HomeEnv   string
-	HomeVar   string
 	Files     []string
 	SeedFiles []AgentHomeSeedFile
 	Egress    []string
@@ -145,11 +140,6 @@ type agentManifestEntry struct {
 	Dir       string              `json:"dir"`
 	Files     []string            `json:"files"`
 	SeedFiles []AgentHomeSeedFile `json:"seed_files,omitempty"`
-	// HomeVar rides along when a row declares one, so a provider that also
-	// writes under $HOME becomes a table edit rather than a code change in
-	// sessiond. Absent for every row that does not, which is all of them
-	// today, so the bytes are exactly the three-key shape the design names.
-	HomeVar string `json:"home_var,omitempty"`
 }
 
 // AgentsEnv is the environment every session gets so that the agents inside
@@ -169,7 +159,7 @@ func AgentsEnv(providers []AgentProvider) map[string]string {
 		env[p.HomeEnv] = dir
 		entries = append(entries, agentManifestEntry{
 			Provider: p.Name, Dir: dir, Files: slices.Clone(p.Files),
-			SeedFiles: slices.Clone(p.SeedFiles), HomeVar: p.HomeVar,
+			SeedFiles: slices.Clone(p.SeedFiles),
 		})
 	}
 	// json.Marshal of a slice of plain structs cannot fail, and a create is

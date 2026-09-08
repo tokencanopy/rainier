@@ -92,9 +92,8 @@ type agentCredentialBlob struct {
 var errAgentCredentialSeal = errors.New("controld: the agent credential could not be sealed or opened")
 
 // FetchAgentCredentials opens userID's set for provider. A set nobody has put
-// — or one a revoke destroyed — is version 0 with no files and no error: "you
-// have not logged this agent in" is an answer, and the sandbox starts the
-// agent anyway so the person can log in.
+// is version 0 with no files. A revoke is a positive version with no files so
+// it can fence earlier puts. Both mean "not logged in" and let the agent start.
 //
 // A row that will not open is NOT reported as version 0. That would silently
 // tell a person who is logged in that they are not, and would hide exactly
@@ -107,6 +106,9 @@ func (v *AgentVault) FetchAgentCredentials(ctx context.Context, user control.Act
 		return controlapp.AgentCredentialSet{}, nil
 	case err != nil:
 		return controlapp.AgentCredentialSet{}, err
+	}
+	if row.Revoked {
+		return controlapp.AgentCredentialSet{Version: row.Version, Files: map[string][]byte{}}, nil
 	}
 	plaintext, err := OpenAAD(v.key, row.Ciphertext, row.Nonce,
 		agentCredentialAAD(string(user), provider, row.Version))
@@ -130,7 +132,7 @@ func (v *AgentVault) FetchAgentCredentials(ctx context.Context, user control.Act
 // and stores them, returning that version. See this file's header for why the
 // read, the seal, and the write are one compare-and-set loop rather than
 // three independent steps.
-func (v *AgentVault) PutAgentCredentials(ctx context.Context, user control.ActorID, provider string, files map[string][]byte) (uint64, error) {
+func (v *AgentVault) PutAgentCredentials(ctx context.Context, user control.ActorID, provider string, files map[string][]byte, expected uint64) (uint64, error) {
 	// Encoded once, outside the loop: the plaintext does not depend on the
 	// version, only the seal does, so a retry re-seals without rebuilding it.
 	plaintext, err := json.Marshal(agentCredentialBlob{Files: nonNilFiles(files)})
@@ -144,8 +146,14 @@ func (v *AgentVault) PutAgentCredentials(ctx context.Context, user control.Actor
 		switch {
 		case err == nil:
 			stored = cur.Version
+			if cur.Revoked && expected != stored {
+				return 0, control.ErrConflict
+			}
 		case errors.Is(err, control.ErrNotFound):
 			// stored stays 0: the first put of a set is version 1.
+			if expected != 0 {
+				return 0, control.ErrConflict
+			}
 		default:
 			return 0, err
 		}
@@ -158,7 +166,7 @@ func (v *AgentVault) PutAgentCredentials(ctx context.Context, user control.Actor
 		}
 		version, err := v.rows.PutAgentCredential(ctx, AgentCredential{
 			UserID: string(user), Provider: provider,
-			Ciphertext: ciphertext, Nonce: nonce, Version: next,
+			Ciphertext: ciphertext, Nonce: nonce, Version: next, Revoked: false,
 		})
 		if errors.Is(err, control.ErrConflict) {
 			// Somebody else's put landed between the read and the write. Our
@@ -174,11 +182,10 @@ func (v *AgentVault) PutAgentCredentials(ctx context.Context, user control.Actor
 	return 0, control.ErrConflict
 }
 
-// RevokeAgentCredentials destroys the set. It is idempotent by construction:
-// the store's delete reports nothing for a row that is not there, because
-// "there is no credential" is the state the caller asked for either way.
-func (v *AgentVault) RevokeAgentCredentials(ctx context.Context, user control.ActorID, provider string) error {
-	return v.rows.DeleteAgentCredential(ctx, string(user), provider)
+// RevokeAgentCredentials replaces the set with a monotonic tombstone. The
+// tombstone holds no credential bytes and fences puts that began before it.
+func (v *AgentVault) RevokeAgentCredentials(ctx context.Context, user control.ActorID, provider string) (uint64, error) {
+	return v.rows.RevokeAgentCredential(ctx, string(user), provider)
 }
 
 // ListAgentCredentials renders one status per stored set. It never opens a

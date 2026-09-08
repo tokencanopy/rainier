@@ -366,7 +366,6 @@ func prepareBoot(dir, root string, env bootEnv) ([]bootStage, []envVar, error) {
 			return nil, nil, err
 		}
 		stages = append(stages, st)
-		vars = append(vars, agentHomeVars(entries)...)
 	}
 
 	if env.InitB64 != "" {

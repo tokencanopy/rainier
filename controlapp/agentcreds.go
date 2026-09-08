@@ -36,15 +36,16 @@ import (
 
 // AgentCredentialSet is one provider's credential files for one person, plus
 // the version custody has assigned them. Version 0 with no files is the
-// truthful answer for a person who has not logged that agent in — it is an
-// answer, not a refusal.
+// truthful answer for a person who has not logged that agent in. A positive
+// version with no files is a revoke tombstone. Both are answers, not refusals.
 type AgentCredentialSet struct {
 	Version uint64
 	Files   map[string][]byte
 }
 
 // AgentCredentialStatus is everything about a stored set EXCEPT the set: the
-// provider it belongs to, the version, and when it last moved. Listing
+// provider it belongs to, the version, and when it last moved. Revoked
+// tombstones are not listed. Listing
 // answers with these, so no listing path can return a credential byte —
 // AgentCredentialStore.ListAgentCredentials has no way to express one.
 type AgentCredentialStatus struct {
@@ -68,19 +69,20 @@ type AgentCredentialStatus struct {
 // these comments say what the behavior is, and that suite is where it is
 // pinned.
 type AgentCredentialStore interface {
-	// FetchAgentCredentials returns the stored set. A set that was never put,
-	// or that a revoke destroyed, is version 0 with no files and a nil error
-	// — "you have not logged in" is not a failure.
+	// FetchAgentCredentials returns the stored set. A set that was never put is
+	// version 0 with no files; a revoked set is its positive tombstone version
+	// with no files. Both are answers rather than failures.
 	FetchAgentCredentials(ctx context.Context, user control.ActorID, provider string) (AgentCredentialSet, error)
 	// PutAgentCredentials replaces the set with files and returns the new
 	// version, which is one more than the version it replaced (1 for a first
-	// put). It is last-writer-wins: two sessions of the same person racing
-	// each other both succeed, and the later write is the one that stands.
-	PutAgentCredentials(ctx context.Context, user control.ActorID, provider string, files map[string][]byte) (uint64, error)
-	// RevokeAgentCredentials destroys the set. It is idempotent: revoking
-	// what is not there is a nil error, because "there is no credential" is
-	// the state the caller asked for either way.
-	RevokeAgentCredentials(ctx context.Context, user control.ActorID, provider string) error
+	// put). expected is the version the sandbox last saw. Ordinary concurrent
+	// writes remain last-writer-wins, but a version older than a revoke
+	// tombstone is control.ErrConflict and cannot resurrect a logged-out set.
+	PutAgentCredentials(ctx context.Context, user control.ActorID, provider string, files map[string][]byte, expected uint64) (uint64, error)
+	// RevokeAgentCredentials replaces the set with a versioned tombstone and
+	// returns its version. It is idempotent in outcome, while each call still
+	// advances the fence so every earlier in-flight put is stale.
+	RevokeAgentCredentials(ctx context.Context, user control.ActorID, provider string) (uint64, error)
 	// ListAgentCredentials returns one status per provider the user has a set
 	// for, and no bytes.
 	ListAgentCredentials(ctx context.Context, user control.ActorID) ([]AgentCredentialStatus, error)
@@ -158,6 +160,10 @@ var (
 	// ErrAgentCredentialUnwritable is the same flattening on the way in.
 	ErrAgentCredentialUnwritable error = &agentRefusal{
 		"the agent credential could not be stored", control.ErrUnavailable}
+	// ErrAgentCredentialStale refuses a put that began before logout advanced
+	// custody's revoke fence.
+	ErrAgentCredentialStale error = &agentRefusal{
+		"the agent credential changed after this session last read it", control.ErrConflict}
 	// ErrAgentCredentialNotYours refuses a logout by anyone but the account.
 	// A credential set is not the workspace's property, so no role over the
 	// workspace reaches it — an owner and an admin get this too.
@@ -309,12 +315,11 @@ func (s *AgentCredentialService) AnswerFetch(ctx context.Context, row control.Se
 // and the provider's file allowlist.
 //
 // The wire's put also carries the version the sandbox last saw
-// (runner.MethodPutAgentCredentials). It is deliberately not a parameter
-// here: v0 custody is last-writer-wins, so the answer to a stale version is
-// the same as the answer to a current one — store it, and hand back the
-// version it became. Nothing is answered before the store has accepted the
-// write, so a version a sandbox holds is always a version custody has.
-func (s *AgentCredentialService) AnswerPut(ctx context.Context, row control.Session, provider string, files map[string][]byte) (uint64, error) {
+// (runner.MethodPutAgentCredentials). Custody uses it only at a revoke
+// boundary: ordinary concurrent writes remain last-writer-wins, while a put
+// older than a logout tombstone is refused. Nothing is answered before the
+// store has accepted the write.
+func (s *AgentCredentialService) AnswerPut(ctx context.Context, row control.Session, provider string, files map[string][]byte, expected uint64) (uint64, error) {
 	p, err := s.answerable(ctx, row, provider)
 	if err != nil {
 		return 0, err
@@ -322,14 +327,24 @@ func (s *AgentCredentialService) AnswerPut(ctx context.Context, row control.Sess
 	if err := checkAgentFiles(p, files); err != nil {
 		return 0, err
 	}
-	version, err := s.store.PutAgentCredentials(ctx, row.CreatorID, provider, files)
+	if len(files) == 0 {
+		version, err := s.store.RevokeAgentCredentials(ctx, row.CreatorID, provider)
+		if err != nil {
+			return 0, ErrAgentCredentialUnwritable
+		}
+		return version, nil
+	}
+	version, err := s.store.PutAgentCredentials(ctx, row.CreatorID, provider, files, expected)
 	if err != nil {
+		if errors.Is(err, control.ErrConflict) {
+			return 0, ErrAgentCredentialStale
+		}
 		return 0, ErrAgentCredentialUnwritable
 	}
 	return version, nil
 }
 
-// Logout destroys the caller's own set for provider and then tells every
+// Logout replaces the caller's own set with a versioned tombstone and then tells every
 // running sandbox of theirs to forget the copy it holds.
 //
 // There is no "other user" parameter, and that is the access control: a
@@ -356,7 +371,8 @@ func (s *AgentCredentialService) Logout(ctx context.Context, sc control.Scope, p
 	if _, ok := agentProviderByName(provider); !ok {
 		return ErrUnknownAgentProvider
 	}
-	if err := s.store.RevokeAgentCredentials(ctx, sc.Actor.ID, provider); err != nil {
+	version, err := s.store.RevokeAgentCredentials(ctx, sc.Actor.ID, provider)
+	if err != nil {
 		return portError(err)
 	}
 	workspaces, err := s.logoutWorkspaces(ctx, sc)
@@ -364,7 +380,7 @@ func (s *AgentCredentialService) Logout(ctx context.Context, sc control.Scope, p
 		return err
 	}
 	for _, ws := range workspaces {
-		s.revokeDownward(ctx, ws, sc.Actor.ID, provider)
+		s.revokeDownward(ctx, ws, sc.Actor.ID, provider, version)
 	}
 	return nil
 }
@@ -382,7 +398,7 @@ func (s *AgentCredentialService) Withdraw(ctx context.Context, ws control.Worksp
 		return control.ErrInvalid
 	}
 	for _, p := range AgentProviders() {
-		s.revokeDownward(ctx, ws, user, p.Name)
+		s.revokeDownward(ctx, ws, user, p.Name, 0)
 	}
 	return nil
 }
@@ -459,13 +475,14 @@ func (s *AgentCredentialService) logoutWorkspaces(ctx context.Context, sc contro
 // may name a session id and never a credential byte — is met most simply by
 // having no log line at all. The host's transport already records what it
 // could not reach.
-func (s *AgentCredentialService) revokeDownward(ctx context.Context, ws control.WorkspaceID, user control.ActorID, provider string) {
+func (s *AgentCredentialService) revokeDownward(ctx context.Context, ws control.WorkspaceID, user control.ActorID, provider string, version uint64) {
 	if s.rpc == nil || s.sessions == nil || ws == "" || user == "" {
 		return
 	}
 	payload := struct {
 		Provider string `json:"provider"`
-	}{provider}
+		Version  uint64 `json:"version,omitempty"`
+	}{provider, version}
 	for _, row := range s.liveSessionsOf(ctx, ws, user) {
 		// The answer body is deliberately ignored (the wire shape is `{}`):
 		// what the sandbox says about a revoke changes nothing custody does.
@@ -516,13 +533,20 @@ func agentProviderByName(name string) (AgentProvider, bool) {
 // bare name on the provider's allowlist, and the whole set fits in
 // AgentCredentialSetMaxBytes.
 //
-// An empty map passes. It is how a person's set becomes "logged in, holding
-// nothing" — the agent removed its own credential file — and it must be
-// storable, or the last state a sandbox could report would be a stale one.
+// An empty map means the agent removed its own credential and is handled as a
+// revoke. A non-empty map must be the provider's complete set, with every
+// declared file non-empty, so custody cannot create a positive version that a
+// future session cannot restore.
 func checkAgentFiles(p AgentProvider, files map[string][]byte) error {
+	if len(files) == 0 {
+		return nil
+	}
+	if len(files) != len(p.Files) {
+		return ErrAgentFileNotAllowed
+	}
 	total := 0
 	for name, body := range files {
-		if !bareAgentFileName(name) || !slices.Contains(p.Files, name) {
+		if !bareAgentFileName(name) || !slices.Contains(p.Files, name) || len(body) == 0 {
 			return ErrAgentFileNotAllowed
 		}
 		total += len(name) + len(body)

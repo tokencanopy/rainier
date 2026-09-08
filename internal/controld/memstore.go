@@ -1132,17 +1132,26 @@ func (m *memStore) PutAgentCredential(ctx context.Context, c AgentCredential) (u
 		c.UpdatedAt = time.Now()
 	}
 	cp := cloneAgentCredential(c)
+	cp.Revoked = false
 	m.agentCredentials[credKey{c.UserID, c.Provider}] = &cp
 	return cp.Version, nil
 }
 
-func (m *memStore) DeleteAgentCredential(ctx context.Context, userID, provider string) error {
+func (m *memStore) RevokeAgentCredential(ctx context.Context, userID, provider string) (uint64, error) {
+	if userID == "" || provider == "" {
+		return 0, control.ErrInvalid
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// No ErrNotFound: a revoke of what is not there has already achieved
-	// what it asked for.
-	delete(m.agentCredentials, credKey{userID, provider})
-	return nil
+	key := credKey{userID, provider}
+	version := uint64(1)
+	if previous, ok := m.agentCredentials[key]; ok {
+		version = previous.Version + 1
+	}
+	m.agentCredentials[key] = &AgentCredential{
+		UserID: userID, Provider: provider, Version: version, Revoked: true, UpdatedAt: time.Now(),
+	}
+	return version, nil
 }
 
 func (m *memStore) ListAgentCredentials(ctx context.Context, userID string) ([]AgentCredential, error) {
@@ -1150,6 +1159,9 @@ func (m *memStore) ListAgentCredentials(ctx context.Context, userID string) ([]A
 	out := make([]AgentCredential, 0)
 	for key, c := range m.agentCredentials {
 		if key.userID != userID {
+			continue
+		}
+		if c.Revoked {
 			continue
 		}
 		// The sealed bytes are never copied out of a listing — the same

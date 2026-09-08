@@ -271,11 +271,12 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	if want := embeddedMigrationVersions(t); !slices.Equal(applied, want) {
 		t.Fatalf("schema_migrations = %v, want every embedded migration in order %v", applied, want)
 	}
-	// This release's head is 10: a database that stopped at 0003 runs the
+	// This release's head is 11: a database that stopped at 0003 runs the
 	// expand step (0007), the contract step (0008), the events table
-	// (0009), and the agent credentials table (0010) in the same start.
-	if head := applied[len(applied)-1]; head != 10 {
-		t.Fatalf("head migration = %d, want 10", head)
+	// (0009), the agent credentials table (0010), and revoke fences (0011) in
+	// the same start.
+	if head := applied[len(applied)-1]; head != 11 {
+		t.Fatalf("head migration = %d, want 11", head)
 	}
 
 	// The legacy session survived, and its new columns read as "never exited"
@@ -526,7 +527,7 @@ func TestPGStoreAgentCredentialsCascadeWithTheirOperator(t *testing.T) {
 	vault := controld.NewAgentVault(st, agentTestSecretsKey)
 	provider := controlapp.AgentProviders()[0].Name
 	if _, err := vault.PutAgentCredentials(ctx, repotest.AgentUser, provider,
-		map[string][]byte{"file_example": []byte("credential_example")}); err != nil {
+		map[string][]byte{"file_example": []byte("credential_example")}, 0); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	mustExec(t, st.pool, `DELETE FROM users WHERE id = 'user_example'`)

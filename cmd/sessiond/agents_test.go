@@ -15,6 +15,7 @@ import (
 
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/protocol/runner"
+	"golang.org/x/sys/unix"
 )
 
 // The fixture every test in this file writes and reads. It is the plan's
@@ -69,6 +70,8 @@ type fakeAgentHost struct {
 	// sent it and before custody answers it.
 	fetchStarted chan struct{}
 	fetchGate    chan struct{}
+	putStarted   chan struct{}
+	putGate      chan struct{}
 
 	fetches []string
 	puts    []agentPutRecord
@@ -179,6 +182,15 @@ func (h *fakeAgentHost) answerPut(ev relay.ControlEvent) {
 		rec.Files[name] = string(blob)
 	}
 	h.puts = append(h.puts, rec)
+	putStarted, putGate := h.putStarted, h.putGate
+	h.mu.Unlock()
+	if putStarted != nil {
+		close(putStarted)
+	}
+	if putGate != nil {
+		<-putGate
+	}
+	h.mu.Lock()
 	refuse := h.putRefusals > 0
 	if refuse {
 		h.putRefusals--
@@ -553,6 +565,23 @@ func TestAgentsStageWithNoCredentialStartsTheAgentAnyway(t *testing.T) {
 	}
 }
 
+func TestAgentsStageDoesNotSeedFromARevokeTombstone(t *testing.T) {
+	e := agentTestEntry(t)
+	e.SeedFiles = []agentSeedFile{{Name: agentSeedName, Contents: agentSeedFixture}}
+	h := newFakeAgentHost(t)
+	h.setFetch(4, nil)
+	a := newTestAgentSync(h, []agentEntry{e}, make(chan []byte, 8))
+
+	a.boot()
+
+	if _, err := os.Stat(filepath.Join(e.Dir, agentSeedName)); !os.IsNotExist(err) {
+		t.Fatalf("onboarding state exists for a revoke tombstone: %v", err)
+	}
+	if version, _ := a.baseline("test"); version != 4 {
+		t.Fatalf("baseline = %d, want tombstone version 4", version)
+	}
+}
+
 // TestAgentsStageRefusalIsANoteNotAFailure: a refusal and a timeout both leave
 // the session running. The agent starts, asks the person to log in — which is
 // the truthful state — and the reason travels as a note on the events channel.
@@ -791,47 +820,6 @@ func TestAgentsManifestIsReadLikeTheRepositoryList(t *testing.T) {
 	}
 }
 
-// TestHomeVarIsSetForTheAgentOnly covers the A1-false path: a provider that
-// also writes under $HOME gets that variable pointed inside its own directory,
-// in the chain's environment — never in the container's, which every session on
-// the runner would share.
-func TestHomeVarIsSetForTheAgentOnly(t *testing.T) {
-	root := t.TempDir()
-	old := agentsMountRoot
-	agentsMountRoot = root
-	defer func() { agentsMountRoot = old }()
-
-	dir := t.TempDir()
-	e := agentEntry{Provider: "test", Dir: filepath.Join(root, "test"), Files: []string{agentFileName}, HomeVar: "HOME"}
-	_, vars, err := prepareBoot(dir, dir, bootEnv{AgentsB64: encodeAgentsB64(t, []agentEntry{e})})
-	if err != nil {
-		t.Fatalf("prepareBoot: %v", err)
-	}
-	want := filepath.Join(e.Dir, agentHomeSubdir)
-	var found bool
-	for _, v := range vars {
-		if v.Name == "HOME" {
-			found = true
-			if v.Value != want {
-				t.Fatalf("HOME = %q, want %q", v.Value, want)
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("vars = %+v, want HOME among them", vars)
-	}
-	info, err := os.Stat(want)
-	if err != nil {
-		t.Fatalf("the home directory was not made: %v", err)
-	}
-	if got := info.Mode().Perm(); got != 0o700 {
-		t.Fatalf("mode = %o, want 700", got)
-	}
-	if os.Getenv("HOME") == want {
-		t.Fatal("HOME was set in this process; the variable is the agent's, not the container's")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // the sync loop
 // ---------------------------------------------------------------------------
@@ -1034,6 +1022,93 @@ func TestRevokeEmptiesAndResetsTheBaseline(t *testing.T) {
 	// A provider this session has no home for is refused rather than answered.
 	if _, err := a.handleRevoke([]byte(`{"provider":"other"}`)); err == nil {
 		t.Fatal("a revoke for an unknown provider was answered ok")
+	}
+}
+
+func TestRevokeFencesAnInFlightPutResponse(t *testing.T) {
+	e := agentTestEntry(t)
+	h := newFakeAgentHost(t)
+	h.setFetch(1, map[string]string{agentFileName: agentFixture})
+	h.putStarted = make(chan struct{})
+	h.putGate = make(chan struct{})
+	a := newTestAgentSync(h, []agentEntry{e}, make(chan []byte, 8))
+	a.boot()
+
+	writeAgentFixture(t, e, agentFileName, agentFixture+"-changed")
+	done := make(chan struct{})
+	go func() {
+		a.tick(time.Now())
+		close(done)
+	}()
+	<-h.putStarted
+	if _, err := a.handleRevoke([]byte(`{"provider":"test","version":2}`)); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	close(h.putGate)
+	<-done
+
+	if _, err := os.Stat(filepath.Join(e.Dir, agentFileName)); !os.IsNotExist(err) {
+		t.Fatalf("credential remains after revoke: %v", err)
+	}
+	if version, _ := a.baseline("test"); version != 2 {
+		t.Fatalf("baseline = %d, want revoke version 2", version)
+	}
+}
+
+func TestFailedRestoreRetriesBeforeSeedingOnboarding(t *testing.T) {
+	e := agentTestEntry(t)
+	e.SeedFiles = []agentSeedFile{{Name: agentSeedName, Contents: agentSeedFixture}}
+	if err := os.MkdirAll(filepath.Join(e.Dir, agentFileName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h := newFakeAgentHost(t)
+	h.setFetch(3, map[string]string{agentFileName: agentFixture})
+	a := newTestAgentSync(h, []agentEntry{e}, make(chan []byte, 8))
+
+	a.boot()
+	if _, err := os.Stat(filepath.Join(e.Dir, agentSeedName)); !os.IsNotExist(err) {
+		t.Fatalf("onboarding was seeded after a failed credential write: %v", err)
+	}
+	if err := os.Remove(filepath.Join(e.Dir, agentFileName)); err != nil {
+		t.Fatal(err)
+	}
+	a.tick(time.Now())
+
+	if body, err := os.ReadFile(filepath.Join(e.Dir, agentFileName)); err != nil || string(body) != agentFixture {
+		t.Fatalf("credential after retry = %d bytes, %v; want restored", len(body), err)
+	}
+	if body, err := os.ReadFile(filepath.Join(e.Dir, agentSeedName)); err != nil || string(body) != agentSeedFixture {
+		t.Fatalf("onboarding after retry = %q, %v; want seeded", body, err)
+	}
+}
+
+func TestSpecialCredentialFileCannotBlockSyncRevokeOrClose(t *testing.T) {
+	e := agentTestEntry(t)
+	h := newFakeAgentHost(t)
+	h.setFetch(0, nil)
+	a := newTestAgentSync(h, []agentEntry{e}, make(chan []byte, 8))
+	a.boot()
+	if err := unix.Mkfifo(filepath.Join(e.Dir, agentFileName), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		a.tick(time.Now())
+		_, err := a.handleRevoke([]byte(`{"provider":"test","version":1}`))
+		a.close()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("revoke: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a special credential file blocked sync, revoke, or close")
+	}
+	if got := h.putCount(); got != 0 {
+		t.Fatalf("special file produced %d put(s), want none", got)
 	}
 }
 

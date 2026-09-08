@@ -41,10 +41,11 @@ const (
 	// set that has since been revoked.
 	MethodPutAgentCredentials = "put_agent_credentials"
 	// MethodRevokeAgentCredentials is control plane → sandbox, on a logout or
-	// a membership that went away: {"provider": "..."} → {}. The sandbox
-	// removes that provider's allowlisted files and forgets its baseline, so
-	// a later login inside the same session is a new set rather than a re-put
-	// of the revoked one.
+	// a membership that went away: {"provider": "...", "version": n} → {}.
+	// Logout includes its tombstone version; membership withdrawal may omit it.
+	// The sandbox removes that provider's allowlisted files and adopts the
+	// supplied baseline, so an earlier in-flight put cannot undo the revoke and
+	// a later login inside the same session is a new set.
 	MethodRevokeAgentCredentials = "revoke_agent_credentials"
 )
 

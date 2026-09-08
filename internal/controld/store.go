@@ -83,6 +83,7 @@ type AgentCredential struct {
 	UserID, Provider  string
 	Ciphertext, Nonce []byte
 	Version           uint64
+	Revoked           bool
 	UpdatedAt         time.Time
 }
 
@@ -109,9 +110,10 @@ type AgentCredentialRows interface {
 	// A c.Version of 0 is control.ErrInvalid: versions start at 1, and 0 is
 	// the wire's word for "there is no set".
 	PutAgentCredential(ctx context.Context, c AgentCredential) (version uint64, err error)
-	// DeleteAgentCredential removes the row. Deleting what is not there is a
-	// nil error: "there is no credential" is the state either way.
-	DeleteAgentCredential(ctx context.Context, userID, provider string) error
+	// RevokeAgentCredential replaces the row with a tombstone whose monotonic
+	// version fences every put that began before logout. It returns that
+	// version; revoking an absent row creates version 1.
+	RevokeAgentCredential(ctx context.Context, userID, provider string) (uint64, error)
 	// ListAgentCredentials returns userID's rows ordered by provider, with
 	// Ciphertext and Nonce left NIL. A listing renders a status — provider,
 	// version, timestamp — so it never reads the sealed bytes at all, which

@@ -97,9 +97,6 @@ const (
 	// is an EVENT, like a stage verdict — nobody answers it, and it is never a
 	// failure.
 	agentNoteKind = "agent_note"
-	// agentHomeSubdir is where a provider that ALSO writes under $HOME is
-	// pointed, inside its own directory (the A1-false path; see agentHomeVars).
-	agentHomeSubdir = "home"
 )
 
 // agentMountSentence is what a session says when the runner under it is too old
@@ -135,7 +132,6 @@ type agentEntry struct {
 	Dir       string          `json:"dir"`
 	Files     []string        `json:"files"`
 	SeedFiles []agentSeedFile `json:"seed_files,omitempty"`
-	HomeVar   string          `json:"home_var,omitempty"`
 }
 
 // agentNote is the boot note's payload: which home, and what to say about it.
@@ -294,31 +290,6 @@ func agentMountUsable(root string) error {
 	return os.Remove(name)
 }
 
-// agentHomeVars is the A1-false path, wired but unused by today's rows: a
-// provider that ALSO writes under $HOME regardless of where its configuration
-// directory points gets that variable redirected inside its own home.
-//
-// These go into the CHAIN's environment (chainArgv's exports), which is the
-// agent's and the stages'. They are deliberately not the container's: the
-// container's environment is set by the driver for every process in it, and
-// moving $HOME for the whole sandbox would change what every unrelated tool in
-// the session does.
-func agentHomeVars(entries []agentEntry) []envVar {
-	var out []envVar
-	for _, e := range entries {
-		if e.HomeVar == "" {
-			continue
-		}
-		dir := filepath.Join(e.Dir, agentHomeSubdir)
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			log.Printf("home %q: %v", e.Provider, err)
-			continue
-		}
-		out = append(out, envVar{Name: e.HomeVar, Value: dir})
-	}
-	return out
-}
-
 // ---------------------------------------------------------------------------
 // the stage
 // ---------------------------------------------------------------------------
@@ -401,12 +372,13 @@ type agentSet struct {
 	// generation fences an RPC that began before a downward revoke. The revoke
 	// increments it while holding mu; a late fetch response is then discarded
 	// before it can put credentials or onboarding state back on disk.
-	generation uint64
-	stamps     map[string]fileStamp
-	digest     [32]byte
-	dirty      bool
-	backoff    time.Duration
-	retryAt    time.Time
+	generation   uint64
+	stamps       map[string]fileStamp
+	digest       [32]byte
+	dirty        bool
+	restoreRetry bool
+	backoff      time.Duration
+	retryAt      time.Time
 	// noted remembers the conditions already reported, so a symlink or an
 	// oversized set is news once rather than every two seconds for the life of
 	// the session. An entry is cleared when its condition clears.
@@ -508,6 +480,14 @@ func (a *agentSync) close() {
 			continue
 		}
 		a.mu.Lock()
+		if set.restoreRetry {
+			files, ok := a.readSetLocked(set)
+			if !ok || !completeAgentSet(set.entry, files) {
+				a.mu.Unlock()
+				continue
+			}
+			set.restoreRetry = false
+		}
 		set.dirty = true
 		set.retryAt = time.Time{}
 		a.mu.Unlock()
@@ -599,7 +579,18 @@ func (a *agentSync) fetchOne(e agentEntry) {
 		}
 		log.Printf("home %q: wrote %s (%d bytes) at v%d", e.Provider, name, len(blob), body.Version)
 	}
-	if body.Version > 0 && writtenAll {
+	if !writtenAll {
+		files, ok := a.readSetLocked(set)
+		set.version = body.Version
+		set.stamps = statAgentFiles(set)
+		set.dirty = false
+		set.restoreRetry = true
+		if ok {
+			set.digest = agentSetDigest(files)
+		}
+		return
+	}
+	if body.Version > 0 && len(held) > 0 && writtenAll {
 		for _, seed := range e.SeedFiles {
 			created, err := writeAgentFileIfAbsentAt(set.dir, seed.Name, []byte(seed.Contents))
 			if err != nil {
@@ -619,6 +610,7 @@ func (a *agentSync) fetchOne(e agentEntry) {
 	set.digest = agentSetDigest(held)
 	set.stamps = statAgentFiles(set)
 	set.dirty = false
+	set.restoreRetry = false
 }
 
 // decodeFetchedAgentSet accepts exactly the two coherent custody states: an
@@ -627,8 +619,11 @@ func (a *agentSync) fetchOne(e agentEntry) {
 // filesystem write so a malformed multi-file response cannot partially land
 // and still unlock provider onboarding.
 func decodeFetchedAgentSet(e agentEntry, version uint64, encoded map[string]string) (map[string][]byte, bool) {
+	if len(encoded) == 0 {
+		return map[string][]byte{}, true
+	}
 	if version == 0 {
-		return map[string][]byte{}, len(encoded) == 0
+		return nil, false
 	}
 	if len(encoded) != len(e.Files) {
 		return nil, false
@@ -709,6 +704,17 @@ func (a *agentSync) flush() { a.tick(time.Now()) }
 // wire for no reason.
 func (a *agentSync) syncOne(set *agentSet, now time.Time) {
 	a.mu.Lock()
+	if set.restoreRetry {
+		files, ok := a.readSetLocked(set)
+		if !ok || !completeAgentSet(set.entry, files) {
+			a.mu.Unlock()
+			a.fetchOne(set.entry)
+			return
+		}
+		// A complete local set appeared after the failed restore. That is a
+		// login performed in this session; it wins over retrying old custody.
+		set.restoreRetry = false
+	}
 	stamps := statAgentFiles(set)
 	if !maps.Equal(stamps, set.stamps) {
 		set.stamps = stamps
@@ -720,6 +726,18 @@ func (a *agentSync) syncOne(set *agentSet, now time.Time) {
 		return
 	}
 	a.putSet(set, now)
+}
+
+func completeAgentSet(e agentEntry, files map[string][]byte) bool {
+	if len(files) != len(e.Files) {
+		return false
+	}
+	for _, name := range e.Files {
+		if len(files[name]) == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // putSet sends one home's set upward, if it is not already there.
@@ -744,7 +762,7 @@ func (a *agentSync) putSet(set *agentSet, now time.Time) {
 		a.mu.Unlock()
 		return
 	}
-	provider, version := set.entry.Provider, set.version
+	provider, version, generation := set.entry.Provider, set.version, set.generation
 	a.mu.Unlock()
 
 	encoded := make(map[string]string, len(files))
@@ -761,6 +779,10 @@ func (a *agentSync) putSet(set *agentSet, now time.Time) {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if set.generation != generation {
+		log.Printf("home %q: discarded a credential put superseded by a revoke", provider)
+		return
+	}
 	if err != nil {
 		set.backoff = nextAgentBackoff(set.backoff, a.backoffMin, a.backoffMax)
 		set.retryAt = now.Add(set.backoff)
@@ -804,6 +826,7 @@ func nextAgentBackoff(d, min, max time.Duration) time.Duration {
 func (a *agentSync) handleRevoke(payload []byte) (any, error) {
 	var in struct {
 		Provider string `json:"provider"`
+		Version  uint64 `json:"version"`
 	}
 	if len(payload) > 0 {
 		if err := json.Unmarshal(payload, &in); err != nil {
@@ -834,7 +857,7 @@ func (a *agentSync) handleRevoke(payload []byte) (any, error) {
 		removed++
 	}
 	set.generation++
-	set.version = 0
+	set.version = in.Version
 	set.digest = agentSetDigest(nil)
 	set.stamps = statAgentFiles(set)
 	set.dirty = false
@@ -963,7 +986,7 @@ func openAgentHome(e agentEntry) (*os.File, error) {
 // The last condition prevents a workload from aliasing credential bytes into
 // a provider-local state file and having the sync upload that state.
 func readAgentFileAt(dir *os.File, name string, limit int64) ([]byte, error) {
-	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1055,7 +1078,7 @@ func statAgentFiles(set *agentSet) map[string]fileStamp {
 		return out
 	}
 	for _, name := range set.entry.Files {
-		fd, err := unix.Openat(int(set.dir.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		fd, err := unix.Openat(int(set.dir.Fd()), name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 		if err != nil {
 			if !errors.Is(err, unix.ENOENT) {
 				out[name] = fileStamp{size: -1, mod: -1}

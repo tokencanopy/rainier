@@ -65,7 +65,7 @@ func TestAgentVaultBindsUserProviderVersion(t *testing.T) {
 		st := NewMemStore()
 		v := NewAgentVault(st, testSecretsKey)
 		if _, err := v.PutAgentCredentials(ctx, userA, first,
-			map[string][]byte{"file_example": []byte("credential_example")}); err != nil {
+			map[string][]byte{"file_example": []byte("credential_example")}, 0); err != nil {
 			t.Fatalf("put: %v", err)
 		}
 		row, err := st.GetAgentCredential(ctx, string(userA), first)
@@ -144,7 +144,7 @@ func TestAgentVaultKeepsTheVersionAndTheCiphertextTogether(t *testing.T) {
 
 	st := NewMemStore()
 	v := NewAgentVault(st, testSecretsKey)
-	if _, err := v.PutAgentCredentials(ctx, user, first, map[string][]byte{"file_example": []byte("credential_example")}); err != nil {
+	if _, err := v.PutAgentCredentials(ctx, user, first, map[string][]byte{"file_example": []byte("credential_example")}, 0); err != nil {
 		t.Fatalf("first put: %v", err)
 	}
 
@@ -152,12 +152,12 @@ func TestAgentVaultKeepsTheVersionAndTheCiphertextTogether(t *testing.T) {
 	// own, exactly once — the interleaving the CAS exists for.
 	raced := &racingAgentRows{AgentCredentialRows: st, onRead: func() {
 		other := NewAgentVault(st, testSecretsKey)
-		if _, err := other.PutAgentCredentials(ctx, user, first, map[string][]byte{"file_example": []byte("auth_example")}); err != nil {
+		if _, err := other.PutAgentCredentials(ctx, user, first, map[string][]byte{"file_example": []byte("auth_example")}, 1); err != nil {
 			t.Errorf("the racing put failed: %v", err)
 		}
 	}}
 	racedVault := NewAgentVault(raced, testSecretsKey)
-	version, err := racedVault.PutAgentCredentials(ctx, user, first, map[string][]byte{"file_example": []byte("credential_example")})
+	version, err := racedVault.PutAgentCredentials(ctx, user, first, map[string][]byte{"file_example": []byte("credential_example")}, 1)
 	if err != nil {
 		t.Fatalf("put under contention: %v", err)
 	}
@@ -173,6 +173,33 @@ func TestAgentVaultKeepsTheVersionAndTheCiphertextTogether(t *testing.T) {
 	if set.Version != 3 || !bytes.Equal(set.Files["file_example"], []byte("credential_example")) {
 		t.Fatalf("fetch after contention = version %d with %d files, want the retried put's bytes at version 3",
 			set.Version, len(set.Files))
+	}
+}
+
+func TestAgentVaultRejectsAPutThatLogoutOvertook(t *testing.T) {
+	ctx := context.Background()
+	provider, _ := agentTestProviders(t)
+	const user = control.ActorID("user_example")
+	st := NewMemStore()
+	v := NewAgentVault(st, testSecretsKey)
+	if _, err := v.PutAgentCredentials(ctx, user, provider,
+		map[string][]byte{"file_example": []byte("credential_example")}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	raced := &racingAgentRows{AgentCredentialRows: st, onRead: func() {
+		if _, err := v.RevokeAgentCredentials(ctx, user, provider); err != nil {
+			t.Errorf("revoke: %v", err)
+		}
+	}}
+	late := NewAgentVault(raced, testSecretsKey)
+	if _, err := late.PutAgentCredentials(ctx, user, provider,
+		map[string][]byte{"file_example": []byte("auth_example")}, 1); !errors.Is(err, control.ErrConflict) {
+		t.Fatalf("put overtaken by logout = %v, want ErrConflict", err)
+	}
+	set, err := v.FetchAgentCredentials(ctx, user, provider)
+	if err != nil || set.Version != 2 || len(set.Files) != 0 {
+		t.Fatalf("after raced logout = version %d, %d files, %v; want v2 tombstone", set.Version, len(set.Files), err)
 	}
 }
 

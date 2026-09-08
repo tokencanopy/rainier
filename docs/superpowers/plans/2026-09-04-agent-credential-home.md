@@ -30,7 +30,7 @@
 | A3 | Which hosts do Claude Code login, refresh, and inference reach; which do Codex device login and inference reach? (read off egressd's log) | **Claude Code:** `api.anthropic.com` (API), `platform.claude.com` (OAuth exchange at login), `downloads.claude.ai` (self-update check), `mcp-proxy.anthropic.com` (claude.ai connectors); optional, refused harmlessly: `http-intake.logs.us5.datadoghq.com` (telemetry), `raw.githubusercontent.com` and `registry.npmjs.org` (update check). **Codex:** `auth.openai.com` (device login), `chatgpt.com` — the bare apex, which a `*.chatgpt.com` entry does not match — (inference). See A5. |
 | A4 | Two `claude` processes in two sessions sharing one config directory: both work, neither corrupts the other's credential? | **Partial.** Two concurrent `claude -p` runs sharing one config directory both started, both read the same login, and `.credentials.json` was byte-for-byte unchanged afterwards; neither completed a model call because of A5, so "both work" is proven for the credential and not yet for the API. |
 
-If A1 is "under `$HOME`", the `claude` row gains `HomeVar: "HOME"` and `sessiond` sets `HOME` for the agent process only (Task 3, "A1 false"); the mount and every other task are unchanged.
+The unused `$HOME` fallback was removed after A1 proved both supported agents keep their state under their dedicated configuration directory.
 
 **A5 (found by the probes, not planned) — RESOLVED 2026-09-05.** Under the session's `HTTPS_PROXY`, Claude Code — the native 2.1.261 build and the npm 2.1.197 build alike — completed login and the OAuth exchange but failed every model call with `Connection error` and never opened a socket toward the proxy. The cause was the proxy URL the driver injects: `http://<session-id>:@host:3128`, a username with an EMPTY password. With a bare URL the client reaches egressd and receives its 407 challenge; with `http://<session-id>:x@host:3128` both builds answer a model call in three to five seconds through the proxy, and egressd's `sessionFromProxyAuth` reads the username half and ignores the password. DNS was a red herring: the `ENOTFOUND` came from the native build's first-run connectivity check, which does resolve the host itself, and a DNS answer alone changed nothing. **The fix is one line in `internal/driver/docker.go`** (`withSessionUserinfo` now carries the placeholder password `rainier`), shipped separately from this plan so it reaches `v0.0.3`'s runner artifacts, plus a bug report to Claude Code. **Validated end to end the same day:** runnerd rebuilt from the fix on the fleet VM, a fresh session created under the corrected URL, the native build's first-run check passed through the proxy, a person completed the paste-a-code login inside the session, and `claude -p` answered a model call in seconds through egressd's audited path. The `claude` row's `Egress` stands; its `Env` gains nothing, though a deployment may set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` to skip the claude.ai connectors' retry cost.
 
@@ -99,8 +99,8 @@ No worker. Half a day. Each probe runs in a throwaway session on rainier-1 from 
 
 **Interfaces:**
 - `runner.HomeMount{Volume string; Path string}`; `runner.Spec.Home *HomeMount` (`json:"home,omitempty"`).
-- Method names: `runner.MethodFetchAgentCredentials = "fetch_agent_credentials"`, `MethodPutAgentCredentials = "put_agent_credentials"`, `MethodRevokeAgentCredentials = "revoke_agent_credentials"`. Payloads (documented on the constants, as the mint's is): fetch `{"provider"}` → `{"version", "files": {name: base64}}`; put `{"provider", "files", "version"}` → `{"version"}`; revoke (downward) `{"provider"}` → `{}`. Refusals are `{"error": sentence}` on `ok:false`, as everywhere.
-- `controlapp.AgentProvider{Name, HomeEnv, HomeVar, Files []string, SeedFiles []AgentHomeSeedFile, Egress []string, LoginCmd []string}`; `controlapp.AgentProviders() []AgentProvider` — `claude`, `codex`, and `test` (present only when `controlapp.EnableTestAgentProvider` is set by the host, which only the e2e's controld does).
+- Method names: `runner.MethodFetchAgentCredentials = "fetch_agent_credentials"`, `MethodPutAgentCredentials = "put_agent_credentials"`, `MethodRevokeAgentCredentials = "revoke_agent_credentials"`. Payloads (documented on the constants, as the mint's is): fetch `{"provider"}` → `{"version", "files": {name: base64}}`; put `{"provider", "files", "version"}` → `{"version"}`; revoke (downward) `{"provider", "version"}` → `{}`. Refusals are `{"error": sentence}` on `ok:false`, as everywhere.
+- `controlapp.AgentProvider{Name, HomeEnv, Files []string, SeedFiles []AgentHomeSeedFile, Egress []string, LoginCmd []string}`; `controlapp.AgentProviders() []AgentProvider` — `claude`, `codex`, and `test` (present only when `controlapp.EnableTestAgentProvider` is set by the host, which only the e2e's controld does).
 - `controlapp.HomeMountPath = "/rainier/agents"`; `controlapp.AgentHomeVolume(ws control.WorkspaceID, creator control.ActorID) string` = `"rainier-agents-" + hex(sha256(ws + "\x00" + creator))[:16]`; `controlapp.AgentsEnv(providers) (map[string]string)` — each provider's `HomeEnv` → `HomeMountPath/<name>`, plus `RAINIER_AGENTS_B64` = base64 JSON `[{"provider","dir","files"}]`.
 - `createSpec` sets `spec.Home` for every create with a creator, reserves the provider home variables and `RAINIER_AGENTS_B64` while merging ordinary values from `material.Environment`, and unions every provider's `Egress` into `spec.EgressAllow`.
 
@@ -182,7 +182,7 @@ func TestSnapshotExcludesTheHome(t *testing.T) {
 - The **agents stage**, after the clone stage and before init: for each entry, `mkdir -p dir` 0700 (fail the stage with the sentence `"this runner does not mount agent homes; upgrade runnerd to v0.0.3"` if `HomeMountPath` is absent or not writable), then `fetch_agent_credentials`; write each returned file 0600 via temp-and-rename; record the baseline (version, per-file size and mtime). A refusal or a timeout is a **boot note** (`{"kind":"agent_note","provider":…,"text":…}` on the events channel, the way a stage verdict travels), not a failure: the agent starts and asks for login, which is the truthful state.
 - The **sync loop** (`agentSyncInterval = 2s`): stat the allowlisted files; on any change, read them (`O_NOFOLLOW`; a symlink is skipped with a note), cap the set at `agentSetMaxBytes = 64 << 10` (over → note, no put), and if the bytes differ from the last put, `put_agent_credentials`. A failed put retries with backoff 2 s → 30 s and never blocks the agent. On shutdown, one final put bounded by the RPC timeout.
 - The **revoke handler**, registered beside the file handlers: remove the allowlisted files, reset the baseline to "nothing", answer `{}`.
-- **A1 false:** an entry may carry `"home_var": "HOME"`; `sessiond` then sets that variable to `dir + "/home"` in the *agent's* environment only (`chainArgv`'s env, not the container's).
+- Provider homes are addressed only by the dedicated configuration variables proven in A1; the unused `home_var` fallback is outside the manifest.
 
 - [ ] **Step 1: Write the failing tests** (the `rpc_test` fake host answers fetch/put; every case asserts no credential byte reaches the log)
 
@@ -219,13 +219,13 @@ type AgentCredentialSet struct{ Version uint64; Files map[string][]byte }
 type AgentCredentialStatus struct{ Provider string; Version uint64; UpdatedAt time.Time }
 type AgentCredentialStore interface {
 	FetchAgentCredentials(ctx, user control.ActorID, provider string) (AgentCredentialSet, error) // version 0, no files when none
-	PutAgentCredentials(ctx, user control.ActorID, provider string, files map[string][]byte) (uint64, error)
-	RevokeAgentCredentials(ctx, user control.ActorID, provider string) error                     // idempotent
+	PutAgentCredentials(ctx, user control.ActorID, provider string, files map[string][]byte, expected uint64) (uint64, error)
+	RevokeAgentCredentials(ctx, user control.ActorID, provider string) (uint64, error)           // versioned tombstone
 	ListAgentCredentials(ctx, user control.ActorID) ([]AgentCredentialStatus, error)
 }
 type AgentCredentialService struct{ /* store, control.Authorizer, *AttachmentService (for the downward revoke), SessionRepository */ }
 func (s *AgentCredentialService) AnswerFetch(ctx, row control.Session, provider string) (AgentCredentialSet, error)
-func (s *AgentCredentialService) AnswerPut(ctx, row control.Session, provider string, files map[string][]byte) (uint64, error)
+func (s *AgentCredentialService) AnswerPut(ctx, row control.Session, provider string, files map[string][]byte, expected uint64) (uint64, error)
 func (s *AgentCredentialService) Logout(ctx, sc control.Scope, provider string) error           // revoke + downward to every live session of the user
 func (s *AgentCredentialService) Withdraw(ctx, ws control.WorkspaceID, user control.ActorID) error // downward to the user's live sessions in ws; custody untouched
 func (s *AgentCredentialService) List(ctx, sc control.Scope) ([]AgentCredentialStatus, error)

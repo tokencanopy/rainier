@@ -73,7 +73,7 @@ func (f *agentFakeStore) FetchAgentCredentials(_ context.Context, user control.A
 	return f.sets[agentKey(user, provider)], nil
 }
 
-func (f *agentFakeStore) PutAgentCredentials(_ context.Context, user control.ActorID, provider string, files map[string][]byte) (uint64, error) {
+func (f *agentFakeStore) PutAgentCredentials(_ context.Context, user control.ActorID, provider string, files map[string][]byte, expected uint64) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.puts++
@@ -81,22 +81,28 @@ func (f *agentFakeStore) PutAgentCredentials(_ context.Context, user control.Act
 		return 0, f.putErr
 	}
 	cur := f.sets[agentKey(user, provider)]
+	if cur.Version > 0 && len(cur.Files) == 0 && expected != cur.Version {
+		return 0, control.ErrConflict
+	}
 	cur.Version++
 	cur.Files = files
 	f.sets[agentKey(user, provider)] = cur
 	return cur.Version, nil
 }
 
-func (f *agentFakeStore) RevokeAgentCredentials(_ context.Context, user control.ActorID, provider string) error {
+func (f *agentFakeStore) RevokeAgentCredentials(_ context.Context, user control.ActorID, provider string) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.revokes++
 	if f.revokeErr != nil {
-		return f.revokeErr
+		return 0, f.revokeErr
 	}
 	f.revoked = append(f.revoked, agentKey(user, provider))
-	delete(f.sets, agentKey(user, provider))
-	return nil
+	cur := f.sets[agentKey(user, provider)]
+	cur.Version++
+	cur.Files = map[string][]byte{}
+	f.sets[agentKey(user, provider)] = cur
+	return cur.Version, nil
 }
 
 func (f *agentFakeStore) ListAgentCredentials(_ context.Context, _ control.ActorID) ([]AgentCredentialStatus, error) {
@@ -406,7 +412,7 @@ func TestAnswerPutSealsBeforeAnswering(t *testing.T) {
 	fx.store.putErr = errors.New("pgstore: put agent credential for provider \"x\": connection refused to db.internal")
 
 	version, err := fx.svc.AnswerPut(context.Background(), agentSessionRow(), provider.Name,
-		map[string][]byte{file: []byte(agentTestCredential)})
+		map[string][]byte{file: []byte(agentTestCredential)}, 0)
 	if err == nil {
 		t.Fatal("a failed store write answered with a version")
 	}
@@ -429,7 +435,7 @@ func TestAnswerPutSealsBeforeAnswering(t *testing.T) {
 	// And the happy path answers with the version the store assigned.
 	fx.store.putErr = nil
 	if v, err := fx.svc.AnswerPut(context.Background(), agentSessionRow(), provider.Name,
-		map[string][]byte{file: []byte(agentTestCredential)}); err != nil || v != 1 {
+		map[string][]byte{file: []byte(agentTestCredential)}, 0); err != nil || v != 1 {
 		t.Fatalf("put = %d, %v; want version 1 and no error", v, err)
 	}
 }
@@ -460,7 +466,7 @@ func TestAnswerPutBoundsWhatTheSandboxSends(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fx := newAgentFixture(t)
-			_, err := fx.svc.AnswerPut(context.Background(), agentSessionRow(), provider.Name, tc.files)
+			_, err := fx.svc.AnswerPut(context.Background(), agentSessionRow(), provider.Name, tc.files, 0)
 			if !errors.Is(err, tc.is) {
 				t.Fatalf("got %v, want a refusal wrapping %v", err, tc.is)
 			}
@@ -478,8 +484,25 @@ func TestAnswerPutBoundsWhatTheSandboxSends(t *testing.T) {
 		fx := newAgentFixture(t)
 		body := bytes.Repeat([]byte("x"), AgentCredentialSetMaxBytes-len(file))
 		if _, err := fx.svc.AnswerPut(context.Background(), agentSessionRow(), provider.Name,
-			map[string][]byte{file: body}); err != nil {
+			map[string][]byte{file: body}, 0); err != nil {
 			t.Fatalf("a set at exactly the cap was refused: %v", err)
+		}
+	})
+
+	t.Run("a partial or zero-length credential set", func(t *testing.T) {
+		multi := provider
+		multi.Files = []string{file, "second.json"}
+		for name, files := range map[string]map[string][]byte{
+			"missing a declared file": {file: []byte(agentTestCredential)},
+			"holding an empty file": {
+				file: []byte(agentTestCredential), "second.json": {},
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				if err := checkAgentFiles(multi, files); !errors.Is(err, control.ErrInvalid) {
+					t.Fatalf("checkAgentFiles = %v, want ErrInvalid", err)
+				}
+			})
 		}
 	})
 
@@ -489,7 +512,7 @@ func TestAnswerPutBoundsWhatTheSandboxSends(t *testing.T) {
 	t.Run("an empty set", func(t *testing.T) {
 		fx := newAgentFixture(t)
 		if v, err := fx.svc.AnswerPut(context.Background(), agentSessionRow(), provider.Name,
-			map[string][]byte{}); err != nil || v != 1 {
+			map[string][]byte{}, 0); err != nil || v != 1 {
 			t.Fatalf("put of an empty set = %d, %v; want version 1 and no error", v, err)
 		}
 	})
@@ -554,7 +577,7 @@ func TestLogoutRevokesEverywhere(t *testing.T) {
 		if r.Method != runner.MethodRevokeAgentCredentials {
 			t.Fatalf("downward method = %q, want %q", r.Method, runner.MethodRevokeAgentCredentials)
 		}
-		if want := `{"provider":"` + provider.Name + `"}`; r.Payload != want {
+		if want := `{"provider":"` + provider.Name + `","version":1}`; r.Payload != want {
 			t.Fatalf("downward payload = %s, want %s", r.Payload, want)
 		}
 	}
