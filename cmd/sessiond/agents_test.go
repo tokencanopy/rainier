@@ -65,6 +65,10 @@ type fakeAgentHost struct {
 	silent bool
 	// putRefusals is how many of the next puts are refused before one lands.
 	putRefusals int
+	// fetchStarted and fetchGate let a race test stop a fetch after sessiond
+	// sent it and before custody answers it.
+	fetchStarted chan struct{}
+	fetchGate    chan struct{}
 
 	fetches []string
 	puts    []agentPutRecord
@@ -142,6 +146,12 @@ func (h *fakeAgentHost) answerFetch(ev relay.ControlEvent) {
 		files[name] = base64.StdEncoding.EncodeToString([]byte(body))
 	}
 	h.mu.Unlock()
+	if h.fetchStarted != nil {
+		close(h.fetchStarted)
+	}
+	if h.fetchGate != nil {
+		<-h.fetchGate
+	}
 
 	if refusal != "" {
 		h.reply(ev.ID, false, map[string]string{"error": refusal})
@@ -389,6 +399,97 @@ func TestAgentsStageDoesNotSeedFromUnversionedCredentialFiles(t *testing.T) {
 
 	if _, err := os.Stat(filepath.Join(e.Dir, agentSeedName)); !os.IsNotExist(err) {
 		t.Fatalf("onboarding state exists for an unversioned credential response: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(e.Dir, agentFileName)); !os.IsNotExist(err) {
+		t.Fatalf("credential exists for an inconsistent version-zero response: %v", err)
+	}
+}
+
+func TestAgentsStageRejectsAnIncompleteCredentialSetBeforeWriting(t *testing.T) {
+	e := agentTestEntry(t)
+	e.Files = []string{agentFileName, "second.json"}
+	e.SeedFiles = []agentSeedFile{{Name: agentSeedName, Contents: agentSeedFixture}}
+	h := newFakeAgentHost(t)
+	h.setFetch(3, map[string]string{agentFileName: agentFixture})
+	events := make(chan []byte, 8)
+	a := newTestAgentSync(h, []agentEntry{e}, events)
+
+	a.boot()
+
+	for _, name := range []string{agentFileName, "second.json", agentSeedName} {
+		if _, err := os.Stat(filepath.Join(e.Dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s exists after an incomplete restore: %v", name, err)
+		}
+	}
+	if got := notes(t, events); len(got) != 1 {
+		t.Fatalf("notes = %+v, want one unreadable-set note", got)
+	}
+}
+
+func TestCredentialRestoreCannotBeRedirectedByReplacingTheProviderDirectory(t *testing.T) {
+	e := agentTestEntry(t)
+	e.SeedFiles = []agentSeedFile{{Name: agentSeedName, Contents: agentSeedFixture}}
+	h := newFakeAgentHost(t)
+	h.setFetch(3, map[string]string{agentFileName: agentFixture})
+	h.fetchStarted = make(chan struct{})
+	h.fetchGate = make(chan struct{})
+	a := newTestAgentSync(h, []agentEntry{e}, make(chan []byte, 8))
+
+	done := make(chan struct{})
+	go func() {
+		a.boot()
+		close(done)
+	}()
+	<-h.fetchStarted
+	original := e.Dir + "-original"
+	if err := os.Rename(e.Dir, original); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, e.Dir); err != nil {
+		t.Fatal(err)
+	}
+	close(h.fetchGate)
+	<-done
+
+	for _, name := range []string{agentFileName, agentSeedName} {
+		if _, err := os.Stat(filepath.Join(outside, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s was redirected outside the held provider directory: %v", name, err)
+		}
+		if _, err := os.Stat(filepath.Join(original, name)); err != nil {
+			t.Fatalf("%s did not land in the held provider directory: %v", name, err)
+		}
+	}
+}
+
+func TestRevokeFencesAnInFlightCredentialAndOnboardingRestore(t *testing.T) {
+	e := agentTestEntry(t)
+	e.SeedFiles = []agentSeedFile{{Name: agentSeedName, Contents: agentSeedFixture}}
+	h := newFakeAgentHost(t)
+	h.setFetch(3, map[string]string{agentFileName: agentFixture})
+	h.fetchStarted = make(chan struct{})
+	h.fetchGate = make(chan struct{})
+	a := newTestAgentSync(h, []agentEntry{e}, make(chan []byte, 8))
+
+	done := make(chan struct{})
+	go func() {
+		a.boot()
+		close(done)
+	}()
+	<-h.fetchStarted
+	if _, err := a.handleRevoke([]byte(`{"provider":"test"}`)); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	close(h.fetchGate)
+	<-done
+
+	for _, name := range []string{agentFileName, agentSeedName} {
+		if _, err := os.Stat(filepath.Join(e.Dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s was restored after revoke: %v", name, err)
+		}
+	}
+	if version, _ := a.baseline("test"); version != 0 {
+		t.Fatalf("baseline = %d after revoke, want 0", version)
 	}
 }
 
@@ -665,6 +766,28 @@ func TestAgentsManifestIsReadLikeTheRepositoryList(t *testing.T) {
 	got := agentEntries(bootEnv{AgentsB64: outside})
 	if len(got) != 1 || got[0].Provider != "a" {
 		t.Fatalf("entries = %+v, want only the row inside the mount with a bare file name", got)
+	}
+
+	duplicates := encodeAgentsB64(t, []agentEntry{
+		{Provider: "a", Dir: filepath.Join(root, "a"), Files: []string{agentFileName}},
+		{Provider: "a", Dir: filepath.Join(root, "b"), Files: []string{agentFileName}},
+		{Provider: "c", Dir: filepath.Join(root, "a"), Files: []string{agentFileName}},
+	})
+	got = agentEntries(bootEnv{AgentsB64: duplicates})
+	if len(got) != 1 || got[0].Provider != "a" || got[0].Dir != filepath.Join(root, "a") {
+		t.Fatalf("duplicate entries = %+v, want only the first unique provider and directory", got)
+	}
+
+	tooMany := make([]agentEntry, agentManifestMaxEntries+1)
+	for i := range tooMany {
+		tooMany[i] = agentEntry{
+			Provider: fmt.Sprintf("provider-%d", i),
+			Dir:      filepath.Join(root, fmt.Sprintf("provider-%d", i)),
+			Files:    []string{agentFileName},
+		}
+	}
+	if got := agentEntries(bootEnv{AgentsB64: encodeAgentsB64(t, tooMany)}); len(got) != 0 {
+		t.Fatalf("oversized manifest produced %d entries, want none", len(got))
 	}
 }
 
@@ -946,6 +1069,32 @@ func TestOversizedAndSymlinkedFilesAreNotSent(t *testing.T) {
 		}
 		if !strings.Contains(got[0].Text, agentFileName) || strings.Contains(got[0].Text, agentFixture) {
 			t.Fatalf("note = %q, want it to name the file and quote nothing", got[0].Text)
+		}
+	})
+
+	t.Run("a hard link", func(t *testing.T) {
+		e := agentTestEntry(t)
+		h := newFakeAgentHost(t)
+		h.setFetch(0, nil)
+		events := make(chan []byte, 8)
+		a := newTestAgentSync(h, []agentEntry{e}, events)
+		a.boot()
+
+		state := filepath.Join(e.Dir, "local-state.json")
+		if err := os.WriteFile(state, []byte(agentFixture), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(state, filepath.Join(e.Dir, agentFileName)); err != nil {
+			t.Fatal(err)
+		}
+		a.tick(time.Now())
+
+		if n := h.putCount(); n != 0 {
+			t.Fatalf("%d put(s) for a multiply-linked credential, want 0", n)
+		}
+		got := notes(t, events)
+		if len(got) != 1 || !strings.Contains(got[0].Text, agentFileName) {
+			t.Fatalf("notes = %+v, want one note naming the refused file", got)
 		}
 	})
 

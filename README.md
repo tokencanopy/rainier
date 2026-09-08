@@ -152,8 +152,10 @@ and `sessiond` keeps it equal to a sealed copy the control plane holds:
 fetched at boot, put whenever the agent rewrites it (a background token
 refresh included), removed when you log out. The credential is never in the
 workspace, an environment snapshot, the process environment, a create, or a
-log. Everything provider-specific is one row in `controlapp/agents.go`; a
-third agent is a row plus its probes.
+log. After restoring Claude credentials into a fresh home, Rainier also creates
+the minimal non-secret onboarding marker so the interactive TUI opens ready to
+use; it preserves any existing Claude settings. Everything provider-specific
+is one row in `controlapp/agents.go`; a third agent is a row plus its probes.
 
 
 `rainier new` attaches immediately by default so you watch the agent boot;

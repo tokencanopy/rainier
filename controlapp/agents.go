@@ -158,9 +158,9 @@ type agentManifestEntry struct {
 // watch, and delete. It carries no credential — it is a map of paths — which
 // is why it can sit in the container environment at all.
 //
-// Callers merge it into the create's environment BEFORE the resolved launch
-// material, so a host that deliberately relocates one provider still wins
-// under the documented last-wins rule.
+// The scheduler reserves these keys when it merges resolved launch material:
+// provider homes and the manifest are credential-custody boundaries, not
+// workspace-configurable environment defaults.
 func AgentsEnv(providers []AgentProvider) map[string]string {
 	env := make(map[string]string, len(providers)+1)
 	entries := make([]agentManifestEntry, 0, len(providers))

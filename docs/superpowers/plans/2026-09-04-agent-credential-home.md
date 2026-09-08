@@ -100,9 +100,9 @@ No worker. Half a day. Each probe runs in a throwaway session on rainier-1 from 
 **Interfaces:**
 - `runner.HomeMount{Volume string; Path string}`; `runner.Spec.Home *HomeMount` (`json:"home,omitempty"`).
 - Method names: `runner.MethodFetchAgentCredentials = "fetch_agent_credentials"`, `MethodPutAgentCredentials = "put_agent_credentials"`, `MethodRevokeAgentCredentials = "revoke_agent_credentials"`. Payloads (documented on the constants, as the mint's is): fetch `{"provider"}` → `{"version", "files": {name: base64}}`; put `{"provider", "files", "version"}` → `{"version"}`; revoke (downward) `{"provider"}` → `{}`. Refusals are `{"error": sentence}` on `ok:false`, as everywhere.
-- `controlapp.AgentProvider{Name, HomeEnv, HomeVar, Files []string, Egress []string, LoginCmd []string}`; `controlapp.AgentProviders() []AgentProvider` — `claude`, `codex`, and `test` (present only when `controlapp.EnableTestAgentProvider` is set by the host, which only the e2e's controld does).
+- `controlapp.AgentProvider{Name, HomeEnv, HomeVar, Files []string, SeedFiles []AgentHomeSeedFile, Egress []string, LoginCmd []string}`; `controlapp.AgentProviders() []AgentProvider` — `claude`, `codex`, and `test` (present only when `controlapp.EnableTestAgentProvider` is set by the host, which only the e2e's controld does).
 - `controlapp.HomeMountPath = "/rainier/agents"`; `controlapp.AgentHomeVolume(ws control.WorkspaceID, creator control.ActorID) string` = `"rainier-agents-" + hex(sha256(ws + "\x00" + creator))[:16]`; `controlapp.AgentsEnv(providers) (map[string]string)` — each provider's `HomeEnv` → `HomeMountPath/<name>`, plus `RAINIER_AGENTS_B64` = base64 JSON `[{"provider","dir","files"}]`.
-- `createSpec` sets `spec.Home` for every create with a creator, merges `AgentsEnv` into `spec.Env` *before* `material.Environment` (so a resolver's value can still override, the documented last-wins rule), and unions every provider's `Egress` into `spec.EgressAllow`.
+- `createSpec` sets `spec.Home` for every create with a creator, reserves the provider home variables and `RAINIER_AGENTS_B64` while merging ordinary values from `material.Environment`, and unions every provider's `Egress` into `spec.EgressAllow`.
 
 The volume key is opaque on purpose: a docker volume name is visible to anyone with `docker` on the runner, and an account id is not something to print there. The provider table is data, not code: adding a third agent is a row plus its Task 0 probes.
 
@@ -127,8 +127,8 @@ func TestAgentHomeVolumeIsOpaqueAndStable(t *testing.T) {
 func TestCreateSpecCarriesTheHome(t *testing.T) {
 	// a create for (ws_example, user_example) has Home{Volume: AgentHomeVolume(...), Path: HomeMountPath},
 	// Env[CLAUDE_CONFIG_DIR] == "/rainier/agents/claude", Env[RAINIER_AGENTS_B64] decodes to both rows,
-	// and EgressAllow contains every provider's Egress hosts once; a resolver value for
-	// CLAUDE_CONFIG_DIR wins over the table's.
+	// and EgressAllow contains every provider's Egress hosts once; resolver values cannot
+	// replace CLAUDE_CONFIG_DIR or RAINIER_AGENTS_B64.
 }
 ```
 

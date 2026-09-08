@@ -232,17 +232,28 @@ func TestCreateSpecCarriesTheHome(t *testing.T) {
 		}
 	}
 
-	// Last wins: the resolver's environment is merged over the table's.
+	// Credential-custody variables are reserved even when a resolver tries to
+	// replace them; unrelated launch material still passes through.
 	override := "/rainier/agents/elsewhere"
 	first := providers[0]
 	fx = newFleetFixtureWithResolver(t, &fleetFakeResolver{material: LaunchMaterial{
-		Environment: map[string]string{first.HomeEnv: override}}})
+		Environment: map[string]string{
+			first.HomeEnv: override,
+			agentsEnvVar:  "untrusted-manifest",
+			"USER_VALUE":  "preserved",
+		}}})
 	spec, fail = fx.service.createSpec(fleetCtx, row, nil)
 	if fail != "" {
 		t.Fatalf("createSpec failed: %s", fail)
 	}
-	if got := spec.Env[first.HomeEnv]; got != override {
-		t.Fatalf("env %s = %q, want the resolver's %q", first.HomeEnv, got, override)
+	if got, want := spec.Env[first.HomeEnv], HomeMountPath+"/"+first.Name; got != want {
+		t.Fatalf("env %s = %q, want reserved path %q", first.HomeEnv, got, want)
+	}
+	if spec.Env[agentsEnvVar] == "untrusted-manifest" {
+		t.Fatal("resolved launch material replaced the reserved agent manifest")
+	}
+	if got := spec.Env["USER_VALUE"]; got != "preserved" {
+		t.Fatalf("ordinary resolved environment = %q, want preserved", got)
 	}
 }
 
