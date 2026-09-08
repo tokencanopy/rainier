@@ -37,29 +37,169 @@ func runCLI(t *testing.T, bin, config string, args ...string) (string, int) {
 	return "", -1
 }
 
-func TestCLIHelpAndVersion(t *testing.T) {
-	bin := buildCLI(t, "-X main.version=v9.8.7-test")
-	config := filepath.Join(t.TempDir(), "corrupt.json")
-	if err := os.WriteFile(config, []byte("invalid secret config"), 0600); err != nil {
-		t.Fatal(err)
+// runCLISplit is runCLI with the two streams kept apart, for the tests that
+// are about which stream something went to.
+func runCLISplit(t *testing.T, bin, config string, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	cmd := exec.Command(bin, args...)
+	cmd.Env = append(os.Environ(), "RAINIER_CONFIG="+config, "RAINIER_NO_BROWSER=1")
+	var out, errBuf strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &errBuf
+	err := cmd.Run()
+	code = 0
+	if err != nil {
+		e, ok := err.(*exec.ExitError)
+		if !ok {
+			t.Fatal(err)
+		}
+		code = e.ExitCode()
 	}
+	return out.String(), errBuf.String(), code
+}
+
+// TestRootHelpInventory is the contract's most load-bearing test: the whole
+// point of this surface is that a new developer can read it off one screen
+// (docs/cli-v0-contract.md §1, §2), and that property is destroyed one
+// well-meaning line at a time. So the inventory is exact — a command added to
+// the default help fails this test until somebody decides it belongs in the
+// product's first impression — and the height is bounded at a normal
+// terminal's.
+func TestRootHelpInventory(t *testing.T) {
+	bin := buildCLI(t, "")
+	config := filepath.Join(t.TempDir(), "absent.json")
+
+	// Exactly the public surface. Nothing else may appear as a command.
+	public := []string{
+		"login", "logout", "status",
+		"new", "ls", "info", "attach", "stop", "delete",
+		"agent login", "agent status", "agent logout",
+		"help", "version",
+	}
+	// Removed outright, or moved behind `rainier help all`. None of these may
+	// be advertised in the first-run experience.
+	hidden := []string{
+		"diff", "doctor", "suspend", "resume", "snapshot", "rm",
+		"push", "pull", "creds", "connection", "secret", "env",
+		"context", "workspace",
+	}
+
 	for _, args := range [][]string{{"--help"}, {"-h"}, {"help"}} {
 		out, code := runCLI(t, bin, config, args...)
-		lines := 0
-		for _, line := range strings.Split(out, "\n") {
-			if strings.TrimSpace(line) != "" {
-				lines++
+		if code != 0 {
+			t.Fatalf("%v: exit %d\n%s", args, code, out)
+		}
+		lines := strings.Count(strings.TrimRight(out, "\n"), "\n") + 1
+		if lines > 24 {
+			t.Errorf("%v: %d lines; the default help must fit one terminal screen\n%s", args, lines, out)
+		}
+		for _, want := range public {
+			if !strings.Contains(out, want) {
+				t.Errorf("%v: default help is missing the public command %q\n%s", args, want, out)
 			}
 		}
-		if code != 0 || lines > 26 || !strings.Contains(out, "doctor") {
-			t.Errorf("%v: exit %d, %d lines\n%s", args, code, lines, out)
+		for _, unwanted := range hidden {
+			if commandMentioned(out, unwanted) {
+				t.Errorf("%v: default help advertises %q, which belongs under `rainier help all`\n%s", args, unwanted, out)
+			}
 		}
 	}
-	for _, command := range []string{"login", "new", "attach", "doctor", "env", "agent", "secret", "context", "workspace", "push", "pull", "ls", "suspend", "resume", "snapshot", "rm", "diff", "creds"} {
+}
+
+// commandMentioned reports whether help text OFFERS a command, as opposed to
+// happening to contain the word. "Sign in to your Rainier workspace" is prose;
+// an indented line beginning with "workspace" is an offer, and so is any
+// "rainier workspace" in running text. Both are what the inventory is about;
+// neither is a plain substring search, which would flag the prose.
+func commandMentioned(out, command string) bool {
+	if strings.Contains(out, "rainier "+command+" ") || strings.HasSuffix(strings.TrimRight(out, "\n"), "rainier "+command) {
+		return true
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "  ") {
+			continue
+		}
+		if fields := strings.Fields(line); len(fields) > 0 && fields[0] == command {
+			return true
+		}
+	}
+	return false
+}
+
+// `rainier help all` is where everything the default screen leaves out has to
+// be findable, clearly labeled as advanced rather than as part of the primary
+// journey.
+func TestHelpAllDocumentsWhatTheDefaultHides(t *testing.T) {
+	bin := buildCLI(t, "")
+	out, code := runCLI(t, bin, filepath.Join(t.TempDir(), "absent.json"), "help", "all")
+	if code != 0 {
+		t.Fatalf("help all: exit %d\n%s", code, out)
+	}
+	for _, want := range []string{
+		"doctor", "suspend", "rm", "agent ls", // the compatibility aliases
+		"resume", "snapshot", "push", "pull", // low-level operations
+		"creds", "connection", "secret", "env", "context", "workspace",
+		"ADVANCED", "COMPATIBILITY ALIASES",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help all does not document %q:\n%s", want, out)
+		}
+	}
+	// diff is gone completely, not relocated (contract §2.3).
+	if commandMentioned(out, "diff") {
+		t.Errorf("help all still advertises `diff`:\n%s", out)
+	}
+}
+
+// `rainier diff` was removed completely. An invocation of it must be an
+// invalid invocation — exit 2 with the usage — not a command that silently
+// does something else.
+func TestDiffIsGone(t *testing.T) {
+	bin := buildCLI(t, "")
+	config := filepath.Join(t.TempDir(), "absent.json")
+	for _, args := range [][]string{{"diff", "sess_example"}, {"diff"}} {
+		out, code := runCLI(t, bin, config, args...)
+		if code != 2 {
+			t.Errorf("%v: exit %d, want 2\n%s", args, code, out)
+		}
+		if !strings.Contains(out, "unknown command") {
+			t.Errorf("%v: does not report an unknown command\n%s", args, out)
+		}
+	}
+	if out, code := runCLI(t, bin, config, "help", "diff"); code != 2 || strings.Contains(out, "usage: rainier diff") {
+		t.Errorf("help diff: exit %d\n%s", code, out)
+	}
+}
+
+// Every command the CLI dispatches — public, alias, or advanced — must answer
+// `rainier help X` and `rainier X --help` identically, because a user who
+// found the command in `help all` will reach for either.
+func TestPerCommandHelp(t *testing.T) {
+	bin := buildCLI(t, "")
+	config := filepath.Join(t.TempDir(), "absent.json")
+	// `version` and `help` are intercepted before any handler, so they have
+	// no `--help` of their own; every other command must answer both spellings
+	// identically.
+	commands := []string{
+		"login", "logout", "status", "new", "ls", "info", "attach", "stop",
+		"delete", "agent",
+		"doctor", "suspend", "rm",
+		"env", "secret", "context", "workspace", "resume", "snapshot",
+		"push", "pull", "creds", "connection",
+	}
+	for _, command := range []string{"version", "help"} {
+		if out, code := runCLI(t, bin, config, "help", command); code != 0 || !strings.Contains(out, "usage: rainier "+command) {
+			t.Errorf("help %s: exit %d\n%s", command, code, out)
+		}
+	}
+	for _, command := range commands {
 		a, code := runCLI(t, bin, config, "help", command)
 		b, code2 := runCLI(t, bin, config, command, "--help")
-		if code != 0 || code2 != 0 || a != b || !strings.Contains(a, "usage: rainier "+command) {
-			t.Errorf("help %s mismatch: %d/%d\n%s\n%s", command, code, code2, a, b)
+		if code != 0 || code2 != 0 || a != b {
+			t.Errorf("help %s mismatch: %d/%d\n--- help ---\n%s--- --help ---\n%s", command, code, code2, a, b)
+			continue
+		}
+		if !strings.Contains(a, "usage: rainier "+command) {
+			t.Errorf("help %s does not lead with its usage line:\n%s", command, a)
 		}
 	}
 	for _, args := range [][]string{{"env", "create", "--help"}, {"agent", "login", "--help"}, {"secret", "set", "--help"}, {"context", "use", "--help"}} {
@@ -67,6 +207,32 @@ func TestCLIHelpAndVersion(t *testing.T) {
 			t.Errorf("%v: %d %s", args, code, out)
 		}
 	}
+}
+
+// Help somebody asked for is output and belongs on stdout; usage printed
+// because an invocation was wrong is a diagnostic and belongs on stderr
+// (contract §6.1).
+func TestHelpStreamsAndExitCodes(t *testing.T) {
+	bin := buildCLI(t, "")
+	config := filepath.Join(t.TempDir(), "absent.json")
+
+	stdout, stderr, code := runCLISplit(t, bin, config, "help")
+	if code != 0 || !strings.Contains(stdout, "usage: rainier") || strings.Contains(stderr, "usage: rainier") {
+		t.Errorf("requested help went to the wrong stream: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLISplit(t, bin, config, "nonesuch")
+	if code != 2 || stdout != "" || !strings.Contains(stderr, "usage: rainier") {
+		t.Errorf("usage-on-error went to the wrong stream: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	stdout, _, code = runCLISplit(t, bin, config)
+	if code != 2 || stdout != "" {
+		t.Errorf("bare invocation: exit %d, stdout %q", code, stdout)
+	}
+}
+
+func TestVersion(t *testing.T) {
+	bin := buildCLI(t, "-X main.version=v9.8.7-test")
+	config := filepath.Join(t.TempDir(), "absent.json")
 	for _, args := range [][]string{{"version"}, {"--version"}} {
 		out, code := runCLI(t, bin, config, args...)
 		if code != 0 || strings.TrimSpace(out) != "rainier v9.8.7-test" {

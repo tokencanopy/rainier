@@ -169,6 +169,12 @@ type APIError struct {
 	Status int
 	// RetryAfter is transport guidance, preserved separately from untrusted prose.
 	RetryAfter string
+	// RequestID is the correlation id for this exchange: the server's own
+	// X-Request-Id when it echoes or mints one, otherwise the id this client
+	// sent. It is what a person can quote when asking why a request failed,
+	// and it is deliberately NOT part of Error's text — a caller that wants
+	// it renders it, and a caller that does not is not made noisier.
+	RequestID string
 }
 
 func (e *APIError) Error() string {
@@ -421,7 +427,8 @@ func (c *Client) attempt(ctx context.Context, method, path string, in any, opts 
 	if c.Workspace != "" {
 		req.Header.Set("Rainier-Workspace", c.Workspace)
 	}
-	req.Header.Set("X-Request-Id", RandHex(headerIDBytes))
+	requestID := RandHex(headerIDBytes)
+	req.Header.Set("X-Request-Id", requestID)
 	for _, o := range opts {
 		o(req)
 	}
@@ -445,9 +452,41 @@ func (c *Client) attempt(ctx context.Context, method, path string, in any, opts 
 			if len(text) > clip {
 				text = text[:clip]
 			}
-			return nil, &APIError{Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After"), Message: fmt.Sprintf("unexpected response: %d %s", resp.StatusCode, text)}
+			return nil, &APIError{Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After"), RequestID: responseRequestID(resp, requestID), Message: fmt.Sprintf("unexpected response: %d %s", resp.StatusCode, text)}
 		}
-		return nil, &APIError{Code: env.Error.Code, Message: env.Error.Message, Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After")}
+		return nil, &APIError{Code: env.Error.Code, Message: env.Error.Message, Status: resp.StatusCode, RetryAfter: resp.Header.Get("Retry-After"), RequestID: responseRequestID(resp, requestID)}
 	}
 	return resp, nil
+}
+
+// responseRequestID is the correlation id to record on a failure: whatever the
+// server put in X-Request-Id, and otherwise the id this client sent. A server
+// that mints its own is the one worth quoting; a server that echoes ours
+// yields the same string either way; a server that sets neither still leaves
+// the caller with an id that appears in this client's own request.
+func responseRequestID(resp *http.Response, sent string) string {
+	if id := resp.Header.Get("X-Request-Id"); id != "" {
+		return id
+	}
+	return sent
+}
+
+// DoStatus is Do plus the successful response's status code. Exactly one
+// caller needs it — `rainier delete`, which must tell a completed destruction
+// (204) from one the server has merely accepted (202), because those are
+// different things to tell a person about a session they asked to destroy
+// forever. Every other caller wants Do, which cannot report a status it has
+// no use for.
+func (c *Client) DoStatus(ctx context.Context, method, path string, in, out any, opts ...Option) (int, error) {
+	resp, err := c.send(ctx, method, path, in, opts...)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return resp.StatusCode, err
+		}
+	}
+	return resp.StatusCode, nil
 }

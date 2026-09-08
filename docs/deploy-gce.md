@@ -328,9 +328,10 @@ enough to diagnose. The container is still there and sessiond is still serving
 viewers, so **attach to it and read the whole log**:
 
 ```bash
-./bin/rainier ls --all              # the failed session, with its runner
-./bin/rainier attach --since 0 <id> # replays everything the setup printed
-./bin/rainier rm <id>               # frees the slot
+./bin/rainier ls --all                # the unavailable session (--verbose adds its runner)
+./bin/rainier info <id>               # its state, environment, and sanitized failure
+./bin/rainier attach --since 0 <id>   # replays everything the setup printed
+./bin/rainier delete <id> --yes       # frees the slot
 ```
 
 Attach works on a `failed` session for exactly as long as its runner holds its
@@ -422,7 +423,7 @@ EOF
 # inside the session:
 #   /workspace/app is a clone of acme/app on branch rainier/app1
 #   git commit && git push just work; no token in .git/config or the env
-./bin/rainier diff app1          # per repo: what this branch changed vs main
+# attach and run `git status` / `git diff` in the session to see what changed
 ```
 
 **`setup` vs `init` — the split that decides what gets cached.** They are two
@@ -532,7 +533,7 @@ The login itself is the vendor's own, run inside a session:
 ```bash
 ./bin/rainier agent login claude --env web   # web has the agent installed
 # Claude Code: /login, choose the subscription, paste the code back; /exit
-./bin/rainier agent ls
+./bin/rainier agent status
 ```
 
 `sessiond` keeps the provider's credential file equal to a sealed copy in
@@ -566,8 +567,8 @@ suspend/resume/rm, then the environments phase (secret, setup script,
 snapshot cache, second session from the cache), then the **github rehearsal**
 (a throwaway private repo it creates and deletes, cloned at boot, an init hook
 that reads the git log, a real commit and push through the credential helper,
-the attribution GitHub records for it, `rainier diff`, `rainier creds`, and a
-push/pull round trip), plus the egress acceptance — on your own machine. It is
+the attribution GitHub records for it, an in-session `git diff`, `rainier creds`,
+and a push/pull round trip), plus the egress acceptance — on your own machine. It is
 the same wiring with `127.0.0.1` substituted for the tailnet name, and it fails
 faster than a VM does. Run it before you run this document.
 
@@ -743,8 +744,8 @@ runs against one. Record what actually happened in the Result column.
 | 4 | Session `repos` overrides beat env connector defaults; explicit `[]` means no clone (scratch semantics preserved); multi-repo clones land as sibling directories. | Covered by `go test ./internal/e2e/ -run TestConnectorSessionMintsAndReportsDiff` (two connectors → two sibling directories, each on the session branch) and controld's `repoOverrides`/`sessionRepoRefs` tests. | ☑ | Automated: green under `-race -count=5`. |
 | 5 | The cacheable/per-session split holds: `setup` (pre-clone, cached) and `init` (post-clone, every session, never cached) both stream to an attached viewer; a cache-hit session runs `init` but not `setup`. | Step 8's table, on the VM: an environment with both scripts, two sessions, `rainier attach --since 0` on each. The rehearsal proves the ordering half (its init hook reads the cloned repo's git log, which no cached image could contain). | ☑ | Setup created its cached marker before clone; init then read the cloned repository's git log. The second session booted from the environment snapshot, ran init, and did not rerun setup. |
 | 6 | `rainier push <dir> <session>:<path>` and `pull` round-trip a directory laptop↔session (bounded size, v0). | `go test ./internal/e2e/ -run TestPushPullRoundTrip`; the rehearsal repeats it against a real container. | ☑ | Automated: green — nested directories, an empty one, binary content, a non-ASCII name and an executable bit all survive both directions. |
-| 7 | `GET /v0/sessions/{id}/diff` returns per-repo `--stat` vs the merge-base with the base branch. | `go test ./internal/e2e/ -run TestConnectorSessionMintsAndReportsDiff`; `rainier diff <id>` on the VM against a real commit. | ☑ | On the VM, `rainier diff` reported the acceptance file against the real merge-base; the automated transport test remained green. |
-| 8 | Riders land: a container crash preserves the workspace volume (salvage until `rm`); `child_exited` is visible in `ls`; `attach --since 0` full-history replay actually reaches the viewer; `/v0/me` exposes the user id (and the CLI's owner-preference uses it). | `go test ./internal/e2e/ -run 'TestCrashKeepsTheWorkspaceAndRmReclaimsIt|TestEnvSetupStreamsAndCaches|TestFullReplayReachesTheViewer'`. On the VM, the `--since 0` half is the one Plan 3's overnight run found broken — re-run it there. | ☑ | `attach --since 0` replayed the full boot output on rainier-1; the other riders passed their automated scenes. The pre-existing `gce-1` session also survived the full-stack Plan 5 redeploy without a container restart. |
+| 7 | `GET /v0/sessions/{id}/diff` returns per-repo `--stat` vs the merge-base with the base branch. | `go test ./internal/e2e/ -run TestConnectorSessionMintsAndReportsDiff`; `rainier diff <id>` on the VM against a real commit. | ☑ | On the VM, `rainier diff` reported the acceptance file against the real merge-base; the automated transport test remained green. **The `rainier diff` command has since been removed** (see [the CLI contract](cli-v0-contract.md) §2.3); run `git` inside the session instead. This row records what was verified on the date of that run and is left as written. |
+| 8 | Riders land: a container crash preserves the workspace volume (salvage until `rm`); `child_exited` is visible in `ls` (today: as the `finished` state, with the exit code under `ls --verbose` and `rainier info`); `attach --since 0` full-history replay actually reaches the viewer; `/v0/me` exposes the user id (and the CLI's owner-preference uses it). | `go test ./internal/e2e/ -run 'TestCrashKeepsTheWorkspaceAndRmReclaimsIt|TestEnvSetupStreamsAndCaches|TestFullReplayReachesTheViewer'`. On the VM, the `--since 0` half is the one Plan 3's overnight run found broken — re-run it there. | ☑ | `attach --since 0` replayed the full boot output on rainier-1; the other riders passed their automated scenes. The pre-existing `gce-1` session also survived the full-stack Plan 5 redeploy without a container restart. |
 | 9 | All of the above pass in the e2e suite and in a live fleet-rehearsal phase (real clone/push against a throwaway GitHub repo when `gh` is available); GCE acceptance recorded in the runbook. | `go test ./... -race`, then `./scripts/e2e-fleet.sh`, then this table filled in from the VM. | ☑ | Local fleet rehearsal: 35/35 checks. GCE main run: 13/13; the separate stale-credential run: 7/7. Cleanup restored rainier-1 to its single durable session, removed the throwaway repository, and removed the temporary plaintext credential from the VM. |
 
 **Where each criterion can go wrong, so you know what you're looking at:**

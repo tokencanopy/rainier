@@ -9,7 +9,7 @@
 # second session that boots the cache). Then Plan 5's GITHUB REHEARSAL against
 # a throwaway private repo this script creates and deletes — clone at boot,
 # the init hook, a real commit and push through the in-sandbox credential
-# helper, the attribution GitHub records for it, `rainier diff`, `rainier
+# helper, the attribution GitHub records for it, an in-session `git diff`, `rainier
 # creds`, and a push/pull round trip. It finishes with scripts/egress-check.sh,
 # the R4 acceptance.
 #
@@ -351,9 +351,6 @@ case "$SID" in
   *) fail "new printed \"$SID\", want a sess_ id" ;;
 esac
 
-# `rainier ls`: ID NAME ENV STATE RUNNER REACHABLE AGE — read by header
-# offset, since ENV is empty on a scratch session (see `cell`).
-#
 # TWO readers, and which one a check needs is not a detail. A plain `ls`
 # EXCLUDES the terminal states (canceled/failed/dead/destroyed) — that is what
 # `--all` is for — so state_of answers "" for a session that failed exactly as
@@ -367,19 +364,33 @@ esac
 # that was working (Plan 5, first live rehearsal). Anything asserting on a
 # terminal state reads state_all_of.
 #
-# Both take the FIRST WORD of the cell, because the STATE column is a rendered
-# sentence and not a bare state: cmd/rainier's sessionStateCell annotates it
-# with whatever the state alone leaves unanswered — "failed (exited 128)",
+# These assertions are about the CONTROL PLANE's state machine — queued,
+# creating, running, suspended_cold, failed, destroyed — and the default `ls`
+# no longer shows it: its three columns are the five words a person needs.
+# `ls --verbose` is where the diagnostic state lives, so that is what the
+# fleet suite reads.
+#
+# Its columns are NAME STATE AGE ID ENV RUNNER REACHABLE DIAGNOSTIC. Fields 1
+# through 7 never contain a space (an empty cell renders as "-"), so awk's
+# default splitting addresses them exactly, and DIAGNOSTIC is last — which is
+# what lets a queue reason or an exit code, both of which contain spaces, be
+# read whole.
+#
+# state_of and state_all_of take the FIRST WORD of DIAGNOSTIC, because that
+# column is a rendered sentence and not a bare state: diagnosticState annotates
+# it with whatever the state alone leaves unanswered — "failed (exited 128)",
 # "running (exited 0)", "queued (waiting for runner rainier-gpu)". Comparing
 # the whole cell to "failed" is therefore false for every session whose agent
-# exited, which is all of them; the annotation is for a human reading the
-# table, and a check wants the state it decorates.
-state_of()      { ./bin/rainier ls | cell "$1" STATE RUNNER | awk '{print $1}'; }
-state_all_of()  { ./bin/rainier ls --all | cell "$1" STATE RUNNER | awk '{print $1}'; }
+# exited, which is all of them.
+diagnostic_of() { ./bin/rainier ls --verbose 2>/dev/null | awk -v id="$1" '$4 == id { $1=$2=$3=$4=$5=$6=$7=""; sub(/^ +/, ""); print }'; }
+diagnostic_all_of() { ./bin/rainier ls --all --verbose 2>/dev/null | awk -v id="$1" '$4 == id { $1=$2=$3=$4=$5=$6=$7=""; sub(/^ +/, ""); print }'; }
+runner_of()     { ./bin/rainier ls --verbose 2>/dev/null | awk -v id="$1" '$4 == id { print $6 }'; }
+state_of()      { diagnostic_of "$1" | awk '{print $1}'; }
+state_all_of()  { diagnostic_all_of "$1" | awk '{print $1}'; }
 session_state() { state_of "$SID"; }
 waitfor '[ "$(session_state)" = running ]' 90 "session running" \
   || fail "$SID never reached running (state: $(session_state)); see /tmp/runnerd.log"
-ok "session is running: $(./bin/rainier ls | awk -v id="$SID" '$1 == id')"
+ok "session is running: $(./bin/rainier ls --verbose | awk -v id="$SID" '$4 == id')"
 
 # ---------------------------------------------------------------------------
 step "rainier ls"
@@ -427,21 +438,26 @@ grep -q "detached at seq" "$ATTACH_OUT" || fail "attach did not print the detach
 ok "attach relayed a live shell and detached cleanly (marker seen $HITS times)"
 
 # ---------------------------------------------------------------------------
-step "rainier suspend / resume"
+step "rainier stop / resume"
 # ---------------------------------------------------------------------------
-./bin/rainier suspend "$SID" | grep -q "suspended_warm" || fail "suspend did not report suspended_warm"
-[ "$(session_state)" = "suspended_warm" ] || fail "state after suspend = $(session_state), want suspended_warm"
-ok "suspended (warm)"
+# `stop` is always the persisted stop that releases capacity — the warm/cold
+# choice is gone from the interface, so the state to expect is suspended_cold.
+./bin/rainier stop "$SID" | grep -q "capacity released" || fail "stop did not report the session stopped"
+[ "$(session_state)" = "suspended_cold" ] || fail "state after stop = $(session_state), want suspended_cold"
+ok "stopped (persisted, capacity released)"
+# Stopping again is the outcome that was asked for, not a failure.
+./bin/rainier stop "$SID" | grep -q "already stopped" || fail "a second stop was not idempotent"
+ok "stop is idempotent"
 ./bin/rainier resume "$SID" | grep -q "running" || fail "resume did not report running"
 [ "$(session_state)" = "running" ] || fail "state after resume = $(session_state), want running"
 ok "resumed"
 
 # ---------------------------------------------------------------------------
-step "rainier rm"
+step "rainier delete"
 # ---------------------------------------------------------------------------
-./bin/rainier rm "$SID" | grep -q "removed" || fail "rm did not report removal"
+./bin/rainier delete "$SID" --yes | grep -q "deleted permanently" || fail "delete did not report removal"
 waitfor '[ -z "$(session_state)" ]' 30 "session gone from ls" \
-  || fail "$SID still listed after rm (state: $(session_state))"
+  || fail "$SID still listed after delete (state: $(session_state))"
 # Scoped to THIS session's row: a bare `grep -q destroyed` over the whole
 # --all listing passes on any leftover destroyed session from an earlier run
 # — including one this run's rm never touched.
@@ -663,8 +679,8 @@ grep -q conflict /tmp/rainier-e2e-envrm.txt \
   || fail "env rm while referenced said \"$(cat /tmp/rainier-e2e-envrm.txt)\", want a conflict"
 ok "env rm is refused while live sessions reference the environment"
 
-./bin/rainier rm "$SID1" >/dev/null
-./bin/rainier rm "$SID2" >/dev/null
+./bin/rainier delete "$SID1" --yes >/dev/null
+./bin/rainier delete "$SID2" --yes >/dev/null
 waitfor '[ -z "$(state_of "$SID1")" ] && [ -z "$(state_of "$SID2")" ]' 60 "both env sessions to go" \
   || fail "the environment's sessions are still listed after rm"
 ./bin/rainier env rm "$ENV_NAME" | grep -q removed || fail "env rm did not report removal"
@@ -697,7 +713,7 @@ CAP_SID=$(./bin/rainier new --detach --name "$CAP_ENV-session" --env "$CAP_ENV")
 case "$CAP_SID" in sess_*) ;; *) fail "new --env $CAP_ENV printed \"$CAP_SID\"" ;; esac
 waitfor '[ "$(state_of "$CAP_SID")" = running ]' 120 "the capability-matched session" \
   || fail "$CAP_SID never reached running (state: $(state_of "$CAP_SID")); the runner advertises $FLEET_CAPABILITY — see $CONTROLD_LOG"
-CAP_RUNNER=$(./bin/rainier ls | cell "$CAP_SID" RUNNER REACHABLE)
+CAP_RUNNER=$(runner_of "$CAP_SID")
 [ "$CAP_RUNNER" = "$RUNNER_NAME" ] \
   || fail "$CAP_SID is running on \"$CAP_RUNNER\", want $RUNNER_NAME (the runner that announced $FLEET_CAPABILITY)"
 ok "a session from an environment requiring $FLEET_CAPABILITY landed on $RUNNER_NAME"
@@ -707,18 +723,18 @@ ok "a session from an environment requiring $FLEET_CAPABILITY landed on $RUNNER_
   || fail "env create --capability $MISSING_CAPABILITY"
 NOCAP_SID=$(./bin/rainier new --detach --name "$NOCAP_ENV-session" --env "$NOCAP_ENV")
 case "$NOCAP_SID" in sess_*) ;; *) fail "new --env $NOCAP_ENV printed \"$NOCAP_SID\"" ;; esac
-# The STATE column carries the queue reason in parentheses (sessionStateCell),
-# which is where a human meets it.
-nocap_state() { ./bin/rainier ls | cell "$NOCAP_SID" STATE RUNNER; }
+# The DIAGNOSTIC column carries the queue reason in parentheses, which is where
+# an operator meets it; the default table's STATE says only "starting".
+nocap_state() { diagnostic_of "$NOCAP_SID"; }
 waitfor '[ "$(nocap_state)" = "queued (waiting for a runner with capability '"$MISSING_CAPABILITY"')" ]' \
   30 "the queue reason naming $MISSING_CAPABILITY" \
   || fail "$NOCAP_SID reads \"$(nocap_state)\", want queued naming the missing capability $MISSING_CAPABILITY"
 ok "a session requiring $MISSING_CAPABILITY stays queued and names the capability nothing advertises"
 
-./bin/rainier rm "$CAP_SID" >/dev/null
-./bin/rainier rm "$NOCAP_SID" >/dev/null
+./bin/rainier delete "$CAP_SID" --yes >/dev/null
+./bin/rainier delete "$NOCAP_SID" --yes >/dev/null
 waitfor '[ -z "$(state_of "$CAP_SID")" ] && [ -z "$(state_of "$NOCAP_SID")" ]' 60 "both capability sessions to go" \
-  || fail "the capability scene's sessions are still listed after rm"
+  || fail "the capability scene'"'"'s sessions are still listed after delete"
 ./bin/rainier env rm "$CAP_ENV" | grep -q removed || fail "env rm $CAP_ENV did not report removal"
 ./bin/rainier env rm "$NOCAP_ENV" | grep -q removed || fail "env rm $NOCAP_ENV did not report removal"
 rm -f /tmp/rainier-e2e-cap-env.json
@@ -755,13 +771,14 @@ AGENT_LOGIN_OUT=/tmp/rainier-e2e-agent-login.txt
 AGENT_PROBE_OUT=/tmp/rainier-e2e-agent-probe.txt
 AGENT_CRED_PATH=/rainier/agents/test/credential.json
 
-# agent_row FIELD — one cell of `rainier agent ls` for the test provider.
-agent_row() { ./bin/rainier agent ls | cell test "$1" ""; }
-agent_status()  { ./bin/rainier agent ls | cell test STATUS SINCE; }
-agent_version() { ./bin/rainier agent ls | cell test VERSION WORKSPACES; }
+# `agent status` speaks the three words a person needs; the custody version is
+# a machine-readable detail, so it is read from --json rather than from a
+# column that no longer exists.
+agent_status()  { ./bin/rainier agent status 2>/dev/null | awk '$1 == "test" { $1=""; sub(/^ +/, ""); sub(/ +[^ ]+$/, ""); print }'; }
+agent_version() { ./bin/rainier agent status --json 2>/dev/null | tr -d ' \n' | sed -n 's/.*"provider":"test"[^}]*"version":\([0-9]*\).*/\1/p'; }
 
-[ "$(agent_status)" = "none" ] || fail "before any login, agent ls shows test as \"$(agent_status)\", want none"
-ok "agent ls lists the test provider with status none before any login"
+[ "$(agent_status)" = "not configured" ] || fail "before any login, agent status shows test as \"$(agent_status)\", want not configured"
+ok "agent status lists the test provider as not configured before any login"
 
 # --- the login. `agent login` creates a session running the provider's own
 # login command and attaches to it, the way a person would; the synthetic
@@ -779,7 +796,7 @@ AGENT_LOGIN_JOB=$!
 # already gone (a CLI that refused the request and exited).
 exec 7<>"$AGENT_FIFO"
 waitfor '[ "$(agent_version)" = "1" ]' 90 "custody to reach version 1 after the synthetic login" \
-  || { printf '\035' >&7; exec 7>&-; wait "$AGENT_LOGIN_JOB" 2>/dev/null || true; cat "$AGENT_LOGIN_OUT" >&2; fail "custody never reached version 1; agent ls: $(./bin/rainier agent ls | tr '\n' '|')"; }
+  || { printf '\035' >&7; exec 7>&-; wait "$AGENT_LOGIN_JOB" 2>/dev/null || true; cat "$AGENT_LOGIN_OUT" >&2; fail "custody never reached version 1; agent status: $(./bin/rainier agent status 2>&1 | tr '\n' '|')"; }
 printf '\035' >&7                # Ctrl-]: detach; the CLI removes the session and reports
 exec 7>&-
 wait "$AGENT_LOGIN_JOB" 2>/dev/null || true
@@ -787,7 +804,7 @@ rm -f "$AGENT_FIFO"
 grep -q "logged in as of" "$AGENT_LOGIN_OUT" \
   || { cat "$AGENT_LOGIN_OUT" >&2; fail "agent login did not report a completed login"; }
 ! grep -q credential_example "$AGENT_LOGIN_OUT" || fail "agent login echoed the credential"
-[ "$(agent_status)" = "logged_in" ] || fail "after the login, agent ls shows \"$(agent_status)\", want logged_in"
+[ "$(agent_status)" = "ready" ] || fail "after the login, agent status shows \"$(agent_status)\", want ready"
 ok "agent login test completed: custody at v1, the CLI reported it, nothing echoed the credential"
 ./bin/rainier ls | grep -q "agent-login-test" && fail "the login session was not removed after the login"
 ok "the login session was removed once the login was reported"
@@ -841,7 +858,7 @@ ok "the environment snapshot carries nothing under the agent home"
 # the downward revoke within the sync interval.
 ./bin/rainier agent logout test --yes >"$AGENT_LOGIN_OUT" 2>&1 || { cat "$AGENT_LOGIN_OUT" >&2; fail "agent logout failed"; }
 grep -q "logged out of test" "$AGENT_LOGIN_OUT" || fail "agent logout printed \"$(cat "$AGENT_LOGIN_OUT")\""
-[ "$(agent_status)" = "none" ] || fail "after logout, agent ls shows \"$(agent_status)\", want none"
+[ "$(agent_status)" = "not configured" ] || fail "after logout, agent status shows \"$(agent_status)\", want not configured"
 # The probe's typed text must not itself match the pattern (attach_probe's
 # rule), hence the split words: the shell prints revoke-absent, the echo of
 # the command line does not.
@@ -860,7 +877,7 @@ for logf in "$CONTROLD_LOG" /tmp/runnerd.log /tmp/egressd.log; do
 done
 ok "no log line holds the credential"
 
-./bin/rainier rm "$AGENT_SID" >/dev/null 2>&1 || true
+./bin/rainier delete "$AGENT_SID" --yes >/dev/null 2>&1 || true
 ./bin/rainier env rm "$AGENT_ENV_NAME" >/dev/null 2>&1 || true
 unset RAINIER_E2E_TEST_AGENT
 
@@ -988,7 +1005,8 @@ session_error() {
 #
 # Finished means INIT, not clone, and the difference is the next assertion:
 # it reads /workspace/init-marker, which the init stage writes. This gate used
-# to be `rainier diff`, which answers as soon as the CLONE is on disk — a stage
+# to be the removed `rainier diff`, which answered as soon as the CLONE was on
+# disk — a stage
 # too early. It never went wrong only because the agent is exec'd after init,
 # so the attach probe could not get a shell prompt any sooner and the typed
 # line sat in the tty buffer meanwhile; that is an accident of the boot chain,
@@ -1077,14 +1095,23 @@ grep -q 'cfg-hits=0 ws-hits=0 env-hits=0' "$GH_ATTACH3" \
   || fail "something token-shaped is on disk or in the environment of a session that just pushed: $(grep -o 'cfg-hits=.*' "$GH_ATTACH3" | head -1)"
 ok "after a successful push, nothing token-shaped is in .git, anywhere under /workspace, or in the process environment"
 
-# --- the diff endpoint, against the commit that was just made.
-./bin/rainier diff "$GH_SID" > /tmp/rainier-e2e-gh-diff.txt 2>&1 \
-  || { cat /tmp/rainier-e2e-gh-diff.txt >&2; fail "rainier diff $GH_SID"; }
-grep -q "$SCRATCH_SLUG  $GH_BRANCH vs origin/$GH_BASE" /tmp/rainier-e2e-gh-diff.txt \
-  || fail "diff did not name the repository and both branches: $(head -1 /tmp/rainier-e2e-gh-diff.txt)"
-grep -q 'agent-note.txt' /tmp/rainier-e2e-gh-diff.txt \
-  || { cat /tmp/rainier-e2e-gh-diff.txt; fail "diff does not show the file the session added"; }
-ok "rainier diff reports the session's change against the merge-base with origin/$GH_BASE"
+# --- what the session's own git says about the commit that was just made.
+# This used to be `rainier diff`. That command is gone: git inside the session
+# is the source of truth for repository state, and Rainier grows no
+# repository-diff abstraction of its own. The assertion is the same one — the
+# branch differs from its base by exactly the file the session added — asked of
+# git directly, which is what a user or an agent would now do.
+GH_ATTACH4=/tmp/rainier-e2e-gh-diff.txt
+attach_probe "$GH_SID" \
+  "git -C /workspace/$SCRATCH_REPO --no-pager diff --stat \"origin/$GH_BASE...HEAD\"; echo \"diffed:\$?\"" \
+  "$GH_ATTACH4" 'diffed:[0-9]' 120 \
+  || { echo "--- attach output ---"; cat -v "$GH_ATTACH4"; echo "---------------------"; \
+       fail "the session never answered the git-diff probe"; }
+grep -q 'diffed:0' "$GH_ATTACH4" \
+  || { cat -v "$GH_ATTACH4"; fail "in-session git diff against origin/$GH_BASE failed"; }
+grep -q 'agent-note.txt' "$GH_ATTACH4" \
+  || { cat -v "$GH_ATTACH4"; fail "git diff does not show the file the session added"; }
+ok "in-session git reports the session's change against the merge-base with origin/$GH_BASE"
 
 # --- `rainier creds`: the credential this whole phase used, still valid.
 ./bin/rainier creds > /tmp/rainier-e2e-gh-creds.txt
@@ -1173,7 +1200,7 @@ ok "a session created against a stale credential failed in ${GH_STALE_SECS}s, na
 # ("a failed session still present on its runner is destroyed"). The verdict
 # that must survive the rm is the error column: a user who removes a failed
 # session must not lose the record of why it failed.
-./bin/rainier rm "$GH_SID2" >/dev/null || fail "rm of the failed session $GH_SID2"
+./bin/rainier delete "$GH_SID2" --yes >/dev/null || fail "delete of the unavailable session $GH_SID2"
 [ "$(state_all_of "$GH_SID2")" = destroyed ] \
   || fail "after rm, $GH_SID2 reads \"$(state_all_of "$GH_SID2")\" under ls --all, want destroyed"
 case "$(session_error "$GH_SID2")" in
@@ -1189,7 +1216,7 @@ psql_e2e "UPDATE credentials SET status='valid' WHERE provider='github'" >/dev/n
 
 # --- teardown of this phase's own state. The repository goes in cleanup, so it
 # is deleted whether or not everything above passed.
-./bin/rainier rm "$GH_SID" >/dev/null
+./bin/rainier delete "$GH_SID" --yes >/dev/null
 waitfor '[ -z "$(state_of "$GH_SID")" ]' 60 "the github session to go" \
   || fail "$GH_SID is still listed after rm"
 ./bin/rainier env rm "$GH_ENV_NAME" | grep -q removed || fail "env rm $GH_ENV_NAME"

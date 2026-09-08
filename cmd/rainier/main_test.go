@@ -22,7 +22,6 @@ import (
 	"github.com/tokencanopy/rainier/controlapp"
 	"github.com/tokencanopy/rainier/internal/cli"
 	"github.com/tokencanopy/rainier/protocol/terminal"
-	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 // ---------------------------------------------------------------------------
@@ -404,12 +403,14 @@ func TestLsHintsWhenFailedSessionsAreHidden(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out, err := captureStdout(t, func() error { return runLs(nil) })
+	_, diag, err := captureBoth(t, func() error { return runLs(nil) })
 	if err != nil {
 		t.Fatalf("ls: %v; requests=%v", err, paths)
 	}
-	if !strings.Contains(out, "rainier ls --all") {
-		t.Fatalf("ls output = %q, want a --all hint", out)
+	// The hint is a diagnostic beside a table somebody may be parsing, so it
+	// belongs on stderr (docs/cli-v0-contract.md §6.1).
+	if !strings.Contains(diag, "rainier ls --all") {
+		t.Fatalf("ls stderr = %q, want a --all hint", diag)
 	}
 	if len(paths) != 2 || paths[0] != "/v0/sessions" || paths[1] != "/v0/sessions?all=true&limit=1&state=failed" {
 		t.Fatalf("requests = %v, want default list then bounded failed-session probe", paths)
@@ -430,12 +431,12 @@ func TestLsAllDoesNotPrintTheHiddenFailureHint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out, err := captureStdout(t, func() error { return runLs([]string{"--all"}) })
+	out, diag, err := captureBoth(t, func() error { return runLs([]string{"--all"}) })
 	if err != nil {
 		t.Fatalf("ls --all: %v", err)
 	}
-	if strings.Contains(out, "sessions are hidden") {
-		t.Fatalf("ls --all output = %q, want no hidden-session hint", out)
+	if strings.Contains(out+diag, "sessions are hidden") {
+		t.Fatalf("ls --all output = %q/%q, want no hidden-session hint", out, diag)
 	}
 }
 
@@ -460,11 +461,11 @@ func TestLsIgnoresHiddenFailureProbeErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out, err := captureStdout(t, func() error { return runLs(nil) })
+	out, diag, err := captureBoth(t, func() error { return runLs(nil) })
 	if err != nil {
 		t.Fatalf("ls returned the optional probe error: %v", err)
 	}
-	if !strings.Contains(out, "ID") || strings.Contains(out, "sessions are hidden") {
+	if !strings.Contains(out, "NAME") || strings.Contains(out+diag, "sessions are hidden") {
 		t.Fatalf("ls output = %q, want the table without an unproven hint", out)
 	}
 }
@@ -473,51 +474,10 @@ func TestLsIgnoresHiddenFailureProbeErrors(t *testing.T) {
 // ls columns
 // ---------------------------------------------------------------------------
 
-// TestSessionStateCell pins the STATE column. A bare "queued" invites the
-// wrong question — is it stuck, is it broken? — so when controld says which
-// runner a queued session is waiting on, `ls` says it too, in place.
-func TestSessionStateCell(t *testing.T) {
-	cases := []struct {
-		name string
-		in   session
-		want string
-	}{
-		{"running", session{State: "running"}, "running"},
-		{"queued with nothing to explain", session{State: "queued"}, "queued"},
-		{
-			"queued behind a placement pin",
-			session{State: "queued", QueueReason: "waiting for runner rainier-gpu"},
-			"queued (waiting for runner rainier-gpu)",
-		},
-		{
-			// The session is still up — attachable, holding its slot — and the
-			// agent inside it has finished. "running" alone would leave a user
-			// watching a session that is never going to print anything again.
-			"running with a finished agent",
-			session{State: "running", ChildExitCode: intPtr(0)},
-			"running (exited 0)",
-		},
-		{
-			"running with a killed agent",
-			session{State: "running", ChildExitCode: intPtr(137)},
-			"running (exited 137)",
-		},
-		{
-			// A dead session's exit code is the diagnosis, and `ls --all` is
-			// where it is read.
-			"dead with an exit code",
-			session{State: "dead", ChildExitCode: intPtr(1)},
-			"dead (exited 1)",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := sessionStateCell(tc.in); got != tc.want {
-				t.Fatalf("sessionStateCell = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
+// The session model's own tests live in sessionstate_test.go: the three
+// dimensions, their independence, action eligibility from raw states, the
+// human columns, and JSON fidelity. What remains here is everything else
+// about `ls`.
 
 // intPtr is the one-liner a nullable int column needs at a test's call site.
 func intPtr(n int) *int { return &n }
@@ -930,6 +890,31 @@ func captureStdout(t *testing.T, fn func() error) (string, error) {
 	return out, runErr
 }
 
+// captureBoth is captureStdout with stderr captured too, for the assertions
+// about which stream a line went to — several of this CLI's outputs are on
+// stderr precisely because they are diagnostics beside parseable output.
+func captureBoth(t *testing.T, fn func() error) (stdout, stderr string, err error) {
+	t.Helper()
+	errR, errW, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		t.Fatalf("os.Pipe: %v", pipeErr)
+	}
+	savedErr := os.Stderr
+	os.Stderr = errW
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		io.Copy(&buf, errR)
+		done <- buf.String()
+	}()
+	stdout, err = captureStdout(t, fn)
+	os.Stderr = savedErr
+	errW.Close()
+	stderr = <-done
+	errR.Close()
+	return stdout, stderr, err
+}
+
 // credsServer serves GET /v0/credentials with the given body and records the
 // path it was asked for.
 func credsServer(t *testing.T, body string) (*httptest.Server, *string) {
@@ -1132,32 +1117,6 @@ func TestSplitRemote(t *testing.T) {
 	}
 }
 
-// TestRenderDiff: one heading per repository naming both branches, git's stat
-// underneath, and an explicit line for a repository with nothing to show —
-// silence there would read as a rendering bug.
-func TestRenderDiff(t *testing.T) {
-	var buf bytes.Buffer
-	renderDiff(&buf, workspace.DiffAnswer{Repos: []workspace.RepoDiff{
-		{Repo: "acme/widget", BaseBranch: "main", SessionBranch: "rainier/dev", Stat: " main.go | 2 +-\n 1 file changed\n"},
-		{Repo: "acme/other", BaseBranch: "trunk", SessionBranch: "rainier/dev", Stat: ""},
-	}})
-	out := buf.String()
-	for _, want := range []string{"acme/widget", "rainier/dev", "main", "main.go | 2 +-", "acme/other", "no changes"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("diff output missing %q:\n%s", want, out)
-		}
-	}
-}
-
-// A session with no repositories says so rather than printing an empty page.
-func TestRenderDiffWithNoRepos(t *testing.T) {
-	var buf bytes.Buffer
-	renderDiff(&buf, workspace.DiffAnswer{})
-	if !strings.Contains(buf.String(), "no repositories") {
-		t.Errorf("diff output = %q, want it to say the session has no repositories", buf.String())
-	}
-}
-
 // ---------------------------------------------------------------------------
 // attach: which of three requests --since spells
 // ---------------------------------------------------------------------------
@@ -1175,16 +1134,21 @@ func TestAttachFlagsCursor(t *testing.T) {
 		args   []string
 		ref    string
 		cursor uint64
+		replay bool
 	}{
-		{"no flag is no cursor", []string{"sess_a"}, "sess_a", 0},
-		{"--since 0 is the whole log", []string{"--since", "0", "sess_a"}, "sess_a", terminal.SinceAll},
-		{"--since 0 after the ref", []string{"sess_a", "--since", "0"}, "sess_a", terminal.SinceAll},
-		{"--since N resumes", []string{"my-box", "--since", "19"}, "my-box", 19},
+		{"no flag is no cursor", []string{"sess_a"}, "sess_a", 0, false},
+		{"--since 0 is the whole log", []string{"--since", "0", "sess_a"}, "sess_a", terminal.SinceAll, true},
+		{"--since 0 after the ref", []string{"sess_a", "--since", "0"}, "sess_a", terminal.SinceAll, true},
+		{"--since N resumes", []string{"my-box", "--since", "19"}, "my-box", 19, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ref, cursor := attachFlags(tc.args)
-			if ref != tc.ref || cursor != tc.cursor {
-				t.Fatalf("attachFlags(%q) = (%q, %d), want (%q, %d)", tc.args, ref, cursor, tc.ref, tc.cursor)
+			ref, cursor, replay, err := attachFlags(tc.args)
+			if err != nil {
+				t.Fatalf("attachFlags(%q): %v", tc.args, err)
+			}
+			if ref != tc.ref || cursor != tc.cursor || replay != tc.replay {
+				t.Fatalf("attachFlags(%q) = (%q, %d, %t), want (%q, %d, %t)",
+					tc.args, ref, cursor, replay, tc.ref, tc.cursor, tc.replay)
 			}
 		})
 	}
@@ -1195,7 +1159,7 @@ func TestAttachFlagsCursor(t *testing.T) {
 // test pins how the CLI composes them without adding a second server-side
 // lifecycle path.
 func TestPrepareAttach(t *testing.T) {
-	for _, state := range []string{"running", "creating", "queued", "failed"} {
+	for _, state := range []string{"running", "creating", "queued"} {
 		t.Run("does not resume "+state, func(t *testing.T) {
 			var resumes int
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1212,7 +1176,7 @@ func TestPrepareAttach(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach"); err != nil {
+			if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
 				t.Fatalf("prepareAttach: %v", err)
 			}
 			if resumes != 0 {
@@ -1238,7 +1202,7 @@ func TestPrepareAttach(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach"); err != nil {
+			if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
 				t.Fatalf("prepareAttach: %v", err)
 			}
 			if resumes != 1 {
@@ -1247,16 +1211,106 @@ func TestPrepareAttach(t *testing.T) {
 		})
 	}
 
-	t.Run("refuses a permanently ended session", func(t *testing.T) {
+	// A running session whose child exited is STILL ATTACHABLE. The sandbox
+	// is up, the screen is there, and the server accepts the attach — so the
+	// CLI must not refuse it. This is the case the collapsed display state
+	// used to get wrong.
+	t.Run("attaches to a running session whose child exited", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_attach", State: "dead"}})
+			json.NewEncoder(w).Encode(sessionEnvelope{Session: session{
+				ID: "sess_attach", Name: "box", State: "running", Reachable: true, ChildExitCode: intPtr(0),
+			}})
 		}))
 		defer ts.Close()
 
-		err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach")
-		if err == nil || !strings.Contains(err.Error(), `session sess_attach is dead and cannot be attached`) {
-			t.Fatalf("prepareAttach error = %v, want a direct dead-session error", err)
+		if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
+			t.Fatalf("prepareAttach refused an attachable session: %v", err)
+		}
+	})
+
+	// A failed session keeps a diagnostic terminal only while its runner is
+	// connected — that is AttachmentService.attachable's own rule, and it is
+	// the one place a connection fact legitimately decides an action.
+	t.Run("attaches to a failed session while its runner is connected", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(sessionEnvelope{Session: session{
+				ID: "sess_attach", Name: "box", State: "failed", Reachable: true,
+			}})
+		}))
+		defer ts.Close()
+
+		if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
+			t.Fatalf("prepareAttach refused a failed session with a live runner: %v", err)
+		}
+	})
+
+	// The refusals, each naming its own cause. A connection failure and a
+	// vanished sandbox are different problems with different recoveries, and
+	// the messages keep them apart.
+	for _, tc := range []struct {
+		name   string
+		row    session
+		want   string
+		replay bool
+	}{
+		{
+			"a failed session whose runner is gone",
+			session{ID: "sess_attach", Name: "box", State: "failed"},
+			"no longer connected", false,
+		},
+		{
+			"a canceled session",
+			session{ID: "sess_attach", Name: "box", State: "canceled"},
+			"is Canceled", false,
+		},
+		{
+			"a deleted session",
+			session{ID: "sess_attach", Name: "box", State: "destroyed"},
+			"is Deleted", false,
+		},
+		{
+			"a dead session",
+			session{ID: "sess_attach", Name: "box", State: "dead"},
+			"is Failed", false,
+		},
+	} {
+		t.Run("refuses "+tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(sessionEnvelope{Session: tc.row})
+			}))
+			defer ts.Close()
+
+			err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("prepareAttach error = %v, want one containing %q", err, tc.want)
+			}
+			// The refusal has to name what to do next, or it is a dead end.
+			if !strings.Contains(err.Error(), "rainier info box") {
+				t.Errorf("refusal does not point anywhere: %v", err)
+			}
+			// --since is the documented diagnostic override.
+			if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", true); err != nil {
+				t.Fatalf("--since must override the refusal, got: %v", err)
+			}
+		})
+	}
+
+	// A state this build has never heard of makes no claim: the attach is
+	// attempted and the server is the authority.
+	t.Run("attempts an unknown future state", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(sessionEnvelope{Session: session{
+				ID: "sess_attach", Name: "box", State: "hibernating", Reachable: true,
+			}})
+		}))
+		defer ts.Close()
+
+		if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
+			t.Fatalf("prepareAttach refused an unknown state locally: %v", err)
 		}
 	})
 
@@ -1279,7 +1333,7 @@ func TestPrepareAttach(t *testing.T) {
 		}))
 		defer ts.Close()
 
-		if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach"); err != nil {
+		if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
 			t.Fatalf("prepareAttach: %v", err)
 		}
 		if gets != 4 {
@@ -1301,7 +1355,7 @@ func TestPrepareAttach(t *testing.T) {
 		}))
 		defer ts.Close()
 
-		err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach")
+		err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false)
 		if err == nil || !strings.Contains(err.Error(), "conflict: session cannot be resumed right now") {
 			t.Fatalf("prepareAttach error = %v, want the original resume failure", err)
 		}
@@ -1667,7 +1721,7 @@ func TestCloudLoginStoresTheHostedContext(t *testing.T) {
 	got := saved.Contexts[name]
 	want := cli.Context{
 		Server: edge.URL, Token: "tok_access_example", Workspace: "ws_example",
-		RefreshToken: "tok_refresh_example", AccessExpiresAt: "2026-09-02T00:10:00Z",
+		RefreshToken: "tok_refresh_example", AccessExpiresAt: "2026-09-02T00:10:00Z", Kind: cli.KindHosted,
 	}
 	if got != want {
 		t.Errorf("stored context = %+v, want %+v", got, want)
@@ -1844,6 +1898,11 @@ func agentServer(t *testing.T, agents []string) (*httptest.Server, *[]agentCall)
 			gets++
 			w.Header().Set("Content-Type", "application/json")
 			io.WriteString(w, agents[i])
+		// These fixtures publish no environments: that is the "workspace has
+		// no default environment" case the agent-login readiness test drives.
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/environments":
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"environments":[]}`)
 		case r.Method == http.MethodPost && r.URL.Path == "/v0/sessions":
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(sessionEnvelope{Session: session{ID: "sess_example", State: "queued"}})
@@ -1904,6 +1963,11 @@ func useAgentServer(t *testing.T, ts *httptest.Server) *[]string {
 }
 
 // answerPrompt feeds one line to the confirmation prompt.
+// answerPrompt puts one answer on stdin and tells the CLI there is a person
+// at the keyboard. Both halves are needed: without the pipe the read has no
+// answer, and without the terminal claim the confirmation paths refuse rather
+// than prompt — which is exactly the behavior TestDeleteRequiresConsent pins
+// from the other side.
 func answerPrompt(t *testing.T, line string) {
 	t.Helper()
 	r, w, err := os.Pipe()
@@ -1912,7 +1976,9 @@ func answerPrompt(t *testing.T, line string) {
 	}
 	saved := os.Stdin
 	os.Stdin = r
-	t.Cleanup(func() { os.Stdin = saved; r.Close() })
+	savedTTY := isInteractive
+	isInteractive = func() bool { return true }
+	t.Cleanup(func() { os.Stdin = saved; isInteractive = savedTTY; r.Close() })
 	go func() {
 		io.WriteString(w, line)
 		w.Close()
@@ -2036,49 +2102,62 @@ func TestAgentLoginRefusesAnUnknownProviderWithoutARequest(t *testing.T) {
 	}
 }
 
-// --env is required, and the refusal says why an environment is needed at all.
-func TestAgentLoginRequiresAnEnvironment(t *testing.T) {
+// An ordinary hosted user never types --env: the workspace's default
+// environment is the answer, and it is the server's to give. When there is
+// none, that is a READINESS problem — the workspace has no image carrying the
+// agent — and must not be reported as a flag somebody forgot to pass
+// (docs/cli-v0-contract.md §4.4).
+func TestAgentLoginReportsAMissingEnvironmentAsReadiness(t *testing.T) {
 	p := controlapp.AgentProviders()[0]
 	ts, calls := agentServer(t, []string{agentsBody(t, 0)})
 	useAgentServer(t, ts)
 
 	_, err := captureStdout(t, func() error { return runAgentLogin([]string{p.Name}) })
 	if err == nil {
-		t.Fatal("agent login ran without --env")
+		t.Fatal("agent login ran with no environment available")
 	}
-	const want = "the provider's CLI has to be in the image: name an environment that has it with --env"
-	if err.Error() != want {
-		t.Errorf("error = %q, want %q", err, want)
+	for _, want := range []string{"no default environment", "rainier status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to mention %q", err, want)
+		}
 	}
-	if len(*calls) != 0 {
-		t.Errorf("calls = %+v, want none", *calls)
+	// It must not have created a session it knew could only fail.
+	for _, call := range *calls {
+		if call.method == http.MethodPost {
+			t.Errorf("agent login created something before it had an environment: %+v", call)
+		}
 	}
 }
 
-// `agent ls` renders every provider the server named, in the order it named
-// them, with a dash for a provider nobody has logged in.
-func TestAgentLsRendersTheTable(t *testing.T) {
+// `agent status` renders every provider the server named, in the order it
+// named them, in the three words the contract allows — and never in the
+// server's own custody vocabulary (docs/cli-v0-contract.md §4.4).
+func TestAgentStatusRendersTheTable(t *testing.T) {
 	ts, calls := agentServer(t, []string{agentsBody(t, 2)})
 	useAgentServer(t, ts)
 
-	out, err := captureStdout(t, func() error { return runAgentLs(nil) })
+	out, err := captureStdout(t, func() error { return runAgentStatus(nil) })
 	if err != nil {
-		t.Fatalf("agent ls: %v", err)
+		t.Fatalf("agent status: %v", err)
 	}
 	if len(*calls) != 1 || (*calls)[0].path != "/v0/agents" {
 		t.Fatalf("calls = %+v, want one GET /v0/agents", *calls)
 	}
-	for _, want := range []string{"PROVIDER", "STATUS", "SINCE", "VERSION", "WORKSPACES", "logged_in", "none", "ws_example"} {
+	for _, want := range []string{"AGENT", "STATUS", "SINCE", agentReady, agentNotConfigured} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
+	}
+	// "logged_in" is custody's word, not a person's, and it must not leak.
+	if strings.Contains(out, "logged_in") {
+		t.Errorf("agent status leaked the server's internal status vocabulary:\n%s", out)
 	}
 	rows := controlapp.AgentProviders()
 	first, second := strings.Index(out, rows[0].Name), strings.Index(out, rows[1].Name)
 	if first < 0 || second < 0 || first > second {
 		t.Errorf("providers are not in table order:\n%s", out)
 	}
-	if !strings.Contains(out, "\t-\t") && !strings.Contains(out, " -  ") && !strings.Contains(out, " - ") {
+	if !strings.Contains(out, "-\n") {
 		t.Errorf("output has no dash for the absent since:\n%s", out)
 	}
 }
@@ -2086,16 +2165,16 @@ func TestAgentLsRendersTheTable(t *testing.T) {
 // The CLI decodes only the fields it displays, so a field this version does
 // not know about — including one a future or misbehaving server used to carry
 // something it should not have — never reaches a terminal or a CI log.
-func TestAgentLsRendersNothingItDoesNotKnow(t *testing.T) {
+func TestAgentStatusRendersNothingItDoesNotKnow(t *testing.T) {
 	p := controlapp.AgentProviders()[0]
 	body := fmt.Sprintf(`{"agents":[{"provider":%q,"status":"logged_in","since":"2026-01-02T03:04:05Z",`+
 		`"version":1,"workspaces":["ws_example"],"files":{"x":"credential_example"}}]}`, p.Name)
 	ts, _ := agentServer(t, []string{body})
 	useAgentServer(t, ts)
 
-	out, err := captureStdout(t, func() error { return runAgentLs(nil) })
+	out, err := captureStdout(t, func() error { return runAgentStatus(nil) })
 	if err != nil {
-		t.Fatalf("agent ls: %v", err)
+		t.Fatalf("agent status: %v", err)
 	}
 	if strings.Contains(out, "credential_example") {
 		t.Fatalf("the table rendered a field it does not know:\n%s", out)
@@ -2114,15 +2193,18 @@ func TestAgentLogoutPrompts(t *testing.T) {
 		useAgentServer(t, ts)
 		answerPrompt(t, "n\n")
 
-		out, err := captureStdout(t, func() error { return runAgentLogout([]string{p.Name}) })
+		// The caveat and the prompt are an interaction, not a result, so they
+		// go to stderr — which is what lets a --json command promise that its
+		// document is the only thing on stdout.
+		_, diag, err := captureBoth(t, func() error { return runAgentLogout([]string{p.Name}) })
 		if err != nil {
 			t.Fatalf("agent logout: %v", err)
 		}
-		if !strings.Contains(out, caveat) {
-			t.Errorf("output = %q, want the caveat", out)
+		if !strings.Contains(diag, caveat) {
+			t.Errorf("stderr = %q, want the caveat", diag)
 		}
-		if !strings.Contains(out, "continue? [y/N]") {
-			t.Errorf("output = %q, want the prompt", out)
+		if !strings.Contains(diag, "continue? [y/N]") {
+			t.Errorf("stderr = %q, want the prompt", diag)
 		}
 		if len(*calls) != 0 {
 			t.Errorf("calls = %+v, want none after a refusal", *calls)
@@ -2150,15 +2232,15 @@ func TestAgentLogoutPrompts(t *testing.T) {
 		ts, calls := agentServer(t, []string{agentsBody(t, 1)})
 		useAgentServer(t, ts)
 
-		out, err := captureStdout(t, func() error { return runAgentLogout([]string{p.Name, "--yes"}) })
+		out, diag, err := captureBoth(t, func() error { return runAgentLogout([]string{p.Name, "--yes"}) })
 		if err != nil {
 			t.Fatalf("agent logout --yes: %v", err)
 		}
-		if strings.Contains(out, "continue? [y/N]") {
-			t.Errorf("output = %q, want no prompt under --yes", out)
+		if strings.Contains(out+diag, "continue? [y/N]") {
+			t.Errorf("output = %q/%q, want no prompt under --yes", out, diag)
 		}
-		if !strings.Contains(out, caveat) {
-			t.Errorf("output = %q, want the caveat even under --yes", out)
+		if !strings.Contains(diag, caveat) {
+			t.Errorf("stderr = %q, want the caveat even under --yes", diag)
 		}
 		if len(*calls) != 1 || (*calls)[0].method != http.MethodDelete {
 			t.Fatalf("calls = %+v, want one DELETE", *calls)

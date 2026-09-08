@@ -29,14 +29,28 @@ lists several workspaces, select the actual id it displayed:
 ```bash
 rainier workspace use ws_example
 rainier context current
-rainier doctor
+rainier status
 ```
 
-`doctor` takes at most about 15 seconds of network work, including normal token
-refresh. It reports PASS/WARN/FAIL with a next action. Exit 0 means the required
-basic-session checks passed; exit 1 means one failed; invalid usage exits 2.
-It does not create sessions, environments, or infrastructure. A normal hosted
-token refresh can save rotated credentials to the current context.
+On the hosted service a bare `rainier login` is enough after the first time: it
+signs in again to the server this machine already uses, and it is safe to
+rerun. `rainier logout` removes those credentials and nothing else — remote
+sessions keep running, coding-agent logins stay in the workspace, and the
+GitHub connection stays authorized.
+
+`rainier status` answers one question in seven lines: signed in, workspace,
+compute, default environment, GitHub, and each coding agent. Every line comes
+from the server, never from local configuration, and when something has to
+happen on the web the server names the address to continue at. Exit 0 means
+everything required is ready; exit 1 means it is not; invalid usage exits 2.
+`--json` prints one document; `--verbose` adds the full diagnostics that
+`rainier doctor` used to print, and `doctor` remains as an alias for
+`status --verbose`.
+
+The verbose report takes at most about 15 seconds of network work, including
+normal token refresh. It reports PASS/WARN/FAIL with a next action. It creates
+no sessions, environments, or infrastructure; a normal hosted token refresh can
+save rotated credentials to the current context.
 
 Authentication and observable runner capacity are required. Unknown or unavailable
 runner readiness fails the check. Missing environments or agent logins warn that
@@ -97,39 +111,62 @@ the command fails and asks you to inspect `rainier connection ls`.
 ## Choose an environment and sign in to your coding agent
 
 ```bash
-rainier env ls
-rainier env show dev             # replace dev with an available environment
-rainier agent ls
-rainier agent login codex --env dev
-rainier doctor
+rainier agent status
+rainier agent login codex
+rainier status
 ```
 
-The `codex` example requires that the selected environment already contains Codex.
-Use `rainier agent --help` to see supported providers, and finish the provider's
-login flow before exiting that login session. If there is no suitable environment,
-ask your administrator to create one with the needed image, setup, and egress;
-`rainier env --help` documents the existing environment commands. Rainier does not
-install an agent merely because `agent login` names it.
+On the hosted service that is the whole of it: `agent login` runs in your
+workspace's default environment, whose image contains the agent. On a
+self-hosted server that publishes several environments, choose one and name it:
+
+```bash
+rainier env ls                   # advanced: rainier help all
+rainier env show dev             # replace dev with an available environment
+rainier agent login codex --env dev
+```
+
+Finish the provider's login flow before exiting that login session. If there is
+no suitable environment, `agent login` says so as a readiness problem rather
+than asking for a flag; ask your administrator to create one with the needed
+image, setup, and egress. Rainier does not install an agent merely because
+`agent login` names it.
+
+`agent status` reports `not configured`, `ready`, or `needs attention`.
+`ready` means a credential is stored; Rainier does not verify it with the
+provider.
 
 ## Start, detach, and return
 
 ```bash
-rainier new --env dev --name box1
+rainier new --name box1
 # In the terminal, Ctrl-] detaches and leaves the session running.
 rainier ls
 rainier attach box1
 ```
 
-Pass a command after `--` if your environment does not already start the desired
-agent, for example `rainier new --env dev --name box2 -- codex`.
-Use `--detach` on `new` to create without opening the terminal. `attach` resumes a
-suspended session when necessary and restores the current screen. To replay all
-recorded output, use `rainier attach box1 --since 0`.
+With no `--env`, `new` starts from your workspace's default environment. Pass a
+command after `--` to run something specific, for example
+`rainier new --name box2 -- codex`. Use `--detach` to create without opening the
+terminal.
+
+`rainier ls` shows name, state and age; states are `starting`, `running`,
+`stopped`, `finished` and `unavailable`. `--all` adds finished and unavailable
+history, and `--verbose` adds ids, environments, runners and the server's own
+state. `rainier info <session>` is one session in full.
+
+Any session command takes a name, a `sess_` id, or the word `current`, which is
+the session you last created or attached.
+
+`attach` resumes a stopped session when necessary and restores the current
+screen. A session whose process has finished says so rather than opening a
+screen nothing will write to; `rainier attach box1 --since 0` replays all
+recorded output and is the way to read a failed session's log.
 
 If initial attach keeps receiving 503 responses, the CLI waits about a minute,
 then makes bounded readiness observations and prints a reattach command. It keeps
 the session; do not repeatedly create replacements. Ctrl-C stops waiting without
-removing the session. Run `rainier doctor`, follow its guidance, and reattach with
+removing the session. Run `rainier status --verbose`, follow its guidance, and reattach with
 the printed session id. A queue reason can identify a runner/capability constraint;
 otherwise the CLI reports only observed capacity or says the cause is unknown.
 Transient disconnects after a successful attach continue to reconnect from the
@@ -147,4 +184,12 @@ failed refresh exchange is not retried automatically because refresh tokens are
 single-use. Terminal input modes are cleaned up on final return to the shell,
 without clearing local scrollback.
 
-`rainier rm <id|name>` destroys a session when you deliberately want to remove it.
+`rainier stop <session>` stops a session and releases its compute; attaching
+brings it back where you left it. `rainier delete <session>` destroys one
+permanently — it asks first on a terminal and requires `--yes` in a script.
+`rainier suspend` and `rainier rm` remain as compatibility aliases for scripts
+that already call them.
+
+Git inside the session is the source of truth for repository state: attach and
+run `git status`, `git diff` or `git log` there. Rainier has no repository-diff
+command.
