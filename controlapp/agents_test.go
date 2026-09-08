@@ -16,9 +16,15 @@ import (
 // of its own, and this test is the place where the two spellings are proven to
 // agree.
 type agentEnvEntry struct {
-	Provider string   `json:"provider"`
-	Dir      string   `json:"dir"`
-	Files    []string `json:"files"`
+	Provider  string             `json:"provider"`
+	Dir       string             `json:"dir"`
+	Files     []string           `json:"files"`
+	SeedFiles []agentEnvSeedFile `json:"seed_files,omitempty"`
+}
+
+type agentEnvSeedFile struct {
+	Name     string `json:"name"`
+	Contents string `json:"contents"`
 }
 
 // withTestAgentProvider turns the synthetic provider on for one test and off
@@ -189,6 +195,14 @@ func TestCreateSpecCarriesTheHome(t *testing.T) {
 		if !slices.Equal(entries[i].Files, p.Files) {
 			t.Fatalf("manifest files for %q = %v, want %v", p.Name, entries[i].Files, p.Files)
 		}
+		if len(entries[i].SeedFiles) != len(p.SeedFiles) {
+			t.Fatalf("manifest seed files for %q = %+v, want %+v", p.Name, entries[i].SeedFiles, p.SeedFiles)
+		}
+		for j, seed := range p.SeedFiles {
+			if entries[i].SeedFiles[j].Name != seed.Name || entries[i].SeedFiles[j].Contents != seed.Contents {
+				t.Fatalf("manifest seed file %d for %q = %+v, want %+v", j, p.Name, entries[i].SeedFiles[j], seed)
+			}
+		}
 	}
 
 	// A session nobody created — there is no such thing today, but the field
@@ -229,6 +243,38 @@ func TestCreateSpecCarriesTheHome(t *testing.T) {
 	}
 	if got := spec.Env[first.HomeEnv]; got != override {
 		t.Fatalf("env %s = %q, want the resolver's %q", first.HomeEnv, got, override)
+	}
+}
+
+func TestClaudeProviderSeedsOnlyOnboardingCompletion(t *testing.T) {
+	var claude AgentProvider
+	for _, provider := range AgentProviders() {
+		if provider.Name == "claude" {
+			claude = provider
+			break
+		}
+	}
+	if claude.Name == "" {
+		t.Fatal("the provider table has no Claude row")
+	}
+	if len(claude.SeedFiles) != 1 || claude.SeedFiles[0].Name != ".claude.json" {
+		t.Fatalf("Claude seed files = %+v, want only .claude.json", claude.SeedFiles)
+	}
+	var state map[string]any
+	if err := json.Unmarshal([]byte(claude.SeedFiles[0].Contents), &state); err != nil {
+		t.Fatalf("Claude onboarding seed is not JSON: %v", err)
+	}
+	if len(state) != 1 || state["hasCompletedOnboarding"] != true {
+		t.Fatalf("Claude onboarding seed keys = %v, want only hasCompletedOnboarding=true", state)
+	}
+	if slices.Contains(claude.Files, ".claude.json") {
+		t.Fatal("Claude application state is in account-wide credential custody")
+	}
+
+	first := AgentProviders()
+	first[0].SeedFiles[0].Contents = "mutated"
+	if got := AgentProviders()[0].SeedFiles[0].Contents; got == "mutated" {
+		t.Fatal("a caller mutated the provider table's onboarding seed")
 	}
 }
 

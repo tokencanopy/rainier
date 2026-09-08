@@ -29,9 +29,10 @@ import (
 // custody and the next boot fetched it back.
 //
 // NOTHING HERE KNOWS WHAT A PROVIDER IS. The driver injects a manifest
-// (RAINIER_AGENTS_B64) of rows that each say a name, a directory, and the file
-// names inside it that are the set; this file makes directories, writes files,
-// stats them, reads them and deletes them. Which tool the name belongs to,
+// (RAINIER_AGENTS_B64) of rows that each say a name, a directory, the file
+// names inside it that are the set, and optional non-secret files to seed after
+// a credential restore; this file makes directories, writes files, stats them,
+// reads them and deletes them. Which tool the name belongs to,
 // which variable points it at its directory, and which hosts it talks to are
 // the control plane's table (controlapp/agents.go) and are never spelled here —
 // which is what makes adding a third agent a row rather than a change to the
@@ -62,6 +63,10 @@ const (
 	// sandbox can push through this channel by writing into an allowlisted
 	// name.
 	agentSetMaxBytes = 64 << 10
+	// agentSeedFileMaxBytes keeps the provider manifest from becoming an
+	// unbounded file-write channel. Seeds are tiny non-secret compatibility
+	// markers, not another home snapshot.
+	agentSeedFileMaxBytes = 4 << 10
 	// agentCallTimeout bounds one fetch or put. It is the RPC's own existing
 	// call budget — the same one the in-sandbox socket gives a mint — because
 	// this is the same hop through the same forwarders.
@@ -107,15 +112,22 @@ const agentMountSentence = "this runner does not mount agent homes; upgrade runn
 var agentsMountRoot = "/rainier/agents"
 
 // agentEntry is one row of RAINIER_AGENTS_B64: a provider's name, its directory
-// under the mount, the file names inside it that make up the set, and — for a
-// provider that also writes under $HOME — the variable to redirect. The JSON
+// under the mount, the file names inside it that make up the set, optional
+// non-secret files to seed after restore, and — for a provider that also writes
+// under $HOME — the variable to redirect. The JSON
 // tags mirror controlapp's manifest exactly; the two spellings are the contract
 // across the env-var channel and have to stay identical.
+type agentSeedFile struct {
+	Name     string `json:"name"`
+	Contents string `json:"contents"`
+}
+
 type agentEntry struct {
-	Provider string   `json:"provider"`
-	Dir      string   `json:"dir"`
-	Files    []string `json:"files"`
-	HomeVar  string   `json:"home_var,omitempty"`
+	Provider  string          `json:"provider"`
+	Dir       string          `json:"dir"`
+	Files     []string        `json:"files"`
+	SeedFiles []agentSeedFile `json:"seed_files,omitempty"`
+	HomeVar   string          `json:"home_var,omitempty"`
 }
 
 // agentNote is the boot note's payload: which home, and what to say about it.
@@ -186,12 +198,33 @@ func checkAgentEntry(e agentEntry) error {
 	if len(e.Files) == 0 {
 		return errors.New("the row lists no files")
 	}
+	seen := make(map[string]bool, len(e.Files)+len(e.SeedFiles))
 	for _, n := range e.Files {
-		if n == "" || n != filepath.Base(n) || n == "." || n == ".." {
+		if !bareAgentFileName(n) {
 			return fmt.Errorf("%q is not a bare file name", n)
 		}
+		if seen[n] {
+			return fmt.Errorf("%q is named more than once", n)
+		}
+		seen[n] = true
+	}
+	for _, seed := range e.SeedFiles {
+		if !bareAgentFileName(seed.Name) {
+			return fmt.Errorf("%q is not a bare seed file name", seed.Name)
+		}
+		if seen[seed.Name] {
+			return fmt.Errorf("%q is both synchronized and seeded", seed.Name)
+		}
+		if len(seed.Contents) > agentSeedFileMaxBytes {
+			return fmt.Errorf("%q seed is over %d bytes", seed.Name, agentSeedFileMaxBytes)
+		}
+		seen[seed.Name] = true
 	}
 	return nil
+}
+
+func bareAgentFileName(name string) bool {
+	return name != "" && name == filepath.Base(name) && name != "." && name != ".."
 }
 
 // underAgentMount reports whether dir is a directory inside the mounted home
@@ -509,6 +542,18 @@ func (a *agentSync) fetchOne(e agentEntry) {
 		}
 		held[name] = blob
 		log.Printf("home %q: wrote %s (%d bytes) at v%d", e.Provider, name, len(blob), body.Version)
+	}
+	if body.Version > 0 && len(held) > 0 {
+		for _, seed := range e.SeedFiles {
+			created, err := writeAgentFileIfAbsent(filepath.Join(e.Dir, seed.Name), []byte(seed.Contents))
+			if err != nil {
+				a.note(e.Provider, fmt.Sprintf("%s could not be initialized: %v", seed.Name, err))
+				continue
+			}
+			if created {
+				log.Printf("home %q: initialized %s after credential restore", e.Provider, seed.Name)
+			}
+		}
 	}
 
 	a.mu.Lock()
@@ -843,6 +888,36 @@ func writeAgentFile(path string, blob []byte) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// writeAgentFileIfAbsent atomically creates a non-secret provider seed without
+// replacing state another session or the agent already wrote. The hard link
+// publishes a complete 0600 temp file in one step; an existing file wins.
+func writeAgentFileIfAbsent(path string, blob []byte) (bool, error) {
+	f, err := os.CreateTemp(filepath.Dir(path), ".rainier-seed-")
+	if err != nil {
+		return false, err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return false, err
+	}
+	if _, err := f.Write(blob); err != nil {
+		f.Close()
+		return false, err
+	}
+	if err := f.Close(); err != nil {
+		return false, err
+	}
+	if err := os.Link(tmp, path); err != nil {
+		if os.IsExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // statAgentFiles is the cheap half of the loop: what the allowlisted files

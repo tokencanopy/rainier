@@ -30,6 +30,12 @@ const agentFixture = "credential_example"
 // file's contents.
 const agentFileName = "auth.json"
 
+const (
+	agentSeedName     = "onboarding.json"
+	agentSeedFixture  = `{"hasCompletedOnboarding":true}`
+	agentExistingSeed = `{"hasCompletedOnboarding":true,"theme":"light"}`
+)
+
 // ---------------------------------------------------------------------------
 // the fake host
 // ---------------------------------------------------------------------------
@@ -341,12 +347,82 @@ func TestAgentsStageWritesFetchedFilesReadOnlyToOwner(t *testing.T) {
 	}
 }
 
+func TestAgentsStageSeedsOnboardingAfterCredentialRestore(t *testing.T) {
+	e := agentTestEntry(t)
+	e.SeedFiles = []agentSeedFile{{Name: agentSeedName, Contents: agentSeedFixture}}
+	h := newFakeAgentHost(t)
+	h.setFetch(3, map[string]string{agentFileName: agentFixture})
+	a := newTestAgentSync(h, []agentEntry{e}, make(chan []byte, 8))
+
+	a.boot()
+
+	path := filepath.Join(e.Dir, agentSeedName)
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("onboarding state was not seeded: %v", err)
+	}
+	if string(body) != agentSeedFixture {
+		t.Fatalf("onboarding state = %q, want the provider seed", body)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("onboarding state mode = %o, want 600", got)
+	}
+
+	a.tick(time.Now())
+	if got := h.putCount(); got != 0 {
+		t.Fatalf("onboarding state entered credential custody in %d put(s), want 0", got)
+	}
+}
+
+func TestAgentsStageDoesNotSeedFromUnversionedCredentialFiles(t *testing.T) {
+	e := agentTestEntry(t)
+	e.SeedFiles = []agentSeedFile{{Name: agentSeedName, Contents: agentSeedFixture}}
+	h := newFakeAgentHost(t)
+	h.setFetch(0, map[string]string{agentFileName: agentFixture})
+	a := newTestAgentSync(h, []agentEntry{e}, make(chan []byte, 8))
+
+	a.boot()
+
+	if _, err := os.Stat(filepath.Join(e.Dir, agentSeedName)); !os.IsNotExist(err) {
+		t.Fatalf("onboarding state exists for an unversioned credential response: %v", err)
+	}
+}
+
+func TestAgentsStageDoesNotOverwriteExistingOnboardingState(t *testing.T) {
+	e := agentTestEntry(t)
+	e.SeedFiles = []agentSeedFile{{Name: agentSeedName, Contents: agentSeedFixture}}
+	if err := os.MkdirAll(e.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(e.Dir, agentSeedName), []byte(agentExistingSeed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := newFakeAgentHost(t)
+	h.setFetch(3, map[string]string{agentFileName: agentFixture})
+	a := newTestAgentSync(h, []agentEntry{e}, make(chan []byte, 8))
+
+	a.boot()
+
+	body, err := os.ReadFile(filepath.Join(e.Dir, agentSeedName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != agentExistingSeed {
+		t.Fatalf("existing onboarding state = %q, want it preserved", body)
+	}
+}
+
 // TestAgentsStageWithNoCredentialStartsTheAgentAnyway: version 0 with no files
 // is custody's truthful answer for a person who has not logged this agent in.
 // It is an answer, not a refusal — the directory is made, nothing is written,
 // and no note is raised.
 func TestAgentsStageWithNoCredentialStartsTheAgentAnyway(t *testing.T) {
 	e := agentTestEntry(t)
+	e.SeedFiles = []agentSeedFile{{Name: agentSeedName, Contents: agentSeedFixture}}
 	h := newFakeAgentHost(t)
 	h.setFetch(0, nil)
 	events := make(chan []byte, 8)
@@ -360,6 +436,9 @@ func TestAgentsStageWithNoCredentialStartsTheAgentAnyway(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("%d file(s) in a home custody has nothing for, want 0", len(entries))
+	}
+	if _, err := os.Stat(filepath.Join(e.Dir, agentSeedName)); !os.IsNotExist(err) {
+		t.Fatalf("onboarding state exists without a restored credential: %v", err)
 	}
 	if v, ok := a.baseline("test"); !ok || v != 0 {
 		t.Fatalf("baseline version = %d (%v), want 0", v, ok)
@@ -578,7 +657,10 @@ func TestAgentsManifestIsReadLikeTheRepositoryList(t *testing.T) {
 		{Provider: "a", Dir: filepath.Join(root, "a"), Files: []string{agentFileName}},
 		{Provider: "b", Dir: "/workspace/b", Files: []string{agentFileName}},
 		{Provider: "c", Dir: filepath.Join(root, "c"), Files: []string{"../../escape"}},
-		{Provider: "", Dir: filepath.Join(root, "d"), Files: []string{agentFileName}},
+		{Provider: "d", Dir: filepath.Join(root, "d"), Files: []string{agentFileName}, SeedFiles: []agentSeedFile{{Name: "../../escape", Contents: agentSeedFixture}}},
+		{Provider: "e", Dir: filepath.Join(root, "e"), Files: []string{agentFileName}, SeedFiles: []agentSeedFile{{Name: agentFileName, Contents: agentSeedFixture}}},
+		{Provider: "f", Dir: filepath.Join(root, "f"), Files: []string{agentFileName}, SeedFiles: []agentSeedFile{{Name: agentSeedName, Contents: strings.Repeat("x", agentSeedFileMaxBytes+1)}}},
+		{Provider: "", Dir: filepath.Join(root, "g"), Files: []string{agentFileName}},
 	})
 	got := agentEntries(bootEnv{AgentsB64: outside})
 	if len(got) != 1 || got[0].Provider != "a" {
