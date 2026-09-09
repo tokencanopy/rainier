@@ -85,7 +85,8 @@ link_one() {
     case "$name" in
       INSTALLATION_COMPLETE|DEPENDENCIES_VALIDATED|"$OURS"|'*') continue ;;
     esac
-    rm -rf "$dst/$name"
+    [ -n "$dst" ] && [ -n "$name" ] || { echo "invalid browser cache entry" >&2; return 1; }
+    rm -rf -- "$dst/$name"
     ln -s "$entry" "$dst/$name"
   done
   printf 'link  %s -> %s\n' "$dst" "$src"
