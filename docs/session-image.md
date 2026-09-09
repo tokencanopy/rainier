@@ -425,6 +425,18 @@ on arrival under `no-new-privileges`. The observed status is reported by
 `scripts/session-image-smoke.sh` on every qualification run rather than
 asserted, because which policy a host applies is not an image property.
 
+It fails **closed**, which is the part that matters. On the qualified
+candidate, under the driver's restrictions and docker's default seccomp
+profile, a launch that asks for the sandbox exits 133 with
+
+```
+[FATAL:content/browser/zygote_host/zygote_host_impl_linux.cc] No usable sandbox!
+```
+
+and renders nothing. A browser that reported no usable sandbox and drew the
+page anyway would be the failure worth guarding against, and it is not what
+happens.
+
 **What was not done to change that**, and would not be:
 
 - No `--privileged`, no `--cap-add`, no `seccomp=unconfined` and no
@@ -473,14 +485,28 @@ should say so; adding it is a bounded change to the Dockerfile.
 Measured by the build and reported by the smoke on every qualification run, so
 read it off the run rather than off this page:
 
+On the qualified candidate (linux/amd64, the default pinned base; run
+[34378290786](https://github.com/tokencanopy/rainier/actions/runs/34378290786)):
+
 | | |
 |---|---|
-| Shared libraries and fonts | `/usr/local/share/rainier-browser-size.txt`, first line |
-| The browser payload | the `browser payload:` line of the same file |
-| Compressed, in the pull | ~117 MiB (`chrome-headless-shell-linux64.zip` 114.3 MiB + ffmpeg 2.3 MiB) |
-| Extracted, in the image | ~266 MiB |
-| Per session, on the workspace volume | three directories of symlinks and empty marker files — kilobytes |
+| Shared libraries and fonts | **26 packages, 30,744 KiB (≈30 MiB)** |
+| The browser payload | **272,100 KiB (≈266 MiB)** under `/usr/local/lib/rainier-browsers` |
+| Whole image, with it | **2,725,950,441 bytes, 28 layers** — up from 2,416,401,380 and 22 layers, so **+295 MiB and +6 layers** |
+| Compressed, in the pull | ~117 MiB (`chrome-headless-shell-linux64.zip` 114.3 MiB + ffmpeg 2.3 MiB), plus the apt layer |
+| Per session, on the workspace volume | two directories of symlinks and empty marker files — kilobytes |
 | Startup cost | none: docker copies the links when it creates the volume, and no entrypoint step touches them |
+
+Read the first two off the run rather than off this table, which is one build
+old the moment it is written: the apt layer diffs its own package set and
+writes `/usr/local/share/rainier-browser-size.txt`,
+`images/session/browsers.sh` appends the browser payload to the same file, and
+the smoke reports both as workflow notices on the pull request being approved.
+
+Dropping the browser would return ~296 MiB; adding the full Chrome for Testing
+build would cost ~393 MiB more. Both are one line of `images/session/browsers.sh`
+and a checksum, and the [rollout runbook](https://github.com/tokencanopy/rainier-cloud/blob/main/docs/runbooks/default-environment-rollout.md)
+step 2 is where the pull cost is reviewed against them.
 
 A project that pins another Playwright pays ~114 MiB of download once per
 workspace, onto the volume, where it survives suspend and resume.
@@ -498,6 +524,14 @@ One host, for both artifacts:
 Nothing is needed at all for a project on the pinned version: the baseline is
 in the image and the suite runs on `--network none`. Which of these an
 environment gets is a control-plane decision and not this image's to make.
+
+**A test web server has to be on loopback.** A session's `http_proxy` points at
+the egress proxy and its `no_proxy` carries `localhost` and `127.0.0.1`, which
+Chromium reads. A dev server on `127.0.0.1` — which is what Playwright's
+`webServer` starts and what Vite, Next and the rest bind by default — is
+reached directly. A suite that instead addressed the container by its own
+hostname or its non-loopback address would send the request to the egress proxy
+and be refused; bind and address loopback.
 
 ## Why this base image, and not a Dev Containers one
 
