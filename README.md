@@ -25,7 +25,7 @@ Autonomous coding agents (Claude Code, Codex, Gemini CLI, and others) are transf
 
 - **Continuous Sessions:** Agents run on cloud sandboxes that survive laptop sleep, network drops, and machine transitions. Reconnecting instantly restores the interactive TUI.
 - **Zero Credential Exposure:** GitHub tokens and secrets are vaulted in the control plane and minted per-git-operation via an in-sandbox helper — never written to disk or container volumes.
-- **Locked-Down Egress:** Built-in network allowlisting restricts external network calls to approved endpoints and registries.
+- **Locked-Down Egress:** Built-in network allowlisting restricts external network calls to approved endpoints and registries. Public package registries, the Go module mirror and GitHub's source and API hosts are reachable by default so ordinary development works out of the box; everything else, including private registries, is named per environment. See [`docs/default-egress.md`](docs/default-egress.md).
 - **Parallel Scale:** Offload multiple agent sessions simultaneously without bogging down your workstation.
 
 ### Architecture & Status
@@ -166,13 +166,15 @@ Names are per-owner, so `<id|name>` takes either.
 
 An **environment** is the reusable template a session starts from — a base
 image, a setup script, an egress allowlist, and the team secrets its sessions
-get as environment variables:
+get as environment variables. `--egress` is what a session needs BEYOND the
+default developer baseline (npm, PyPI, the Go module mirror, GitHub's source
+and API hosts), which every session already gets:
 
 ```bash
 printf %s "$GH_PAT" | bin/rainier secret set GH_TOKEN   # write-only; stdin keeps it out of your history
 bin/rainier env create dev --image node:22 \
   --setup-file ./setup.sh --secret-ref GH_TOKEN \
-  --egress registry.npmjs.org,github.com
+  --egress npm.internal.example.com                     # extra hosts; the public registries are already on
 bin/rainier env ls                                      # name, id, image, cached
 bin/rainier env create gpu-dev --image node:22 --capability gpu   # only lands on a runner that announced gpu
 bin/rainier new --name box2 --env dev                   # ...starts from it

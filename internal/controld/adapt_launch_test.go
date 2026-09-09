@@ -66,7 +66,7 @@ func TestLaunchMaterialResolvesReposAttributionAndSecrets(t *testing.T) {
 	if m.GitAuthorName != "octo-example" || m.GitAuthorEmail != "12345+octo-example@users.noreply.github.com" {
 		t.Fatalf("attribution = %q <%s>", m.GitAuthorName, m.GitAuthorEmail)
 	}
-	if !reflect.DeepEqual(m.EgressAllow, gitEgressHosts) {
+	if !reflect.DeepEqual(m.EgressAllow, gitEgressHosts()) {
 		t.Fatalf("egress = %v", m.EgressAllow)
 	}
 	if m.Environment["API_TOKEN"] != "s3cr3t-value" {
@@ -74,7 +74,7 @@ func TestLaunchMaterialResolvesReposAttributionAndSecrets(t *testing.T) {
 	}
 	// The material must not hand the package's own list out for mutation.
 	m.EgressAllow[0] = "mutated.invalid"
-	if slices.Contains(gitEgressHosts, "mutated.invalid") {
+	if slices.Contains(gitEgressHosts(), "mutated.invalid") {
 		t.Fatal("material aliased gitEgressHosts")
 	}
 }

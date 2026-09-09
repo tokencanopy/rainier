@@ -51,6 +51,21 @@ type FleetOptions struct {
 	// scheduler prefers a runner that admits one and falls back to a rebuild
 	// elsewhere; nothing in this task asks it yet.
 	Checkpoints control.CheckpointLocator
+
+	// DefaultEgress replaces the built-in developer egress baseline
+	// (DefaultDeveloperEgressHosts) that every dispatched session's allowlist
+	// is unioned with. It is a POINTER because "leave it alone" and "make it
+	// empty" are different instructions and an operator needs both: nil takes
+	// the baseline, a non-nil empty slice turns it off entirely and returns
+	// the fleet to declare-every-host behaviour, and a non-nil non-empty slice
+	// is a host's own baseline in place of this one.
+	//
+	// It is host policy, not workspace configuration: there is no API field
+	// and no environment column behind it, so a tenant cannot widen its own
+	// default. Whatever it holds is ADDITIVE at dispatch and is never written
+	// to a session row — the row keeps what its caller or environment
+	// declared, exactly as it did before.
+	DefaultEgress *[]string
 }
 
 // FleetService implements control.Fleet and owns runner registration,
@@ -80,6 +95,11 @@ type FleetService struct {
 	// checkpoint can boot (FleetOptions).
 	uow         control.UnitOfWork
 	checkpoints control.CheckpointLocator
+
+	// defaultEgress is the host's developer egress baseline, resolved once at
+	// construction (FleetOptions.DefaultEgress). Held as a plain slice because
+	// by this point "unset" has already been answered.
+	defaultEgress []string
 
 	// wake carries pool IDs that need a placement pass. It is buffered so
 	// Wake never blocks a caller; Run drains it.
@@ -125,9 +145,22 @@ func NewFleetService(opts FleetOptions) (*FleetService, error) {
 		defaultInitTimeout:  opts.DefaultInitTimeoutSec,
 		uow:                 opts.UnitOfWork,
 		checkpoints:         opts.Checkpoints,
+		defaultEgress:       resolveDefaultEgress(opts.DefaultEgress),
 		wake:                make(chan control.PoolID, 64),
 		known:               make(map[control.PoolID]struct{}),
 	}, nil
+}
+
+// resolveDefaultEgress answers FleetOptions.DefaultEgress once, here, so no
+// later reader has to remember what a nil pointer meant. An unset option takes
+// the built-in baseline; a set one is taken verbatim and copied, empty
+// included, because switching the baseline off is a legitimate thing for an
+// operator to want and must not be indistinguishable from not having asked.
+func resolveDefaultEgress(opt *[]string) []string {
+	if opt == nil {
+		return DefaultDeveloperEgressHosts()
+	}
+	return slices.Clone(*opt)
 }
 
 // Wake requests a placement pass for pool. It never blocks: when the wake
