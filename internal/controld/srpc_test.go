@@ -550,7 +550,7 @@ func TestSessionRequestAnswersFetchAndPut(t *testing.T) {
 
 	// Boot with no login: an ANSWER, not a refusal. The agent starts and asks
 	// the person to log in, which is the truthful state.
-	f.sandboxRequest(t, id, 51, runner.MethodFetchAgentCredentials, `{"provider":"`+provider+`"}`)
+	f.sandboxRequest(t, id, 51, runner.MethodFetchAgentCredentials, `{"protocol":1,"provider":"`+provider+`"}`)
 	cmd := nextSessionRPC(t, f)
 	if cmd.RPC.ID != 51 || !cmd.RPC.OK {
 		_, _, errText := agentRPCBody(t, cmd.RPC)
@@ -563,7 +563,7 @@ func TestSessionRequestAnswersFetchAndPut(t *testing.T) {
 	// The person logs in; the sandbox puts what the agent wrote.
 	encoded := base64.StdEncoding.EncodeToString([]byte(agentCredentialFixture))
 	f.sandboxRequest(t, id, 52, runner.MethodPutAgentCredentials,
-		`{"provider":"`+provider+`","files":{"`+file+`":"`+encoded+`"},"version":0}`)
+		`{"protocol":1,"provider":"`+provider+`","files":{"`+file+`":"`+encoded+`"},"version":0}`)
 	cmd = nextSessionRPC(t, f)
 	if cmd.RPC.ID != 52 || !cmd.RPC.OK {
 		_, _, errText := agentRPCBody(t, cmd.RPC)
@@ -575,7 +575,7 @@ func TestSessionRequestAnswersFetchAndPut(t *testing.T) {
 
 	// A second boot — the whole point of custody — finds the login already
 	// there, at the version the put reported.
-	f.sandboxRequest(t, id, 53, runner.MethodFetchAgentCredentials, `{"provider":"`+provider+`"}`)
+	f.sandboxRequest(t, id, 53, runner.MethodFetchAgentCredentials, `{"protocol":1,"provider":"`+provider+`"}`)
 	cmd = nextSessionRPC(t, f)
 	if cmd.RPC.ID != 53 || !cmd.RPC.OK {
 		t.Fatalf("the second fetch = %+v, want an ok:true answer", cmd.RPC)
@@ -590,7 +590,7 @@ func TestSessionRequestAnswersFetchAndPut(t *testing.T) {
 	// A second put advances the version: that is how `rainier agent ls` and
 	// the sandbox's own baseline tell a fresh login from a stale one.
 	f.sandboxRequest(t, id, 54, runner.MethodPutAgentCredentials,
-		`{"provider":"`+provider+`","files":{"`+file+`":"`+encoded+`"},"version":1}`)
+		`{"protocol":1,"provider":"`+provider+`","files":{"`+file+`":"`+encoded+`"},"version":1}`)
 	cmd = nextSessionRPC(t, f)
 	if got, want := string(cmd.RPC.Payload), `{"version":2}`; !cmd.RPC.OK || got != want {
 		t.Fatalf("second put payload = %s, want %s", got, want)
@@ -616,8 +616,17 @@ func TestSessionRequestRefusesAnAgentCredentialItMustNot(t *testing.T) {
 		want string
 	}{
 		{
-			name: "a session placed on another runner", method: runner.MethodFetchAgentCredentials,
+			name: "a session without the credential protocol", method: runner.MethodFetchAgentCredentials,
 			payload: `{"provider":"` + provider + `"}`,
+			seed: func(t *testing.T, s *Server, st MemStore) string {
+				u := seedVaultUser(t, st, 6100, "alice")
+				return sandboxSessionFor(t, st, "sess_agent_old", "vm1", u.ID)
+			},
+			want: "this session must be replaced before agent credentials can sync",
+		},
+		{
+			name: "a session placed on another runner", method: runner.MethodFetchAgentCredentials,
+			payload: `{"protocol":1,"provider":"` + provider + `"}`,
 			seed: func(t *testing.T, s *Server, st MemStore) string {
 				u := seedVaultUser(t, st, 6101, "alice")
 				return sandboxSessionFor(t, st, "sess_agent_elsewhere", "vm2", u.ID)
@@ -626,13 +635,13 @@ func TestSessionRequestRefusesAnAgentCredentialItMustNot(t *testing.T) {
 		},
 		{
 			name: "a session nobody has", method: runner.MethodFetchAgentCredentials,
-			payload: `{"provider":"` + provider + `"}`,
+			payload: `{"protocol":1,"provider":"` + provider + `"}`,
 			seed:    func(t *testing.T, s *Server, st MemStore) string { return "sess_agent_ghost" },
 			want:    "no such session",
 		},
 		{
 			name: "a session with no creator", method: runner.MethodFetchAgentCredentials,
-			payload: `{"provider":"` + provider + `"}`,
+			payload: `{"protocol":1,"provider":"` + provider + `"}`,
 			seed: func(t *testing.T, s *Server, st MemStore) string {
 				// Written straight through the store: seedSession supplies a
 				// creator, and this is the row nothing in the API produces.
@@ -646,7 +655,7 @@ func TestSessionRequestRefusesAnAgentCredentialItMustNot(t *testing.T) {
 		},
 		{
 			name: "a creator who is no longer an operator here", method: runner.MethodFetchAgentCredentials,
-			payload: `{"provider":"` + provider + `"}`,
+			payload: `{"protocol":1,"provider":"` + provider + `"}`,
 			seed: func(t *testing.T, s *Server, st MemStore) string {
 				return sandboxSessionFor(t, st, "sess_agent_stranger", "vm1", "usr_no_such_operator")
 			},
@@ -654,7 +663,7 @@ func TestSessionRequestRefusesAnAgentCredentialItMustNot(t *testing.T) {
 		},
 		{
 			name: "a provider outside the table", method: runner.MethodFetchAgentCredentials,
-			payload: `{"provider":"provider_example"}`,
+			payload: `{"protocol":1,"provider":"provider_example"}`,
 			seed: func(t *testing.T, s *Server, st MemStore) string {
 				u := seedVaultUser(t, st, 6102, "alice")
 				return sandboxSessionFor(t, st, "sess_agent_unknown_provider", "vm1", u.ID)
@@ -663,7 +672,7 @@ func TestSessionRequestRefusesAnAgentCredentialItMustNot(t *testing.T) {
 		},
 		{
 			name: "a set over the cap", method: runner.MethodPutAgentCredentials,
-			payload: `{"provider":"` + provider + `","files":{"` + file + `":"` + oversize + `"}}`,
+			payload: `{"protocol":1,"provider":"` + provider + `","files":{"` + file + `":"` + oversize + `"}}`,
 			seed: func(t *testing.T, s *Server, st MemStore) string {
 				u := seedVaultUser(t, st, 6103, "alice")
 				return sandboxSessionFor(t, st, "sess_agent_oversize", "vm1", u.ID)
@@ -672,7 +681,7 @@ func TestSessionRequestRefusesAnAgentCredentialItMustNot(t *testing.T) {
 		},
 		{
 			name: "a file name off the allowlist", method: runner.MethodPutAgentCredentials,
-			payload: `{"provider":"` + provider + `","files":{"../../workspace/notes":"` + encoded + `"}}`,
+			payload: `{"protocol":1,"provider":"` + provider + `","files":{"../../workspace/notes":"` + encoded + `"}}`,
 			seed: func(t *testing.T, s *Server, st MemStore) string {
 				u := seedVaultUser(t, st, 6104, "alice")
 				return sandboxSessionFor(t, st, "sess_agent_traversal", "vm1", u.ID)
@@ -686,7 +695,7 @@ func TestSessionRequestRefusesAnAgentCredentialItMustNot(t *testing.T) {
 			// encoder is under the same constraint, so this IS the malformed
 			// request that can actually arrive.
 			name: "a body that is not the shape", method: runner.MethodPutAgentCredentials,
-			payload: `{"provider":7,"files":"not_a_map"}`,
+			payload: `{"protocol":1,"provider":7,"files":"not_a_map"}`,
 			seed: func(t *testing.T, s *Server, st MemStore) string {
 				u := seedVaultUser(t, st, 6105, "alice")
 				return sandboxSessionFor(t, st, "sess_agent_garbage", "vm1", u.ID)
@@ -743,23 +752,23 @@ func TestNoCredentialByteReachesALogOrError(t *testing.T) {
 	id := sandboxSessionFor(t, st, "sess_agent_quiet", "vm1", u.ID)
 	encoded := base64.StdEncoding.EncodeToString([]byte(agentCredentialFixture))
 
-	f.sandboxRequest(t, id, 71, runner.MethodFetchAgentCredentials, `{"provider":"`+provider+`"}`)
+	f.sandboxRequest(t, id, 71, runner.MethodFetchAgentCredentials, `{"protocol":1,"provider":"`+provider+`"}`)
 	if cmd := nextSessionRPC(t, f); !cmd.RPC.OK {
 		t.Fatalf("the empty fetch was refused: %s", cmd.RPC.Payload)
 	}
 	f.sandboxRequest(t, id, 72, runner.MethodPutAgentCredentials,
-		`{"provider":"`+provider+`","files":{"`+file+`":"`+encoded+`"}}`)
+		`{"protocol":1,"provider":"`+provider+`","files":{"`+file+`":"`+encoded+`"}}`)
 	if cmd := nextSessionRPC(t, f); !cmd.RPC.OK {
 		t.Fatalf("the put was refused: %s", cmd.RPC.Payload)
 	}
-	f.sandboxRequest(t, id, 73, runner.MethodFetchAgentCredentials, `{"provider":"`+provider+`"}`)
+	f.sandboxRequest(t, id, 73, runner.MethodFetchAgentCredentials, `{"protocol":1,"provider":"`+provider+`"}`)
 	if cmd := nextSessionRPC(t, f); !cmd.RPC.OK {
 		t.Fatalf("the second fetch was refused: %s", cmd.RPC.Payload)
 	}
 	// Two refusals, which are the arms that build a message out of what went
 	// wrong and are therefore the ones most likely to quote the value.
 	f.sandboxRequest(t, id, 74, runner.MethodPutAgentCredentials,
-		`{"provider":"`+provider+`","files":{"file_example_off_the_list":"`+encoded+`"}}`)
+		`{"protocol":1,"provider":"`+provider+`","files":{"file_example_off_the_list":"`+encoded+`"}}`)
 	if cmd := nextSessionRPC(t, f); cmd.RPC.OK {
 		t.Fatal("a file off the allowlist was stored")
 	}
@@ -767,7 +776,7 @@ func TestNoCredentialByteReachesALogOrError(t *testing.T) {
 	// asserting: a decode error's own text quotes the bytes it choked on, so
 	// wrapping one into a log line would publish the credential.
 	f.sandboxRequest(t, id, 75, runner.MethodPutAgentCredentials,
-		`{"provider":"`+provider+`","files":"`+encoded+`"}`)
+		`{"protocol":1,"provider":"`+provider+`","files":"`+encoded+`"}`)
 	if cmd := nextSessionRPC(t, f); cmd.RPC.OK {
 		t.Fatal("an undecodable body was stored")
 	}

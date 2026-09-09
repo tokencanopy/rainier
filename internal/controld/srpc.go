@@ -182,13 +182,11 @@ const agentRequestMaxBytes = 128 << 10
 // answers share their front half; the fields a fetch does not send are simply
 // absent.
 //
-// Version is accepted and deliberately not acted on: v0 custody is
-// last-writer-wins, so a stale version is stored exactly as a current one is
-// (see controlapp.AgentCredentialService.AnswerPut). It is decoded rather
-// than ignored so that a sandbox sending it is not answered with a decode
-// error, and so the field's arrival here is visible to whoever adds the
-// stricter rule later.
+// Version is the sandbox's last custody baseline. Ordinary concurrent writes
+// remain last-writer-wins, while a value older than a logout tombstone is
+// refused so an in-flight put cannot recreate a revoked credential.
 type agentCredentialRequest struct {
+	Protocol uint64            `json:"protocol"`
 	Provider string            `json:"provider"`
 	Files    map[string][]byte `json:"files"`
 	Version  uint64            `json:"version"`
@@ -260,7 +258,7 @@ func (s *Server) answerPutAgentCredentials(ctx context.Context, runnerName strin
 			runnerName, row.ID, clip(env.Method))
 		return *bad
 	}
-	version, err := s.agents.AnswerPut(s.agentActorContext(ctx, row), row, req.Provider, req.Files)
+	version, err := s.agents.AnswerPut(s.agentActorContext(ctx, row), row, req.Provider, req.Files, req.Version)
 	if err != nil {
 		return s.agentRefusal(env, row, runnerName, req.Provider, err, "the agent credential could not be stored")
 	}
@@ -286,6 +284,10 @@ func decodeAgentRequest(env runner.RPCEnvelope) (agentCredentialRequest, *runner
 	}
 	if err := json.Unmarshal(env.Payload, &req); err != nil {
 		refusal := rpcRefusal(env.ID, "the agent credential request could not be decoded")
+		return req, &refusal
+	}
+	if req.Protocol != runner.AgentCredentialProtocolVersion {
+		refusal := rpcRefusal(env.ID, "this session must be replaced before agent credentials can sync")
 		return req, &refusal
 	}
 	return req, nil

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/tokencanopy/rainier/control"
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // agentEnvEntry mirrors, in the test's own words, the shape AgentsEnv encodes
@@ -16,9 +17,16 @@ import (
 // of its own, and this test is the place where the two spellings are proven to
 // agree.
 type agentEnvEntry struct {
-	Provider string   `json:"provider"`
-	Dir      string   `json:"dir"`
-	Files    []string `json:"files"`
+	CredentialProtocol uint64             `json:"credential_protocol"`
+	Provider           string             `json:"provider"`
+	Dir                string             `json:"dir"`
+	Files              []string           `json:"files"`
+	SeedFiles          []agentEnvSeedFile `json:"seed_files,omitempty"`
+}
+
+type agentEnvSeedFile struct {
+	Name     string `json:"name"`
+	Contents string `json:"contents"`
 }
 
 // withTestAgentProvider turns the synthetic provider on for one test and off
@@ -180,6 +188,9 @@ func TestCreateSpecCarriesTheHome(t *testing.T) {
 		t.Fatalf("manifest has %d entries, want %d", len(entries), len(providers))
 	}
 	for i, p := range providers {
+		if entries[i].CredentialProtocol != runner.AgentCredentialProtocolVersion {
+			t.Fatalf("manifest credential protocol for %q = %d, want %d", p.Name, entries[i].CredentialProtocol, runner.AgentCredentialProtocolVersion)
+		}
 		if entries[i].Provider != p.Name {
 			t.Fatalf("manifest entry %d is %q, want %q", i, entries[i].Provider, p.Name)
 		}
@@ -188,6 +199,14 @@ func TestCreateSpecCarriesTheHome(t *testing.T) {
 		}
 		if !slices.Equal(entries[i].Files, p.Files) {
 			t.Fatalf("manifest files for %q = %v, want %v", p.Name, entries[i].Files, p.Files)
+		}
+		if len(entries[i].SeedFiles) != len(p.SeedFiles) {
+			t.Fatalf("manifest seed files for %q = %+v, want %+v", p.Name, entries[i].SeedFiles, p.SeedFiles)
+		}
+		for j, seed := range p.SeedFiles {
+			if entries[i].SeedFiles[j].Name != seed.Name || entries[i].SeedFiles[j].Contents != seed.Contents {
+				t.Fatalf("manifest seed file %d for %q = %+v, want %+v", j, p.Name, entries[i].SeedFiles[j], seed)
+			}
 		}
 	}
 
@@ -218,17 +237,60 @@ func TestCreateSpecCarriesTheHome(t *testing.T) {
 		}
 	}
 
-	// Last wins: the resolver's environment is merged over the table's.
+	// Credential-custody variables are reserved even when a resolver tries to
+	// replace them; unrelated launch material still passes through.
 	override := "/rainier/agents/elsewhere"
 	first := providers[0]
 	fx = newFleetFixtureWithResolver(t, &fleetFakeResolver{material: LaunchMaterial{
-		Environment: map[string]string{first.HomeEnv: override}}})
+		Environment: map[string]string{
+			first.HomeEnv: override,
+			agentsEnvVar:  "untrusted-manifest",
+			"USER_VALUE":  "preserved",
+		}}})
 	spec, fail = fx.service.createSpec(fleetCtx, row, nil)
 	if fail != "" {
 		t.Fatalf("createSpec failed: %s", fail)
 	}
-	if got := spec.Env[first.HomeEnv]; got != override {
-		t.Fatalf("env %s = %q, want the resolver's %q", first.HomeEnv, got, override)
+	if got, want := spec.Env[first.HomeEnv], HomeMountPath+"/"+first.Name; got != want {
+		t.Fatalf("env %s = %q, want reserved path %q", first.HomeEnv, got, want)
+	}
+	if spec.Env[agentsEnvVar] == "untrusted-manifest" {
+		t.Fatal("resolved launch material replaced the reserved agent manifest")
+	}
+	if got := spec.Env["USER_VALUE"]; got != "preserved" {
+		t.Fatalf("ordinary resolved environment = %q, want preserved", got)
+	}
+}
+
+func TestClaudeProviderSeedsOnlyOnboardingCompletion(t *testing.T) {
+	var claude AgentProvider
+	for _, provider := range AgentProviders() {
+		if provider.Name == "claude" {
+			claude = provider
+			break
+		}
+	}
+	if claude.Name == "" {
+		t.Fatal("the provider table has no Claude row")
+	}
+	if len(claude.SeedFiles) != 1 || claude.SeedFiles[0].Name != ".claude.json" {
+		t.Fatalf("Claude seed files = %+v, want only .claude.json", claude.SeedFiles)
+	}
+	var state map[string]any
+	if err := json.Unmarshal([]byte(claude.SeedFiles[0].Contents), &state); err != nil {
+		t.Fatalf("Claude onboarding seed is not JSON: %v", err)
+	}
+	if len(state) != 1 || state["hasCompletedOnboarding"] != true {
+		t.Fatalf("Claude onboarding seed keys = %v, want only hasCompletedOnboarding=true", state)
+	}
+	if slices.Contains(claude.Files, ".claude.json") {
+		t.Fatal("Claude application state is in account-wide credential custody")
+	}
+
+	first := AgentProviders()
+	first[0].SeedFiles[0].Contents = "mutated"
+	if got := AgentProviders()[0].SeedFiles[0].Contents; got == "mutated" {
+		t.Fatal("a caller mutated the provider table's onboarding seed")
 	}
 }
 

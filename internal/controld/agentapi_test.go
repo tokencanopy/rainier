@@ -33,7 +33,7 @@ func seedAgentCredential(t *testing.T, st Store, userID string) controlapp.Agent
 	p := rows[0]
 	files := map[string][]byte{p.Files[0]: []byte("credential_example")}
 	if _, err := NewAgentVault(st, testSecretsKey).PutAgentCredentials(
-		context.Background(), control.ActorID(userID), p.Name, files); err != nil {
+		context.Background(), control.ActorID(userID), p.Name, files, 0); err != nil {
 		t.Fatalf("seeding an agent credential: %v", err)
 	}
 	return p
@@ -157,8 +157,8 @@ func TestLogoutAgentDestroysTheSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch after logout: %v", err)
 	}
-	if set.Version != 0 || len(set.Files) != 0 {
-		t.Fatalf("custody still holds v%d with %d files after a logout", set.Version, len(set.Files))
+	if set.Version == 0 || len(set.Files) != 0 {
+		t.Fatalf("custody after logout = v%d with %d files, want a positive empty tombstone", set.Version, len(set.Files))
 	}
 }
 

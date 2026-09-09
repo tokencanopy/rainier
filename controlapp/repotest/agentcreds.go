@@ -3,6 +3,7 @@ package repotest
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/tokencanopy/rainier/control"
@@ -69,11 +70,11 @@ func RunAgentCredentialStore(t *testing.T, open func(t *testing.T) controlapp.Ag
 	}{
 		{"A1 a set nobody has put is version 0 with no files", caseAgentFetchEmpty},
 		{"A2 puts version upward and the last bytes stand", caseAgentPutVersions},
-		{"A3 a revoke destroys the set and is idempotent", caseAgentRevoke},
+		{"A3 a revoke fences the set and is repeatable", caseAgentRevoke},
 		{"A4 a listing carries versions and no bytes", caseAgentList},
 		{"A5 two people never see each other's set", caseAgentUserIsolation},
 		{"A6 two providers of one person are separate sets", caseAgentProviderIsolation},
-		{"A7 a put of no files is a real version", caseAgentEmptySet},
+		{"A7 a tombstone fences stale puts", caseAgentRevokeFence},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			s := open(t)
@@ -104,7 +105,7 @@ func caseAgentFetchEmpty(t *testing.T, s controlapp.AgentCredentialStore, provid
 // login indistinguishable from a failed one.
 func caseAgentPutVersions(t *testing.T, s controlapp.AgentCredentialStore, provider, file, _, _ string) {
 	ctx := context.Background()
-	v, err := s.PutAgentCredentials(ctx, AgentUser, provider, map[string][]byte{file: agentFixtureCredential})
+	v, err := s.PutAgentCredentials(ctx, AgentUser, provider, map[string][]byte{file: agentFixtureCredential}, 0)
 	if err != nil {
 		t.Fatalf("first put: %v", err)
 	}
@@ -113,7 +114,7 @@ func caseAgentPutVersions(t *testing.T, s controlapp.AgentCredentialStore, provi
 	}
 	wantSet(t, s, AgentUser, provider, 1, map[string][]byte{file: agentFixtureCredential})
 
-	v, err = s.PutAgentCredentials(ctx, AgentUser, provider, map[string][]byte{file: agentFixtureAuth})
+	v, err = s.PutAgentCredentials(ctx, AgentUser, provider, map[string][]byte{file: agentFixtureAuth}, 1)
 	if err != nil {
 		t.Fatalf("second put: %v", err)
 	}
@@ -131,18 +132,19 @@ func caseAgentPutVersions(t *testing.T, s controlapp.AgentCredentialStore, provi
 // believing they are still logged in.
 func caseAgentRevoke(t *testing.T, s controlapp.AgentCredentialStore, provider, file, _, _ string) {
 	ctx := context.Background()
-	if _, err := s.PutAgentCredentials(ctx, AgentUser, provider, map[string][]byte{file: agentFixtureCredential}); err != nil {
+	if _, err := s.PutAgentCredentials(ctx, AgentUser, provider, map[string][]byte{file: agentFixtureCredential}, 0); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if err := s.RevokeAgentCredentials(ctx, AgentUser, provider); err != nil {
+	version, err := s.RevokeAgentCredentials(ctx, AgentUser, provider)
+	if err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
-	wantSet(t, s, AgentUser, provider, 0, nil)
+	wantSet(t, s, AgentUser, provider, version, nil)
 
-	if err := s.RevokeAgentCredentials(ctx, AgentUser, provider); err != nil {
+	if _, err := s.RevokeAgentCredentials(ctx, AgentUser, provider); err != nil {
 		t.Fatalf("second revoke: %v", err)
 	}
-	if err := s.RevokeAgentCredentials(ctx, AgentOther, provider); err != nil {
+	if _, err := s.RevokeAgentCredentials(ctx, AgentOther, provider); err != nil {
 		t.Fatalf("revoke of a set that never existed: %v", err)
 	}
 }
@@ -156,13 +158,13 @@ func caseAgentList(t *testing.T, s controlapp.AgentCredentialStore, first, first
 	if got, err := s.ListAgentCredentials(ctx, AgentUser); err != nil || len(got) != 0 {
 		t.Fatalf("list before any put = %v, %v; want an empty listing and no error", got, err)
 	}
-	if _, err := s.PutAgentCredentials(ctx, AgentUser, first, map[string][]byte{firstFile: agentFixtureCredential}); err != nil {
+	if _, err := s.PutAgentCredentials(ctx, AgentUser, first, map[string][]byte{firstFile: agentFixtureCredential}, 0); err != nil {
 		t.Fatalf("put %s: %v", first, err)
 	}
-	if _, err := s.PutAgentCredentials(ctx, AgentUser, second, map[string][]byte{secondFile: agentFixtureAuth}); err != nil {
+	if _, err := s.PutAgentCredentials(ctx, AgentUser, second, map[string][]byte{secondFile: agentFixtureAuth}, 0); err != nil {
 		t.Fatalf("put %s: %v", second, err)
 	}
-	if _, err := s.PutAgentCredentials(ctx, AgentUser, second, map[string][]byte{secondFile: agentFixtureAuth}); err != nil {
+	if _, err := s.PutAgentCredentials(ctx, AgentUser, second, map[string][]byte{secondFile: agentFixtureAuth}, 1); err != nil {
 		t.Fatalf("second put %s: %v", second, err)
 	}
 
@@ -194,12 +196,12 @@ func caseAgentList(t *testing.T, s controlapp.AgentCredentialStore, first, first
 // hand every session the same login.
 func caseAgentUserIsolation(t *testing.T, s controlapp.AgentCredentialStore, provider, file, _, _ string) {
 	ctx := context.Background()
-	if _, err := s.PutAgentCredentials(ctx, AgentUser, provider, map[string][]byte{file: agentFixtureCredential}); err != nil {
+	if _, err := s.PutAgentCredentials(ctx, AgentUser, provider, map[string][]byte{file: agentFixtureCredential}, 0); err != nil {
 		t.Fatalf("put for %s: %v", AgentUser, err)
 	}
 	wantSet(t, s, AgentOther, provider, 0, nil)
 
-	if _, err := s.PutAgentCredentials(ctx, AgentOther, provider, map[string][]byte{file: agentFixtureAuth}); err != nil {
+	if _, err := s.PutAgentCredentials(ctx, AgentOther, provider, map[string][]byte{file: agentFixtureAuth}, 0); err != nil {
 		t.Fatalf("put for %s: %v", AgentOther, err)
 	}
 	// Each person's version counts THEIR puts: the second person's first put
@@ -207,7 +209,7 @@ func caseAgentUserIsolation(t *testing.T, s controlapp.AgentCredentialStore, pro
 	wantSet(t, s, AgentOther, provider, 1, map[string][]byte{file: agentFixtureAuth})
 	wantSet(t, s, AgentUser, provider, 1, map[string][]byte{file: agentFixtureCredential})
 
-	if err := s.RevokeAgentCredentials(ctx, AgentOther, provider); err != nil {
+	if _, err := s.RevokeAgentCredentials(ctx, AgentOther, provider); err != nil {
 		t.Fatalf("revoke for %s: %v", AgentOther, err)
 	}
 	wantSet(t, s, AgentUser, provider, 1, map[string][]byte{file: agentFixtureCredential})
@@ -218,53 +220,49 @@ func caseAgentUserIsolation(t *testing.T, s controlapp.AgentCredentialStore, pro
 // independently.
 func caseAgentProviderIsolation(t *testing.T, s controlapp.AgentCredentialStore, first, firstFile, second, secondFile string) {
 	ctx := context.Background()
-	if _, err := s.PutAgentCredentials(ctx, AgentUser, first, map[string][]byte{firstFile: agentFixtureCredential}); err != nil {
+	if _, err := s.PutAgentCredentials(ctx, AgentUser, first, map[string][]byte{firstFile: agentFixtureCredential}, 0); err != nil {
 		t.Fatalf("put %s: %v", first, err)
 	}
 	wantSet(t, s, AgentUser, second, 0, nil)
 
-	if _, err := s.PutAgentCredentials(ctx, AgentUser, second, map[string][]byte{secondFile: agentFixtureAuth}); err != nil {
+	if _, err := s.PutAgentCredentials(ctx, AgentUser, second, map[string][]byte{secondFile: agentFixtureAuth}, 0); err != nil {
 		t.Fatalf("put %s: %v", second, err)
 	}
-	if err := s.RevokeAgentCredentials(ctx, AgentUser, first); err != nil {
+	if _, err := s.RevokeAgentCredentials(ctx, AgentUser, first); err != nil {
 		t.Fatalf("revoke %s: %v", first, err)
 	}
-	wantSet(t, s, AgentUser, first, 0, nil)
+	wantSet(t, s, AgentUser, first, 2, nil)
 	wantSet(t, s, AgentUser, second, 1, map[string][]byte{secondFile: agentFixtureAuth})
 }
 
-// caseAgentEmptySet: a put of no files is allowed and yields a NEW version
-// holding nothing. It is how "the agent removed its own credential file"
-// reaches custody — a real state, and distinct from both "never logged in"
-// (version 0) and "still holds what it had", which is why it must advance the
-// version rather than being dropped as a no-op.
-func caseAgentEmptySet(t *testing.T, s controlapp.AgentCredentialStore, provider, file, _, _ string) {
+// caseAgentRevokeFence proves a logout tombstone cannot be overwritten by a
+// put carrying the version that preceded it, while a session that learned the
+// tombstone version may log in again.
+func caseAgentRevokeFence(t *testing.T, s controlapp.AgentCredentialStore, provider, file, _, _ string) {
 	ctx := context.Background()
-	if _, err := s.PutAgentCredentials(ctx, AgentUser, provider, map[string][]byte{file: agentFixtureCredential}); err != nil {
+	if _, err := s.PutAgentCredentials(ctx, AgentUser, provider, map[string][]byte{file: agentFixtureCredential}, 0); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	v, err := s.PutAgentCredentials(ctx, AgentUser, provider, map[string][]byte{})
+	v, err := s.RevokeAgentCredentials(ctx, AgentUser, provider)
 	if err != nil {
-		t.Fatalf("put of an empty set: %v", err)
+		t.Fatalf("revoke: %v", err)
 	}
 	if v != 2 {
-		t.Fatalf("put of an empty set returned version %d, want 2", v)
+		t.Fatalf("revoke returned version %d, want 2", v)
 	}
-	set, err := s.FetchAgentCredentials(ctx, AgentUser, provider)
-	if err != nil {
-		t.Fatalf("fetch after an empty put: %v", err)
+	if _, err := s.PutAgentCredentials(ctx, AgentUser, provider,
+		map[string][]byte{file: agentFixtureAuth}, 1); !errors.Is(err, control.ErrConflict) {
+		t.Fatalf("stale put after revoke = %v, want ErrConflict", err)
 	}
-	if set.Version != 2 || len(set.Files) != 0 {
-		t.Fatalf("fetch after an empty put = version %d with %d files, want version 2 with none", set.Version, len(set.Files))
+	if next, err := s.PutAgentCredentials(ctx, AgentUser, provider,
+		map[string][]byte{file: agentFixtureAuth}, v); err != nil || next != 3 {
+		t.Fatalf("new login from tombstone = %d, %v; want version 3", next, err)
 	}
-
-	// A nil map is the same statement as an empty one, and stores the same
-	// way: callers build these maps by ranging over an allowlist, and a
-	// provider whose files are all gone produces nil on some paths and an
-	// empty map on others.
-	if v, err := s.PutAgentCredentials(ctx, AgentUser, provider, nil); err != nil || v != 3 {
-		t.Fatalf("put of a nil set = %d, %v; want version 3 and no error", v, err)
+	if _, err := s.PutAgentCredentials(ctx, AgentUser, provider,
+		map[string][]byte{file: agentFixtureCredential}, 1); !errors.Is(err, control.ErrConflict) {
+		t.Fatalf("pre-logout put after relogin = %v, want ErrConflict", err)
 	}
+	wantSet(t, s, AgentUser, provider, 3, map[string][]byte{file: agentFixtureAuth})
 }
 
 // wantSet asserts one fetch: the version, and the files byte for byte. A
