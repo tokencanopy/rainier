@@ -431,12 +431,27 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 	// declared; the hosts the resolved material needs are the resolver's
 	// knowledge and are added here, at dispatch, so the row and the view a
 	// human reads off it never claim a host nobody asked for. The providers'
-	// hosts — what an agent's login, refresh, and inference reach — join last
+	// hosts — what an agent's login, refresh, and inference reach — join next
 	// for the same reason, so a host a human named still reads first.
 	spec.EgressAllow = unionHosts(spec.EgressAllow, material.EgressAllow)
 	for _, p := range providers {
 		spec.EgressAllow = unionHosts(spec.EgressAllow, p.Egress)
 	}
+	// The developer baseline joins LAST and unconditionally, including for a
+	// session with no creator and no environment. This is the seam the whole
+	// default-egress policy hangs on: every dispatch in both compositions —
+	// self-hosted and hosted — builds its runner spec here, so a host added to
+	// the table reaches every session without a second list existing anywhere,
+	// and a session's stored egress_allow keeps meaning "what a human asked
+	// for" rather than quietly acquiring twelve rows nobody typed.
+	//
+	// Additive, never replacing: an environment that declares its own hosts
+	// keeps every one of them and gains these, and unionHosts dedupes so an
+	// environment that already named registry.npmjs.org does not carry it
+	// twice. A host set here grants reachability only — the credential a
+	// session presents to any of these hosts is still the broker's to issue
+	// or withhold.
+	spec.EgressAllow = unionHosts(spec.EgressAllow, s.defaultEgress)
 	return &spec, ""
 }
 

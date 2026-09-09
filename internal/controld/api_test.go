@@ -455,7 +455,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
 		putSecretValue(t, st, "GH_TOKEN", "ghp_resolved_value")
 		env := seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1", Setup: "apt-get install -y jq",
-			EgressAllow: []string{"api.github.com"}, SecretRefs: []string{"GH_TOKEN"}})
+			EgressAllow: []string{"index.example.test"}, SecretRefs: []string{"GH_TOKEN"}})
 
 		got := createWithEnv(t, ts, tok, map[string]any{"name": "e1", "environment": "dev"})
 		if got.Environment != "dev" {
@@ -469,7 +469,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		if row.Spec.Image != "env-img:1" {
 			t.Errorf("stored resolved_image = %q, want env-img:1", row.Spec.Image)
 		}
-		if !slices.Equal(row.Spec.EgressAllow, []string{"api.github.com"}) {
+		if !slices.Equal(row.Spec.EgressAllow, []string{"index.example.test"}) {
 			t.Errorf("stored egress_allow = %v, want the environment's", row.Spec.EgressAllow)
 		}
 
@@ -490,7 +490,7 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 		if spec.Env["GH_TOKEN"] != "ghp_resolved_value" {
 			t.Errorf("spec.Env = %v, want GH_TOKEN decrypted", spec.Env)
 		}
-		if !slices.Equal(declaredEgress(spec.EgressAllow), []string{"api.github.com"}) {
+		if !slices.Equal(declaredEgress(spec.EgressAllow), []string{"index.example.test"}) {
 			t.Errorf("spec.EgressAllow = %v, want the environment's", spec.EgressAllow)
 		}
 	})
@@ -627,10 +627,10 @@ func TestCreateSessionResolvesEnvironment(t *testing.T) {
 	// needs to work, and a session adds hosts to it.
 	t.Run("a session egress_allow extends the environment's", func(t *testing.T) {
 		st, ts, f, tok := oneRunnerFleet(t)
-		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1", EgressAllow: []string{"api.github.com"}})
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1", EgressAllow: []string{"index.example.test"}})
 
-		createWithEnv(t, ts, tok, map[string]any{"name": "e9", "environment": "dev", "egress_allow": []string{"pypi.org"}})
-		if got := nextCreate(t, f).Spec.EgressAllow; !slices.Equal(declaredEgress(got), []string{"api.github.com", "pypi.org"}) {
+		createWithEnv(t, ts, tok, map[string]any{"name": "e9", "environment": "dev", "egress_allow": []string{"wheels.example.test"}})
+		if got := nextCreate(t, f).Spec.EgressAllow; !slices.Equal(declaredEgress(got), []string{"index.example.test", "wheels.example.test"}) {
 			t.Fatalf("spec.EgressAllow = %v, want the environment's list extended by the session's", got)
 		}
 	})
@@ -778,7 +778,7 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 	t.Run("a github connector becomes a RepoSpec, with attribution and the git egress", func(t *testing.T) {
 		_, st, ts, f, u, tok := repoFleet(t)
 		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1",
-			EgressAllow: []string{"pypi.org"},
+			EgressAllow: []string{"index.example.test"},
 			Connectors: []control.Connector{
 				{Type: "github", Raw: githubConnectorJSON("acme/app", "")},
 				{Type: "github", Raw: githubConnectorJSON("acme/infra", "develop")},
@@ -804,12 +804,20 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 		// session already had. D6: the row and the view carry only what the
 		// caller or the environment declared — the hosts a clone needs are the
 		// launch material's knowledge, added where the clone is ordered.
-		wantEgress := []string{"pypi.org", "github.com", "codeload.github.com", "objects.githubusercontent.com"}
-		if !slices.Equal(declaredEgress(spec.EgressAllow), wantEgress) {
-			t.Errorf("spec.EgressAllow = %v, want %v", spec.EgressAllow, wantEgress)
+		if !slices.Equal(declaredEgress(spec.EgressAllow), []string{"index.example.test"}) {
+			t.Errorf("spec.EgressAllow = %v, want only the environment's own declared host", spec.EgressAllow)
 		}
-		if row := getSession(t, st, got.ID); !slices.Equal(row.Spec.EgressAllow, []string{"pypi.org"}) {
-			t.Errorf("stored egress_allow = %v, want the environment's own [pypi.org]", row.Spec.EgressAllow)
+		// The clone hosts themselves: present, once each. They now arrive by
+		// two routes that agree — the launch material's, and the developer
+		// baseline every dispatch carries — so what this pins is that the
+		// union is a union, not that only one of them ran.
+		for _, host := range controlapp.GitHubGitEgressHosts() {
+			if n := countHost(spec.EgressAllow, host); n != 1 {
+				t.Errorf("spec.EgressAllow has %s %d times, want exactly once: %v", host, n, spec.EgressAllow)
+			}
+		}
+		if row := getSession(t, st, got.ID); !slices.Equal(row.Spec.EgressAllow, []string{"index.example.test"}) {
+			t.Errorf("stored egress_allow = %v, want the environment's own declared host", row.Spec.EgressAllow)
 		}
 	})
 
@@ -820,9 +828,17 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 			Connectors:  []control.Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "dup", "environment": "dev"})
-		want := []string{"github.com", "codeload.github.com", "objects.githubusercontent.com"}
-		if got := nextCreate(t, f).Spec.EgressAllow; !slices.Equal(declaredEgress(got), want) {
-			t.Errorf("spec.EgressAllow = %v, want %v", got, want)
+		got := nextCreate(t, f).Spec.EgressAllow
+		// github.com is declared by the environment, added again by the launch
+		// material, and carried a third time by the developer baseline. Three
+		// routes, one entry.
+		if n := countHost(got, "github.com"); n != 1 {
+			t.Errorf("spec.EgressAllow has github.com %d times, want exactly once: %v", n, got)
+		}
+		for _, host := range controlapp.GitHubGitEgressHosts() {
+			if n := countHost(got, host); n != 1 {
+				t.Errorf("spec.EgressAllow has %s %d times, want exactly once: %v", host, n, got)
+			}
 		}
 	})
 
@@ -843,7 +859,7 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 
 	t.Run("an explicit empty repos array clones nothing", func(t *testing.T) {
 		_, st, ts, f, _, tok := repoFleet(t)
-		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1", EgressAllow: []string{"pypi.org"},
+		seedEnv(t, st, control.Environment{Name: "dev", Image: "env-img:1", EgressAllow: []string{"index.example.test"},
 			Connectors: []control.Connector{{Type: "github", Raw: githubConnectorJSON("acme/app", "")}}})
 
 		createWithEnv(t, ts, tok, map[string]any{"name": "bare", "environment": "dev", "repos": []any{}})
@@ -855,7 +871,7 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 			t.Errorf("spec attribution = %q/%q, want none for a session that clones nothing",
 				spec.GitAuthorName, spec.GitAuthorEmail)
 		}
-		if !slices.Equal(declaredEgress(spec.EgressAllow), []string{"pypi.org"}) {
+		if !slices.Equal(declaredEgress(spec.EgressAllow), []string{"index.example.test"}) {
 			t.Errorf("spec.EgressAllow = %v, want the environment's untouched", spec.EgressAllow)
 		}
 	})
@@ -906,9 +922,13 @@ func TestCreateSessionResolvesRepos(t *testing.T) {
 		if spec.GitAuthorEmail != noreplyFor(u) {
 			t.Errorf("spec.GitAuthorEmail = %q, want %q", spec.GitAuthorEmail, noreplyFor(u))
 		}
-		wantEgress := []string{"github.com", "codeload.github.com", "objects.githubusercontent.com"}
-		if !slices.Equal(declaredEgress(spec.EgressAllow), wantEgress) {
-			t.Errorf("spec.EgressAllow = %v, want %v", spec.EgressAllow, wantEgress)
+		if len(declaredEgress(spec.EgressAllow)) != 0 {
+			t.Errorf("spec.EgressAllow = %v, want nothing declared beyond the agents and the baseline", spec.EgressAllow)
+		}
+		for _, host := range controlapp.GitHubGitEgressHosts() {
+			if n := countHost(spec.EgressAllow, host); n != 1 {
+				t.Errorf("spec.EgressAllow has %s %d times, want exactly once: %v", host, n, spec.EgressAllow)
+			}
 		}
 		// D6: the row carries what the caller declared, which here is nothing.
 		if row := getSession(t, st, got.ID); len(row.Spec.EgressAllow) != 0 {
@@ -4322,17 +4342,33 @@ func TestUnavailableStatusRefinesByRunnerConnectivity(t *testing.T) {
 	}
 }
 
-// declaredEgress drops the hosts every create carries for the coding agents in
-// the session's agent home, leaving what the caller and the environment
-// actually declared — which is what the scenes above are about. It reads the
-// hosts off the control plane's provider table rather than listing them,
-// because that table is the one place allowed to name an agent.
-func declaredEgress(hosts []string) []string {
-	var agent []string
-	for _, p := range controlapp.AgentProviders() {
-		agent = append(agent, p.Egress...)
+// countHost reports how many times host appears in a dispatched allowlist. It
+// exists because several hosts now reach a session by more than one route —
+// declared, launch material, developer baseline — and "present exactly once"
+// is the property those scenes are actually about.
+func countHost(hosts []string, host string) int {
+	n := 0
+	for _, h := range hosts {
+		if h == host {
+			n++
+		}
 	}
+	return n
+}
+
+// declaredEgress drops the hosts every create carries on its own — the coding
+// agents in the session's agent home, and the developer egress baseline every
+// dispatch is unioned with — leaving what the caller and the environment
+// actually declared, which is what the scenes above are about. It reads both
+// off the control plane's own tables rather than listing them, because those
+// tables are the one place allowed to name an agent or a package host.
+func declaredEgress(hosts []string) []string {
+	var added []string
+	for _, p := range controlapp.AgentProviders() {
+		added = append(added, p.Egress...)
+	}
+	added = append(added, controlapp.DefaultDeveloperEgressHosts()...)
 	return slices.DeleteFunc(slices.Clone(hosts), func(h string) bool {
-		return slices.Contains(agent, h)
+		return slices.Contains(added, h)
 	})
 }

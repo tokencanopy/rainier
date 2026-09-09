@@ -558,7 +558,27 @@ type fleetFixture struct {
 	checkpoints *locatorStub
 }
 
+// fleetTestNoBaseline switches the developer egress baseline OFF for the
+// shared fixture. Every scheduler scene below is about a different question —
+// what the row declared, what the resolver added, what a provider needs — and
+// a dozen package hosts in every dispatched allowlist would bury all of them
+// while pinning none. The baseline has its own fixture
+// (newFleetFixtureWithBaseline) and its own tests, where it is the subject.
+var fleetTestNoBaseline = []string{}
+
 func newFleetFixtureWithResolver(t *testing.T, resolver LaunchMaterialResolver) *fleetFixture {
+	t.Helper()
+	return newFleetFixtureWith(t, resolver, &fleetTestNoBaseline)
+}
+
+// newFleetFixtureWithBaseline is the same fixture with the developer egress
+// baseline left at its production default.
+func newFleetFixtureWithBaseline(t *testing.T) *fleetFixture {
+	t.Helper()
+	return newFleetFixtureWith(t, nil, nil)
+}
+
+func newFleetFixtureWith(t *testing.T, resolver LaunchMaterialResolver, defaultEgress *[]string) *fleetFixture {
 	t.Helper()
 	st := newFleetFakeStore()
 	auth := &fleetFakeAuthorizer{}
@@ -593,6 +613,7 @@ func newFleetFixtureWithResolver(t *testing.T, resolver LaunchMaterialResolver) 
 		LaunchMaterial: r,
 		UnitOfWork:     directUOW{},
 		Checkpoints:    ckpts,
+		DefaultEgress:  defaultEgress,
 	})
 	if err != nil {
 		t.Fatalf("NewFleetService: %v", err)

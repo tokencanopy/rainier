@@ -98,7 +98,10 @@ func TestRealClientsThroughTheProxy(t *testing.T) {
 
 	t.Run("egressd challenges, so both clients get through", func(t *testing.T) {
 		var audit bytes.Buffer
-		p := New(&audit)
+		// The fixture git origin is served on loopback (originHost), so this
+		// proxy lifts the private-destination guard the same way a local fleet
+		// does. The behaviour under test is the 407 challenge.
+		p := New(&audit, AllowPrivateDestinations())
 		p.SetAllow("sess-real", []string{originHost})
 		proxyPort := serveOnAllInterfaces(t, p.Handler())
 

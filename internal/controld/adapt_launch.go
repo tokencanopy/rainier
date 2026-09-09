@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 
 	"github.com/tokencanopy/rainier/control"
@@ -62,7 +61,7 @@ func (l launchMaterial) ResolveLaunchMaterial(ctx context.Context, row control.S
 		// caller's: the connector said "acme/app", not three CDN names. The
 		// scheduler unions them into the session's own allowlist at dispatch,
 		// so the row keeps only what the caller or environment declared.
-		m.EgressAllow = slices.Clone(gitEgressHosts)
+		m.EgressAllow = gitEgressHosts()
 	}
 
 	vars, err := l.secretEnvironment(ctx, env)
@@ -119,7 +118,13 @@ const defaultBaseBranch = "main"
 // for LFS and release assets. Appended to a cloning session's allowlist
 // because every one of them is a host the SESSION did not ask for and cannot
 // know about — the connector said "acme/app", not "three CDN names".
-var gitEgressHosts = []string{"github.com", "codeload.github.com", "objects.githubusercontent.com"}
+//
+// They are READ OUT of the one egress table (controlapp.GitHubGitEgressHosts)
+// rather than spelled again here. The dispatch baseline already carries them,
+// so a second literal list would be a copy that can only ever drift; and this
+// one still has to exist, because a host that switched the baseline off
+// (FleetOptions.DefaultEgress) has not thereby asked for its clones to fail.
+func gitEgressHosts() []string { return controlapp.GitHubGitEgressHosts() }
 
 // sessionRepoRefs returns the repositories row is to clone: its own stored
 // override when it has one — including an explicit empty one, which means

@@ -2519,14 +2519,28 @@ func TestConnectorSessionMintsAndReportsDiff(t *testing.T) {
 		}
 	}
 	// Every create for a person also carries the hosts their coding agents
-	// reach, from the same dispatch-time union; what is left after those is
-	// what this scene is about, and it is exactly four.
-	agentHosts := agentEgressHosts()
+	// reach and the developer egress baseline, from the same dispatch-time
+	// union; what is left after those two tables is what this scene is about,
+	// and it is exactly the environment's own host.
+	added := append(agentEgressHosts(), controlapp.DefaultDeveloperEgressHosts()...)
 	declared := slices.DeleteFunc(slices.Clone(spec.EgressAllow), func(h string) bool {
-		return slices.Contains(agentHosts, h)
+		return slices.Contains(added, h)
 	})
-	if got := len(declared); got != 4 {
-		t.Fatalf("dispatched Spec.EgressAllow = %v (%d hosts besides the agents'), want exactly the environment's one plus the three git hosts, deduped", declared, got)
+	if !slices.Equal(declared, []string{"registry.example.com"}) {
+		t.Fatalf("dispatched Spec.EgressAllow = %v; beyond the agents' and the baseline's hosts it carries %v, want exactly the environment's own",
+			spec.EgressAllow, declared)
+	}
+	// And nothing arrives twice, however many of the three tables named it.
+	for _, host := range spec.EgressAllow {
+		n := 0
+		for _, h := range spec.EgressAllow {
+			if h == host {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Fatalf("dispatched Spec.EgressAllow = %v carries %q %d times, want once", spec.EgressAllow, host, n)
+		}
 	}
 	if gotAllow := rows[created.ID].EgressAllow; !slices.Equal(gotAllow, []string{"registry.example.com"}) {
 		t.Fatalf("session egress_allow = %v, want exactly what the environment declared", gotAllow)

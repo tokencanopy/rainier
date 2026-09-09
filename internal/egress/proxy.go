@@ -13,12 +13,15 @@
 package egress
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -34,10 +37,38 @@ type Proxy struct {
 	allow map[string][]string
 	audit io.Writer
 	now   func() time.Time
+
+	// allowPrivate lifts the private-destination guard. See
+	// AllowPrivateDestinations.
+	allowPrivate bool
+	// resolve is the name lookup the guard uses, overridable so a test can
+	// state what a name resolves to instead of needing a DNS server that
+	// answers with a private address.
+	resolve func(ctx context.Context, host string) ([]netip.Addr, error)
 }
 
-func New(audit io.Writer) *Proxy {
-	return &Proxy{allow: map[string][]string{}, audit: audit, now: time.Now}
+// Option configures a Proxy at construction. There is exactly one, and it
+// exists because the guard it lifts is otherwise unconditional.
+type Option func(*Proxy)
+
+// AllowPrivateDestinations lets this proxy tunnel to loopback, RFC1918,
+// link-local and the other non-public ranges vettedAddrs refuses.
+//
+// It is for a proxy whose origins are FIXTURES — this package's own tests
+// serve a git repository on localhost and allowlist "localhost" — and for a
+// local fleet where the thing on the other side is a container on the same
+// machine. It is not a production setting: egressd does not offer a flag for
+// it, because on a runner the private addresses on the other side of that
+// name are the metadata service, the other tenants' sandboxes, and the
+// runner's own control plane.
+func AllowPrivateDestinations() Option { return func(p *Proxy) { p.allowPrivate = true } }
+
+func New(audit io.Writer, opts ...Option) *Proxy {
+	p := &Proxy{allow: map[string][]string{}, audit: audit, now: time.Now, resolve: lookupAddrs}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
 }
 
 func (p *Proxy) SetAllow(session string, hosts []string) {
@@ -58,6 +89,167 @@ func (p *Proxy) permitted(session, host string) bool {
 		}
 	}
 	return false
+}
+
+// errPrivateDestination reports a host that resolved only to addresses this
+// proxy will not tunnel to.
+var errPrivateDestination = errors.New("destination is not a public address")
+
+// vettedAddrs resolves host and returns the public addresses it answers with,
+// or errPrivateDestination when it answers with none.
+//
+// WHY THE PROXY RESOLVES AT ALL, when net.Dial would have done it a line
+// later: the allowlist is a set of NAMES, matched against the string a client
+// wrote into its CONNECT request line, and the mapping from that string to an
+// address belongs to a nameserver nobody here controls. Two things follow.
+//
+// The first is DNS rebinding. Nothing stops an answer for an allowlisted name
+// from being 169.254.169.254 — the cloud metadata endpoint that hands out the
+// runner's own instance credentials — or a 10.0.0.0/8 address on the runner's
+// network, or 127.0.0.1, which from the proxy's side is the runner itself. The
+// name matched, so the allowlist said yes; without this the tunnel opens. The
+// session container's own network cannot reach any of those (it is
+// `internal: true` and has no route at all), which is exactly why the proxy is
+// the interesting place to attack: it is the one process that has both a route
+// to the private network and an instruction to dial where a session points it.
+//
+// The second is that resolving here and DIALING WHAT WAS RESOLVED closes the
+// window between the two. A guard that resolved, approved, and then handed the
+// NAME to net.Dial would be checking one answer and connecting to another; the
+// second lookup can differ from the first, and a short TTL is all it takes. So
+// the vetted addresses, not the name, are what dialFirst connects to.
+//
+// This is defence in depth and not the allowlist's replacement: the baseline
+// (controlapp) is what decides a name may be reached at all, and every host on
+// it is a public package or source host. The guard is what keeps that decision
+// from being silently re-answered by a DNS reply.
+func (p *Proxy) vettedAddrs(ctx context.Context, host string) ([]netip.Addr, error) {
+	if p.allowPrivate {
+		// The caller has said the private side is where its origins live, so
+		// there is nothing to resolve here: dial the name as before.
+		return nil, nil
+	}
+	// A literal address needs no lookup and gets the same verdict.
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if isPrivateAddr(addr) {
+			return nil, errPrivateDestination
+		}
+		return []netip.Addr{addr}, nil
+	}
+	addrs, err := p.resolve(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	public := make([]netip.Addr, 0, len(addrs))
+	for _, addr := range addrs {
+		if !isPrivateAddr(addr) {
+			public = append(public, addr)
+		}
+	}
+	if len(public) == 0 {
+		return nil, errPrivateDestination
+	}
+	return public, nil
+}
+
+// dialTimeout bounds the WHOLE outbound attempt for one CONNECT — every
+// address tried, not each one — and resolveTimeout bounds the lookup in front
+// of it. Both are explicit because the guard moved work that net.DialTimeout
+// used to bound on its own: a name with four A records would otherwise be four
+// ten-second attempts, and a nameserver that never answers would hold the
+// handler open for as long as the client was willing to wait.
+const (
+	dialTimeout    = 10 * time.Second
+	resolveTimeout = 5 * time.Second
+)
+
+func lookupAddrs(ctx context.Context, host string) ([]netip.Addr, error) {
+	ctx, cancel := context.WithTimeout(ctx, resolveTimeout)
+	defer cancel()
+	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+}
+
+// isPrivateAddr reports whether addr is somewhere a session has no business
+// reaching THROUGH THIS PROXY. Everything not routable on the public internet
+// is refused, rather than an enumeration of the endpoints known to be
+// sensitive: 169.254.169.254 is the metadata address on three clouds and
+// 100.100.100.200 is a fourth's, and a list of the ones somebody remembered is
+// a list that is wrong the next time a provider picks an address.
+//
+// The 4-in-6 form is unmapped first, because ::ffff:169.254.169.254 is the
+// same destination written differently and the v6 predicates do not see it.
+func isPrivateAddr(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	switch {
+	case !addr.IsValid(), addr.IsUnspecified(), addr.IsLoopback(),
+		addr.IsPrivate(),          // RFC1918 and the v6 unique-local fc00::/7
+		addr.IsLinkLocalUnicast(), // 169.254.0.0/16 — cloud metadata — and fe80::/10
+		addr.IsLinkLocalMulticast(),
+		addr.IsInterfaceLocalMulticast(),
+		addr.IsMulticast():
+		return true
+	}
+	// The IPv4 ranges Go has no predicate for and a session still has no
+	// reason to reach: carrier-grade NAT (where more than one cloud puts an
+	// internal service), IETF protocol assignments, benchmarking, and the
+	// reserved 240/4.
+	for _, prefix := range reservedV4 {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+var reservedV4 = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"), // RFC6598 carrier-grade NAT
+	netip.MustParsePrefix("192.0.0.0/24"),  // RFC6890 IETF protocol assignments
+	netip.MustParsePrefix("198.18.0.0/15"), // RFC2544 benchmarking
+	netip.MustParsePrefix("240.0.0.0/4"),   // RFC1112 reserved
+}
+
+// dialFirst connects to the first of addrs that answers, or to host by name
+// when addrs is nil — which is what AllowPrivateDestinations leaves behind.
+// Trying each in turn matters for a real registry: a name with an A and a AAAA
+// record on a runner with no IPv6 route would otherwise fail half the time
+// depending on resolver order.
+//
+// The deadline is shared across the whole loop, not per address, so a name
+// with several dead records costs one dialTimeout rather than one each. Each
+// address gets a share of the remaining budget so a blackhole cannot starve
+// later, healthy addresses.
+func dialFirst(ctx context.Context, host string, addrs []netip.Addr, port string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	var d net.Dialer
+	if len(addrs) == 0 {
+		return d.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+	}
+	return dialAddresses(ctx, addrs, port, d.DialContext)
+}
+
+func dialAddresses(ctx context.Context, addrs []netip.Addr, port string, dial func(context.Context, string, string) (net.Conn, error)) (net.Conn, error) {
+	var err error
+	for i, addr := range addrs {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			deadline = time.Now().Add(dialTimeout)
+		}
+		attempt, cancel := context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(addrs)-i))
+		conn, dialErr := dial(attempt, "tcp", net.JoinHostPort(addr.String(), port))
+		cancel()
+		err = dialErr
+		if err == nil {
+			return conn, nil
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, err
 }
 
 func (p *Proxy) logDecision(session, host, port, decision string) {
@@ -176,9 +368,29 @@ func (p *Proxy) Handler() http.Handler {
 			http.Error(w, "egress denied", http.StatusForbidden)
 			return
 		}
+		// An allowlisted NAME is not yet an allowlisted DESTINATION. See
+		// vettedAddrs: the allowlist is matched on the string the client
+		// wrote, and what that string resolves to is the answer of a
+		// nameserver this proxy does not control.
+		addrs, err := p.vettedAddrs(r.Context(), host)
+		if errors.Is(err, errPrivateDestination) {
+			p.logDecision(session, host, port, "deny_private")
+			http.Error(w, "egress denied: host resolves to a non-public address", http.StatusForbidden)
+			return
+		}
+		// Anything else the lookup could not answer is NOT a policy decision:
+		// the allowlist said yes and a nameserver did not answer, which is the
+		// same "allow, then the dial failed" this proxy has always logged and
+		// answered 502 to. Keeping it that way keeps the audit log's three
+		// words meaning exactly what they meant — a fourth would appear on
+		// every transient DNS failure and read like a refusal.
 		p.logDecision(session, host, port, "allow")
+		if err != nil {
+			http.Error(w, "upstream dial failed", http.StatusBadGateway)
+			return
+		}
 
-		upstream, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), 10*time.Second)
+		upstream, err := dialFirst(r.Context(), host, addrs, port)
 		if err != nil {
 			http.Error(w, "upstream dial failed", http.StatusBadGateway)
 			return

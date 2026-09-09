@@ -65,7 +65,9 @@ func TestDefaultDenyAndAllow(t *testing.T) {
 	origin, stop := startOrigin(t)
 	defer stop()
 	var audit bytes.Buffer
-	p := New(&audit)
+	// The fixture origin is on loopback, which the private-destination guard
+	// refuses by design; this test exercises the allowlist, not the guard.
+	p := New(&audit, AllowPrivateDestinations())
 	srv := httptest.NewServer(p.Handler())
 	defer srv.Close()
 
@@ -201,7 +203,9 @@ func TestChallengedClientRetryIsAllowlisted(t *testing.T) {
 	origin, stop := startOrigin(t)
 	defer stop()
 	var audit bytes.Buffer
-	p := New(&audit)
+	// The fixture origin is on loopback, which the private-destination guard
+	// refuses by design; this test exercises the allowlist, not the guard.
+	p := New(&audit, AllowPrivateDestinations())
 	srv := httptest.NewServer(p.Handler())
 	defer srv.Close()
 
@@ -264,7 +268,9 @@ func TestBasicAuthSessionIdentity(t *testing.T) {
 			origin, stop := startOrigin(t)
 			defer stop()
 			var audit bytes.Buffer
-			p := New(&audit)
+			// The fixture origin is on loopback, which the private-destination guard
+			// refuses by design; this test exercises the allowlist, not the guard.
+			p := New(&audit, AllowPrivateDestinations())
 			srv := httptest.NewServer(p.Handler())
 			defer srv.Close()
 
