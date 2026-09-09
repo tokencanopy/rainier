@@ -29,7 +29,7 @@ DOCKER_CANONICAL_SHA256 = (
     "885442dc08f21f8d60f99ea43d59af88b1c529103815fe24bbf9ce998d3a609d"
 )
 SECCOMP_CANONICAL_SHA256 = (
-    "4af52b1aa66bbee5bb8e3b3f713a56de3b2590a2ba052212c491b1cf9b078671"
+    "883fc167edee1490885be2f9c971716381d0a1b931da2b5085410ca7e5cc7d3c"
 )
 APPARMOR_SHA256 = (
     "53f78e768ee56099b764661c58b569504e39ecc45b2b3fb0dffd13ea329eb431"
@@ -174,6 +174,15 @@ class SessionImageSecurityPolicyTest(unittest.TestCase):
                         "still requires CAP_SYS_CHROOT there."
                     ),
                 ),
+                rule(
+                    ["setns"],
+                    "SCMP_ACT_ALLOW",
+                    comment=(
+                        "RAINIER: Chromium's namespace sandbox may join its "
+                        "private user, PID, network, and mount namespaces after "
+                        "creation; namespace ownership still limits targets."
+                    ),
+                ),
             ],
         )
 
@@ -186,9 +195,11 @@ class SessionImageSecurityPolicyTest(unittest.TestCase):
             and not item.get("excludes")
             for name in item["names"]
         }
-        self.assertTrue({"mount", "pivot_root", "umount2", "chroot"} <= unconditional)
         self.assertTrue(
-            {"clone3", "setns", "sethostname", "setdomainname", "unshare"}.isdisjoint(
+            {"mount", "pivot_root", "umount2", "chroot", "setns"} <= unconditional
+        )
+        self.assertTrue(
+            {"clone3", "sethostname", "setdomainname", "unshare"}.isdisjoint(
                 unconditional
             )
         )

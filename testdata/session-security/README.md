@@ -8,7 +8,8 @@ Rainier Cloud repository or requiring a cross-repository GitHub token.
 The seccomp file starts from Docker Engine 27.5.1's default profile and adds
 only the exact syscall shapes needed by Codex's Bubblewrap and Chromium's
 namespace sandbox, including Chromium's x86_64 safe-empty-directory clone
-helper and its `chroot` syscall. The kernel still requires `CAP_SYS_CHROOT`
+helper, its `chroot` syscall, and Chromium's namespace `setns` operation. The
+kernel still requires `CAP_SYS_CHROOT`
 inside the private user namespace. The AppArmor file keeps Docker's device, procfs, sysfs, and kernel
 denials while admitting Bubblewrap's namespace setup and Chromium's three
 namespace-map writes. Both policies remain default-deny; this fixture
@@ -23,7 +24,7 @@ run with only this public repository.
 Pinned fixture invariants:
 
 - Docker base profile: 27.5.1; canonical JSON SHA-256: `885442dc08f21f8d60f99ea43d59af88b1c529103815fe24bbf9ce998d3a609d`
-- Full Rainier seccomp canonical JSON SHA-256: `4af52b1aa66bbee5bb8e3b3f713a56de3b2590a2ba052212c491b1cf9b078671`
+- Full Rainier seccomp canonical JSON SHA-256: `883fc167edee1490885be2f9c971716381d0a1b931da2b5085410ca7e5cc7d3c`
 - AppArmor profile SHA-256: `53f78e768ee56099b764661c58b569504e39ecc45b2b3fb0dffd13ea329eb431`
 
 The canonical JSON hash is calculated with sorted keys and compact separators;

@@ -879,6 +879,13 @@
 		},
 		{
 			"names": [
+				"setns"
+			],
+			"action": "SCMP_ACT_ALLOW",
+			"comment": "RAINIER: Chromium's namespace sandbox may join its private user, PID, network, and mount namespaces after creation; namespace ownership still limits targets."
+		},
+		{
+			"names": [
 				"chroot"
 			],
 			"action": "SCMP_ACT_ALLOW",
