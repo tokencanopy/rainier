@@ -1,4 +1,4 @@
-.PHONY: test build demo e2e verify module-path protocols control session-image session-image-smoke session-image-browser-e2e session-image-verify
+.PHONY: test build demo e2e verify module-path protocols control session-image session-image-security-policy session-image-smoke session-image-browser-e2e session-image-verify
 
 DOCKER ?= docker
 SESSION_IMAGE ?= rainier-session:smoke
@@ -41,6 +41,12 @@ control:
 session-image:
 	$(DOCKER) build $(BUILD_ARGS) -t "$(SESSION_IMAGE)" .
 
+# session-image-security-policy checks the public, test-only policy snapshot
+# used by image qualification. Hosted Rainier Cloud owns and qualifies its
+# runtime copy independently; core CI must not need a cross-repository token.
+session-image-security-policy:
+	python3 scripts/session-image-security-policy-test.py
+
 # session-image-smoke does the part `--version` cannot: it builds, runs,
 # installs and serves inside containers wearing the driver's real restrictions
 # — uid 1000, read-only rootfs, noexec /tmp, no network at all. See the header
@@ -58,5 +64,5 @@ session-image-browser-e2e:
 
 session-image-verify: session-image session-image-smoke session-image-browser-e2e
 
-verify: module-path protocols control test build
+verify: module-path protocols control session-image-security-policy test build
 	go vet ./...

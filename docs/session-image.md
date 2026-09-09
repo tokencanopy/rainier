@@ -419,7 +419,10 @@ and `unshare(CLONE_NEWUSER|CLONE_NEWNS)` forms, plus the AppArmor `userns`
 permission. The hosted browser qualification runs the real web suite under
 those profiles and fails if Chromium cannot initialize its sandbox. A local
 Docker host with stricter policies must load an equivalent reviewed profile;
-Rainier never falls back to `--no-sandbox`.
+Rainier never falls back to `--no-sandbox`. Core keeps a public, test-only
+snapshot of this boundary in `testdata/session-security/`; its structural test
+and image workflow no longer need to check out Rainier Cloud. The runtime
+policy remains Cloud-owned and is qualified independently.
 
 **No broad privilege is needed.** The session does not use `--privileged`,
 `--cap-add`, `seccomp=unconfined`, `apparmor=unconfined`, host networking,
@@ -668,9 +671,11 @@ unwritable, that a freshly created workspace volume already carries the cache
 links, that the preinstalled build is the one the `Dockerfile` pins, that every
 shared library resolves, that a page renders and screenshots at 1280x800 and at
 390x844, that Arial lays out at Liberation's metrics rather than a fallback's,
-and that no browser process survives the run. Chromium's own sandbox status
-under the driver's restrictions is *reported* rather than asserted, because
-which policy a host applies is not a property of the image.
+and that no browser process survives the run. Chromium's own sandbox is
+asserted when qualification loads the reviewed seccomp and AppArmor fixture;
+the smoke script fails closed if Chromium exits without its sandbox. Which
+policy a production host applies remains a host property and is qualified by
+Rainier Cloud separately.
 
 `scripts/session-image-browser-e2e.sh` is the third piece and the only one with
 a network, deliberately: it stages a sample project that has never been in the
@@ -804,8 +809,9 @@ explicit recovery step for existing volumes, not an automatic image migration.
 `PLAYWRIGHT_BROWSERS_PATH=0` uses Playwright's package-local cache and is not
 managed by this helper; use the project's installer for that mode.
 
-The session-image CI runs `make session-image-browser-e2e` in addition to
-its offline image checks. The sample project explicitly enables
-`chromiumSandbox: true`, and Cloud's hosted browser qualification runs the web
-suite under the reviewed seccomp and AppArmor profiles. Both checks are release
-gates for the supported browser path.
+The session-image CI runs `make session-image-security-policy` and
+`make session-image-browser-e2e` in addition to its offline image checks. The
+sample project explicitly enables `chromiumSandbox: true`, and the image job
+loads the public test-only seccomp and AppArmor snapshot. Cloud's hosted browser
+qualification runs the web suite under its independently reviewed runtime
+profiles. Both checks are release gates for the supported browser path.

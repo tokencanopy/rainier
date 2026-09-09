@@ -7,7 +7,10 @@ on:
       - .dockerignore
       - images/session/**
       - scripts/session-image-*.sh
+      - scripts/session-image-security-policy-test.py
       - internal/driver/image*test.go
+      - testdata/session-security/**
+      - Makefile
       - .github/workflows/session-image.yml
   workflow_dispatch:
 
@@ -34,27 +37,22 @@ jobs:
       # Chromium must use its own sandbox; enable user namespaces on this disposable CI host.
       - name: Enable Chromium sandbox user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      # The image repository owns the browser payload; Rainier Cloud owns the
-      # host policy that admits Chromium's user-namespace sandbox. Pin the
-      # reviewed policy commit so this qualification exercises the same outer
-      # boundary as a hosted session. Advance this SHA with policy changes.
-      - name: Fetch the reviewed hosted browser policy
-        uses: actions/checkout@v4
-        with:
-          repository: tokencanopy/rainier-cloud
-          ref: 2f2bb5743c7cb35ba803f108343690e01f0a9b03
-          path: .browser-cloud
-          persist-credentials: false
+      # This public snapshot exercises the browser boundary without requiring
+      # a cross-repository token. Rainier Cloud owns and qualifies its runtime
+      # policy independently; the fixture's hashes and exact rules are checked
+      # before the profile is loaded.
+      - name: Validate the public browser policy fixture
+        run: make session-image-security-policy
       - name: Load the reviewed Chromium AppArmor policy
-        run: sudo apparmor_parser -r .browser-cloud/infra/security/rainier-codex-bwrap.apparmor
+        run: sudo apparmor_parser -r testdata/session-security/rainier-codex-bwrap.apparmor
       - name: Functional smoke with no network or credentials
         env:
-          SECCOMP: ${{ github.workspace }}/.browser-cloud/infra/security/codex-bwrap-seccomp-docker-27.5.1.json
+          SECCOMP: ${{ github.workspace }}/testdata/session-security/codex-bwrap-seccomp-docker-27.5.1.json
           APPARMOR: rainier-codex-bwrap
         run: make session-image-smoke SESSION_IMAGE=rainier-session:qualify
       - name: Browser end to end in a fresh project
         env:
-          SECCOMP: ${{ github.workspace }}/.browser-cloud/infra/security/codex-bwrap-seccomp-docker-27.5.1.json
+          SECCOMP: ${{ github.workspace }}/testdata/session-security/codex-bwrap-seccomp-docker-27.5.1.json
           APPARMOR: rainier-codex-bwrap
         run: make session-image-browser-e2e SESSION_IMAGE=rainier-session:qualify
       - name: Image size
