@@ -218,6 +218,15 @@ func TestSessionImageDoesNotDisableBrowserSafety(t *testing.T) {
 	if strings.Contains(df, "--no-sandbox") {
 		t.Error("the Dockerfile names --no-sandbox; the image does not choose a project's browser launch flags")
 	}
+	for _, path := range []string{"../../scripts/session-image-smoke.sh", "../../scripts/session-image-browser-e2e.sh", "../../images/session/browser-sample/playwright.config.js"} {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("reading browser safety contract %s: %v", path, err)
+		}
+		if strings.Contains(string(b), "--no-sandbox") {
+			t.Errorf("%s names --no-sandbox; browser qualification must fail closed", path)
+		}
+	}
 }
 
 // TestDockerGrantsNoBrowserPrivilege: the isolation half of the same change.

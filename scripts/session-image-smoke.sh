@@ -676,14 +676,22 @@ check "rainier-browsers reports the cache a project's Playwright will read" "lin
 # The sandbox-enabled launch is a required check; a browser that cannot
 # initialize its own sandbox exits nonzero. The observed status is recorded for
 # diagnostics after the functional checks.
-SANDBOX_STATUS=$(probe '
+SANDBOX_OUTPUT=$(probe '
   '"$BROWSER_FIXTURE"'
   out=$("$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p2" --dump-dom "file://$d/page.html" 2>&1)
   st=$?
-  printf "exit=%s %s\n" "$st" "$(printf "%s" "$out" | grep -i -m1 "sandbox\|namespace" || echo "no sandbox diagnostic")"
-' | tail -1)
-printf 'note  chromium own-sandbox under the driver restrictions: %s\n' "$SANDBOX_STATUS"
-note "chromium own-sandbox status" "$SANDBOX_STATUS"
+  printf "exit=%s %s\n" "$st" "$(printf "%s" "$out" | grep -i -m1 "sandbox\|namespace" || echo "sandbox launch succeeded")"
+  exit "$st"
+')
+SANDBOX_STATUS=$?
+SANDBOX_DIAGNOSTIC=$(printf '%s\n' "$SANDBOX_OUTPUT" | tail -1)
+printf 'note  chromium own-sandbox under the driver restrictions: exit=%s %s\n' "$SANDBOX_STATUS" "$SANDBOX_DIAGNOSTIC"
+note "chromium own-sandbox status" "exit=$SANDBOX_STATUS $SANDBOX_DIAGNOSTIC"
+if [ "$SANDBOX_STATUS" -eq 0 ]; then
+  ok "Chromium starts with its own sandbox"
+else
+  bad "Chromium starts with its own sandbox" "exit=$SANDBOX_STATUS; $SANDBOX_DIAGNOSTIC"
+fi
 
 BROWSER_SIZE=$(probe 'cat /usr/local/share/rainier-browser-size.txt 2>/dev/null | head -1; grep -h "browser payload" /usr/local/share/rainier-browser-size.txt 2>/dev/null' | tr '\n' '; ')
 printf 'note  browser layer: %s\n' "$BROWSER_SIZE"
