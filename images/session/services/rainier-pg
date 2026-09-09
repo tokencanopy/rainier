@@ -1,0 +1,167 @@
+#!/bin/sh
+# rainier-pg — a session-local PostgreSQL, started by the developer, on the
+# only writable storage a session has.
+#
+# Installed by the session image at /usr/local/bin/rainier-pg, root-owned, and
+# never invoked by the entrypoint. It installs nothing, downloads nothing, and
+# needs no privilege: everything it does is `initdb`, `pg_ctl` and `psql` from
+# /usr/lib/postgresql/<major>/bin, which the image links into /usr/local/bin.
+#
+# Why a script and not just the raw commands:
+#
+#   * PGDATA has to live on the workspace volume. $HOME is on the read-only
+#     rootfs and /tmp is a per-container tmpfs, so a cluster anywhere else
+#     either cannot be created or does not survive a suspend/resume.
+#   * The socket directory has to exist before the postmaster binds it, and
+#     PostgreSQL's compiled-in default (/var/run/postgresql) is on the
+#     read-only rootfs. `init` therefore writes unix_socket_directories into
+#     the generated postgresql.conf, so a later plain `pg_ctl start` works too.
+#   * `stop` waits for the SERVER, not for the process table. pg_ctl's own -w
+#     loop asks kill(pid, 0), which cannot tell a shut-down postmaster from an
+#     unreaped zombie; a real session's PID 1 (sessiond) reaps orphans, but a
+#     bare `docker run ... --entrypoint timeout` does not, and a stop that
+#     hangs for 60s in one shape and not the other is not worth debugging
+#     twice. Waiting for the postmaster's own pidfile to disappear is the
+#     server's own completion signal and is true in both.
+#
+# The equivalent raw commands are in docs/session-image.md. Nothing here is
+# required: `initdb` and `pg_ctl` are on PATH and work directly.
+#
+# Usage: rainier-pg init|start|stop|restart|status|url|psql|up [args...]
+set -eu
+
+# The two roots the image also sets, so this script behaves the same whether
+# it is run inside the session image or out of a checkout. Durable state on the
+# workspace volume; sockets and pidfiles on the per-container tmpfs, because
+# protocol/workspace.TarGz refuses a socket rather than skipping it and a
+# `rainier pull` of a tree containing one fails — permanently, if an unclean
+# exit left the socket behind.
+: "${RAINIER_SERVICES_DIR:=/workspace/.services}"
+: "${RAINIER_SERVICES_RUNTIME_DIR:=/tmp/rainier-services}"
+# PostgreSQL's own variables win, because every other client honours them too
+# and a second, overlapping knob would be worse than none. A second cluster is
+# a second PGDATA and PGPORT.
+: "${PGDATA:=$RAINIER_SERVICES_DIR/postgresql/data}"
+: "${PGHOST:=$RAINIER_SERVICES_RUNTIME_DIR/postgresql}"
+: "${PGPORT:=5432}"
+: "${PGDATABASE:=postgres}"
+: "${RAINIER_PG_LOG:=$(dirname "$PGDATA")/server.log}"
+# Deadline, in seconds, for a start and for a stop alike.
+: "${RAINIER_PG_TIMEOUT:=60}"
+
+me=${0##*/}
+pguser=$(id -un)
+
+die() { echo "$me: $*" >&2; exit 1; }
+
+initialized() { [ -s "$PGDATA/PG_VERSION" ]; }
+running()     { pg_isready -q -h "$PGHOST" -p "$PGPORT" 2>/dev/null; }
+# pg_isready's own vocabulary: 0 accepting, 1 rejecting (alive, still starting
+# or shutting down), 2 no response, 3 no attempt made. Only 0 and 1 mean a
+# server is there, and the difference matters to stop().
+answering()   { pg_isready -q -h "$PGHOST" -p "$PGPORT" >/dev/null 2>&1; c=$?; [ "$c" = 0 ] || [ "$c" = 1 ]; }
+
+do_init() {
+  initialized && die "$PGDATA already holds a cluster; remove it first, or set PGDATA"
+  mkdir -p "$(dirname "$PGDATA")" "$PGHOST"
+  # C.UTF-8 rather than the ambient locale: this image generates no locales, so
+  # an unset LANG would give initdb "C" and an SQL_ASCII database that silently
+  # mangles the first non-ASCII row a test inserts. trust auth is safe here and
+  # only here — the server listens on the session container's own loopback,
+  # which is inside a network namespace nothing else shares.
+  initdb --pgdata="$PGDATA" --username="$pguser" \
+         --encoding=UTF8 --locale=C.UTF-8 \
+         --auth-local=trust --auth-host=trust >/dev/null
+  cat >> "$PGDATA/postgresql.conf" <<EOF
+
+# Added by rainier-pg (the Rainier session image). The compiled-in socket
+# directory is /var/run/postgresql, which is on this session's read-only
+# rootfs; listen_addresses stays on loopback so the server is reachable from
+# this session and from nothing else. Both are plain settings — edit them.
+unix_socket_directories = '$PGHOST'
+listen_addresses = 'localhost'
+EOF
+  echo "$me: initialized $PGDATA (superuser $pguser, UTF8/C.UTF-8)"
+}
+
+do_start() {
+  initialized || die "no cluster in $PGDATA; run '$me init' first"
+  running && { echo "$me: already running on port $PGPORT"; return 0; }
+  mkdir -p "$PGHOST" "$(dirname "$RAINIER_PG_LOG")"
+  pg_ctl --pgdata="$PGDATA" --log="$RAINIER_PG_LOG" \
+         --options="-p $PGPORT" --timeout="$RAINIER_PG_TIMEOUT" -w start >/dev/null
+  running || die "the server did not accept connections; see $RAINIER_PG_LOG"
+  echo "$me: listening on 127.0.0.1:$PGPORT and $PGHOST"
+}
+
+do_stop() {
+  initialized || die "no cluster in $PGDATA"
+  [ -f "$PGDATA/postmaster.pid" ] || { echo "$me: not running"; return 0; }
+  # A pidfile with nothing behind it is the normal state after the container
+  # this cluster last ran in went away: $PGDATA is on the workspace volume and
+  # survives, the postmaster does not. Signalling that recorded pid in a new
+  # container would at best fail and at worst interrupt whatever now holds it,
+  # so the pidfile alone is never taken as proof a server is running. It is
+  # left in place rather than deleted, because `pg_ctl start` already clears a
+  # stale one and refuses when the pid has genuinely been reused — which is
+  # PostgreSQL's decision to make, not this script's.
+  if ! answering; then
+    echo "$me: not running (a stale postmaster.pid is left for pg_ctl to clear)"
+    return 0
+  fi
+  # -W: do not wait in pg_ctl. See the header.
+  pg_ctl --pgdata="$PGDATA" --mode=fast -W stop >/dev/null
+  i=0
+  while [ -f "$PGDATA/postmaster.pid" ]; do
+    i=$((i + 1))
+    [ "$i" -lt $((RAINIER_PG_TIMEOUT * 2)) ] || die "the server did not shut down; see $RAINIER_PG_LOG"
+    sleep 0.5
+  done
+  echo "$me: stopped"
+}
+
+do_status() {
+  initialized || { echo "$me: no cluster in $PGDATA"; return 1; }
+  if running; then
+    echo "$me: running on 127.0.0.1:$PGPORT ($PGDATA)"
+  else
+    echo "$me: stopped ($PGDATA)"
+    return 1
+  fi
+}
+
+# The DSN a test suite wants: TCP loopback, no TLS, trust auth. This is the
+# value for rainier-cloud's RAINIER_TEST_DATABASE_URL.
+do_url() { echo "postgres://$pguser@127.0.0.1:$PGPORT/${1:-$PGDATABASE}?sslmode=disable"; }
+
+case "${1:-}" in
+  init)    shift; do_init "$@" ;;
+  start)   shift; do_start "$@" ;;
+  stop)    shift; do_stop "$@" ;;
+  restart) shift; do_stop; do_start ;;
+  status)  shift; do_status "$@" ;;
+  url)     shift; do_url "$@" ;;
+  psql)    shift; exec psql "$@" ;;
+  up)      shift; initialized || do_init; do_start ;;
+  ""|-h|--help|help)
+    cat <<EOF
+usage: $me <command>
+
+  init            create a cluster in \$PGDATA (default
+                  \$RAINIER_SERVICES_DIR/postgresql/data, on the workspace volume)
+  start           start it on 127.0.0.1:\$PGPORT (default 5432) and on the socket
+                  in \$PGHOST (default \$RAINIER_SERVICES_RUNTIME_DIR/postgresql,
+                  on /tmp: a socket under /workspace breaks push and pull)
+  stop            fast shutdown, waiting for the server's own pidfile
+  restart         stop then start
+  status          exit 0 only if the server is accepting connections
+  url [database]  print the DSN (rainier-cloud's RAINIER_TEST_DATABASE_URL)
+  psql [args...]  psql against this cluster
+  up              init if needed, then start
+
+Nothing here starts automatically and nothing is published outside this
+session's network namespace. See docs/session-image.md.
+EOF
+    ;;
+  *) die "unknown command '$1'; try '$me --help'" ;;
+esac

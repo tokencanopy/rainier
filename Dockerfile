@@ -45,6 +45,15 @@ ARG JQ_VERSION=1.8.2
 # hash on the way in.
 ARG CLAUDE_CODE_VERSION=2.1.263
 
+# PostgreSQL comes from the PostgreSQL project's own Debian archive (PGDG),
+# because Debian bookworm ships 15 and the platform's own store tests are
+# written against 17. The archive is the same one the official `postgres` image
+# installs from; what is pinned here is its SIGNING KEY, by full fingerprint,
+# checked before the archive is added to apt at all. See the services layer
+# below and docs/session-image.md for what that pin does and does not cover.
+ARG POSTGRES_MAJOR=17
+ARG PGDG_KEY_FINGERPRINT=B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
+
 # --- the pinned upstream toolchain, verified before it is extracted ----------
 FROM ${BASE_IMAGE} AS toolchain
 ARG TARGETARCH
@@ -86,8 +95,10 @@ ARG CLAUDE_CODE_VERSION
 # afternoon.
 #
 # Deliberately absent: sudo (a session user who could escalate would make every
-# other boundary in this file decorative) and any credential helper, keyring, or
-# package manager configuration that could hold one.
+# other boundary in this file decorative) and any credential helper or package
+# manager configuration that could hold one. The one keyring this image does
+# install (the services layer below) holds a public archive-verification key and
+# no secret; nothing token-shaped is baked in anywhere.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential zlib1g-dev \
       pkg-config \
@@ -102,6 +113,125 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && update-ca-certificates
+
+# --- the local service tools: PostgreSQL 17, SQLite and Redis ----------------
+#
+# A session that cannot start a database cannot run an integration test, and
+# every way of getting one later is worse than baking it in: `sudo` is not
+# installed and never will be, the rootfs is read-only, and an environment's
+# setup script would cost an egress allowlist entry per installer plus a
+# snapshot per environment. So the CLIENT and the SERVER halves are both here.
+# Nothing starts them — there is no service in this image's entrypoint, no
+# cluster in its layers, and no port bound until a developer runs one of the
+# commands in docs/session-image.md.
+#
+# SQLite and Redis are Debian bookworm's own packages. PostgreSQL is not:
+# bookworm ships 15, and rainier-cloud's cell is 17 with store tests written
+# against it, so a session with a 15 cannot run them. PGDG is the PostgreSQL
+# project's own Debian archive and the same one the official `postgres` image
+# installs from. Adding a second archive is a real trust decision and it is
+# pinned the strongest way an apt archive can be: the signing key is fetched
+# over HTTPS and its FULL fingerprint is checked before the archive is
+# configured at all, so a substituted key is a failed build and never a silent
+# install. The key COUNT is checked first and separately, because `gpg
+# --dearmor` converts every key in the file and `signed-by=` then trusts the
+# whole keyring: a file carrying the genuine key followed by somebody else's
+# would otherwise satisfy a check that reads only the first fingerprint. Package VERSIONS resolve against a moving archive — exactly like
+# Debian's own, and with the same answer — and are recorded by the manifest
+# below rather than pinned. See docs/session-image.md.
+#
+# create_main_cluster=false, because postgresql-common otherwise runs initdb at
+# install time. That cluster would live under /var/lib/postgresql — on the
+# read-only rootfs at runtime, owned by a `postgres` account no session ever
+# becomes — so it would be dead weight in every layer and a misleading thing
+# for a developer to find. A session's cluster belongs on the workspace volume,
+# created by the developer when they want one.
+#
+# policy-rc.d, because Debian maintainer scripts start what they install and
+# nothing in this image may be running. It refuses every service start for the
+# duration of the install and is removed immediately afterwards.
+#
+# libpq5 and libpq-dev are named explicitly, and their major floored at the
+# server's, because the base image carries Debian's 15 of both while
+# postgresql-client-17 needs at least a 17. apt is as free to resolve that by
+# REMOVING the -dev package as by upgrading it, and a silently dropped C client
+# header set is exactly the kind of regression a manifest records after the
+# fact instead of preventing. The floor is `>=` and not `==` deliberately: PGDG
+# ships ONE libpq for every server major it carries, so an archive that has
+# released an 18 hands this image an 18.x libpq beside the 17 server. That is
+# the supported arrangement — libpq is compatible with older servers — and an
+# equality check here would break the build the day a new major ships.
+ARG POSTGRES_MAJOR
+ARG PGDG_KEY_FINGERPRINT
+RUN set -eu; \
+    . /etc/os-release; \
+    [ "${VERSION_CODENAME:-}" = bookworm ] || { \
+      echo "the archive line below names bookworm; this base is ${VERSION_CODENAME:-unknown}" >&2; exit 1; }; \
+    curl --fail --location --retry 3 --retry-delay 2 --max-time 120 \
+         --proto '=https' --tlsv1.2 --output /tmp/pgdg.asc \
+         https://www.postgresql.org/media/keys/ACCC4CF8.asc; \
+    keys="$(gpg --show-keys --with-colons /tmp/pgdg.asc | grep -c '^pub:')"; \
+    [ "$keys" = 1 ] || { \
+      echo "the PGDG key file carries ${keys} primary keys, not one; --dearmor would trust all of them" >&2; exit 1; }; \
+    got="$(gpg --show-keys --with-colons --fingerprint /tmp/pgdg.asc | awk -F: '$1 == "fpr" { print $10; exit }')"; \
+    [ "$got" = "$PGDG_KEY_FINGERPRINT" ] || { \
+      echo "the PGDG signing key is ${got:-unreadable}, not the pinned $PGDG_KEY_FINGERPRINT" >&2; exit 1; }; \
+    gpg --dearmor < /tmp/pgdg.asc > /usr/share/keyrings/rainier-pgdg.gpg; \
+    rm -f /tmp/pgdg.asc; \
+    chmod 0644 /usr/share/keyrings/rainier-pgdg.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/rainier-pgdg.gpg] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+      > /etc/apt/sources.list.d/rainier-pgdg.list; \
+    mkdir -p /etc/postgresql-common; \
+    echo 'create_main_cluster = false' > /etc/postgresql-common/createcluster.conf; \
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d; \
+    chmod 0755 /usr/sbin/policy-rc.d; \
+    apt-get update; \
+    dpkg-query -W -f='${Package}\n' | sort > /tmp/packages.before; \
+    apt-get install -y --no-install-recommends \
+      "postgresql-${POSTGRES_MAJOR}" "postgresql-client-${POSTGRES_MAJOR}" \
+      libpq5 libpq-dev \
+      sqlite3 libsqlite3-0 \
+      redis-server redis-tools; \
+    rm -f /usr/sbin/policy-rc.d; \
+    rm -rf /var/lib/apt/lists/*; \
+    pgbin="/usr/lib/postgresql/${POSTGRES_MAJOR}/bin"; \
+    "$pgbin/postgres" --version | grep -q "(PostgreSQL) ${POSTGRES_MAJOR}\."; \
+    "$pgbin/psql" --version | grep -q "(PostgreSQL) ${POSTGRES_MAJOR}\."; \
+    "$pgbin/initdb" --version >/dev/null; \
+    "$pgbin/pg_ctl" --version >/dev/null; \
+    for pkg in libpq5 libpq-dev; do \
+      have=$(dpkg-query -W -f='${Version}' "$pkg" | sed 's/[^0-9].*//'); \
+      [ -n "$have" ] && [ "$have" -ge "${POSTGRES_MAJOR}" ] || { \
+        echo "$pkg is $(dpkg-query -W -f='${Version}' "$pkg"), older than ${POSTGRES_MAJOR}" >&2; exit 1; }; \
+    done; \
+    [ ! -d /var/lib/postgresql/${POSTGRES_MAJOR}/main ] || { \
+      echo "an installed cluster is in the image; create_main_cluster did not take" >&2; exit 1; }; \
+    for f in "$pgbin"/*; do \
+      n="${f##*/}"; \
+      [ ! -e "/usr/local/bin/$n" ] || { echo "/usr/local/bin/$n already exists" >&2; exit 1; }; \
+      ln -s "$f" "/usr/local/bin/$n"; \
+    done; \
+    sqlite3 --version >/dev/null; \
+    redis-server --version >/dev/null; \
+    redis-cli --version >/dev/null; \
+    dpkg-query -W -f='${Package}\t${Installed-Size}\n' | sort \
+      | awk -F'\t' 'NR==FNR { had[$1] = 1; next } \
+                     !($1 in had) { n++; kb += $2; added[$1] = $2 } \
+                     END { printf "%d packages, %d KiB installed\n", n, kb; \
+                           for (p in added) printf "%8d KiB  %s\n", added[p], p }' \
+            /tmp/packages.before - \
+      | { read -r first; echo "$first"; sort -rn; } > /usr/local/share/rainier-services-size.txt; \
+    rm -f /tmp/packages.before; \
+    chmod 0644 /usr/local/share/rainier-services-size.txt
+
+# The two helpers that turn those binaries into a working non-root service.
+# Root-owned in /usr/local/bin, like sessiond and the agents: a session user who
+# could rewrite them could rewrite what a developer is about to run as a server.
+# Neither installs anything, neither needs the network, and neither is invoked
+# by the entrypoint — see docs/session-image.md for what they do and for the
+# equivalent raw initdb/pg_ctl commands.
+COPY images/session/services/ /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/rainier-pg /usr/local/bin/rainier-redis
 
 # The pinned upstream releases from the toolchain stage. Root-owned, under
 # /usr/local, which the session user cannot write — see the prefix note below.
@@ -190,7 +320,13 @@ RUN groupmod --new-name rainier node \
 # ran on the 6th" from a digest alone. A target list is not evidence; this is.
 RUN { dpkg-query -W -f='${Package}\t${Version}\n' | sort; } > /usr/local/share/rainier-os-packages.txt \
     && npm ls --global --depth=0 --json > /usr/local/share/rainier-npm-global.json \
-    && chmod 0644 /usr/local/share/rainier-os-packages.txt /usr/local/share/rainier-npm-global.json
+    && { for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do \
+           [ -f "$f" ] || continue; \
+           echo "== $f"; \
+           grep -vE '^[[:space:]]*(#|$)' "$f" || true; \
+         done; } > /usr/local/share/rainier-apt-sources.txt \
+    && chmod 0644 /usr/local/share/rainier-os-packages.txt /usr/local/share/rainier-npm-global.json \
+                  /usr/local/share/rainier-apt-sources.txt
 
 # Caches, all on the workspace volume. A session's $HOME is on the read-only
 # rootfs, so a tool that caches under it fails its first write; /workspace is
@@ -202,7 +338,21 @@ RUN { dpkg-query -W -f='${Package}\t${Version}\n' | sort; } > /usr/local/share/r
 # carry off the runner, and the two must not meet. A tool that wants to write a
 # token gets a read-only $HOME and fails loudly, which is the outcome this
 # system wants.
+#
+# A service's DURABLE state goes on the volume, for the same reason the caches
+# do; its RUNTIME state — the unix sockets, the pidfiles — deliberately does
+# not. protocol/workspace.TarGz refuses a socket rather than skipping it, so a
+# socket under /workspace turns `rainier push`/`pull` of any tree containing it
+# into an error, and an unclean exit leaves the socket behind to keep doing so.
+# /tmp is the right home for it: writable, per container, and gone when the
+# container is.
 ENV PATH="/opt/rainier-env/bin:${PATH}" \
+    RAINIER_SERVICES_DIR=/workspace/.services \
+    RAINIER_SERVICES_RUNTIME_DIR=/tmp/rainier-services \
+    PGDATA=/workspace/.services/postgresql/data \
+    PGHOST=/tmp/rainier-services/postgresql \
+    PGPORT=5432 \
+    PGDATABASE=postgres \
     GOCACHE=/workspace/.cache/go-build \
     GOMODCACHE=/workspace/.cache/go-mod \
     GOPATH=/workspace/.gopath \

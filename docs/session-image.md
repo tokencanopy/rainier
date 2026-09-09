@@ -30,26 +30,250 @@ Pinned by version in the `Dockerfile`, and by SHA-256 in
 | **Python** | `python3`, `venv`, `pip`, and `uv`/`uvx` |
 | **Shell** | `bash`, GNU coreutils, findutils, grep, sed, gawk, diffutils, `patch` |
 | **Search and data** | `ripgrep`, `jq` |
+| **Databases** | PostgreSQL 17 client *and server* (`psql`, `initdb`, `pg_ctl`, `pg_dump`, `createdb`, `pg_isready`, …), SQLite 3 (`sqlite3`), Redis (`redis-server`, `redis-cli`) — installed, never started; see [Local services](#local-services-a-developer-starts) |
 | **Network** | `curl`, `wget`, CA certificates, `openssl`, `nc` |
 | **Archives** | `tar`, `gzip`, `bzip2`, `xz-utils`, `zip`, `unzip` |
 | **Diagnostics** | `ps` (procps), `ss` (iproute2), `lsof`, `dig` (dnsutils), `file` |
 | **Editing and transfer** | `less`, `nano`, `vim-tiny`, `rsync` |
 
-Two manifests are written into the image at build time, because a target list
+Three manifests are written into the image at build time, because a target list
 is not evidence and a digest on its own answers nothing:
 `/usr/local/share/rainier-os-packages.txt` (every Debian package and version
-actually installed) and `/usr/local/share/rainier-npm-global.json`.
+actually installed), `/usr/local/share/rainier-npm-global.json`, and
+`/usr/local/share/rainier-apt-sources.txt` (every apt archive the build
+resolved against — there are two of them; see [Local services](#local-services-a-developer-starts)).
 
 **What "version-pinned" does and does not cover.** Every base image is a
 digest; every downloaded artifact is a version in the URL and a SHA-256 checked
 before extraction; Claude Code is an exact npm version, which for that package
 is one immutable tarball with no dependency tree under it. The Debian package
 set is pinned by the base image digest and *recorded* by the manifest, not
-pinned by version — apt resolves against a moving archive. Pinning that too
+pinned by version — apt resolves against a moving archive, and that is now true
+of two archives rather than one: Debian's, and the PostgreSQL project's own
+(PGDG), whose *signing key* is pinned here by full fingerprint. Pinning that too
 means sourcing from `snapshot.debian.org`, which is a real option and a real
 cost (a slow, frequently unavailable host in the build path); it has not been
 taken. Rebuilds of one commit are therefore reproducible in every layer except
 the apt one, and the manifest is how you find out what the apt layer was.
+
+## Local services a developer starts
+
+An integration test needs a database, and a session has no way to get one after
+the fact: `sudo` is not installed, the rootfs is read-only, and the egress
+allowlist does not carry a package archive. So PostgreSQL 17 — the **server**,
+not only `psql` — SQLite and Redis are in the image, and **nothing starts
+them**. There is no service in the entrypoint, no cluster in any layer, and no
+port bound until somebody runs one of the commands below. Each session
+container has its own network namespace, so the loopback these servers bind is
+reachable from that session and from nothing else: not the runner, not another
+session, not the host.
+
+**Durable** state lives on `/workspace`, under `/workspace/.services`, because
+that is the one writable, persistent path a session has — `$HOME` is on the
+read-only rootfs and `/tmp` is a per-container tmpfs a suspend and resume does
+not carry. That also means a database on this path is inside what checkpoints,
+archives and `rainier pull` carry off the runner. Put test data there, not
+anything you would not want in an archive.
+
+**Runtime** state — the unix sockets and the pidfiles — deliberately goes the
+other way, under `/tmp/rainier-services`. `protocol/workspace.TarGz` *refuses*
+a socket rather than skipping it, on the principle that silently shipping a
+tree that is not the tree you named is the worse failure. So a socket under
+`/workspace` turns `rainier push` or `rainier pull` of any tree containing it
+into an error — and an unclean container exit leaves the socket file behind on
+the volume to keep doing so. A socket is per-container state anyway; the server
+recreates it on every start.
+
+### PostgreSQL
+
+```sh
+rainier-pg init          # initdb a cluster in $PGDATA (UTF8, C.UTF-8, trust auth)
+rainier-pg start         # pg_ctl start on 127.0.0.1:$PGPORT and $PGHOST
+rainier-pg status        # exit 0 only while it is accepting connections
+createdb myapp_test      # ordinary client tools; PGHOST/PGPORT are already set
+psql -d myapp_test
+rainier-pg url myapp_test    # postgres://rainier@127.0.0.1:5432/myapp_test?sslmode=disable
+rainier-pg restart
+rainier-pg stop
+```
+
+`rainier-pg` is a root-owned shell script in `/usr/local/bin`; it installs
+nothing, downloads nothing and needs no privilege. The raw tools are on `PATH`
+and the equivalent commands are:
+
+```sh
+mkdir -p "$(dirname "$PGDATA")" "$PGHOST"
+initdb --pgdata="$PGDATA" --username="$(id -un)" \
+       --encoding=UTF8 --locale=C.UTF-8 --auth-local=trust --auth-host=trust
+printf "unix_socket_directories = '%s'\nlisten_addresses = 'localhost'\n" \
+       "$PGHOST" >> "$PGDATA/postgresql.conf"
+pg_ctl --pgdata="$PGDATA" --log="$RAINIER_SERVICES_DIR/postgresql/server.log" \
+       --options="-p $PGPORT" -w start
+pg_ctl --pgdata="$PGDATA" --mode=fast -W stop   # then wait for postmaster.pid to go
+```
+
+Three of those lines are the reason the helper exists.
+
+- **`unix_socket_directories`.** PostgreSQL's compiled-in default is
+  `/var/run/postgresql`, which is on the read-only rootfs. Without the
+  override the postmaster cannot create its socket and a plain `pg_ctl start`
+  fails on a correct image.
+- **`--locale=C.UTF-8`.** This image generates no locales, so an `initdb` that
+  inherited an unset `LANG` produces an **SQL_ASCII** database that mangles the
+  first non-ASCII row a test inserts.
+- **`-W` and then waiting for `postmaster.pid`, and never trusting that file
+  on its own.** `pg_ctl -w stop` polls `kill(pid, 0)`, which cannot tell a
+  shut-down postmaster from an unreaped zombie. A real session's PID 1 is sessiond, which reaps orphans
+  (`internal/reap`), but a bare `docker run --entrypoint …` PID 1 does not, and
+  a stop that hangs for a minute in one shape and not the other is not worth
+  debugging twice. The server removing its own pidfile is its own completion
+  signal and is true under either. The same file is also the ordinary state
+  after the container this cluster last ran in went away — `$PGDATA` is on the
+  volume and survives, the postmaster does not — so `rainier-pg stop` asks the
+  server before it signals anything. A pid with nothing behind it may since
+  have been reused by something unrelated in the new container. The stale file
+  is left in place rather than deleted: `pg_ctl start` already clears one, and
+  refuses when the pid really is in use, which is PostgreSQL's call to make.
+
+`RAINIER_PG_TIMEOUT` (seconds, default 60) bounds a start and a stop alike.
+
+`trust` authentication is safe **here and only here**: the server listens on
+`localhost` inside the session's own network namespace and its data directory
+is the session user's. Do not copy this configuration anywhere a second party
+can reach the port.
+
+Environment already set by the image: `RAINIER_SERVICES_DIR`
+(`/workspace/.services`, durable) and `RAINIER_SERVICES_RUNTIME_DIR`
+(`/tmp/rainier-services`, sockets and pidfiles), and from those `PGDATA`,
+`PGHOST` (a socket directory, so bare `psql` connects with no flags), `PGPORT`
+and `PGDATABASE`.
+
+For PostgreSQL, **`PGDATA` and `PGPORT` are the knobs** — a second cluster is a
+second `PGDATA` on a second `PGPORT`. They are PostgreSQL's own variables and
+every client honours them, which is why the image does not add a second,
+overlapping one. `RAINIER_SERVICES_DIR` and `RAINIER_SERVICES_RUNTIME_DIR` are
+where those defaults come from, and are what `rainier-redis` reads.
+
+### Running rainier-cloud's PostgreSQL-backed tests
+
+```sh
+rainier-pg up                       # init if needed, then start
+createdb rainier_test
+export RAINIER_TEST_DATABASE_URL="$(rainier-pg url rainier_test)"
+go test ./...                       # in a rainier-cloud checkout
+```
+
+The suite migrates the database itself. `rainier-pg url` prints exactly the DSN
+shape those tests parse; `make canary` in that repository takes the same
+variable.
+
+### SQLite and Redis
+
+```sh
+sqlite3 app.db "select sqlite_version()"
+
+rainier-redis start      # 127.0.0.1:$RAINIER_REDIS_PORT (default 6379), protected mode
+rainier-redis ping       # PONG
+rainier-redis url        # redis://127.0.0.1:6379/0
+rainier-redis stop
+```
+
+SQLite needs nothing started — it is a library and a shell, and Python's
+`sqlite3` module is the same library.
+
+### What is deliberately not here
+
+Named, because "not supported" and "nobody thought about it" look identical
+from inside a session:
+
+- **No MySQL/MariaDB, no MongoDB, no Kafka, no Elasticsearch, no MinIO/S3
+  stand-in, no NATS, no RabbitMQ.** Each is a real size and maintenance cost
+  and none of them is on the path of the tests this platform actually runs. A
+  project that needs one should say so; adding it is a bounded change to this
+  file.
+- **No Docker, no Docker-in-Docker, no `docker compose`, no `testcontainers`
+  substrate.** A session gets no docker socket, no privileged container and no
+  nested daemon, so a test suite that reaches for testcontainers will fail —
+  the answer is the local server above, not a relaxed container.
+- **No `gcloud`, `terraform`, `kubectl` or other cloud-ops tooling.**
+- **No PostgreSQL extension outside the standard `contrib` set** that ships
+  with `postgresql-17`, and no PostGIS, TimescaleDB or `pgvector`.
+- **A 64 MiB `/dev/shm`.** That is docker's default and the driver does not
+  change it. It is ample for ordinary work; a deliberately parallel query over
+  a large table can exhaust it and report `could not resize shared memory
+  segment`. Set `max_parallel_workers_per_gather = 0` in that session's
+  `postgresql.conf` rather than asking for a wider container.
+
+### Why PGDG, and what that pin covers
+
+Debian bookworm ships PostgreSQL 15. rainier-cloud's cell is 17 and its store
+tests are written against 17, so a session with a 15 cannot run them. There is
+no PostgreSQL 17 for bookworm that does not come, directly or transitively,
+from **PGDG** — the PostgreSQL project's own Debian archive, and the archive
+the official `postgres` image installs from.
+
+Adding a second apt archive to the platform's own image is a real trust
+decision, and it is pinned the strongest way an apt archive admits: the signing
+key is fetched over HTTPS and its **full 40-hex fingerprint** is checked, as an
+`ARG` in the `Dockerfile` a reviewer can read, *before* the archive is
+configured at all. A substituted key is a failed build, never a silent install.
+What that does **not** pin is package versions, which resolve against a moving
+archive exactly as Debian's own do — `rainier-apt-sources.txt` records the
+archives and `rainier-os-packages.txt` records the versions that were realized.
+
+Two alternatives were considered and not taken. Copying `/usr/lib/postgresql/17`
+out of a digest-pinned `postgres:17-bookworm` stage pins harder, but hand-carries
+the dependency set — `libpq5`, the ICU and LLVM JIT libraries — with a missing
+one showing up as a runtime failure in somebody's test rather than a failed
+build. A Dev Container Feature would install from the same archive while adding
+the devcontainer CLI to the build path, which this image already rejected for
+[the reasons below](#why-this-base-image-and-not-a-dev-containers-one).
+
+### Size
+
+Measured, not estimated. `scripts/session-image-smoke.sh` reports both numbers
+on every qualification run — as workflow notices when it runs in Actions, so
+the figure lands on the pull request being approved rather than only in a job
+log — and the
+[rollout runbook](https://github.com/tokencanopy/rainier-cloud/blob/main/docs/runbooks/default-environment-rollout.md)
+step 2 is where the pull cost is reviewed against it.
+
+On the qualified candidate (linux/amd64, the default pinned base; run
+[34330830439](https://github.com/tokencanopy/rainier/actions/runs/34330830439)):
+
+| | |
+|---|---|
+| Whole image | ≈2.42 GB (2,416,401,380 bytes), 22 layers |
+| The services layer's installed payload | **14 packages, 244,512 KiB (≈239 MiB)** |
+
+That second figure is measured by the build, not estimated: it diffs its own
+package set across the install and writes the total and a per-package
+breakdown to `/usr/local/share/rainier-services-size.txt`, which the smoke then
+reports. Read it off the run rather than off this table, which is one build old
+the moment it is written.
+
+**Most of that 239 MiB is not PostgreSQL.** The five largest of the fourteen:
+
+```
+  126303 KiB  libllvm19
+   57395 KiB  postgresql-17
+   22767 KiB  libz3-4
+   15847 KiB  locales
+   10427 KiB  postgresql-client-17
+```
+
+`libllvm19` and its `libz3-4` are 149 MiB — 61% of the layer — and they are
+there for **JIT compilation of queries**, which `postgresql-17` hard-depends
+on. A session that never runs a query expensive enough to JIT still pays for
+them, because a distribution package's dependencies are not optional.
+
+Two things could remove that and neither was done here. Building PostgreSQL
+from source with `--without-llvm` trades a checksum-pinned distribution archive
+for a build this repository would then own and have to keep patched — a real
+cost, on the security-relevant path, for 149 MiB of a 2.4 GB image. Shipping no
+server at all is the thing this change exists to fix. If the pull cost review
+decides 239 MiB per runner boot is too much, the source build is the
+conversation to have, and the breakdown on the run is where it starts.
 
 ## Why this base image, and not a Dev Containers one
 
@@ -130,6 +354,19 @@ survivable:
   root-owned wrapper that creates the directories and then execs the real
   toolchain — a `go test` on a noexec `/tmp` otherwise dies at the last step of
   a green build with `fork/exec /tmp/...: permission denied`.
+- **`TMPDIR` is deliberately left alone**, for the same reason
+  `XDG_CONFIG_HOME` is. `/tmp` is a per-container tmpfs: agent scratch written
+  there is writable, is not in a checkpoint, is not in an archive, and does not
+  follow `rainier pull` off the runner. Exactly one build temp is moved off it
+  — `GOTMPDIR`, because `go test` has to *execute* what it builds. Setting
+  `TMPDIR` globally would move every tool's scratch, Claude Code's and Codex's
+  included, onto the volume that leaves the runner, and would quietly change
+  the sandbox each agent believes it has. Neither agent is wrapped here and
+  neither is given a rewritten temp; `internal/driver.TestSessionImageLeavesScratchOnTheTmpfs`
+  fails the ordinary suite if that changes.
+- **A service's state is on the volume too.** `PGDATA`, `PGHOST` and
+  `RAINIER_SERVICES_DIR` point under `/workspace/.services` for the same reason
+  the caches do. See [Local services](#local-services-a-developer-starts).
 - **`XDG_CONFIG_HOME` is deliberately left alone.** Configuration is where
   tools write credentials, and `/workspace` is what checkpoints, archives and
   `rainier pull` carry off the runner. A tool that wants to persist a token
@@ -176,7 +413,21 @@ npm dependency offline and checks the cache it used, serves HTTP from Python
 and HTTPS from Node against a certificate `curl` verifies, makes a real git
 commit, starts Claude Code and Codex with a read-only `$HOME`, asks Codex where
 it resolved its own package and runs the tool host it names, and brings the
-real entrypoint up as PID 1. Every probe runs in a container wearing the
+real entrypoint up as PID 1.
+
+It also runs the local services end to end: it checks that a fresh session has
+**nothing** listening and no cluster in the image, then `initdb`s a cluster on
+the workspace volume, starts it with `pg_ctl`, creates a database, commits one
+transaction and rolls another back, connects again over the DSN `rainier-pg
+url` prints, asserts the listener is on loopback and not on `0.0.0.0`, stops
+and restarts the server with its data intact, writes and reads a SQLite
+database from both the shell and Python, and starts Redis, PINGs it, round-trips
+a key and stops it — all as uid 1000, with a read-only rootfs and no network at
+all. The shell of those two helpers is separately exercised against stub
+binaries in `internal/driver/image_services_test.go`, which needs no docker and
+catches the behavioural failures (a stop that waits on the wrong thing, a
+server bound to the wrong interface, a cluster created with the wrong locale)
+that reading the script does not. Every probe runs in a container wearing the
 driver's own restrictions with **no network at all**, and nothing is relaxed to
 make a check pass — a check that cannot pass under the real contract is
 reporting a real defect in the image.

@@ -1,0 +1,107 @@
+#!/bin/sh
+# rainier-redis — a session-local Redis, started by the developer, on the only
+# writable storage a session has.
+#
+# The same shape as rainier-pg and for the same reasons: root-owned in
+# /usr/local/bin, never invoked by the entrypoint, installs nothing, needs no
+# privilege, and keeps its data, socket, pidfile and log on the workspace
+# volume because $HOME is read-only and Debian's /var/lib/redis belongs to an
+# account no session ever becomes.
+#
+# It binds 127.0.0.1 only. A session container has its own network namespace,
+# so that loopback is reachable from this session and from nothing else — not
+# from the runner, not from another session. `redis-server --daemonize yes`
+# double-forks, so the server is reparented to PID 1; a real session's PID 1 is
+# sessiond, which reaps (internal/reap). `stop` still waits on the server's own
+# answer rather than on the process table, so it behaves the same under any
+# PID 1.
+#
+# Usage: rainier-redis start|stop|restart|status|ping|url|cli [args...]
+set -eu
+
+: "${RAINIER_SERVICES_DIR:=/workspace/.services}"
+: "${RAINIER_SERVICES_RUNTIME_DIR:=/tmp/rainier-services}"
+: "${RAINIER_REDIS_DIR:=$RAINIER_SERVICES_DIR/redis}"
+: "${RAINIER_REDIS_RUNTIME_DIR:=$RAINIER_SERVICES_RUNTIME_DIR/redis}"
+: "${RAINIER_REDIS_PORT:=6379}"
+# Deadline, in seconds, for a start and for a stop alike.
+: "${RAINIER_REDIS_TIMEOUT:=60}"
+
+DATA="$RAINIER_REDIS_DIR/data"
+# The socket and the pidfile are runtime state and go on the per-container
+# tmpfs, not on the volume: protocol/workspace.TarGz refuses a socket rather
+# than skipping it, so one under /workspace fails a push or a pull of any tree
+# containing it.
+RUNDIR="$RAINIER_REDIS_RUNTIME_DIR"
+SOCK="$RUNDIR/redis.sock"
+PIDFILE="$RUNDIR/redis.pid"
+LOG="$RAINIER_REDIS_DIR/redis.log"
+
+me=${0##*/}
+die() { echo "$me: $*" >&2; exit 1; }
+
+alive() { [ "$(redis-cli -h 127.0.0.1 -p "$RAINIER_REDIS_PORT" ping 2>/dev/null || true)" = PONG ]; }
+
+do_start() {
+  alive && { echo "$me: already running on port $RAINIER_REDIS_PORT"; return 0; }
+  mkdir -p "$DATA" "$RUNDIR"
+  redis-server \
+    --daemonize yes \
+    --bind 127.0.0.1 \
+    --protected-mode yes \
+    --port "$RAINIER_REDIS_PORT" \
+    --unixsocket "$SOCK" \
+    --dir "$DATA" \
+    --pidfile "$PIDFILE" \
+    --logfile "$LOG"
+  i=0
+  until alive; do
+    i=$((i + 1))
+    [ "$i" -lt $((RAINIER_REDIS_TIMEOUT * 2)) ] || die "the server did not answer PING; see $LOG"
+    sleep 0.5
+  done
+  echo "$me: listening on 127.0.0.1:$RAINIER_REDIS_PORT and $SOCK"
+}
+
+do_stop() {
+  alive || { echo "$me: not running"; return 0; }
+  redis-cli -h 127.0.0.1 -p "$RAINIER_REDIS_PORT" shutdown nosave 2>/dev/null || true
+  i=0
+  while alive; do
+    i=$((i + 1))
+    [ "$i" -lt $((RAINIER_REDIS_TIMEOUT * 2)) ] || die "the server did not shut down; see $LOG"
+    sleep 0.5
+  done
+  rm -f "$PIDFILE"
+  echo "$me: stopped"
+}
+
+case "${1:-}" in
+  start)   shift; do_start "$@" ;;
+  stop)    shift; do_stop "$@" ;;
+  restart) shift; do_stop; do_start ;;
+  status)  shift; if alive; then echo "$me: running on 127.0.0.1:$RAINIER_REDIS_PORT"; else echo "$me: stopped"; exit 1; fi ;;
+  ping)    shift; exec redis-cli -h 127.0.0.1 -p "$RAINIER_REDIS_PORT" ping ;;
+  url)     shift; echo "redis://127.0.0.1:$RAINIER_REDIS_PORT/0" ;;
+  cli)     shift; exec redis-cli -h 127.0.0.1 -p "$RAINIER_REDIS_PORT" "$@" ;;
+  ""|-h|--help|help)
+    cat <<EOF
+usage: $me <command>
+
+  start          start Redis on 127.0.0.1:\$RAINIER_REDIS_PORT (default 6379)
+                 with its data and log under \$RAINIER_REDIS_DIR (default
+                 \$RAINIER_SERVICES_DIR/redis, on the workspace volume) and its
+                 socket and pidfile under \$RAINIER_REDIS_RUNTIME_DIR (on /tmp)
+  stop           SHUTDOWN NOSAVE, waiting for the server to stop answering
+  restart        stop then start
+  status         exit 0 only if the server answers PING
+  ping           PING it
+  url            print redis://127.0.0.1:<port>/0
+  cli [args...]  redis-cli against this server
+
+Nothing here starts automatically and nothing is published outside this
+session's network namespace. See docs/session-image.md.
+EOF
+    ;;
+  *) die "unknown command '$1'; try '$me --help'" ;;
+esac
