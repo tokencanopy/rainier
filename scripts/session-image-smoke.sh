@@ -694,7 +694,13 @@ SANDBOX_OUTPUT=$(probe '
   '"$BROWSER_FIXTURE"'
   out=$("$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad --enable-logging=stderr --v=1 --user-data-dir="$d/p2" --dump-dom "file://$d/page.html" 2>&1)
   st=$?
-  printf "exit=%s %s\n" "$st" "$(printf "%s" "$out" | grep -i -m1 "sandbox\|namespace" || echo "sandbox launch succeeded")"
+  diagnostic=chromium-no-diagnostic
+  case "$out" in
+    *"No usable sandbox"*) diagnostic=chromium-no-usable-sandbox ;;
+    *"Failed to move to new namespace"*) diagnostic=chromium-namespace-setup-failed ;;
+    *"SIGSYS"*|*"seccomp-bpf"*) diagnostic=chromium-seccomp-failure ;;
+  esac
+  printf "exit=%s %s\n" "$st" "$diagnostic"
   exit "$st"
 ')
 SANDBOX_STATUS=$?
