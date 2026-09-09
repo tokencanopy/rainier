@@ -719,6 +719,21 @@ else
   bad "Chromium starts with its own sandbox" "exit=$SANDBOX_STATUS"
 fi
 
+# Diagnostic only: compare the bounded launch with Chromium's sandbox disabled
+# under the same outer container policy. Keep this as a fixed status token so
+# a qualification log cannot receive browser stderr or host audit data. This
+# distinguishes a missing Chromium-layer syscall from a broader browser/image
+# problem; it does not relax or replace the required sandboxed check above.
+NO_SANDBOX_STATUS=$(probe '
+  '"$BROWSER_FIXTURE"'
+  timeout -k 5 30 "$b" --no-sandbox --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p3" --dump-dom "$SERVER_URL" >/dev/null 2>&1
+  st=$?
+  printf "no-sandbox-exit=%s\n" "$st"
+  exit 0
+' | sed -n 's/.*\(no-sandbox-exit=[0-9][0-9]*\).*/\1/p' | tail -1)
+printf 'note  chromium without its own sandbox under the driver restrictions: %s\n' "${NO_SANDBOX_STATUS:-no-sandbox-status-unavailable}"
+note "chromium no-sandbox diagnostic" "${NO_SANDBOX_STATUS:-no-sandbox-status-unavailable}"
+
 BROWSER_SIZE=$(probe 'cat /usr/local/share/rainier-browser-size.txt 2>/dev/null | head -1; grep -h "browser payload" /usr/local/share/rainier-browser-size.txt 2>/dev/null' | tr '\n' '; ')
 printf 'note  browser layer: %s\n' "$BROWSER_SIZE"
 note "browser layer size" "$BROWSER_SIZE"
