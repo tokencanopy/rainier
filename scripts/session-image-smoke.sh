@@ -585,6 +585,17 @@ document.title = String(Math.round(document.getElementById("m").getBoundingClien
 </script>
 </body></html>
 HTML
+  SERVER_URL=http://127.0.0.1:8974/page.html
+  python3 -m http.server 8974 --bind 127.0.0.1 --directory "$d" >/dev/null 2>&1 &
+  server=$!
+  cleanup_server() { kill "$server" >/dev/null 2>&1 || true; wait "$server" 2>/dev/null || true; }
+  trap cleanup_server EXIT
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    curl -fsS "$SERVER_URL" >/dev/null 2>&1 && break
+    kill -0 "$server" >/dev/null 2>&1 || { echo "browser fixture server exited"; exit 1; }
+    sleep 0.1
+  done
+  curl -fsS "$SERVER_URL" >/dev/null 2>&1 || { echo "browser fixture server not ready"; exit 1; }
   # The flags Playwright passes, and nothing else: --disable-dev-shm-usage is
   # in chromiumSwitches for every launch, which is why docker default 64 MiB
   # /dev/shm is enough for a Playwright suite.
@@ -637,14 +648,14 @@ check "every shared library the browser needs resolves in this image" "libs-reso
 
 check "the browser renders a page and writes a desktop-viewport screenshot, offline" "1280 800" '
   '"$BROWSER_FIXTURE"'
-  render --screenshot="$d/desktop.png" --window-size=1280,800 "file://$d/page.html" >/dev/null
+  render --screenshot="$d/desktop.png" --window-size=1280,800 "$SERVER_URL" >/dev/null
   [ -s "$d/desktop.png" ] || { echo "no screenshot was written"; exit 1; }
   file "$d/desktop.png" | grep -q "PNG image" || { echo "not a PNG"; exit 1; }
   png_size "$d/desktop.png"'
 
 check "the same page at a phone viewport produces a phone-sized screenshot" "390 844" '
   '"$BROWSER_FIXTURE"'
-  render --screenshot="$d/phone.png" --window-size=390,844 "file://$d/page.html" >/dev/null
+  render --screenshot="$d/phone.png" --window-size=390,844 "$SERVER_URL" >/dev/null
   [ -s "$d/phone.png" ] || { echo "no screenshot was written"; exit 1; }
   png_size "$d/phone.png"'
 
@@ -659,7 +670,7 @@ check "Arial resolves to a metric-compatible font and text lays out at its real 
   '"$BROWSER_FIXTURE"'
   fc-match Arial | grep -qi liberation || { echo "fc-match Arial = $(fc-match Arial)"; exit 1; }
   fc-list | grep -qi emoji || { echo "no emoji font"; exit 1; }
-  w=$(render --dump-dom "file://$d/page.html" | sed -n "s/.*<title>\([0-9]*\)<\/title>.*/\1/p" | head -1)
+  w=$(render --dump-dom "$SERVER_URL" | sed -n "s/.*<title>\([0-9]*\)<\/title>.*/\1/p" | head -1)
   [ -n "$w" ] || { echo "the page did not report a measured width"; exit 1; }
   [ "$w" -ge 800 ] && [ "$w" -le 870 ] || { echo "ten 100px Arial Ms measured ${w}px, not ~833"; exit 1; }
   echo font-metrics-ok'
@@ -676,7 +687,7 @@ check "the browser leaves no process behind after it exits" "no-browser-left" '
     done
     return 1
   }
-  render --screenshot="$d/x.png" --window-size=800,600 "file://$d/page.html" >/dev/null
+  render --screenshot="$d/x.png" --window-size=800,600 "$SERVER_URL" >/dev/null
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     browsers_alive || break
     sleep 0.5
@@ -694,7 +705,7 @@ check "rainier-browsers reports the cache a project's Playwright will read" "lin
 # initialize its own sandbox exits nonzero.
 SANDBOX_OUTPUT=$(probe '
   '"$BROWSER_FIXTURE"'
-  timeout -k 5 30 "$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p2" --dump-dom "file://$d/page.html" >/dev/null 2>&1
+  timeout -k 5 30 "$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p2" --dump-dom "$SERVER_URL" >/dev/null 2>&1
   st=$?
   printf "exit=%s\n" "$st"
   exit "$st"
