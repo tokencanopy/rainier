@@ -555,6 +555,64 @@ check "every service kept its durable state on the workspace volume, and none on
 echo
 echo "-- browser testing"
 
+# Before launching the browser, exercise the five namespace shapes Chromium's
+# sandbox uses with a tiny in-process probe. This keeps the diagnosis at the
+# policy boundary: the probe reports only fixed stage names and result classes,
+# never raw errno values or host audit data.
+check "the outer policy admits Chromium namespace syscall shapes" "clone-user=allowed" '
+  python3 - <<PY
+import ctypes
+import os
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+libc._exit.argtypes = [ctypes.c_int]
+SYS_CLONE = 56
+SYS_UNSHARE = 272
+SIGCHLD = 17
+CLONE_NEWUSER = 0x10000000
+CLONE_NEWPID = 0x20000000
+CLONE_NEWNET = 0x40000000
+CLONE_NEWNS = 0x00020000
+CLONE_FS = 0x00000200
+CLONE_VM = 0x00000100
+CLONE_VFORK = 0x00004000
+CLONE_SETTLS = 0x00080000
+
+def clone_result(flags, with_stack=False):
+    stack = None
+    child_stack = 0
+    if with_stack:
+        stack = ctypes.create_string_buffer(65536)
+        child_stack = ctypes.addressof(stack) + len(stack)
+    pid = libc.syscall(SYS_CLONE, flags, child_stack, 0, 0, 0)
+    if pid == 0:
+        libc._exit(0)
+    if pid < 0:
+        return "refused"
+    _, status = os.waitpid(pid, 0)
+    return "allowed" if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 else "other"
+
+def unshare_result(flags):
+    pid = os.fork()
+    if pid == 0:
+        libc._exit(0 if libc.syscall(SYS_UNSHARE, flags) == 0 else 1)
+    _, status = os.waitpid(pid, 0)
+    return "allowed" if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 else "refused"
+
+results = {
+    "clone-user": clone_result(CLONE_NEWUSER | SIGCHLD),
+    "clone-zygote": clone_result(CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET | SIGCHLD),
+    "clone-safe-empty-dir": clone_result(CLONE_FS | CLONE_VM | CLONE_VFORK | CLONE_SETTLS | SIGCHLD, True),
+    "unshare-user": unshare_result(CLONE_NEWUSER),
+    "unshare-user-mount": unshare_result(CLONE_NEWUSER | CLONE_NEWNS),
+}
+for name, result in results.items():
+    print(name + "=" + result)
+raise SystemExit(0 if all(value == "allowed" for value in results.values()) else 1)
+PY
+'
+
 # `npx playwright install --with-deps` is what every project's CI runs and what
 # a session cannot: its --with-deps half is an apt install as root, and a
 # session has no escalation path, a read-only rootfs and no package archive on
