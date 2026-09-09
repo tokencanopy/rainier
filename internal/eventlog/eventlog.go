@@ -74,8 +74,7 @@ func Open(path string) (*Log, error) {
 func (l *Log) Append(typ string, data []byte) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.last++
-	e := Entry{Seq: l.last, Type: typ, Data: append([]byte(nil), data...), TS: time.Now().UnixMilli()}
+	e := Entry{Seq: l.last + 1, Type: typ, Data: append([]byte(nil), data...), TS: time.Now().UnixMilli()}
 	b, err := json.Marshal(e)
 	if err != nil {
 		return 0, err
@@ -86,6 +85,7 @@ func (l *Log) Append(typ string, data []byte) (uint64, error) {
 	if err := l.w.Flush(); err != nil {
 		return 0, err
 	}
+	l.last = e.Seq
 	l.entries = append(l.entries, e)
 	return e.Seq, nil
 }

@@ -85,3 +85,33 @@ func TestOpenTruncatesCorruptTail(t *testing.T) {
 		}
 	}
 }
+
+// A failed Append must not advance LastSeq() past a write Since() cannot answer.
+func TestFailedAppendDoesNotAdvanceLastSeq(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "s.log")
+	l, err := Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, err := l.Append("output", []byte("a")); err != nil || s != 1 {
+		t.Fatalf("first Append = %d, %v, want 1, nil", s, err)
+	}
+
+	// Close the underlying file to force the next write to fail deterministically.
+	l.f.Close()
+
+	if _, err := l.Append("output", []byte("b")); err == nil {
+		t.Fatal("Append over a closed file returned nil error, want a write failure")
+	}
+
+	if got := l.LastSeq(); got != 1 {
+		t.Fatalf("LastSeq() after failed Append = %d, want 1 (unchanged)", got)
+	}
+	got, err := l.Since(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Seq != 1 {
+		t.Fatalf("Since(0) after failed Append = %+v, want exactly seq 1", got)
+	}
+}
