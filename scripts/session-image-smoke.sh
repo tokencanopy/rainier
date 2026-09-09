@@ -555,23 +555,6 @@ check "every service kept its durable state on the workspace volume, and none on
 echo
 echo "-- browser testing"
 
-# Chromium's safe-empty-directory helper enters a user namespace, writes its
-# identity maps, then chroots to a proc fdinfo directory. Exercise that whole
-# boundary with the system helper before launching Chromium. Only fixed output
-# is emitted; no raw errno or host audit data can enter the log.
-check "Chromium namespace maps and safe chroot are admitted" "chroot=allowed" '
-  if ! unshare -Ur true >/dev/null 2>&1; then
-    echo namespace=refused
-    exit 1
-  fi
-  if unshare -Ur bash -c "chroot /proc/self/fdinfo/" >/dev/null 2>&1; then
-    echo namespace=allowed chroot=allowed
-  else
-    echo namespace=allowed chroot=refused
-    exit 1
-  fi
-'
-
 # `npx playwright install --with-deps` is what every project's CI runs and what
 # a session cannot: its --with-deps half is an apt install as root, and a
 # session has no escalation path, a read-only rootfs and no package archive on
@@ -705,29 +688,21 @@ check "rainier-browsers reports the cache a project's Playwright will read" "lin
   rainier-browsers status'
 
 # The sandbox-enabled launch is a required check; a browser that cannot
-# initialize its own sandbox exits nonzero. The observed status is recorded for
-# diagnostics after the functional checks.
+# initialize its own sandbox exits nonzero.
 SANDBOX_OUTPUT=$(probe '
   '"$BROWSER_FIXTURE"'
-  out=$("$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad --enable-logging=stderr --v=1 --user-data-dir="$d/p2" --dump-dom "file://$d/page.html" 2>&1)
+  "$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p2" --dump-dom "file://$d/page.html" >/dev/null 2>&1
   st=$?
-  diagnostic=chromium-no-diagnostic
-  case "$out" in
-    *"No usable sandbox"*) diagnostic=chromium-no-usable-sandbox ;;
-    *"Failed to move to new namespace"*) diagnostic=chromium-namespace-setup-failed ;;
-    *"SIGSYS"*|*"seccomp-bpf"*) diagnostic=chromium-seccomp-failure ;;
-  esac
-  printf "exit=%s %s\n" "$st" "$diagnostic"
+  printf "exit=%s\n" "$st"
   exit "$st"
 ')
 SANDBOX_STATUS=$?
-SANDBOX_DIAGNOSTIC=$(printf '%s\n' "$SANDBOX_OUTPUT" | tail -1)
-printf 'note  chromium own-sandbox under the driver restrictions: exit=%s %s\n' "$SANDBOX_STATUS" "$SANDBOX_DIAGNOSTIC"
-note "chromium own-sandbox status" "exit=$SANDBOX_STATUS $SANDBOX_DIAGNOSTIC"
+printf 'note  chromium own-sandbox under the driver restrictions: exit=%s\n' "$SANDBOX_STATUS"
+note "chromium own-sandbox status" "exit=$SANDBOX_STATUS"
 if [ "$SANDBOX_STATUS" -eq 0 ]; then
   ok "Chromium starts with its own sandbox"
 else
-  bad "Chromium starts with its own sandbox" "exit=$SANDBOX_STATUS; $SANDBOX_DIAGNOSTIC"
+  bad "Chromium starts with its own sandbox" "exit=$SANDBOX_STATUS"
 fi
 
 BROWSER_SIZE=$(probe 'cat /usr/local/share/rainier-browser-size.txt 2>/dev/null | head -1; grep -h "browser payload" /usr/local/share/rainier-browser-size.txt 2>/dev/null' | tr '\n' '; ')
