@@ -239,7 +239,6 @@ func (s *FleetService) RegisterRunner(ctx context.Context, r control.RunnerRegis
 		}
 		return control.RunnerRegistrationResult{}, portError(err)
 	}
-	s.Wake(r.PoolID)
 	return control.RunnerRegistrationResult{Accepted: true, Generation: r.Generation}, nil
 }
 
@@ -442,6 +441,13 @@ func (s *FleetService) ReconcileRunner(ctx context.Context, snap control.RunnerS
 	if err != nil {
 		return control.ReconcileResult{}, err
 	}
+	// Registration makes the runner row authoritative before the transport
+	// installs the connection. Reconciliation is the first point where both
+	// the row and the runner's announced session set agree, so only now may a
+	// scheduler pass place new work on the runner. Waking any earlier can race
+	// an empty announce against a just-dispatched create and open two placement
+	// generations for the same sandbox.
+	s.Wake(snap.PoolID)
 	return control.ReconcileResult{Generation: authoritative, Destroy: destroy}, nil
 }
 
@@ -487,7 +493,7 @@ func (s *FleetService) upsertSnapshotRunner(ctx context.Context, snap control.Ru
 }
 
 // recordSnapshotAuthority records snap as the runner's authoritative
-// generation and wakes the pool. It reports fenced when a concurrent
+// generation. It reports fenced when a concurrent
 // higher-generation write won the race, carrying the store-authoritative
 // generation the runner must resync to; every other port failure is
 // normalized to a closed control sentinel.
@@ -502,7 +508,6 @@ func (s *FleetService) recordSnapshotAuthority(ctx context.Context, snap control
 		}
 		return 0, false, portError(err)
 	}
-	s.Wake(snap.PoolID)
 	return 0, false, nil
 }
 
