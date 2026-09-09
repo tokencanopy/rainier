@@ -2,8 +2,8 @@
 // here is Rainier-specific, because the point of the qualification is that a
 // project's own unmodified Playwright configuration works in a session.
 //
-// In particular there is no `channel`, no `executablePath`, no launch
-// argument, and no chromiumSandbox setting. Playwright resolves the browser
+// In particular there is no `channel`, no `executablePath`, or launch
+// argument. The browser sandbox is required for this baseline. Playwright resolves the browser
 // from PLAYWRIGHT_BROWSERS_PATH, which the image points at the workspace
 // cache; the image seeds that cache with links to its pinned baseline, so this
 // runs with nothing downloaded and no network at all.
@@ -34,7 +34,7 @@ module.exports = defineConfig({
   projects: [
     {
       name: 'desktop',
-      use: { ...devices['Desktop Chrome'], viewport: { width: 1280, height: 800 } },
+      use: { ...devices['Desktop Chrome'], viewport: { width: 1280, height: 800 }, chromiumSandbox: true },
     },
     {
       name: 'phone',
@@ -42,7 +42,7 @@ module.exports = defineConfig({
       // factor, touch, and the mobile user agent all change what the page
       // does, and a layout assertion that ignored them would be measuring
       // something nobody has.
-      use: { ...devices['Pixel 7'] },
+      use: { ...devices['Pixel 7'], chromiumSandbox: true },
     },
   ],
   // Playwright starts and stops this itself, which is half of what the

@@ -553,13 +553,9 @@ echo "-- browser testing"
 # needed to download anything on first use would fail here, which is the point:
 # a fresh session has to be able to run a test suite offline.
 #
-# The direct invocations below pass --no-sandbox because that is what
-# Playwright itself passes: chromiumSandbox defaults to false in every
-# Playwright release, so the launch this smoke imitates is the launch a project
-# actually gets. Nothing in this image or this driver adds that flag, and the
-# isolation a session relies on is the container's — uid 1000,
-# no-new-privileges, a read-only rootfs, its own network namespace, and the
-# host's seccomp and AppArmor policy. See docs/session-image.md.
+# The direct invocations below intentionally omit --no-sandbox. The sample
+# Playwright project requires chromiumSandbox=true, so these probes must prove
+# the packaged browser can use its own sandbox under the session policy.
 
 BROWSER_FIXTURE='
   b=$(find -L "$PLAYWRIGHT_BROWSERS_PATH" -maxdepth 3 -type f -name chrome-headless-shell 2>/dev/null | head -1)
@@ -578,7 +574,7 @@ HTML
   # The flags Playwright passes, and nothing else: --disable-dev-shm-usage is
   # in chromiumSwitches for every launch, which is why docker default 64 MiB
   # /dev/shm is enough for a Playwright suite.
-  render() { "$b" --no-sandbox --disable-dev-shm-usage --disable-gpu --disable-breakpad \
+  render() { "$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad \
       --user-data-dir="$d/profile" "$@" 2>&1; }
   png_size() { python3 -c "import struct,sys; d=open(sys.argv[1],\"rb\").read(24); w,h=struct.unpack(\">II\", d[16:24]); print(w,h)" "$1"; }
 '
@@ -677,13 +673,9 @@ check "rainier-browsers reports the cache a project's Playwright will read" "lin
   rainier-browsers path | grep -qx /workspace/.cache/ms-playwright || { echo "path = $(rainier-browsers path)"; exit 1; }
   rainier-browsers status'
 
-# Reported rather than asserted, because both answers are legitimate and which
-# one a session gets is host policy rather than an image property. Chromium's
-# own layer-1 sandbox needs to create a user namespace, which docker's default
-# seccomp profile refuses without CAP_SYS_ADMIN; Playwright disables that
-# sandbox by default anyway (chromiumSandbox: false) and relies on the
-# container. What must never happen is a browser that reports no usable sandbox
-# and renders the page regardless, so the observed exit status is on the record.
+# The sandbox-enabled launch is a required check; a browser that cannot
+# initialize its own sandbox exits nonzero. The observed status is recorded for
+# diagnostics after the functional checks.
 SANDBOX_STATUS=$(probe '
   '"$BROWSER_FIXTURE"'
   out=$("$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p2" --dump-dom "file://$d/page.html" 2>&1)
