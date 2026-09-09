@@ -222,3 +222,7 @@ func (v *AgentVault) ListAgentCredentials(ctx context.Context, user control.Acto
 func agentCredentialAAD(user, provider string, version uint64) []byte {
 	return []byte(user + "\x00" + provider + "\x00" + strconv.FormatUint(version, 10))
 }
+
+func (v *AgentVault) ConditionalRevokeAgentCredentials(ctx context.Context, user control.ActorID, provider string, expected uint64) (uint64, error) {
+	return v.rows.ConditionalRevokeAgentCredential(ctx, string(user), provider, expected)
+}

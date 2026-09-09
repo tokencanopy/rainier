@@ -116,6 +116,7 @@ type AgentCredentialRows interface {
 	// LastRevokedVersion after a later login. It returns the new version;
 	// revoking an absent row creates version 1.
 	RevokeAgentCredential(ctx context.Context, userID, provider string) (uint64, error)
+	ConditionalRevokeAgentCredential(ctx context.Context, userID, provider string, expected uint64) (uint64, error)
 	// ListAgentCredentials returns userID's rows ordered by provider, with
 	// Ciphertext and Nonce left NIL. A listing renders a status — provider,
 	// version, timestamp — so it never reads the sealed bytes at all, which
