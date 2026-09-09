@@ -11,7 +11,7 @@ check() {
   if [ "$status" -eq 0 ] && [ -n "$want" ] && [ "$matched" -eq 0 ]; then
     ok "$name"
   else
-    bad "$name" "exit=$status; wanted \"$want\", got: $(printf '%s' "$out" | tr '\n' '|' | tail -c 400)"
+    bad "$name" "exit=$status; wanted \"$want\", got: $(printf '%s' "$out" | tr '\n' '|' | tail -c 1500)"
   fi
 }
 

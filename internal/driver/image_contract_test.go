@@ -313,9 +313,184 @@ func TestSessionImageCarriesTheDeveloperToolset(t *testing.T) {
 		"file", "less", "nano", "rsync",
 		"GO_VERSION", "GH_VERSION", "CODEX_VERSION", "UV_VERSION",
 		"RIPGREP_VERSION", "JQ_VERSION", "CLAUDE_CODE_VERSION",
+		// The local services. A session that cannot start a database cannot
+		// run an integration test, and the server halves are as much of the
+		// promise as the clients.
+		"POSTGRES_MAJOR", "postgresql-${POSTGRES_MAJOR}",
+		"postgresql-client-${POSTGRES_MAJOR}",
+		"sqlite3", "redis-server", "redis-tools",
 	} {
 		if !strings.Contains(both, want) {
 			t.Errorf("the session image no longer provides %q; the quickstart and docs/session-image.md promise it", want)
 		}
+	}
+}
+
+// TestSessionImageInstallsTheLocalServices: PostgreSQL 17, SQLite and Redis are
+// in the image because a session has no other way to get them — no sudo, a
+// read-only rootfs, and an egress allowlist that does not carry a package
+// archive. What this pins is the half of that which is a security decision
+// rather than a package list.
+func TestSessionImageInstallsTheLocalServices(t *testing.T) {
+	df := sessionDockerfile(t)
+
+	// PostgreSQL comes from a SECOND apt archive, which is a real trust
+	// decision. The strongest pin an apt archive admits is its signing key, so
+	// the key's full fingerprint has to be a constant in this file and has to
+	// be checked before the archive is configured. A short key id would be
+	// forgeable; a missing check would make the archive line the whole trust.
+	fpr := regexp.MustCompile(`(?m)^ARG PGDG_KEY_FINGERPRINT=([0-9A-F]{40})$`).FindStringSubmatch(df)
+	if fpr == nil {
+		t.Fatal("the Dockerfile pins no full 40-hex PGDG signing-key fingerprint; an apt archive with an unpinned key is an unpinned archive")
+	}
+	for _, want := range []string{
+		`"$got" = "$PGDG_KEY_FINGERPRINT"`,
+		"gpg --show-keys --with-colons --fingerprint /tmp/pgdg.asc",
+		"https://www.postgresql.org/media/keys/ACCC4CF8.asc",
+		"signed-by=/usr/share/keyrings/rainier-pgdg.gpg",
+		// `gpg --dearmor` converts every key in the file and `signed-by=`
+		// trusts the whole keyring, so a fingerprint check that reads only the
+		// first key is satisfied by the genuine key with somebody else's
+		// appended. The count is checked separately, and first.
+		`grep -c '^pub:'`,
+		`"$keys" = 1`,
+	} {
+		if !strings.Contains(df, want) {
+			t.Errorf("the PGDG archive is configured without %q; the key check is what makes the archive trustworthy", want)
+		}
+	}
+	if !regexp.MustCompile(`apt\.postgresql\.org/pub/repos/apt bookworm-pgdg main`).MatchString(df) {
+		t.Error("the PGDG archive line does not name a fixed suite; a moving suite is a moving image")
+	}
+
+	// Nothing in this image may be running when it boots, and nothing may be
+	// baked into it that a developer did not create. Debian maintainer scripts
+	// start what they install, and postgresql-common runs initdb at install
+	// time unless told not to.
+	for _, want := range []string{
+		"create_main_cluster = false",
+		"/usr/sbin/policy-rc.d",
+		"rm -f /usr/sbin/policy-rc.d",
+	} {
+		if !strings.Contains(df, want) {
+			t.Errorf("the services layer is missing %q; an image that starts or pre-creates a service is an image with a port and a cluster nobody asked for", want)
+		}
+	}
+
+	// The helpers are the platform's own code and live where sessiond and the
+	// agents live, not in the user-writable prefix.
+	for _, want := range []string{
+		"COPY images/session/services/ /usr/local/bin/",
+		"chmod 0755 /usr/local/bin/rainier-pg /usr/local/bin/rainier-redis",
+	} {
+		if !strings.Contains(df, want) {
+			t.Errorf("the Dockerfile does not install %q root-owned in /usr/local/bin", want)
+		}
+	}
+
+	// A service's state has to be on the one writable, persistent path a
+	// session has. $HOME is on the read-only rootfs and /tmp is a per-container
+	// tmpfs, so a cluster anywhere else either cannot be created at all or does
+	// not survive a suspend and resume.
+	for _, v := range []string{"RAINIER_SERVICES_DIR", "PGDATA"} {
+		m := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(v) + `=(\S+)`).FindStringSubmatch(df)
+		if m == nil {
+			t.Errorf("the image sets no %s; the server that reads it will try to write under a read-only $HOME", v)
+			continue
+		}
+		if !strings.HasPrefix(m[1], workspaceMount+"/") {
+			t.Errorf("%s is %s, which is not on the writable %s volume", v, m[1], workspaceMount)
+		}
+	}
+	// And the other half, which is the one that is easy to get wrong: a
+	// service's SOCKETS must not be on the workspace volume.
+	// protocol/workspace.TarGz refuses a socket rather than skipping it, so one
+	// under /workspace turns `rainier push`/`pull` of any tree containing it
+	// into an error — and an unclean exit leaves the socket behind to keep
+	// doing so. /tmp is a per-container tmpfs: writable, and gone with the
+	// container that made it.
+	for _, v := range []string{"RAINIER_SERVICES_RUNTIME_DIR", "PGHOST"} {
+		m := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(v) + `=(\S+)`).FindStringSubmatch(df)
+		if m == nil {
+			t.Errorf("the image sets no %s; a service has nowhere to put a socket that is not the workspace volume", v)
+			continue
+		}
+		if strings.HasPrefix(m[1], workspaceMount+"/") {
+			t.Errorf("%s is %s, on the %s volume that push and pull carry; workspace.TarGz refuses a socket outright", v, m[1], workspaceMount)
+		}
+		if !strings.HasPrefix(m[1], "/tmp/") {
+			t.Errorf("%s is %s, which is not on the per-container tmpfs", v, m[1])
+		}
+	}
+
+	// And the image still boots a shell, not a database.
+	if !strings.Contains(df, `CMD ["--", "bash", "-i"]`) {
+		t.Error("the image's CMD is no longer an interactive shell; nothing in this image may start a service")
+	}
+	for _, bad := range []string{"rainier-pg start", "rainier-pg up", "rainier-redis start", "pg_ctlcluster", "service postgresql", "service redis"} {
+		if strings.Contains(df, bad) {
+			t.Errorf("the Dockerfile contains %q; a session gets a database when a developer starts one, never at boot", bad)
+		}
+	}
+}
+
+// TestSessionImageServiceHelpersStayOnLoopback: the session's own network namespace
+// is the boundary, and these two helpers are the only thing in the image that
+// opens a socket. Binding anything wider would publish a trust-authenticated
+// database to every container that shares the session's docker network.
+func TestSessionImageServiceHelpersStayOnLoopback(t *testing.T) {
+	for _, name := range []string{"rainier-pg", "rainier-redis"} {
+		b, err := os.ReadFile("../../images/session/services/" + name)
+		if err != nil {
+			t.Fatalf("reading the %s helper: %v", name, err)
+		}
+		src := string(b)
+		for _, bad := range []string{"0.0.0.0", "listen_addresses = '*'", "--bind *", "::0"} {
+			if strings.Contains(src, bad) {
+				t.Errorf("%s contains %q; a trust-authenticated server must not leave the session's loopback", name, bad)
+			}
+		}
+		for _, bad := range []string{"sudo", "curl ", "wget ", "apt-get", "pip install", "npm install"} {
+			if strings.Contains(src, bad) {
+				t.Errorf("%s contains %q; the helpers start what the image already carries and install nothing", name, bad)
+			}
+		}
+	}
+	pg, err := os.ReadFile("../../images/session/services/rainier-pg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"listen_addresses = 'localhost'", "--auth-local=trust", "--auth-host=trust"} {
+		if !strings.Contains(string(pg), want) {
+			t.Errorf("rainier-pg no longer writes %q; trust auth is safe only because the server never leaves this session's loopback", want)
+		}
+	}
+	redis, err := os.ReadFile("../../images/session/services/rainier-redis")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(redis), "--bind 127.0.0.1") || !strings.Contains(string(redis), "--protected-mode yes") {
+		t.Error("rainier-redis no longer binds loopback with protected mode on")
+	}
+}
+
+// TestSessionImageLeavesScratchOnTheTmpfs: /tmp is a per-container noexec
+// tmpfs and that is where an agent's scratch belongs — it is not in a
+// checkpoint, not in an archive, and not in `rainier pull`. The image moves
+// exactly one build temp off it, GOTMPDIR, because `go test` has to EXECUTE
+// what it builds. Setting TMPDIR (or TMP/TEMP) would move every tool's scratch
+// — including Claude Code's and Codex's — onto the workspace volume instead,
+// which is a quiet change to what leaves the runner and to the sandbox each
+// agent thinks it has. Neither agent is wrapped here, and neither should be
+// given a rewritten temp without saying so.
+func TestSessionImageLeavesScratchOnTheTmpfs(t *testing.T) {
+	df := sessionDockerfile(t)
+	for _, v := range []string{"TMPDIR", "TMP", "TEMP"} {
+		if regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(v) + `=`).MatchString(df) {
+			t.Errorf("the image sets %s; every tool's scratch would move off the per-container tmpfs and onto the workspace volume that checkpoints carry", v)
+		}
+	}
+	if !strings.Contains(df, "GOTMPDIR=") {
+		t.Error("the image sets no GOTMPDIR; `go test` executes what it builds and a session's /tmp is noexec")
 	}
 }

@@ -36,8 +36,29 @@ command -v "$DOCKER" >/dev/null 2>&1 || { echo "no docker executable ($DOCKER); 
   || { echo "image $IMAGE is not present; build it first (make session-image)" >&2; exit 2; }
 
 PASS=0 FAIL=0
+
+# In GitHub Actions the job log is the only record of a failed qualification,
+# and it is not always reachable from wherever the fix is being made — a
+# session's egress allowlist does not carry the Actions log host, for one.
+# Emitting each failure as a workflow annotation puts the check's name and its
+# detail on the pull request itself, where the check status already is. Inert
+# outside Actions, and it reports; it never changes what passes.
+# A workflow command's PROPERTIES are comma-separated and colon-terminated, so
+# a title carrying either has to be escaped or it truncates the annotation —
+# and most of the check names below contain a comma. The message half only has
+# to survive the newline.
+wf_title() { printf '%s' "$1" | sed 's/%/%25/g; s/\r/%0D/g; s/:/%3A/g; s/,/%2C/g'; }
+wf_body()  { printf '%s' "${1:-}" | cut -c1-2000 | sed 's/%/%25/g; s/\r/ /g' | awk '{printf "%s%%0A", $0}'; }
+note() {
+  [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+  printf '::notice title=%s::%s\n' "$(wf_title "$1")" "$(wf_body "$2")"
+}
+annotate() {
+  [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+  printf '::error title=%s::%s\n' "$(wf_title "$1")" "$(wf_body "${2:-}")"
+}
 ok()  { PASS=$((PASS+1)); printf 'ok    %s\n' "$1"; }
-bad() { FAIL=$((FAIL+1)); printf 'FAIL  %s\n' "$1"; [ $# -gt 1 ] && printf '      %s\n' "$2"; return 0; }
+bad() { FAIL=$((FAIL+1)); printf 'FAIL  %s\n' "$1"; [ $# -gt 1 ] && printf '      %s\n' "$2"; annotate "$1" "${2:-}"; return 0; }
 
 SUFFIX=$(od -An -tx1 -N6 /dev/urandom | tr -d ' \n')
 WS_VOL="rainier-smoke-ws-$SUFFIX"
@@ -121,6 +142,10 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/session-image-checks.sh"
 CLAUDE_VERSION=$(sed -n 's/^ARG CLAUDE_CODE_VERSION=//p' "$SCRIPT_DIR/../Dockerfile")
 CODEX_VERSION=$(sed -n 's/^ARG CODEX_VERSION=//p' "$SCRIPT_DIR/../Dockerfile")
+# Read, not hardcoded: a check that names 17 while the image builds an 18 does
+# not fail, it stops asking the question.
+PG_MAJOR=$(sed -n 's/^ARG POSTGRES_MAJOR=//p' "$SCRIPT_DIR/../Dockerfile")
+[[ "$PG_MAJOR" =~ ^[0-9]+$ ]] || { echo "missing or invalid POSTGRES_MAJOR pin" >&2; exit 2; }
 for version in "$CLAUDE_VERSION" "$CODEX_VERSION"; do
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "missing or invalid agent version pin" >&2; exit 2; }
 done
@@ -149,6 +174,14 @@ if printf '%s' "$CFG" | grep -qE 'gh[pousr]_[A-Za-z0-9]|github_pat_|sk-ant-|AKIA
 else
   ok "no credential is baked into the image configuration"
 fi
+
+# Size is a rollout gate, not a curiosity: a Dedicated runner pulls this image
+# at boot and somebody has to approve what that costs
+# (rainier-cloud docs/runbooks/default-environment-rollout.md, step 2). Report
+# it where the approval happens rather than only in a job log.
+SIZE=$("$DOCKER" image inspect -f '{{.Size}} bytes, {{.Architecture}}/{{.Os}}, {{len .RootFS.Layers}} layers' "$IMAGE")
+printf 'note  image: %s\n' "$SIZE"
+note "session image size" "$SIZE"
 
 check "the session runs as uid 1000" "uid=1000" 'id'
 check "the rootfs is read-only" "ro-ok" \
@@ -384,6 +417,146 @@ check "ss reports the listening socket" "ss-ok" '
   for _ in $(seq 40); do ss -ltn 2>/dev/null | grep -q ":8112" && { echo ss-ok; break; }; sleep 0.25; done'
 
 echo
+echo "-- the local services a developer starts"
+
+# A probe is one container, so a running server does not outlive the check that
+# started it: each check below starts what it needs and stops it again. That is
+# the honest shape anyway — the thing being asserted is that a developer can
+# bring a database up and take it down, repeatedly, with no privilege at all.
+#
+# Quoting note: a check program is a single-quoted shell word and cannot contain
+# an apostrophe, so SQL string literals use PostgreSQL dollar quoting inside a
+# QUOTED heredoc, where neither shell expands anything.
+
+# The negative half first, and before anything in this section has run. A
+# session gets a database because a developer starts one; an always-on
+# trust-authenticated server, or a cluster baked into a layer, is exactly what
+# the rest of this image's boundaries exist to make impossible to arrange.
+check "a fresh session has no database running and no cluster in the image" "no-service-running" '
+  ss -ltn 2>/dev/null | grep -Eq ":(5432|6379)\b" && { echo A-SERVER-IS-LISTENING; exit 1; }
+  test -e /workspace/.services && { echo SERVICE-STATE-ALREADY-EXISTS; exit 1; }
+  test -e /var/lib/postgresql/'"$PG_MAJOR"'/main && { echo A-CLUSTER-IS-BAKED-IN; exit 1; }
+  echo no-service-running'
+
+check "the PostgreSQL on PATH is the root-owned $PG_MAJOR the docs promise" "pg-major-ok" '
+  for t in initdb pg_ctl postgres psql pg_isready createdb pg_dump; do
+    command -v "$t" >/dev/null || { echo "missing $t"; exit 1; }
+    [ "$(stat -Lc %U "$(command -v "$t")")" = root ] || { echo "$t is not root-owned"; exit 1; }
+  done
+  for t in initdb pg_ctl psql; do
+    "$t" --version | grep -q "(PostgreSQL) '"$PG_MAJOR"'\." || { echo "$t: $("$t" --version)"; exit 1; }
+  done
+  echo pg-major-ok'
+
+# The acceptance case the whole services layer exists for: a database, on the
+# session'"'"'s own writable storage, with no sudo, no download and nothing about
+# the runtime contract relaxed to get it.
+check "initdb and pg_ctl bring PostgreSQL up on the workspace volume and run a transaction" "pg-transaction-ok" '
+  rainier-pg init >/dev/null || { echo "init failed"; exit 1; }
+  case "$PGDATA" in /workspace/*) ;; *) echo "PGDATA-ELSEWHERE $PGDATA"; exit 1;; esac
+  rainier-pg start >/dev/null || { echo "start failed"; cat /workspace/.services/postgresql/server.log 2>/dev/null; exit 1; }
+  rainier-pg status >/dev/null || { echo "status reports stopped"; exit 1; }
+  test -S "$PGHOST/.s.PGSQL.$PGPORT" || { echo "no socket in $PGHOST"; exit 1; }
+  createdb smokedb || { echo "createdb failed"; exit 1; }
+  psql -v ON_ERROR_STOP=1 -q -d smokedb <<"SQL" || { echo "the transaction failed"; exit 1; }
+begin;
+create table ledger (id integer primary key, note text not null);
+insert into ledger values (1, $q$committed$q$);
+commit;
+begin;
+insert into ledger values (2, $q$rolled back$q$);
+rollback;
+SQL
+  rows=$(psql -tAq -d smokedb -c "select count(*) from ledger")
+  [ "$rows" = 1 ] || { echo "ROLLBACK-NOT-HONOURED rows=$rows"; exit 1; }
+  rainier-pg stop >/dev/null || { echo "stop failed"; exit 1; }
+  echo pg-transaction-ok'
+
+# The DSN is the deliverable: this is the exact string a rainier-cloud checkout
+# puts in RAINIER_TEST_DATABASE_URL, parsed by a real client against the running
+# server. And the interface it is bound to is the security half of it — a
+# trust-authenticated server is safe only while it cannot leave this session.
+check "the printed DSN reaches the data, over loopback and nothing wider" "pg-dsn-ok" '
+  rainier-pg start >/dev/null || { echo "start failed"; exit 1; }
+  url=$(rainier-pg url smokedb)
+  case "$url" in postgres://*@127.0.0.1:$PGPORT/smokedb[?]sslmode=disable) ;;
+    *) echo "UNEXPECTED-DSN $url"; exit 1 ;; esac
+  [ "$(psql -tAq "$url" -c "select count(*) from ledger")" = 1 ] || { echo "the DSN did not reach the data"; exit 1; }
+  grep -q "listen_addresses = " "$PGDATA/postgresql.conf" || { echo "no listen_addresses"; exit 1; }
+  # The LOCAL address column only. `ss` prints a peer column too, and for a
+  # listening socket that column is literally 0.0.0.0:* — grepping the whole
+  # line for 0.0.0.0 calls every correctly-bound server a leak.
+  local_addrs=$(ss -ltnH 2>/dev/null | tr -s " " | cut -d" " -f4)
+  case "$local_addrs" in *"0.0.0.0:$PGPORT"*|*"[::]:$PGPORT"*) echo LISTENING-ON-ALL-INTERFACES; exit 1;; esac
+  case "$local_addrs" in *"127.0.0.1:$PGPORT"*) ;; *) echo "not listening on loopback: $local_addrs"; exit 1;; esac
+  rainier-pg stop >/dev/null
+  echo pg-dsn-ok'
+
+check "PostgreSQL stops, restarts and still has its data" "pg-restart-ok" '
+  rainier-pg start >/dev/null || { echo "start failed"; exit 1; }
+  [ "$(psql -tAq -d smokedb -c "select note from ledger where id = 1")" = committed ] ||
+    { echo "the data did not survive the first stop"; exit 1; }
+  rainier-pg restart >/dev/null || { echo "restart failed"; exit 1; }
+  [ "$(psql -tAq -d smokedb -c "select count(*) from ledger")" = 1 ] || { echo "lost data across a restart"; exit 1; }
+  rainier-pg stop >/dev/null || { echo "stop failed"; exit 1; }
+  rainier-pg status >/dev/null 2>&1 && { echo STILL-RUNNING-AFTER-STOP; exit 1; }
+  echo pg-restart-ok'
+
+check "SQLite writes and reads a database, from the shell and from Python" "sqlite-ok 2" '
+  d=$(mktemp -d -p /workspace) && cd "$d"
+  sqlite3 s.db "create table t (id integer primary key, v text)" || exit 1
+  sqlite3 s.db "insert into t (v) values (char(97)), (char(98))" || exit 1
+  python3 -c "import sqlite3; c=sqlite3.connect(\"s.db\"); print(\"sqlite-ok\", c.execute(\"select count(*) from t\").fetchone()[0])"'
+
+check "Redis starts on loopback, answers PING without root, and stops" "redis-ok" '
+  command -v redis-server >/dev/null || { echo "no redis-server"; exit 1; }
+  rainier-redis start >/dev/null || { echo "start failed"; cat /workspace/.services/redis/redis.log 2>/dev/null; exit 1; }
+  [ "$(rainier-redis ping)" = PONG ] || { echo "no PONG"; exit 1; }
+  case "$(rainier-redis url)" in redis://127.0.0.1:*/0) ;; *) echo UNEXPECTED-URL; exit 1;; esac
+  local_addrs=$(ss -ltnH 2>/dev/null | tr -s " " | cut -d" " -f4)
+  case "$local_addrs" in *"0.0.0.0:6379"*|*"[::]:6379"*) echo "REDIS-ON-ALL-INTERFACES $local_addrs"; exit 1;; esac
+  case "$local_addrs" in *"127.0.0.1:6379"*) ;; *) echo "redis not on loopback: $local_addrs"; exit 1;; esac
+  redis-cli -h 127.0.0.1 set smoke redis-ok >/dev/null || { echo "SET failed"; exit 1; }
+  v=$(redis-cli -h 127.0.0.1 get smoke)
+  rainier-redis stop >/dev/null || { echo "stop failed"; exit 1; }
+  rainier-redis status >/dev/null 2>&1 && { echo STILL-RUNNING-AFTER-STOP; exit 1; }
+  [ "$v" = redis-ok ] && echo redis-ok'
+
+# The services layer's own contribution, so the size review has a number for
+# the thing this change added and not only a total to diff by hand. The build
+# takes it by DIFFING the package set across its own apt install, so it counts
+# the Debian-sourced dependencies PostgreSQL pulled in (the JIT and ICU
+# libraries and the like) as well as the packages named on the command line.
+# Summing by version string, or by a hand-written list, undercounts exactly
+# there — and undercounting is the direction that gets a rollout approved.
+SERVICES_SIZE=$(probe 'head -6 /usr/local/share/rainier-services-size.txt' | tr -d '\r')
+printf 'note  services layer: %s\n' "$SERVICES_SIZE"
+note "services layer installed size" "$SERVICES_SIZE"
+
+# The half that is easy to get wrong in the other direction. A service's
+# DURABLE state has to be on the volume, or it does not survive a suspend; its
+# SOCKETS must not be, because protocol/workspace.TarGz refuses a socket
+# outright rather than skipping it — so one under /workspace fails a `rainier
+# push` or `pull` of any tree containing it, and an unclean exit leaves it
+# there to keep failing. Both servers are running for this check, which is the
+# only time the sockets exist.
+check "a running server puts no socket on the volume that push and pull carry" "no-socket-on-the-volume" '
+  rainier-pg start >/dev/null || { echo "postgres start failed"; exit 1; }
+  rainier-redis start >/dev/null || { echo "redis start failed"; exit 1; }
+  found=$(find /workspace -xdev -type s 2>/dev/null | head -5)
+  rainier-redis stop >/dev/null; rainier-pg stop >/dev/null
+  [ -z "$found" ] || { echo "SOCKET-ON-THE-VOLUME $found"; exit 1; }
+  echo no-socket-on-the-volume'
+
+check "every service kept its durable state on the workspace volume, and none on the rootfs" "service-state-ok" '
+  for p in /workspace/.services/postgresql/data /workspace/.services/redis/data; do
+    test -d "$p" || { echo "missing $p"; exit 1; }
+  done
+  case "$PGHOST" in /workspace/*) echo "PGHOST-ON-THE-VOLUME $PGHOST"; exit 1;; esac
+  test -e /var/lib/postgresql/'"$PG_MAJOR"'/main && { echo CLUSTER-ON-ROOTFS; exit 1; }
+  echo service-state-ok'
+
+echo
 echo "-- git, gh and the rest of the shell toolkit"
 check "git makes a commit" "git-ok" '
   d=$(mktemp -d -p /workspace) && cd "$d" && git init -q . && echo a > a
@@ -425,9 +598,17 @@ check "ps, lsof, dig, file, less and an editor are present" "utils-ok" '
   echo utils-ok'
 check "curl trusts the system CA bundle" "ca-ok" '
   test -s /etc/ssl/certs/ca-certificates.crt && curl --version | grep -qi ssl && echo ca-ok'
-check "the image records what it actually contains" "manifest-ok" '
-  test -s /usr/local/share/rainier-os-packages.txt &&
-  test -s /usr/local/share/rainier-npm-global.json && echo manifest-ok'
+check "the image records what it actually contains, and where it came from" "manifest-ok" '
+  test -s /usr/local/share/rainier-os-packages.txt || { echo "no package manifest"; exit 1; }
+  test -s /usr/local/share/rainier-npm-global.json || { echo "no npm manifest"; exit 1; }
+  # Two archives resolve this image now, and a reviewer holding only a digest
+  # has to be able to see both.
+  test -s /usr/local/share/rainier-apt-sources.txt || { echo "no apt-source manifest"; exit 1; }
+  test -s /usr/local/share/rainier-services-size.txt || { echo "no services size manifest"; exit 1; }
+  grep -q "apt.postgresql.org" /usr/local/share/rainier-apt-sources.txt || { echo "the PGDG archive is unrecorded"; exit 1; }
+  grep -q "deb.debian.org" /usr/local/share/rainier-apt-sources.txt || { echo "the Debian archive is unrecorded"; exit 1; }
+  grep -q "^postgresql-'"$PG_MAJOR"'" /usr/local/share/rainier-os-packages.txt || { echo "the PostgreSQL server package is unrecorded"; exit 1; }
+  echo manifest-ok'
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
