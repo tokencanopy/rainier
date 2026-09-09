@@ -692,7 +692,7 @@ check "rainier-browsers reports the cache a project's Playwright will read" "lin
 # diagnostics after the functional checks.
 SANDBOX_OUTPUT=$(probe '
   '"$BROWSER_FIXTURE"'
-  out=$("$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p2" --dump-dom "file://$d/page.html" 2>&1)
+  out=$("$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad --enable-logging=stderr --v=1 --user-data-dir="$d/p2" --dump-dom "file://$d/page.html" 2>&1)
   st=$?
   printf "exit=%s %s\n" "$st" "$(printf "%s" "$out" | grep -i -m1 "sandbox\|namespace" || echo "sandbox launch succeeded")"
   exit "$st"
