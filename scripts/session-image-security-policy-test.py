@@ -17,6 +17,10 @@ UNSHARE_CHROMIUM = 0x10020000
 CLONE_CHROMIUM_USER = 0x10000011
 CLONE_CHROMIUM_ZYGOTE = 0x70000011
 CLONE_CHROMIUM_ZYGOTE_NO_NET = 0x30000011
+# Chromium's safe-empty-dir helper uses the x86_64 clone optimization before
+# chrooting its short-lived child. Keep this exact non-namespace shape rather
+# than widening the Docker clone rule.
+CLONE_CHROMIUM_CHROOT = 0x00084311
 CLONE_WITH_NETWORK = 0x78020011
 CLONE_WITHOUT_NETWORK = 0x38020011
 ENOSYS = 38
@@ -25,7 +29,7 @@ DOCKER_CANONICAL_SHA256 = (
     "885442dc08f21f8d60f99ea43d59af88b1c529103815fe24bbf9ce998d3a609d"
 )
 SECCOMP_CANONICAL_SHA256 = (
-    "4fb409bf9925eeaab50f950118682150cafa4868dba3b277554dd3936b333ae0"
+    "411202bbf22820f4631ca2fb4c7b9f1b88079f25d923fb021aac1830846d8626"
 )
 APPARMOR_SHA256 = (
     "53f78e768ee56099b764661c58b569504e39ecc45b2b3fb0dffd13ea329eb431"
@@ -110,6 +114,17 @@ class SessionImageSecurityPolicyTest(unittest.TestCase):
                     comment=(
                         "RAINIER: Chromium sandbox probes unprivileged user "
                         "namespaces with clone(CLONE_NEWUSER|SIGCHLD)."
+                    ),
+                ),
+                rule(
+                    ["clone"],
+                    "SCMP_ACT_ALLOW",
+                    args=exact_clone(CLONE_CHROMIUM_CHROOT),
+                    includes=amd64,
+                    comment=(
+                        "RAINIER: Chromium's safe-empty-dir helper uses the "
+                        "x86_64 CLONE_FS|CLONE_VM|CLONE_VFORK|CLONE_SETTLS|SIGCHLD "
+                        "shape before chroot."
                     ),
                 ),
                 rule(

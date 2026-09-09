@@ -415,9 +415,10 @@ that container; it does not replace the container boundary.
 
 **Hosted Rainier admits only the namespace operations Chromium needs.** The
 Cloud security profile permits Chromium's exact `clone(CLONE_NEWUSER|SIGCHLD)`
-and `unshare(CLONE_NEWUSER|CLONE_NEWNS)` forms, plus the AppArmor `userns`
-permission. The hosted browser qualification runs the real web suite under
-those profiles and fails if Chromium cannot initialize its sandbox. A local
+and `unshare(CLONE_NEWUSER|CLONE_NEWNS)` forms, the x86_64 clone shape used by
+its safe-empty-directory helper, plus the AppArmor `userns` permission. The
+hosted browser qualification runs the real web suite under those profiles and
+fails if Chromium cannot initialize its sandbox. A local
 Docker host with stricter policies must load an equivalent reviewed profile;
 Rainier never falls back to `--no-sandbox`. Core keeps a public, test-only
 snapshot of this boundary in `testdata/session-security/`; its structural test

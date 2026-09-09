@@ -680,6 +680,26 @@
 		},
 		{
 			"names": [
+				"clone"
+			],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [
+				{
+					"index": 0,
+					"value": 541457,
+					"op": "SCMP_CMP_EQ"
+				}
+			],
+			"comment": "RAINIER: Chromium's safe-empty-dir helper uses the x86_64 CLONE_FS|CLONE_VM|CLONE_VFORK|CLONE_SETTLS|SIGCHLD shape before chroot.",
+			"includes": {
+				"arches": [
+					"amd64",
+					"x32"
+				]
+			}
+		},
+		{
+			"names": [
 				"unshare"
 			],
 			"action": "SCMP_ACT_ALLOW",
