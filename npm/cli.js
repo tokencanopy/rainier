@@ -6,6 +6,6 @@ try {
   await runBinary(executable, process.argv.slice(2));
 } catch (error) {
   console.error(`rainier: ${error.message}`);
-  console.error('Check network access to GitHub and cache-directory permissions. Standalone binaries: https://github.com/tokencanopy/rainier/releases/tag/v0.0.8');
+  console.error('Check network access to GitHub and cache-directory permissions. Standalone binaries: https://github.com/tokencanopy/rainier/releases/tag/v0.0.9');
   process.exitCode = 1;
 }

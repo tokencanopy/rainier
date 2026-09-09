@@ -1,24 +1,24 @@
-// Immutable CLI assets built from v0.0.8 (87d74455ba63b899a583eaded1de3f6ab73ba3cc).
-export const version = '0.0.8';
+// Immutable CLI assets built from the published v0.0.9 release.
+export const version = '0.0.9';
 export const assets = {
   "darwin_x64": [
     "amd64",
-    "20268f2d336d89ab5fd507627394c97a19f673e767446b93d691e6d3501c2f79",
-    "4135ecdef045bea82fba794362921ec1266775f576a24e9493bcb8c8f3fc56af"
+    "f1dd1ed28ab965a554ec2c55dab45e665803778c63ebbff3e11e79d0ce7bb43b",
+    "aeb0d00ba660a39f3292184d8803f502db400e02a21ab682cc9bdf4c37a9381a"
   ],
   "darwin_arm64": [
     "arm64",
-    "fa1b52bbfb6a721f419524fa2728ff99e355ab9c004756911637fc69f0070631",
-    "95314f4b12de46bb4508bfe62148ceca3798bb28c775ff42d12f2af0d3bb6bec"
+    "d98561979369024f82ac75893dd71f9bc8c476952c797e3055033172f90379ff",
+    "ab2d4216a8fb982d32583f6a6de962113dbd84358c33e6bf906117a398ed0388"
   ],
   "linux_x64": [
     "amd64",
-    "bde2f1c546384b9873a9b544bebd4b954e81cc41bdba82dc047902e9f8ebdbcc",
-    "f6fbb7f49ce0909c1d188746510ab2e30e8cbeb96952849ad68e6ac68d788d8b"
+    "c584b630fec86c2b137962e078c4477ba039b071130120997aec6454d4d10dba",
+    "1893972c31dc7378e590ee73d389414f2e23a8380f8ac14d24aa554d8514917a"
   ],
   "linux_arm64": [
     "arm64",
-    "2bf2ef44cf84ef1bd264ccfaa5fb17853ec0bbb9e447b26477814988df658a2a",
-    "65f4898c3c981c9fda0f5fd3ad7136fdfa7f87a6cb63726a5adc9c85b86b6c90"
+    "636a8c09801ee95e2f6b850b20ecef8cbfe095f39ec9802e2490f82acd0ffbdd",
+    "343099fbba2841e08e8aa01735ce6f9a26ed1771961b444c841ae4bc1a8f2352"
   ]
 };
