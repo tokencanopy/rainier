@@ -34,7 +34,7 @@ module.exports = defineConfig({
   projects: [
     {
       name: 'desktop',
-      use: { ...devices['Desktop Chrome'], viewport: { width: 1280, height: 800 }, chromiumSandbox: true },
+      use: { ...devices['Desktop Chrome'], viewport: { width: 1280, height: 800 }, launchOptions: { chromiumSandbox: true } },
     },
     {
       name: 'phone',
@@ -42,7 +42,7 @@ module.exports = defineConfig({
       // factor, touch, and the mobile user agent all change what the page
       // does, and a layout assertion that ignored them would be measuring
       // something nobody has.
-      use: { ...devices['Pixel 7'], chromiumSandbox: true },
+      use: { ...devices['Pixel 7'], launchOptions: { chromiumSandbox: true } },
     },
   ],
   // Playwright starts and stops this itself, which is half of what the
