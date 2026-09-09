@@ -89,16 +89,22 @@ make build
 # --from-gh borrows the token from the `gh` CLI; --token <t> and
 # --client-id <id> (device flow) are the alternatives.
 bin/rainier login --from-gh --server https://rainier.example.invalid # replace with your server URL
-bin/rainier doctor                                          # required checks must pass
-bin/rainier env ls                                          # choose an environment available on your server
-bin/rainier agent ls                                        # inspect coding-agent login status
+bin/rainier status                                           # are you ready to code?
+bin/rainier env ls                                           # choose an environment available on your server
+bin/rainier agent status                                     # inspect coding-agent login status
 
 bin/rainier new --name box1 --env dev                        # replace dev with your environment; creates, then attaches
-bin/rainier ls                                               # id, name, env, state, runner, reachable, age
-bin/rainier attach box1                                      # resumes if needed; Ctrl-] detaches
-bin/rainier suspend box1 && bin/rainier resume box1
-bin/rainier rm box1
+bin/rainier ls                                               # name, state, age (--verbose for ids and runners)
+bin/rainier attach box1                                      # resumes a stopped session; Ctrl-] detaches
+bin/rainier stop box1                                        # release its compute; attach brings it back
+bin/rainier delete box1                                      # permanent, and it asks first
 ```
+
+`rainier --help` is the whole product surface on one screen;
+`rainier help all` is everything else, including the self-hosted and
+administrative commands used below. The command contract — what each promises
+and which Cloud APIs it depends on — is
+[`docs/cli-v0-contract.md`](docs/cli-v0-contract.md).
 
 ### Hosted login and contexts
 
@@ -106,10 +112,17 @@ A hosted rainier logs in through the browser instead of a GitHub token:
 
 ```bash
 bin/rainier login --cloud https://edge.example.invalid # replace with your hosted URL; prints and opens sign-in
-bin/rainier context list                              # every server this CLI knows
-bin/rainier workspace use ws_example                  # when the account has several
-bin/rainier doctor
+bin/rainier context list                              # every server this CLI knows (advanced)
+bin/rainier workspace use ws_example                  # when the account has several (advanced)
+bin/rainier status
 ```
+
+On a hosted rainier a bare `rainier login` is enough after the first time: it
+signs in again to the server this machine is already using, and it is always
+safe to rerun. `rainier logout` removes those credentials and nothing else —
+your sessions keep running, and your coding-agent logins and GitHub connection
+are untouched. Signing in successfully is not the same as having a ready
+workspace, so `login` ends by printing the authoritative readiness of yours.
 
 `login --cloud` starts a login attempt, prints the URL you finish signing in
 at, polls until the browser half is done, and stores the result as a **context**
@@ -133,16 +146,22 @@ stays logged in: in every later session, in every workspace you are a member
 of, on any runner.
 
 ```bash
-bin/rainier agent login claude --env dev   # a session running the agent's own login; finish it, then exit
-bin/rainier agent ls                       # PROVIDER  STATUS  SINCE  WORKSPACES
-bin/rainier agent logout claude            # everywhere, at once
+bin/rainier agent login claude   # a session running the agent's own login; finish it, then exit
+bin/rainier agent status         # AGENT  STATUS  SINCE
+bin/rainier agent logout claude  # everywhere, at once
 ```
 
 `agent login` is an ordinary session whose only job is the vendor's own login
 flow, attached to your terminal: Claude Code prints its sign-in URL and asks
-for the code back, Codex uses a device code. The environment you name has to
-have the agent installed. When you exit, the CLI removes that session and
-reports whether a credential was stored.
+for the code back, Codex uses a device code. It runs in your workspace's
+default environment, whose image has the agent installed; `--env NAME` is the
+advanced override for a self-hosted server that publishes several. When you
+exit, the CLI removes that session and reports whether a credential was stored.
+
+`agent status` says one of three things per agent: `not configured`, `ready`,
+or `needs attention`. `ready` means a credential is stored — Rainier does not
+check it with Anthropic or OpenAI, so it is not a promise that the agent will
+authenticate.
 
 What makes this work is the **agent home**: every session a person starts
 mounts one writable volume per workspace at `/rainier/agents`, and each agent
@@ -201,9 +220,12 @@ bin/rainier env create app --image node:22 \
   --connector-json '{"type":"github","repo":"acme/app"}' \
   --init-file ./init.sh                  # runs after the clone, on every boot
 bin/rainier new --env app --name app1    # /workspace/app on branch rainier/app1
-bin/rainier diff app1                    # per repo: this branch vs the base
 bin/rainier push ./notes app1:/workspace/notes   # and `pull` the other way
 ```
+
+Git inside the session is the source of truth for what changed: attach and run
+`git status`, `git diff`, or `git log` there. Rainier deliberately has no
+repository-diff command of its own.
 
 Commits from inside a session are the human's: `user.name` is your GitHub
 login and `user.email` your GitHub noreply address. The token behind them is

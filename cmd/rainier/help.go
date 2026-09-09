@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"strings"
 )
@@ -31,34 +32,44 @@ func buildVersion() string {
 	return "dev"
 }
 
-func printUsage() {
-	fmt.Fprintln(os.Stderr, `usage: rainier <command> [flags]
+// printUsage is the default help, and the constraint on it is a product one
+// rather than a stylistic one: a new developer has to be able to read the
+// whole primary interface off one screen (docs/cli-v0-contract.md §1). It
+// fits in 24 lines, it names only commands a hosted developer needs, and it
+// shows the happy path in the order it is walked.
+//
+// Everything else this CLI can do still dispatches; it lives under
+// `rainier help all`, where somebody looking for it will find it and nobody
+// meeting rainier for the first time has to wade through it.
+//
+// The writer is a parameter because the same text is two different things:
+// help somebody asked for is output and belongs on stdout, and help printed
+// because an invocation was wrong is a diagnostic and belongs on stderr
+// (contract §6.1).
+func printUsage(w io.Writer) {
+	fmt.Fprintln(w, `usage: rainier <command> [flags]
 
-Start and reconnect:
-  login        Sign in to your server or hosted workspace
-  doctor       Check basic session and coding-agent readiness
-  new          Create a session and attach
-  ls           List sessions
-  attach       Reattach; resume a suspended session
+Account:
+  login             Sign in to your Rainier workspace
+  logout            Remove this machine's credentials for it
+  status            Are you ready to code?  [--verbose] [--json]
 
-Manage sessions:
-  suspend, resume, snapshot, rm
-  diff         Show repository changes
-  push, pull   Transfer a directory to or from a session
+Sessions:
+  new               Create a session and attach to it
+                    [--name N] [--agent claude|codex] [--detach] [-- CMD ...]
+  ls                List your sessions  [--all] [--verbose] [--json]
+  info <session>    Everything about one session  [--json]
+  attach <session>  Reopen its terminal; Ctrl-] detaches and leaves it running
+  stop <session>    Stop it, keeping its files; billing is unchanged
+  delete <session>  Destroy it permanently  [--yes]
 
-Configure:
-  env          Manage reusable session environments
-  agent        Log coding agents in or out; inspect status
-  secret       Manage write-only environment secrets
-  creds        Inspect GitHub credential status (self-hosted)
-  connection   Inspect a hosted GitHub connection; share it with a workspace
-  context, workspace   Select your server and workspace
-  version      Show CLI build version
+Coding agents:
+  agent login <claude|codex>     Sign the agent in, once, for every session
+  agent status [--json]          What is signed in
+  agent logout <claude|codex>    Sign it out everywhere  [--yes]
 
-Examples: rainier new --env dev --name box1
-          rainier attach box1
-Help: rainier help <command> | rainier <command> --help
-Full guide: rainier help all`)
+Also: rainier help [command] | rainier help all | rainier version
+<session> is a session name, a sess_ id, or the word "current".`)
 }
 
 // Help is intercepted before command handlers so even nested help is read-only.
@@ -74,7 +85,7 @@ func handleHelpVersion(command string, args []string) bool {
 	}
 	if command == "help" || command == "--help" || command == "-h" {
 		if len(args) == 0 {
-			printUsage()
+			printUsage(os.Stdout)
 			return true
 		}
 		if !printCommandHelp(args[0]) {
@@ -98,96 +109,210 @@ func handleHelpVersion(command string, args []string) bool {
 	return false
 }
 
+// printCommandHelp prints one command's detail. It answers for the public
+// surface, for every compatibility alias, and for every Advanced command,
+// because `rainier <anything> --help` has to work whether or not the command
+// is one the default help advertises.
 func printCommandHelp(command string) bool {
 	var help string
 	switch command {
 	case "all":
 		printManual()
 		return true
-	case "login":
-		help = `usage: rainier login [--from-gh | --token TOKEN | --client-id ID]
-                     [--server URL] [--refresh github] [--context NAME]
-       rainier login --cloud EDGE_URL [--device-name NAME] [--context NAME]
 
-Use the URL supplied by your administrator. Hosted login opens a browser;
-self-hosted login uses GitHub. --from-gh borrows your gh CLI token.
-GitHub credentials are vaulted for session git access; repo scope is needed.
-Use rainier creds to inspect status and login --refresh github to refresh it.
-Contexts store one server and its credentials. After login, run rainier doctor.`
+	// --- the public surface -------------------------------------------------
+	case "login":
+		help = `usage: rainier login
+       rainier login --cloud EDGE_URL [--device-name NAME] [--context NAME]
+       rainier login [--from-gh | --token TOKEN | --client-id ID]
+                     [--server URL] [--refresh github] [--context NAME]
+
+With no arguments, login signs in again to the server you are already using —
+it is always safe to rerun — or, on a machine with no context yet, to this
+build's hosted default when it has one. Hosted login opens a browser.
+
+Signing in proves who you are. It does not make a workspace ready: when
+compute still needs a plan, a payment or provisioning, login says so and
+prints the web address to continue at. Run rainier status afterwards.
+
+The remaining forms are self-hosted (rainier help all): --cloud names a
+hosted edge explicitly, and the GitHub flags log in to a self-hosted controld,
+whose vault also holds the credential your sessions use for git.`
+	case "logout":
+		help = `usage: rainier logout [--context NAME]
+
+Remove this machine's access and refresh credentials for the current server.
+Nothing else changes: your remote sessions keep running, your Claude and
+Codex logins stay in the workspace, and your GitHub connection stays
+authorized. Rerunning it is not an error. Sign back in with rainier login.`
+	case "status":
+		help = `usage: rainier status [--verbose] [--json]
+
+Seven lines saying whether you can start coding: signed in, workspace,
+compute, default environment, GitHub, and each coding agent. Every line comes
+from the server, never from this machine's configuration — a stored token is
+not a ready workspace.
+
+When something needs doing on the web, status prints the address the server
+named. Exit 0 when everything required is ready, 1 when it is not.
+--verbose adds the full readiness diagnostics; --json prints one document.`
 	case "new":
-		help = `usage: rainier new [--name N] [--env ENV] [--image IMG]
-                   [--egress host,host] [--detach] [--idempotency-key KEY]
+		help = `usage: rainier new [--name N] [--agent claude|codex] [--detach]
+                   [--env ENV] [--image IMG] [--egress host,host]
                    [-- CMD ARGS...]
 
-Create a session and attach to its terminal; Ctrl-] detaches without stopping it.
---env accepts an environment name or id and inherits its image, setup, egress,
-and secrets. --image and --egress override it for this session only.
-Prerequisites: login and a connected runner with capacity (rainier doctor).
-An environment image must already include the coding agent you want to run.
---detach creates without attaching; use rainier attach <id|name> later.`
-	case "attach":
-		help = `usage: rainier attach <id|name> [--since N]
+Create a session and attach to its terminal; Ctrl-] detaches without stopping
+it. With no --env the session starts from your workspace's default
+environment.
 
-Open the current terminal screen; resume a suspended session when necessary.
-Ctrl-] detaches and keeps the session. Transient established-stream disconnects
-and hosted lease renewals reconnect from the last rendered sequence. Hosted
-credentials refresh automatically; revoked access still requires login.
---since 0 replays the full event log;
---since N resumes after N. Run rainier doctor if the session keeps waiting.
-Use a sess_ id directly, or a session name. Ambiguous names require an id.`
+A session runs a shell, a coding agent, or any command you name after "--".
+--agent starts the named agent; it cannot be combined with an explicit
+command, since both answer the same question. Git inside the session is the
+source of truth for your repositories.
+
+--detach creates without attaching; use rainier attach <session> later.
+--env, --image and --egress are advanced (rainier help all).`
+	case "ls":
+		help = `usage: rainier ls [--all] [--verbose] [--json]
+
+Your sessions, across the three things that can be true of one at once:
+
+  STATE       the sandbox: Starting, Running, Stopped, Failed
+  PROCESS     what you told it to run: Running, or Exited (code)
+  CONNECTION  whether it can be reached right now: Available, Unavailable
+
+They are separate because they fail separately. A session whose agent exited
+is still Running — it holds its filesystem and you can still attach to it. A
+session you cannot reach is Unavailable, not Failed; the work is still there
+and the runner may come back.
+
+By default you see the sessions you can still act on. --all adds cancelled and
+deleted history. --verbose adds the id, environment, runner, any queue reason,
+and the server's own API state.`
+	case "info":
+		help = `usage: rainier info <session> [--json]
+
+One session in full: its session state, its process, its connection, the
+server's own API state beside them, when it was created and last changed, its
+environment, and whether it can be attached, stopped or deleted right now.
+Those three answers come from the API's own transition rules, so "Stop: no"
+means the server would refuse it, not that a word looked wrong.
+
+A failed session's reason is included, sanitized. --json carries the raw API
+facts — state, reachable, child_exit_code — beside the derived ones.`
+	case "attach":
+		help = `usage: rainier attach <session> [--since N]
+
+Open the session's current terminal screen. Ctrl-] detaches and leaves the
+session running. A stopped session is resumed first and waited for.
+
+A running sandbox stays attachable after its child exits. A failed session
+is attachable while its runner is reachable. --since requests diagnostic
+replay: --since 0 replays the whole event log — a failed
+setup's complete output — and --since N resumes after sequence N.
+
+Transient disconnects and hosted lease renewals reconnect from the last
+rendered sequence. Hosted credentials refresh automatically.`
+	case "stop":
+		help = `usage: rainier stop <session> [--json]
+
+Stop a running session. Its filesystem is persisted, so rainier attach brings
+it back where you left it, and the session resources it was holding — the
+runner slot, its memory — are released for your other sessions to use.
+
+This does not change what you pay. Your Dedicated subscription stays active
+and continues to bill monthly whether your sessions are running or stopped;
+stopping frees capacity inside the compute you already have. Cancelling the
+subscription is a separate action, on the web.
+
+Only a running session can be stopped. Stopping an already-stopped one is not
+an error. If the stop or its persistence fails, stop says so and does not
+report success — your session's state is never discarded quietly.
+
+To destroy a session for good, use rainier delete.`
+	case "delete":
+		help = `usage: rainier delete <session> [--yes] [--json]
+
+Destroy the session permanently. Its container, its terminal, and any work
+you have not pushed are gone and cannot be recovered.
+
+On a terminal it asks first. In a script it requires --yes and refuses
+otherwise rather than waiting for an answer that cannot arrive. A session
+that is already gone is reported as such, not as a failure.`
+	case "agent":
+		help = agentUsage
+	case "version":
+		help = "usage: rainier version\n\nPrint this CLI's build version."
+	case "help":
+		help = "usage: rainier help [command]\n\nrainier help lists the primary commands; rainier help <command> details one;\nrainier help all is the full manual, including advanced and self-hosted use."
+
+	// --- compatibility aliases (contract §2.1) ------------------------------
 	case "doctor":
 		help = `usage: rainier doctor
 
-Read-only readiness report, bounded to about 15 seconds including token refresh.
-Checks active config, server authentication, workspace, runners, environments,
-and coding-agent status using existing API routes. Normal token refresh may save
-rotated credentials. No provisioning or automatic environment/agent setup.
-Exit 0: basic session prerequisites pass; 1: a required check failed.
-Environment or agent warnings mean coding-agent readiness is incomplete;
-basic sessions may still work. Backend version is unknown unless advertised.`
+Compatibility alias for rainier status --verbose. Prefer rainier status.`
+	case "suspend":
+		help = `usage: rainier suspend <session>
+
+Compatibility alias for rainier stop. Prefer rainier stop. The warm/cold
+distinction is gone from the interface: stop always persists the session and
+releases its capacity, which is what --cold used to mean.`
+	case "rm":
+		help = `usage: rainier rm <session>
+
+Compatibility alias for rainier delete, kept with its original behavior: it
+destroys the session without prompting and needs no --yes, because scripts
+call it that way. Prefer rainier delete, which asks first.`
+
+	// --- advanced (contract §2.2) -------------------------------------------
 	case "env":
 		help = envUsage
-	case "agent":
-		help = agentUsage + "\n\nProviders: " + strings.Join(agentProviderNames(), ", ") + "."
 	case "secret":
 		help = secretUsage
 	case "context":
 		help = `usage: rainier context list | use <name> | current | remove <name>
 
-A context is one server and its credentials. Every command uses the current
-context. list shows saved contexts; use switches; current prints the selection;
-remove deletes local credentials for that context. Login creates a context.`
+Advanced. A context is one server and its credentials. Every command uses the
+current context. list shows saved contexts; use switches; current prints the
+selection; remove deletes local credentials for that context. Login creates a
+context. Hosted v0 needs exactly one, and login manages it for you.`
 	case "workspace":
 		help = `usage: rainier workspace use <id>
 
-Select a workspace within the current hosted context. A hosted login chooses
-automatically when there is one workspace; otherwise it lists available ids.
-This selection scopes subsequent requests; it does not create a workspace.`
-	case "push", "pull":
-		help = "usage: rainier push <local-dir> <id|name>:<path>"
-		if command == "pull" {
-			help = "usage: rainier pull <id|name>:<path> <local-dir>"
-		}
-		help += "\n\nTransfer a directory once, bounded to 256 MiB. Remote paths stay inside\n/workspace; neither direction follows symlinks outside the tree being moved."
-	case "ls":
-		help = "usage: rainier ls [--all]\n\nList sessions; --all includes terminal states. Shows runner and queue state."
-	case "suspend":
-		help = "usage: rainier suspend <id|name> [--cold]\n\nSuspend a session (warm by default); --cold snapshots it to release memory."
+Advanced. Select a workspace within the current hosted context. A hosted login
+chooses automatically when there is one workspace, which is the hosted v0
+case. This selection scopes subsequent requests; it does not create a
+workspace.`
 	case "resume":
-		help = "usage: rainier resume <id|name>\n\nResume a suspended session. Use attach to open its terminal afterwards."
+		help = `usage: rainier resume <session> [--json]
+
+Advanced. Resume a stopped session without attaching, for automation that
+wants the two halves separately. Interactive users run rainier attach, which
+resumes a stopped session on its own.`
 	case "snapshot":
-		help = "usage: rainier snapshot <id|name>\n\nCreate a checkpoint of the session and print its reference."
-	case "rm":
-		help = "usage: rainier rm <id|name>\n\nDestroy the session. Detach with Ctrl-] to keep a session instead."
-	case "diff":
-		help = "usage: rainier diff <id|name>\n\nShow git --stat for each cloned repository against its original base branch."
+		help = `usage: rainier snapshot <session>
+
+Advanced. Create a checkpoint of the session and print its reference.`
+	case "push", "pull":
+		help = "usage: rainier push <local-dir> <session>:<path>"
+		if command == "pull" {
+			help = "usage: rainier pull <session>:<path> <local-dir>"
+		}
+		help += "\n\nAdvanced. Transfer a directory once, bounded to 256 MiB. Remote paths stay\ninside /workspace; neither direction follows symlinks outside the tree being\nmoved."
 	case "creds":
-		help = "usage: rainier creds\n\nShow GitHub credential provider, status, scopes and verification/use times.\nIf needs_refresh or repo scope is missing, run rainier login --refresh github.\nThis reads a self-hosted server's vault. On a hosted rainier, GitHub is a\nconnection you authorize in the browser instead: see rainier help connection."
+		help = `usage: rainier creds
+
+Advanced, self-hosted only. Show the server vault's GitHub credential:
+provider, status, scopes and verification/use times. If it says needs_refresh
+or lacks repo scope, run rainier login --refresh github. A hosted rainier has
+no vault — GitHub is a connection you authorize in the browser, and
+rainier status reports it.`
 	case "connection":
 		help = connectionUsage + "\n\nProviders: " + strings.Join(connectionProviders, ", ") + "."
 	default:
 		return false
 	}
-	fmt.Fprintln(os.Stderr, help)
+	// Help somebody asked for is output, not a diagnostic (contract §6.1).
+	fmt.Fprintln(os.Stdout, help)
 	return true
 }

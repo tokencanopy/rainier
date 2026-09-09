@@ -463,8 +463,8 @@ func TestSessionConnDeathClosesClient(t *testing.T) {
 	// a dropped/dead outbound WebSocket to runnerd looks like in production.
 	sessConn.Close()
 
-	// The death must cascade all the way to the client: assert its next Read
-	// errors out promptly. The inner Read deliberately carries no deadline of
+	// The death must cascade all the way to the client. Drain output already
+	// queued before the close, then require Read to error promptly. The inner Read deliberately carries no deadline of
 	// its own (context.Background()) — the *only* bound on this wait is the
 	// outer select's time.After. That matters: if the Read instead used its
 	// own e.g. 3s inner context.WithTimeout, a reverted/broken cascade would
@@ -477,8 +477,13 @@ func TestSessionConnDeathClosesClient(t *testing.T) {
 	// fails the test via t.Fatal below rather than a false pass.
 	done := make(chan error, 1)
 	go func() {
-		_, err := client.Read(context.Background())
-		done <- err
+		for {
+			_, err := client.Read(context.Background())
+			if err != nil {
+				done <- err
+				return
+			}
+		}
 	}()
 	select {
 	case err := <-done:
