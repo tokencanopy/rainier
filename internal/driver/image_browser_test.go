@@ -396,3 +396,42 @@ func TestSessionImageBrowserHelperReportsThePathPlaywrightReads(t *testing.T) {
 		t.Fatalf("path with only XDG_CACHE_HOME = %q", got)
 	}
 }
+
+func TestSessionImageBrowserHelperInvalidatesRetiredBaseline(t *testing.T) {
+	prefix := fakeBaseline(t)
+	cache := filepath.Join(t.TempDir(), "cache")
+	env := []string{"RAINIER_BROWSERS_PREFIX=" + prefix, "PLAYWRIGHT_BROWSERS_PATH=" + cache}
+	if run := runHelper(t, browsersHelper(t), t.TempDir(), env, "link"); run.status != 0 {
+		t.Fatal(run.out)
+	}
+	old := filepath.Join(cache, "chromium_headless_shell-1243")
+	// A newer image no longer carries the old read-only payload.
+	if err := os.RemoveAll(filepath.Join(prefix, "chromium_headless_shell-1243")); err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(cache, "chromium_headless_shell-1200")
+	if err := os.MkdirAll(project, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, "INSTALLATION_COMPLETE"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if run := runHelper(t, browsersHelper(t), t.TempDir(), env, "link"); run.status != 0 {
+		t.Fatal(run.out)
+	}
+	if _, err := os.Stat(filepath.Join(old, "INSTALLATION_COMPLETE")); !os.IsNotExist(err) {
+		t.Fatalf("retired payload still marked installed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(project, "INSTALLATION_COMPLETE")); err != nil {
+		t.Fatalf("project install changed: %v", err)
+	}
+}
+
+func TestSessionImageBrowserHelperRejectsPackageLocalCache(t *testing.T) {
+	for _, command := range []string{"path", "link", "status"} {
+		run := runHelper(t, browsersHelper(t), t.TempDir(), []string{"PLAYWRIGHT_BROWSERS_PATH=0", "RAINIER_BROWSERS_PREFIX=" + fakeBaseline(t)}, command)
+		if run.status == 0 || !strings.Contains(run.out, "package-local") {
+			t.Fatalf("%s: exit=%d output=%s", command, run.status, run.out)
+		}
+	}
+}

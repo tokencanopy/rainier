@@ -819,3 +819,20 @@ useful local diagnostics, not qualification of the shipping AMD64 image.
 Authenticated agent workloads and cold dependency downloads under hosted
 egress policy remain a separate no-setup environment gate on approved canary
 capacity; never replace a runner holding active work to obtain that evidence.
+
+
+### Browser cache recovery after an image change
+
+After restoring a workspace onto a different browser-image revision, run
+`rainier-browsers link`. It links the new baseline and invalidates completion
+markers for Rainier-owned revisions whose image-local payload no longer exists.
+The project's normal `npx playwright install` can then fetch an older pinned
+revision again; project-installed browser directories are preserved. This is an
+explicit recovery step for existing volumes, not an automatic image migration.
+`PLAYWRIGHT_BROWSERS_PATH=0` uses Playwright's package-local cache and is not
+managed by this helper; use the project's installer for that mode.
+
+The session-image CI now runs `make session-image-browser-e2e` in addition to
+its offline image checks. Functional browser success does not prove Chromium's
+own sandbox is enabled: Playwright's default disables it. The separately
+requested sandbox-enabled qualification remains a release acceptance gap.

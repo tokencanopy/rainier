@@ -46,6 +46,10 @@ USAGE
 }
 
 registry_dir() {
+  if [ "${PLAYWRIGHT_BROWSERS_PATH:-}" = 0 ]; then
+    echo "PLAYWRIGHT_BROWSERS_PATH=0 selects a package-local cache; use the project Playwright installer or unset this override" >&2
+    return 2
+  fi
   if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ]; then
     printf '%s\n' "$PLAYWRIGHT_BROWSERS_PATH"
   else
@@ -91,6 +95,18 @@ cmd_link() {
   [ -d "$PREFIX" ] || { echo "no browser baseline at $PREFIX" >&2; exit 1; }
   reg=$(registry_dir)
   mkdir -p "$reg"
+  # An upgraded image may have retired a revision whose cache links survived
+  # on the workspace volume. Playwright skips download when this marker exists,
+  # even if the linked payload is gone. Invalidate only our stale markers;
+  # leave project installs and any other workspace files untouched.
+  for dst in "$reg"/*; do
+    [ -d "$dst" ] && [ ! -L "$dst" ] && is_ours "$dst" || continue
+    source_path=$(cat "$dst/$OURS")
+    if [ ! -d "$source_path" ]; then
+      rm -f "$dst/INSTALLATION_COMPLETE" "$dst/DEPENDENCIES_VALIDATED"
+      printf 'repair  %s (retired baseline; project installer may download it)\n' "$dst"
+    fi
+  done
   for src in "$PREFIX"/*; do
     [ -d "$src" ] || continue
     link_one "$src" "$reg/${src##*/}"
