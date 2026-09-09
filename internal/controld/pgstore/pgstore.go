@@ -412,7 +412,16 @@ func (s *Store) PutAgentCredential(ctx context.Context, c controld.AgentCredenti
 }
 
 func (s *Store) RevokeAgentCredential(ctx context.Context, userID, provider string) (uint64, error) {
+	return s.revokeAgentCredential(ctx, userID, provider, nil)
+}
+func (s *Store) ConditionalRevokeAgentCredential(ctx context.Context, userID, provider string, expected uint64) (uint64, error) {
+	return s.revokeAgentCredential(ctx, userID, provider, &expected)
+}
+func (s *Store) revokeAgentCredential(ctx context.Context, userID, provider string, expected *uint64) (uint64, error) {
 	if userID == "" || provider == "" {
+		return 0, control.ErrInvalid
+	}
+	if expected != nil && *expected > uint64(1<<63-1) {
 		return 0, control.ErrInvalid
 	}
 	var version int64
@@ -426,7 +435,11 @@ func (s *Store) RevokeAgentCredential(ctx context.Context, userID, provider stri
 			revoked    = true,
 			last_revoked_version = agent_credentials.version + 1,
 			updated_at = now()
-		RETURNING version`, userID, provider).Scan(&version)
+		WHERE $3::bigint IS NULL OR agent_credentials.last_revoked_version <= $3
+ RETURNING version`, userID, provider, expected).Scan(&version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, control.ErrConflict
+	}
 	if err != nil {
 		return 0, fmt.Errorf("pgstore: revoke agent credential for provider %q: %w", provider, err)
 	}

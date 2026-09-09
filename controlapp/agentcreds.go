@@ -83,6 +83,9 @@ type AgentCredentialStore interface {
 	// returns its version. It is idempotent in outcome, while each call still
 	// advances the fence so every earlier in-flight put is stale.
 	RevokeAgentCredentials(ctx context.Context, user control.ActorID, provider string) (uint64, error)
+	// ConditionalRevokeAgentCredentials is a session-originated deletion. It
+	// atomically rejects expected versions older than the durable logout fence.
+	ConditionalRevokeAgentCredentials(ctx context.Context, user control.ActorID, provider string, expected uint64) (uint64, error)
 	// ListAgentCredentials returns one status per provider the user has a set
 	// for, and no bytes.
 	ListAgentCredentials(ctx context.Context, user control.ActorID) ([]AgentCredentialStatus, error)
@@ -328,7 +331,10 @@ func (s *AgentCredentialService) AnswerPut(ctx context.Context, row control.Sess
 		return 0, err
 	}
 	if len(files) == 0 {
-		version, err := s.store.RevokeAgentCredentials(ctx, row.CreatorID, provider)
+		version, err := s.store.ConditionalRevokeAgentCredentials(ctx, row.CreatorID, provider, expected)
+		if errors.Is(err, control.ErrConflict) {
+			return 0, ErrAgentCredentialStale
+		}
 		if err != nil {
 			return 0, ErrAgentCredentialUnwritable
 		}

@@ -835,3 +835,11 @@ no checkpoint/restore mechanism and no new server endpoint.
 | 4 | Warmed-fleet p95 stays under 1.5 s create-to-usable, 200 ms attach by id, 225 ms by name, and 75 ms terminal RTT. | The latency command above. It emits raw JSONL plus R-7 summaries. | ☑ | Five-sample directional run: create-to-usable 1.12 s; id first frame 165 ms; name first frame 198 ms; id/name RTT 58/50 ms. All targets passed. |
 | 5 | The benchmark uses only synthetic scratch names, emits no identifiers or terminal content, and removes every session it creates. | Read `cmd/rainier-latency`; run `go test ./cmd/rainier-latency -run 'TestMeasureSampleFallsBackToNameCleanupBeforeCreateAck|TestEnsureNameAvailableFiltersAndPaginatesClientSide|TestPublicFailureDoesNotExposeSessionOrServerDetails'`; after the live run, count active `latency-test-*` rows in ordinary `rainier ls`. | ☑ | The tool preflights each random name across paginated old/new-server responses. Before create acknowledgement it replays the same private idempotency key to recover the exact owned ID; afterward it already has that ID. Cleanup never deletes by name, and stderr emits only allowlisted failure classes/codes. The post-fix live smoke exercised create, id/name attach, warm/cold resume, and cleanup; `synthetic_active=0`. Historical destroyed rows remain visible only under `ls --all`, as designed. |
 | 6 | The complete branch is green under the race detector. | `go test -race -p 1 ./...`. | ☑ | Green 2026-08-30, including the Docker driver contract suite. `make e2e` could not start because a pre-existing shared fleet owns port 8080; it stopped at the non-destructive preflight and touched nothing. |
+
+Session-originated empty credential puts must use
+`ConditionalRevokeAgentCredentials` with their observed version. Explicit user
+logout continues to use unconditional revoke. This post-v0.0.9 control-plane
+correction prevents delayed local file deletion from erasing a later login; it
+changes no session wire shape and requires no further database migration.
+Hosted adapters must implement the same atomic condition before deploying the
+updated control package.

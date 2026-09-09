@@ -48,6 +48,7 @@ func agentTestProvider(t *testing.T) (AgentProvider, string) {
 // refused request never reached it at all.
 type agentFakeStore struct {
 	mu       sync.Mutex
+	fences   map[string]uint64
 	sets     map[string]AgentCredentialSet
 	statuses []AgentCredentialStatus
 
@@ -58,7 +59,7 @@ type agentFakeStore struct {
 }
 
 func newAgentFakeStore() *agentFakeStore {
-	return &agentFakeStore{sets: map[string]AgentCredentialSet{}}
+	return &agentFakeStore{sets: map[string]AgentCredentialSet{}, fences: map[string]uint64{}}
 }
 
 func agentKey(user control.ActorID, provider string) string { return string(user) + "\x00" + provider }
@@ -90,9 +91,12 @@ func (f *agentFakeStore) PutAgentCredentials(_ context.Context, user control.Act
 	return cur.Version, nil
 }
 
-func (f *agentFakeStore) RevokeAgentCredentials(_ context.Context, user control.ActorID, provider string) (uint64, error) {
+func (f *agentFakeStore) revokeAgentCredentials(user control.ActorID, provider string, expected *uint64) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if expected != nil && *expected < f.fences[agentKey(user, provider)] {
+		return 0, control.ErrConflict
+	}
 	f.revokes++
 	if f.revokeErr != nil {
 		return 0, f.revokeErr
@@ -100,6 +104,7 @@ func (f *agentFakeStore) RevokeAgentCredentials(_ context.Context, user control.
 	f.revoked = append(f.revoked, agentKey(user, provider))
 	cur := f.sets[agentKey(user, provider)]
 	cur.Version++
+	f.fences[agentKey(user, provider)] = cur.Version
 	cur.Files = map[string][]byte{}
 	f.sets[agentKey(user, provider)] = cur
 	return cur.Version, nil
@@ -809,4 +814,35 @@ func equalSessionIDs(a, b []control.SessionID) bool {
 		}
 	}
 	return true
+}
+
+func (f *agentFakeStore) RevokeAgentCredentials(_ context.Context, user control.ActorID, provider string) (uint64, error) {
+	return f.revokeAgentCredentials(user, provider, nil)
+}
+func (f *agentFakeStore) ConditionalRevokeAgentCredentials(_ context.Context, user control.ActorID, provider string, expected uint64) (uint64, error) {
+	return f.revokeAgentCredentials(user, provider, &expected)
+}
+
+func TestAnswerPutStaleEmptySetPreservesRelogin(t *testing.T) {
+	p, file := agentTestProvider(t)
+	fx := newAgentFixture(t)
+	ctx := context.Background()
+	row := agentSessionRow()
+	fence, err := fx.store.RevokeAgentCredentials(ctx, row.CreatorID, p.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := fx.svc.AnswerPut(ctx, row, p.Name, map[string][]byte{file: []byte(agentTestCredential)}, fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, files := range []map[string][]byte{nil, {}} {
+		if _, err := fx.svc.AnswerPut(ctx, row, p.Name, files, 0); !errors.Is(err, ErrAgentCredentialStale) {
+			t.Fatalf("stale deletion: %v", err)
+		}
+	}
+	set, err := fx.store.FetchAgentCredentials(ctx, row.CreatorID, p.Name)
+	if err != nil || set.Version != live || len(set.Files) == 0 {
+		t.Fatal("stale empty write erased the new login")
+	}
 }

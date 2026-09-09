@@ -1140,12 +1140,21 @@ func (m *memStore) PutAgentCredential(ctx context.Context, c AgentCredential) (u
 }
 
 func (m *memStore) RevokeAgentCredential(ctx context.Context, userID, provider string) (uint64, error) {
+	return m.revokeAgentCredential(ctx, userID, provider, nil)
+}
+func (m *memStore) ConditionalRevokeAgentCredential(ctx context.Context, userID, provider string, expected uint64) (uint64, error) {
+	return m.revokeAgentCredential(ctx, userID, provider, &expected)
+}
+func (m *memStore) revokeAgentCredential(ctx context.Context, userID, provider string, expected *uint64) (uint64, error) {
 	if userID == "" || provider == "" {
 		return 0, control.ErrInvalid
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := credKey{userID, provider}
+	if previous := m.agentCredentials[key]; previous != nil && expected != nil && *expected < previous.LastRevokedVersion {
+		return 0, control.ErrConflict
+	}
 	version := uint64(1)
 	if previous, ok := m.agentCredentials[key]; ok {
 		version = previous.Version + 1

@@ -75,6 +75,7 @@ func RunAgentCredentialStore(t *testing.T, open func(t *testing.T) controlapp.Ag
 		{"A5 two people never see each other's set", caseAgentUserIsolation},
 		{"A6 two providers of one person are separate sets", caseAgentProviderIsolation},
 		{"A7 a tombstone fences stale puts", caseAgentRevokeFence},
+		{"A8 a tombstone fences session deletions after relogin", caseAgentConditionalRevoke},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			s := open(t)
@@ -290,5 +291,28 @@ func wantSet(t *testing.T, s controlapp.AgentCredentialStore, user control.Actor
 		if !bytes.Equal(got, want) {
 			t.Fatalf("fetch %s/%s file %q is %d bytes, want %d and equal", user, provider, name, len(got), len(want))
 		}
+	}
+}
+
+func caseAgentConditionalRevoke(t *testing.T, s controlapp.AgentCredentialStore, provider, file, _, _ string) {
+	ctx := context.Background()
+	fence, err := s.RevokeAgentCredentials(ctx, AgentUser, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err := s.PutAgentCredentials(ctx, AgentUser, provider, map[string][]byte{file: agentFixtureCredential}, fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ConditionalRevokeAgentCredentials(ctx, AgentUser, provider, 0); !errors.Is(err, control.ErrConflict) {
+		t.Fatalf("stale deletion: %v", err)
+	}
+	set, err := s.FetchAgentCredentials(ctx, AgentUser, provider)
+	if err != nil || set.Version != live || len(set.Files) == 0 {
+		t.Fatal("stale deletion erased relogin")
+	}
+	next, err := s.ConditionalRevokeAgentCredentials(ctx, AgentUser, provider, live)
+	if err != nil || next != live+1 {
+		t.Fatalf("current deletion: version %d, error %v", next, err)
 	}
 }
