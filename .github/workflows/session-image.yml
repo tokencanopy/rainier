@@ -31,6 +31,9 @@ jobs:
         env:
           RAINIER_SESSION_IMAGE: rainier-session:qualify
         run: go test ./internal/driver -run '^(TestSessionImage|TestImageSmoke)' -count=1
+      # Chromium must use its own sandbox; enable user namespaces on this disposable CI host.
+      - name: Enable Chromium sandbox user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Functional smoke with no network or credentials
         run: make session-image-smoke SESSION_IMAGE=rainier-session:qualify
       - name: Browser end to end in a fresh project
