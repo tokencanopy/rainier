@@ -42,7 +42,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: tokencanopy/rainier-cloud
-          ref: 6e6665b1009cc93489014af5761d45743b086c1e
+          ref: 2f2bb5743c7cb35ba803f108343690e01f0a9b03
           path: .browser-cloud
           persist-credentials: false
       - name: Load the reviewed Chromium AppArmor policy
