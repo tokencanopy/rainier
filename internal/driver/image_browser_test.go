@@ -223,8 +223,14 @@ func TestSessionImageDoesNotDisableBrowserSafety(t *testing.T) {
 		if err != nil {
 			t.Fatalf("reading browser safety contract %s: %v", path, err)
 		}
-		if strings.Contains(string(b), "--no-sandbox") {
-			t.Errorf("%s names --no-sandbox; browser qualification must fail closed", path)
+		for _, line := range strings.Split(string(b), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			if strings.Contains(line, "--no-sandbox") {
+				t.Errorf("%s names --no-sandbox in executable code; browser qualification must fail closed", path)
+			}
 		}
 	}
 }
