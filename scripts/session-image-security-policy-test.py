@@ -29,7 +29,7 @@ DOCKER_CANONICAL_SHA256 = (
     "885442dc08f21f8d60f99ea43d59af88b1c529103815fe24bbf9ce998d3a609d"
 )
 SECCOMP_CANONICAL_SHA256 = (
-    "411202bbf22820f4631ca2fb4c7b9f1b88079f25d923fb021aac1830846d8626"
+    "4af52b1aa66bbee5bb8e3b3f713a56de3b2590a2ba052212c491b1cf9b078671"
 )
 APPARMOR_SHA256 = (
     "53f78e768ee56099b764661c58b569504e39ecc45b2b3fb0dffd13ea329eb431"
@@ -165,6 +165,15 @@ class SessionImageSecurityPolicyTest(unittest.TestCase):
                         "only inside the child mount namespace."
                     ),
                 ),
+                rule(
+                    ["chroot"],
+                    "SCMP_ACT_ALLOW",
+                    comment=(
+                        "RAINIER: Chromium's safe-empty-dir helper chroots only "
+                        "after entering its private user namespace; the kernel "
+                        "still requires CAP_SYS_CHROOT there."
+                    ),
+                ),
             ],
         )
 
@@ -177,7 +186,7 @@ class SessionImageSecurityPolicyTest(unittest.TestCase):
             and not item.get("excludes")
             for name in item["names"]
         }
-        self.assertTrue({"mount", "pivot_root", "umount2"} <= unconditional)
+        self.assertTrue({"mount", "pivot_root", "umount2", "chroot"} <= unconditional)
         self.assertTrue(
             {"clone3", "setns", "sethostname", "setdomainname", "unshare"}.isdisjoint(
                 unconditional
