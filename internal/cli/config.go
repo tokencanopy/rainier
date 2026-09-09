@@ -38,13 +38,40 @@ type Context struct {
 	Workspace       string `json:"workspace,omitempty"`
 	RefreshToken    string `json:"refresh_token,omitempty"`
 	AccessExpiresAt string `json:"access_expires_at,omitempty"`
+
+	// Kind records how this context authenticates: "hosted" for one created
+	// by the browser login, empty for a self-hosted GitHub login. It exists
+	// because the refresh token used to be the only evidence, and `rainier
+	// logout` deletes the refresh token — after which a hosted context would
+	// have looked self-hosted, and a bare `rainier login` would not have
+	// known to run the browser flow against it.
+	Kind string `json:"kind,omitempty"`
+
+	// CurrentSession is the opaque id of the last session this CLI created
+	// or attached in this context — what the `current` selector resolves to.
+	// The ID and never the name: a name can be freed by a delete and reused
+	// by the next `new`, and a selector that followed the name would then
+	// point at a different session without anything having changed on this
+	// machine. It is per context because a session id means nothing on
+	// another server.
+	CurrentSession string `json:"current_session,omitempty"`
 }
 
-// Hosted reports whether this context came from a hosted edge — the presence
-// of a refresh token is what distinguishes the hosted passwordless login
-// from a self-hosted GitHub login, whose token neither expires on its own
-// nor rotates.
-func (c Context) Hosted() bool { return c.RefreshToken != "" }
+// Hosted reports whether this context came from a hosted edge. A recorded
+// Kind is the durable answer; the presence of a refresh token is the one that
+// keeps every context written before Kind existed reading correctly, since
+// only the hosted passwordless login has ever stored one.
+func (c Context) Hosted() bool { return c.Kind == KindHosted || c.RefreshToken != "" }
+
+// KindHosted is the Kind a browser login writes.
+const KindHosted = "hosted"
+
+// SignedIn reports whether this context still holds a usable local
+// credential. `rainier logout` clears the tokens and keeps everything else,
+// so a context can name a server and a workspace while holding nothing to
+// authenticate with — which is exactly the state a bare `rainier login`
+// re-authenticates from.
+func (c Context) SignedIn() bool { return c.Server != "" && c.Token != "" }
 
 // Config is what `rainier login` writes and every other command reads: the
 // named contexts the CLI knows and which one is current.

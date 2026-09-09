@@ -149,18 +149,25 @@ func TestDoctorDeadlineIncludesRefresh(t *testing.T) {
 	}
 }
 
+// `doctor` survives as a hidden compatibility alias for `status --verbose`
+// (docs/cli-v0-contract.md §2.1). It has to keep working for the runbooks and
+// scripts that call it, keep printing the diagnostics they read, and keep
+// changing nothing on disk.
 func TestDoctorCLIConfigAndExit(t *testing.T) {
 	bin := buildCLI(t, "")
 	config := filepath.Join(t.TempDir(), "config.json")
 	out, code := runCLI(t, bin, config, "doctor")
-	if code != 1 || !strings.Contains(out, "FAIL config") || !strings.Contains(out, "rainier login") {
+	if code != 1 || !strings.Contains(out, "Signed in: no") {
 		t.Fatalf("%d %s", code, out)
+	}
+	if !strings.Contains(out, "compatibility alias") {
+		t.Errorf("the alias does not say it is one:\n%s", out)
 	}
 	if err := os.WriteFile(config, []byte(`{"token":"secret_example", broken`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	out, code = runCLI(t, bin, config, "doctor")
-	if code != 1 || !strings.Contains(out, "cannot read config") || strings.Contains(out, "secret_example") {
+	if code != 1 || !strings.Contains(out, "cannot read") || strings.Contains(out, "secret_example") {
 		t.Fatalf("%d %s", code, out)
 	}
 	ts := httptest.NewServer(http.HandlerFunc(doctorFixture))
@@ -172,6 +179,9 @@ func TestDoctorCLIConfigAndExit(t *testing.T) {
 	out, code = runCLI(t, bin, config, "doctor")
 	if code != 0 || !strings.Contains(out, "basic session readiness passed") {
 		t.Fatalf("%d %s", code, out)
+	}
+	if !strings.Contains(out, "Default environment: ready") {
+		t.Errorf("the alias does not run status underneath:\n%s", out)
 	}
 	after, _ := os.ReadFile(config)
 	if !bytes.Equal(data, after) {

@@ -1,7 +1,14 @@
-// Command rainier is the client CLI for controld: log in, create sessions,
-// list them, attach to them, and drive their lifecycle (suspend/resume/
-// snapshot/rm). Subcommand dispatch follows runnerctl's style — stdlib
-// `flag` per subcommand, no cobra.
+// Command rainier is the client CLI for controld and for Rainier Cloud.
+//
+// Its public surface is small on purpose and is specified in
+// docs/cli-v0-contract.md: sign in, check readiness, authenticate a coding
+// agent, and create and manage sessions. Everything else — self-hosted login,
+// environments, secrets, contexts, transfers, snapshots, administration —
+// still dispatches, but lives under `rainier help all` so that a first-time
+// reader sees the product and not the toolbox.
+//
+// Subcommand dispatch follows runnerctl's style: stdlib `flag` per
+// subcommand, no cobra.
 package main
 
 import (
@@ -21,7 +28,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
-	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -31,7 +37,6 @@ import (
 	"github.com/tokencanopy/rainier/internal/attachio"
 	"github.com/tokencanopy/rainier/internal/cli"
 	"github.com/tokencanopy/rainier/protocol/terminal"
-	"github.com/tokencanopy/rainier/protocol/workspace"
 )
 
 // devicePollTimeout bounds a single poll request to GitHub's device-flow
@@ -42,7 +47,7 @@ const devicePollTimeout = 15 * time.Second
 
 func main() {
 	if len(os.Args) < 2 {
-		printUsage()
+		printUsage(os.Stderr)
 		os.Exit(2)
 	}
 	cmd, rest := os.Args[1], os.Args[2:]
@@ -52,26 +57,42 @@ func main() {
 
 	var err error
 	switch cmd {
+	// --- the public surface (docs/cli-v0-contract.md §2) ---
 	case "login":
 		err = runLogin(rest)
-	case "doctor":
-		err = runDoctor(rest)
+	case "logout":
+		err = runLogout(rest)
+	case "status":
+		err = runStatus(rest)
 	case "new":
 		err = runNew(rest)
 	case "ls":
 		err = runLs(rest)
+	case "info":
+		err = runInfo(rest)
 	case "attach":
 		err = runAttach(rest)
+	case "stop":
+		err = runStop(rest)
+	case "delete":
+		err = runDelete(rest)
+	case "agent":
+		err = runAgent(rest)
+
+	// --- compatibility aliases (§2.1): hidden, temporary, and each one a
+	// thin call into the command that replaced it, so they cannot drift ---
+	case "doctor":
+		err = runDoctor(rest)
 	case "suspend":
 		err = runSuspend(rest)
+	case "rm":
+		err = runRm(rest)
+
+	// --- advanced (§2.2): dispatched, documented under `rainier help all` ---
 	case "resume":
 		err = runResume(rest)
 	case "snapshot":
 		err = runSnapshot(rest)
-	case "rm":
-		err = runRm(rest)
-	case "diff":
-		err = runDiff(rest)
 	case "push":
 		err = runPush(rest)
 	case "pull":
@@ -80,8 +101,6 @@ func main() {
 		err = runCreds(rest)
 	case "connection":
 		err = runConnection(rest)
-	case "agent":
-		err = runAgent(rest)
 	case "secret":
 		err = runSecret(rest)
 	case "env":
@@ -90,127 +109,168 @@ func main() {
 		err = runContext(rest)
 	case "workspace":
 		err = runWorkspace(rest)
-	case "-h", "--help", "help":
-		printUsage()
-		return
+
 	default:
+		// help, --help, -h and version never reach here: handleHelpVersion
+		// above answers all of them, so a second arm for them would be an
+		// unreachable copy that the next person edits by mistake.
 		fmt.Fprintf(os.Stderr, "rainier: unknown command %q\n", cmd)
-		printUsage()
+		printUsage(os.Stderr)
 		os.Exit(2)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		// One exit for every command: redacted on stderr, with the server's
+		// stable code and request id when it has them, and 2 rather than 1
+		// when the invocation itself was wrong (contract §6.1, §6.3).
+		cfg, _ := cli.Load()
+		reportError(cfg, os.Stderr, err)
+		os.Exit(exitCodeFor(err))
 	}
 }
 
+// printManual is `rainier help all`: the reference for everything the default
+// help leaves out. Its job is to be complete, not short, and its structure is
+// the one thing that keeps it from leaking back into the first-run
+// experience — everything past the primary surface is under an Advanced
+// heading, so a reader always knows whether what they are looking at is part
+// of the product they bought or part of the toolbox underneath it.
 func printManual() {
-	fmt.Fprintln(os.Stderr, `usage: rainier <command> [flags]
+	fmt.Fprintln(os.Stdout, `rainier — the full command reference
 
-commands:
-  login    [--from-gh] [--token GH_TOKEN] [--client-id ID] [--server URL]
-           [--refresh PROVIDER] [--context NAME]
-  login    --cloud EDGE_URL [--device-name NAME] [--context NAME]
-  new      [--name N] [--env ENV] [--image IMG] [--egress host,host] [--detach]
-           [-- CMD ARGS...]
-  ls       [--all]
-  attach   <id|name> [--since N]
-  suspend  <id|name> [--cold]
-  resume   <id|name>
-  snapshot <id|name>
-  rm       <id|name>
-  diff     <id|name>
-  push     <local-dir> <id|name>:<path>
-  pull     <id|name>:<path> <local-dir>
-  creds
-  connection ls | share <provider> [--workspace ID] | unshare <provider> [--workspace ID]
-             | reconnect <provider>
-  agent    login <provider> --env NAME | ls | logout <provider> [--yes]
-  secret   set <NAME> [--value V] | ls | rm <NAME>
-  env      create <name> [flags] | ls | show <ref> | update <ref> [flags] | rm <ref>
-  context  list | use <name> | current | remove <name>
+PRIMARY COMMANDS
+  login                      sign in (rerunnable; no arguments needed)
+  logout                     remove this machine's credentials
+  status [--verbose] [--json]   is this workspace ready to code?
+  new [--name N] [--agent claude|codex] [--detach] [-- CMD ARGS...]
+  ls [--all] [--verbose] [--json]
+  info <session> [--json]
+  attach <session> [--since N]
+  stop <session> [--json]
+  delete <session> [--yes] [--json]
+  agent login <claude|codex> | status [--json] | logout <claude|codex> [--yes]
+  help [command] | version
+
+SESSION SELECTORS
+  A <session> is one of three things:
+    sess_...   an exact id, used verbatim
+    a name     resolved against your sessions; a name matching more than one
+               is refused, with every match's id listed, rather than guessed
+    current    the session you last created or attached, in this context
+
+  "current" remembers the ID, never the name, so a name freed by a delete and
+  reused by the next new cannot silently retarget it. A real session named
+  "current" is reachable only by its id (ls --verbose prints ids).
+
+SESSION STATES
+  starting     queued or booting
+  running      sandbox up; the child may have exited
+  stopped      suspended; attach brings it back
+  failed       failed or dead; info shows the API state
+  canceled / deleted   terminal records (ls --all)
+  unknown      an unrecognized API state
+
+  Process exit and runner reachability are separate facts.
+  info shows recent activity as the server-reported last event timestamp.
+
+MACHINE-READABLE OUTPUT
+  --json is supported by status, ls, info, agent status, and by new --detach,
+  stop, resume and delete. Every document carries "schema" and "version" fields.
+  Output never changes shape because stdout is a pipe: --json is the only way
+  to ask for JSON. Human output goes to stdout, diagnostics and errors to
+  stderr. Exit 0 success, 1 operational or server failure, 2 bad invocation.
+
+COMPATIBILITY ALIASES (temporary; prefer the command each names)
+  doctor       = status --verbose
+  suspend      = stop
+  rm           = delete, keeping its original no-prompt behavior for scripts
+  agent ls     = agent status
+
+ADVANCED — self-hosted login
+  login --cloud EDGE_URL [--device-name NAME] [--context NAME]
+  login [--from-gh | --token GH_TOKEN | --client-id ID] [--server URL]
+        [--refresh github] [--context NAME]
+
+  --cloud names a hosted edge explicitly and runs the browser login. The
+  GitHub forms log in to a self-hosted controld and store your GitHub token in
+  that server's credential vault, so its sessions can clone, pull and push as
+  you. "creds" shows what is stored — provider, status, scopes, last verified
+  and used. A status of needs_refresh means git saw that token rejected: run
+
+    rainier login --refresh github
+
+  to log in again with a fresh token and clear it. Use the same command when
+  "creds" shows scopes without "repo": such a token can prove who you are but
+  cannot do git.
+
+ADVANCED — hosted GitHub connection
+  connection ls | share <provider> [--workspace ID]
+             | unshare <provider> [--workspace ID] | reconnect <provider>
+
+  On a hosted rainier there is no vault: you connect your GitHub account in
+  the browser and the cell brokers a credential into each session. A new
+  connection reaches no workspace, so "connection share github" is what lets
+  your workspace use it and "connection unshare github" removes it.
+  "connection reconnect github" replaces the browser authorization and
+  restores the previous access mode and workspace selection.
+
+  The API replaces the whole workspace list rather than adding to it, and
+  offers no conditional write, so editing one connection from two places at
+  once can lose an edit. Neither command ever prints a credential: the CLI
+  never has one to print.
+
+  In hosted v0 these are web actions. rainier status reports GitHub readiness
+  and the address to continue at; these commands remain for the flows that
+  still depend on them.
+
+ADVANCED — contexts and workspaces
+  context list | use <name> | current | remove <name>
   workspace use <id>
 
-new --env starts the session from an environment (by name or id): its image,
-setup script, egress and secrets. --image and --egress override the
-environment's own for that one session; everything else comes from it.
+  A context is one server and the credentials for it, so one config can hold
+  a self-hosted controld and any number of hosted edges. Every command talks
+  to whichever is current. A hosted context is scoped to one workspace: a
+  login with a single workspace picks it, which is the hosted v0 case.
 
-attach opens on the session's current screen. --since 0 replays the whole
-event log instead — a failed setup's full output, or a day of scrollback —
-and --since N resumes after sequence number N, the number the disconnect
-line prints when an attach drops.
+ADVANCED — environments and secrets
+  env create <name> [flags] | ls | show <ref> | update <ref> [flags] | rm <ref>
+  secret set <NAME> [--value V] | ls | rm <NAME>
 
-login stores your GitHub token in the server's credential vault (sealed), so
-sessions can clone, pull and push as you. "creds" shows what's stored:
-provider, status, scopes and when it was last verified and used. A status of
-needs_refresh means git saw that token rejected — run
+  An environment is an image, a setup script, an egress allowlist, secrets and
+  connectors, reused by every session started from it. "new --env NAME" starts
+  from one; --image and --egress override it for that one session. In hosted
+  v0 the workspace's default environment is maintained for you and "new" needs
+  no --env at all.
 
-  rainier login --refresh github
+  "secret set" reads the value from stdin when --value is omitted, so it never
+  lands in your shell history:  cat token.txt | rainier secret set GH_TOKEN
+  Values are write-only: the API never gives one back, and "secret ls" shows
+  names and timestamps only.
 
-to log in again with a fresh token and clear it. Use the same command when
-"creds" shows scopes without "repo": that token can prove who you are but
-cannot do git.
+ADVANCED — transfer and snapshots
+  push <local-dir> <session>:<path>
+  pull <session>:<path> <local-dir>
+  snapshot <session>
+  resume <session>
 
-On a hosted rainier that vault is not how GitHub works: you connect your
-GitHub account in the browser (the last step of "login --cloud" has a Connect
-GitHub button) and the cell brokers a credential into each session. "creds"
-has nothing to show there; "connection" is the command. "connection ls" is
-what you have connected, the GitHub login it names, and the workspaces it
-reaches; a new connection reaches none of them, so
+  push and pull move a directory between your machine and a session's
+  workspace: one-shot, bounded to 256 MiB, always inside /workspace, and
+  never following a symlink out of the tree being moved. snapshot checkpoints
+  a session and prints its reference. resume is stop's counterpart for
+  automation; interactive users just attach.
 
-  rainier connection share github
+ADVANCED — diagnostics
+  attach --since N   0 replays the whole event log — a failed setup's full
+                     output, or a day of scrollback — and N resumes after
+                     sequence N, the number a disconnect line prints. It also
+                     requests diagnostic replay even for terminal lifecycle states.
+  status --verbose   the full readiness report: config, authentication,
+                     workspace, runners, environments and agents.
+  ls --verbose       ids, environments, runners, reachability, and the
+                     server's own state for each session.
 
-lets your current workspace use it and "connection unshare github" removes
-that workspace from the selection. "connection reconnect github" replaces the
-browser authorization and restores the previous access mode and workspace
-selection after it succeeds. Unsharing also works after you leave a
-workspace; sharing requires current membership. Both change only the workspace
-you name, keeping the others the connection reached when the command read it, and neither ever prints a
-credential: the CLI never has one to print. The API replaces the whole
-workspace list rather than adding to it and offers no conditional write, so
-editing one connection from two places at once can lose an edit or restore
-a grant another client removed.
-
-diff shows, per repository the session cloned, what its branch changed against
-the base branch it started from — git's own "--stat", read from inside the
-session. push and pull move a directory between your machine and a session's
-workspace: they are one-shot and bounded (256MiB per transfer), the remote
-path is always inside /workspace, and neither follows a symlink out of the
-tree it is moving.
-
-secret set reads the value from stdin when --value is omitted, so it never
-lands in your shell history:  cat token.txt | rainier secret set GH_TOKEN
-Secret values are write-only: this API never gives one back, and "secret ls"
-shows names and timestamps only. Names are [A-Z0-9_], up to 64 characters —
-they become environment variables inside your sessions.
-
-login --cloud EDGE_URL logs in to a hosted rainier: it prints (and opens) a
-URL, you finish signing in there, and the CLI stores the result as a context
-named after the edge host. A context is one server and the credentials for it
-— "context list" shows them, "context use NAME" switches, and every other
-command talks to whichever one is current. A hosted context is scoped to one
-workspace: a login with a single workspace picks it, and "workspace use <id>"
-chooses when there are several.
-
-<id|name>: a "sess_" prefix is used as a session id directly. Anything else
-is resolved by name against your team's non-terminal sessions — names are
-unique only per owner, so two teammates can share one. If the name matches
-more than one session, your own is preferred when it's the only one of the
-matches that's yours (login records who you are); otherwise the name is
-rejected as ambiguous and every matching session's id and owner are listed
-so you can pass the id explicitly.`)
-
-	// The provider list is read off the table rather than typed here: a
-	// third coding agent is a row in controlapp/agents.go, and a usage line
-	// that named them by hand would be the second place to remember.
-	fmt.Fprintf(os.Stderr, `
-agent login <provider> opens a throwaway session that runs the agent's own
-login flow — nothing is pasted anywhere and no credential passes through this
-CLI. Finish the login, exit the agent, and every later session of yours starts
-already logged in. --env names an environment whose image carries that
-provider's CLI. "agent ls" shows what you have logged in and where it reaches;
-"agent logout <provider>" destroys it everywhere. Providers: %s.
-`, strings.Join(agentProviderNames(), ", "))
+REPOSITORIES
+  Git inside the session is the source of truth for repository and worktree
+  state. Rainier has no repository-diff command: run git in the session.`)
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +300,7 @@ type session struct {
 	ChildExitCode *int   `json:"child_exit_code"`
 	CreatedAt     string `json:"created_at"`
 	UpdatedAt     string `json:"updated_at"`
+	LastEventAt   string `json:"last_event_at"`
 }
 
 type sessionEnvelope struct {
@@ -361,8 +422,13 @@ type putSecretRequest struct {
 // value, not necessarily the byte sequence — Postgres jsonb re-renders
 // whitespace and member order.)
 type environment struct {
-	ID              string            `json:"id"`
-	Name            string            `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Default marks the workspace's default environment. No server sends it
+	// yet; decoding it here is what lets `new` and `agent login` stop
+	// guessing the day one does, without this CLI ever carrying a name or an
+	// image of its own (docs/cli-v0-contract.md §5.3).
+	Default         bool              `json:"default"`
 	Image           string            `json:"image"`
 	Setup           string            `json:"setup"`
 	SetupHash       string            `json:"setup_hash"`
@@ -424,9 +490,25 @@ func runLogin(args []string) error {
 	deviceName := fs.String("device-name", "", "how this device is `named` in the hosted login attempt (default: the hostname)")
 	contextName := fs.String("context", "", "config context to write (default: \"default\" for a GitHub login, the edge host for --cloud)")
 	fs.Parse(reorderArgs(fs, args))
+	if fs.NArg() != 0 {
+		return usagef("usage: rainier login [flags]")
+	}
 
+	sources := 0
+	if *fromGH {
+		sources++
+	}
+	if *token != "" {
+		sources++
+	}
+	if *clientID != "" {
+		sources++
+	}
+	if sources > 1 {
+		return usagef("choose one of --from-gh, --token, or --client-id")
+	}
 	if *refresh != "" && !slices.Contains(refreshableProviders, *refresh) {
-		return fmt.Errorf("--refresh %s: unknown provider; rainier stores credentials for: %s",
+		return usagef("--refresh %s: unknown provider; rainier stores credentials for: %s",
 			*refresh, strings.Join(refreshableProviders, ", "))
 	}
 
@@ -435,10 +517,30 @@ func runLogin(args []string) error {
 	// refused rather than silently honoring one of them.
 	if *cloud != "" {
 		if *fromGH || *token != "" || *clientID != "" || *refresh != "" || *server != "" {
-			return fmt.Errorf("login --cloud names the hosted edge and runs the browser login; " +
+			return usagef("login --cloud names the hosted edge and runs the browser login; " +
 				"it takes none of --from-gh, --token, --client-id, --refresh or --server")
 		}
-		return runCloudLogin(*cloud, *deviceName, *contextName)
+		return finishLogin(runCloudLogin(*cloud, *deviceName, *contextName))
+	}
+
+	// A bare `rainier login` is the first line of the happy path and has to
+	// work without anyone learning a flag. It re-authenticates against the
+	// server this machine is already using — which is what makes login safe to
+	// rerun after a logout, an expired refresh token, or a revoked device —
+	// and falls back to this build's hosted default on a machine with no
+	// context yet (docs/cli-v0-contract.md §4.1).
+	if bareLogin(*fromGH, *token, *clientID, *server, *refresh) {
+		if target, name, ok := reauthenticationTarget(*contextName); ok {
+			return finishLogin(runCloudLogin(target, *deviceName, name))
+		}
+		// The hosted default is for a machine with nothing configured. A
+		// machine whose context names a self-hosted controld already has a
+		// server, and signing that person into a different one — silently
+		// creating a second context — is not what "log me in again" meant.
+		if fallback := hostedDefaultServer(); fallback != "" && !hasConfiguredServer(*contextName) {
+			return finishLogin(runCloudLogin(fallback, *deviceName, *contextName))
+		}
+		return bareLoginHasNoTarget(*contextName)
 	}
 
 	cfg, _ := cli.Load() // a missing/unreadable config is not fatal here: --server can still supply everything
@@ -502,6 +604,10 @@ func runLogin(args []string) error {
 	// who the caller is.
 	if err := cli.UpdateConfig(func(latest *cli.Config) error {
 		ctx := latest.Contexts[target]
+		if ctx.Server != serverURL || (resp.User.ID != "" && ctx.OwnerID != resp.User.ID) {
+			ctx.CurrentSession = ""
+		}
+		ctx.Kind, ctx.RefreshToken, ctx.AccessExpiresAt, ctx.Workspace = "", "", "", ""
 		ctx.Server, ctx.Token = serverURL, resp.Token
 		if resp.User.ID != "" {
 			ctx.OwnerID = resp.User.ID
@@ -525,6 +631,112 @@ func runLogin(args []string) error {
 	// this login's outcome and not a CLI-level error.
 	if resp.Warning != "" {
 		fmt.Printf("warning: %s\n", resp.Warning)
+	}
+	return nil
+}
+
+// bareLogin reports whether this invocation named no way to authenticate. It
+// is the shape `rainier login` takes in the happy path, and the shape that
+// gets to resolve a server on its own.
+func bareLogin(fromGH bool, token, clientID, server, refresh string) bool {
+	return !fromGH && token == "" && clientID == "" && server == "" && refresh == ""
+}
+
+// reauthenticationTarget names the hosted server a bare login should sign in
+// to again: the one whose context is current, or the one --context named.
+//
+// Only a hosted context qualifies. A self-hosted context authenticates with a
+// GitHub token this CLI cannot obtain by itself, so a bare login there falls
+// through to the usage that says which flag supplies one.
+func reauthenticationTarget(contextName string) (server, name string, ok bool) {
+	cfg, err := cli.Load()
+	if err != nil {
+		return "", "", false
+	}
+	name = contextName
+	if name == "" {
+		name = cfg.ActiveName()
+	}
+	// A logged-out context still names its server and still records that it
+	// is hosted, and signing back in to it is exactly what a bare login means
+	// after `rainier logout`.
+	ctx, exists := cfg.Contexts[name]
+	if !exists || ctx.Server == "" || !ctx.Hosted() {
+		return "", "", false
+	}
+	return ctx.Server, name, true
+}
+
+// hasConfiguredServer reports whether the named (or current) context already
+// names a server. It is the guard that keeps a build's hosted default from
+// hijacking a self-hosted machine's bare login.
+func hasConfiguredServer(contextName string) bool {
+	cfg, err := cli.Load()
+	if err != nil {
+		return false
+	}
+	name := contextName
+	if name == "" {
+		name = cfg.ActiveName()
+	}
+	ctx, ok := cfg.Contexts[name]
+	return ok && ctx.Server != ""
+}
+
+// bareLoginHasNoTarget explains why `rainier login` on its own could not
+// resolve a server, and the two cases are genuinely different.
+//
+// A self-hosted context HAS a server; what a bare login cannot do there is
+// obtain a GitHub token, which is the credential that login exchanges. Telling
+// that person "no server configured" would be false and would send them
+// looking for the wrong thing.
+//
+// With no context at all there is nothing to sign in to, and this build
+// compiled in no hosted default. That is deliberate: inventing a hostname
+// would send somebody's credentials at a server nobody has stood up.
+func bareLoginHasNoTarget(contextName string) error {
+	cfg, err := cli.Load()
+	name := contextName
+	if name == "" && err == nil {
+		name = cfg.ActiveName()
+	}
+	if err == nil {
+		if ctx, ok := cfg.Contexts[name]; ok && ctx.Server != "" && !ctx.Hosted() {
+			return usagef("rainier login: context %s is a self-hosted server, and a bare login has no way to obtain a GitHub token for it.\n"+
+				"Name one:  rainier login --from-gh   (or --token GH_TOKEN, or --client-id ID)\n"+
+				"See rainier help login for the whole self-hosted form.", name)
+		}
+	}
+	return usagef("rainier login: no server configured on this machine, and this build has no hosted default.\n" +
+		"Sign in to a hosted rainier with:   rainier login --cloud EDGE_URL\n" +
+		"Or to a self-hosted controld with:  rainier login --server URL --from-gh   (rainier help login)")
+}
+
+// finishLogin is what a successful login says next, and the reason it exists
+// is a claim the CLI must never make: authentication is not readiness.
+//
+// A person whose account is fine and whose workspace has no compute has
+// logged in successfully and cannot start a session. Printing "logged in" and
+// stopping would leave them to discover that at `rainier new`. So login ends
+// by reporting the authoritative workspace state and, when the server named
+// one, the address to continue at — and it does not turn a not-ready
+// workspace into a failed login, because the login did work.
+func finishLogin(err error) error {
+	if err != nil {
+		return err
+	}
+	cfg, cfgErr := cli.Load()
+	if cfgErr != nil {
+		return nil
+	}
+	if _, ok := cfg.Active(); !ok {
+		return nil
+	}
+	fmt.Println()
+	rows, ready := collectStatus(context.Background(), cfg)
+	printStatus(os.Stdout, rows)
+	if !ready {
+		fmt.Fprintln(os.Stderr, "this workspace is not ready yet; the lines above say what is outstanding")
 	}
 	return nil
 }
@@ -756,8 +968,8 @@ func runCloudLoginSleep(edgeURL, deviceName, contextName string, sleep func(time
 func runCloudLoginContext(ctx context.Context, edgeURL, deviceName, contextName string, sleep func(time.Duration)) error {
 	base := strings.TrimRight(edgeURL, "/")
 	u, err := url.Parse(base)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return fmt.Errorf("login --cloud: %q is not an http(s) URL", edgeURL)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return usagef("login --cloud requires an http(s) server URL without credentials, query, or fragment")
 	}
 	if deviceName == "" {
 		deviceName = defaultDeviceName()
@@ -790,8 +1002,15 @@ func runCloudLoginContext(ctx context.Context, edgeURL, deviceName, contextName 
 
 	if err := cli.UpdateConfigContext(ctx, func(cfg *cli.Config) error {
 		ctx := cfg.Contexts[contextName]
+		if ctx.Server != base {
+			ctx = cli.Context{}
+		}
+		ctx.OwnerID, ctx.CurrentSession = "", ""
 		ctx.Server, ctx.Token = base, pair.AccessToken
 		ctx.RefreshToken, ctx.AccessExpiresAt = pair.RefreshToken, pair.AccessExpiresAt
+		// Recorded so a later logout, which deletes both tokens, still leaves
+		// something that says how to sign back in here.
+		ctx.Kind = cli.KindHosted
 		cfg.SetContext(contextName, ctx)
 		return nil
 	}); err != nil {
@@ -1180,25 +1399,82 @@ func runWorkspace(args []string) error {
 func runNew(args []string) error {
 	fs := flag.NewFlagSet("new", flag.ExitOnError)
 	name := fs.String("name", "", "session name")
+	agentName := fs.String("agent", "", "coding `agent` to start in the session (claude, codex)")
 	env := fs.String("env", "", "environment to start from (name or id)")
 	image := fs.String("image", "", "container image (overrides the environment's)")
 	egress := fs.String("egress", "", "comma-separated egress allowlist (overrides the environment's)")
 	detach := fs.Bool("detach", false, "create without attaching")
+	asJSON := fs.Bool("json", false, "with --detach, print one machine-readable result document")
 	idempotencyKey := fs.String("idempotency-key", "", "stable create retry key (developer tooling)")
 	fs.Parse(reorderArgs(fs, args))
 	cmdArgs := fs.Args() // whatever followed "--"
+
+	// Two answers to "what does this session run" is a mistake, not a
+	// precedence puzzle. Refusing costs one retype; picking a winner costs a
+	// person a session that quietly did the other thing (contract §3.3).
+	if *agentName != "" && *image != "" {
+		return usagef("--agent requires the environment image; use -- CMD with --image")
+	}
+	if *agentName != "" && len(cmdArgs) > 0 {
+		return usagef("--agent %s and an explicit command both say what this session runs; pass one of them", *agentName)
+	}
+	if *asJSON && !*detach {
+		return usagef("--json describes a created session; use it with --detach (an attached session's output is the terminal's)")
+	}
 
 	cfg, err := requireLogin()
 	if err != nil {
 		return err
 	}
 	c := cli.NewClient(cfg)
+	ctx := context.Background()
+
+	// The workspace's default environment when none was named. The server
+	// owns which one that is; when it names none and its catalog cannot
+	// answer, the session is a scratch session exactly as it always was
+	// (contract §5.2).
+	// --image is the advanced escape hatch that says "run exactly this image".
+	// Folding a default environment's setup script and secrets in underneath
+	// one would be a surprise, and a setup script written for another image is
+	// a session that fails at boot — so an explicit image opts out of the
+	// default the same way an explicit --env opts into a specific one.
+	var resolvedEnv environment
+	environmentName := *env
+	if environmentName == "" && *image == "" {
+		resolved, resolveErr := resolveDefaultEnvironment(ctx, c)
+		switch {
+		case resolveErr == nil:
+			resolvedEnv, environmentName = resolved, resolved.ID
+		case !errors.Is(resolveErr, errNoDefaultEnvironment):
+			return resolveErr
+		}
+	}
 
 	// --env and the two override flags compose: the environment supplies
 	// everything the flags don't, and controld resolves the pair (design §4.3).
-	body := createSessionRequest{Name: *name, Image: *image, Environment: *env}
-	if len(cmdArgs) > 0 {
+	body := createSessionRequest{Name: *name, Image: *image, Environment: environmentName}
+	switch {
+	case len(cmdArgs) > 0:
 		body.Cmd = cmdArgs
+	case *agentName != "":
+		// The environment has to be settled first: which agents can start is
+		// a property of the environment's image, so there is no launch argv
+		// to ask for until we know which environment the session will run in.
+		if environmentName == "" {
+			return fmt.Errorf("--agent %s needs an environment whose image carries that agent, and this workspace publishes no default one; name it with --env", safeField(*agentName))
+		}
+		if resolvedEnv.ID == "" {
+			named, err := environmentByRef(ctx, c, environmentName)
+			if err != nil {
+				return err
+			}
+			resolvedEnv = named
+		}
+		launch, err := agentLaunchCommand(ctx, c, resolvedEnv, *agentName)
+		if err != nil {
+			return err
+		}
+		body.Cmd = launch
 	}
 	if *egress != "" {
 		body.EgressAllow = strings.Split(*egress, ",")
@@ -1206,11 +1482,28 @@ func runNew(args []string) error {
 
 	created, err := createSession(c, body, *idempotencyKey)
 	if err != nil {
+		var apiErr *cli.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "workspace_not_ready" {
+			return newSessionError(err, workspaceNotReadyDestination(ctx, cfg, c))
+		}
 		return err
 	}
-	fmt.Println(created.ID)
+	// The id is the durable handle, so it is printed before anything can go
+	// wrong with the attach that follows — except under --json, where the
+	// document IS the output and a bare id ahead of it makes the stream
+	// unparseable (contract §6.2).
+	if !*asJSON {
+		fmt.Println(created.ID)
+	}
+	if err := rememberCurrentSession(created.ID, cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "note: could not record this session as `current`: %v\n", err)
+	}
 
 	if *detach {
+		if *asJSON {
+			return writeJSON(os.Stdout, schemaMutation,
+				mutationDocument("new", created.ID, true, created.State, "session created; attach with rainier attach "+created.ID))
+		}
 		return nil
 	}
 	// The whole log, not a snapshot: `new`'s attach is "stream everything"
@@ -1220,6 +1513,65 @@ func runNew(args []string) error {
 	// from the first entry costs nothing and is the only way the user sees
 	// what happened before they got here.
 	return attachWithRetry(cfg, created.ID, terminal.SinceAll)
+}
+
+// newSessionError turns a refusal to create into the one sentence a person
+// can act on.
+//
+// workspace_not_ready is the case this exists for: the account authenticated
+// fine, the CLI is fine, and the workspace has no compute because a plan, a
+// payment or a provisioning run is still outstanding. That is a web action,
+// so what the CLI owes is the server's own destination and nothing else — no
+// session was created, and the CLI must not offer to create the compute.
+//
+// It branches on the machine-readable code, never on the message text
+// (contract §6.3): prose is the server's to reword.
+func newSessionError(err error, destination string) error {
+	var apiErr *cli.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "workspace_not_ready" {
+		return err
+	}
+	message := "no session was created: workspace compute is not ready; run rainier status"
+	if destination != "" {
+		message += "\nContinue: " + destination
+	}
+	return commandError{message: message, cause: err}
+}
+
+// environmentByRef resolves an environment name or id to its row. --agent
+// needs the id to ask which agents that environment can start, and the server
+// accepts either spelling on the environment route.
+func environmentByRef(ctx context.Context, c *cli.Client, ref string) (environment, error) {
+	envs, err := fetchEnvironments(ctx, c)
+	if err != nil {
+		return environment{}, err
+	}
+	for _, env := range envs {
+		if env.ID == ref || env.Name == ref {
+			return env, nil
+		}
+	}
+	return environment{}, fmt.Errorf("no environment named %q in this workspace", safeField(ref))
+}
+
+// workspaceNotReadyDestination fetches the console address to print beside a
+// workspace_not_ready refusal, and answers "" when the server publishes none.
+// It runs only on that refusal: an ordinary create must not pay for a lookup
+// nothing will use.
+func workspaceNotReadyDestination(ctx context.Context, cfg cli.Config, c *cli.Client) string {
+	active, ok := cfg.Active()
+	if !ok {
+		return ""
+	}
+	state, err := fetchCompute(ctx, c, active.Workspace)
+	if err != nil {
+		return ""
+	}
+	onboarding, err := fetchOnboarding(ctx, c)
+	if err != nil {
+		return ""
+	}
+	return onboarding.destinationFor(state.Status)
 }
 
 // createSession posts one create and returns the session it made. It is the
@@ -1234,7 +1586,7 @@ func createSession(c *cli.Client, body createSessionRequest, idempotencyKey stri
 	}
 	var resp sessionEnvelope
 	if err := c.Do(http.MethodPost, "/v0/sessions", body, &resp, cli.IdempotencyKey(idempotencyKey)); err != nil {
-		return session{}, err
+		return session{}, commandError{message: fmt.Sprintf("create was not confirmed; inspect rainier ls, or retry the same request with --idempotency-key %s", idempotencyKey), cause: err}
 	}
 	return resp.Session, nil
 }
@@ -1387,10 +1739,21 @@ func retryableAttachError(err error) bool {
 // ls
 // ---------------------------------------------------------------------------
 
+// runLs is the session table. Three columns by default — NAME, STATE, AGE —
+// because that is what a person reads twenty times a day, and because every
+// column beyond those three is a diagnostic that belongs behind --verbose
+// (docs/cli-v0-contract.md §3.4). Placement, runner identity and
+// reachability are the control plane's vocabulary and are not put in front of
+// somebody who only wants to know which of their sessions is up.
 func runLs(args []string) error {
 	fs := flag.NewFlagSet("ls", flag.ExitOnError)
-	all := fs.Bool("all", false, "include terminal (canceled/failed/dead/destroyed) sessions")
+	all := fs.Bool("all", false, "include canceled and deleted history")
+	verbose := fs.Bool("verbose", false, "add id, environment, runner, reachability and diagnostic state")
+	asJSON := fs.Bool("json", false, "print one machine-readable sessions document")
 	fs.Parse(reorderArgs(fs, args))
+	if fs.NArg() != 0 {
+		return usagef("usage: rainier ls [--all] [--verbose] [--json]")
+	}
 
 	cfg, err := requireLogin()
 	if err != nil {
@@ -1398,13 +1761,36 @@ func runLs(args []string) error {
 	}
 	c := cli.NewClient(cfg)
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tNAME\tENV\tSTATE\tRUNNER\tREACHABLE\tAGE")
+	rows, err := listSessions(c, true)
+	if err != nil {
+		return err
+	}
+	if !*all {
+		rows = slices.DeleteFunc(rows, func(s session) bool { return !activeSession(s) })
+	}
+	if *asJSON {
+		return writeSessionsJSON(os.Stdout, cfg, rows)
+	}
+	printSessions(os.Stdout, rows, *verbose)
 
+	return nil
+}
+
+// listSessions reads every page in the server's own order. Ordering is
+// stable because it is not this CLI's: pages are concatenated as they arrive
+// and nothing here re-sorts them.
+func listSessions(c *cli.Client, all bool) ([]session, error) {
+	var out []session
 	cursor := ""
+	// A repeated cursor is a server bug, and this loop must not answer it by
+	// allocating forever. The old streaming version at least printed rows as
+	// it went, so a runaway was visible; this one accumulates, so an
+	// unguarded loop would hang `rainier ls` while it consumed memory.
+	// listWorkspacesContext guards the same way.
+	seen := map[string]bool{}
 	for {
 		q := url.Values{}
-		if *all {
+		if all {
 			q.Set("all", "true")
 		}
 		if cursor != "" {
@@ -1416,51 +1802,63 @@ func runLs(args []string) error {
 		}
 		var page sessionsEnvelope
 		if err := c.Do(http.MethodGet, path, nil, &page); err != nil {
-			return err
+			return nil, err
 		}
-		for _, s := range page.Sessions {
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%t\t%s\n",
-				s.ID, s.Name, dashIfEmpty(s.Environment), sessionStateCell(s), s.Runner, s.Reachable, formatAge(s.CreatedAt))
-		}
+		out = append(out, page.Sessions...)
 		if page.NextCursor == "" {
-			break
+			return out, nil
 		}
+		if seen[page.NextCursor] {
+			return nil, errors.New("session listing repeated a pagination cursor")
+		}
+		seen[page.NextCursor] = true
 		cursor = page.NextCursor
 	}
-	if err := w.Flush(); err != nil {
-		return err
-	}
-
-	if !*all {
-		var failed sessionsEnvelope
-		if err := c.Do(http.MethodGet, "/v0/sessions?all=true&limit=1&state=failed", nil, &failed); err == nil && len(failed.Sessions) > 0 {
-			fmt.Println("hint: failed sessions are hidden; run `rainier ls --all` to inspect or remove them")
-		}
-	}
-	return nil
 }
 
-// sessionStateCell renders the STATE column: the state alone, plus whatever
-// the state alone leaves unanswered.
+// printSessions renders the table across the three dimensions a session
+// actually has (docs/cli-v0-contract.md §3.1). PROCESS is a column rather
+// than a parenthetical on STATE, which is what stops the old
+// "running (exited -1)" cell from coming back; CONNECTION is a column rather
+// than a lifecycle word, so a runner that dropped its link reads as a
+// connection problem and not as a broken session.
 //
-// "queued" by itself invites the wrong question ("is it broken?"); "queued
-// (waiting for runner rainier-gpu)" answers it in the same glance. "running"
-// has the same problem once the agent inside has finished: the session IS
-// still up — attachable, holding its slot — and nothing is ever going to
-// print in it again, so "running (exited 0)" is what the row actually means.
-//
-// The two annotations are mutually exclusive in practice (a queued session
-// has no agent to have exited) and the queue reason wins if they ever meet:
-// it explains why nothing is happening, which is the more urgent of the two.
-func sessionStateCell(s session) string {
-	switch {
-	case s.QueueReason != "":
-		return s.State + " (" + s.QueueReason + ")"
-	case s.ChildExitCode != nil:
-		return s.State + " (exited " + strconv.Itoa(*s.ChildExitCode) + ")"
-	default:
-		return s.State
+// Every cell that came off the wire goes through safeField. The session list
+// is team-visible and the create route puts no character restriction on a
+// name, so a name is untrusted input from another person; the queue reason
+// under --verbose is server prose for the same reason.
+func printSessions(w io.Writer, rows []session, verbose bool) {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	if verbose {
+		fmt.Fprintln(tw, "NAME\tSTATE\tPROCESS\tCONNECTION\tAGE\tID\tENV\tAPI STATE\tRUNNER\tDETAIL")
+	} else {
+		fmt.Fprintln(tw, "NAME\tSTATE\tPROCESS\tCONNECTION\tAGE")
 	}
+	for _, s := range rows {
+		if verbose {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				safeField(dashIfEmpty(s.Name)), displayLifecycle(s), displayProcess(s), displayConnection(s),
+				formatAge(s.CreatedAt), safeField(s.ID), safeField(dashIfEmpty(s.Environment)),
+				safeField(s.State), safeField(dashIfEmpty(s.Runner)),
+				safeField(dashIfEmpty(diagnosticDetail(s))))
+			continue
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+			safeField(dashIfEmpty(s.Name)), displayLifecycle(s), displayProcess(s), displayConnection(s),
+			formatAge(s.CreatedAt))
+	}
+	tw.Flush()
+}
+
+// writeSessionsJSON emits the listing. Each entry is the same document
+// `info --json` produces, from the same builder, so a script cannot find one
+// shape in a list and a different one in a detail read.
+func writeSessionsJSON(w io.Writer, cfg cli.Config, rows []session) error {
+	out := make([]map[string]any, 0, len(rows))
+	for _, s := range rows {
+		out = append(out, sessionDocument(cfg, s))
+	}
+	return writeJSON(w, schemaSessions, map[string]any{"sessions": out})
 }
 
 // dashIfEmpty renders an empty column value as "-", so a scratch session's
@@ -1499,76 +1897,151 @@ func formatAge(rfc3339 string) string {
 // failed setup's full output, and what the disconnect line's advice means
 // when it fires before the first frame — and `--since N` resumes after N.
 func runAttach(args []string) error {
-	ref, cursor := attachFlags(args)
+	ref, cursor, replay, err := attachFlags(args)
+	if err != nil {
+		return err
+	}
 
 	cfg, c, id, err := resolveClientAndIDForAttach(ref)
 	if err != nil {
 		return err
 	}
-	if err := prepareAttach(c, id); err != nil {
+	if err := prepareAttach(c, id, replay); err != nil {
 		return err
 	}
-	return attachWithRetry(cfg, id, cursor)
+	if err := attachWithRetry(cfg, id, cursor); err != nil {
+		return err
+	}
+	if err := rememberCurrentSession(id, cfg); err != nil {
+		fmt.Fprintln(os.Stderr, "note: could not record this session as current")
+	}
+	return nil
 }
 
-// prepareAttach makes `rainier attach` the one entry command for an existing
-// session. Running/starting sessions can go straight to the attach plane;
-// suspended sessions first use the ordinary resume endpoint. No convenience
-// endpoint is needed server-side — the CLI is the only consumer that wants
-// these two operations composed.
+// prepareAttach decides what `rainier attach` does about a session that is
+// not simply running (docs/cli-v0-contract.md §3.6).
 //
-// A failed session is deliberately admitted. Plan 5 made a failed setup
-// attachable while its runner is still connected so `--since 0` can show the
-// complete diagnostic log; the attach endpoint remains the authority on
-// whether that particular failed row still has a live sessiond behind it.
-func prepareAttach(c *cli.Client, id string) error {
+// A stopped session is resumed here rather than by a separate command: a
+// person who types `attach` means "put me in it", and "first run resume" is a
+// step the CLI can take for them. Everything else is a refusal that says
+// something true — a finished session has nothing more to show, an
+// unavailable one cannot be reached — instead of dropping somebody into a
+// frozen screen and letting them work out why.
+//
+// replay is the one override. `--since` is the diagnostic path: the whole
+// reason to attach to a session that failed its setup is to read the log that
+// says why, and refusing that would take away the only tool for the case.
+func prepareAttach(c *cli.Client, id string, replay bool) error {
 	row, err := getSession(c, id)
 	if err != nil {
 		return err
 	}
+	// Dispatch on the SERVER's state, not on the display word. The endpoint's
+	// rules are stated in raw states (controlapp/attachments.go attachable,
+	// ResumeSession), and a display word groups states the endpoint treats
+	// differently — `queued` and `creating` share the word Starting, and
+	// `failed` and `dead` share Failed while only the first is ever
+	// attachable.
 	switch row.State {
-	case "running", "creating", "queued", "failed":
+	case "running", "queued", "creating":
+		// A running session is attachable outright; queued and creating are
+		// not yet, and attachWithRetry waits for them exactly as `new` does.
+		// A running session whose child has exited is still attachable — the
+		// screen and the sandbox are both still there.
 		return nil
 	case "suspended_warm", "suspended_cold":
-		var resumed sessionEnvelope
-		resumeErr := c.Do(http.MethodPost, "/v0/sessions/"+id+"/resume", nil, &resumed)
-		if resumeErr == nil {
+		return resumeForAttach(c, id)
+	case "failed":
+		// AttachTerminal admits a failed session only while its runner is
+		// still connected, which is what preserves setup-failure diagnosis.
+		if row.Reachable || replay {
 			return nil
 		}
+		return unreachableFailedSession(row)
+	case "dead", "canceled", "destroyed":
+		if replay {
+			// --since is the documented diagnostic override. The endpoint
+			// will refuse if there is nothing behind it, and that refusal is
+			// more informative than one this CLI invents.
+			return nil
+		}
+		return goneSessionResult(row)
+	default:
+		// A state this build has never heard of. Conservative means making no
+		// claim about it, not inventing one: the attach is attempted and the
+		// server decides.
+		return nil
+	}
+}
 
-		// Another client can win the resume between our GET and POST. A conflict
-		// can arrive before that winner's state is committed, so converge for a
-		// short bounded window instead of relying on one immediate re-read. The
-		// structured error code keeps capacity/auth failures immediate and
-		// preserves their more useful original message.
-		var apiErr *cli.APIError
-		if !errors.As(resumeErr, &apiErr) || apiErr.Code != "conflict" {
+// sessionLabel is what to call a session back to the person who named it: the
+// name they typed when there is one, and the id otherwise.
+func sessionLabel(row session) string {
+	if row.Name != "" {
+		return row.Name
+	}
+	return row.ID
+}
+
+// goneSessionResult is what a person gets for attaching to a session whose
+// sandbox no longer exists. It names the lifecycle accurately — a session
+// somebody cancelled and one somebody deleted are different events — and
+// points at the two things still worth doing.
+func goneSessionResult(row session) error {
+	return fmt.Errorf("session %s is %s; its sandbox no longer exists.\n"+
+		"Inspect it: rainier info %s\nReplay its output, if any remains: rainier attach %s --since 0",
+		safeField(sessionLabel(row)), displayLifecycle(row),
+		safeField(sessionLabel(row)), safeField(sessionLabel(row)))
+}
+
+// unreachableFailedSession is the CONNECTION failure, said as one. The
+// session failed and its runner has since gone; those are two facts and the
+// message keeps them apart, because the second one can come back.
+func unreachableFailedSession(row session) error {
+	return fmt.Errorf("session %s failed, and the runner holding it is no longer connected, "+
+		"so there is no terminal to open.\nInspect it: rainier info %s\nDelete it: rainier delete %s",
+		safeField(sessionLabel(row)), safeField(sessionLabel(row)), safeField(sessionLabel(row)))
+}
+
+// resumeForAttach brings a stopped session back. No convenience endpoint is
+// needed server-side — the CLI is the only consumer that wants resume and
+// attach composed.
+func resumeForAttach(c *cli.Client, id string) error {
+	var resumed sessionEnvelope
+	resumeErr := c.Do(http.MethodPost, "/v0/sessions/"+id+"/resume", nil, &resumed)
+	if resumeErr == nil {
+		return nil
+	}
+
+	// Another client can win the resume between our GET and POST. A conflict
+	// can arrive before that winner's state is committed, so converge for a
+	// short bounded window instead of relying on one immediate re-read. The
+	// structured error code keeps capacity/auth failures immediate and
+	// preserves their more useful original message.
+	var apiErr *cli.APIError
+	if !errors.As(resumeErr, &apiErr) || apiErr.Code != "conflict" {
+		return resumeErr
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for {
+		current, readErr := getSessionContext(ctx, c, id)
+		if readErr != nil {
 			return resumeErr
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		for {
-			current, readErr := getSessionContext(ctx, c, id)
-			if readErr != nil {
-				return resumeErr
-			}
-			switch current.State {
-			case "running", "creating":
-				return nil
-			case "suspended_warm", "suspended_cold":
-			case "queued":
-				return nil
-			default:
-				return resumeErr
-			}
-			select {
-			case <-ctx.Done():
-				return resumeErr
-			case <-time.After(50 * time.Millisecond):
-			}
+		switch current.State {
+		case "running", "creating", "queued":
+			return nil
+		case "suspended_warm", "suspended_cold":
+			// Still stopped; the winner's transition has not committed yet.
+		default:
+			return resumeErr
 		}
-	default:
-		return fmt.Errorf("session %s is %s and cannot be attached", id, row.State)
+		select {
+		case <-ctx.Done():
+			return resumeErr
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 }
 
@@ -1584,51 +2057,46 @@ func getSessionContext(ctx context.Context, c *cli.Client, id string) (session, 
 	return resp.Session, nil
 }
 
-// attachFlags parses `attach`'s arguments into the session ref and the
-// attach cursor. Split out of runAttach so the part with no network in it —
-// which of three requests `--since` spells, in either argument order — is
-// testable on its own; the flag-after-the-positional form is the one the
-// acceptance run reached for when the first attempt showed nothing, so it
-// gets pinned rather than assumed (reorderArgs is what makes it work).
-func attachFlags(args []string) (ref string, cursor uint64) {
+// attachFlags parses `attach`'s arguments into the session ref, the attach
+// cursor, and whether --since was passed at all. Split out of runAttach so
+// the part with no network in it — which of three requests `--since` spells,
+// in either argument order — is testable on its own; the flag-after-the-
+// positional form is the one the acceptance run reached for when the first
+// attempt showed nothing, so it gets pinned rather than assumed (reorderArgs
+// is what makes it work).
+//
+// The third return value is what turns `--since` into the documented
+// diagnostic override: passing it means "show me the log", which is a request
+// prepareAttach honors even for a session it would otherwise refuse.
+func attachFlags(args []string) (ref string, cursor uint64, replay bool, err error) {
 	fs := flag.NewFlagSet("attach", flag.ExitOnError)
 	since := fs.Uint64("since", 0, "resume from sequence number; 0 replays the whole event log (omit for the current screen)")
 	fs.Parse(reorderArgs(fs, args))
-	return requireRef(fs, "attach"), attachio.Cursor(passedFlags(fs)["since"], *since)
-}
-
-// ---------------------------------------------------------------------------
-// suspend / resume / snapshot / rm
-// ---------------------------------------------------------------------------
-
-func runSuspend(args []string) error {
-	fs := flag.NewFlagSet("suspend", flag.ExitOnError)
-	cold := fs.Bool("cold", false, "cold suspend (stop the container) instead of warm (pause it)")
-	fs.Parse(reorderArgs(fs, args))
-	ref := requireRef(fs, "suspend")
-
-	_, c, id, err := resolveClientAndID(ref)
+	passed := passedFlags(fs)["since"]
+	selector, err := requireSelector(fs, "attach")
 	if err != nil {
-		return err
+		return "", 0, false, err
 	}
-
-	req := suspendRequest{}
-	if *cold {
-		warm := false
-		req.Warm = &warm
-	}
-	var resp sessionEnvelope
-	if err := c.Do(http.MethodPost, "/v0/sessions/"+id+"/suspend", req, &resp); err != nil {
-		return err
-	}
-	fmt.Printf("%s -> %s\n", resp.Session.ID, resp.Session.State)
-	return nil
+	return selector, attachio.Cursor(passed, *since), passed, nil
 }
+
+// ---------------------------------------------------------------------------
+// resume / snapshot  (Advanced — contract §2.2)
+//
+// `stop` and `attach` are the pair an interactive person uses: attach resumes
+// a stopped session on its own. resume stays for automation that wants the
+// two halves separately, and snapshot for the low-level checkpoint. Neither
+// appears in the default help.
+// ---------------------------------------------------------------------------
 
 func runResume(args []string) error {
 	fs := flag.NewFlagSet("resume", flag.ExitOnError)
-	fs.Parse(args)
-	ref := requireRef(fs, "resume")
+	asJSON := fs.Bool("json", false, "print one machine-readable result document")
+	fs.Parse(reorderArgs(fs, args))
+	ref, err := requireSelector(fs, "resume")
+	if err != nil {
+		return err
+	}
 
 	_, c, id, err := resolveClientAndID(ref)
 	if err != nil {
@@ -1638,14 +2106,20 @@ func runResume(args []string) error {
 	if err := c.Do(http.MethodPost, "/v0/sessions/"+id+"/resume", nil, &resp); err != nil {
 		return err
 	}
-	fmt.Printf("%s -> %s\n", resp.Session.ID, resp.Session.State)
+	if *asJSON {
+		return writeJSON(os.Stdout, schemaMutation, mutationDocument("resume", resp.Session.ID, true, resp.Session.State, "resume accepted"))
+	}
+	fmt.Printf("%s -> %s\n", safeField(resp.Session.ID), safeField(resp.Session.State))
 	return nil
 }
 
 func runSnapshot(args []string) error {
 	fs := flag.NewFlagSet("snapshot", flag.ExitOnError)
 	fs.Parse(args)
-	ref := requireRef(fs, "snapshot")
+	ref, err := requireSelector(fs, "snapshot")
+	if err != nil {
+		return err
+	}
 
 	_, c, id, err := resolveClientAndID(ref)
 	if err != nil {
@@ -1659,72 +2133,13 @@ func runSnapshot(args []string) error {
 	return nil
 }
 
-func runRm(args []string) error {
-	fs := flag.NewFlagSet("rm", flag.ExitOnError)
-	fs.Parse(args)
-	ref := requireRef(fs, "rm")
-
-	_, c, id, err := resolveClientAndIDIncludingTerminal(ref)
-	if err != nil {
-		return err
-	}
-	if err := c.Do(http.MethodDelete, "/v0/sessions/"+id, nil, nil); err != nil {
-		return err
-	}
-	fmt.Println("removed", id)
-	return nil
-}
-
 // ---------------------------------------------------------------------------
-// diff / push / pull
+// push / pull  (Advanced)
 //
-// The three workspace-inspection commands. All the work is in internal/cli
-// (Push/Pull) and protocol/workspace (the archive rules); what is left here is
-// argument parsing and rendering, which is the same split every other
-// subcommand takes.
+// The two transfer commands. All the work is in internal/cli (Push/Pull) and
+// protocol/workspace (the archive rules); what is left here is argument
+// parsing and rendering, which is the same split every other subcommand takes.
 // ---------------------------------------------------------------------------
-
-func runDiff(args []string) error {
-	fs := flag.NewFlagSet("diff", flag.ExitOnError)
-	fs.Parse(args)
-	ref := requireRef(fs, "diff")
-
-	_, c, id, err := resolveClientAndID(ref)
-	if err != nil {
-		return err
-	}
-	var ans workspace.DiffAnswer
-	if err := c.Do(http.MethodGet, "/v0/sessions/"+id+"/diff", nil, &ans); err != nil {
-		return err
-	}
-	renderDiff(os.Stdout, ans)
-	return nil
-}
-
-// renderDiff prints one heading per repository — both branches named, because
-// "what changed" is meaningless without saying against what — and git's stat
-// underneath it.
-//
-// A repository with an empty stat says so explicitly. Printing nothing there
-// reads as a bug in this command rather than as an answer about the session.
-func renderDiff(w io.Writer, ans workspace.DiffAnswer) {
-	if len(ans.Repos) == 0 {
-		fmt.Fprintln(w, "this session has no repositories")
-		return
-	}
-	for i, r := range ans.Repos {
-		if i > 0 {
-			fmt.Fprintln(w)
-		}
-		fmt.Fprintf(w, "%s  %s vs origin/%s\n", r.Repo, r.SessionBranch, r.BaseBranch)
-		stat := strings.TrimRight(r.Stat, "\n")
-		if stat == "" {
-			fmt.Fprintln(w, "  (no changes)")
-			continue
-		}
-		fmt.Fprintln(w, stat)
-	}
-}
 
 func runPush(args []string) error {
 	fs := flag.NewFlagSet("push", flag.ExitOnError)
@@ -1808,16 +2223,25 @@ func progressPrinter(verb string) func(done, total int64) {
 // unmodified, and no credential passes through this CLI in either direction.
 // ---------------------------------------------------------------------------
 
-const agentUsage = `usage: rainier agent <login|ls|logout> [args]
+const agentUsage = `usage: rainier agent <login|status|logout> [args]
 
-  agent login <provider> --env NAME   log the agent in, once, for every workspace
-  agent ls                            what you have logged in, and where it reaches
-  agent logout <provider> [--yes]     destroy that login everywhere
+  agent login <claude|codex>            sign the agent in, once, for every session
+  agent status [--json]                 what is signed in
+  agent logout <claude|codex> [--yes]   sign it out, everywhere
 
 The login runs inside a throwaway session: the agent's own login flow, on your
-screen, with nothing pasted anywhere. --env names an environment whose image
-has that provider's CLI in it — Rainier does not install one. When you exit
-the agent, the session is removed and the login stays.`
+screen, with nothing pasted anywhere and no credential passing through this
+CLI. It uses your workspace's default environment, so there is nothing to
+choose. When you exit the agent, the session is removed and the login stays.
+
+status reports one of three things per agent: not configured, ready, or needs
+attention. "ready" means a credential is stored — Rainier does not check it
+with Anthropic or OpenAI, so it is not a promise that the agent will
+authenticate.
+
+logout destroys that login in every workspace you are in; a session already
+running keeps what it holds until it exits. It requires --yes in a script.
+--env is an advanced override for agent login (rainier help all).`
 
 // agentLoginAttach is how `agent login` attaches to the session it created:
 // attachWithRetry, exactly as `new` does — the same stream-everything attach,
@@ -1856,12 +2280,16 @@ func runAgent(args []string) error {
 	switch sub {
 	case "login":
 		return runAgentLogin(rest)
+	case "status":
+		return runAgentStatus(rest)
 	case "ls":
-		return runAgentLs(rest)
+		// Compatibility alias (contract §2.1).
+		deprecated("agent ls", "agent status")
+		return runAgentStatus(rest)
 	case "logout":
 		return runAgentLogout(rest)
 	case "-h", "--help", "help":
-		fmt.Fprintln(os.Stderr, agentUsage)
+		fmt.Fprintln(os.Stdout, agentUsage)
 		return nil
 	default:
 		fmt.Fprintf(os.Stderr, "rainier agent: unknown subcommand %q\n%s\n", sub, agentUsage)
@@ -1884,18 +2312,11 @@ func runAgent(args []string) error {
 // whose whole purpose is over.
 func runAgentLogin(args []string) error {
 	fs := flag.NewFlagSet("agent login", flag.ExitOnError)
-	env := fs.String("env", "", "environment whose image carries this provider's CLI")
+	env := fs.String("env", "", "environment whose image carries this provider's CLI (advanced; the workspace's default is used otherwise)")
 	fs.Parse(reorderArgs(fs, args))
-	p, err := agentProviderNamed(requireAgentProvider(fs, "rainier agent login <provider> [--env NAME]"))
+	p, err := agentProviderNamed(requireAgentProvider(fs, "rainier agent login <claude|codex>"))
 	if err != nil {
 		return err
-	}
-	// Rainier does not install an agent, and a session started from no
-	// environment runs the stock image, which has no agent CLI installed
-	// in it. Refusing here — before a session is created that could only fail
-	// — says the thing the person needs to hear.
-	if *env == "" {
-		return errors.New("the provider's CLI has to be in the image: name an environment that has it with --env")
 	}
 
 	cfg, err := requireLogin()
@@ -1903,6 +2324,26 @@ func runAgentLogin(args []string) error {
 		return err
 	}
 	c := cli.NewClient(cfg)
+	ctx := context.Background()
+
+	// Rainier does not install an agent, and a session started from no
+	// environment runs the stock image, which has no agent CLI in it. An
+	// ordinary hosted user should never have to know that: the workspace's
+	// default environment is the answer, and the server owns which one that
+	// is (contract §4.4, §5.2). When there is none, that is a readiness
+	// problem and is reported as one — not as a flag somebody forgot.
+	environmentName := *env
+	if environmentName == "" {
+		resolved, resolveErr := resolveDefaultEnvironment(ctx, c)
+		if resolveErr != nil {
+			if !errors.Is(resolveErr, errNoDefaultEnvironment) {
+				return resolveErr
+			}
+			return fmt.Errorf("this workspace publishes no default environment, so there is no image known to carry %s's CLI. "+
+				"Run `rainier status` to see what your workspace is missing, or name one with --env", p.Name)
+		}
+		environmentName = resolved.ID
+	}
 
 	before, err := agentRow(c, p.Name)
 	if err != nil {
@@ -1913,7 +2354,7 @@ func runAgentLogin(args []string) error {
 		// Four hex characters: enough that two logins started in the same
 		// minute do not collide on a name, short enough to read.
 		Name:        fmt.Sprintf("agent-login-%s-%s", p.Name, cli.RandHex(2)),
-		Environment: *env,
+		Environment: environmentName,
 		Cmd:         p.LoginCmd,
 		// Explicitly empty, never absent: an environment that declares
 		// repositories would otherwise clone them into a session that exists
@@ -1939,7 +2380,8 @@ func runAgentLogin(args []string) error {
 		// The removal failing is worth saying and is not worth losing the
 		// login over: the credential is already in custody either way, and
 		// the session is one `rainier rm` away.
-		fmt.Fprintf(os.Stderr, "could not remove the login session %s: %v\n", created.ID, err)
+		fmt.Fprintf(os.Stderr, "could not remove the login session %s: %s\n",
+			safeField(created.ID), redactSecrets(cfg, err.Error()))
 	}
 	if attachErr != nil {
 		return attachErr
@@ -1954,22 +2396,50 @@ func runAgentLogin(args []string) error {
 			after = again
 		}
 	}
-	if after.Version == before.Version {
-		// Deliberately not an error: `agent login` did everything it set out
-		// to do, and a person who exited without finishing is an outcome, not
-		// a failure. There is no note to relay — sessiond's boot notes are
-		// not routed to the control plane yet — so the CLI says only what it
-		// can establish itself.
-		fmt.Println("login did not complete: the agent wrote no credential")
-		return nil
+	if after.Version == before.Version || agentReadiness(after) != agentReady {
+		// Custody did not confirm a new usable credential. Do not report success.
+		return errors.New("login did not complete: the agent wrote no credential")
 	}
 	fmt.Printf("logged in as of %s (v%d)\n", dashIfEmpty(after.Since), after.Version)
 	return nil
 }
 
-func runAgentLs(args []string) error {
-	fs := flag.NewFlagSet("agent ls", flag.ExitOnError)
-	fs.Parse(args)
+// The three words `agent status` uses, and the whole of what this CLI is
+// willing to claim about a coding agent's credential.
+//
+// "ready" says a credential is in custody and nothing more. Rainier does not
+// call Anthropic or OpenAI to see whether it still works, so describing it as
+// verified provider access would be a claim nobody here has checked — and the
+// person who acts on it finds out inside a session, twenty minutes later. The
+// human output says so in a footnote for the same reason.
+const (
+	agentNotConfigured  = "not configured"
+	agentReady          = "ready"
+	agentNeedsAttention = "needs attention"
+)
+
+// agentReadiness maps one custody row onto those three. A status this build
+// does not recognize is "needs attention": it is neither the absence of a
+// credential nor a credential known to be in place, and those are the only
+// two things the other words may mean.
+func agentReadiness(a agent) string {
+	switch a.Status {
+	case "none", "":
+		return agentNotConfigured
+	case "logged_in":
+		return agentReady
+	default:
+		return agentNeedsAttention
+	}
+}
+
+func runAgentStatus(args []string) error {
+	fs := flag.NewFlagSet("agent status", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "print one machine-readable agent status document")
+	fs.Parse(reorderArgs(fs, args))
+	if fs.NArg() != 0 {
+		return usagef("usage: rainier agent status [--json]")
+	}
 
 	cfg, err := requireLogin()
 	if err != nil {
@@ -1979,18 +2449,48 @@ func runAgentLs(args []string) error {
 	if err != nil {
 		return err
 	}
+	// The caveat rides on stderr in both modes. It is the difference between
+	// "a credential is stored" and "the provider will accept it", and a
+	// person reading either form of this output needs to know which one they
+	// are looking at.
+	defer fmt.Fprintln(os.Stderr, `note: "ready" means a stored credential; Rainier does not verify it with the provider`)
+
+	if *asJSON {
+		return writeAgentStatusJSON(os.Stdout, rows)
+	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(w, "PROVIDER\tSTATUS\tSINCE\tVERSION\tWORKSPACES")
+	fmt.Fprintln(w, "AGENT\tSTATUS\tSINCE")
 	for _, a := range rows {
 		since := "-"
 		if a.Since != "" {
 			since = formatAge(a.Since)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", a.Provider, a.Status, since, a.Version,
-			dashIfEmpty(strings.Join(a.Workspaces, ",")))
+		fmt.Fprintf(w, "%s\t%s\t%s\n", safeField(a.Provider), agentReadiness(a), since)
 	}
 	return w.Flush()
+}
+
+func writeAgentStatusJSON(w io.Writer, rows []agent) error {
+	out := make([]map[string]any, 0, len(rows))
+	for _, a := range rows {
+		entry := map[string]any{
+			"provider": a.Provider,
+			"status":   agentReadiness(a),
+			"version":  a.Version,
+			// Explicit, so a consumer cannot read "ready" as a verified
+			// credential without having been told otherwise.
+			"credential_verified": false,
+		}
+		if a.Since != "" {
+			entry["since"] = a.Since
+		}
+		if len(a.Workspaces) > 0 {
+			entry["workspaces"] = a.Workspaces
+		}
+		out = append(out, entry)
+	}
+	return writeJSON(w, schemaAgentStatus, map[string]any{"agents": out})
 }
 
 // runAgentLogout destroys one login and tells the person what that costs
@@ -2007,15 +2507,21 @@ func runAgentLogout(args []string) error {
 		return err
 	}
 
-	fmt.Printf("this logs %s out of every workspace you are in; "+
+	fmt.Fprintf(os.Stderr, "this logs %s out of every workspace you are in; "+
 		"a running agent keeps what it holds until it exits\n", p.Name)
 	if !*yes {
+		// No terminal means no answer is coming. Refusing is the only safe
+		// outcome: prompting would hang, and proceeding would destroy a login
+		// nobody consented to losing (contract §4.4).
+		if !interactiveTerminal() {
+			return usagef("logging out of %s destroys that login in every workspace; pass --yes to confirm", p.Name)
+		}
 		ok, err := confirm("continue? [y/N] ")
 		if err != nil {
 			return err
 		}
 		if !ok {
-			fmt.Println("canceled")
+			fmt.Fprintln(os.Stderr, "canceled")
 			return nil
 		}
 	}
@@ -2034,11 +2540,30 @@ func runAgentLogout(args []string) error {
 // fetchAgents reads GET /v0/agents: one row per provider the server knows,
 // in its table's order.
 func fetchAgents(c *cli.Client) ([]agent, error) {
+	return fetchAgentsContext(context.Background(), c)
+}
+
+func fetchAgentsContext(ctx context.Context, c *cli.Client) ([]agent, error) {
 	var resp agentsEnvelope
-	if err := c.Do(http.MethodGet, "/v0/agents", nil, &resp); err != nil {
+	if err := c.DoContext(ctx, http.MethodGet, "/v0/agents", nil, &resp); err != nil {
 		return nil, err
 	}
 	return resp.Agents, nil
+}
+
+// unknownAgentProvider refuses a provider name against the SERVER's list
+// rather than this build's table. Which agents exist is the server's answer —
+// a CLI that judged it locally would refuse a provider the server had just
+// added, and accept one it had removed.
+func unknownAgentProvider(name string, rows []agent) error {
+	names := make([]string, 0, len(rows))
+	for _, a := range rows {
+		names = append(names, a.Provider)
+	}
+	if len(names) == 0 {
+		return fmt.Errorf("unknown agent %q; this server reports no coding agents", name)
+	}
+	return fmt.Errorf("unknown agent %q; this server supports: %s", name, strings.Join(names, ", "))
 }
 
 // agentRow reads one provider's row. A server that does not name the provider
@@ -2068,7 +2593,7 @@ func agentProviderNamed(name string) (controlapp.AgentProvider, error) {
 			return p, nil
 		}
 	}
-	return controlapp.AgentProvider{}, fmt.Errorf("unknown agent provider %q; this build supports: %s",
+	return controlapp.AgentProvider{}, usagef("unknown agent provider %q; this build supports: %s",
 		name, strings.Join(agentProviderNames(), ", "))
 }
 
@@ -2099,8 +2624,12 @@ func requireAgentProvider(fs *flag.FlagSet, usage string) string {
 // but an explicit yes is a no — including end-of-file, which is what a script
 // that forgot --yes looks like, and which must not be read as consent to
 // destroy a login.
+//
+// The question goes to stderr, with the warning that precedes it. A prompt is
+// an interaction and not a result, and keeping it off stdout is what lets
+// `delete --json` promise that the document is the only thing there.
 func confirm(question string) (bool, error) {
-	fmt.Print(question)
+	fmt.Fprint(os.Stderr, question)
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return false, fmt.Errorf("reading the answer: %w", err)
@@ -2858,11 +3387,46 @@ func resolveClientAndIDWithScope(ref string, scope sessionResolveScope) (cli.Con
 		return cli.Config{}, nil, "", err
 	}
 	c := cli.NewClient(cfg)
+	// `current` is settled from local state, before any name lookup: it is a
+	// keyword, and the id it names is this context's own record of what the
+	// person last worked in (contract §3.2).
+	//
+	// It is then CONFIRMED against the server before any command acts on it,
+	// which is the difference between a clear failure and a confusing one.
+	// The id came from this machine's memory, not from anything the person
+	// typed, so a bare "no session sess_abc" reads as a bug in the CLI; and
+	// `delete current` would otherwise treat the 404 as "already gone" and
+	// exit 0, reporting a successful deletion of a session it never targeted.
+	if ref == currentSelector {
+		id, err := currentSessionID(cfg)
+		if err != nil {
+			return cli.Config{}, nil, "", err
+		}
+		if _, err := getSession(c, id); err != nil {
+			return cli.Config{}, nil, "", staleCurrentSession(id, err)
+		}
+		return cfg, c, id, nil
+	}
 	id, err := resolveSessionIDWithScope(c, cfg.OwnerID, ref, scope)
 	if err != nil {
 		return cli.Config{}, nil, "", err
 	}
 	return cfg, c, id, nil
+}
+
+// requireSelector pulls the <session> positional every session command needs.
+// It returns a usage error rather than exiting, so the caller's own flag
+// validation and this one produce the same exit code by the same path
+// (contract §6.1).
+func requireSelector(fs *flag.FlagSet, cmd string) (string, error) {
+	args := fs.Args()
+	if len(args) < 1 {
+		return "", usagef("usage: rainier %s <session>   (a sess_ id, a session name, or `current`)", cmd)
+	}
+	if len(args) > 1 {
+		return "", usagef("rainier %s takes one session; got %d", cmd, len(args))
+	}
+	return args[0], nil
 }
 
 // resolveSessionID resolves ref to a session id: a "sess_" prefix is
@@ -2916,6 +3480,9 @@ const (
 
 func resolveSessionIDWithScope(c *cli.Client, myOwnerID, ref string, scope sessionResolveScope) (string, error) {
 	if strings.HasPrefix(ref, "sess_") {
+		if strings.ContainsAny(ref, "/?#%\\") || strings.TrimSpace(ref) != ref {
+			return "", usagef("invalid session id")
+		}
 		return ref, nil
 	}
 
@@ -2926,6 +3493,7 @@ func resolveSessionIDWithScope(c *cli.Client, myOwnerID, ref string, scope sessi
 	var matches []match
 
 	cursor := ""
+	seen := map[string]bool{}
 	for {
 		q := url.Values{}
 		if scope != resolveActive {
@@ -2956,6 +3524,10 @@ func resolveSessionIDWithScope(c *cli.Client, myOwnerID, ref string, scope sessi
 		if page.NextCursor == "" {
 			break
 		}
+		if seen[page.NextCursor] {
+			return "", errors.New("session listing repeated a pagination cursor")
+		}
+		seen[page.NextCursor] = true
 		cursor = page.NextCursor
 	}
 	// GET /v0/sessions is team-visible, but lifecycle commands should operate
@@ -3039,10 +3611,9 @@ func wsURLFor(serverURL, id string) string {
 	return strings.TrimRight(ws, "/") + "/v0/sessions/" + id + "/attach"
 }
 
-// requireRef pulls the positional <id|name> argument every lifecycle
-// command needs, exiting with a usage message (exit 2) instead of
-// panicking with an index-out-of-range when it's missing — same pattern as
-// runnerctl's requireID.
+// requireRef is requireSelector's older sibling, kept for the two transfer
+// commands whose positional is not a bare session ref. It exits rather than
+// returning, which is why new code uses requireSelector instead.
 func requireRef(fs *flag.FlagSet, cmd string) string {
 	args := fs.Args()
 	if len(args) < 1 {

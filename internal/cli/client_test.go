@@ -1419,3 +1419,16 @@ func TestASiblingProcessRotatingThePairIsAdoptedNotReplayed(t *testing.T) {
 		t.Errorf("second client holds (%q, %q), want the rotated pair", second.Token, second.RefreshToken)
 	}
 }
+
+func TestUnexpectedResponseDoesNotExposeBody(t *testing.T) {
+	const private = "synthetic-provider-secret-not-in-config"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, private)
+	}))
+	defer ts.Close()
+	err := (&Client{Base: ts.URL}).Do(http.MethodGet, "/v0/sessions", nil, nil)
+	if err == nil || strings.Contains(err.Error(), private) || !strings.Contains(err.Error(), "502") {
+		t.Fatalf("unexpected response was not safely reported: %v", err)
+	}
+}
