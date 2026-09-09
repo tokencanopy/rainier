@@ -116,8 +116,10 @@ image.
 
 The first full race run passed the previously reported keepalive case but hit
 `TestPlacementPinQueuesWithReason` while the image was building. The placement
-case then passed three isolated race runs. Record the final full-suite result
-separately; an isolated pass does not erase the earlier timeout.
+case then passed three isolated race runs. The complete `go test -race -p 1
+./...` run subsequently exited 0 (the e2e package ran uncached). Package
+serialization preserves the race detector while avoiding competing package
+loads. This passing run does not erase the earlier intermittent timeout.
 
 `.github/workflows/verify.yml` now runs general PR verification and CLI/client
 race checks. Previously only image-related paths triggered CI.
