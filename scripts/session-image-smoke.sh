@@ -588,7 +588,10 @@ HTML
   # The flags Playwright passes, and nothing else: --disable-dev-shm-usage is
   # in chromiumSwitches for every launch, which is why docker default 64 MiB
   # /dev/shm is enough for a Playwright suite.
-  render() { "$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad \
+  # Keep a misbehaving sandbox child from holding the whole image qualification
+  # job open. The browser is the process under test; timeout only bounds it and
+  # does not add a flag that changes Chromium's sandbox mode.
+  render() { timeout -k 5 30 "$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad \
       --user-data-dir="$d/profile" "$@" 2>&1; }
   png_size() { python3 -c "import struct,sys; d=open(sys.argv[1],\"rb\").read(24); w,h=struct.unpack(\">II\", d[16:24]); print(w,h)" "$1"; }
 '
@@ -691,7 +694,7 @@ check "rainier-browsers reports the cache a project's Playwright will read" "lin
 # initialize its own sandbox exits nonzero.
 SANDBOX_OUTPUT=$(probe '
   '"$BROWSER_FIXTURE"'
-  "$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p2" --dump-dom "file://$d/page.html" >/dev/null 2>&1
+  timeout -k 5 30 "$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p2" --dump-dom "file://$d/page.html" >/dev/null 2>&1
   st=$?
   printf "exit=%s\n" "$st"
   exit "$st"
