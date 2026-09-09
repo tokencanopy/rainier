@@ -22,7 +22,7 @@ Pinned fixture invariants:
 
 - Docker base profile: 27.5.1; canonical JSON SHA-256: `885442dc08f21f8d60f99ea43d59af88b1c529103815fe24bbf9ce998d3a609d`
 - Full Rainier seccomp canonical JSON SHA-256: `4fb409bf9925eeaab50f950118682150cafa4868dba3b277554dd3936b333ae0`
-- AppArmor profile SHA-256: `1035744cd6dd47f242b4775e15e7c8fae5e38603e748d5111b6e166e26b09a96`
+- AppArmor profile SHA-256: `53f78e768ee56099b764661c58b569504e39ecc45b2b3fb0dffd13ea329eb431`
 
 The canonical JSON hash is calculated with sorted keys and compact separators;
 the raw file hash is intentionally not part of the contract because harmless

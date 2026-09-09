@@ -28,7 +28,7 @@ SECCOMP_CANONICAL_SHA256 = (
     "4fb409bf9925eeaab50f950118682150cafa4868dba3b277554dd3936b333ae0"
 )
 APPARMOR_SHA256 = (
-    "1035744cd6dd47f242b4775e15e7c8fae5e38603e748d5111b6e166e26b09a96"
+    "53f78e768ee56099b764661c58b569504e39ecc45b2b3fb0dffd13ea329eb431"
 )
 
 
@@ -198,6 +198,8 @@ class SessionImageSecurityPolicyTest(unittest.TestCase):
         self.assertNotIn("deny mount", profile)
         self.assertIn("@{PROC}/self/{uid_map,gid_map,setgroups} rw,", profile)
         self.assertIn("@{PROC}/[0-9]*/{uid_map,gid_map,setgroups} rw,", profile)
+        self.assertNotIn("setgroup?*", profile)
+        self.assertIn("setgroup[^s]*", profile)
         self.assertIn("deny @{PROC}/self/", profile)
         self.assertIn("deny @{PROC}/sysrq-trigger rwklx,", profile)
         self.assertIn("deny @{PROC}/kcore rwklx,", profile)

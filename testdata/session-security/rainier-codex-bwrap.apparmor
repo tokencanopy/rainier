@@ -24,7 +24,7 @@ profile rainier-codex-bwrap flags=(attach_disconnected,mediate_deleted) {
   # Keep Docker's direct-proc write denial, except for the three namespace
   # maps Chromium must write after creating its private user namespace. The
   # complement is spelled out because AppArmor deny rules override allows.
-  deny @{PROC}/{[^gsu]*,g[^i]*,gi[^d]*,gid[^_]*,gid_[^m]*,gid_m[^a]*,gid_ma[^p]*,gid_map?*,s[^e]*,se[^t]*,set[^g]*,setg[^r]*,setgr[^o]*,setgro[^u]*,setgrou[^p]*,setgroup?*,u[^i]*,ui[^d]*,uid[^_]*,uid_[^m]*,uid_m[^a]*,uid_ma[^p]*,uid_map?*} w,
+  deny @{PROC}/{[^gsu]*,g[^i]*,gi[^d]*,gid[^_]*,gid_[^m]*,gid_m[^a]*,gid_ma[^p]*,gid_map?*,s[^e]*,se[^t]*,set[^g]*,setg[^r]*,setgr[^o]*,setgro[^u]*,setgrou[^p]*,setgroup[^s]*,u[^i]*,ui[^d]*,uid[^_]*,uid_[^m]*,uid_m[^a]*,uid_ma[^p]*,uid_map?*} w,
   deny @{PROC}/{[^1-9],[^1-9][^0-9],[^1-9s][^0-9y][^0-9s],[^1-9s][^0-9][^0-9][^0-9/]*,s[^ey][^0-9][^0-9/]*,se[^l][^0-9/]*,sel[^f][^0-9/]*,self[^0-9/][^0-9/]*}/** w,
   deny @{PROC}/sys/[^k]** w,
   deny @{PROC}/sys/kernel/{?,??,[^s][^h][^m]**} w,
@@ -43,8 +43,8 @@ profile rainier-codex-bwrap flags=(attach_disconnected,mediate_deleted) {
   # Chromium writes these three files while mapping the uid/gid in its
   # private user namespace. Keep the allowance limited to proc namespace maps;
   # the broader proc write denials below remain in force.
-  deny @{PROC}/self/{[^gsu]*,g[^i]*,gi[^d]*,gid[^_]*,gid_[^m]*,gid_m[^a]*,gid_ma[^p]*,gid_map?*,s[^e]*,se[^t]*,set[^g]*,setg[^r]*,setgr[^o]*,setgro[^u]*,setgrou[^p]*,setgroup?*,u[^i]*,ui[^d]*,uid[^_]*,uid_[^m]*,uid_m[^a]*,uid_ma[^p]*,uid_map?*} w,
-  deny @{PROC}/self/{[^gsu]*,g[^i]*,gi[^d]*,gid[^_]*,gid_[^m]*,gid_m[^a]*,gid_ma[^p]*,gid_map?*,s[^e]*,se[^t]*,set[^g]*,setg[^r]*,setgr[^o]*,setgro[^u]*,setgrou[^p]*,setgroup?*,u[^i]*,ui[^d]*,uid[^_]*,uid_[^m]*,uid_m[^a]*,uid_ma[^p]*,uid_map?*}/** w,
+  deny @{PROC}/self/{[^gsu]*,g[^i]*,gi[^d]*,gid[^_]*,gid_[^m]*,gid_m[^a]*,gid_ma[^p]*,gid_map?*,s[^e]*,se[^t]*,set[^g]*,setg[^r]*,setgr[^o]*,setgro[^u]*,setgrou[^p]*,setgroup[^s]*,u[^i]*,ui[^d]*,uid[^_]*,uid_[^m]*,uid_m[^a]*,uid_ma[^p]*,uid_map?*} w,
+  deny @{PROC}/self/{[^gsu]*,g[^i]*,gi[^d]*,gid[^_]*,gid_[^m]*,gid_m[^a]*,gid_ma[^p]*,gid_map?*,s[^e]*,se[^t]*,set[^g]*,setg[^r]*,setgr[^o]*,setgro[^u]*,setgrou[^p]*,setgroup[^s]*,u[^i]*,ui[^d]*,uid[^_]*,uid_[^m]*,uid_m[^a]*,uid_ma[^p]*,uid_map?*}/** w,
   @{PROC}/self/{uid_map,gid_map,setgroups} rw,
   @{PROC}/[0-9]*/{uid_map,gid_map,setgroups} rw,
 
