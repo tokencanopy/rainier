@@ -57,8 +57,8 @@ We did not, and the reasons are specific rather than reflexive:
 - **A curated list is falsifiable; "the internet" is not.** Each row below
   names a tool that is in the session image and an operation that was run
   against it. That is a thing a reviewer can check and a smoke test can prove.
-- **The failure mode is diagnostic and cheap.** A missing host is a 403 with
-  the host in it, and the fix is one line on one environment. A missing
+- **The failure mode is diagnostic and cheap.** A missing host is a 403;
+  the proxy audit log identifies the host, and the fix is one line on one environment. A missing
   protection is a postmortem.
 
 What the curated list costs, honestly:
@@ -140,7 +140,7 @@ zips take a different first hop, `results-receiver.actions.githubusercontent.com
 whose own continuation could not be observed from a sandbox that (correctly)
 denies it. A workspace that genuinely needs CI logs in-session names the hosts
 on its own environment, with that trade made explicitly by the person making
-it; the default's answer is a 403 that says which host.
+it; the default answers 403 and records the host in its audit log.
 
 **Rust, `cargo`, `rustup`** (`static.rust-lang.org`, `index.crates.io`,
 `static.crates.io`). There is no Rust toolchain in the session image. A row for

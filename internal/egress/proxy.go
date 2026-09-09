@@ -215,7 +215,9 @@ var reservedV4 = []netip.Prefix{
 // depending on resolver order.
 //
 // The deadline is shared across the whole loop, not per address, so a name
-// with several dead records costs one dialTimeout rather than one each.
+// with several dead records costs one dialTimeout rather than one each. Each
+// address gets a share of the remaining budget so a blackhole cannot starve
+// later, healthy addresses.
 func dialFirst(ctx context.Context, host string, addrs []netip.Addr, port string) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
@@ -223,10 +225,24 @@ func dialFirst(ctx context.Context, host string, addrs []netip.Addr, port string
 	if len(addrs) == 0 {
 		return d.DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 	}
+	return dialAddresses(ctx, addrs, port, d.DialContext)
+}
+
+func dialAddresses(ctx context.Context, addrs []netip.Addr, port string, dial func(context.Context, string, string) (net.Conn, error)) (net.Conn, error) {
 	var err error
-	for _, addr := range addrs {
-		var conn net.Conn
-		if conn, err = d.DialContext(ctx, "tcp", net.JoinHostPort(addr.String(), port)); err == nil {
+	for i, addr := range addrs {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			deadline = time.Now().Add(dialTimeout)
+		}
+		attempt, cancel := context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(addrs)-i))
+		conn, dialErr := dial(attempt, "tcp", net.JoinHostPort(addr.String(), port))
+		cancel()
+		err = dialErr
+		if err == nil {
 			return conn, nil
 		}
 		if ctx.Err() != nil {
