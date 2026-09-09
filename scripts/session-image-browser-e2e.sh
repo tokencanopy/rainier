@@ -42,9 +42,6 @@ command -v "$DOCKER" >/dev/null 2>&1 || { echo "no docker executable ($DOCKER); 
 "$DOCKER" image inspect "$IMAGE" >/dev/null 2>&1 \
   || { echo "image $IMAGE is not present; build it first (make session-image)" >&2; exit 2; }
 
-CHROMIUM_VERSION=$(sed -n 's/^ARG CHROMIUM_VERSION=//p' "$SCRIPT_DIR/../Dockerfile")
-[ -n "$CHROMIUM_VERSION" ] || { echo "missing CHROMIUM_VERSION pin" >&2; exit 2; }
-
 SUFFIX=$(od -An -tx1 -N6 /dev/urandom | tr -d ' \n')
 WS_VOL="rainier-browser-ws-$SUFFIX"
 
