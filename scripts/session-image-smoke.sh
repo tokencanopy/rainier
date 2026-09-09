@@ -559,11 +559,15 @@ echo "-- browser testing"
 # identity maps, then chroots to a proc fdinfo directory. Exercise that whole
 # boundary with the system helper before launching Chromium. Only fixed output
 # is emitted; no raw errno or host audit data can enter the log.
-check "Chromium namespace maps and safe chroot are admitted" "safe-empty-dir-ok" '
-  if unshare -Ur bash -c "chroot /proc/self/fdinfo/ && cd /" >/dev/null 2>&1; then
-    echo safe-empty-dir-ok
+check "Chromium namespace maps and safe chroot are admitted" "chroot=allowed" '
+  if ! unshare -Ur true >/dev/null 2>&1; then
+    echo namespace=refused
+    exit 1
+  fi
+  if unshare -Ur bash -c "chroot /proc/self/fdinfo/" >/dev/null 2>&1; then
+    echo namespace=allowed chroot=allowed
   else
-    echo safe-empty-dir-failed
+    echo namespace=allowed chroot=refused
     exit 1
   fi
 '
