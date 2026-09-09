@@ -398,63 +398,35 @@ review; it has not been made.
 
 ### Sandboxing, and what is actually isolating the browser
 
-This is worth stating plainly, because "Chromium sandbox" means two different
-things and only one of them is in play.
+"Chromium sandbox" describes two layers that work together in a hosted
+session.
 
-**Playwright disables Chromium's own sandbox by default.** `chromiumSandbox`
-defaults to `false` in every Playwright release, so `browserType.launch()` adds
-`--no-sandbox` unless a suite asks otherwise. That is upstream's default on
-every platform, not something this image or this driver does — nothing here
-adds that flag, and
-`internal/driver.TestSessionImageDoesNotDisableBrowserSafety` fails the build
-if the image ever names it.
+**The project must request Chromium's own sandbox.** Playwright defaults
+`chromiumSandbox` to `false`, so a project that wants the browser sandbox must
+set it explicitly. Rainier's browser qualification projects do this for every
+Chromium launch. The image and driver never add `--no-sandbox`, and the image
+contract tests reject that flag in executable qualification code.
 
-**What isolates the browser is the container**, and it is the same boundary
-that isolates everything else a session runs: uid 1000, `no-new-privileges`, a
-read-only rootfs, a noexec `/tmp`, the session's own network namespace, no host
-mount and no docker socket, and on the hosted product a host seccomp profile
-and an AppArmor profile besides. A browser process in a session can reach the
-session's own files and nothing else — which is a stronger boundary than the
-one a browser gets on the laptop this suite usually runs on.
+**The container remains the outer boundary.** A session still runs as uid 1000
+with `no-new-privileges`, a read-only rootfs, a noexec `/tmp`, its own network
+namespace, no host mount, no Docker socket, and the hosted runner's seccomp and
+AppArmor profiles. Chromium's sandbox is an additional process boundary inside
+that container; it does not replace the container boundary.
 
-**Chromium's own layer-1 sandbox is not available**, and the reason is
-specific. It needs to create a user namespace — `clone(CLONE_NEWUSER | …)` —
-and both docker's default seccomp profile and the hosted profile refuse that
-argument shape without `CAP_SYS_ADMIN`. The setuid-sandbox alternative is dead
-on arrival under `no-new-privileges`. The observed status is reported by
-`scripts/session-image-smoke.sh` on every qualification run rather than
-asserted, because which policy a host applies is not an image property.
+**Hosted Rainier admits only the namespace operations Chromium needs.** The
+Cloud security profile permits Chromium's exact `clone(CLONE_NEWUSER|SIGCHLD)`
+and `unshare(CLONE_NEWUSER|CLONE_NEWNS)` forms, plus the AppArmor `userns`
+permission. The hosted browser qualification runs the real web suite under
+those profiles and fails if Chromium cannot initialize its sandbox. A local
+Docker host with stricter policies must load an equivalent reviewed profile;
+Rainier never falls back to `--no-sandbox`.
 
-It fails **closed**, which is the part that matters. On the qualified
-candidate, under the driver's restrictions and docker's default seccomp
-profile, a launch that asks for the sandbox exits 133 with
-
-```
-[FATAL:content/browser/zygote_host/zygote_host_impl_linux.cc] No usable sandbox!
-```
-
-and renders nothing. A browser that reported no usable sandbox and drew the
-page anyway would be the failure worth guarding against, and it is not what
-happens.
-
-**What was not done to change that**, and would not be:
-
-- No `--privileged`, no `--cap-add`, no `seccomp=unconfined` and no
-  `apparmor=unconfined`. `internal/driver.TestDockerGrantsNoBrowserPrivilege`
-  fails the build if any of them appears in `runArgs`.
-- No `--ipc=host`, no host network, no wider host mount, no `/dev/shm` bind.
-- No debugging port exposed anywhere. Playwright drives Chromium over
-  `--remote-debugging-pipe` — a pair of file descriptors, not a socket — so
-  there is no port to expose in the first place.
-- No reuse of a host browser profile or credential. Every run gets a fresh
-  `--user-data-dir` under `/tmp`, which is a per-container tmpfs.
-
-Making Chromium's own sandbox work would mean admitting its specific
-`clone(2)` argument values to the hosted seccomp profile, the way Codex's
-Bubblewrap shapes were admitted — a narrow, reviewable change with its own
-live qualification, and one this image does not need in order to run a test
-suite. rainier-cloud's `docs/security/browser-sandbox-in-a-session.md` is where
-that case is written up.
+**No broad privilege is needed.** The session does not use `--privileged`,
+`--cap-add`, `seccomp=unconfined`, `apparmor=unconfined`, host networking,
+host IPC, a wider mount, or a debugging socket. Playwright's
+`--remote-debugging-pipe` uses file descriptors rather than a listening port,
+and each launch receives a fresh profile under the session's temporary
+filesystem.
 
 ### `/dev/shm` is 64 MiB, and that is fine here
 
@@ -832,7 +804,8 @@ explicit recovery step for existing volumes, not an automatic image migration.
 `PLAYWRIGHT_BROWSERS_PATH=0` uses Playwright's package-local cache and is not
 managed by this helper; use the project's installer for that mode.
 
-The session-image CI now runs `make session-image-browser-e2e` in addition to
-its offline image checks. Functional browser success does not prove Chromium's
-own sandbox is enabled: Playwright's default disables it. The separately
-requested sandbox-enabled qualification remains a release acceptance gap.
+The session-image CI runs `make session-image-browser-e2e` in addition to
+its offline image checks. The sample project explicitly enables
+`chromiumSandbox: true`, and Cloud's hosted browser qualification runs the web
+suite under the reviewed seccomp and AppArmor profiles. Both checks are release
+gates for the supported browser path.
