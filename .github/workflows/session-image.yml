@@ -34,9 +34,28 @@ jobs:
       # Chromium must use its own sandbox; enable user namespaces on this disposable CI host.
       - name: Enable Chromium sandbox user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # The image repository owns the browser payload; Rainier Cloud owns the
+      # host policy that admits Chromium's user-namespace sandbox. Pin the
+      # reviewed policy commit so this qualification exercises the same outer
+      # boundary as a hosted session. Advance this SHA with policy changes.
+      - name: Fetch the reviewed hosted browser policy
+        uses: actions/checkout@v4
+        with:
+          repository: tokencanopy/rainier-cloud
+          ref: 5670756c502c89961e03b91bb8bcf037183aa214
+          path: .browser-cloud
+          persist-credentials: false
+      - name: Load the reviewed Chromium AppArmor policy
+        run: sudo apparmor_parser -r .browser-cloud/infra/security/rainier-codex-bwrap.apparmor
       - name: Functional smoke with no network or credentials
+        env:
+          SECCOMP: ${{ github.workspace }}/.browser-cloud/infra/security/codex-bwrap-seccomp-docker-27.5.1.json
+          APPARMOR: rainier-codex-bwrap
         run: make session-image-smoke SESSION_IMAGE=rainier-session:qualify
       - name: Browser end to end in a fresh project
+        env:
+          SECCOMP: ${{ github.workspace }}/.browser-cloud/infra/security/codex-bwrap-seccomp-docker-27.5.1.json
+          APPARMOR: rainier-codex-bwrap
         run: make session-image-browser-e2e SESSION_IMAGE=rainier-session:qualify
       - name: Image size
         run: docker image inspect -f '{{.Size}} bytes; {{.Architecture}}' rainier-session:qualify

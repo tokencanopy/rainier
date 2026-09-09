@@ -24,12 +24,24 @@
 #
 # Usage:  scripts/session-image-smoke.sh [image]     (default rainier-session:smoke)
 # Env:    DOCKER=<docker executable>  PROBE_TIMEOUT=<seconds>  KEEP=1
+#         SECCOMP=<host profile path>  APPARMOR=<loaded host profile name>
 # Exit:   0 every check passed, 1 a check failed, 2 setup or usage error.
 set -uo pipefail
 
 IMAGE=${1:-rainier-session:smoke}
 DOCKER=${DOCKER:-docker}
 PROBE_TIMEOUT=${PROBE_TIMEOUT:-240}
+SECCOMP=${SECCOMP:-}
+APPARMOR=${APPARMOR:-}
+
+SECURITY_OPTS=()
+if [ -n "$SECCOMP" ]; then
+  [ -r "$SECCOMP" ] || { echo "no seccomp profile at $SECCOMP" >&2; exit 2; }
+  SECURITY_OPTS+=(--security-opt "seccomp=$SECCOMP")
+fi
+if [ -n "$APPARMOR" ]; then
+  SECURITY_OPTS+=(--security-opt "apparmor=$APPARMOR")
+fi
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/session-image-checks.sh"
@@ -79,6 +91,7 @@ probe() {
     --network none \
     --user 1000:1000 \
     --security-opt no-new-privileges \
+    "${SECURITY_OPTS[@]}" \
     --cap-drop ALL \
     --read-only \
     --tmpfs /tmp \
@@ -105,6 +118,7 @@ probe_setup() {
     --network none \
     --user 1000:1000 \
     --security-opt no-new-privileges \
+    "${SECURITY_OPTS[@]}" \
     --cap-drop ALL \
     --tmpfs /tmp \
     --memory 3g --pids-limit 1024 \

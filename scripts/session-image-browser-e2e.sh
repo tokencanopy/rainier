@@ -25,12 +25,24 @@
 #
 # Usage:  scripts/session-image-browser-e2e.sh [image]
 # Env:    DOCKER=<docker executable>  STEP_TIMEOUT=<seconds>  KEEP=1
+#         SECCOMP=<host profile path>  APPARMOR=<loaded host profile name>
 # Exit:   0 every check passed, 1 a check failed, 2 setup or usage error.
 set -uo pipefail
 
 IMAGE=${1:-rainier-session:smoke}
 DOCKER=${DOCKER:-docker}
 STEP_TIMEOUT=${STEP_TIMEOUT:-600}
+SECCOMP=${SECCOMP:-}
+APPARMOR=${APPARMOR:-}
+
+SECURITY_OPTS=()
+if [ -n "$SECCOMP" ]; then
+  [ -r "$SECCOMP" ] || { echo "no seccomp profile at $SECCOMP" >&2; exit 2; }
+  SECURITY_OPTS+=(--security-opt "seccomp=$SECCOMP")
+fi
+if [ -n "$APPARMOR" ]; then
+  SECURITY_OPTS+=(--security-opt "apparmor=$APPARMOR")
+fi
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/session-image-checks.sh"
@@ -74,6 +86,7 @@ step() {
     --network "$network" \
     --user 1000:1000 \
     --security-opt no-new-privileges \
+    "${SECURITY_OPTS[@]}" \
     --cap-drop ALL \
     --read-only \
     --tmpfs /tmp \
