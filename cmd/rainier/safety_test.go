@@ -30,8 +30,8 @@ func TestServerStringsNeverReachTheTerminalRaw(t *testing.T) {
 	}
 
 	var plain, verbose, info bytes.Buffer
-	printSessions(&plain, []session{row}, false)
-	printSessions(&verbose, []session{row}, true)
+	printSessions(&plain, cli.Config{}, []session{row}, false)
+	printSessions(&verbose, cli.Config{}, []session{row}, true)
 	printInfo(&info, cli.Config{}, row)
 
 	statusRows := []statusRow{

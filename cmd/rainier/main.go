@@ -1474,6 +1474,7 @@ func runNew(args []string) error {
 		if err != nil {
 			return err
 		}
+		body.Environment = resolvedEnv.ID
 		body.Cmd = launch
 	}
 	if *egress != "" {
@@ -1771,7 +1772,7 @@ func runLs(args []string) error {
 	if *asJSON {
 		return writeSessionsJSON(os.Stdout, cfg, rows)
 	}
-	printSessions(os.Stdout, rows, *verbose)
+	printSessions(os.Stdout, cfg, rows, *verbose)
 
 	return nil
 }
@@ -1827,7 +1828,7 @@ func listSessions(c *cli.Client, all bool) ([]session, error) {
 // is team-visible and the create route puts no character restriction on a
 // name, so a name is untrusted input from another person; the queue reason
 // under --verbose is server prose for the same reason.
-func printSessions(w io.Writer, rows []session, verbose bool) {
+func printSessions(w io.Writer, cfg cli.Config, rows []session, verbose bool) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	if verbose {
 		fmt.Fprintln(tw, "NAME\tSTATE\tPROCESS\tCONNECTION\tAGE\tID\tENV\tAPI STATE\tRUNNER\tDETAIL")
@@ -1840,7 +1841,7 @@ func printSessions(w io.Writer, rows []session, verbose bool) {
 				safeField(dashIfEmpty(s.Name)), displayLifecycle(s), displayProcess(s), displayConnection(s),
 				formatAge(s.CreatedAt), safeField(s.ID), safeField(dashIfEmpty(s.Environment)),
 				safeField(s.State), safeField(dashIfEmpty(s.Runner)),
-				safeField(dashIfEmpty(diagnosticDetail(s))))
+				diagnosticText(cfg, dashIfEmpty(diagnosticDetail(s))))
 			continue
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
@@ -1902,7 +1903,11 @@ func runAttach(args []string) error {
 		return err
 	}
 
-	cfg, c, id, err := resolveClientAndIDForAttach(ref)
+	scope := resolveAttachable
+	if replay {
+		scope = resolveAll
+	}
+	cfg, c, id, err := resolveClientAndIDWithScope(ref, scope)
 	if err != nil {
 		return err
 	}

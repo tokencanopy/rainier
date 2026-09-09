@@ -87,3 +87,43 @@ Both are isolated in `readiness.go`; no Cloud implementation is added here.
 An authoritative environment default flag and session repository display metadata
 are also absent. The CLI supports an unambiguous single environment and omits
 repository metadata rather than reconstructing it.
+
+
+## Completion pass
+
+The CLI work was merged onto core main containing the default developer image
+update (#72), retaining the original CLI PR history. Four independent review
+findings now have regression coverage in `cmd/rainier/completion_test.go`:
+
+- Explicit environment names are resolved to the same opaque ID for both the
+  launch catalog read and session creation.
+- Diagnostic attachment by name includes terminal records when `--since` is
+  explicit, while ordinary attachment preserves its existing filter.
+- Verbose listing uses the same credential and URL redaction as session details
+  and JSON output.
+- A warm suspension, including a concurrent one, never claims released capacity.
+
+Fresh `make verify`, CLI/client race tests, and all completion regressions pass.
+The real local fleet rehearsal also exits 0 using the documented native ARM
+base override (`BUILD_ARGS='--build-arg BASE_IMAGE=node:22-bookworm'`). It covers
+login, create/list/attach, stop/resume/delete, environment setup/snapshot reuse,
+and agent credential restore/revocation. GitHub publishing was explicitly
+skipped (`SKIP_GITHUB=1`); network enforcement cannot be qualified on VM-backed
+macOS Docker and still requires native Linux. Neither skip is a passing check.
+The default pinned amd64 base correctly rejects an implicit ARM target; this
+local override is development evidence, not qualification of the shipping amd64
+image.
+
+The first full race run passed the previously reported keepalive case but hit
+`TestPlacementPinQueuesWithReason` while the image was building. The placement
+case then passed three isolated race runs. Record the final full-suite result
+separately; an isolated pass does not erase the earlier timeout.
+
+`.github/workflows/verify.yml` now runs general PR verification and CLI/client
+race checks. Previously only image-related paths triggered CI.
+
+The two Cloud APIs above remain outside this CLI PR. Releasing the complete
+hosted shortcut workflow requires those APIs and an explicitly configured
+`main.defaultServer` release linker value (or `RAINIER_SERVER` / `login --cloud`
+for source builds). The web destination contract now matches `/app/workspace`
+and `/app/sessions`; there is no separate onboarding UI.

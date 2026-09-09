@@ -275,6 +275,13 @@ func stoppedRaw(s session) bool {
 	return s.State == "suspended_warm" || s.State == "suspended_cold"
 }
 
+func alreadyStoppedMessage(row session) string {
+	if row.State == "suspended_warm" {
+		return "session was already stopped; capacity remains reserved by a warm suspension"
+	}
+	return "session was already stopped"
+}
+
 func stopSession(ctx context.Context, c *cli.Client, id string, asJSON bool, out io.Writer) error {
 	row, err := getSessionContext(ctx, c, id)
 	if err != nil {
@@ -283,7 +290,7 @@ func stopSession(ctx context.Context, c *cli.Client, id string, asJSON bool, out
 	// Idempotent: already stopped is the outcome the caller asked for, and a
 	// second `stop` in a script must not be a failure.
 	if stoppedRaw(row) {
-		return reportStop(out, asJSON, id, row.State, "session was already stopped")
+		return reportStop(out, asJSON, id, row.State, alreadyStoppedMessage(row))
 	}
 	// SuspendSession accepts control.StateRunning and nothing else. Saying so
 	// here — before spending a round trip on a refusal — is the difference
@@ -309,7 +316,7 @@ func stopSession(ctx context.Context, c *cli.Client, id string, asJSON bool, out
 		if readErr != nil || !stoppedRaw(current) {
 			return err
 		}
-		return reportStop(out, asJSON, id, current.State, "session was already stopped")
+		return reportStop(out, asJSON, id, current.State, alreadyStoppedMessage(current))
 	}
 
 	final, err := awaitStopped(ctx, c, id, resp.Session)
@@ -322,6 +329,9 @@ func stopSession(ctx context.Context, c *cli.Client, id string, asJSON bool, out
 		// otherwise is how a person loses work they thought was safe.
 		return fmt.Errorf("stop did not complete: session %s is %s (API state %s). Its state has not been released; run `rainier info %s`",
 			safeField(id), displayLifecycle(final), safeField(final.State), safeField(id))
+	}
+	if final.State == "suspended_warm" {
+		return reportStop(out, asJSON, id, final.State, "session stopped; capacity remains reserved by a warm suspension")
 	}
 	return reportStop(out, asJSON, id, final.State, "session stopped and its resources released")
 }

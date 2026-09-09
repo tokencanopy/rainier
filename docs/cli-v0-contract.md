@@ -284,7 +284,8 @@ distinction is not part of the normal interface.
   round trip on the refusal.
 - A running session whose child has exited is still stoppable.
 - Idempotent: a session already in `suspended_warm` or `suspended_cold` reports
-  that and exits 0.
+  that and exits 0. A warm suspension explicitly says capacity remains reserved;
+  only a confirmed cold suspension claims resources were released.
 - The CLI waits for the server's authoritative post-stop state and reports
   failure unless the server says the session is stopped. It never reports
   success on an unobserved or wrong final state, and never discards session
@@ -356,7 +357,7 @@ Before compute is ready:
 
 ```
 Compute: setup required (no plan selected)
-Continue: https://example.test/app/onboarding/compute
+Continue: https://example.test/app/workspace
 ```
 
 The Compute row is read from the workspace's compute enrollment (§5.1) and
@@ -474,13 +475,13 @@ application's. It carries no tenant state:
 {
   "console_url": "https://app.example",
   "destinations": {
-    "needs_plan":       "https://app.example/app/onboarding/compute",
-    "awaiting_payment": "https://app.example/app/onboarding/compute",
-    "provisioning":     "https://app.example/app/onboarding/provisioning",
-    "cancelling":       "https://app.example/app/onboarding/provisioning",
-    "ready":            "https://app.example/app/settings/compute",
-    "failed":           "https://app.example/app/settings/compute",
-    "cancelled":        "https://app.example/app/onboarding/compute"
+    "needs_plan":       "https://app.example/app/workspace",
+    "awaiting_payment": "https://app.example/app/workspace",
+    "provisioning":     "https://app.example/app/workspace",
+    "cancelling":       "https://app.example/app/workspace",
+    "ready":            "https://app.example/app/sessions",
+    "failed":           "https://app.example/app/workspace",
+    "cancelled":        "https://app.example/app/workspace"
   }
 }
 ```

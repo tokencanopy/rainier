@@ -203,7 +203,7 @@ func TestListColumnsSeparateTheThreeDimensions(t *testing.T) {
 		{ID: "sess_c", Name: "gone", State: "running", CreatedAt: "2026-09-08T00:00:00Z"},
 	}
 	var out bytes.Buffer
-	printSessions(&out, rows, false)
+	printSessions(&out, cli.Config{}, rows, false)
 
 	header := strings.Fields(strings.SplitN(out.String(), "\n", 2)[0])
 	want := []string{"NAME", "STATE", "PROCESS", "CONNECTION", "AGE"}
