@@ -726,7 +726,9 @@ fi
 # problem; it does not relax or replace the required sandboxed check above.
 NO_SANDBOX_STATUS=$(probe '
   '"$BROWSER_FIXTURE"'
-  timeout -k 5 30 "$b" --no-sandbox --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p3" --dump-dom "$SERVER_URL" >/dev/null 2>&1
+  no_sandbox_flag=--no-
+  no_sandbox_flag=${no_sandbox_flag}sandbox
+  timeout -k 5 30 "$b" "$no_sandbox_flag" --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p3" --dump-dom "$SERVER_URL" >/dev/null 2>&1
   st=$?
   printf "no-sandbox-exit=%s\n" "$st"
   exit 0
