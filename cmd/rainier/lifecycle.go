@@ -206,6 +206,11 @@ func sessionDocument(cfg cli.Config, s session) map[string]any {
 	if s.Error != "" {
 		doc["failure"] = "session failed; use diagnostic attach to inspect its output"
 	}
+	for key, value := range doc {
+		if text, ok := value.(string); ok {
+			doc[key] = redactSecrets(cfg, text)
+		}
+	}
 	return doc
 }
 
@@ -260,7 +265,7 @@ func runStop(args []string) error {
 		return err
 	}
 
-	_, c, id, err := resolveClientAndID(ref)
+	_, c, id, err := resolveClientAndIDIncludingTerminal(ref)
 	if err != nil {
 		return err
 	}

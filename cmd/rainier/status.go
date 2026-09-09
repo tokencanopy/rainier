@@ -157,7 +157,11 @@ func collectStatus(ctx context.Context, cfg cli.Config) ([]statusRow, bool) {
 		}
 	}
 	add(cr)
-	add(environmentRow(ctx, c))
+	envRow := environmentRow(ctx, c)
+	// Self-hosted servers also support scratch sessions and explicit --env.
+	// A missing default is guidance, not proof that their compute is unusable.
+	envRow.Required = active.Hosted()
+	add(envRow)
 	add(githubRow(ctx, c, active, onboarding))
 	rows = append(rows, agentRows(ctx, c)...)
 
@@ -265,7 +269,7 @@ func environmentRow(ctx context.Context, c *cli.Client) statusRow {
 		// Several environments and no server-published default is not a
 		// broken workspace: `rainier new --env NAME` still works, and so does
 		// a scratch session. Say which it is.
-		row.Value = "no unambiguous default environment; configure one on the web or use new --env NAME"
+		row.Value = "no unambiguous default environment; use rainier new --env NAME"
 	default:
 		row.Value = "unknown (" + readinessError(err) + ")"
 	}

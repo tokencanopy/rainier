@@ -129,3 +129,17 @@ hosted shortcut workflow requires those APIs and an explicitly configured
 `main.defaultServer` release linker value (or `RAINIER_SERVER` / `login --cloud`
 for source builds). The web destination contract now matches `/app/workspace`
 and `/app/sessions`; there is no separate onboarding UI.
+
+## Independent review follow-up
+
+The later hosted reviewer reproduced two full serialized race failures on both
+this branch and unchanged base main. The local passing run above is historical
+evidence, not a guarantee across runtime environments. Those baseline failures
+remain separate from CLI regression coverage; the reviewer also lacked Docker
+and PostgreSQL, so did not independently repeat the fleet/database checks.
+
+Review regressions cover ordinary attach/stop of terminal sessions by name,
+self-hosted readiness without a default environment, terminal-safe create output,
+known-credential redaction in session JSON, and definitive 4xx create refusals
+without ambiguous-operation retry advice. Hosted default-environment readiness
+remains required; missing Cloud launch/destination APIs remain release dependencies.

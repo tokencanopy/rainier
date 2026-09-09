@@ -375,7 +375,9 @@ drops any value that is not an absolute `https` URL, and never infers payment
 or readiness from a URL parameter or from local configuration. Every row is
 derived from an API answer (§5).
 
-- Required rows: `Signed in`, `Workspace`, `Compute`, `Default environment`.
+- Required rows: `Signed in`, `Workspace`, `Compute`. Hosted contexts also
+  require `Default environment`; on self-hosted servers it is advisory because
+  scratch sessions and explicit `--env` do not require a default.
   If any is not ready — including a check that could not be run — the overall
   result is not ready and the exit code is 1.
 - Advisory rows: `GitHub`, `Claude`, `Codex`. They are reported honestly and

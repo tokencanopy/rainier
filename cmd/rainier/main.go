@@ -1494,7 +1494,7 @@ func runNew(args []string) error {
 	// document IS the output and a bare id ahead of it makes the stream
 	// unparseable (contract §6.2).
 	if !*asJSON {
-		fmt.Println(created.ID)
+		fmt.Println(safeField(redactSecrets(cfg, created.ID)))
 	}
 	if err := rememberCurrentSession(created.ID, cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "note: could not record this session as `current`: %v\n", err)
@@ -1587,6 +1587,10 @@ func createSession(c *cli.Client, body createSessionRequest, idempotencyKey stri
 	}
 	var resp sessionEnvelope
 	if err := c.Do(http.MethodPost, "/v0/sessions", body, &resp, cli.IdempotencyKey(idempotencyKey)); err != nil {
+		var apiErr *cli.APIError
+		if errors.As(err, &apiErr) && apiErr.Status >= 400 && apiErr.Status < 500 && apiErr.Status != http.StatusRequestTimeout {
+			return session{}, err
+		}
 		return session{}, commandError{message: fmt.Sprintf("create was not confirmed; inspect rainier ls, or retry the same request with --idempotency-key %s", idempotencyKey), cause: err}
 	}
 	return resp.Session, nil
@@ -1903,11 +1907,7 @@ func runAttach(args []string) error {
 		return err
 	}
 
-	scope := resolveAttachable
-	if replay {
-		scope = resolveAll
-	}
-	cfg, c, id, err := resolveClientAndIDWithScope(ref, scope)
+	cfg, c, id, err := resolveClientAndIDIncludingTerminal(ref)
 	if err != nil {
 		return err
 	}
