@@ -1,4 +1,4 @@
-.PHONY: test build demo e2e verify module-path protocols control session-image session-image-smoke session-image-verify
+.PHONY: test build demo e2e verify module-path protocols control session-image session-image-smoke session-image-browser-e2e session-image-verify
 
 DOCKER ?= docker
 SESSION_IMAGE ?= rainier-session:smoke
@@ -48,7 +48,15 @@ session-image:
 session-image-smoke:
 	DOCKER="$(DOCKER)" ./scripts/session-image-smoke.sh "$(SESSION_IMAGE)"
 
-session-image-verify: session-image session-image-smoke
+# session-image-browser-e2e is the browser half, and the one step in image
+# qualification that is deliberately allowed a network: it stages a sample
+# project that has never been in the image, installs its locked dependencies
+# from the registry, and then runs its Playwright suite twice with no network
+# at all. See the header of the script.
+session-image-browser-e2e:
+	DOCKER="$(DOCKER)" ./scripts/session-image-browser-e2e.sh "$(SESSION_IMAGE)"
+
+session-image-verify: session-image session-image-smoke session-image-browser-e2e
 
 verify: module-path protocols control test build
 	go vet ./...

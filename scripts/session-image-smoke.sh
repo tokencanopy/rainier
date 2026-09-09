@@ -31,34 +31,12 @@ IMAGE=${1:-rainier-session:smoke}
 DOCKER=${DOCKER:-docker}
 PROBE_TIMEOUT=${PROBE_TIMEOUT:-240}
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+source "$SCRIPT_DIR/session-image-checks.sh"
+
 command -v "$DOCKER" >/dev/null 2>&1 || { echo "no docker executable ($DOCKER); set DOCKER=" >&2; exit 2; }
 "$DOCKER" image inspect "$IMAGE" >/dev/null 2>&1 \
   || { echo "image $IMAGE is not present; build it first (make session-image)" >&2; exit 2; }
-
-PASS=0 FAIL=0
-
-# In GitHub Actions the job log is the only record of a failed qualification,
-# and it is not always reachable from wherever the fix is being made — a
-# session's egress allowlist does not carry the Actions log host, for one.
-# Emitting each failure as a workflow annotation puts the check's name and its
-# detail on the pull request itself, where the check status already is. Inert
-# outside Actions, and it reports; it never changes what passes.
-# A workflow command's PROPERTIES are comma-separated and colon-terminated, so
-# a title carrying either has to be escaped or it truncates the annotation —
-# and most of the check names below contain a comma. The message half only has
-# to survive the newline.
-wf_title() { printf '%s' "$1" | sed 's/%/%25/g; s/\r/%0D/g; s/:/%3A/g; s/,/%2C/g'; }
-wf_body()  { printf '%s' "${1:-}" | cut -c1-2000 | sed 's/%/%25/g; s/\r/ /g' | awk '{printf "%s%%0A", $0}'; }
-note() {
-  [ "${GITHUB_ACTIONS:-}" = true ] || return 0
-  printf '::notice title=%s::%s\n' "$(wf_title "$1")" "$(wf_body "$2")"
-}
-annotate() {
-  [ "${GITHUB_ACTIONS:-}" = true ] || return 0
-  printf '::error title=%s::%s\n' "$(wf_title "$1")" "$(wf_body "${2:-}")"
-}
-ok()  { PASS=$((PASS+1)); printf 'ok    %s\n' "$1"; }
-bad() { FAIL=$((FAIL+1)); printf 'FAIL  %s\n' "$1"; [ $# -gt 1 ] && printf '      %s\n' "$2"; annotate "$1" "${2:-}"; return 0; }
 
 SUFFIX=$(od -An -tx1 -N6 /dev/urandom | tr -d ' \n')
 WS_VOL="rainier-smoke-ws-$SUFFIX"
@@ -138,14 +116,18 @@ $(declare -f brokered_gh_probe)
 $1" 2>&1
 }
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-source "$SCRIPT_DIR/session-image-checks.sh"
 CLAUDE_VERSION=$(sed -n 's/^ARG CLAUDE_CODE_VERSION=//p' "$SCRIPT_DIR/../Dockerfile")
 CODEX_VERSION=$(sed -n 's/^ARG CODEX_VERSION=//p' "$SCRIPT_DIR/../Dockerfile")
 # Read, not hardcoded: a check that names 17 while the image builds an 18 does
 # not fail, it stops asking the question.
 PG_MAJOR=$(sed -n 's/^ARG POSTGRES_MAJOR=//p' "$SCRIPT_DIR/../Dockerfile")
 [[ "$PG_MAJOR" =~ ^[0-9]+$ ]] || { echo "missing or invalid POSTGRES_MAJOR pin" >&2; exit 2; }
+CHROMIUM_VERSION=$(sed -n 's/^ARG CHROMIUM_VERSION=//p' "$SCRIPT_DIR/../Dockerfile")
+CHROMIUM_REVISION=$(sed -n 's/^ARG CHROMIUM_REVISION=//p' "$SCRIPT_DIR/../Dockerfile")
+PLAYWRIGHT_PIN=$(sed -n 's/^ARG PLAYWRIGHT_VERSION=//p' "$SCRIPT_DIR/../Dockerfile")
+[[ "$CHROMIUM_VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]] || { echo "missing or invalid CHROMIUM_VERSION pin" >&2; exit 2; }
+[[ "$CHROMIUM_REVISION" =~ ^[0-9]+$ ]] || { echo "missing or invalid CHROMIUM_REVISION pin" >&2; exit 2; }
+[[ "$PLAYWRIGHT_PIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "missing or invalid PLAYWRIGHT_VERSION pin" >&2; exit 2; }
 for version in "$CLAUDE_VERSION" "$CODEX_VERSION"; do
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "missing or invalid agent version pin" >&2; exit 2; }
 done
@@ -555,6 +537,165 @@ check "every service kept its durable state on the workspace volume, and none on
   case "$PGHOST" in /workspace/*) echo "PGHOST-ON-THE-VOLUME $PGHOST"; exit 1;; esac
   test -e /var/lib/postgresql/'"$PG_MAJOR"'/main && { echo CLUSTER-ON-ROOTFS; exit 1; }
   echo service-state-ok'
+
+echo
+echo "-- browser testing"
+
+# `npx playwright install --with-deps` is what every project's CI runs and what
+# a session cannot: its --with-deps half is an apt install as root, and a
+# session has no escalation path, a read-only rootfs and no package archive on
+# its allowlist. So the shared libraries are a build-time layer and the browser
+# is a checksum-pinned artifact, and if either is wrong there is no in-session
+# repair — which is why these are checks rather than documentation.
+#
+# Everything below runs in the ordinary probe: uid 1000, read-only rootfs,
+# noexec /tmp, docker's 64 MiB /dev/shm, and NO NETWORK AT ALL. A browser that
+# needed to download anything on first use would fail here, which is the point:
+# a fresh session has to be able to run a test suite offline.
+#
+# The direct invocations below pass --no-sandbox because that is what
+# Playwright itself passes: chromiumSandbox defaults to false in every
+# Playwright release, so the launch this smoke imitates is the launch a project
+# actually gets. Nothing in this image or this driver adds that flag, and the
+# isolation a session relies on is the container's — uid 1000,
+# no-new-privileges, a read-only rootfs, its own network namespace, and the
+# host's seccomp and AppArmor policy. See docs/session-image.md.
+
+BROWSER_FIXTURE='
+  b=$(find -L "$PLAYWRIGHT_BROWSERS_PATH" -maxdepth 3 -type f -name chrome-headless-shell 2>/dev/null | head -1)
+  [ -n "$b" ] || { echo "no chrome-headless-shell under $PLAYWRIGHT_BROWSERS_PATH"; exit 1; }
+  d=$(mktemp -d -p /workspace) || exit 1
+  cat > "$d/page.html" <<HTML
+<!doctype html><html><head><meta charset="utf-8"><title>pending</title></head>
+<body style="margin:0;background:#ffffff">
+<h1 style="font-family:Arial,sans-serif;font-size:32px">Rainier browser smoke</h1>
+<span id="m" style="font-family:Arial;font-size:100px">MMMMMMMMMM</span>
+<script>
+document.title = String(Math.round(document.getElementById("m").getBoundingClientRect().width));
+</script>
+</body></html>
+HTML
+  # The flags Playwright passes, and nothing else: --disable-dev-shm-usage is
+  # in chromiumSwitches for every launch, which is why docker default 64 MiB
+  # /dev/shm is enough for a Playwright suite.
+  render() { "$b" --no-sandbox --disable-dev-shm-usage --disable-gpu --disable-breakpad \
+      --user-data-dir="$d/profile" "$@" 2>&1; }
+  png_size() { python3 -c "import struct,sys; d=open(sys.argv[1],\"rb\").read(24); w,h=struct.unpack(\">II\", d[16:24]); print(w,h)" "$1"; }
+'
+
+check "no Playwright is installed globally, so a project's own pin is the one that runs" "no-global-playwright" '
+  if command -v playwright >/dev/null 2>&1; then echo "GLOBAL-PLAYWRIGHT $(command -v playwright)"; exit 1; fi
+  if command -v playwright-core >/dev/null 2>&1; then echo GLOBAL-PLAYWRIGHT-CORE; exit 1; fi
+  if grep -qi "playwright" /usr/local/share/rainier-npm-global.json; then echo GLOBAL-PLAYWRIGHT-PACKAGE; exit 1; fi
+  echo no-global-playwright'
+
+check "the browser baseline is root-owned and the session user cannot rewrite it" "baseline-held" '
+  b=$(find /usr/local/lib/rainier-browsers -type f -name chrome-headless-shell | head -1)
+  [ -n "$b" ] || { echo "no browser baseline in the image"; exit 1; }
+  [ "$(stat -c %U "$b")" = root ] || { echo "the browser is owned by $(stat -c %U "$b")"; exit 1; }
+  if echo x > "$b" 2>/dev/null; then echo BROWSER-WRITABLE; exit 1; fi
+  echo baseline-held'
+
+check "a fresh workspace volume already carries the browser cache Playwright reads" "cache-linked" '
+  [ "$PLAYWRIGHT_BROWSERS_PATH" = /workspace/.cache/ms-playwright ] \
+    || { echo "PLAYWRIGHT_BROWSERS_PATH=$PLAYWRIGHT_BROWSERS_PATH"; exit 1; }
+  dir=$PLAYWRIGHT_BROWSERS_PATH/chromium_headless_shell-'"$CHROMIUM_REVISION"'
+  # The two files Playwright reads before it decides a browser is installed and
+  # whether its dependencies still need checking. Both have to be writable
+  # files on the volume, not links onto the read-only rootfs.
+  for m in INSTALLATION_COMPLETE DEPENDENCIES_VALIDATED; do
+    [ -f "$dir/$m" ] || { echo "no $m in $dir"; exit 1; }
+    [ -L "$dir/$m" ] && { echo "$m is a link onto the read-only rootfs"; exit 1; }
+    : > "$dir/$m" || { echo "$m is not writable"; exit 1; }
+  done
+  exe=$(find -L "$dir" -type f -name chrome-headless-shell | head -1)
+  [ -x "$exe" ] || { echo "the cache does not resolve to an executable browser"; exit 1; }
+  echo cache-linked'
+
+check "the preinstalled browser is exactly the build the Dockerfile pins" "$CHROMIUM_VERSION" '
+  '"$BROWSER_FIXTURE"'
+  "$b" --version'
+
+check "every shared library the browser needs resolves in this image" "libs-resolved" '
+  '"$BROWSER_FIXTURE"'
+  missing=$(ldd "$b" 2>/dev/null | awk "/not found/ { print \$1 }" | sort -u)
+  [ -z "$missing" ] || { echo "MISSING $missing"; exit 1; }
+  echo libs-resolved'
+
+check "the browser renders a page and writes a desktop-viewport screenshot, offline" "1280 800" '
+  '"$BROWSER_FIXTURE"'
+  render --screenshot="$d/desktop.png" --window-size=1280,800 "file://$d/page.html" >/dev/null
+  [ -s "$d/desktop.png" ] || { echo "no screenshot was written"; exit 1; }
+  file "$d/desktop.png" | grep -q "PNG image" || { echo "not a PNG"; exit 1; }
+  png_size "$d/desktop.png"'
+
+check "the same page at a phone viewport produces a phone-sized screenshot" "390 844" '
+  '"$BROWSER_FIXTURE"'
+  render --screenshot="$d/phone.png" --window-size=390,844 "file://$d/page.html" >/dev/null
+  [ -s "$d/phone.png" ] || { echo "no screenshot was written"; exit 1; }
+  png_size "$d/phone.png"'
+
+# A browser with no fonts still renders: it falls back to whatever it can find
+# and lays text out with the wrong metrics, so a screenshot is boxes and a
+# width assertion is a flake. Ten Arial capital Ms at 100px are 833px wide by
+# the font, and Liberation Sans is metric-compatible with Arial by design —
+# DejaVu, the usual fallback, gives 791. So the number below is a check that
+# fontconfig resolved Arial to the font this image installed FOR that, not
+# merely that some font exists.
+check "Arial resolves to a metric-compatible font and text lays out at its real width" "font-metrics-ok" '
+  '"$BROWSER_FIXTURE"'
+  fc-match Arial | grep -qi liberation || { echo "fc-match Arial = $(fc-match Arial)"; exit 1; }
+  fc-list | grep -qi emoji || { echo "no emoji font"; exit 1; }
+  w=$(render --dump-dom "file://$d/page.html" | sed -n "s/.*<title>\([0-9]*\)<\/title>.*/\1/p" | head -1)
+  [ -n "$w" ] || { echo "the page did not report a measured width"; exit 1; }
+  [ "$w" -ge 800 ] && [ "$w" -le 870 ] || { echo "ten 100px Arial Ms measured ${w}px, not ~833"; exit 1; }
+  echo font-metrics-ok'
+
+check "the browser leaves no process behind after it exits" "no-browser-left" '
+  '"$BROWSER_FIXTURE"'
+  # By resolved executable rather than by command line: the shell running this
+  # check has the string "chrome-headless-shell" in its own argv, so a pgrep -f
+  # would match itself and never pass. A zombie has no /proc/pid/exe, which is
+  # the right answer too: sessiond is PID 1 in a real session, and it reaps.
+  browsers_alive() {
+    for p in /proc/[0-9]*; do
+      case "$(readlink "$p/exe" 2>/dev/null)" in *chrome-headless-shell*) return 0 ;; esac
+    done
+    return 1
+  }
+  render --screenshot="$d/x.png" --window-size=800,600 "file://$d/page.html" >/dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    browsers_alive || break
+    sleep 0.5
+  done
+  if browsers_alive; then
+    echo "BROWSER-STILL-RUNNING"; ps -eo pid,ppid,comm | head -20; exit 1
+  fi
+  echo no-browser-left'
+
+check "rainier-browsers reports the cache a project's Playwright will read" "linked" '
+  rainier-browsers path | grep -qx /workspace/.cache/ms-playwright || { echo "path = $(rainier-browsers path)"; exit 1; }
+  rainier-browsers status'
+
+# Reported rather than asserted, because both answers are legitimate and which
+# one a session gets is host policy rather than an image property. Chromium's
+# own layer-1 sandbox needs to create a user namespace, which docker's default
+# seccomp profile refuses without CAP_SYS_ADMIN; Playwright disables that
+# sandbox by default anyway (chromiumSandbox: false) and relies on the
+# container. What must never happen is a browser that reports no usable sandbox
+# and renders the page regardless, so the observed exit status is on the record.
+SANDBOX_STATUS=$(probe '
+  '"$BROWSER_FIXTURE"'
+  out=$("$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p2" --dump-dom "file://$d/page.html" 2>&1)
+  st=$?
+  printf "exit=%s %s\n" "$st" "$(printf "%s" "$out" | grep -i -m1 "sandbox\|namespace" || echo "no sandbox diagnostic")"
+' | tail -1)
+printf 'note  chromium own-sandbox under the driver restrictions: %s\n' "$SANDBOX_STATUS"
+note "chromium own-sandbox status" "$SANDBOX_STATUS"
+
+BROWSER_SIZE=$(probe 'cat /usr/local/share/rainier-browser-size.txt 2>/dev/null | head -1; grep -h "browser payload" /usr/local/share/rainier-browser-size.txt 2>/dev/null' | tr '\n' '; ')
+printf 'note  browser layer: %s\n' "$BROWSER_SIZE"
+note "browser layer size" "$BROWSER_SIZE"
 
 echo
 echo "-- git, gh and the rest of the shell toolkit"

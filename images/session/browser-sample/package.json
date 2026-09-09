@@ -1,0 +1,13 @@
+{
+  "name": "rainier-browser-sample",
+  "private": true,
+  "version": "0.0.0",
+  "description": "The sample project scripts/session-image-browser-e2e.sh qualifies the session image with: a loopback web server, a real Chromium navigation at two viewports, and the artifacts a failure has to leave behind.",
+  "scripts": {
+    "serve": "node server.js",
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

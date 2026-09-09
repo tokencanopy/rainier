@@ -1,6 +1,35 @@
 #!/usr/bin/env bash
-# Small assertion boundary shared by the container smoke and its shell tests.
-# The caller supplies probe (the execution boundary), ok and bad (reporting).
+# Small assertion boundary shared by the image qualification scripts and their
+# shell tests. The caller supplies probe (the execution boundary); reporting is
+# here, because two qualification scripts annotating a pull request in two
+# slightly different ways is how one of them quietly stops annotating at all.
+# A caller that wants different reporting redefines ok and bad after sourcing.
+
+PASS=0 FAIL=0
+
+# In GitHub Actions the job log is the only record of a failed qualification,
+# and it is not always reachable from wherever the fix is being made — a
+# session's egress allowlist does not carry the Actions log host, for one.
+# Emitting each failure as a workflow annotation puts the check's name and its
+# detail on the pull request itself, where the check status already is. Inert
+# outside Actions, and it reports; it never changes what passes.
+# A workflow command's PROPERTIES are comma-separated and colon-terminated, so
+# a title carrying either has to be escaped or it truncates the annotation —
+# and most check names contain a comma. The message half only has to survive
+# the newline.
+wf_title() { printf '%s' "$1" | sed 's/%/%25/g; s/\r/%0D/g; s/:/%3A/g; s/,/%2C/g'; }
+wf_body()  { printf '%s' "${1:-}" | cut -c1-2000 | sed 's/%/%25/g; s/\r/ /g' | awk '{printf "%s%%0A", $0}'; }
+note() {
+  [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+  printf '::notice title=%s::%s\n' "$(wf_title "$1")" "$(wf_body "$2")"
+}
+annotate() {
+  [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+  printf '::error title=%s::%s\n' "$(wf_title "$1")" "$(wf_body "${2:-}")"
+}
+ok()  { PASS=$((PASS+1)); printf 'ok    %s\n' "$1"; }
+bad() { FAIL=$((FAIL+1)); printf 'FAIL  %s\n' "$1"; [ $# -gt 1 ] && printf '      %s\n' "$2"; annotate "$1" "${2:-}"; return 0; }
+
 check() {
   local name=$1 want=$2 prog=$3 runner=${4:-probe} match=${5:-contains} out status=0 matched=1
   out=$("$runner" "$prog") || status=$?
