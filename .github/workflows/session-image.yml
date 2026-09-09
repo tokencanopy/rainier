@@ -33,5 +33,7 @@ jobs:
         run: go test ./internal/driver -run '^(TestSessionImage|TestImageSmoke)' -count=1
       - name: Functional smoke with no network or credentials
         run: make session-image-smoke SESSION_IMAGE=rainier-session:qualify
+      - name: Browser end to end in a fresh project
+        run: make session-image-browser-e2e SESSION_IMAGE=rainier-session:qualify
       - name: Image size
         run: docker image inspect -f '{{.Size}} bytes; {{.Architecture}}' rainier-session:qualify
