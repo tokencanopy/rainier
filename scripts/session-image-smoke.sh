@@ -590,7 +590,7 @@ HTML
   # /dev/shm is enough for a Playwright suite.
   # Keep a misbehaving sandbox child from holding the whole image qualification
   # job open. The browser is the process under test; timeout only bounds it and
-  # does not add a flag that changes Chromium's sandbox mode.
+  # does not add a flag that changes the Chromium sandbox mode.
   render() { timeout -k 5 30 "$b" --disable-dev-shm-usage --disable-gpu --disable-breakpad \
       --user-data-dir="$d/profile" "$@" 2>&1; }
   png_size() { python3 -c "import struct,sys; d=open(sys.argv[1],\"rb\").read(24); w,h=struct.unpack(\">II\", d[16:24]); print(w,h)" "$1"; }
