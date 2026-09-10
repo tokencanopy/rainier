@@ -146,6 +146,31 @@ else.
   printed: it is what lets one press of the take-control key take control
   rather than discovering that the number the viewer saw at attach time is
   gone.
+- An attach is authorized for the mode it **opens in**, and taking control
+  later is authorized separately, on the claim itself. A host whose policy
+  grants viewing without granting driving therefore admits `--view` normally,
+  and that client's take-control key is answered "you are still a viewer" —
+  refused on this replica, without a generation moving anywhere. The claim
+  asks the policy live rather than reading an answer cached at attach time, so
+  a grant revoked mid-attach is honoured at the next press. Self-hosted
+  Rainier answers both questions the same way (a caller who may attach may
+  drive), so none of this is visible there.
+- A **take-over commits before the terminal exists**. The binding rides the
+  `dial_attach`, so a negotiated controller attach advances the generation and
+  displaces the incumbent before the runner has been asked to dial back — and
+  if it never dials back, the attach ends at its pairing TTL having produced
+  no terminal at all. The previous controller is then a viewer of a session
+  nobody controls. It is not stuck: the displacement announced the new
+  generation, so one press of the take-control key takes it back. Reversing
+  the order is not available, because until the runner dials back there is no
+  socket to install a binding on.
+- Nothing bounds how often a client may claim. A client that already has
+  control can loop `claim` and `release` on its own stream; each claim
+  advances the generation and waits, serially and up to the acknowledgement
+  timeout per peer, for every other attach's sandbox. It is an authorized
+  user's nuisance against their own session — no escalation, and nothing
+  another account can do — and it is deliberately not rate limited, because a
+  limiter would also refuse the legitimate rapid hand-back after a mis-press.
 - Nothing about ownership is logged, and no message, byte, or length of one is.
   The holder is an opaque per-attach identity, never a user, device, account or
   browser-session identifier, and never leaves the control plane.
