@@ -204,3 +204,42 @@ func TestTheFenceOnlyEverGoesUp(t *testing.T) {
 		t.Fatal("the live controller was displaced by a stale binding")
 	}
 }
+
+// TestAnUnboundAttachmentCannotBindItself is the defence at the pty behind
+// the plane's own refusal to carry a client's `control`. A binding travels on
+// the frame that OPENS an attachment; an attachment that was opened without
+// one is talking to something that grants no bindings at all — an older
+// plane, or a runner's local debugging attach, which has no control plane
+// above it. A handoff arriving on such an attachment did not come from a
+// plane, and honouring it would let whatever is on the other end name its own
+// mode and its own generation.
+//
+// The generation below is the one that makes this more than tidiness: a fence
+// only ever goes up, so accepting it once would leave every attachment on the
+// session — including the one that was typing — unable to write for the life
+// of the process.
+func TestAnUnboundAttachmentCannotBindItself(t *testing.T) {
+	s, fp := newFakeSession(t)
+	a, err := s.Attach(0, Size{80, 24}, Binding{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recv(t, a.Msgs)
+
+	if s.Bind(a.ID, controllerAt(^uint64(0))) {
+		t.Fatal("an attachment nobody bound bound itself")
+	}
+	// The fence did not move, so the attachment still writes exactly as an
+	// old plane's attachment always has.
+	if !s.Stdin(a.ID, 0, []byte("ls\r")) {
+		t.Fatal("a forged binding wedged an unconditional attachment")
+	}
+	select {
+	case got := <-fp.stdin:
+		if string(got) != "ls\r" {
+			t.Fatalf("the process received %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("nothing reached the process")
+	}
+}

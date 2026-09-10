@@ -82,6 +82,17 @@ func splice(ctx context.Context, client control.TerminalStream, runner runnerCon
 			case terminal.TypeRelease:
 				own.release(ctx)
 				continue
+			case terminal.TypeControl, terminal.TypeControlAck:
+				// The sandbox-facing control verbs. They are the PLANE's —
+				// `install` writes them straight onto the runner socket —
+				// and a client's copy of one is not a handoff, it is a
+				// client asking the sandbox to install a binding nobody
+				// granted. Carrying it would let any attach name its own
+				// mode and its own generation at the pty: a viewer could
+				// promote itself, and a generation past every generation
+				// this session will ever reach would fence everybody
+				// forever. It goes no further.
+				continue
 			case "stdin", "resize":
 				if !own.mayForward() {
 					// A viewer's keystroke, or a displaced controller's. The

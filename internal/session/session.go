@@ -275,6 +275,16 @@ func (s *Session) Bind(id int, bind Binding) bool {
 	if !ok {
 		return false
 	}
+	if !v.bind.Bound {
+		// An attachment that was OPENED unbound is never bound later. A
+		// plane that grants a binding grants it on the frame that opens the
+		// attachment — that is what leaves no window between the size and
+		// the binding — so a handoff arriving on an attachment that never
+		// had one did not come from a plane. It came from whatever is on the
+		// other end of an unmanaged attach socket, and honouring it would
+		// let that end name its own mode and its own generation at the pty.
+		return false
+	}
 	s.observeLocked(bind)
 	v.bind = bind
 	// The controller may have changed, and the pty follows the controller.

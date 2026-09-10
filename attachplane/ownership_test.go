@@ -544,3 +544,59 @@ func TestRequestedOwnershipReadsTheAttachURL(t *testing.T) {
 		})
 	}
 }
+
+// TestAClientsControlVerbNeverReachesTheSandbox is the fence around the
+// privileged half of the protocol. `control` is the PLANE's word to a
+// sandbox: it installs a mode and a generation at the pty. A client that
+// writes one itself is not performing a handoff — it is naming its own
+// authority — so the plane must not carry it, however the client dresses it
+// up.
+//
+// The generation below is what makes this more than tidiness. The pty's fence
+// only ever goes up, so one accepted `control` at a generation past every
+// generation this session will ever reach would leave nobody able to type for
+// the life of the process — a session wedged by any attach that can send
+// JSON.
+func TestAClientsControlVerbNeverReachesTheSandbox(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{})
+	lease := &fakeLease{gen: 1, holder: "att_laptop"}
+	a := startAttach(t, p, h, ts, control.AttachmentController, 1,
+		fakeKeeper{lease, "att_laptop"}, true)
+	awaitType(t, a.stream, terminal.TypeAttached)
+	<-a.sandbox.ready
+
+	a.stream.in <- terminal.ClientMessage{
+		Type: terminal.TypeControl, Mode: terminal.ModeView, Generation: terminal.GenOf(2)}
+	a.stream.in <- terminal.ClientMessage{
+		Type: terminal.TypeControl, Mode: terminal.ModeControl, Generation: terminal.GenOf(^uint64(0))}
+	a.stream.in <- terminal.ClientMessage{Type: terminal.TypeControlAck, Generation: terminal.GenOf(9)}
+	// A message the plane DOES carry, sent after them, so that observing it
+	// arrive proves the three above were dropped rather than merely slow.
+	a.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("ls\r")}
+	awaitSandbox(t, a.sandbox, func(got []terminal.ClientMessage) bool {
+		return len(got) > 0 && got[len(got)-1].Type == "stdin"
+	}, "the trailing keystroke")
+
+	for _, got := range a.sandbox.received() {
+		if got.Type == terminal.TypeControl || got.Type == terminal.TypeControlAck {
+			t.Fatalf("a client's %q reached the sandbox at generation %q", got.Type, got.Generation)
+		}
+	}
+}
+
+// awaitSandbox waits until the sandbox's record satisfies want, so a test can
+// say "everything up to here has arrived" without sleeping for a fixed time.
+func awaitSandbox(t *testing.T, s *fakeSandbox, want func([]terminal.ClientMessage) bool, what string) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		if want(s.received()) {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("%s never reached the sandbox", what)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
