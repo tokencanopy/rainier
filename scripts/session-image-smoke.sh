@@ -759,6 +759,40 @@ else
   note "chromium inner-filter diagnostic" "no-filter-status-unavailable"
 fi
 
+# Diagnostic only: retain the required sandbox and classify Chromium's own
+# startup message without publishing its raw stderr. The fixed categories are
+# enough to distinguish namespace setup from a later zygote failure while
+# keeping paths, arguments, and host-specific text out of the qualification
+# log.
+SANDBOX_LOG_STATUS=$(probe '
+  '"$BROWSER_FIXTURE"'
+  log="$d/chromium.stderr"
+  timeout -k 5 30 "$b" --enable-logging=stderr --v=1 --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p5" --dump-dom "$SERVER_URL" > /dev/null 2>"$log"
+  st=$?
+  if grep -Fq "Failed to move to new namespace" "$log"; then
+    token=namespace-move-failed
+  elif grep -Fq "No usable sandbox" "$log"; then
+    token=no-usable-sandbox
+  elif grep -Fq "InitializeSandbox" "$log"; then
+    token=sandbox-initialize
+  elif grep -Fq "zygote" "$log"; then
+    token=zygote-startup
+  elif [ -s "$log" ]; then
+    token=other-startup-error
+  else
+    token=no-startup-diagnostic
+  fi
+  printf "sandbox-log=%s exit=%s\\n" "$token" "$st"
+  exit 0
+' | sed -n 's/.*\(sandbox-log=[a-z-]* exit=[0-9][0-9]*\).*/\1/p' | tail -1)
+if [ -n "$SANDBOX_LOG_STATUS" ]; then
+  printf 'note  chromium sandbox startup category: %s\n' "$SANDBOX_LOG_STATUS"
+  note "chromium sandbox startup category" "$SANDBOX_LOG_STATUS"
+else
+  printf 'note  chromium sandbox startup category: unavailable\n'
+  note "chromium sandbox startup category" "unavailable"
+fi
+
 BROWSER_SIZE=$(probe 'cat /usr/local/share/rainier-browser-size.txt 2>/dev/null | head -1; grep -h "browser payload" /usr/local/share/rainier-browser-size.txt 2>/dev/null' | tr '\n' '; ')
 printf 'note  browser layer: %s\n' "$BROWSER_SIZE"
 note "browser layer size" "$BROWSER_SIZE"
