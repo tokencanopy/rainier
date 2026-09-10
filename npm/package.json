@@ -1,6 +1,6 @@
 {
   "name": "@tokencanopy/rainier",
-  "version": "0.0.9",
+  "version": "0.0.10",
   "description": "Rainier CLI: persistent remote coding-agent sessions",
   "type": "module",
   "bin": { "rainier": "cli.js" },
