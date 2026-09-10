@@ -18,19 +18,31 @@ import (
 // exactly as it did before — type unconditionally, forward Ctrl-\ as an
 // ordinary byte, stamp nothing — which is what settled=false means here.
 type ownership struct {
-	asked bool // this attach advertised the capability
-	take  bool // --take: claim once if it comes back a viewer
+	asked     bool // this attach advertised the capability
+	askedView bool // --view: this attach asked never to claim
+	take      bool // --take: claim once if it comes back a viewer
 
-	mu      sync.Mutex
-	settled bool // the server answered, so it speaks conditional ownership
-	legacy  bool // the server sent terminal traffic without ever answering
-	mode    string
-	gen     uint64
-	claimed bool // the one --take claim has been spent
+	mu       sync.Mutex
+	settled  bool // the server answered, so it speaks conditional ownership
+	answered bool // an ownership message has arrived, whatever it said
+	legacy   bool // the server sent terminal traffic without ever answering
+	mode     string
+	gen      uint64
+	claimed  bool // the one --take claim has been spent
 }
 
 func newOwnership(o Options) *ownership {
-	return &ownership{asked: o.Control, take: o.Take, gen: o.Expected}
+	own := &ownership{asked: o.Control, take: o.Take, gen: o.Expected}
+	if o.Control && o.Mode == terminal.ModeView {
+		// --view is the user's instruction, not a request the server may
+		// ignore. Holding it locally from the first byte is what makes it
+		// true before any answer arrives, and true at all against a plane
+		// that never answers — which is the plane that would otherwise
+		// admit this attach as an unconditional controller and let it type.
+		own.askedView = true
+		own.mode = terminal.ModeView
+	}
+	return own
 }
 
 // state returns the current mode and generation.
@@ -78,13 +90,19 @@ func (o *ownership) observe(m terminal.ServerMessage) string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	was := o.mode
-	o.settled = true
+	first := !o.answered
+	o.settled, o.answered = true, true
 	switch m.Type {
 	case terminal.TypeAttached:
 		o.mode = m.Mode
 		o.gen = m.Generation.Value()
 		switch {
-		case m.Mode == terminal.ModeView && was == "":
+		case m.Mode == terminal.ModeView && first:
+			if o.askedView {
+				// It asked to watch. Being told it is watching is not news,
+				// and "another device has control" might not even be true.
+				return ""
+			}
 			return NoticeViewing // the opening answer: somebody else is typing
 		case m.Mode == terminal.ModeView:
 			return NoticeTaken
@@ -123,14 +141,19 @@ func (o *ownership) settleLegacy() {
 // takeOnce reports whether --take should spend its one claim now, and marks
 // it spent. A client that re-claimed every time it was refused would be two
 // devices fighting over a keyboard instead of one person deciding.
+//
+// The FIRST answer spends it, whatever that answer said. --take is a flag on
+// one attach, and an attach that opened holding control has already had what
+// it asked for; leaving the claim unspent would fire it minutes later, when
+// somebody else takes control, as a snatch-back nobody pressed a key for.
 func (o *ownership) takeOnce() bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if !o.take || o.claimed || o.mode != terminal.ModeView {
+	if !o.take || o.claimed || !o.answered {
 		return false
 	}
 	o.claimed = true
-	return true
+	return o.mode == terminal.ModeView
 }
 
 // claim reports the claim this attach should send when the user presses the

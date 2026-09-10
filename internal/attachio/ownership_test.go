@@ -15,6 +15,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	"github.com/creack/pty"
 
 	"github.com/tokencanopy/rainier/protocol/terminal"
 )
@@ -433,5 +434,109 @@ func TestScanKeysReadsTheTwoKeysThisPackageOwns(t *testing.T) {
 				t.Fatalf("scanKeys = (%d, %v), want (%d, %v)", at, kind, tc.wantAt, tc.wantKind)
 			}
 		})
+	}
+}
+
+// TestViewNeverTypesEvenWhenNothingAnswers is --view against a plane that
+// predates conditional ownership — the exact pairing the compatibility matrix
+// is about, and the one where the flag is load-bearing. That plane admits
+// every attach as an unconditional controller and takes control from whoever
+// had it, so a client that waited for permission to be a viewer would type
+// into somebody else's shell after asking not to.
+//
+// It is also the pre-answer window against a NEW plane: --view is the user's
+// instruction, and it holds from the first byte rather than from the first
+// answer.
+func TestViewNeverTypesEvenWhenNothingAnswers(t *testing.T) {
+	p := newFakePlane(false, terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
+	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeView})
+	if _, err := run.stdin.Write([]byte("rm -rf /\r")); err != nil {
+		t.Fatal(err)
+	}
+	// Give the keystroke every chance to arrive before concluding it did not.
+	time.Sleep(200 * time.Millisecond)
+	for _, m := range p.received() {
+		if m.Type == "stdin" {
+			t.Fatalf("--view typed %q into a session it asked only to watch", m.Data)
+		}
+	}
+	out := run.detach(t)
+	if out.Mode != terminal.ModeView {
+		t.Fatalf("a --view attach ended in mode %q, want view", out.Mode)
+	}
+}
+
+// TestTakeIsSpentByTheFirstAnswer pins --take as a flag on one attach rather
+// than a standing instruction. An attach that opened holding control has
+// already had what it asked for; a claim left unspent would fire minutes
+// later, when somebody else takes control, as a snatch-back nobody pressed a
+// key for.
+func TestTakeIsSpentByTheFirstAnswer(t *testing.T) {
+	p := newFakePlane(true, terminal.ServerMessage{
+		Type: terminal.TypeAttached, Mode: terminal.ModeControl, Generation: terminal.GenOf(1)})
+	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeControl, Take: true})
+
+	// Somebody else takes control. This client is told, and must not answer.
+	p.extra <- terminal.ServerMessage{
+		Type: terminal.TypeControlChanged, Mode: terminal.ModeView, Generation: terminal.GenOf(2)}
+	run.awaitPrinted(t, NoticeTaken)
+	time.Sleep(200 * time.Millisecond)
+	for _, m := range p.received() {
+		if m.Type == terminal.TypeClaim {
+			t.Fatalf("--take claimed control back on its own, from generation %q", m.Expected)
+		}
+	}
+	run.detach(t)
+}
+
+// TestGainingControlSaysHowBigThisTerminalIs is the other half of "the pty
+// follows the controller". A viewer's resizes are suppressed on the way out,
+// so the size the session holds for this attachment is the one it had when it
+// attached — possibly several window changes ago. Taking control has to say
+// what this terminal actually is, or the take-over snaps the pty to a stale
+// size.
+//
+// It drives a real pty, because the size only exists when there is a terminal
+// to measure and a pipe has none.
+func TestGainingControlSaysHowBigThisTerminalIs(t *testing.T) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Fatalf("pty.Open: %v", err)
+	}
+	defer master.Close()
+	defer slave.Close()
+
+	p := newFakePlane(true, terminal.ServerMessage{
+		Type: terminal.TypeAttached, Mode: terminal.ModeView, Generation: terminal.GenOf(1)})
+	ts := httptest.NewServer(http.HandlerFunc(p.serve))
+	defer ts.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runWithIO(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach",
+			nil, 0, Options{Control: true, Mode: terminal.ModeControl}, slave, io.Discard)
+	}()
+	<-p.ready
+	// Everything the attach has said while it was only watching.
+	p.awaitFrame(t, func(m terminal.ClientMessage) bool { return m.Type == "resize" })
+	before := len(p.received())
+
+	p.extra <- terminal.ServerMessage{
+		Type: terminal.TypeAttached, Mode: terminal.ModeControl, Generation: terminal.GenOf(2)}
+
+	deadline := time.Now().Add(5 * time.Second)
+	var sized bool
+	for time.Now().Before(deadline) && !sized {
+		for _, m := range p.received()[before:] {
+			if m.Type == "resize" {
+				sized = true
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	master.Write([]byte{detachKey})
+	<-done
+	if !sized {
+		t.Fatal("taking control sent no size, so the pty keeps whatever this attachment had when it was watching")
 	}
 }

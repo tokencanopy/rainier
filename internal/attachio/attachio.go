@@ -350,8 +350,14 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 	var resizeDone chan struct{}
 	var resizeWG sync.WaitGroup
 	var winch chan os.Signal
+	// sendSize is nil when there is no terminal to measure. It is declared
+	// out here because gaining control is the other moment this attach owes
+	// the session its size: a viewer's resizes are suppressed, so the size
+	// the session has for this attachment is the one it had when it attached
+	// — possibly several window changes ago.
+	var sendSize func()
 	if isTTY {
-		sendSize := func() {
+		sendSize = func() {
 			w, h, err := term.GetSize(fd)
 			if err != nil {
 				return
@@ -450,7 +456,13 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 				return
 			}
 			if isOwnershipMessage(m.Type) {
+				before, _ := own.state()
 				notice := own.observe(m)
+				if now, _ := own.state(); now == terminal.ModeControl && before != terminal.ModeControl && sendSize != nil {
+					// It has control now, and the pty follows the
+					// controller. Say how big this terminal actually is.
+					sendSize()
+				}
 				stdoutMu.Lock()
 				if notice != "" && !decided.Load() {
 					writeNotice(stdout, notice)
