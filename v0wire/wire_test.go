@@ -76,13 +76,14 @@ func fullSession() control.Session {
 			Cmd:         []string{"bash", "-lc", "echo ok"},
 			EgressAllow: []string{"example.test", "203.0.113.7"},
 		},
-		State:         control.StateRunning,
-		RunnerID:      "runner-example",
-		Error:         "the setup script failed",
-		ChildExitCode: &code,
-		CreatedAt:     at(5),
-		UpdatedAt:     at(6),
-		LastEventAt:   at(7),
+		State:                control.StateRunning,
+		RunnerID:             "runner-example",
+		Error:                "the setup script failed",
+		ChildExitCode:        &code,
+		ControllerGeneration: 6,
+		CreatedAt:            at(5),
+		UpdatedAt:            at(6),
+		LastEventAt:          at(7),
 	}
 }
 
@@ -92,13 +93,14 @@ const fullSessionJSON = `{"id":"sess_example","owner_id":"usr_example","name":"d
 	`"reachable":true,"error":"the setup script failed","environment":"dev",` +
 	`"queue_reason":"waiting for runner runner-example","child_exit_code":0,` +
 	`"created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:06Z",` +
-	`"last_event_at":"2026-01-02T03:04:07Z"}`
+	`"last_event_at":"2026-01-02T03:04:07Z","controller":{"generation":"6","held":true}}`
 
 func fullDerived() v0wire.SessionDerived {
 	return v0wire.SessionDerived{
-		Reachable:   true,
-		Environment: "dev",
-		QueueReason: "waiting for runner runner-example",
+		Reachable:      true,
+		Environment:    "dev",
+		QueueReason:    "waiting for runner runner-example",
+		ControllerHeld: true,
 	}
 }
 
@@ -163,12 +165,12 @@ func TestSessionViewKeySet(t *testing.T) {
 	keySet(t, v0wire.RenderSession(control.Session{}, v0wire.SessionDerived{}),
 		"id", "owner_id", "name", "image", "cmd", "egress_allow", "state", "runner",
 		"reachable", "error", "environment", "queue_reason", "child_exit_code",
-		"created_at", "updated_at", "last_event_at")
+		"created_at", "updated_at", "last_event_at", "controller")
 	// The key set does not depend on how much of the row is populated.
 	keySet(t, v0wire.RenderSession(fullSession(), fullDerived()),
 		"id", "owner_id", "name", "image", "cmd", "egress_allow", "state", "runner",
 		"reachable", "error", "environment", "queue_reason", "child_exit_code",
-		"created_at", "updated_at", "last_event_at")
+		"created_at", "updated_at", "last_event_at", "controller")
 }
 
 func TestSessionViewNormalizesEmptyAndNull(t *testing.T) {
@@ -179,7 +181,8 @@ func TestSessionViewNormalizesEmptyAndNull(t *testing.T) {
 		`{"id":"","owner_id":"","name":"","image":"","cmd":[],"egress_allow":[],`+
 			`"state":"","runner":"","reachable":false,"error":"","environment":"",`+
 			`"queue_reason":"","child_exit_code":null,"created_at":"0001-01-01T00:00:00Z",`+
-			`"updated_at":"0001-01-01T00:00:00Z","last_event_at":"0001-01-01T00:00:00Z"}`)
+			`"updated_at":"0001-01-01T00:00:00Z","last_event_at":"0001-01-01T00:00:00Z",`+
+			`"controller":{"generation":"0","held":false}}`)
 }
 
 func TestSessionViewRendersTimestampsAsUTC(t *testing.T) {
@@ -912,5 +915,38 @@ func TestAgentViewCarriesNoCredentialAndNoSharedSlice(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "credential_example") {
 		t.Fatalf("the rendered envelope carries credential bytes: %s", raw)
+	}
+}
+
+// TestSessionViewControllerIsAdditiveAndNamesNobody pins the new object's two
+// promises. It is additive: nothing else in the JSON moved, which is what the
+// golden and key-set cases above assert. And it names nobody — a client
+// learns that somebody has control, never who, because that is a fact about
+// another person's session and this is the view a browser reads.
+func TestSessionViewControllerIsAdditiveAndNamesNobody(t *testing.T) {
+	row := fullSession()
+	row.ControllerGeneration = 1 << 60 // past a JSON number's exact range
+	row.ControllerHolder = "att_secret_example"
+	view := v0wire.RenderSession(row, fullDerived())
+
+	if view.Controller.Generation != "1152921504606846976" {
+		t.Fatalf("generation = %q, want an exact decimal string", view.Controller.Generation)
+	}
+	if !view.Controller.Held {
+		t.Fatal("held = false, want the host's derived answer")
+	}
+	b, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), "att_secret_example") {
+		t.Fatalf("the rendered view disclosed the lease holder: %s", b)
+	}
+	// The generation is rendered whether or not anybody holds it: a client
+	// that wants to claim needs the number, and "free" is exactly when it
+	// wants it most.
+	free := v0wire.RenderSession(row, v0wire.SessionDerived{})
+	if free.Controller.Held || free.Controller.Generation != view.Controller.Generation {
+		t.Fatalf("a vacant lease rendered %+v", free.Controller)
 	}
 }

@@ -389,7 +389,7 @@ func TestCreateSession(t *testing.T) {
 		assertKeySet(t, string(outer["session"]),
 			"id", "owner_id", "name", "image", "cmd", "egress_allow", "state", "runner",
 			"reachable", "error", "environment", "queue_reason", "child_exit_code",
-			"created_at", "updated_at", "last_event_at")
+			"created_at", "updated_at", "last_event_at", "controller")
 		// child_exit_code is nullable and present on every session, never
 		// omitted: "the agent has not exited" and "the field wasn't rendered"
 		// have to be the same visible answer (null), or a client cannot tell

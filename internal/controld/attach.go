@@ -58,7 +58,12 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 	// costs a full replay, never an error the client can do anything about.
 	since, _ := strconv.ParseUint(r.URL.Query().Get("since"), 10, 64)
 
-	if !s.mayAttach(w, r, u, id) {
+	// What the client asked for about control, read before the upgrade like
+	// every other refusable thing: a 403 is a status code, and a status code
+	// has nowhere to go once the socket is a websocket.
+	asked := attachplane.RequestedOwnership(r.URL.Query())
+
+	if !s.mayAttach(w, r, u, id, asked.Mode) {
 		return
 	}
 
@@ -103,9 +108,11 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 	stream := attachplane.ClientStream(c)
 	ctx := attachplane.WithSince(withUser(r.Context(), u), since)
 	err = s.attachments.AttachTerminal(ctx, userScope(u), control.AttachTerminal{
-		SessionID: control.SessionID(id),
-		Since:     since,
-		Mode:      control.AttachmentController,
+		SessionID:          control.SessionID(id),
+		Since:              since,
+		Mode:               asked.Mode,
+		Negotiated:         asked.Negotiated,
+		ExpectedGeneration: asked.Expected,
 	}, stream)
 	if err != nil {
 		_ = stream.Close(err)
@@ -122,7 +129,7 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 // The decision itself is not a second implementation: it is the same
 // ownerOrAdmin policy adapter, asked the same question about the same
 // resource, and the service's own answer downstream stays authoritative.
-func (s *Server) mayAttach(w http.ResponseWriter, r *http.Request, u User, id string) bool {
+func (s *Server) mayAttach(w http.ResponseWriter, r *http.Request, u User, id string, mode control.AttachmentMode) bool {
 	row, err := s.st.Sessions().GetSession(r.Context(), installWorkspace, control.SessionID(id))
 	if err != nil {
 		if errors.Is(err, control.ErrNotFound) {
@@ -136,7 +143,7 @@ func (s *Server) mayAttach(w http.ResponseWriter, r *http.Request, u User, id st
 	resource := control.Resource{Kind: control.ResourceSession, WorkspaceID: installWorkspace,
 		ID: string(row.ID), CreatorID: row.CreatorID}
 	if err := (ownerOrAdmin{}).AuthorizeAttachment(withUser(r.Context(), u), userScope(u),
-		resource, control.AttachmentController); err != nil {
+		resource, mode); err != nil {
 		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to attach to this session")
 		return false
 	}

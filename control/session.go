@@ -210,10 +210,15 @@ const (
 //
 // A nil keeper on an AttachTarget means the host does not negotiate control;
 // the attach then behaves exactly as it did before this contract existed.
+// State reads the session's current controller generation and whether a lease
+// is live right now. It is what lets a refused claim be answered with the
+// generation that actually exists — the one the caller would have to claim
+// from to try again — rather than with a bare refusal.
 type ControllerLeaseKeeper interface {
 	Claim(ctx context.Context, expected uint64) (uint64, error)
 	Renew(ctx context.Context, generation uint64) error
 	Release(ctx context.Context, generation uint64) error
+	State(ctx context.Context) (generation uint64, held bool, err error)
 }
 
 // CreateSession is the command for CreateSession. EnvironmentID names the

@@ -226,6 +226,17 @@ func (k controllerKeeper) Release(ctx context.Context, generation uint64) error 
 	return nil
 }
 
+// State reads the row's current generation and whether anybody holds a live
+// lease on it. It discloses no holder: "somebody has control" is the whole of
+// what a client is told about another client.
+func (k controllerKeeper) State(ctx context.Context) (uint64, bool, error) {
+	row, err := k.sessions.GetSession(ctx, k.ws, k.id)
+	if err != nil {
+		return 0, false, portError(err)
+	}
+	return row.ControllerGeneration, control.ControllerLeaseOf(row).Live(k.clock.Now()), nil
+}
+
 // grant decides what one attach actually gets: its mode, the generation it
 // holds, and the keeper it runs the rest of its life through.
 //

@@ -41,6 +41,10 @@ var (
 	// errAttachIDCollision is the refusal to overwrite another client's
 	// parked pairing (see attachTable.park).
 	errAttachIDCollision = errors.New("controld: attach id collision")
+	// errAttachNotSpliced is a handoff attempted before the runner's
+	// dial-back arrived: there is no sandbox socket to install a binding on
+	// yet, so the claim cannot be honoured and the client is told it lost.
+	errAttachNotSpliced = errors.New("controld: the attach is not spliced yet")
 	// errAttachEnded is an attach that ran and is over — one side of the
 	// splice stopped, and the other is being closed after it.
 	errAttachEnded = errors.New("controld: the attach ended")

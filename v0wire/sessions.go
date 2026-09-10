@@ -3,6 +3,7 @@ package v0wire
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/tokencanopy/rainier/control"
@@ -43,6 +44,25 @@ type SessionView struct {
 	CreatedAt     string `json:"created_at"`
 	UpdatedAt     string `json:"updated_at"`
 	LastEventAt   string `json:"last_event_at"`
+	// Controller is who may type. It is additive — every other key above is
+	// unchanged — and, like them, always present, because a key that appears
+	// only sometimes cannot be told apart from an older server that never had
+	// it.
+	Controller ControllerView `json:"controller"`
+}
+
+// ControllerView is the session's terminal ownership, as much of it as any
+// client is told: which generation is in force, and whether anybody currently
+// holds it. It names NOBODY. A client learns that somebody else has control,
+// never who or on what device — that is a fact about another person's
+// session, and this is the API a browser reads.
+//
+// Generation is a DECIMAL STRING for the reason it is one on the terminal
+// wire: a uint64 past 2^53 is silently wrong as a JSON number in a browser,
+// and the browser is the next consumer of this view.
+type ControllerView struct {
+	Generation string `json:"generation"`
+	Held       bool   `json:"held"`
 }
 
 // SessionDerived carries the three view fields that cannot be read off the
@@ -57,6 +77,12 @@ type SessionDerived struct {
 	Reachable   bool
 	Environment string
 	QueueReason string
+	// ControllerHeld is whether the session's controller lease is live as of
+	// now: the row carries an expiry, and only the host has a clock. It sits
+	// here, beside Reachable, so RenderSession stays a pure function of its
+	// arguments rather than reading the wall clock out from under its
+	// callers' tests.
+	ControllerHeld bool
 }
 
 // RenderSession renders s as its client-facing view, with d supplying the
@@ -83,6 +109,10 @@ func RenderSession(s control.Session, d SessionDerived) SessionView {
 		CreatedAt:     s.CreatedAt.UTC().Format(time.RFC3339),
 		UpdatedAt:     s.UpdatedAt.UTC().Format(time.RFC3339),
 		LastEventAt:   s.LastEventAt.UTC().Format(time.RFC3339),
+		Controller: ControllerView{
+			Generation: strconv.FormatUint(s.ControllerGeneration, 10),
+			Held:       d.ControllerHeld,
+		},
 	}
 }
 

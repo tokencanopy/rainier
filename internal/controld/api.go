@@ -79,7 +79,13 @@ func (s *Server) renderer(ctx context.Context) *sessionRenderer {
 
 // view renders one session.
 func (r *sessionRenderer) view(row control.Session) v0wire.SessionView {
-	d := v0wire.SessionDerived{Reachable: r.srv.reachable(row)}
+	d := v0wire.SessionDerived{
+		Reachable: r.srv.reachable(row),
+		// Whether anybody currently holds control. The row carries an expiry
+		// and only this process has a clock, which is why it is derived here
+		// rather than read off the row by the renderer.
+		ControllerHeld: control.ControllerLeaseOf(row).Live(time.Now()),
+	}
 	if env := r.environment(string(row.EnvironmentID)); env != nil {
 		d.Environment = env.Name
 		d.QueueReason = r.queueReason(row, *env)

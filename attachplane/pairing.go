@@ -15,7 +15,13 @@ import (
 // runs its deferred close on a socket the splice is still using.
 type pendingAttach struct {
 	stream control.TerminalStream
-	done   chan struct{}
+	// own is what this attach holds — its mode, its generation, and the
+	// keeper it hands control over through. It is parked with the socket
+	// because the splice that claims the socket is where ownership becomes
+	// live: until the dial-back arrives there is no sandbox to install a
+	// binding in.
+	own  *ownership
+	done chan struct{}
 }
 
 // attachTable holds the pairings this replica is waiting on, keyed by
