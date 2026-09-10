@@ -1039,10 +1039,12 @@ func caseControllerLease(t *testing.T, s Stores) {
 		t.Fatalf("an unconditional advance left the displaced holder's lease behind: holder %q, expiry %v",
 			row.ControllerHolder, row.ControllerLeaseExpiresAt)
 	}
-	// And that holder's heartbeat is refused, which is how it finds out.
+	// And the row is vacant in the way that matters operationally: somebody
+	// else can install a lease at the new generation at once, which the
+	// holder predicate only permits over an empty holder.
 	if err := s.Sessions.RenewControllerLease(ctx, Alpha, "sess_example",
-		control.ControllerLease{Generation: 2, Holder: "att_cccc", ExpiresAt: later}); !errors.Is(err, control.ErrStale) {
-		t.Fatalf("the displaced holder's heartbeat after an unconditional advance: err = %v, want ErrStale", err)
+		control.ControllerLease{Generation: 3, Holder: "att_dddd", ExpiresAt: later}); err != nil {
+		t.Fatalf("the new controller's first renew over a vacated lease: %v", err)
 	}
 
 	// A malformed lease is input, not a missing row.

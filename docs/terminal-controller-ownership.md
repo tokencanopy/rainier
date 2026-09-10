@@ -149,12 +149,21 @@ else.
 - An attach is authorized for the mode it **opens in**, and taking control
   later is authorized separately, on the claim itself. A host whose policy
   grants viewing without granting driving therefore admits `--view` normally,
-  and that client's take-control key is answered "you are still a viewer" —
-  refused on this replica, without a generation moving anywhere. The claim
-  asks the policy live rather than reading an answer cached at attach time, so
-  a grant revoked mid-attach is honoured at the next press. Self-hosted
-  Rainier answers both questions the same way (a caller who may attach may
-  drive), so none of this is visible there.
+  and that client's take-control key is answered `stale` — refused on this
+  replica, without a generation moving anywhere. The claim asks the policy
+  live rather than reading an answer cached at attach time, so a grant revoked
+  mid-attach is honoured at the next press. Self-hosted Rainier answers both
+  questions the same way (a caller who may attach may drive), so none of this
+  is visible there.
+
+  There is **one message for both refusals**, and the CLI renders it
+  `[somebody else got there first; press Ctrl-\ to try again]`. For a
+  principal the host's policy refuses, that sentence is wrong about the cause
+  and its suggestion cannot succeed. A client cannot tell the two apart today:
+  distinguishing them means a message the wire does not have, and the
+  compatibility matrix is the reason not to add one in a fix. Tell such users
+  that they are attached read-only, rather than letting the notice explain
+  it.
 - A **take-over commits before the terminal exists**. The binding rides the
   `dial_attach`, so a negotiated controller attach advances the generation and
   displaces the incumbent before the runner has been asked to dial back — and

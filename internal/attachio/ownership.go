@@ -22,12 +22,16 @@ type ownership struct {
 	askedView bool // --view: this attach asked never to claim
 	take      bool // --take: claim once if it comes back a viewer
 
-	mu       sync.Mutex
-	settled  bool // the server answered, so it speaks conditional ownership
-	answered bool // an ownership message has arrived, whatever it said
-	mode     string
-	gen      uint64
-	claimed  bool // the one --take claim has been spent
+	mu sync.Mutex
+	// settled is the one bit an answer sets, and it means both things it
+	// could mean at once: an ownership message has arrived, and the server
+	// therefore speaks conditional ownership. Nothing else can set it — a
+	// plane that speaks it says so by saying anything at all — so tracking
+	// the two separately was tracking one fact twice.
+	settled bool
+	mode    string
+	gen     uint64
+	claimed bool // the one --take claim has been spent
 }
 
 func newOwnership(o Options) *ownership {
@@ -89,8 +93,8 @@ func (o *ownership) observe(m terminal.ServerMessage) string {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	was := o.mode
-	first := !o.answered
-	o.settled, o.answered = true, true
+	first := !o.settled
+	o.settled = true
 	switch m.Type {
 	case terminal.TypeAttached:
 		o.mode = m.Mode
@@ -135,7 +139,7 @@ func (o *ownership) observe(m terminal.ServerMessage) string {
 func (o *ownership) takeOnce() bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if !o.take || o.claimed || !o.answered {
+	if !o.take || o.claimed || !o.settled {
 		return false
 	}
 	o.claimed = true

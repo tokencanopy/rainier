@@ -201,16 +201,20 @@ const (
 //
 // Claim advances the generation from expected, returning ErrStale when
 // somebody else advanced it first (the caller stays, or becomes, a viewer and
-// may claim again from the generation it is told about). Renew extends the
+// may claim again from the generation it is told about) and ErrDenied when
+// the host's policy refuses this attach the controller privilege at all —
+// which an application authorizes HERE rather than at attach time, because an
+// attach is admitted at the mode it opens in. A broker treats both as "still
+// a viewer" and neither as a transport failure. Renew extends the
 // lease under a generation this attach was granted, and reports ErrStale once
 // that generation has moved — which is how a displaced controller on another
 // replica finds out. Release vacates the lease AND advances the generation,
 // because a controller that is leaving must not leave the bytes it already
 // sent executable.
 //
-// A nil keeper on an AttachTarget means the host does not negotiate control;
-// the attach then behaves exactly as it did before this contract existed.
-// State reads the session's current controller generation and whether a lease
+// A nil keeper on an AttachTarget accompanies AttachTarget.Negotiated being
+// false; the attach then behaves exactly as it did before this contract
+// existed. State reads the session's current controller generation and whether a lease
 // is live right now. It is what lets a refused claim be answered with the
 // generation that actually exists — the one the caller would have to claim
 // from to try again — rather than with a bare refusal.

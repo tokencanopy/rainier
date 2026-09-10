@@ -256,6 +256,10 @@ func (r *sessionStubSessionRepo) NextControllerGeneration(ctx context.Context, w
 		return 0, control.ErrNotFound
 	}
 	s.ControllerGeneration++
+	// And vacates the lease, as the port requires: this is the unconditional
+	// take-over, and it displaces whoever held control.
+	s.ControllerHolder = ""
+	s.ControllerLeaseExpiresAt = time.Time{}
 	r.rows[id] = s
 	return s.ControllerGeneration, nil
 }
