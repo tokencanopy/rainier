@@ -736,6 +736,29 @@ NO_SANDBOX_STATUS=$(probe '
 printf 'note  chromium without its own sandbox under the driver restrictions: %s\n' "${NO_SANDBOX_STATUS:-no-sandbox-status-unavailable}"
 note "chromium no-sandbox diagnostic" "${NO_SANDBOX_STATUS:-no-sandbox-status-unavailable}"
 
+# Diagnostic only: keep Chromium's namespace sandbox enabled while disabling
+# its inner seccomp-BPF filter. This is constructed in pieces so the executable
+# smoke source cannot accidentally be mistaken for a supported browser launch
+# that weakens the security contract. A successful result here points to an
+# interaction between the outer driver seccomp profile and Chromium's layer-2
+# filter; it does not authorize shipping this flag.
+NO_FILTER_STATUS=$(probe '
+  '"$BROWSER_FIXTURE"'
+  filter_flag=--disable-
+  filter_flag=$filter_flag"seccomp-filter-sandbox"
+  timeout -k 5 30 "$b" "$filter_flag" --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p4" --dump-dom "$SERVER_URL" >/dev/null 2>&1
+  st=$?
+  printf "no-filter-exit=%s\n" "$st"
+  exit 0
+' | sed -n 's/.*\(no-filter-exit=[0-9][0-9]*\).*/\1/p' | tail -1)
+if [ -n "$NO_FILTER_STATUS" ]; then
+  printf 'note  chromium namespace sandbox without its inner filter: %s\n' "$NO_FILTER_STATUS"
+  note "chromium inner-filter diagnostic" "$NO_FILTER_STATUS"
+else
+  printf 'note  chromium namespace sandbox without its inner filter: no-filter-status-unavailable\n'
+  note "chromium inner-filter diagnostic" "no-filter-status-unavailable"
+fi
+
 BROWSER_SIZE=$(probe 'cat /usr/local/share/rainier-browser-size.txt 2>/dev/null | head -1; grep -h "browser payload" /usr/local/share/rainier-browser-size.txt 2>/dev/null' | tr '\n' '; ')
 printf 'note  browser layer: %s\n' "$BROWSER_SIZE"
 note "browser layer size" "$BROWSER_SIZE"
