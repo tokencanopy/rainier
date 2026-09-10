@@ -243,7 +243,7 @@ func awaitType(t *testing.T, s *scriptedStream, kind string) (terminal.ServerMes
 func TestJourney1And2ANegotiatedAttachIsToldItsModeFirst(t *testing.T) {
 	p, h, ts := newTestPlane(t, Options{})
 	lease := &fakeLease{gen: 1}
-	f := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_a"}, true)
+	f := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_aaaa"}, true)
 
 	m, before := awaitType(t, f.stream, terminal.TypeAttached)
 	if len(before) != 0 {
@@ -267,7 +267,7 @@ func TestJourney1And2ANegotiatedAttachIsToldItsModeFirst(t *testing.T) {
 func TestAViewerIsToldSoAndItsInputNeverLeavesThePlane(t *testing.T) {
 	p, h, ts := newTestPlane(t, Options{})
 	lease := &fakeLease{gen: 4, holder: "att_other"}
-	f := startAttach(t, p, h, ts, control.AttachmentViewer, 4, fakeKeeper{lease, "att_b"}, true)
+	f := startAttach(t, p, h, ts, control.AttachmentViewer, 4, fakeKeeper{lease, "att_bbbb"}, true)
 
 	m, _ := awaitType(t, f.stream, terminal.TypeAttached)
 	if m.Mode != terminal.ModeView || m.Generation.Value() != 4 {
@@ -472,8 +472,8 @@ func TestAStaleHeartbeatDemotesAControllerFromAnotherReplica(t *testing.T) {
 // keystroke would still execute.
 func TestReleasingAdvancesTheGenerationAndDemotes(t *testing.T) {
 	p, h, ts := newTestPlane(t, Options{})
-	lease := &fakeLease{gen: 1, holder: "att_a"}
-	f := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_a"}, true)
+	lease := &fakeLease{gen: 1, holder: "att_aaaa"}
+	f := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_aaaa"}, true)
 	awaitType(t, f.stream, terminal.TypeAttached)
 	<-f.sandbox.ready
 
@@ -502,8 +502,8 @@ func TestReleasingAdvancesTheGenerationAndDemotes(t *testing.T) {
 // no click rather than waiting out a lease nobody is using.
 func TestDetachingReleasesControl(t *testing.T) {
 	p, h, ts := newTestPlane(t, Options{})
-	lease := &fakeLease{gen: 1, holder: "att_a"}
-	f := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_a"}, true)
+	lease := &fakeLease{gen: 1, holder: "att_aaaa"}
+	f := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_aaaa"}, true)
 	awaitType(t, f.stream, terminal.TypeAttached)
 	<-f.sandbox.ready
 
@@ -841,10 +841,10 @@ func TestAClaimSupersededWhileItWaitedIsNeverToldItHasControl(t *testing.T) {
 	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 500 * time.Millisecond})
 	lease := &fakeLease{gen: 1}
 
-	a := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_a"}, false)
+	a := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_aaaa"}, false)
 	awaitType(t, a.stream, terminal.TypeAttached)
 	awaitViewerSpliced(t, a)
-	b := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_b"}, true)
+	b := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_bbbb"}, true)
 	awaitType(t, b.stream, terminal.TypeAttached)
 	awaitViewerSpliced(t, b)
 
@@ -878,6 +878,23 @@ func TestAClaimSupersededWhileItWaitedIsNeverToldItHasControl(t *testing.T) {
 	if got.Mode != terminal.ModeControl || got.Generation.Value() != 3 {
 		t.Fatalf("the winning claim = %s at %q, want control at 3", got.Mode, got.Generation)
 	}
+
+	// The loser's own claim installed a CONTROL binding in its sandbox on the
+	// way in, and nothing else will replace it — a peer displacing a viewer
+	// installs nothing, because a viewer has nothing to fence. The refused
+	// answer is what re-points it, so the sandbox's copy of what this
+	// attachment is agrees with the plane's. The pty fence had already made
+	// the stale binding inert; this is what stops it lingering until the next
+	// handoff.
+	awaitSandbox(t, a.sandbox, func(got []terminal.ClientMessage) bool {
+		last := ""
+		for _, m := range got {
+			if m.Type == terminal.TypeControl {
+				last = m.Mode + "@" + string(m.Generation)
+			}
+		}
+		return last == terminal.ModeView+"@3"
+	}, "the refused claimant's binding, re-pointed at the viewer it is")
 }
 
 // countingKeeper counts the claims that actually reach the application, so a
@@ -1182,5 +1199,106 @@ func TestANegotiatedClaimIsAlwaysAnswered(t *testing.T) {
 	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(6)}
 	if m, _ := awaitType(t, f.stream, terminal.TypeStale); m.Generation.Value() != 6 {
 		t.Fatalf("the claim was answered %q, want the 6 this attach holds", m.Generation)
+	}
+}
+
+// TestDisplaceToRefusesAGenerationThisAttachHasPassed pins the check itself:
+// an attach already at or past the generation a peer is announcing is left
+// alone, because naming it a number it has passed would walk its client
+// backwards.
+func TestDisplaceToRefusesAGenerationThisAttachHasPassed(t *testing.T) {
+	o := &ownership{mode: terminal.ModeControl, gen: 3}
+	switch was, moved := o.displaceTo(2); {
+	case moved:
+		t.Fatal("a displacement to an older generation moved an attach that has passed it")
+	case was != terminal.ModeControl:
+		t.Fatalf("reported the previous mode as %q, want control", was)
+	}
+	if mode, gen := o.get(); mode != terminal.ModeControl || gen != 3 {
+		t.Fatalf("after a refused displacement: %s at %d, want control at 3", mode, gen)
+	}
+}
+
+// TestDisplaceToAndAdvanceAreEachOneStep is the atomicity, asserted as an
+// invariant rather than as one reproduced interleaving. A displacement that
+// reads an attach and then writes it can have a claim land between the two:
+// the write then puts back the mode it read, at a generation OLDER than the
+// one the claim won, and the client has already been told it has control.
+//
+// Whatever order these two run in, the answer is the same and there is only
+// one: the claim at 3 either happens before the displacement to 2 (which then
+// refuses) or after it (which then advances over it).
+func TestDisplaceToAndAdvanceAreEachOneStep(t *testing.T) {
+	for range 2000 {
+		o := &ownership{mode: terminal.ModeView, gen: 1}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); o.advance(terminal.ModeControl, 3) }()
+		go func() { defer wg.Done(); o.displaceTo(2) }()
+		wg.Wait()
+		if mode, gen := o.get(); mode != terminal.ModeControl || gen != 3 {
+			t.Fatalf("a claim that won generation 3 came out %s at %d: "+
+				"a displacement to 2 clobbered it between its own read and write", mode, gen)
+		}
+	}
+}
+
+// TestDemoteToNeverWalksTheGenerationBack pins the max. A demotion reads the
+// current generation and can be overtaken by a peer's claim before it writes;
+// moving the number down would leave this attach — and its client — claiming
+// from a generation that has been superseded, refused every time.
+func TestDemoteToNeverWalksTheGenerationBack(t *testing.T) {
+	o := &ownership{mode: terminal.ModeControl, gen: 5}
+	if got := o.demoteTo(3); got != 5 {
+		t.Fatalf("demoteTo(3) at generation 5 returned %d, want 5", got)
+	}
+	if mode, gen := o.get(); mode != terminal.ModeView || gen != 5 {
+		t.Fatalf("after demoteTo(3): %s at %d, want view at 5", mode, gen)
+	}
+	// And it still demotes at a generation it cannot read: being wrong about
+	// the number is survivable, believing you still have control is not.
+	o = &ownership{mode: terminal.ModeControl, gen: 5}
+	if got := o.demoteTo(5); got != 5 {
+		t.Fatalf("demoteTo(5) returned %d, want 5", got)
+	}
+	if mode, _ := o.get(); mode != terminal.ModeView {
+		t.Fatalf("after demoteTo at its own generation: mode %q, want view", mode)
+	}
+}
+
+// TestAdvanceAcceptsTheGenerationThisAttachAlreadyHolds pins the boundary.
+// A departing peer's release announces the CURRENT generation to everybody
+// behind it, which can set a still-waiting claimant to view at exactly the
+// generation it has just won; the honest advance that follows must be allowed
+// through, or the winner is told "somebody else got there first" about a
+// generation it owns and holds the lease on.
+func TestAdvanceAcceptsTheGenerationThisAttachAlreadyHolds(t *testing.T) {
+	o := &ownership{mode: terminal.ModeView, gen: 4}
+	if !o.advance(terminal.ModeControl, 4) {
+		t.Fatal("a claim was refused its own generation")
+	}
+	if mode, gen := o.get(); mode != terminal.ModeControl || gen != 4 {
+		t.Fatalf("after advance at the held generation: %s at %d, want control at 4", mode, gen)
+	}
+	if o.advance(terminal.ModeControl, 3) {
+		t.Fatal("a generation older than the one this attach holds was accepted")
+	}
+}
+
+// TestDisplaceAtGenerationZeroTouchesNobody pins the guard at the top of
+// displace. Zero is not a generation any row is ever at, so an announcement
+// carrying it says nothing — and acting on it would demote every attach on
+// the session to a generation none of them could ever claim from.
+func TestDisplaceAtGenerationZeroTouchesNobody(t *testing.T) {
+	p, _, _ := newTestPlane(t, Options{})
+	winner := &ownership{plane: p, session: "sess_example"}
+	peer := &ownership{plane: p, session: "sess_example", mode: terminal.ModeControl, gen: 2}
+	p.owners.add(winner)
+	p.owners.add(peer)
+
+	p.displace(context.Background(), winner, 0, false)
+
+	if mode, gen := peer.get(); mode != terminal.ModeControl || gen != 2 {
+		t.Fatalf("a displacement at generation zero moved a peer to %s at %d, want control at 2", mode, gen)
 	}
 }

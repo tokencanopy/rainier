@@ -561,9 +561,8 @@ func (t *ownerTable) peers(o *ownership) []*ownership {
 // could still execute; a release does not, because the generation it is
 // announcing has already moved and there is nobody it could be racing.
 func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wait bool) {
-	if gen == 0 {
-		return
-	}
+	// Zero needs no guard of its own: no row is ever at generation zero, so
+	// every attach is already at or past it and displaceTo refuses each one.
 	for _, other := range p.owners.peers(winner) {
 		// The check and the write are ONE step, under that peer's own lock:
 		// between them, a claim of its own could otherwise land and overwrite
