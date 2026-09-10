@@ -26,8 +26,9 @@ on:
         required: true
 
 permissions:
-  contents: write   # create the release, upload assets, record the pins on main
-  id-token: write   # npm Trusted Publishing
+  contents: write        # create the release, upload assets, push the pins branch
+  pull-requests: write   # open the PR that records the pins on main
+  id-token: write        # npm Trusted Publishing
 
 concurrency:
   group: release-cli-${{ github.event.inputs.tag || github.ref_name }}
