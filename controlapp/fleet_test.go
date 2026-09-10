@@ -2131,3 +2131,11 @@ func TestReconcileAdoptsAnUnplacedLiveRow(t *testing.T) {
 		t.Fatalf("duplicate: res=%+v err=%v", res, err)
 	}
 }
+
+func (f *fleetFakeSessions) CompareAndAdvanceControllerGeneration(_ context.Context, _ control.WorkspaceID, _ control.SessionID, expected uint64) (uint64, error) {
+	return expected + 1, nil
+}
+
+func (f *fleetFakeSessions) RenewControllerLease(context.Context, control.WorkspaceID, control.SessionID, control.ControllerLease) error {
+	return nil
+}

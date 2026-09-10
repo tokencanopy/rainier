@@ -102,8 +102,37 @@ type SessionRepository interface {
 	SetChildExitCode(ctx context.Context, ws WorkspaceID, id SessionID, code int) error
 	// NextControllerGeneration advances id's controller generation by one and
 	// returns the new value, atomically with respect to every other caller.
-	// ErrNotFound when id does not exist in ws.
+	// ErrNotFound when id does not exist in ws. It is the unconditional
+	// grant, for a client that negotiates nothing and can only be admitted
+	// as the controller; a negotiated attach uses the conditional pair
+	// below.
 	NextControllerGeneration(ctx context.Context, ws WorkspaceID, id SessionID) (uint64, error)
+	// CompareAndAdvanceControllerGeneration advances id's controller
+	// generation from expected to expected+1 and vacates the lease, in ONE
+	// statement, and returns the new generation. It is the whole of the
+	// handoff guarantee: two attaches racing from the same expected value
+	// produce exactly one advance, because exactly one predicated update can
+	// match. An implementation that reads the row and then writes it back is
+	// not this method, whatever its tests say on an idle machine.
+	//
+	// ErrInvalid on an empty workspace. ErrStale when nothing matched — the
+	// generation has moved, or the row is gone. Those are one answer on
+	// purpose: the caller's remedy is identical (re-read and decide again),
+	// and telling them apart would cost a second statement that could only
+	// report a third state that was also already true a moment ago. A stale
+	// call changes nothing, in particular it increments nothing.
+	CompareAndAdvanceControllerGeneration(ctx context.Context, ws WorkspaceID, id SessionID, expected uint64) (uint64, error)
+	// RenewControllerLease installs or extends l on id, atomically and fenced
+	// by l.Generation: the update applies only while the row still carries
+	// that generation and the lease is either vacant or already l.Holder's.
+	// The first renew of a generation is how a claim takes the lease; the
+	// ones after it are the heartbeat.
+	//
+	// ErrInvalid on an empty workspace, a zero generation, or an empty
+	// holder. ErrStale when the fence did not match, which is how a
+	// controller displaced by an attach on another replica learns that it no
+	// longer holds control.
+	RenewControllerLease(ctx context.Context, ws WorkspaceID, id SessionID, l ControllerLease) error
 }
 
 // EnvironmentRepository is the workspace-keyed environment persistence port,

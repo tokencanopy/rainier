@@ -24,7 +24,8 @@ type pgSessions struct{ s *Store }
 // — 0007 folded it into image, which is control.PortableSpec.Image, and the
 // contract model has no second image column.
 const sessionCols = `id, workspace_id, owner_id, name, image, cmd, egress_allow, repos, state, pool_id, runner, ` +
-	`placement_generation, controller_generation, idempotency_key, error, environment_id, setup_hash, ` +
+	`placement_generation, controller_generation, controller_holder, controller_lease_expires_at, ` +
+	`idempotency_key, error, environment_id, setup_hash, ` +
 	`child_exit_code, created_at, updated_at, last_event_at`
 
 func scanControlSession(row rowScanner) (control.Session, error) {
@@ -34,11 +35,13 @@ func scanControlSession(row rowScanner) (control.Session, error) {
 		pool, envID                string
 		runner, idem               *string
 		placementGen, controlleGen int64
+		leaseExpires               *time.Time
 		cmdBytes, egressBytes      []byte
 		reposBytes                 []byte
 	)
 	if err := row.Scan(&id, &ws, &creator, &s.Name, &s.Spec.Image, &cmdBytes, &egressBytes, &reposBytes,
-		&state, &pool, &runner, &placementGen, &controlleGen, &idem, &s.Error, &envID, &s.SetupHash,
+		&state, &pool, &runner, &placementGen, &controlleGen, &s.ControllerHolder, &leaseExpires,
+		&idem, &s.Error, &envID, &s.SetupHash,
 		&s.ChildExitCode, &s.CreatedAt, &s.UpdatedAt, &s.LastEventAt); err != nil {
 		return control.Session{}, err
 	}
@@ -56,6 +59,11 @@ func scanControlSession(row rowScanner) (control.Session, error) {
 	}
 	s.PlacementGeneration = uint64(placementGen)
 	s.ControllerGeneration = uint64(controlleGen)
+	// SQL NULL is a vacant lease, which is the zero time, not a zero-value
+	// timestamptz somebody could mistake for "expired in year one".
+	if leaseExpires != nil {
+		s.ControllerLeaseExpiresAt = *leaseExpires
+	}
 
 	if len(cmdBytes) > 0 {
 		if err := json.Unmarshal(cmdBytes, &s.Spec.Cmd); err != nil {
@@ -382,4 +390,61 @@ func (r pgSessions) NextControllerGeneration(ctx context.Context, ws control.Wor
 		return 0, unavailable("next controller generation", err)
 	}
 	return uint64(generation), nil
+}
+
+// CompareAndAdvanceControllerGeneration advances the row's controller
+// generation from expected, and vacates the lease in the same statement. One
+// predicated UPDATE is the whole handoff guarantee: two claims racing from
+// the same expected value cannot both match, whatever process, replica or
+// connection they arrive on.
+//
+// Vacating the lease here is why there is no separate release primitive: a
+// controller that leaves advances the generation, which both frees the lease
+// and fences everything it had already sent.
+func (r pgSessions) CompareAndAdvanceControllerGeneration(ctx context.Context, ws control.WorkspaceID,
+	id control.SessionID, expected uint64) (uint64, error) {
+	if ws == "" {
+		return 0, control.ErrInvalid
+	}
+	var generation int64
+	err := r.s.q(ctx).QueryRow(ctx, `
+		UPDATE sessions
+		SET controller_generation = controller_generation + 1,
+		    controller_holder = '', controller_lease_expires_at = NULL, updated_at = now()
+		WHERE workspace_id = $1 AND id = $2 AND controller_generation = $3
+		RETURNING controller_generation`, string(ws), string(id), int64(expected)).Scan(&generation)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The generation moved or the row is gone; see the port's
+			// contract for why those are deliberately one answer.
+			return 0, control.ErrStale
+		}
+		return 0, unavailable("compare and advance controller generation", err)
+	}
+	return uint64(generation), nil
+}
+
+// RenewControllerLease installs or extends a lease, fenced by its generation
+// and its holder. The holder predicate is what keeps a second attach from
+// extending a lease it does not hold even while the generation still matches
+// — which is the window between somebody else's successful claim and its own
+// first renew.
+func (r pgSessions) RenewControllerLease(ctx context.Context, ws control.WorkspaceID,
+	id control.SessionID, l control.ControllerLease) error {
+	if ws == "" || l.Generation == 0 || l.Holder == "" {
+		return control.ErrInvalid
+	}
+	ct, err := r.s.q(ctx).Exec(ctx, `
+		UPDATE sessions
+		SET controller_holder = $4, controller_lease_expires_at = $5, updated_at = now()
+		WHERE workspace_id = $1 AND id = $2 AND controller_generation = $3
+		  AND (controller_holder = '' OR controller_holder = $4)`,
+		string(ws), string(id), int64(l.Generation), l.Holder, l.ExpiresAt.UTC())
+	if err != nil {
+		return unavailable("renew controller lease", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return control.ErrStale
+	}
+	return nil
 }

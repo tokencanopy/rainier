@@ -128,16 +128,92 @@ type Session struct {
 	PlacementGeneration uint64
 	// ControllerGeneration is the monotonic generation of this session's
 	// current terminal controller: 0 until a controller has attached, then
-	// the value NextControllerGeneration last returned. A viewer attaches
-	// under the current value; a controller advances it. Stale input is
-	// fenced against it by the attachment plane.
+	// the value the last accepted claim returned. A viewer attaches under
+	// the current value; a controller advances it. Stale input is fenced
+	// against it where it would execute — at the PTY — and again at the
+	// attachment plane.
 	ControllerGeneration uint64
-	IdempotencyKey       string
-	ChildExitCode        *int
-	Error                string
-	CreatedAt            time.Time
-	UpdatedAt            time.Time
-	LastEventAt          time.Time
+	// ControllerHolder is the opaque identity of the attach currently
+	// holding the controller lease, or "" when the lease is vacant. It is
+	// minted per attach from crypto/rand and is NOT a user, device, account
+	// or browser-session identifier: nothing outside the control plane ever
+	// receives it, and the only thing derived from it that a client can see
+	// is the boolean "somebody holds control".
+	ControllerHolder string
+	// ControllerLeaseExpiresAt is when the current lease stops being live,
+	// or the zero time when the lease is vacant. Expiry is passive: nothing
+	// sweeps leases, and a lease whose expiry has passed is simply not live,
+	// so the next attach claims over it. That is what keeps control from
+	// being stuck on a device that crashed without releasing.
+	ControllerLeaseExpiresAt time.Time
+	IdempotencyKey           string
+	ChildExitCode            *int
+	Error                    string
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
+	LastEventAt              time.Time
+}
+
+// ControllerLease is one grant of terminal control: the generation it was
+// granted under, the opaque attach holding it, and when it stops being live.
+// The generation is the authority — it is what input is fenced against — and
+// the lease is the scheduling hint that lets the next attach know whether
+// anybody is currently using that authority.
+type ControllerLease struct {
+	Generation uint64
+	Holder     string
+	ExpiresAt  time.Time
+}
+
+// Live reports whether l is a lease somebody currently holds, as of now. A
+// vacant holder is never live, whatever the expiry says.
+func (l ControllerLease) Live(now time.Time) bool {
+	return l.Holder != "" && l.ExpiresAt.After(now)
+}
+
+// ControllerLeaseOf reads s's lease off the row.
+func ControllerLeaseOf(s Session) ControllerLease {
+	return ControllerLease{
+		Generation: s.ControllerGeneration,
+		Holder:     s.ControllerHolder,
+		ExpiresAt:  s.ControllerLeaseExpiresAt,
+	}
+}
+
+// The lease's two timing parameters, public because a host composing this
+// application (and the plane driving one attach) must agree with the
+// repository about them.
+//
+// Six renewals per lease: one lost heartbeat, or one that arrives late behind
+// a slow write, never costs a controller its lease, while a client that dies
+// outright is out of the way in half a minute — long enough that a laptop lid
+// closing and reopening is usually still the same controller, short enough
+// that nobody waits on a device that is not coming back.
+const (
+	ControllerLeaseTTL          = 30 * time.Second
+	ControllerHeartbeatInterval = 5 * time.Second
+)
+
+// ControllerLeaseKeeper is the live half of the controller lease: the three
+// operations one attach performs on it after the attachment service has
+// granted it. It travels on AttachTarget so that a broker — a plane, a
+// gateway — can run a handoff without ever being handed a repository.
+//
+// Claim advances the generation from expected, returning ErrStale when
+// somebody else advanced it first (the caller stays, or becomes, a viewer and
+// may claim again from the generation it is told about). Renew extends the
+// lease under a generation this attach was granted, and reports ErrStale once
+// that generation has moved — which is how a displaced controller on another
+// replica finds out. Release vacates the lease AND advances the generation,
+// because a controller that is leaving must not leave the bytes it already
+// sent executable.
+//
+// A nil keeper on an AttachTarget means the host does not negotiate control;
+// the attach then behaves exactly as it did before this contract existed.
+type ControllerLeaseKeeper interface {
+	Claim(ctx context.Context, expected uint64) (uint64, error)
+	Renew(ctx context.Context, generation uint64) error
+	Release(ctx context.Context, generation uint64) error
 }
 
 // CreateSession is the command for CreateSession. EnvironmentID names the

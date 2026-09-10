@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"slices"
@@ -271,12 +272,13 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	if want := embeddedMigrationVersions(t); !slices.Equal(applied, want) {
 		t.Fatalf("schema_migrations = %v, want every embedded migration in order %v", applied, want)
 	}
-	// This release's head is 12: a database that stopped at 0003 runs the
+	// This release's head is 13: a database that stopped at 0003 runs the
 	// expand step (0007), the contract step (0008), the events table
-	// (0009), the agent credentials table (0010), the tombstone (0011), and
-	// the durable revoke fence (0012) in the same start.
-	if head := applied[len(applied)-1]; head != 12 {
-		t.Fatalf("head migration = %d, want 12", head)
+	// (0009), the agent credentials table (0010), the tombstone (0011), the
+	// durable revoke fence (0012), and the controller lease (0013) in the
+	// same start.
+	if head := applied[len(applied)-1]; head != 13 {
+		t.Fatalf("head migration = %d, want 13", head)
 	}
 
 	// The legacy session survived, and its new columns read as "never exited"
@@ -461,7 +463,23 @@ func freshDB(t *testing.T, dsn, name string) string {
 		defer cleanup.Close()
 		cleanup.Exec(context.Background(), "DROP DATABASE IF EXISTS "+db+" WITH (FORCE)", pgx.QueryExecModeSimpleProtocol)
 	})
-	return strings.Replace(dsn, "/postgres?", "/"+db+"?", 1)
+	return withDatabase(t, dsn, db)
+}
+
+// withDatabase rewrites dsn's database path to db. It parses rather than
+// string-replacing "/postgres?": RAINIER_TEST_PG_DSN names whatever database
+// the operator created (the README says rainier_core_test), and a replace
+// that only matched the container's default silently returned the ADMIN dsn
+// for every "fresh" database — so every case that thought it had an empty
+// store shared one, and the suite failed on a perfectly good server.
+func withDatabase(t *testing.T, dsn, db string) string {
+	t.Helper()
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("RAINIER_TEST_PG_DSN is not a URL: %v", err)
+	}
+	u.Path = "/" + db
+	return u.String()
 }
 
 // reopen opens a second Store over a database that already exists — the
@@ -653,6 +671,37 @@ func TestMigration0007BackfillsExistingRows(t *testing.T) {
 		if def != nil {
 			t.Fatalf("%s.%s still defaults to %q after 0008", scoped.table, scoped.column, *def)
 		}
+	}
+}
+
+// TestMigration0013LeavesExistingRowsVacant is the compatibility half of the
+// controller lease: a session that was running when the operator upgraded
+// must come out holding no lease at all, so the next attach claims it with no
+// click rather than waiting out a lease nobody ever took.
+func TestMigration0013LeavesExistingRowsVacant(t *testing.T) {
+	ctx := context.Background()
+	pool := rawPoolAt(t, startPostgres(t), 12)
+	mustExec(t, pool, `INSERT INTO users (id, github_id, login, role) VALUES ('usr_example', 1, 'octocat-example', 'admin')`)
+	mustExec(t, pool, `INSERT INTO sessions (id, workspace_id, owner_id, name, image, state, pool_id, controller_generation)
+		VALUES ('sess_example', 'ws_self_hosted', 'usr_example', 'dev', 'img:1', 'running', 'pool_self_hosted', 4)`)
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	st := reopen(t, pool.Config().ConnString())
+	row, err := st.Sessions().GetSession(ctx, "ws_self_hosted", "sess_example")
+	if err != nil {
+		t.Fatalf("legacy session after upgrade: %v", err)
+	}
+	if row.ControllerGeneration != 4 {
+		t.Fatalf("the generation moved during the upgrade: %d, want 4", row.ControllerGeneration)
+	}
+	if row.ControllerHolder != "" || !row.ControllerLeaseExpiresAt.IsZero() {
+		t.Fatalf("an upgraded row holds a lease: holder %q, expiry %v", row.ControllerHolder, row.ControllerLeaseExpiresAt)
+	}
+	// And it is claimable from exactly the generation it came out with.
+	if gen, err := st.Sessions().CompareAndAdvanceControllerGeneration(ctx, "ws_self_hosted", "sess_example", 4); err != nil || gen != 5 {
+		t.Fatalf("first claim after the upgrade = %d, %v; want 5, nil", gen, err)
 	}
 }
 

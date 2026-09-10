@@ -1624,3 +1624,30 @@ func TestCreateFromACachedEnvironmentStoresTheEnvironmentImage(t *testing.T) {
 		t.Fatalf("stored image = %q, want the environment's %q", stored.Spec.Image, env.Image)
 	}
 }
+
+func (r *sessionStubSessionRepo) CompareAndAdvanceControllerGeneration(_ context.Context, ws control.WorkspaceID,
+	id control.SessionID, expected uint64) (uint64, error) {
+	r.log.add("sessions:compare-and-advance-controller-generation")
+	s, ok := r.rows[id]
+	if !ok || s.WorkspaceID != ws || s.ControllerGeneration != expected {
+		return 0, control.ErrStale
+	}
+	s.ControllerGeneration++
+	s.ControllerHolder = ""
+	s.ControllerLeaseExpiresAt = time.Time{}
+	r.rows[id] = s
+	return s.ControllerGeneration, nil
+}
+
+func (r *sessionStubSessionRepo) RenewControllerLease(_ context.Context, ws control.WorkspaceID,
+	id control.SessionID, l control.ControllerLease) error {
+	r.log.add("sessions:renew-controller-lease")
+	s, ok := r.rows[id]
+	if !ok || s.WorkspaceID != ws || s.ControllerGeneration != l.Generation {
+		return control.ErrStale
+	}
+	s.ControllerHolder = l.Holder
+	s.ControllerLeaseExpiresAt = l.ExpiresAt
+	r.rows[id] = s
+	return nil
+}

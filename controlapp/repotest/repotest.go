@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -68,6 +69,8 @@ func cases() []suiteCase {
 		{"S9 provenance writes", caseSessionProvenance},
 		{"S10 controller generation", caseControllerGeneration},
 		{"S11 a placement transition records the resolved image", caseTransitionImage},
+		{"S12 exactly one of two claims from one generation wins", caseControllerClaimRace},
+		{"S13 the controller lease is fenced by its generation and its holder", caseControllerLease},
 
 		{"E1 environment round trip", caseEnvironmentRoundTrip},
 		{"E2 an environment name is unique per workspace", caseEnvironmentName},
@@ -452,6 +455,14 @@ func caseSessionEmptyWorkspace(t *testing.T, s Stores) {
 			_, err := s.Sessions.NextControllerGeneration(ctx, "", "sess_example")
 			return err
 		}},
+		{"CompareAndAdvanceControllerGeneration", func() error {
+			_, err := s.Sessions.CompareAndAdvanceControllerGeneration(ctx, "", "sess_example", 0)
+			return err
+		}},
+		{"RenewControllerLease", func() error {
+			return s.Sessions.RenewControllerLease(ctx, "", "sess_example",
+				control.ControllerLease{Generation: 1, Holder: "att_example", ExpiresAt: time.Now().Add(time.Minute)})
+		}},
 	} {
 		if err := tc.call(); !errors.Is(err, control.ErrInvalid) {
 			t.Errorf("%s with an empty workspace: err = %v, want ErrInvalid", tc.name, err)
@@ -822,6 +833,193 @@ func caseControllerGeneration(t *testing.T, s Stores) {
 
 	if _, err := s.Sessions.NextControllerGeneration(ctx, Alpha, "sess_nosuch"); !errors.Is(err, control.ErrNotFound) {
 		t.Fatalf("generation for an unknown id: err = %v, want ErrNotFound", err)
+	}
+}
+
+// caseControllerClaimRace (S12) is the handoff guarantee itself: two devices
+// claiming control from the same generation must produce exactly one winner
+// and one stale answer, and the stale one must increment nothing.
+//
+// It runs the two claims CONCURRENTLY, which is the only version of this test
+// worth having. A store that reads the row and then writes it back passes a
+// sequential version of this case every time and this one approximately
+// never; that is precisely the implementation the port forbids, and this is
+// what catches it.
+func caseControllerClaimRace(t *testing.T, s Stores) {
+	ctx := context.Background()
+	mustCreate(t, s, Alpha, control.Session{ID: "sess_example", CreatorID: "act_a", State: control.StateRunning, PoolID: PoolA})
+
+	// Walk the row up to 7 so the expected value under test is not also the
+	// zero value of everything around it.
+	for range 7 {
+		if _, err := s.Sessions.NextControllerGeneration(ctx, Alpha, "sess_example"); err != nil {
+			t.Fatalf("advancing to generation 7: %v", err)
+		}
+	}
+
+	const racers = 8
+	type outcome struct {
+		gen uint64
+		err error
+	}
+	results := make([]outcome, racers)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range racers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			gen, err := s.Sessions.CompareAndAdvanceControllerGeneration(ctx, Alpha, "sess_example", 7)
+			results[i] = outcome{gen, err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	winners := 0
+	for i, got := range results {
+		switch {
+		case got.err == nil:
+			winners++
+			if got.gen != 8 {
+				t.Errorf("claim %d won with generation %d, want 8", i, got.gen)
+			}
+		case errors.Is(got.err, control.ErrStale):
+			if got.gen != 0 {
+				t.Errorf("claim %d lost but reported generation %d, want 0", i, got.gen)
+			}
+		default:
+			t.Errorf("claim %d: err = %v, want nil or ErrStale", i, got.err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("%d of %d concurrent claims from generation 7 won; want exactly 1", winners, racers)
+	}
+
+	// And the losers moved nothing: the row is at 8, not at 8 plus however
+	// many claims happened to be racing.
+	row, err := s.Sessions.GetSession(ctx, Alpha, "sess_example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ControllerGeneration != 8 {
+		t.Fatalf("the row's controller generation = %d after %d concurrent claims from 7; want 8",
+			row.ControllerGeneration, racers)
+	}
+
+	// A claim from a generation that has already been superseded is stale
+	// however long it waits, and still increments nothing.
+	if _, err := s.Sessions.CompareAndAdvanceControllerGeneration(ctx, Alpha, "sess_example", 7); !errors.Is(err, control.ErrStale) {
+		t.Fatalf("a second claim from 7: err = %v, want ErrStale", err)
+	}
+	if _, err := s.Sessions.CompareAndAdvanceControllerGeneration(ctx, Alpha, "sess_nosuch", 0); !errors.Is(err, control.ErrStale) {
+		t.Fatalf("a claim on an unknown id: err = %v, want ErrStale", err)
+	}
+	row, err = s.Sessions.GetSession(ctx, Alpha, "sess_example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ControllerGeneration != 8 {
+		t.Fatalf("a stale claim moved the row to %d; want 8", row.ControllerGeneration)
+	}
+}
+
+// caseControllerLease (S13) pins the lease beside the generation: a claim
+// vacates it, the holder installs it, a renew under a superseded generation
+// or by a second holder is refused, and none of that touches another
+// workspace's identically named row.
+func caseControllerLease(t *testing.T, s Stores) {
+	ctx := context.Background()
+	mustCreate(t, s, Alpha, control.Session{ID: "sess_example", CreatorID: "act_a", State: control.StateRunning, PoolID: PoolA})
+	mustCreate(t, s, Beta, control.Session{ID: "sess_example", CreatorID: "act_a", State: control.StateRunning, PoolID: PoolB})
+
+	// A fresh row is vacant: nobody holds control on a session nobody has
+	// attached to, which is what makes the first attach zero-click.
+	row, err := s.Sessions.GetSession(ctx, Alpha, "sess_example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ControllerHolder != "" || !row.ControllerLeaseExpiresAt.IsZero() {
+		t.Fatalf("a fresh row already holds a lease: holder %q, expiry %v", row.ControllerHolder, row.ControllerLeaseExpiresAt)
+	}
+
+	gen, err := s.Sessions.CompareAndAdvanceControllerGeneration(ctx, Alpha, "sess_example", 0)
+	if err != nil || gen != 1 {
+		t.Fatalf("first claim = %d, %v; want 1, nil", gen, err)
+	}
+	expires := time.Now().Add(30 * time.Second).UTC().Truncate(time.Millisecond)
+	if err := s.Sessions.RenewControllerLease(ctx, Alpha, "sess_example",
+		control.ControllerLease{Generation: 1, Holder: "att_aaaa", ExpiresAt: expires}); err != nil {
+		t.Fatalf("the winner's first renew: %v", err)
+	}
+	row, err = s.Sessions.GetSession(ctx, Alpha, "sess_example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ControllerHolder != "att_aaaa" {
+		t.Fatalf("stored holder = %q, want att_aaaa", row.ControllerHolder)
+	}
+	if !row.ControllerLeaseExpiresAt.UTC().Equal(expires) {
+		t.Fatalf("stored expiry = %v, want %v", row.ControllerLeaseExpiresAt.UTC(), expires)
+	}
+
+	// A second holder may not extend a lease it does not hold, even while
+	// the generation still matches: that is the window between somebody
+	// else's successful claim and its own first renew.
+	if err := s.Sessions.RenewControllerLease(ctx, Alpha, "sess_example",
+		control.ControllerLease{Generation: 1, Holder: "att_bbbb", ExpiresAt: expires}); !errors.Is(err, control.ErrStale) {
+		t.Fatalf("a second holder's renew at the same generation: err = %v, want ErrStale", err)
+	}
+	// The holder itself may renew as often as it likes.
+	later := expires.Add(30 * time.Second)
+	if err := s.Sessions.RenewControllerLease(ctx, Alpha, "sess_example",
+		control.ControllerLease{Generation: 1, Holder: "att_aaaa", ExpiresAt: later}); err != nil {
+		t.Fatalf("the holder's heartbeat: %v", err)
+	}
+
+	// A take-over advances the generation and vacates the lease in the same
+	// step — which is also what a clean release is, and is why a departing
+	// controller leaves nothing of its own behind.
+	gen, err = s.Sessions.CompareAndAdvanceControllerGeneration(ctx, Alpha, "sess_example", 1)
+	if err != nil || gen != 2 {
+		t.Fatalf("take-over = %d, %v; want 2, nil", gen, err)
+	}
+	row, err = s.Sessions.GetSession(ctx, Alpha, "sess_example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ControllerHolder != "" || !row.ControllerLeaseExpiresAt.IsZero() {
+		t.Fatalf("a take-over left the old lease behind: holder %q, expiry %v", row.ControllerHolder, row.ControllerLeaseExpiresAt)
+	}
+	// The displaced holder's heartbeat is how it finds out, wherever it is
+	// running: its generation is gone.
+	if err := s.Sessions.RenewControllerLease(ctx, Alpha, "sess_example",
+		control.ControllerLease{Generation: 1, Holder: "att_aaaa", ExpiresAt: later}); !errors.Is(err, control.ErrStale) {
+		t.Fatalf("the displaced holder's heartbeat: err = %v, want ErrStale", err)
+	}
+
+	// A malformed lease is input, not a missing row.
+	for _, tc := range []struct {
+		name  string
+		lease control.ControllerLease
+	}{
+		{"no generation", control.ControllerLease{Holder: "att_aaaa", ExpiresAt: later}},
+		{"no holder", control.ControllerLease{Generation: 2, ExpiresAt: later}},
+	} {
+		if err := s.Sessions.RenewControllerLease(ctx, Alpha, "sess_example", tc.lease); !errors.Is(err, control.ErrInvalid) {
+			t.Errorf("renew with %s: err = %v, want ErrInvalid", tc.name, err)
+		}
+	}
+
+	// None of it reached the identically named row next door.
+	betaRow, err := s.Sessions.GetSession(ctx, Beta, "sess_example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if betaRow.ControllerGeneration != 0 || betaRow.ControllerHolder != "" {
+		t.Fatalf("Beta's row moved with Alpha's: generation %d, holder %q",
+			betaRow.ControllerGeneration, betaRow.ControllerHolder)
 	}
 }
 

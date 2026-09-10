@@ -569,14 +569,16 @@ func (f *attachmentFakePolicy) AuthorizeAttachment(_ context.Context, _ control.
 }
 
 type attachmentFakeSessions struct {
-	mu        sync.Mutex
-	found     bool
-	row       control.Session
-	err       error
-	calls     int
-	nextCalls int
-	lastWS    control.WorkspaceID
-	lastID    control.SessionID
+	mu         sync.Mutex
+	found      bool
+	row        control.Session
+	err        error
+	calls      int
+	nextCalls  int
+	casCalls   int
+	renewCalls int
+	lastWS     control.WorkspaceID
+	lastID     control.SessionID
 }
 
 func (f *attachmentFakeSessions) GetSession(_ context.Context, ws control.WorkspaceID, id control.SessionID) (control.Session, error) {
@@ -763,5 +765,38 @@ func (r *attachmentRecordingTerminalStream) Close(err error) error {
 	defer r.mu.Unlock()
 	r.closed = true
 	r.closeErr = err
+	return nil
+}
+
+// CompareAndAdvanceControllerGeneration is the conditional grant: it advances
+// the row only from the exact generation the caller expected, so an attach
+// test can stage the race the contract is about.
+func (f *attachmentFakeSessions) CompareAndAdvanceControllerGeneration(_ context.Context, ws control.WorkspaceID,
+	id control.SessionID, expected uint64) (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.casCalls++
+	if !f.found || f.row.ControllerGeneration != expected {
+		return 0, control.ErrStale
+	}
+	f.row.ControllerGeneration++
+	f.row.ControllerHolder = ""
+	f.row.ControllerLeaseExpiresAt = time.Time{}
+	return f.row.ControllerGeneration, nil
+}
+
+func (f *attachmentFakeSessions) RenewControllerLease(_ context.Context, ws control.WorkspaceID,
+	id control.SessionID, l control.ControllerLease) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.renewCalls++
+	if !f.found || f.row.ControllerGeneration != l.Generation {
+		return control.ErrStale
+	}
+	if f.row.ControllerHolder != "" && f.row.ControllerHolder != l.Holder {
+		return control.ErrStale
+	}
+	f.row.ControllerHolder = l.Holder
+	f.row.ControllerLeaseExpiresAt = l.ExpiresAt
 	return nil
 }

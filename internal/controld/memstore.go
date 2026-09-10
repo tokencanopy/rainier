@@ -405,8 +405,59 @@ func (r memSessions) NextControllerGeneration(ctx context.Context, ws control.Wo
 		return 0, control.ErrNotFound
 	}
 	s.ControllerGeneration++
+	s.ControllerHolder = ""
+	s.ControllerLeaseExpiresAt = time.Time{}
 	s.UpdatedAt = time.Now()
 	return s.ControllerGeneration, nil
+}
+
+// CompareAndAdvanceControllerGeneration advances the row's controller
+// generation from expected and vacates the lease. The store's own mutex is
+// what makes it one step here, the same role the predicated UPDATE plays in
+// SQL: two claims racing from the same expected value cannot both match.
+func (r memSessions) CompareAndAdvanceControllerGeneration(ctx context.Context, ws control.WorkspaceID,
+	id control.SessionID, expected uint64) (uint64, error) {
+	if ws == "" {
+		return 0, control.ErrInvalid
+	}
+	m := r.m
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[sessionKey{ws, id}]
+	// The generation moved or the row is gone; see the port's contract for
+	// why those are deliberately one answer.
+	if !ok || s.ControllerGeneration != expected {
+		return 0, control.ErrStale
+	}
+	s.ControllerGeneration++
+	s.ControllerHolder = ""
+	s.ControllerLeaseExpiresAt = time.Time{}
+	s.UpdatedAt = time.Now()
+	return s.ControllerGeneration, nil
+}
+
+// RenewControllerLease installs or extends a lease, fenced by its generation
+// and its holder — the holder predicate is what keeps a second attach from
+// extending a lease it does not hold while the generation still matches.
+func (r memSessions) RenewControllerLease(ctx context.Context, ws control.WorkspaceID,
+	id control.SessionID, l control.ControllerLease) error {
+	if ws == "" || l.Generation == 0 || l.Holder == "" {
+		return control.ErrInvalid
+	}
+	m := r.m
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[sessionKey{ws, id}]
+	if !ok || s.ControllerGeneration != l.Generation {
+		return control.ErrStale
+	}
+	if s.ControllerHolder != "" && s.ControllerHolder != l.Holder {
+		return control.ErrStale
+	}
+	s.ControllerHolder = l.Holder
+	s.ControllerLeaseExpiresAt = l.ExpiresAt
+	s.UpdatedAt = time.Now()
+	return nil
 }
 
 // sessionByIdem finds the session creator already created under key in ws.

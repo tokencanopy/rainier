@@ -770,3 +770,12 @@ func TestCreateSessionComposesEnvironmentAndOverrides(t *testing.T) {
 		t.Fatalf("empty repository name: got %v, want ErrInvalid", err)
 	}
 }
+
+func (fakeSessionRepository) CompareAndAdvanceControllerGeneration(_ context.Context, _ control.WorkspaceID, _ control.SessionID, expected uint64) (uint64, error) {
+	_ = expected
+	return 0, nil
+}
+
+func (fakeSessionRepository) RenewControllerLease(context.Context, control.WorkspaceID, control.SessionID, control.ControllerLease) error {
+	return nil
+}
