@@ -1,0 +1,247 @@
+name: Release CLI
+
+# One tag, one release. Pushing `v<semver>` builds the four platform archives,
+# publishes the GitHub release, pins their hashes into the npm wrapper, and
+# publishes that wrapper to npm. Nothing here is done by hand.
+#
+# Two facts this workflow depends on, both deliberate:
+#   * The archives must exist at their download URLs before the wrapper that
+#     pins their hashes is published, so the release is created first.
+#   * The wrapper's pinned hashes must describe the bytes actually uploaded, so
+#     they are computed from the uploaded artifacts and never assumed.
+#
+# Publishing uses npm Trusted Publishing (OIDC), not a stored token: npm is
+# restricting token-based publishing that bypasses 2FA. Configure this
+# repository and workflow as a trusted publisher for @tokencanopy/rainier on
+# npmjs.com once. `NPM_TOKEN` is honored if present, so a token remains a
+# fallback while that is being set up.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)release, e.g. v0.0.10'
+        required: true
+
+permissions:
+  contents: write   # create the release, upload assets, record the pins on main
+  id-token: write   # npm Trusted Publishing
+
+concurrency:
+  group: release-cli-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      PACKAGE: '@tokencanopy/rainier'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Derive and validate the version
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            v*) VERSION="${TAG#v}" ;;
+            *) echo "::error::tag $TAG does not start with v"; exit 1 ;;
+          esac
+          # A malformed version would publish an unusable package and cannot be
+          # taken back, so it fails here rather than at the registry.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::$VERSION is not a semantic version"; exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Refuse to republish a version the registry already has
+        run: |
+          set -euo pipefail
+          # npm forbids overwriting a published version. Discovering that after
+          # the GitHub release exists leaves a half-finished release behind.
+          if npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1; then
+            echo "::error::$PACKAGE@$VERSION is already published"; exit 1
+          fi
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify the tagged tree
+        # The gate for the whole workflow: an unverified tree is never
+        # published. `make verify` is the same target CI runs on every PR.
+        run: make verify
+
+      - name: CLI and client race checks
+        run: go test -race -count=1 ./cmd/rainier/ ./internal/cli/
+
+      - name: Build the four platform archives
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          LDFLAGS="-s -w -X main.version=$TAG -X main.sourceRevision=$SOURCE_SHA -X main.sourceDirty=false"
+          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+            GOOS="${target%%/*}"; GOARCH="${target##*/}"
+            CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" go build \
+              -trimpath -buildvcs=false -ldflags "$LDFLAGS" -o dist/rainier ./cmd/rainier
+            # Deterministic archives: without these flags tar records the
+            # build's mtimes, uid and gid, so two builds of identical bytes
+            # would hash differently and the pins could not be reproduced.
+            tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+              -czf "dist/rainier_${VERSION}_${GOOS}_${GOARCH}.tar.gz" -C dist rainier
+            rm dist/rainier
+          done
+          cd dist && sha256sum rainier_"$VERSION"_*.tar.gz > SHA256SUMS && cat SHA256SUMS
+
+      - name: Record how the binaries were built
+        run: |
+          set -euo pipefail
+          cat > dist/BUILDINFO.txt <<INFO
+          Rainier CLI $TAG beta
+          Source: https://github.com/${{ github.repository }}/commit/$SOURCE_SHA
+          Go: $(go version)
+          Build: CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags '-s -w -X main.version=$TAG -X main.sourceRevision=$SOURCE_SHA -X main.sourceDirty=false' ./cmd/rainier
+          Platforms: darwin/amd64, darwin/arm64, linux/amd64, linux/arm64
+          Built by: ${{ github.workflow }} run ${{ github.run_id }}
+          macOS binaries are not Developer ID signed or notarized.
+          INFO
+          cat dist/BUILDINFO.txt
+
+      - name: Smoke-test the host-native binary
+        run: |
+          set -euo pipefail
+          tar -xzf "dist/rainier_${VERSION}_linux_amd64.tar.gz" -C dist
+          # A binary that reports the wrong version would pin correct hashes to
+          # the wrong build, which no later check would catch.
+          got="$(dist/rainier version)"
+          [ "$got" = "rainier $TAG" ] || { echo "::error::version reports '$got', want 'rainier $TAG'"; exit 1; }
+          lines="$(dist/rainier --help | wc -l)"
+          [ "$lines" -le 24 ] || { echo "::error::default help is $lines lines; it must fit one screen"; exit 1; }
+          rm dist/rainier
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Re-runnable: a release left behind by a failed attempt is filled in
+          # rather than blocking the retry.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" --title "Rainier CLI $TAG beta" --prerelease \
+              --generate-notes dist/*
+          fi
+
+      - name: Pin the published archives into the npm wrapper
+        run: |
+          set -euo pipefail
+          # Hashes come from the uploaded artifacts, so the wrapper can only
+          # ever pin bytes that are actually downloadable.
+          {
+            echo "// Immutable CLI assets built from the published $TAG release."
+            echo "export const version = '$VERSION';"
+            echo "export const assets = {"
+            first=1
+            for pair in darwin_x64:darwin:amd64 darwin_arm64:darwin:arm64 linux_x64:linux:amd64 linux_arm64:linux:arm64; do
+              key="${pair%%:*}"; rest="${pair#*:}"; os="${rest%%:*}"; goarch="${rest##*:}"
+              archive="dist/rainier_${VERSION}_${os}_${goarch}.tar.gz"
+              ah="$(sha256sum "$archive" | cut -d' ' -f1)"
+              tar -xzf "$archive" -C dist rainier
+              bh="$(sha256sum dist/rainier | cut -d' ' -f1)"
+              rm dist/rainier
+              [ $first -eq 1 ] || echo ","
+              first=0
+              printf '  "%s": [\n    "%s",\n    "%s",\n    "%s"\n  ]' "$key" "$goarch" "$ah" "$bh"
+            done
+            echo ""
+            echo "};"
+          } > npm/release.js
+          cat npm/release.js
+          # The wrapper's docs, its one hard-coded fallback URL, and its test
+          # all name a version; a stale one sends users to the previous
+          # release. Rewrite the outgoing version literally rather than by
+          # pattern: a `0.0.x` pattern would silently stop matching at 0.1.0,
+          # which is the same quiet drift this workflow exists to end.
+          PREVIOUS="$(node -p 'require("./npm/package.json").version')"
+          npm --prefix npm version "$VERSION" --no-git-tag-version --allow-same-version
+          if [ "$PREVIOUS" != "$VERSION" ]; then
+            sed -i "s/${PREVIOUS//./\\.}/$VERSION/g" \
+              npm/README.md npm/cli.js npm/test/runtime.test.js
+          fi
+          if grep -rn -- "$PREVIOUS" npm/ --include='*.js' --include='*.md' --include='*.json'; then
+            echo "::error::npm/ still references the previous version $PREVIOUS"; exit 1
+          fi
+
+      - name: Test the wrapper against the pins it just wrote
+        run: npm --prefix npm test
+
+      - name: Check the package contents
+        run: |
+          set -euo pipefail
+          cd npm
+          # The package ships six files and no dependencies or lifecycle
+          # scripts; anything else is a supply-chain change, not a release.
+          files="$(npm pack --dry-run --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s)[0].files.map(f=>f.path).sort().join(" ")))')"
+          expected="LICENSE README.md cli.js package.json release.js runtime.js"
+          [ "$files" = "$expected" ] || { echo "::error::package contains [$files], want [$expected]"; exit 1; }
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm install -g npm@latest   # Trusted Publishing needs npm >= 11.5.1
+          cd npm
+          npm publish --provenance --tag beta
+          # `latest` is what a bare `npm install` resolves to. Left alone it
+          # stays on whichever version npm assigned it first.
+          npm dist-tag add "$PACKAGE@$VERSION" latest
+
+      - name: Verify the published package end to end
+        run: |
+          set -euo pipefail
+          cd "$(mktemp -d)"
+          npm pack "$PACKAGE@$VERSION" >/dev/null
+          # A real install from the registry, downloading and checksum-gating
+          # the real archive: the path every user takes.
+          npm install -g --ignore-scripts "$PACKAGE@$VERSION"
+          got="$(rainier version)"
+          [ "$got" = "rainier $TAG" ] || { echo "::error::published wrapper reports '$got'"; exit 1; }
+          npm view "$PACKAGE" dist-tags
+
+      - name: Record the pins on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # main keeps the record of what was published. Without this the
+          # repository's wrapper describes the previous release forever.
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch origin main
+          git checkout -B "release/npm-$VERSION" origin/main
+          git add npm/
+          if git diff --cached --quiet; then
+            echo 'npm wrapper already matches the published release'; exit 0
+          fi
+          git commit -m "chore: track npm CLI beta $VERSION release" \
+            -m "Published by ${{ github.workflow }} run ${{ github.run_id }} from $TAG."
+          git push origin "release/npm-$VERSION"
+          gh pr create --base main --head "release/npm-$VERSION" \
+            --title "chore: track npm CLI beta $VERSION release" \
+            --body "Pins the published [$TAG](https://github.com/${{ github.repository }}/releases/tag/$TAG) archives into the npm wrapper. Generated from the uploaded artifacts by [run ${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}); the package is already on the registry."
