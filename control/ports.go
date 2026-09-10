@@ -114,6 +114,7 @@ type SessionRepository interface {
 //	ListEnvironments         → Store.ListEnvironments
 //	UpdateEnvironment        → Store.UpdateEnvironment
 //	DeleteEnvironment        → Store.DeleteEnvironment
+//	DeleteEnvironmentUnlessReferenced -> Store.DeleteEnvironmentUnlessReferenced
 //	CountSessionsByEnvironment → Store.CountSessionsByEnvironment
 //	SetEnvironmentSnapshot   → Store.SetEnvironmentSnapshot
 type EnvironmentRepository interface {
@@ -122,6 +123,9 @@ type EnvironmentRepository interface {
 	ListEnvironments(ctx context.Context, ws WorkspaceID, q EnvironmentQuery) ([]Environment, string, error)
 	UpdateEnvironment(ctx context.Context, ws WorkspaceID, e Environment) (Environment, error)
 	DeleteEnvironment(ctx context.Context, ws WorkspaceID, id EnvironmentID) error
+	// DeleteEnvironmentUnlessReferenced atomically deletes envID unless a
+	// session in states still references it: ErrConflict then, ErrNotFound if envID is already gone.
+	DeleteEnvironmentUnlessReferenced(ctx context.Context, ws WorkspaceID, id EnvironmentID, states []SessionState) error
 	// CountSessionsByEnvironment counts sessions on envID whose state is in
 	// states; an empty states counts every session on the environment.
 	CountSessionsByEnvironment(ctx context.Context, ws WorkspaceID, envID EnvironmentID, states []SessionState) (int, error)

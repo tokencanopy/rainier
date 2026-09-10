@@ -373,6 +373,26 @@ func (r *sessionStubEnvironmentRepo) CountSessionsByEnvironment(ctx context.Cont
 	return r.liveSessionCount, nil
 }
 
+func (r *sessionStubEnvironmentRepo) DeleteEnvironmentUnlessReferenced(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID, states []control.SessionState) error {
+	r.log.add("environments:delete-unless-referenced")
+	r.lastCountStates = states
+	if r.countErr != nil {
+		return r.countErr
+	}
+	if r.liveSessionCount != 0 {
+		return control.ErrConflict
+	}
+	if r.deleteErr != nil {
+		return r.deleteErr
+	}
+	e, ok := r.rows[id]
+	if !ok || e.WorkspaceID != ws {
+		return control.ErrNotFound
+	}
+	delete(r.rows, id)
+	return nil
+}
+
 func (r *sessionStubEnvironmentRepo) SetEnvironmentSnapshot(ctx context.Context, ws control.WorkspaceID, envID control.EnvironmentID, expectHash, ref string, runnerID control.RunnerID) error {
 	r.log.add("environments:set-snapshot")
 	return nil

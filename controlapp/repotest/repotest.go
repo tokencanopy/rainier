@@ -77,6 +77,7 @@ func cases() []suiteCase {
 		{"E6 guarded snapshot and its capability", caseEnvironmentSnapshot},
 		{"E7 count sessions by environment", caseCountSessionsByEnvironment},
 		{"E8 an empty workspace is invalid on every environment method", caseEnvironmentEmptyWorkspace},
+		{"E9 delete-unless-referenced guards, then deletes, then reports gone", caseDeleteEnvironmentUnlessReferenced},
 
 		{"F1 runner round trip and order", caseRunnerRoundTrip},
 		{"F2 runners are isolated by pool", caseRunnerPoolIsolation},
@@ -1094,6 +1095,32 @@ func caseCountSessionsByEnvironment(t *testing.T, s Stores) {
 		if got != tc.want {
 			t.Fatalf("count(%s, %v) = %d, want %d", tc.ws, tc.states, got, tc.want)
 		}
+	}
+}
+
+// caseDeleteEnvironmentUnlessReferenced (E9) pins the guard's contract:
+// refuse while a session in the given states still references the
+// environment, delete once none does, report ErrNotFound once it is gone.
+func caseDeleteEnvironmentUnlessReferenced(t *testing.T, s Stores) {
+	ctx := context.Background()
+
+	env := mustCreateEnv(t, s, Alpha, fixtureEnvironment("env_seq", "dev"))
+	mustCreate(t, s, Alpha, control.Session{
+		ID: "sess_seq", CreatorID: "act_a", State: control.StateQueued, PoolID: PoolA, EnvironmentID: env.ID})
+	if err := s.Environments.DeleteEnvironmentUnlessReferenced(ctx, Alpha, env.ID, control.NonTerminal); !errors.Is(err, control.ErrConflict) {
+		t.Fatalf("delete with a live session: err = %v, want ErrConflict", err)
+	}
+	if _, err := s.Environments.GetEnvironment(ctx, Alpha, env.ID); err != nil {
+		t.Fatalf("environment removed despite a live session: %v", err)
+	}
+	if err := s.Sessions.Transition(ctx, Alpha, "sess_seq", control.NonTerminal, control.StateDestroyed, control.TransitionOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Environments.DeleteEnvironmentUnlessReferenced(ctx, Alpha, env.ID, control.NonTerminal); err != nil {
+		t.Fatalf("delete once the only session is terminal: %v", err)
+	}
+	if err := s.Environments.DeleteEnvironmentUnlessReferenced(ctx, Alpha, env.ID, control.NonTerminal); !errors.Is(err, control.ErrNotFound) {
+		t.Fatalf("delete an already-gone environment: err = %v, want ErrNotFound", err)
 	}
 }
 
