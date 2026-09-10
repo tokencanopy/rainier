@@ -36,6 +36,13 @@ type ownership struct {
 	keeper     control.ControllerLeaseKeeper
 	stream     control.TerminalStream
 
+	// handoff serialises the install-and-wait pairs on this attach. The
+	// client pump (a claim, a release) and the heartbeat (a demotion after a
+	// stale renew) can both reach one, and they share one acknowledgement
+	// channel: two of them in flight at once would consume each other's
+	// answer and one would then wait out the whole timeout.
+	handoff sync.Mutex
+
 	mu     sync.Mutex
 	mode   string
 	gen    uint64
@@ -145,9 +152,18 @@ func (o *ownership) install(ctx context.Context, mode string, gen uint64) error 
 // would be a plane requiring something an old sandbox cannot supply, so the
 // wait is bounded and the handoff proceeds without it — fenced at the plane
 // alone, which is what that pairing can offer.
-func (o *ownership) installAndWait(ctx context.Context, mode string, gen uint64) {
+func (o *ownership) installAndWait(ctx context.Context, mode string, gen uint64) error {
+	o.handoff.Lock()
+	defer o.handoff.Unlock()
+	// Drop an acknowledgement left over from a handoff that already gave up
+	// on it: it answers a question nobody is asking any more, and consuming
+	// it here would otherwise cost this handoff the whole timeout.
+	select {
+	case <-o.ack:
+	default:
+	}
 	if err := o.install(ctx, mode, gen); err != nil {
-		return
+		return err
 	}
 	timer := time.NewTimer(o.plane.ackTimeout)
 	defer timer.Stop()
@@ -155,12 +171,12 @@ func (o *ownership) installAndWait(ctx context.Context, mode string, gen uint64)
 		select {
 		case got := <-o.ack:
 			if got == gen {
-				return
+				return nil
 			}
 		case <-timer.C:
-			return
+			return nil
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		}
 	}
 }
@@ -189,11 +205,11 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 		o.sendStale(ctx)
 		return
 	}
-	o.installAndWait(ctx, terminal.ModeControl, gen)
+	_ = o.installAndWait(ctx, terminal.ModeControl, gen)
 	o.set(terminal.ModeControl, gen)
+	o.plane.displace(ctx, o, gen, true)
 	o.send(ctx, terminal.ServerMessage{
 		Type: terminal.TypeAttached, Mode: terminal.ModeControl, Generation: terminal.GenOf(gen)})
-	o.plane.displace(ctx, o, gen)
 }
 
 // sendStale answers a refused claim with the current generation. A read that
@@ -226,25 +242,32 @@ func (o *ownership) release(ctx context.Context) {
 		return
 	}
 	_ = o.keeper.Release(ctx, gen)
-	o.demote(ctx)
+	o.plane.displace(ctx, o, o.demote(ctx), false)
 }
 
 // demote turns this attach into a viewer and says so, in that order: the
 // sandbox learns the current generation and that this attachment is not the
-// controller under it, then the client is told. A demotion whose current
-// generation cannot be read still demotes — being wrong about the number is
-// survivable, believing you still have control is not.
-func (o *ownership) demote(ctx context.Context) {
-	current := uint64(0)
+// controller under it, then the client is told. It returns the generation it
+// demoted to.
+//
+// A demotion whose current generation cannot be read still demotes — being
+// wrong about the number is survivable, believing you still have control is
+// not — but it falls back to the generation this attach already held rather
+// than to zero. A claim from a stale-but-real generation is refused exactly
+// as a claim from zero would be, while the common case, where the read merely
+// timed out, still leaves the client able to take control in one press.
+func (o *ownership) demote(ctx context.Context) uint64 {
+	_, current := o.get()
 	if o.keeper != nil {
 		if gen, _, err := o.keeper.State(ctx); err == nil {
 			current = gen
 		}
 	}
-	o.installAndWait(ctx, terminal.ModeView, current)
+	_ = o.installAndWait(ctx, terminal.ModeView, current)
 	o.set(terminal.ModeView, current)
 	o.send(ctx, terminal.ServerMessage{
 		Type: terminal.TypeControlChanged, Mode: terminal.ModeView, Generation: terminal.GenOf(current)})
+	return current
 }
 
 // heartbeat renews the lease while this attach holds control, on the stream's
@@ -295,6 +318,12 @@ func (o *ownership) finish() {
 	defer cancel()
 	_, gen := o.get()
 	_ = o.keeper.Release(ctx, gen)
+	// And the devices still watching learn the generation they would have to
+	// claim from, so the first press of the take-control key takes it rather
+	// than discovering the number has moved.
+	if current, _, err := o.keeper.State(ctx); err == nil {
+		o.plane.displace(ctx, o, current, false)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -346,18 +375,43 @@ func (t *ownerTable) peers(o *ownership) []*ownership {
 	return out
 }
 
-// displace tells every other attach on this replica that believes it is the
-// controller that it is not, now that gen has been granted to winner. The
-// sandbox has already fenced them — the generation moved before this runs —
-// so this is the notice, not the enforcement.
-func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64) {
+// displace tells every other attach on this replica that the generation has
+// moved to gen. A peer that believed it was the controller is demoted, which
+// is the notice this exists for; a peer that was already a viewer is told the
+// number, which is what lets ONE press of its take-control key take control
+// rather than discovering that the generation it saw at attach time is gone.
+// Without that, every viewer's first press after any handoff — including a
+// controller simply leaving — is answered "somebody else got there first"
+// about a session nobody is using.
+//
+// wait says whether to hold until each demoted peer's sandbox has confirmed
+// the new binding. A take-over waits, because the taker must not be told it
+// has control while a keystroke the previous controller has already sent
+// could still execute; a release does not, because the generation it is
+// announcing has already moved and there is nobody it could be racing.
+func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wait bool) {
+	if gen == 0 {
+		return
+	}
 	for _, other := range p.owners.peers(winner) {
 		mode, otherGen := other.get()
-		if mode != terminal.ModeControl || otherGen >= gen {
+		if otherGen >= gen {
+			continue
+		}
+		if mode != terminal.ModeControl {
+			// A viewer stays a viewer; only the number it would claim from
+			// changes, and its client reads that silently.
+			other.set(mode, gen)
+			other.send(ctx, terminal.ServerMessage{
+				Type: terminal.TypeControlChanged, Mode: terminal.ModeView, Generation: terminal.GenOf(gen)})
 			continue
 		}
 		other.set(terminal.ModeView, gen)
-		_ = other.install(ctx, terminal.ModeView, gen)
+		if wait {
+			_ = other.installAndWait(ctx, terminal.ModeView, gen)
+		} else {
+			_ = other.install(ctx, terminal.ModeView, gen)
+		}
 		other.send(ctx, terminal.ServerMessage{
 			Type: terminal.TypeControlChanged, Mode: terminal.ModeView, Generation: terminal.GenOf(gen)})
 	}

@@ -161,16 +161,20 @@ func (b broker) Attach(ctx context.Context, target control.AttachTarget, stream 
 	own := newOwnership(p, target)
 	own.stream = stream
 	mode, generation := own.get()
-	own.send(ctx, terminal.ServerMessage{
-		Type: terminal.TypeAttached, Mode: mode, Generation: terminal.GenOf(generation)})
 	p.owners.add(own)
 	defer own.finish()
 	if mode == terminal.ModeControl {
-		// Whoever held control before this attach did no longer does: the
-		// application already advanced the generation, so the sandbox fences
-		// them the moment it reads this attach's opening frame. Tell them.
-		p.displace(ctx, own, generation)
+		// Whoever held control before this attach no longer does: the
+		// application already advanced the generation. Tell them, and — for
+		// the ones this replica is serving — wait until their sandbox has
+		// the new binding BEFORE this attach is told it has control, so that
+		// no keystroke the previous controller has already sent can still
+		// execute after the answer. That is the same order a mid-attach
+		// claim keeps; an attach is a take-over like any other.
+		p.displace(ctx, own, generation, true)
 	}
+	own.send(ctx, terminal.ServerMessage{
+		Type: terminal.TypeAttached, Mode: mode, Generation: terminal.GenOf(generation)})
 
 	attachID := randHex(8) // 16 hex characters, crypto/rand
 	pa := &pendingAttach{stream: stream, own: own, done: make(chan struct{})}

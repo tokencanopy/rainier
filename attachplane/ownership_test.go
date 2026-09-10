@@ -600,3 +600,106 @@ func awaitSandbox(t *testing.T, s *fakeSandbox, want func([]terminal.ClientMessa
 		}
 	}
 }
+
+// TestAViewerLearnsWhenControlIsFreed is the other half of "one key press
+// takes control". A viewer that is never told the generation moved is left
+// holding the number it saw at attach time, so its first press claims from a
+// generation that no longer exists and is answered "somebody else got there
+// first" — about a session nobody is using. The notice a viewer gets is
+// silent; the number it carries is the point.
+func TestAViewerLearnsWhenControlIsFreed(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{})
+	lease := &fakeLease{gen: 1, holder: "att_laptop"}
+	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_laptop"}, true)
+	awaitType(t, laptop.stream, terminal.TypeAttached)
+	<-laptop.sandbox.ready
+
+	phone := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_phone"}, true)
+	awaitType(t, phone.stream, terminal.TypeAttached)
+	<-phone.sandbox.ready
+
+	// The laptop gives control up without leaving.
+	laptop.stream.in <- terminal.ClientMessage{Type: terminal.TypeRelease}
+
+	m, _ := awaitType(t, phone.stream, terminal.TypeControlChanged)
+	if m.Generation.Value() != 2 {
+		t.Fatalf("the viewer was told generation %q, want the 2 the release left behind", m.Generation)
+	}
+	// And one press of the key takes it, from the generation it was told.
+	phone.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(2)}
+	got, before := awaitType(t, phone.stream, terminal.TypeAttached)
+	for _, kind := range before {
+		if kind == terminal.TypeStale {
+			t.Fatal("the viewer's first press was refused; it claimed from a generation nobody told it about")
+		}
+	}
+	if got.Mode != terminal.ModeControl || got.Generation.Value() != 3 {
+		t.Fatalf("the viewer's claim = %s at %q, want control at 3", got.Mode, got.Generation)
+	}
+}
+
+// TestALegacyAttachDisplacesANegotiatedControllerAndSaysSo is the old client
+// + new plane pairing at the plane, which is where the compatibility rule
+// says the negotiated client is "notified and fenced". The application admits
+// a legacy attach unconditionally, as a take-over; this is the half that
+// makes that safe for the device it took control from.
+func TestALegacyAttachDisplacesANegotiatedControllerAndSaysSo(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{})
+	lease := &fakeLease{gen: 1, holder: "att_laptop"}
+	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_laptop"}, true)
+	awaitType(t, laptop.stream, terminal.TypeAttached)
+	<-laptop.sandbox.ready
+
+	// A client that negotiates nothing: no keeper, and the generation the
+	// application advanced unconditionally on its behalf.
+	legacy := startAttach(t, p, h, ts, control.AttachmentController, 2, nil, true)
+	<-legacy.sandbox.ready
+
+	m, _ := awaitType(t, laptop.stream, terminal.TypeControlChanged)
+	if m.Mode != terminal.ModeView || m.Generation.Value() != 2 {
+		t.Fatalf("displaced by a legacy attach: told %s at %q, want view at 2", m.Mode, m.Generation)
+	}
+	laptop.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("y\r")}
+	legacy.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("n\r")}
+	awaitSandbox(t, legacy.sandbox, func(got []terminal.ClientMessage) bool {
+		for _, m := range got {
+			if m.Type == "stdin" {
+				return true
+			}
+		}
+		return false
+	}, "the legacy client's keystroke")
+	for _, got := range laptop.sandbox.received() {
+		if got.Type == "stdin" {
+			t.Fatal("a controller displaced by a legacy attach was still carried")
+		}
+	}
+}
+
+// TestATakeOverAtAttachTimeWaitsForTheSandboxToo pins the ordering that makes
+// the in-flight keystroke harmless when the take-over IS the attach rather
+// than a claim on an existing one. The taker is not told it has control until
+// the displaced controller's sandbox has confirmed the new binding, because
+// until then a keystroke the old controller has already sent still executes.
+func TestATakeOverAtAttachTimeWaitsForTheSandboxToo(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{})
+	lease := &fakeLease{gen: 1, holder: "att_laptop"}
+	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_laptop"}, true)
+	awaitType(t, laptop.stream, terminal.TypeAttached)
+	<-laptop.sandbox.ready
+
+	phone := startAttach(t, p, h, ts, control.AttachmentController, 2, fakeKeeper{lease, "att_phone"}, true)
+	awaitType(t, phone.stream, terminal.TypeAttached)
+
+	// By the time the taker was told, the fence protecting it was already in
+	// the displaced controller's sandbox.
+	var fenced bool
+	for _, got := range laptop.sandbox.received() {
+		if got.Type == terminal.TypeControl && got.Mode == terminal.ModeView && got.Generation.Value() == 2 {
+			fenced = true
+		}
+	}
+	if !fenced {
+		t.Fatal("the taker was told it had control before the displaced controller's sandbox knew")
+	}
+}

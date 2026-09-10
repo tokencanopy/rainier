@@ -43,7 +43,11 @@ var (
 	errAttachIDCollision = errors.New("controld: attach id collision")
 	// errAttachNotSpliced is a handoff attempted before the runner's
 	// dial-back arrived: there is no sandbox socket to install a binding on
-	// yet, so the claim cannot be honoured and the client is told it lost.
+	// yet. Claims are only read inside the splice, which binds that socket
+	// first, so it is unreachable from a client — it is what a peer's
+	// displacement gets when that peer is still waiting for its own
+	// dial-back, and the answer is to proceed: the generation has already
+	// moved, and the binding rides the frame that opens that attachment.
 	errAttachNotSpliced = errors.New("controld: the attach is not spliced yet")
 	// errAttachEnded is an attach that ran and is over — one side of the
 	// splice stopped, and the other is being closed after it.
