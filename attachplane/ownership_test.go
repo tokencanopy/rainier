@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -165,9 +166,26 @@ func (f *attachFixture) close() { f.stream.Close(errAttachEnded) }
 
 // startAttach runs one attach against p: mode and generation are what the
 // application granted, keeper is how this attach reaches the lease, and acks
-// says whether the sandbox understands bindings.
+// says whether the sandbox understands bindings. A keeper stands for a
+// negotiated attach that may also claim, which is the ordinary case; the
+// view-only principal that may not is startViewOnlyAttach.
 func startAttach(t *testing.T, p *Plane, h *fakeHost, ts *httptest.Server,
 	mode control.AttachmentMode, gen uint64, keeper control.ControllerLeaseKeeper, acks bool) *attachFixture {
+	t.Helper()
+	return startAttachAs(t, p, h, ts, mode, gen, keeper, acks, keeper != nil)
+}
+
+// startViewOnlyAttach runs an attach the host authorized for viewing and not
+// for driving: it is told everything a negotiated attach is told, and it may
+// not take control.
+func startViewOnlyAttach(t *testing.T, p *Plane, h *fakeHost, ts *httptest.Server,
+	gen uint64, keeper control.ControllerLeaseKeeper, acks bool) *attachFixture {
+	t.Helper()
+	return startAttachAs(t, p, h, ts, control.AttachmentViewer, gen, keeper, acks, false)
+}
+
+func startAttachAs(t *testing.T, p *Plane, h *fakeHost, ts *httptest.Server,
+	mode control.AttachmentMode, gen uint64, keeper control.ControllerLeaseKeeper, acks, mayClaim bool) *attachFixture {
 	t.Helper()
 	sandbox := newFakeSandbox(acks)
 	h.dialBack = func(at *runner.Attach) { sandbox.serve(t, ts, at) }
@@ -177,6 +195,8 @@ func startAttach(t *testing.T, p *Plane, h *fakeHost, ts *httptest.Server,
 	target := brokerTarget("sess_example", "vm1")
 	target.Mode = mode
 	target.ControllerGeneration = gen
+	target.Negotiated = keeper != nil
+	target.MayClaim = mayClaim
 	target.Controller = keeper
 
 	done := make(chan error, 1)
@@ -847,5 +867,67 @@ func TestAClaimSupersededWhileItWaitedIsNeverToldItHasControl(t *testing.T) {
 	got, _ := awaitType(t, b.stream, terminal.TypeAttached)
 	if got.Mode != terminal.ModeControl || got.Generation.Value() != 3 {
 		t.Fatalf("the winning claim = %s at %q, want control at 3", got.Mode, got.Generation)
+	}
+}
+
+// countingKeeper counts the claims that actually reach the application, so a
+// test can say that a refusal never left this replica.
+type countingKeeper struct {
+	fakeKeeper
+	n atomic.Int64
+}
+
+func (k *countingKeeper) Claim(ctx context.Context, expected uint64) (uint64, error) {
+	k.n.Add(1)
+	return k.fakeKeeper.Claim(ctx, expected)
+}
+
+// TestAViewOnlyAttachIsToldEverythingAndClaimsNothing is the plane's half of
+// the mode-aware attachment policy. A host can grant viewing without granting
+// driving, and such an attach is still NEGOTIATED — its client is told its
+// mode and its generation, and reads every `control_changed` that follows,
+// because being unable to take control is not a reason to be told nothing.
+//
+// Its take-control key is answered "you are still a viewer", and the answer
+// is reached without the application being asked at all: an unauthorized
+// claim must not advance a generation on its way to being refused.
+func TestAViewOnlyAttachIsToldEverythingAndClaimsNothing(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{})
+	lease := &fakeLease{gen: 4}
+	keeper := &countingKeeper{fakeKeeper: fakeKeeper{lease, "att_guest"}}
+
+	f := startViewOnlyAttach(t, p, h, ts, 4, keeper, true)
+	opening, _ := awaitType(t, f.stream, terminal.TypeAttached)
+	if opening.Mode != terminal.ModeView || opening.Generation.Value() != 4 {
+		t.Fatalf("a view-only attach was told %s at %q, want view at 4", opening.Mode, opening.Generation)
+	}
+	awaitViewerSpliced(t, f)
+
+	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(4)}
+	deadline := time.After(5 * time.Second)
+	for done := false; !done; {
+		select {
+		case m := <-f.stream.out:
+			if m.Type == terminal.TypeAttached && m.Mode == terminal.ModeControl {
+				t.Fatalf("a client the host authorized for viewing alone was granted control at %q", m.Generation)
+			}
+			if m.Type == terminal.TypeStale {
+				if m.Generation.Value() != 4 {
+					t.Fatalf("the refused claim was told generation %q, want the 4 that stands", m.Generation)
+				}
+				done = true
+			}
+		case <-deadline:
+			t.Fatal("a view-only client's claim was never answered at all")
+		}
+	}
+	if n := keeper.n.Load(); n != 0 {
+		t.Fatalf("%d unauthorized claim(s) reached the application", n)
+	}
+	lease.mu.Lock()
+	gen := lease.gen
+	lease.mu.Unlock()
+	if gen != 4 {
+		t.Fatalf("an unauthorized claim moved the generation to %d", gen)
 	}
 }

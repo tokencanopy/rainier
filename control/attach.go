@@ -63,19 +63,30 @@ type AttachTarget struct {
 	// the one the command asked for: a controller attach arriving while
 	// somebody else holds a live lease is granted AttachmentViewer.
 	Mode AttachmentMode
+	// Negotiated reports that this client advertised conditional ownership
+	// and can therefore be TOLD things: `attached`, `stale`,
+	// `control_changed`. A broker sends none of them to a client that
+	// negotiated nothing, because it cannot decode them.
+	Negotiated bool
+	// MayClaim reports that this client may TAKE control mid-attach — what
+	// the take-control key does.
+	//
+	// It is a fact of its own, and deliberately not inferred from Negotiated
+	// or from Controller being non-nil, because a host policy can grant
+	// viewing without granting driving. Such a client must still be told its
+	// mode and its generation, and must still never be admitted a
+	// controller; one boolean cannot say both. A broker refuses its claims
+	// without leaving the replica; the keeper's own Claim asks the policy
+	// again, and that answer is the authority.
+	MayClaim bool
 	// Controller is the live half of the lease — claim, renew, release —
 	// bound by the application to this workspace, session and attach. A
 	// broker drives a handoff through it and is never handed a repository.
 	//
-	// It is nil when the attach was not negotiated, and a nil keeper means
-	// "do not negotiate": the broker sends no ownership message and the
-	// attach behaves exactly as it did before this contract existed.
-	//
-	// A non-nil keeper therefore MUST mean the client advertised the
-	// capability. A broker will send that client `attached`, `stale` and
-	// `control_changed`, which a client that negotiated nothing cannot
-	// decode — so an application must not hand one to an attach that did not
-	// ask, however convenient the keeper would be internally.
+	// It is nil when the attach was not negotiated: there is no lease for a
+	// client that cannot be told about one. A negotiated attach carries one
+	// whether or not MayClaim is set, because a viewer reads its own
+	// generation through it.
 	Controller ControllerLeaseKeeper
 }
 

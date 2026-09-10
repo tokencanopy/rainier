@@ -25,14 +25,18 @@ import (
 // makes an unstamped frame arriving at a sandbox mean "an older plane" and
 // nothing else.
 //
-// negotiated is the narrower fact: this client asked for conditional
-// ownership and can therefore be told things. An unnegotiated attach is
-// stamped and fenced like any other, and is sent nothing it would not
-// understand.
+// negotiated and mayClaim are two narrower facts, and they are separate on
+// purpose. negotiated says this client asked for conditional ownership and
+// can therefore be told things; an unnegotiated attach is stamped and fenced
+// like any other, and is sent nothing it would not understand. mayClaim says
+// the application authorized this client for the controller it would become
+// — a host policy that grants viewing without driving sets the first and not
+// the second, and such a client must still be told its mode and generation.
 type ownership struct {
 	plane      *Plane
 	session    control.SessionID
 	negotiated bool
+	mayClaim   bool
 	keeper     control.ControllerLeaseKeeper
 	stream     control.TerminalStream
 
@@ -58,7 +62,8 @@ func newOwnership(p *Plane, target control.AttachTarget) *ownership {
 	return &ownership{
 		plane:      p,
 		session:    target.SessionID,
-		negotiated: target.Controller != nil,
+		negotiated: target.Negotiated,
+		mayClaim:   target.MayClaim,
 		keeper:     target.Controller,
 		mode:       mode,
 		gen:        target.ControllerGeneration,
@@ -251,6 +256,18 @@ func (o *ownership) acked(gen uint64) {
 // again — never an error, because losing a race is an answer.
 func (o *ownership) claim(ctx context.Context, expected uint64) {
 	if !o.negotiated || o.keeper == nil {
+		return
+	}
+	if !o.mayClaim {
+		// This client may watch and may not drive: the host's policy answers
+		// differently for a viewer and a controller, which is the whole
+		// reason those are two facts on the target. It is told its claim did
+		// not land, in the words a lost race already uses — a refusal of its
+		// own would be a message every client would have to learn for an
+		// answer that is already "you are still a viewer" — and the store is
+		// never touched, so an unauthorized claim costs nothing anywhere.
+		_, current := o.get()
+		o.send(ctx, terminal.ServerMessage{Type: terminal.TypeStale, Generation: terminal.GenOf(current)})
 		return
 	}
 	gen, err := o.keeper.Claim(ctx, expected)

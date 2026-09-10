@@ -162,6 +162,15 @@ func (s *AttachmentService) attachable(row control.Session) bool {
 type controllerKeeper struct {
 	sessions control.SessionRepository
 	clock    control.Clock
+	// policy, scope and resource are what a mid-attach claim is authorized
+	// against. The attach itself was authorized for the mode it OPENED in,
+	// so taking control later is a privilege that has to be asked for on its
+	// own — and asked LIVE rather than cached, so a host that revokes a
+	// collaboration grant mid-attach is honoured at the next press of the
+	// take-control key.
+	policy   AttachmentPolicy
+	scope    control.Scope
+	resource control.Resource
 	ws       control.WorkspaceID
 	id       control.SessionID
 	holder   string
@@ -183,6 +192,9 @@ var _ control.ControllerLeaseKeeper = controllerKeeper{}
 // attach's: the generation is the authority and the lease is only the hint,
 // so the claim stands and the heartbeat installs the lease on its next pass.
 func (k controllerKeeper) Claim(ctx context.Context, expected uint64) (uint64, error) {
+	if err := k.policy.AuthorizeAttachment(ctx, k.scope, k.resource, control.AttachmentController); err != nil {
+		return 0, control.ErrDenied
+	}
 	gen, err := k.sessions.CompareAndAdvanceControllerGeneration(ctx, k.ws, k.id, expected)
 	if err != nil {
 		if errors.Is(err, control.ErrStale) {
@@ -270,8 +282,8 @@ func (k controllerKeeper) State(ctx context.Context) (uint64, bool, error) {
 // Every refusal lands the attach in AttachmentViewer under the current
 // generation — never an error, because "somebody else is typing" is an
 // answer, not a failure.
-func (s *AttachmentService) grant(ctx context.Context, row control.Session,
-	cmd control.AttachTerminal) (control.AttachmentMode, uint64, control.ControllerLeaseKeeper, error) {
+func (s *AttachmentService) grant(ctx context.Context, scope control.Scope, resource control.Resource,
+	row control.Session, cmd control.AttachTerminal) (control.AttachmentMode, uint64, control.ControllerLeaseKeeper, error) {
 	if !cmd.Negotiated {
 		if cmd.Mode == control.AttachmentViewer {
 			return control.AttachmentViewer, row.ControllerGeneration, nil, nil
@@ -291,6 +303,7 @@ func (s *AttachmentService) grant(ctx context.Context, row control.Session,
 		return "", 0, nil, err
 	}
 	keeper := controllerKeeper{sessions: s.sessions, clock: s.clock,
+		policy: s.policy, scope: scope, resource: resource,
 		ws: row.WorkspaceID, id: row.ID, holder: holder}
 	if cmd.Mode == control.AttachmentViewer {
 		return control.AttachmentViewer, row.ControllerGeneration, keeper, nil
@@ -347,17 +360,27 @@ func newHolderID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// authorizedAs is the mode an attach must be authorized for, which is not
-// always the mode it asked to open in. A negotiated attach can claim control
-// at any moment on its own stream — that is what the take-control key is —
-// so it is authorized for the privilege it may REACH, not the one it happens
-// to start with. A host whose policy answers differently for a viewer and a
-// controller would otherwise find `mode=view` a way around it.
-func authorizedAs(cmd control.AttachTerminal) control.AttachmentMode {
-	if cmd.Negotiated {
-		return control.AttachmentController
+// mayClaim reports whether this attach may take control mid-attach, which is
+// a second question from whether it may attach at all. An attach is
+// authorized for the mode it OPENS in — a view-only principal is a principal
+// the host means to admit, and authorizing every negotiated attach as a
+// controller locks it out of a session it may perfectly well watch. The
+// privilege it might REACH is asked for separately, here and again in
+// controllerKeeper.Claim.
+//
+// A negotiated controller attach has already been authorized for exactly
+// this, so it is not asked twice. An unnegotiated attach has no way to send a
+// claim at all.
+func (s *AttachmentService) mayClaim(ctx context.Context, scope control.Scope,
+	resource control.Resource, cmd control.AttachTerminal) bool {
+	switch {
+	case !cmd.Negotiated:
+		return false
+	case cmd.Mode == control.AttachmentController:
+		return true
+	default:
+		return s.policy.AuthorizeAttachment(ctx, scope, resource, control.AttachmentController) == nil
 	}
-	return cmd.Mode
 }
 
 // AttachTerminal authorizes and fences one terminal attach, then hands the
@@ -379,7 +402,7 @@ func (s *AttachmentService) AttachTerminal(ctx context.Context, scope control.Sc
 	}
 	resource := control.Resource{Kind: control.ResourceSession, WorkspaceID: row.WorkspaceID,
 		ID: string(row.ID), CreatorID: row.CreatorID}
-	if err := s.policy.AuthorizeAttachment(ctx, scope, resource, authorizedAs(cmd)); err != nil {
+	if err := s.policy.AuthorizeAttachment(ctx, scope, resource, cmd.Mode); err != nil {
 		return control.ErrDenied
 	}
 	if !s.attachable(row) {
@@ -389,7 +412,8 @@ func (s *AttachmentService) AttachTerminal(ctx context.Context, scope control.Sc
 	if err != nil {
 		return err
 	}
-	mode, generation, keeper, err := s.grant(ctx, row, cmd)
+	mayClaim := s.mayClaim(ctx, scope, resource, cmd)
+	mode, generation, keeper, err := s.grant(ctx, scope, resource, row, cmd)
 	if err != nil {
 		return err
 	}
@@ -401,6 +425,8 @@ func (s *AttachmentService) AttachTerminal(ctx context.Context, scope control.Sc
 		PlacementGeneration:  row.PlacementGeneration,
 		ControllerGeneration: generation,
 		Mode:                 mode,
+		Negotiated:           cmd.Negotiated,
+		MayClaim:             mayClaim,
 		Controller:           keeper,
 	}
 	if err := s.broker.Attach(ctx, target, stream); err != nil {

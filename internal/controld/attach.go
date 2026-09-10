@@ -128,7 +128,10 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 //
 // The decision itself is not a second implementation: it is the same
 // ownerOrAdmin policy adapter, asked the same question about the same
-// resource, and the service's own answer downstream stays authoritative.
+// resource — the mode the client asked for, which is the mode the attach
+// opens in — and the service's own answer downstream stays authoritative.
+// Taking control later is a privilege of its own and is authorized where it
+// is exercised, on the claim, not here.
 func (s *Server) mayAttach(w http.ResponseWriter, r *http.Request, u User, id string, mode control.AttachmentMode) bool {
 	row, err := s.st.Sessions().GetSession(r.Context(), installWorkspace, control.SessionID(id))
 	if err != nil {

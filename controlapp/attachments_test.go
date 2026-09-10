@@ -560,6 +560,7 @@ type attachmentFakePolicy struct {
 	deny     map[control.AttachmentMode]bool
 	calls    int
 	lastMode control.AttachmentMode
+	asked    []control.AttachmentMode
 }
 
 func (f *attachmentFakePolicy) AuthorizeAttachment(_ context.Context, _ control.Scope, _ control.Resource, mode control.AttachmentMode) error {
@@ -567,10 +568,21 @@ func (f *attachmentFakePolicy) AuthorizeAttachment(_ context.Context, _ control.
 	defer f.mu.Unlock()
 	f.calls++
 	f.lastMode = mode
+	f.asked = append(f.asked, mode)
 	if f.deny != nil && f.deny[mode] {
 		return control.ErrDenied
 	}
 	return f.err
+}
+
+// modes is every mode this policy was asked about, in order. The FIRST is the
+// one an attach was admitted on, which is the question the edge's
+// pre-upgrade check asks too; a later one is a privilege asked for
+// separately.
+func (f *attachmentFakePolicy) modes() []control.AttachmentMode {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]control.AttachmentMode(nil), f.asked...)
 }
 
 type attachmentFakeSessions struct {
@@ -617,6 +629,13 @@ func (f *attachmentFakeSessions) Transition(context.Context, control.WorkspaceID
 }
 func (f *attachmentFakeSessions) SetSessionSetupHash(context.Context, control.WorkspaceID, control.SessionID, string) error {
 	return nil
+}
+
+// compareAndAdvanceCalls is how many conditional claims reached the store.
+func (f *attachmentFakeSessions) compareAndAdvanceCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.casCalls
 }
 
 // NextControllerGeneration is the repository's lease: it advances the stored
@@ -704,6 +723,13 @@ func (f *attachmentFakeBroker) Attach(_ context.Context, target control.AttachTa
 	f.lastTarget = target
 	f.targets = append(f.targets, target)
 	return f.err
+}
+
+// target is the last binding the service handed this broker.
+func (f *attachmentFakeBroker) target() control.AttachTarget {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastTarget
 }
 
 func (f *attachmentFakeBroker) targetGenerations() []uint64 {
@@ -1125,27 +1151,68 @@ func TestAClaimSurvivesAStoreThatIsBrieflyUnusable(t *testing.T) {
 	}
 }
 
-// TestANegotiatedAttachIsAuthorizedForWhatItCanBecome closes the gap between
-// the mode a client asks to OPEN in and the mode it can reach: a negotiated
-// attach can claim control at any moment on its own stream, so a policy that
-// refuses this caller the controller must refuse the attach, whatever the
-// query string says. Otherwise `mode=view` is the way around it.
-func TestANegotiatedAttachIsAuthorizedForWhatItCanBecome(t *testing.T) {
+// TestAViewOnlyPrincipalWatchesAndMayNotClaim is the mode-aware attachment
+// policy from both sides at once, which is the whole reason that seam exists:
+// a host that grants viewing without granting driving — the Cloud
+// collaboration policy — must be able to admit `rainier attach --view`, and
+// must never have that viewer become a controller.
+//
+// Authorizing every negotiated attach as a controller made the first half
+// impossible. It locked a view-only principal out of a session it may
+// perfectly well watch, and it left the edge's pre-upgrade check (which asks
+// about the mode the client asked for) asking a different question from the
+// service — so such a caller would get a 101 upgrade and then a
+// policy-violation close instead of a clean 403.
+//
+// An attach is therefore authorized for the mode it OPENS in, and the
+// privilege it might REACH is asked for separately: once here, to decide what
+// the plane is told, and again live on the claim itself.
+func TestAViewOnlyPrincipalWatchesAndMayNotClaim(t *testing.T) {
 	fx := newAttachmentFixture(t)
 	fx.policy.deny = map[control.AttachmentMode]bool{control.AttachmentController: true}
 
-	err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
+	if err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
 		SessionID: "sess_example", Mode: control.AttachmentViewer, Negotiated: true,
-	}, &attachmentRecordingTerminalStream{})
-	if !errors.Is(err, control.ErrDenied) {
-		t.Fatalf("a negotiated view attach under a controller-denying policy: err = %v, want ErrDenied", err)
+	}, &attachmentRecordingTerminalStream{}); err != nil {
+		t.Fatalf("a negotiated view attach under a controller-denying policy: %v", err)
 	}
-	if got := fx.policy.authorizedMode(); got != control.AttachmentController {
-		t.Fatalf("authorized as %q, want controller", got)
+	if modes := fx.policy.modes(); len(modes) == 0 || modes[0] != control.AttachmentViewer {
+		t.Fatalf("the attach was admitted on %v, want the viewer mode it opens in", modes)
+	}
+	target := fx.broker.target()
+	switch {
+	case target.Mode != control.AttachmentViewer:
+		t.Fatalf("granted mode = %q, want viewer", target.Mode)
+	case !target.Negotiated:
+		t.Fatal("a negotiated attach was not marked negotiated; its client would be told nothing")
+	case target.MayClaim:
+		t.Fatal("a principal the policy refuses the controller was handed the right to claim")
+	case target.Controller == nil:
+		t.Fatal("a negotiated viewer got no keeper, so it cannot read its own generation")
 	}
 
-	// An UNNEGOTIATED viewer is still authorized as what it is: it has no way
-	// to claim, so nothing about it can become a controller.
+	// And the claim path refuses it live, whatever the plane does with the
+	// flag: the store is never reached, so nobody is displaced on the way to
+	// finding out.
+	before := fx.sessions.compareAndAdvanceCalls()
+	if _, err := target.Controller.Claim(context.Background(), 0); !errors.Is(err, control.ErrDenied) {
+		t.Fatalf("a view-only principal's mid-attach claim: err = %v, want ErrDenied", err)
+	}
+	if got := fx.sessions.compareAndAdvanceCalls(); got != before {
+		t.Fatalf("a refused claim still advanced the generation %d time(s)", got-before)
+	}
+
+	// A negotiated CONTROLLER attach under the same policy is still refused
+	// at the door, which is where `mode=control` is answered.
+	if err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
+		SessionID: "sess_example", Mode: control.AttachmentController, Negotiated: true,
+	}, &attachmentRecordingTerminalStream{}); !errors.Is(err, control.ErrDenied) {
+		t.Fatalf("a negotiated control attach under a controller-denying policy: err = %v, want ErrDenied", err)
+	}
+
+	// An UNNEGOTIATED viewer is authorized as what it is and may not claim:
+	// it has no way to send one.
+	fx.policy.deny = nil
 	if err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
 		SessionID: "sess_example", Mode: control.AttachmentViewer,
 	}, &attachmentRecordingTerminalStream{}); err != nil {
@@ -1153,6 +1220,19 @@ func TestANegotiatedAttachIsAuthorizedForWhatItCanBecome(t *testing.T) {
 	}
 	if got := fx.policy.authorizedMode(); got != control.AttachmentViewer {
 		t.Fatalf("an unnegotiated viewer was authorized as %q, want viewer", got)
+	}
+	if tg := fx.broker.target(); tg.Negotiated || tg.MayClaim {
+		t.Fatalf("an unnegotiated attach was marked negotiated=%v mayClaim=%v", tg.Negotiated, tg.MayClaim)
+	}
+
+	// A permitted negotiated controller attach carries both facts.
+	if err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
+		SessionID: "sess_example", Mode: control.AttachmentController, Negotiated: true,
+	}, &attachmentRecordingTerminalStream{}); err != nil {
+		t.Fatalf("a permitted negotiated control attach: %v", err)
+	}
+	if tg := fx.broker.target(); !tg.Negotiated || !tg.MayClaim {
+		t.Fatalf("a permitted controller attach: negotiated=%v mayClaim=%v, want both true", tg.Negotiated, tg.MayClaim)
 	}
 }
 
