@@ -18,15 +18,15 @@ async function fixture(t) {
   const archive = join(dir, 'source.tar.gz');
   execFileSync('tar', ['-czf', archive, '-C', source, 'rainier']);
   const bytes = await readFile(archive);
-  const release = { version: '0.0.9', platform: 'linux', arch: 'x64', url: 'https://example.test/release.tar.gz', archiveHash: hash(bytes), binaryHash: hash(binary) };
+  const release = { version: '0.0.10', platform: 'linux', arch: 'x64', url: 'https://example.test/release.tar.gz', archiveHash: hash(bytes), binaryHash: hash(binary) };
   return { dir, binary, bytes, release, cache: join(dir, 'cache'), download: async () => bytes };
 }
 
-test('maps all supported platforms to immutable v0.0.9 assets', () => {
+test('maps all supported platforms to immutable v0.0.10 assets', () => {
   for (const platform of ['darwin', 'linux']) {
     for (const [arch, goArch] of [['arm64', 'arm64'], ['x64', 'amd64']]) {
       const release = selectRelease(platform, arch);
-      assert.equal(release.url, `https://github.com/tokencanopy/rainier/releases/download/v0.0.9/rainier_0.0.9_${platform}_${goArch}.tar.gz`);
+      assert.equal(release.url, `https://github.com/tokencanopy/rainier/releases/download/v0.0.10/rainier_0.0.10_${platform}_${goArch}.tar.gz`);
       assert.match(release.archiveHash, /^[a-f0-9]{64}$/);
       assert.match(release.binaryHash, /^[a-f0-9]{64}$/);
     }
