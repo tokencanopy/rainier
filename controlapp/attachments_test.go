@@ -620,8 +620,10 @@ func (f *attachmentFakeSessions) SetSessionSetupHash(context.Context, control.Wo
 }
 
 // NextControllerGeneration is the repository's lease: it advances the stored
-// row's generation and returns the new value, counting the calls so a test can
-// assert that only a controller attach asks for one.
+// row's generation, vacates the lease as the port requires — this is the
+// unconditional take-over, and it displaces whoever held control — and
+// returns the new value, counting the calls so a test can assert that only a
+// controller attach asks for one.
 func (f *attachmentFakeSessions) NextControllerGeneration(_ context.Context, ws control.WorkspaceID, id control.SessionID) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -630,6 +632,8 @@ func (f *attachmentFakeSessions) NextControllerGeneration(_ context.Context, ws 
 		return 0, control.ErrNotFound
 	}
 	f.row.ControllerGeneration++
+	f.row.ControllerHolder = ""
+	f.row.ControllerLeaseExpiresAt = time.Time{}
 	return f.row.ControllerGeneration, nil
 }
 

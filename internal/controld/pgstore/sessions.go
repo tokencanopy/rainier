@@ -370,17 +370,26 @@ func (r pgSessions) SetChildExitCode(ctx context.Context, ws control.WorkspaceID
 	return nil
 }
 
-// NextControllerGeneration advances the row's own controller counter in one
-// statement. The lease is durable and shared by every replica, so two
-// controllers cannot be handed the same authority whatever process they
-// attached through.
+// NextControllerGeneration advances the row's own controller counter and
+// vacates the lease, in one statement. The lease is durable and shared by
+// every replica, so two controllers cannot be handed the same authority
+// whatever process they attached through.
+//
+// Vacating is not incidental: this is the unconditional take-over, and it
+// displaces whoever held control. Advancing the counter alone would leave the
+// DISPLACED holder's identity and future expiry on the row, so for the rest
+// of the lease TTL the session would report that somebody holds control who
+// has no authority at all — and the next negotiated controller attach, which
+// reads exactly that, would be admitted a viewer.
 func (r pgSessions) NextControllerGeneration(ctx context.Context, ws control.WorkspaceID, id control.SessionID) (uint64, error) {
 	if ws == "" {
 		return 0, control.ErrInvalid
 	}
 	var generation int64
 	err := r.s.q(ctx).QueryRow(ctx, `
-		UPDATE sessions SET controller_generation = controller_generation + 1, updated_at = now()
+		UPDATE sessions
+		SET controller_generation = controller_generation + 1,
+		    controller_holder = '', controller_lease_expires_at = NULL, updated_at = now()
 		WHERE workspace_id = $1 AND id = $2
 		RETURNING controller_generation`, string(ws), string(id)).Scan(&generation)
 	if err != nil {

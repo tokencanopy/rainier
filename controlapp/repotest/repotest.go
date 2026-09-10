@@ -938,8 +938,9 @@ func caseControllerClaimRace(t *testing.T, s Stores) {
 
 // caseControllerLease (S13) pins the lease beside the generation: a claim
 // vacates it, the holder installs it, a renew under a superseded generation
-// or by a second holder is refused, and none of that touches another
-// workspace's identically named row.
+// or by a second holder is refused, an UNCONDITIONAL advance over a live
+// lease vacates it too, and none of that touches another workspace's
+// identically named row.
 func caseControllerLease(t *testing.T, s Stores) {
 	ctx := context.Background()
 	mustCreate(t, s, Alpha, control.Session{ID: "sess_example", CreatorID: "act_a", State: control.StateRunning, PoolID: PoolA})
@@ -1008,6 +1009,40 @@ func caseControllerLease(t *testing.T, s Stores) {
 	if err := s.Sessions.RenewControllerLease(ctx, Alpha, "sess_example",
 		control.ControllerLease{Generation: 1, Holder: "att_aaaa", ExpiresAt: later}); !errors.Is(err, control.ErrStale) {
 		t.Fatalf("the displaced holder's heartbeat: err = %v, want ErrStale", err)
+	}
+
+	// An UNCONDITIONAL advance is a take-over like any other, and must leave
+	// the row just as vacant. It is the primitive a legacy attach uses — a
+	// client that predates conditional ownership and can only be admitted as
+	// the controller — so this is the "old client + new plane" row of the
+	// compatibility matrix, exercised against the lease it displaces rather
+	// than against an idle row.
+	//
+	// A store that advances the counter alone leaves the DISPLACED holder's
+	// identity and future expiry behind. For the rest of the lease TTL the
+	// session then reports that somebody holds control who has no authority
+	// at all, and the next negotiated controller attach reads that live lease
+	// and is admitted a viewer.
+	if err := s.Sessions.RenewControllerLease(ctx, Alpha, "sess_example",
+		control.ControllerLease{Generation: 2, Holder: "att_cccc", ExpiresAt: later}); err != nil {
+		t.Fatalf("installing a live lease at generation 2: %v", err)
+	}
+	gen, err = s.Sessions.NextControllerGeneration(ctx, Alpha, "sess_example")
+	if err != nil || gen != 3 {
+		t.Fatalf("an unconditional advance over a live lease = %d, %v; want 3, nil", gen, err)
+	}
+	row, err = s.Sessions.GetSession(ctx, Alpha, "sess_example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.ControllerHolder != "" || !row.ControllerLeaseExpiresAt.IsZero() {
+		t.Fatalf("an unconditional advance left the displaced holder's lease behind: holder %q, expiry %v",
+			row.ControllerHolder, row.ControllerLeaseExpiresAt)
+	}
+	// And that holder's heartbeat is refused, which is how it finds out.
+	if err := s.Sessions.RenewControllerLease(ctx, Alpha, "sess_example",
+		control.ControllerLease{Generation: 2, Holder: "att_cccc", ExpiresAt: later}); !errors.Is(err, control.ErrStale) {
+		t.Fatalf("the displaced holder's heartbeat after an unconditional advance: err = %v, want ErrStale", err)
 	}
 
 	// A malformed lease is input, not a missing row.

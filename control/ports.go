@@ -100,12 +100,21 @@ type SessionRepository interface {
 	SetSessionSetupHash(ctx context.Context, ws WorkspaceID, id SessionID, hash string) error
 	// SetChildExitCode records the exit status of a session's agent process.
 	SetChildExitCode(ctx context.Context, ws WorkspaceID, id SessionID, code int) error
-	// NextControllerGeneration advances id's controller generation by one and
-	// returns the new value, atomically with respect to every other caller.
-	// ErrNotFound when id does not exist in ws. It is the unconditional
-	// grant, for a client that negotiates nothing and can only be admitted
-	// as the controller; a negotiated attach uses the conditional pair
-	// below.
+	// NextControllerGeneration advances id's controller generation by one,
+	// VACATES THE LEASE, and returns the new value, atomically with respect
+	// to every other caller. ErrNotFound when id does not exist in ws. It is
+	// the unconditional grant, for a client that negotiates nothing and can
+	// only be admitted as the controller; a negotiated attach uses the
+	// conditional pair below.
+	//
+	// Vacating the lease is part of the contract, not an implementation's
+	// choice, and it is the same step CompareAndAdvanceControllerGeneration
+	// takes for the same reason: this is a take-over, and it displaces
+	// whoever held control. An implementation that advances the counter alone
+	// leaves the DISPLACED holder's identity and future expiry on the row, so
+	// for the rest of the lease TTL the session reports a live lease held by
+	// somebody with no authority — and the next negotiated controller attach
+	// reads that lease and is admitted a viewer.
 	NextControllerGeneration(ctx context.Context, ws WorkspaceID, id SessionID) (uint64, error)
 	// CompareAndAdvanceControllerGeneration advances id's controller
 	// generation from expected to expected+1 and vacates the lease, in ONE
