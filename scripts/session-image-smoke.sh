@@ -793,6 +793,26 @@ else
   note "chromium sandbox startup category" "unavailable"
 fi
 
+# Diagnostic only: disable Chromium's namespace layer while keeping its other
+# launch machinery and inner filter enabled. This is another comparison, never
+# a supported launch mode.
+NO_NAMESPACE_STATUS=$(probe '
+  '"$BROWSER_FIXTURE"'
+  namespace_flag=--disable-
+  namespace_flag=$namespace_flag"namespace-sandbox"
+  timeout -k 5 30 "$b" "$namespace_flag" --disable-dev-shm-usage --disable-gpu --disable-breakpad --user-data-dir="$d/p6" --dump-dom "$SERVER_URL" >/dev/null 2>&1
+  st=$?
+  printf "no-namespace-exit=%s\\n" "$st"
+  exit 0
+' | sed -n 's/.*\(no-namespace-exit=[0-9][0-9]*\).*/\1/p' | tail -1)
+if [ -n "$NO_NAMESPACE_STATUS" ]; then
+  printf 'note  chromium without its namespace layer: %s\n' "$NO_NAMESPACE_STATUS"
+  note "chromium namespace diagnostic" "$NO_NAMESPACE_STATUS"
+else
+  printf 'note  chromium without its namespace layer: no-namespace-status-unavailable\n'
+  note "chromium namespace diagnostic" "no-namespace-status-unavailable"
+fi
+
 BROWSER_SIZE=$(probe 'cat /usr/local/share/rainier-browser-size.txt 2>/dev/null | head -1; grep -h "browser payload" /usr/local/share/rainier-browser-size.txt 2>/dev/null' | tr '\n' '; ')
 printf 'note  browser layer: %s\n' "$BROWSER_SIZE"
 note "browser layer size" "$BROWSER_SIZE"
