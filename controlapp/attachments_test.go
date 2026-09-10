@@ -582,8 +582,11 @@ type attachmentFakeSessions struct {
 	nextCalls  int
 	casCalls   int
 	renewCalls int
-	lastWS     control.WorkspaceID
-	lastID     control.SessionID
+	// renewErr, when set, is what every lease renew answers, so a test can
+	// stage the two ways a claim's first renew can fail.
+	renewErr error
+	lastWS   control.WorkspaceID
+	lastID   control.SessionID
 }
 
 func (f *attachmentFakeSessions) GetSession(_ context.Context, ws control.WorkspaceID, id control.SessionID) (control.Session, error) {
@@ -795,6 +798,9 @@ func (f *attachmentFakeSessions) RenewControllerLease(_ context.Context, ws cont
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.renewCalls++
+	if f.renewErr != nil {
+		return f.renewErr
+	}
 	if !f.found || f.row.ControllerGeneration != l.Generation {
 		return control.ErrStale
 	}
@@ -1053,4 +1059,102 @@ func TestTwoDevicesRacingFromOneGenerationHaveOneWinner(t *testing.T) {
 	if winners != 1 {
 		t.Fatalf("%d of 2 claims from generation %d won; want exactly 1", winners, from)
 	}
+}
+
+// TestJourney6ReconnectResumesAfterItsOwnReleaseFreedTheLease is the case a
+// dropped connection actually produces, and the one the "still holds it"
+// branch above cannot reach: a controller whose attach ended released on its
+// way out, so by the time it dials back the generation has already moved past
+// the one it is presenting and NOBODY holds control.
+//
+// Coming back a viewer there would be a false statement — there is no other
+// device — and would cost the zero-click property to one lost packet.
+func TestJourney6ReconnectResumesAfterItsOwnReleaseFreedTheLease(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	first := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController})
+	// What the plane does when an attach ends, however it ended.
+	if err := first.Controller.Release(context.Background(), first.ControllerGeneration); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	back := attachNegotiated(t, fx, control.AttachTerminal{
+		Mode: control.AttachmentController, ExpectedGeneration: first.ControllerGeneration})
+	if back.Mode != control.AttachmentController {
+		t.Fatalf("mode = %q, want controller — nobody else had it", back.Mode)
+	}
+	if back.ControllerGeneration != 3 {
+		t.Fatalf("generation = %d, want 3", back.ControllerGeneration)
+	}
+}
+
+// TestAClaimWhoseFirstRenewIsStaleIsALostClaim pins the difference between
+// the two ways a claim's lease write can fail. ErrStale means the generation
+// this claim just won has already been advanced past: the claim is a moment
+// old and already lost, and answering it with success would tell two devices
+// at once that they have control.
+func TestAClaimWhoseFirstRenewIsStaleIsALostClaim(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.sessions.renewErr = control.ErrStale
+
+	got := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController})
+	if got.Mode != control.AttachmentViewer {
+		t.Fatalf("mode = %q, want viewer — the generation moved out from under the claim", got.Mode)
+	}
+}
+
+// TestAClaimSurvivesAStoreThatIsBrieflyUnusable is the other half. A renew
+// that fails for any reason OTHER than staleness failed at a generation that
+// is still this attach's, and the generation is the authority while the lease
+// is only the hint — so the claim stands and the heartbeat installs the lease
+// on its next pass. Failing here would advance the generation, displace
+// whoever had control, and then hand control to nobody.
+func TestAClaimSurvivesAStoreThatIsBrieflyUnusable(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.sessions.renewErr = control.ErrUnavailable
+
+	got := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController})
+	if got.Mode != control.AttachmentController {
+		t.Fatalf("mode = %q, want controller", got.Mode)
+	}
+	if got.ControllerGeneration != 1 {
+		t.Fatalf("generation = %d, want 1", got.ControllerGeneration)
+	}
+}
+
+// TestANegotiatedAttachIsAuthorizedForWhatItCanBecome closes the gap between
+// the mode a client asks to OPEN in and the mode it can reach: a negotiated
+// attach can claim control at any moment on its own stream, so a policy that
+// refuses this caller the controller must refuse the attach, whatever the
+// query string says. Otherwise `mode=view` is the way around it.
+func TestANegotiatedAttachIsAuthorizedForWhatItCanBecome(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	fx.policy.deny = map[control.AttachmentMode]bool{control.AttachmentController: true}
+
+	err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
+		SessionID: "sess_example", Mode: control.AttachmentViewer, Negotiated: true,
+	}, &attachmentRecordingTerminalStream{})
+	if !errors.Is(err, control.ErrDenied) {
+		t.Fatalf("a negotiated view attach under a controller-denying policy: err = %v, want ErrDenied", err)
+	}
+	if got := fx.policy.authorizedMode(); got != control.AttachmentController {
+		t.Fatalf("authorized as %q, want controller", got)
+	}
+
+	// An UNNEGOTIATED viewer is still authorized as what it is: it has no way
+	// to claim, so nothing about it can become a controller.
+	if err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
+		SessionID: "sess_example", Mode: control.AttachmentViewer,
+	}, &attachmentRecordingTerminalStream{}); err != nil {
+		t.Fatalf("an unnegotiated view attach: %v", err)
+	}
+	if got := fx.policy.authorizedMode(); got != control.AttachmentViewer {
+		t.Fatalf("an unnegotiated viewer was authorized as %q, want viewer", got)
+	}
+}
+
+// authorizedMode is the mode the last attach was actually authorized for.
+func (f *attachmentFakePolicy) authorizedMode() control.AttachmentMode {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastMode
 }
