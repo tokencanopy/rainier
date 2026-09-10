@@ -179,7 +179,16 @@ jobs:
           # pattern: a `0.0.x` pattern would silently stop matching at 0.1.0,
           # which is the same quiet drift this workflow exists to end.
           PREVIOUS="$(node -p 'require("./npm/package.json").version')"
-          npm --prefix npm version "$VERSION" --no-git-tag-version --allow-same-version
+          # Rewrite the version in place. `npm version` reformats the file,
+          # expanding every compact one-line object, which turns a one-line
+          # bump into a forty-eight-line diff and buries the real change.
+          VERSION="$VERSION" node -e '
+            const fs = require("fs"), f = "npm/package.json";
+            const s = fs.readFileSync(f, "utf8");
+            const out = s.replace(/("version":\s*)"[^"]+"/, `$1"${process.env.VERSION}"`);
+            if (out === s) { console.error("::error::could not rewrite the version in " + f); process.exit(1); }
+            fs.writeFileSync(f, out);
+          '
           if [ "$PREVIOUS" != "$VERSION" ]; then
             sed -i "s/${PREVIOUS//./\\.}/$VERSION/g" \
               npm/README.md npm/cli.js npm/test/runtime.test.js
@@ -208,10 +217,30 @@ jobs:
           set -euo pipefail
           npm install -g npm@latest   # Trusted Publishing needs npm >= 11.5.1
           cd npm
-          npm publish --provenance --tag beta
-          # `latest` is what a bare `npm install` resolves to. Left alone it
-          # stays on whichever version npm assigned it first.
-          npm dist-tag add "$PACKAGE@$VERSION" latest
+          # Publish straight onto `latest`, the tag a bare `npm install`
+          # resolves to. It has to be set here: Trusted Publishing's
+          # credential authorizes publishing a version and nothing else, so a
+          # dist-tag PUT afterwards returns 401. v0.0.10 published and then
+          # failed on exactly that, leaving `latest` on 0.0.3 — six releases
+          # and four days behind — while the step reported failure after the
+          # package was already public.
+          npm publish --provenance --tag latest
+
+      - name: Move the beta tag
+        continue-on-error: true
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Secondary, and deliberately not fatal: only a real token can move a
+          # dist-tag, and the release is already published and correct on
+          # `latest` by the time this runs. Failing here would abort the
+          # verification and the record for a cosmetic pointer.
+          if npm dist-tag add "$PACKAGE@$VERSION" beta; then
+            echo "beta -> $VERSION"
+          else
+            echo "::warning::could not move the beta tag; latest is $VERSION and correct. Add an NPM_TOKEN secret with dist-tag rights to automate this."
+          fi
 
       - name: Verify the published package end to end
         run: |
