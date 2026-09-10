@@ -17,6 +17,7 @@ UNSHARE_CHROMIUM = 0x10020000
 CLONE_CHROMIUM_USER = 0x10000011
 CLONE_CHROMIUM_ZYGOTE = 0x70000011
 CLONE_CHROMIUM_ZYGOTE_NO_NET = 0x30000011
+CLONE_CHROMIUM_PID = 0x20000011
 # Chromium's safe-empty-dir helper uses the x86_64 clone optimization before
 # chrooting its short-lived child. Keep this exact non-namespace shape rather
 # than widening the Docker clone rule.
@@ -29,7 +30,7 @@ DOCKER_CANONICAL_SHA256 = (
     "885442dc08f21f8d60f99ea43d59af88b1c529103815fe24bbf9ce998d3a609d"
 )
 SECCOMP_CANONICAL_SHA256 = (
-    "883fc167edee1490885be2f9c971716381d0a1b931da2b5085410ca7e5cc7d3c"
+    "4e43265c398ab8e93118568ff37749abd8d367dc6a01419dfa1d1efecd3bb636"
 )
 APPARMOR_SHA256 = (
     "53f78e768ee56099b764661c58b569504e39ecc45b2b3fb0dffd13ea329eb431"
@@ -104,6 +105,17 @@ class SessionImageSecurityPolicyTest(unittest.TestCase):
                     comment=(
                         "RAINIER: Chromium namespace sandbox fallback zygote shape "
                         "with CLONE_NEWUSER|CLONE_NEWPID|SIGCHLD."
+                    ),
+                ),
+                rule(
+                    ["clone"],
+                    "SCMP_ACT_ALLOW",
+                    args=exact_clone(CLONE_CHROMIUM_PID),
+                    includes=amd64,
+                    comment=(
+                        "RAINIER: Chromium gives each renderer its own PID namespace "
+                        "with CLONE_NEWPID|SIGCHLD after the zygote enters its "
+                        "private user namespace."
                     ),
                 ),
                 rule(

@@ -666,6 +666,26 @@
 			"args": [
 				{
 					"index": 0,
+					"value": 536870929,
+					"op": "SCMP_CMP_EQ"
+				}
+			],
+			"comment": "RAINIER: Chromium gives each renderer its own PID namespace with CLONE_NEWPID|SIGCHLD after the zygote enters its private user namespace.",
+			"includes": {
+				"arches": [
+					"amd64",
+					"x32"
+				]
+			}
+		},
+		{
+			"names": [
+				"clone"
+			],
+			"action": "SCMP_ACT_ALLOW",
+			"args": [
+				{
+					"index": 0,
 					"value": 268435473,
 					"op": "SCMP_CMP_EQ"
 				}
