@@ -455,12 +455,18 @@ func (o *ownership) heartbeat(ctx context.Context) {
 // the last thing this attach owes everybody else.
 func (o *ownership) finish() {
 	o.plane.owners.remove(o)
-	if o.keeper == nil || !o.controlling() {
+	// ONE read, as release does. Split in two, this attach's own heartbeat
+	// demotion can complete between them — it holds `control` for the whole
+	// of its bounded wait on the sandbox — and the second read then returns
+	// the generation the NEW controller holds. Releasing that advances past
+	// somebody who legitimately has control, on their own generation, from an
+	// attach that is walking out of the door.
+	mode, gen := o.get()
+	if o.keeper == nil || mode != terminal.ModeControl {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
 	defer cancel()
-	_, gen := o.get()
 	_ = o.keeper.Release(ctx, gen)
 	// And the devices still watching learn the generation they would have to
 	// claim from, so the first press of the take-control key takes it rather

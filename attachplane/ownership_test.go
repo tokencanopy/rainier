@@ -1042,3 +1042,75 @@ func TestATakeOverAtAttachTimeIsToldWhatItIsAfterItDisplaced(t *testing.T) {
 		t.Fatalf("the displaced attach opened at generation %q, want the 3 that exists", m.Generation)
 	}
 }
+
+// recordingKeeper records every generation a release was attempted at, so a
+// test can say which generation a departing attach actually gave up.
+type recordingKeeper struct {
+	fakeKeeper
+	mu       sync.Mutex
+	releases []uint64
+	stateErr error
+}
+
+func (k *recordingKeeper) Release(ctx context.Context, generation uint64) error {
+	k.mu.Lock()
+	k.releases = append(k.releases, generation)
+	k.mu.Unlock()
+	return k.fakeKeeper.Release(ctx, generation)
+}
+
+func (k *recordingKeeper) State(ctx context.Context) (uint64, bool, error) {
+	if k.stateErr != nil {
+		return 0, false, k.stateErr
+	}
+	return k.fakeKeeper.State(ctx)
+}
+
+func (k *recordingKeeper) released() []uint64 {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return append([]uint64(nil), k.releases...)
+}
+
+// TestFinishReleasesOnlyTheGenerationItActuallyHeld closes the last place a
+// mode and a generation were read separately. A departing attach gives up
+// control on its way out, and its own heartbeat can be demoting it at the
+// same moment — a demotion holds `control` for the whole of its bounded wait
+// on the sandbox, and only then writes the CURRENT generation, which belongs
+// to whoever took over.
+//
+// Read in two steps, the mode says "still the controller" and the generation
+// says "the winner's", and the release advances past a device that
+// legitimately has control, from an attach that is walking out of the door.
+// Its screen says [you have control] and its keystrokes are fenced until its
+// next heartbeat.
+func TestFinishReleasesOnlyTheGenerationItActuallyHeld(t *testing.T) {
+	p, _, _ := newTestPlane(t, Options{})
+	for range 500 {
+		// This attach holds control at 1; another replica has just taken it.
+		lease := &fakeLease{gen: 2, holder: "att_bbbb"}
+		keeper := &recordingKeeper{fakeKeeper: fakeKeeper{lease, "att_aaaa"}}
+		o := &ownership{plane: p, session: "sess_example", negotiated: true, mayClaim: true,
+			keeper: keeper, mode: terminal.ModeControl, gen: 1, ack: make(chan uint64, 1)}
+		p.owners.add(o)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); o.demoteTo(2) }() // the heartbeat, finishing
+		go func() { defer wg.Done(); o.finish() }()    // the client, disconnecting
+		wg.Wait()
+
+		for _, gen := range keeper.released() {
+			if gen != 1 {
+				t.Fatalf("a departing attach released generation %d, which it never held", gen)
+			}
+		}
+		lease.mu.Lock()
+		gen, holder := lease.gen, lease.holder
+		lease.mu.Unlock()
+		if gen != 2 || holder != "att_bbbb" {
+			t.Fatalf("a departing attach advanced past the live controller: generation %d, holder %q; want 2, att_bbbb",
+				gen, holder)
+		}
+	}
+}
