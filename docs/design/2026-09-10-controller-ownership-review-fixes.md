@@ -153,6 +153,35 @@ not being allowed to claim. Two explicit facts go on the target instead:
 The plane reads both. A claim from an attach with `MayClaim` false is answered
 `stale` and never reaches the store.
 
+### 2a. One place that says what this attach is
+
+Review found `advance` closes only the FIRST of two waits. A claim also has to
+displace every peer before it answers, and that loop waits on each displaced
+peer's sandbox, once per peer and up to `ackTimeout` each; a second claim can
+win inside it. The attach path does the same thing — the broker reads the
+granted mode, displaces, and sends the value it read.
+
+That version of the lie is worse, because nothing corrects it: a client that
+believes it is the controller sends no claim, so its take-control key does
+nothing, and its heartbeat renews nothing because the plane knows it is a
+viewer, so no stale renewal ever demotes it.
+
+Every message that tells a client what it is therefore goes out under one
+`announce` hold that also does the state read — `announceClaim`,
+`announceOpening`, `announceViewer`, `announceStale`. A claim asks one
+question once, at the end: does this attach still hold the generation it won?
+That answers both waits. `announce` is only ever taken alone (a claim finishes
+displacing its peers before announcing anything about itself, and a
+displacement takes the peer's `announce` and no other), so two attaches cannot
+each hold one and wait for the other's.
+
+Two more read-then-write pairs went with it: `finish` read the mode and the
+generation separately, so this attach's own heartbeat demotion could complete
+between them and the release would advance past the generation the NEW
+controller holds; and `sendStale` fell back to generation zero, which is a
+generation no row is ever at, stranding a client whose take-control key is
+then refused for the life of the attach.
+
 ### 4, 5, 6
 
 - The pairing-stage displacement is documented in
@@ -218,6 +247,18 @@ The plane reads both. A claim from an attach with `MayClaim` false is answered
   `ControlAckTimeout`; A claims, B claims from A's generation while A is still
   waiting. A must never be told `attached mode=control`. Fails without
   `advance`.
+- `attachplane`: the same, with the second claim landing while the first is
+  inside its displace loop, on the claim path and on the attach path. Fails
+  without the `announce` hold.
+- `attachplane`: a disconnect raced against this attach's own heartbeat
+  demotion 500 times — no release at a generation it never held, and the live
+  controller still holding its lease. Fails without `finish`'s single read.
+- `attachplane`: a refused claim whose generation read fails is answered the
+  generation this attach holds, never zero.
+- `attachplane`: one test per transition — `advance` at the generation already
+  held, `demoteTo`'s max, `displaceTo`'s refusal and its atomicity over 2000
+  rounds, and the refused claim's re-install. Each was a mutation that
+  survived the whole tree before it.
 - `attachplane`: a claim from an attach with `MayClaim` false is answered
   `stale` and the keeper is never called. Fails without the flag.
 - `controlapp`: under a policy that permits viewer and denies controller, a
