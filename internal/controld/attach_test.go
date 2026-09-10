@@ -813,3 +813,55 @@ func TestPairingTTL(t *testing.T) {
 		return nil
 	})
 }
+
+// TestTheAttachURLReachesTheCommand walks the negotiation through the HTTP
+// handler, which is the one hop between "what the client asked for" and "what
+// the application granted" that nothing else covers: RequestedOwnership is
+// well tested in isolation and so is the grant, but a regression that dropped
+// one of the three fields on the way between them would silently return every
+// attach to today's unconditional semantics with no test noticing.
+func TestTheAttachURLReachesTheCommand(t *testing.T) {
+	fx := newAttachFixture(t)
+	ts, sd := fx.ts, fx.sd
+
+	// A negotiating client is told its mode and its generation, and the
+	// binding rides the frame that opens its attachment.
+	laptop, _, err := dialAttach(t, ts, fx.id, "?control=v1", fx.tok)
+	if err != nil {
+		t.Fatalf("dial attach: %v", err)
+	}
+	defer laptop.CloseNow()
+	writeClient(t, laptop, terminal.ClientMessage{Type: "resize", Cols: 120, Rows: 40})
+	if m := readServer(t, laptop); m.Type != terminal.TypeAttached ||
+		m.Mode != terminal.ModeControl || m.Generation.Value() != 1 {
+		t.Fatalf("first server msg = %+v, want attached as control at 1", m)
+	}
+	if open := sd.nextOpen(t); open.Mode != terminal.ModeControl || open.Gen != 1 {
+		t.Fatalf("FrameOpen carried mode %q at %d, want control at 1", open.Mode, open.Gen)
+	}
+
+	// mode=view is carried too: this one watches, and claims nothing.
+	phone, _, err := dialAttach(t, ts, fx.id, "?control=v1&mode=view", fx.tok)
+	if err != nil {
+		t.Fatalf("dial view attach: %v", err)
+	}
+	defer phone.CloseNow()
+	writeClient(t, phone, terminal.ClientMessage{Type: "resize", Cols: 40, Rows: 20})
+	if m := readServer(t, phone); m.Type != terminal.TypeAttached ||
+		m.Mode != terminal.ModeView || m.Generation.Value() != 1 {
+		t.Fatalf("the viewer's first server msg = %+v, want attached as view at 1", m)
+	}
+
+	// And an expected generation is carried: presenting the generation in
+	// force is how a device resumes what it had, and it claims from it.
+	back, _, err := dialAttach(t, ts, fx.id, "?control=v1&expected=1", fx.tok)
+	if err != nil {
+		t.Fatalf("dial resuming attach: %v", err)
+	}
+	defer back.CloseNow()
+	writeClient(t, back, terminal.ClientMessage{Type: "resize", Cols: 120, Rows: 40})
+	if m := readServer(t, back); m.Type != terminal.TypeAttached ||
+		m.Mode != terminal.ModeControl || m.Generation.Value() != 2 {
+		t.Fatalf("the resuming attach's first server msg = %+v, want attached as control at 2", m)
+	}
+}

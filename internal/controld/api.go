@@ -83,14 +83,25 @@ func (r *sessionRenderer) view(row control.Session) v0wire.SessionView {
 		Reachable: r.srv.reachable(row),
 		// Whether anybody currently holds control. The row carries an expiry
 		// and only this process has a clock, which is why it is derived here
-		// rather than read off the row by the renderer.
-		ControllerHeld: control.ControllerLeaseOf(row).Live(time.Now()),
+		// rather than read off the row by the renderer — and it is the
+		// SERVER's clock, the one the attachment service measures the same
+		// lease against, so a test can drive an expiry through the JSON.
+		ControllerHeld: control.ControllerLeaseOf(row).Live(r.srv.now()),
 	}
 	if env := r.environment(string(row.EnvironmentID)); env != nil {
 		d.Environment = env.Name
 		d.QueueReason = r.queueReason(row, *env)
 	}
 	return v0wire.RenderSession(row, d)
+}
+
+// now is this replica's clock. A Server built by New always has one; a bare
+// Server in a test may not, and the wall clock is the honest default there.
+func (s *Server) now() time.Time {
+	if s.clock == nil {
+		return time.Now()
+	}
+	return s.clock.Now()
 }
 
 // environment returns the environment for id, or nil for a scratch session,

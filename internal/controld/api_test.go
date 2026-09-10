@@ -4372,3 +4372,39 @@ func declaredEgress(hosts []string) []string {
 		return slices.Contains(added, h)
 	})
 }
+
+// renderClock is control.Clock over a time a test moves.
+type renderClock struct{ now *time.Time }
+
+func (c renderClock) Now() time.Time { return *c.now }
+
+// TestControllerHeldIsMeasuredOnTheServersClock pins the derived half of the
+// session view to the same clock the attachment service measures the lease
+// against. A read model that asked the wall clock while the service asked a
+// fake one would report a lease live that the service had already let expire,
+// and nothing could drive an expiry through the JSON in a test.
+func TestControllerHeldIsMeasuredOnTheServersClock(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0).UTC()
+	s := &Server{clock: renderClock{&now}}
+	row := control.Session{
+		ID: "sess_example", State: control.StateSuspendedCold,
+		ControllerGeneration:     3,
+		ControllerHolder:         "att_example",
+		ControllerLeaseExpiresAt: now.Add(control.ControllerLeaseTTL),
+	}
+
+	view := s.renderer(context.Background()).view(row)
+	if !view.Controller.Held {
+		t.Fatalf("controller = %+v, want a live lease", view.Controller)
+	}
+	if view.Controller.Generation != "3" {
+		t.Fatalf("generation = %q, want the decimal string 3", view.Controller.Generation)
+	}
+
+	// The clock passes the expiry. Nothing swept, nothing wrote: the same row
+	// simply stops reading as held.
+	now = now.Add(control.ControllerLeaseTTL + time.Second)
+	if view := s.renderer(context.Background()).view(row); view.Controller.Held {
+		t.Fatal("an expired lease still reads as held; expiry is passive and must be derived on the read")
+	}
+}
