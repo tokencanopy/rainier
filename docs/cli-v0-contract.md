@@ -288,8 +288,16 @@ point on a laptop and a phone.
 - A plain `attach` claims control when nobody holds it — which is every
   single-device attach — and attaches as a viewer when somebody does, printing
   one line naming that another device has control and the key that takes it.
-- `--view` never claims. `--take` takes control on attach, once, even from a
-  live holder. They ask for opposite things and are refused together.
+- `--view` never claims, and never types: it is held on the client from the
+  first byte rather than from the server's answer, so it means the same thing
+  against a server that does not implement conditional ownership — where a
+  plain attach would take control unconditionally. Ctrl-\ still works; the
+  flag is about what happens without one.
+- `--take` takes control on attach, once, even from a live holder, and its one
+  claim is spent by the first answer whatever that answer said: an attach that
+  opened holding control does not take it back later, on its own, when
+  somebody else takes it. `--view` and `--take` ask for opposite things and
+  are refused together.
 - **Ctrl-\** takes control inside a live attach and tells the device that had
   it, which drops to viewer and keeps showing output. Either side may take it
   back the same way. There is no confirmation prompt: the change is one key
@@ -302,9 +310,11 @@ point on a laptop and a phone.
   phone watching does not squeeze a laptop's terminal to phone width.
 - **Reconnect is conditional.** A controller that reconnects within its lease
   presents the generation it held and resumes control only while nobody took
-  it; if somebody did, it comes back as a viewer and says so. A viewer stays a
-  viewer. The CLI never claims control on its own — not on reconnect, and not
-  in answer to a refusal.
+  it; if somebody did, it comes back as a viewer and says so. A connection
+  that merely dropped resumes: the attach released on its way out, so nobody
+  holds control, and control nobody holds is claimed by whoever asks. A viewer
+  stays a viewer. The CLI never claims control on its own — not on reconnect,
+  and not in answer to a refusal.
 - Control is a 30-second lease renewed every 5 seconds while the attach is
   live. A device that crashes without releasing holds control for at most the
   lease, after which the next attach claims it.

@@ -116,13 +116,30 @@ hint*:
    - `ErrStale` → somebody else got there first → viewer;
    - success → controller at `expected+1`, then `RenewControllerLease`.
 
+Step 2's "did not ask to take over" is: the attach presented no generation, or
+presented one the row has since moved past. Presenting the generation IN FORCE
+is a take-over request — it is how a reconnecting device resumes what it had
+and how `--take` takes it — and the only lease that can still be live at a
+generation nobody has advanced past belongs to the attach being resumed. A
+vacant or expired lease is claimed by whoever asks, whatever they presented,
+because control nobody holds is free.
+
+A claim whose first `RenewControllerLease` answers `ErrStale` is a LOST claim,
+not a claim whose lease will arrive at the next heartbeat: a stale renew means
+the generation the claim just won has already been advanced past. A renew that
+fails any other way is a store briefly unusable at a generation that is still
+this attach's, and the claim stands — the generation is the authority and the
+lease is only the hint.
+
 Two devices racing from the same generation both call CAS with the same
 `expected`; exactly one row update matches; one gets `expected+1` and one gets
 `ErrStale`. A renew that lands after another CAS is itself stale and fails, so
 the loser cannot install a lease over the winner's generation.
 
 `control.ControllerLeaseKeeper` is the seam the attach plane drives mid-attach
-(`Claim`, `Renew`, `Release`), carried on `control.AttachTarget`. The plane
+(`Claim`, `Renew`, `Release`, and `State`, which is what lets a refused claim
+be answered with the generation that actually exists), carried on
+`control.AttachTarget`. The plane
 never sees a repository; `controlapp` binds the keeper to one workspace,
 session and holder. A nil keeper means "this host does not negotiate", which
 is exactly today's behaviour.
@@ -134,9 +151,24 @@ that sets none produces the same bytes it produces today. Generations travel
 as **decimal strings** (`terminal.Gen`) because a `uint64` exceeds the
 browser's exact integer range and task 7 renders this in a browser.
 
-Client → server: `resize` gains `control:"v1"` (the capability advertisement,
-on the first message only), `mode` (`control`|`view`) and `expected`.
-`stdin`/`resize` gain `gen`. New types `claim {expected}` and `release`.
+Client → server: the capability advertisement, `mode` (`control`|`view`) and
+`expected` travel on the **attach request's query string** (`control=v1`,
+`mode=`, `expected=`), not in a message, so a server settles them before it
+upgrades the socket — a refusal is a status code, and a status code has
+nowhere to go once the socket is a websocket. `stdin`/`resize` gain `gen`. New
+types `claim {expected}` and `release`.
+
+The `gen` a sandbox reads is always the PLANE's: a plane replaces the field on
+every frame it forwards. A fence a client could write its own value into would
+not be a fence.
+
+The two sandbox-facing verbs, `control` and `control_ack`, are the plane's
+alone. A plane drops a client's copy of either rather than forwarding it: they
+name a mode and a generation at the pty, and a client sending one is naming its
+own authority. Behind that, a session refuses to bind an attachment that was
+opened unbound — the binding rides the opening frame or it does not exist —
+which is what protects an attach socket with no control plane above it, such as
+a runner's local debugging endpoint.
 
 Server → client: new types `attached {mode, gen}`, `stale {gen}` (the current
 generation, so the client can claim again from it) and
@@ -162,8 +194,8 @@ execute only when:
 - the attachment is **negotiated** (a `control` message arrived for it), its
   mode is `control`, and the frame's generation equals the session's current
   controller generation; **or**
-- the attachment is **not negotiated** and the frame carries no generation, in
-  which case it is treated as the current controller's.
+- the attachment is **not negotiated**, in which case it executes
+  unconditionally, whatever the frame carries.
 
 That second rule is the old-plane compatibility rule, and it is safe for the
 reason it is written down: under the old message set only one client could be
@@ -178,7 +210,10 @@ past the relay; the plane fence is what keeps such frames off the wire at all.
 
 **PTY size follows the controller.** `EffectiveSize` is computed over
 controller attachments only; a viewer's size is recorded and ignored. A
-session with no controller keeps the size it had.
+session with no controller keeps the size it had. Because a viewer's resizes
+are suppressed on the client, a client that GAINS control sends its size again
+at that moment — otherwise a take-over would snap the pty to the size that
+viewer had when it attached.
 
 ### The in-flight frame
 
@@ -204,8 +239,13 @@ The displaced controller learns two ways. Locally — both attachments on one
 replica — the plane pushes `control_changed {mode:"view"}` immediately. Across
 replicas, and as the durable backstop everywhere, its own heartbeat renew
 returns `ErrStale` within one interval (≤5s) and the plane pushes the same
-message then. Its fencing is immediate either way; only the notice can be
-late.
+message then. The GENERATION moves the moment the take-over commits, wherever it happened.
+When the take-over is local the plane installs the new binding and waits for
+the sandbox's acknowledgement before it tells the taker anything, so the fence
+is in place before anybody believes they have control — and that is true of a
+take-over that IS an attach, not only of a mid-attach claim. Across replicas
+the sandbox learns the new generation from the taker's own opening frame or
+from the displaced controller's next heartbeat, whichever is first.
 
 ## Read model
 
@@ -300,6 +340,23 @@ browser, and the browser is the next consumer.
   recorded as a take-over, so a negotiated client attached at the same time is
   notified and fenced. This is deliberate: a legacy client has no way to be a
   viewer, so admitting it as anything else would silently break it.
+- **A legacy client displaced by a negotiated one.** The cost of the rule
+  above, in the other direction: it is fenced with no notice it can render and
+  no key that takes control back, so its terminal simply stops accepting
+  typing. Detaching and attaching again takes control back unconditionally.
+  This is the reason the CLI is tagged last in the release order — old clients
+  keep working, and the fewer of them there are when a plane rolls, the smaller
+  this window is.
+- **A `--view` attach against an old plane.** That plane admits every attach as
+  an unconditional controller. `--view` is therefore held on the CLIENT, from
+  the first byte rather than from the first answer: the flag is the user's
+  instruction, not a request a server may ignore.
+- **Authorization and the mode.** A negotiated attach is authorized for
+  `AttachmentController` whatever mode it opened in, because it can claim
+  control at any moment on its own stream. A host whose `AttachmentPolicy`
+  answers differently for a viewer would otherwise find `mode=view` a way
+  around it. An unnegotiated viewer is authorized as a viewer: it has no way
+  to claim.
 
 ## Verification
 
@@ -315,8 +372,9 @@ Each of the journey's seven steps is a test, beside the package that owns it:
    (`internal/session` for the fence, `attachplane` for the notice);
 5. detach releases, a crashed client's lease expires under a fake clock
    (`controlapp`);
-6. reconnect within the lease resumes; reconnect after a take-over returns a
-   viewer (`internal/attachio`, `cmd/rainier`);
+6. reconnect within the lease resumes, and so does a reconnect after this
+   attach's own departure freed the lease; a reconnect after somebody else's
+   take-over returns a viewer (`controlapp`, `cmd/rainier`);
 7. a viewer's resize does not move the PTY (`internal/session`).
 
 The four compatibility pairings are tests in both directions: new client + old

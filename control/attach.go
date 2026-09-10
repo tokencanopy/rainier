@@ -70,6 +70,12 @@ type AttachTarget struct {
 	// It is nil when the attach was not negotiated, and a nil keeper means
 	// "do not negotiate": the broker sends no ownership message and the
 	// attach behaves exactly as it did before this contract existed.
+	//
+	// A non-nil keeper therefore MUST mean the client advertised the
+	// capability. A broker will send that client `attached`, `stale` and
+	// `control_changed`, which a client that negotiated nothing cannot
+	// decode — so an application must not hand one to an attach that did not
+	// ask, however convenient the keeper would be internally.
 	Controller ControllerLeaseKeeper
 }
 

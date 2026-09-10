@@ -40,7 +40,13 @@ unknown parameters exactly as it ignores any other.
 |---|---|
 | `control=v1` | This client understands conditional ownership; tell it its mode and generation. |
 | `mode=control\|view` | Claim control when it is free, or never claim. Omitted reads as `control`. |
-| `expected=<decimal>` | Claim only from this generation. What a reconnecting controller presents. |
+| `expected=<decimal>` | The generation this client last held. Presenting the generation in force claims it even under a live lease — that is how a device resumes what it had, and how `--take` takes it — while presenting one that has been superseded falls back to the ordinary rule below. |
+
+A client that presents no generation claims only while nobody holds a live
+lease. A lease that is vacant or expired is claimed by whoever asks, which is
+what makes a reconnect after a dropped connection resume rather than come back
+a viewer of a session nobody is using: the departing attach released on its
+way out.
 
 A client that sends `control=v1` receives `attached {mode, gen}` **before** the
 first snapshot or output byte. A client that sends nothing receives exactly the
@@ -63,7 +69,17 @@ a JSON number in a browser.
 | plane → sandbox | `control` | `mode`, `gen` — install a binding on a live attachment |
 | sandbox → plane | `control_ack` | `gen` — the binding is installed |
 
-The last two never reach a client. A **claim is not answered until the sandbox
+The last two are the plane's, and a plane never carries a client's copy of one
+in either direction: `control` names a mode and a generation at the pty, so a
+client that could send one would be naming its own authority rather than asking
+for it. Behind that, an attachment that was opened *unbound* is never bound
+later — a binding rides the frame that opens an attachment or it does not
+exist — which is what protects a runner's local debugging attach, where there
+is no control plane above the socket at all.
+
+The `gen` a sandbox reads on a forwarded frame is always the **plane's**: the
+plane replaces whatever the client put there, including on a legacy client's
+frames, which the client cannot stamp itself. A **claim is not answered until the sandbox
 has acknowledged the new generation**: two attachments reach one sandbox over
 one connection but on independent paths, so waiting for the acknowledgement is
 what guarantees that every frame from the displaced controller arriving after
@@ -85,6 +101,11 @@ An attachment executes input when:
   current controller generation; **or**
 - it is **unbound**, in which case it executes unconditionally.
 
+The frame's `gen` is a separate condition from the binding's, and it is
+load-bearing on its own: a controller that was displaced and then took control
+back holds a binding at the current generation, so only the frame's own stamp
+distinguishes what it is typing now from what it typed two generations ago.
+
 The session's generation only ever goes up, so a late frame carrying a
 superseded binding cannot un-displace the controller that superseded it.
 
@@ -98,7 +119,7 @@ tested in both directions.
 | Pairing | Behaviour |
 |---|---|
 | **new client + old plane** | No `attached` ever arrives. The client settles as an ordinary attach the moment terminal traffic appears: it types, stamps no generation, and stops intercepting Ctrl-\\. |
-| **old client + new plane** | The plane sends the old message set. The attach is recorded as a **take-over** — a generation advance — because a client that cannot be told it is a viewer cannot be made one without breaking it; a negotiated client attached at the same time is fenced by that advance and told. |
+| **old client + new plane** | The plane sends the old message set. The attach is recorded as a **take-over** — a generation advance — because a client that cannot be told it is a viewer cannot be made one without breaking it; a negotiated client attached at the same time is fenced by that advance and told. The reverse is the cost of the same rule: a legacy client that is later displaced by a negotiated one is fenced with **no notice it can render and no key that takes control back**, because it has neither. Its terminal simply stops accepting typing; detaching and attaching again takes control back, unconditionally. Tell operators this before a mixed-version week, and note that it is what the CLI being tagged last is for. |
 | **new plane + old sandbox** | The plane installs bindings and asks for acknowledgements it may not get. It waits its bounded wait and proceeds. That attach is fenced at the plane alone, which is what the pairing can offer. |
 | **new sandbox + old plane** | The plane grants no binding and stamps no generation, so the attachment is unbound and unconditional. **Input with no generation is treated as the current controller's**, which is safe because under the old message set only one client could have been sending — the old plane had no way to admit a second one as anything else. |
 
@@ -113,8 +134,18 @@ else.
   second replica cannot hand out the same authority twice.
 - A controller displaced by an attach on **another replica** is not pushed a
   message; its own heartbeat renewal stops being accepted, within one interval
-  (≤5s), and it demotes itself. Its fencing is immediate either way, because
-  the generation moved before either notice was sent.
+  (≤5s), and it demotes itself. The **generation** moves the moment the
+  take-over commits, wherever it happened; what varies is when the sandbox is
+  told. On this replica the plane installs the new binding and waits for the
+  acknowledgement before answering the taker, so the fence is in place before
+  anybody is told they have control. Across replicas the sandbox learns it
+  from the taker's own opening frame, or from the displaced controller's next
+  heartbeat, whichever lands first — a few hundred milliseconds in practice,
+  and bounded by the heartbeat interval.
+- A **viewer** is told when the generation moves too, without any notice being
+  printed: it is what lets one press of the take-control key take control
+  rather than discovering that the number the viewer saw at attach time is
+  gone.
 - Nothing about ownership is logged, and no message, byte, or length of one is.
   The holder is an opaque per-attach identity, never a user, device, account or
   browser-session identifier, and never leaves the control plane.
