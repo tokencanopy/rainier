@@ -1114,3 +1114,27 @@ func TestFinishReleasesOnlyTheGenerationItActuallyHeld(t *testing.T) {
 		}
 	}
 }
+
+// TestARefusedClaimIsNeverToldGenerationZero pins the fallback a refused
+// claim answers with when the store cannot be read. Zero is a generation no
+// row is ever at, so a client told it presents zero on every later claim and
+// is refused every time — stranded by one read that timed out, until it
+// detaches and attaches again.
+func TestARefusedClaimIsNeverToldGenerationZero(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{})
+	lease := &fakeLease{gen: 7, holder: "att_aaaa"}
+	keeper := &recordingKeeper{fakeKeeper: fakeKeeper{lease, "att_bbbb"},
+		stateErr: control.ErrUnavailable}
+
+	f := startAttach(t, p, h, ts, control.AttachmentViewer, 7, keeper, true)
+	awaitType(t, f.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, f)
+
+	// A claim from a generation that has been superseded, answered while the
+	// store is briefly unusable.
+	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(5)}
+	m, _ := awaitType(t, f.stream, terminal.TypeStale)
+	if m.Generation.Value() != 7 {
+		t.Fatalf("a refused claim whose generation read failed was told %q, want the 7 this attach holds", m.Generation)
+	}
+}

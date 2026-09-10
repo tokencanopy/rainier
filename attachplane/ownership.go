@@ -359,10 +359,17 @@ func (o *ownership) announceStale(ctx context.Context, gen uint64) {
 }
 
 // sendStale answers a refused claim with the current generation. A read that
-// fails still gets an answer: the client must learn its claim did not land,
-// and a "stale" with no generation is still true.
+// fails still gets an answer: the client must learn its claim did not land.
+//
+// It falls back to the generation this attach already holds rather than to
+// zero, for the reason demote does. Zero is a generation no row can ever be
+// at, so a client told it presents zero on every later claim and is refused
+// every time — stranded by one store read that timed out, until it detaches
+// and attaches again. A stale-but-real generation is refused exactly as zero
+// would be, and in the common case, where the read merely timed out, it is
+// still the number that takes control in one press.
 func (o *ownership) sendStale(ctx context.Context) {
-	var current uint64
+	_, current := o.get()
 	if o.keeper != nil {
 		if gen, _, err := o.keeper.State(ctx); err == nil {
 			current = gen
