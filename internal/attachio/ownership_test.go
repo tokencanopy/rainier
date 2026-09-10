@@ -22,10 +22,10 @@ import (
 
 // fakePlane is a server on the other end of one attach: it records the query
 // string the client dialed with and every frame it sent, and it says whatever
-// the test tells it to say. speaks:false is a plane that predates conditional
-// ownership — it answers nothing about control, ever.
+// the test tells it to say. A plane that predates conditional ownership is a
+// script with no ownership message in it — which is faithful, because that is
+// exactly and only what an old plane is on the wire.
 type fakePlane struct {
-	speaks bool
 	script []terminal.ServerMessage // sent, in order, after the opening resize
 
 	mu       sync.Mutex
@@ -36,8 +36,8 @@ type fakePlane struct {
 	ready    chan struct{}
 }
 
-func newFakePlane(speaks bool, script ...terminal.ServerMessage) *fakePlane {
-	return &fakePlane{speaks: speaks, script: script,
+func newFakePlane(script ...terminal.ServerMessage) *fakePlane {
+	return &fakePlane{script: script,
 		extra: make(chan terminal.ServerMessage, 8), ready: make(chan struct{})}
 }
 
@@ -213,7 +213,7 @@ func (r *attachRun) awaitPrinted(t *testing.T, want string) {
 // before it upgrades — and a plane that predates it ignores three unknown
 // parameters exactly as it ignores any other.
 func TestTheAttachURLCarriesTheRequest(t *testing.T) {
-	p := newFakePlane(true, terminal.ServerMessage{
+	p := newFakePlane(terminal.ServerMessage{
 		Type: terminal.TypeAttached, Mode: terminal.ModeControl, Generation: terminal.GenOf(4)})
 	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeControl, Expected: 3})
 	defer run.detach(t)
@@ -232,7 +232,7 @@ func TestTheAttachURLCarriesTheRequest(t *testing.T) {
 // TestAnAttachThatAsksForNothingDialsExactlyAsBefore is the promise to every
 // caller that never heard of conditional ownership, cmd/rattach included.
 func TestAnAttachThatAsksForNothingDialsExactlyAsBefore(t *testing.T) {
-	p := newFakePlane(false, terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
+	p := newFakePlane(terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
 	run := runAgainst(t, p, Options{})
 	defer run.detach(t)
 
@@ -247,7 +247,7 @@ func TestAnAttachThatAsksForNothingDialsExactlyAsBefore(t *testing.T) {
 // line naming the situation and the key that changes it, and keystrokes that
 // do not leave the machine.
 func TestJourney2AViewerIsToldAndTypesNothing(t *testing.T) {
-	p := newFakePlane(true,
+	p := newFakePlane(
 		terminal.ServerMessage{Type: terminal.TypeAttached, Mode: terminal.ModeView, Generation: terminal.GenOf(2)},
 		terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
 	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeControl})
@@ -271,7 +271,7 @@ func TestJourney2AViewerIsToldAndTypesNothing(t *testing.T) {
 // TestTheTakeKeyClaimsFromTheGenerationItWasTold is the one key binding: it
 // asks, from the generation this device actually saw, and it asks once.
 func TestTheTakeKeyClaimsFromTheGenerationItWasTold(t *testing.T) {
-	p := newFakePlane(true,
+	p := newFakePlane(
 		terminal.ServerMessage{Type: terminal.TypeAttached, Mode: terminal.ModeView, Generation: terminal.GenOf(5)},
 		terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
 	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeControl})
@@ -306,7 +306,7 @@ func TestTheTakeKeyClaimsFromTheGenerationItWasTold(t *testing.T) {
 // TestJourney4TheDisplacedControllerIsToldAndStopsTyping is the laptop's side
 // of a take-over: one line, and it keeps showing output while sending none.
 func TestJourney4TheDisplacedControllerIsToldAndStopsTyping(t *testing.T) {
-	p := newFakePlane(true,
+	p := newFakePlane(
 		terminal.ServerMessage{Type: terminal.TypeAttached, Mode: terminal.ModeControl, Generation: terminal.GenOf(1)},
 		terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
 	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeControl})
@@ -335,7 +335,7 @@ func TestJourney4TheDisplacedControllerIsToldAndStopsTyping(t *testing.T) {
 // client is told it lost, it says so once, and it sends nothing further
 // unless a person presses the key again.
 func TestALostClaimSaysSoAndDoesNotRetry(t *testing.T) {
-	p := newFakePlane(true,
+	p := newFakePlane(
 		terminal.ServerMessage{Type: terminal.TypeAttached, Mode: terminal.ModeView, Generation: terminal.GenOf(3)},
 		terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
 	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeControl, Take: true})
@@ -366,7 +366,7 @@ func TestALostClaimSaysSoAndDoesNotRetry(t *testing.T) {
 // always has — it types, it stamps nothing, and Ctrl-\ is a byte for the
 // remote application rather than a key this client eats.
 func TestNewClientOldPlane(t *testing.T) {
-	p := newFakePlane(false, terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
+	p := newFakePlane(terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
 	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeControl})
 
 	if _, err := run.stdin.Write([]byte{takeKey}); err != nil {
@@ -448,7 +448,7 @@ func TestScanKeysReadsTheTwoKeysThisPackageOwns(t *testing.T) {
 // instruction, and it holds from the first byte rather than from the first
 // answer.
 func TestViewNeverTypesEvenWhenNothingAnswers(t *testing.T) {
-	p := newFakePlane(false, terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
+	p := newFakePlane(terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
 	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeView})
 	if _, err := run.stdin.Write([]byte("rm -rf /\r")); err != nil {
 		t.Fatal(err)
@@ -472,7 +472,7 @@ func TestViewNeverTypesEvenWhenNothingAnswers(t *testing.T) {
 // later, when somebody else takes control, as a snatch-back nobody pressed a
 // key for.
 func TestTakeIsSpentByTheFirstAnswer(t *testing.T) {
-	p := newFakePlane(true, terminal.ServerMessage{
+	p := newFakePlane(terminal.ServerMessage{
 		Type: terminal.TypeAttached, Mode: terminal.ModeControl, Generation: terminal.GenOf(1)})
 	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeControl, Take: true})
 
@@ -506,7 +506,7 @@ func TestGainingControlSaysHowBigThisTerminalIs(t *testing.T) {
 	defer master.Close()
 	defer slave.Close()
 
-	p := newFakePlane(true, terminal.ServerMessage{
+	p := newFakePlane(terminal.ServerMessage{
 		Type: terminal.TypeAttached, Mode: terminal.ModeView, Generation: terminal.GenOf(1)})
 	ts := httptest.NewServer(http.HandlerFunc(p.serve))
 	defer ts.Close()

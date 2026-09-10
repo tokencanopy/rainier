@@ -25,7 +25,6 @@ type ownership struct {
 	mu       sync.Mutex
 	settled  bool // the server answered, so it speaks conditional ownership
 	answered bool // an ownership message has arrived, whatever it said
-	legacy   bool // the server sent terminal traffic without ever answering
 	mode     string
 	gen      uint64
 	claimed  bool // the one --take claim has been spent
@@ -123,19 +122,6 @@ func (o *ownership) observe(m terminal.ServerMessage) string {
 		return ""
 	}
 	return ""
-}
-
-// settleLegacy records that terminal traffic arrived without the server ever
-// answering the capability. From here this attach is an ordinary one: the
-// question was asked, nothing answered it, and pretending otherwise would
-// mean stamping frames nobody reads and swallowing a key the user meant to
-// send.
-func (o *ownership) settleLegacy() {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if !o.settled {
-		o.legacy = true
-	}
 }
 
 // takeOnce reports whether --take should spend its one claim now, and marks

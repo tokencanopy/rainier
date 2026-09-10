@@ -476,9 +476,11 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 			switch m.Type {
 			case "snapshot", "output":
 				// Terminal traffic without an answer means a plane that does
-				// not speak conditional ownership. From here this attach is
-				// an ordinary one, byte for byte.
-				own.settleLegacy()
+				// not speak conditional ownership, and there is nothing to
+				// record: never having settled IS that state. It types, it
+				// stamps nothing, and Ctrl-\ stays a byte for the remote
+				// application — which is what this attach has been doing all
+				// along, because that is what the zero value already says.
 				stdoutMu.Lock()
 				if !decided.Load() {
 					n, writeErr := stdout.Write(m.Data)
@@ -502,7 +504,6 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 				// who is free to touch os.Stdout the instant Run returns.
 				stdoutMu.Unlock()
 			case "exit":
-				own.settleLegacy()
 				if !claim() {
 					return
 				}
