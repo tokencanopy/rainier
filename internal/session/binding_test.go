@@ -243,3 +243,45 @@ func TestAnUnboundAttachmentCannotBindItself(t *testing.T) {
 		t.Fatal("nothing reached the process")
 	}
 }
+
+// TestARePromotedControllersOlderFrameIsStillDiscarded is the clause of the
+// fence that nothing else reaches. A controller that was displaced and then
+// took control back holds a binding at the CURRENT generation, so the rule
+// about its binding says yes; the only thing standing between the shell and a
+// keystroke it typed two generations ago — one that was in flight while
+// somebody else had control — is that the frame carries the generation it was
+// sent under and that generation is gone.
+func TestARePromotedControllersOlderFrameIsStillDiscarded(t *testing.T) {
+	s, fp := newFakeSession(t)
+	laptop, err := s.Attach(0, Size{80, 24}, controllerAt(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recv(t, laptop.Msgs)
+
+	// Displaced, then back: the laptop is the controller again, at 3.
+	if !s.Bind(laptop.ID, viewerAt(2)) {
+		t.Fatal("the demotion did not install")
+	}
+	if !s.Bind(laptop.ID, controllerAt(3)) {
+		t.Fatal("taking control back did not install")
+	}
+
+	if s.Stdin(laptop.ID, 1, []byte("y\r")) {
+		t.Fatal("a keystroke typed two generations ago executed on its sender's return")
+	}
+	if s.SetSize(laptop.ID, 1, Size{40, 20}) {
+		t.Fatal("a resize sent two generations ago moved the pty on its sender's return")
+	}
+	if !s.Stdin(laptop.ID, 3, []byte("ls\r")) {
+		t.Fatal("the re-promoted controller cannot type under the generation it holds")
+	}
+	select {
+	case got := <-fp.stdin:
+		if string(got) != "ls\r" {
+			t.Fatalf("the process received %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("nothing reached the process")
+	}
+}

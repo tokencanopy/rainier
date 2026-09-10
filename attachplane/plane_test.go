@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -105,7 +106,18 @@ func newTestPlane(t *testing.T, o Options) (*Plane, *fakeHost, *httptest.Server)
 		cmds:  make(chan runner.ToRunner, 8),
 	}
 	if o.Logf == nil {
-		o.Logf = t.Logf
+		// A pairing that is never claimed logs when its TTL expires, which
+		// is fifteen seconds after the test that opened it — long after that
+		// test has finished, and t.Logf on a finished test panics the whole
+		// binary. The guard turns that into silence, so a test's own leak
+		// cannot take down every other test's run.
+		var done atomic.Bool
+		t.Cleanup(func() { done.Store(true) })
+		o.Logf = func(format string, a ...any) {
+			if !done.Load() {
+				t.Logf(format, a...)
+			}
+		}
 	}
 	p := New(h, o)
 	mux := http.NewServeMux()

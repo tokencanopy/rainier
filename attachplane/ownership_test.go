@@ -686,7 +686,7 @@ func TestATakeOverAtAttachTimeWaitsForTheSandboxToo(t *testing.T) {
 	lease := &fakeLease{gen: 1, holder: "att_laptop"}
 	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_laptop"}, true)
 	awaitType(t, laptop.stream, terminal.TypeAttached)
-	<-laptop.sandbox.ready
+	awaitSpliced(t, laptop)
 
 	phone := startAttach(t, p, h, ts, control.AttachmentController, 2, fakeKeeper{lease, "att_phone"}, true)
 	awaitType(t, phone.stream, terminal.TypeAttached)
@@ -702,4 +702,59 @@ func TestATakeOverAtAttachTimeWaitsForTheSandboxToo(t *testing.T) {
 	if !fenced {
 		t.Fatal("the taker was told it had control before the displaced controller's sandbox knew")
 	}
+}
+
+// TestThePlaneStampsItsOwnViewOverTheClients pins which of the two
+// generations on a frame is the one the sandbox reads. The client's is a
+// claim about itself; the plane's is what the application granted, and it is
+// the fresher of the two. A fence a client could write its own value into
+// would be no fence at all.
+func TestThePlaneStampsItsOwnViewOverTheClients(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{})
+	lease := &fakeLease{gen: 1, holder: "att_laptop"}
+	a := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_laptop"}, true)
+	awaitType(t, a.stream, terminal.TypeAttached)
+	<-a.sandbox.ready
+
+	// It takes control, so the plane now holds generation 2 — and then sends
+	// a keystroke stamped with the one it used to hold.
+	a.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
+	if m, _ := awaitType(t, a.stream, terminal.TypeAttached); m.Generation.Value() != 2 {
+		t.Fatalf("the claim landed at %q, want 2", m.Generation)
+	}
+	a.stream.in <- terminal.ClientMessage{
+		Type: "stdin", Data: []byte("ls\r"), Generation: terminal.GenOf(1)}
+
+	awaitSandbox(t, a.sandbox, func(got []terminal.ClientMessage) bool {
+		for _, m := range got {
+			if m.Type == "stdin" {
+				return true
+			}
+		}
+		return false
+	}, "the keystroke")
+	for _, m := range a.sandbox.received() {
+		if m.Type == "stdin" && m.Generation.Value() != 2 {
+			t.Fatalf("the sandbox read generation %q off a keystroke, want the plane's 2", m.Generation)
+		}
+	}
+}
+
+// awaitSpliced waits until f's client pump is actually carrying frames to its
+// sandbox, which is the moment the plane has the socket it installs bindings
+// on. Until then a displacement has nowhere to go — harmlessly, because the
+// attachment's binding rides its own opening frame — but a test about the
+// ORDER of a handoff has to start after it.
+func awaitSpliced(t *testing.T, f *attachFixture) {
+	t.Helper()
+	<-f.sandbox.ready
+	f.stream.in <- terminal.ClientMessage{Type: "resize", Cols: 80, Rows: 24}
+	awaitSandbox(t, f.sandbox, func(got []terminal.ClientMessage) bool {
+		for _, m := range got {
+			if m.Type == "resize" {
+				return true
+			}
+		}
+		return false
+	}, "the attach's first forwarded frame")
 }

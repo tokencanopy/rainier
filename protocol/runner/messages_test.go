@@ -328,3 +328,33 @@ func TestHomeMountRoundTrip(t *testing.T) {
 			runner.MethodRevokeAgentCredentials)
 	}
 }
+
+// TestAnUnboundDialAttachIsTheBytesItAlwaysWas is the same additive promise
+// one hop earlier, on the command a control plane sends a runner. controld
+// and runnerd are separately deployed, so a dial_attach that grants no
+// binding has to be byte-identical to the one every runner already knows.
+func TestAnUnboundDialAttachIsTheBytesItAlwaysWas(t *testing.T) {
+	raw, err := json.Marshal(runner.Attach{
+		AttachID: "att_example", Since: 3, Cols: 80, Rows: 24,
+		TargetURL: "wss://rainier.example.invalid/v0/attach-back/att_example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"attach_id":"att_example","since":3,"cols":80,"rows":24,` +
+		`"target_url":"wss://rainier.example.invalid/v0/attach-back/att_example"}`
+	if string(raw) != want {
+		t.Fatalf("an unbound dial_attach = %s\nwant %s", raw, want)
+	}
+
+	bound, err := json.Marshal(runner.Attach{AttachID: "att_example", Mode: "view", Generation: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back runner.Attach
+	if err := json.Unmarshal(bound, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Mode != "view" || back.Generation != 9 {
+		t.Fatalf("decoded binding = %q at %d, want view at 9", back.Mode, back.Generation)
+	}
+}

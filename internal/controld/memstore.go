@@ -230,13 +230,15 @@ func (r memSessions) CreateSession(ctx context.Context, ws control.WorkspaceID, 
 		s.LastEventAt = now
 	}
 	s.WorkspaceID = ws
-	// Three fields are the row's own history, never the caller's: a create
-	// opens the first placement generation, no controller has attached yet,
-	// and nothing has exited.
+	// These are the row's own history, never the caller's: a create opens the
+	// first placement generation, no controller has attached yet and none
+	// holds a lease, and nothing has exited.
 	if s.PlacementGeneration < 1 {
 		s.PlacementGeneration = 1
 	}
 	s.ControllerGeneration = 0
+	s.ControllerHolder = ""
+	s.ControllerLeaseExpiresAt = time.Time{}
 	s.ChildExitCode = nil
 
 	cp := cloneControlSession(s)

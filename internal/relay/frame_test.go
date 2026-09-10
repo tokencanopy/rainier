@@ -90,3 +90,35 @@ func TestDecodeRejectsGarbage(t *testing.T) {
 		t.Fatal("expected error decoding garbage")
 	}
 }
+
+// TestAnUnboundFrameIsTheBytesItAlwaysWas is the cross-version promise on
+// this hop, which is the one between runnerd and sessiond — two halves that
+// ship in different artifacts and roll on different days. The binding is
+// additive, so a peer that sets neither field writes exactly the bytes it
+// wrote before the field existed, and an older peer reading a newer one's
+// frame sees only members it already knows.
+func TestAnUnboundFrameIsTheBytesItAlwaysWas(t *testing.T) {
+	raw, err := Encode(Frame{Type: FrameOpen, AttachID: 7, Since: 3, Cols: 80, Rows: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"t":0,"a":7,"s":3,"c":80,"r":24}`
+	if string(raw) != want {
+		t.Fatalf("an unbound open frame = %s, want %s", raw, want)
+	}
+
+	// And the binding round-trips when it IS set, which is the other half:
+	// an omitempty that never carried its value would fence nobody.
+	bound, err := Encode(Frame{Type: FrameOpen, AttachID: 7, Cols: 80, Rows: 24,
+		Mode: "control", Gen: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Decode(bound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != "control" || got.Gen != 4 {
+		t.Fatalf("decoded binding = %q at %d, want control at 4", got.Mode, got.Gen)
+	}
+}

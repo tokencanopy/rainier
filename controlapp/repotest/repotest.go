@@ -313,8 +313,8 @@ func pageSessions(t *testing.T, s Stores, ws control.WorkspaceID, q control.Sess
 // ---------------------------------------------------------------------------
 
 // caseSessionRoundTrip (S1) pins what a create stores and what it refuses to
-// store: the three fields the row's own history owns — the child's exit
-// code, the placement generation, and the controller generation — are the
+// store: the fields the row's own history owns — the child's exit code, the
+// placement generation, and the controller generation and its lease — are the
 // store's, never the caller's.
 func caseSessionRoundTrip(t *testing.T, s Stores) {
 	ctx := context.Background()
@@ -336,12 +336,17 @@ func caseSessionRoundTrip(t *testing.T, s Stores) {
 		RunnerID:             "runner_a",
 		PlacementGeneration:  0,
 		ControllerGeneration: 9,
-		IdempotencyKey:       "idem_1",
-		ChildExitCode:        &code,
-		Error:                "",
-		CreatedAt:            baseTime(),
-		UpdatedAt:            baseTime(),
-		LastEventAt:          baseTime(),
+		// A lease on a session that does not exist yet is nonsense, and a
+		// store that kept one would open every new session with a controller
+		// nobody attached as.
+		ControllerHolder:         "att_example",
+		ControllerLeaseExpiresAt: baseTime().Add(time.Hour),
+		IdempotencyKey:           "idem_1",
+		ChildExitCode:            &code,
+		Error:                    "",
+		CreatedAt:                baseTime(),
+		UpdatedAt:                baseTime(),
+		LastEventAt:              baseTime(),
 	}
 	created := mustCreate(t, s, Alpha, in)
 
@@ -350,7 +355,13 @@ func caseSessionRoundTrip(t *testing.T, s Stores) {
 	want.ChildExitCode = nil     // create never stores one
 	want.PlacementGeneration = 1 // zero is stored as one
 	want.ControllerGeneration = 0
+	want.ControllerHolder = ""
+	want.ControllerLeaseExpiresAt = time.Time{}
 	sameSession(t, "created row", created, want)
+	if created.ControllerHolder != "" || !created.ControllerLeaseExpiresAt.IsZero() {
+		t.Fatalf("a create stored a caller-supplied lease: holder %q, expiry %v",
+			created.ControllerHolder, created.ControllerLeaseExpiresAt)
+	}
 
 	read, err := s.Sessions.GetSession(ctx, Alpha, "sess_example")
 	if err != nil {

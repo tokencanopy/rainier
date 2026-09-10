@@ -54,6 +54,12 @@ type ClientMessage struct {
 	// client, an old client; from a plane, an old plane, whose input is
 	// treated as the current controller's because under the old message set
 	// only one client could have sent it.
+	//
+	// A plane REPLACES this field on every frame it forwards, with the
+	// generation it granted that attach — it stamps a legacy client's frames
+	// for the same reason. A sandbox therefore reads the plane's view of who
+	// was typing and never the client's own claim about it, which is what
+	// keeps the fence out of reach of the peer it is fencing.
 	Generation Gen `json:"gen,omitempty"`
 }
 

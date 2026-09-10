@@ -108,6 +108,10 @@ func (o *ownership) send(ctx context.Context, m terminal.ServerMessage) {
 // client's frames too: the client cannot stamp them, the plane can, and a
 // frame that reaches a sandbox unstamped then means an older plane and
 // nothing else.
+//
+// It OVERWRITES whatever the client put there. The plane's view of what this
+// attach holds is the fresher one, and a fence a client could write its own
+// value into would be no fence at all.
 func (o *ownership) stamp(m terminal.ClientMessage) terminal.ClientMessage {
 	_, gen := o.get()
 	m.Generation = terminal.GenOf(gen)
