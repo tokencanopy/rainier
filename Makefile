@@ -1,4 +1,4 @@
-.PHONY: test build demo e2e verify module-path protocols control session-image session-image-smoke session-image-verify
+.PHONY: test build demo e2e verify module-path protocols control session-image session-image-security-policy session-image-smoke session-image-browser-e2e session-image-verify
 
 DOCKER ?= docker
 SESSION_IMAGE ?= rainier-session:smoke
@@ -41,6 +41,12 @@ control:
 session-image:
 	$(DOCKER) build $(BUILD_ARGS) -t "$(SESSION_IMAGE)" .
 
+# session-image-security-policy checks the public, test-only policy snapshot
+# used by image qualification. Hosted Rainier Cloud owns and qualifies its
+# runtime copy independently; core CI must not need a cross-repository token.
+session-image-security-policy:
+	python3 scripts/session-image-security-policy-test.py
+
 # session-image-smoke does the part `--version` cannot: it builds, runs,
 # installs and serves inside containers wearing the driver's real restrictions
 # — uid 1000, read-only rootfs, noexec /tmp, no network at all. See the header
@@ -48,7 +54,15 @@ session-image:
 session-image-smoke:
 	DOCKER="$(DOCKER)" ./scripts/session-image-smoke.sh "$(SESSION_IMAGE)"
 
-session-image-verify: session-image session-image-smoke
+# session-image-browser-e2e is the browser half, and the one step in image
+# qualification that is deliberately allowed a network: it stages a sample
+# project that has never been in the image, installs its locked dependencies
+# from the registry, and then runs its Playwright suite twice with no network
+# at all. See the header of the script.
+session-image-browser-e2e:
+	DOCKER="$(DOCKER)" ./scripts/session-image-browser-e2e.sh "$(SESSION_IMAGE)"
 
-verify: module-path protocols control test build
+session-image-verify: session-image session-image-smoke session-image-browser-e2e
+
+verify: module-path protocols control session-image-security-policy test build
 	go vet ./...

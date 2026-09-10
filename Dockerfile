@@ -54,6 +54,18 @@ ARG CLAUDE_CODE_VERSION=2.1.263
 ARG POSTGRES_MAJOR=17
 ARG PGDG_KEY_FINGERPRINT=B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8
 
+# The browser baseline. A project runs ITS OWN Playwright — nothing Playwright
+# is installed globally in this image, deliberately — so what is pinned here is
+# the browser that Playwright launches, and the Playwright version it is the
+# right browser for. A project on that version downloads nothing; a project on
+# another version installs its own revision into the workspace cache beside it.
+# See images/session/browsers.sh, whose checksums are the actual pin, and
+# docs/session-image.md for the supported set and for what other versions do.
+ARG PLAYWRIGHT_VERSION=1.63.0
+ARG CHROMIUM_VERSION=153.0.8010.12
+ARG CHROMIUM_REVISION=1243
+ARG PLAYWRIGHT_FFMPEG_REVISION=1011
+
 # --- the pinned upstream toolchain, verified before it is extracted ----------
 FROM ${BASE_IMAGE} AS toolchain
 ARG TARGETARCH
@@ -233,6 +245,77 @@ RUN set -eu; \
 COPY images/session/services/ /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/rainier-pg /usr/local/bin/rainier-redis
 
+# --- browser testing: the shared libraries, the fonts, and one Chromium ------
+#
+# `npx playwright install --with-deps chromium` is the line every project's CI
+# runs, and its --with-deps half is an `apt-get install` as root. This image
+# installs no escalation path and never will, the rootfs is read-only, and the
+# egress allowlist carries no package archive — so that half has to be a
+# build-time layer or a session cannot run a browser test at all. This is that
+# layer.
+#
+# The package list is Playwright's own `debian12-x64` chromium dependency set
+# (packages/playwright-core/src/server/registry/nativeDeps.ts), named here in
+# full rather than resolved by the tool, because the tool needs root to read it
+# and a session has none. Sixteen of these are missing from the base image and
+# each one is a `chrome-headless-shell: error while loading shared libraries`
+# at somebody's first test run.
+#
+# The fonts are not decoration. A Chromium with no fonts renders every glyph as
+# a box, which turns a screenshot into a useless artifact and a text-measuring
+# assertion into a flake. fonts-liberation is the metric-compatible Arial /
+# Times / Courier set Chrome for Testing expects, fonts-dejavu-core covers
+# Latin, Greek and Cyrillic, and fonts-noto-color-emoji is what an emoji in a
+# product's UI renders as. CJK is deliberately absent — fonts-wqy-zenhei and
+# fonts-ipafont-gothic are ~35 MiB for a script most suites never assert on;
+# see docs/session-image.md.
+#
+# Xvfb is deliberately absent too: this image runs headless browsers only, and
+# an X server would be dead weight plus a socket in every session.
+RUN set -eu; \
+    apt-get update; \
+    dpkg-query -W -f='${Package}\n' | sort > /tmp/packages.before; \
+    apt-get install -y --no-install-recommends \
+      libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 \
+      libcairo2 libcups2 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0 \
+      libnspr4 libnss3 libpango-1.0-0 \
+      libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 \
+      libxkbcommon0 libxrandr2 \
+      fontconfig libfontconfig1 libfreetype6 \
+      fonts-liberation fonts-dejavu-core fonts-noto-color-emoji; \
+    rm -rf /var/lib/apt/lists/*; \
+    fc-cache -f >/dev/null; \
+    dpkg-query -W -f='${Package}\t${Installed-Size}\n' | sort \
+      | awk -F'\t' 'NR==FNR { had[$1] = 1; next } \
+                     !($1 in had) { n++; kb += $2; added[$1] = $2 } \
+                     END { printf "%d packages, %d KiB installed\n", n, kb; \
+                           for (p in added) printf "%8d KiB  %s\n", added[p], p }' \
+            /tmp/packages.before - \
+      | { read -r first; echo "$first"; sort -rn; } > /usr/local/share/rainier-browser-size.txt; \
+    rm -f /tmp/packages.before; \
+    chmod 0644 /usr/local/share/rainier-browser-size.txt
+
+# The browser itself, checksum-verified before extraction and laid out exactly
+# where a project's Playwright looks. Root-owned under /usr/local/lib for the
+# same reason the agents are: a session user who could rewrite the browser
+# binary could rewrite what every later test run executes.
+ARG TARGETARCH
+ARG PLAYWRIGHT_VERSION
+ARG CHROMIUM_VERSION
+ARG CHROMIUM_REVISION
+ARG PLAYWRIGHT_FFMPEG_REVISION
+COPY images/session/browsers.sh /tmp/browsers.sh
+RUN TARGETARCH="${TARGETARCH}" PLAYWRIGHT_VERSION="${PLAYWRIGHT_VERSION}" \
+    CHROMIUM_VERSION="${CHROMIUM_VERSION}" CHROMIUM_REVISION="${CHROMIUM_REVISION}" \
+    PLAYWRIGHT_FFMPEG_REVISION="${PLAYWRIGHT_FFMPEG_REVISION}" \
+    /tmp/browsers.sh && rm /tmp/browsers.sh
+
+# The helper that links that baseline into the cache a project's Playwright
+# reads. Root-owned in /usr/local/bin beside rainier-pg and rainier-redis; it
+# installs nothing, downloads nothing and needs no privilege.
+COPY images/session/browsers/ /usr/local/bin/
+RUN chmod 0755 /usr/local/bin/rainier-browsers
+
 # The pinned upstream releases from the toolchain stage. Root-owned, under
 # /usr/local, which the session user cannot write — see the prefix note below.
 COPY --from=toolchain /opt/toolchain/go /usr/local/go
@@ -358,6 +441,7 @@ ENV PATH="/opt/rainier-env/bin:${PATH}" \
     GOPATH=/workspace/.gopath \
     GOTMPDIR=/workspace/.cache/go-tmp \
     XDG_CACHE_HOME=/workspace/.cache \
+    PLAYWRIGHT_BROWSERS_PATH=/workspace/.cache/ms-playwright \
     npm_config_cache=/workspace/.cache/npm \
     npm_config_update_notifier=false \
     PIP_CACHE_DIR=/workspace/.cache/pip \
@@ -365,6 +449,39 @@ ENV PATH="/opt/rainier-env/bin:${PATH}" \
     UV_PYTHON_DOWNLOADS=never \
     PYTHONDONTWRITEBYTECODE=1 \
     DISABLE_AUTOUPDATER=1
+
+# The browser baseline, linked into the cache a project's Playwright reads.
+#
+# PLAYWRIGHT_BROWSERS_PATH above is /workspace/.cache/ms-playwright, which is
+# both writable and exactly where Playwright would have looked anyway
+# ($XDG_CACHE_HOME/ms-playwright). Building the links HERE, into the image's
+# own /workspace, means docker copies them onto a freshly created workspace
+# volume at session creation: no entrypoint work, no first-run copy of a
+# quarter of a gigabyte, and nothing on the volume but symlinks and two empty
+# marker files. The payload stays on the read-only rootfs, out of checkpoints,
+# archives and `rainier pull`.
+#
+# The seed's chown is -h, and the layout it produces is why the driver's own
+# volume initializer is still correct. GNU chown -R traverses -P by default and
+# lchown()s a symlink rather than its target (verified against coreutils 9.1),
+# so `chown -R 1000:1000 /workspace` — which is exactly what
+# internal/driver.initVolumeScript runs, as root with CAP_CHOWN and a READ-ONLY
+# rootfs — walks over these links without touching the browser they point at
+# and without failing on a filesystem it cannot write. A -L or --dereference
+# there would do both: fail the init job with EROFS, and, on any host where it
+# did not, hand the session user the root-owned binary it is about to execute.
+# -h here says that out loud, and the assertions below are what actually holds
+# it: the binary is still root's, and the cache still reaches it.
+RUN set -eu; \
+    /usr/local/bin/rainier-browsers link; \
+    chown -Rh 1000:1000 /workspace/.cache; \
+    bin=$(find /usr/local/lib/rainier-browsers -name chrome-headless-shell -type f); \
+    [ -n "$bin" ] || { echo "no browser baseline was installed" >&2; exit 1; }; \
+    [ "$(stat -c %u "$bin")" = 0 ] || { \
+      echo "the browser baseline is owned by $(stat -c %U "$bin"), not root; the workspace chown followed a symlink" >&2; exit 1; }; \
+    link=/workspace/.cache/ms-playwright/chromium_headless_shell-${CHROMIUM_REVISION}/$(basename "$(dirname "$bin")"); \
+    [ -L "$link" ] && [ -x "$link/chrome-headless-shell" ] || { \
+      echo "the workspace cache does not resolve to the baseline through $link" >&2; exit 1; }
 
 COPY --from=build /out/sessiond /usr/local/bin/sessiond
 

@@ -30,6 +30,7 @@ Pinned by version in the `Dockerfile`, and by SHA-256 in
 | **Python** | `python3`, `venv`, `pip`, and `uv`/`uvx` |
 | **Shell** | `bash`, GNU coreutils, findutils, grep, sed, gawk, diffutils, `patch` |
 | **Search and data** | `ripgrep`, `jq` |
+| **Browser testing** | The shared libraries and fonts Chromium needs, and one pinned Chrome for Testing headless shell with Playwright's ffmpeg, preinstalled and linked into the workspace browser cache — see [Browser testing](#browser-testing) |
 | **Databases** | PostgreSQL 17 client *and server* (`psql`, `initdb`, `pg_ctl`, `pg_dump`, `createdb`, `pg_isready`, …), SQLite 3 (`sqlite3`), Redis (`redis-server`, `redis-cli`) — installed, never started; see [Local services](#local-services-a-developer-starts) |
 | **Network** | `curl`, `wget`, CA certificates, `openssl`, `nc` |
 | **Archives** | `tar`, `gzip`, `bzip2`, `xz-utils`, `zip`, `unzip` |
@@ -275,6 +276,239 @@ server at all is the thing this change exists to fix. If the pull cost review
 decides 239 MiB per runner boot is too much, the source build is the
 conversation to have, and the breakdown on the run is where it starts.
 
+## Browser testing
+
+`npx playwright install --with-deps chromium` is the line every project's CI
+runs, and it is the line a session cannot: `--with-deps` is `apt-get install`
+as root, and a session has no escalation path, a read-only rootfs, and no
+package archive on its egress allowlist. So the image carries the two halves
+that command would have installed — the **shared libraries and fonts**, as an
+ordinary build-time apt layer, and **one browser**, checksum-pinned beside the
+rest of the toolchain — and a fresh session runs a project's Playwright suite
+with no setup step and, on the supported version, no download at all.
+
+What it deliberately does **not** carry is Playwright itself. See
+[Version matching](#version-matching-what-is-ready-to-run-and-what-is-not).
+
+### The ready-to-run baseline
+
+| | |
+|---|---|
+| Playwright the baseline matches | **1.63.x** (`@playwright/test` or `playwright`) |
+| Browser | Chrome for Testing **153.0.8010.12**, `chromium-headless-shell` revision **1243** |
+| Also preinstalled | Playwright's `ffmpeg` revision 1011, which is what `video:` recording uses |
+| Where it lives | `/usr/local/lib/rainier-browsers`, root-owned, on the read-only rootfs |
+| Where Playwright looks | `PLAYWRIGHT_BROWSERS_PATH=/workspace/.cache/ms-playwright` |
+
+```sh
+# In a project with @playwright/test in its lockfile:
+npm ci
+npx playwright test          # no `playwright install`, no network, no root
+
+rainier-browsers status      # what is installed, where, and what resolves
+rainier-browsers path        # the cache directory Playwright reads
+```
+
+`rainier-browsers` is a root-owned shell script in `/usr/local/bin`, like
+`rainier-pg` and `rainier-redis`. It installs nothing, downloads nothing and
+needs no privilege.
+
+**Only the headless shell.** Playwright launches `chromium-headless-shell` for
+`headless: true` and the full Chrome for Testing build only for `headless:
+false` or an explicit `channel: 'chromium'`. This image has no X server and no
+Xvfb, so `headless: false` cannot run in it whatever is installed, and the full
+build is another ~393 MiB extracted for one channel setting. A project that
+wants it runs `npx playwright install chromium`, which writes into the
+workspace cache and needs only `cdn.playwright.dev`.
+
+### How the baseline and the workspace cache meet
+
+The baseline is on the **read-only rootfs**, because a session user who could
+rewrite the browser binary could rewrite what every later test run executes.
+Playwright's cache has to be **writable**, because a project pinned to a
+different Playwright installs its own revision there and must win. The two meet
+through links:
+
+```
+/workspace/.cache/ms-playwright/chromium_headless_shell-1243/
+    INSTALLATION_COMPLETE          real file, writable
+    DEPENDENCIES_VALIDATED         real file, writable (Playwright rewrites it every 30 days)
+    .rainier-baseline              says this entry is the image's, not the project's
+    chrome-headless-shell-linux64 -> /usr/local/lib/rainier-browsers/...
+```
+
+Those links are built into the image's own `/workspace`, so **docker copies
+them onto a freshly created workspace volume** when the session is created.
+There is no entrypoint work, no first-run copy of a quarter of a gigabyte, and
+nothing on the volume but symlinks and two empty files — the payload stays on
+the rootfs, out of checkpoints, archives and `rainier pull`.
+
+The two markers are real files rather than links because Playwright rewrites
+`DEPENDENCIES_VALIDATED` after every successful host-requirements check and
+re-runs that check when the file is older than thirty days; a failed write
+there would cost an `ldd` sweep on every launch, forever.
+
+`PLAYWRIGHT_BROWSERS_PATH` is set explicitly even though it is exactly what
+Playwright would compute on its own from `XDG_CACHE_HOME`, so the path is a
+property of this image rather than of a default that could move.
+
+### Version matching: what is ready to run, and what is not
+
+**Nothing Playwright is installed globally, deliberately.** A global
+`playwright` on `PATH` is what a bare `npx playwright` finds, and it would
+drive a browser revision the project never pinned. The version that runs a
+project's tests is the version in the project's own lockfile, always. The image
+installs browsers; the project installs Playwright.
+
+Playwright pins a browser revision **per minor release** — 1.61 is 1228, 1.62
+is 1234, 1.63 is 1243 — and patch releases keep their minor's revision. So:
+
+| The project pins | What happens |
+|---|---|
+| `1.63.x` | The baseline is used. Nothing is downloaded; the suite runs offline. |
+| Any other version | Playwright reports `Executable doesn't exist at …` and names `npx playwright install`, which downloads that version's revision (~114 MiB) into `/workspace/.cache/ms-playwright` beside the baseline. It needs `cdn.playwright.dev`. The download survives suspend and resume, so it is paid once per workspace. |
+| `channel: 'chrome'` or `'msedge'` | Not supported and will not be: those are Google's and Microsoft's branded builds, installed from their own apt archives as root. |
+| `channel: 'chromium'`, or `headless: false` | Needs the full Chrome for Testing build (`npx playwright install chromium`), and `headless: false` needs a display this image does not have. |
+
+`npm ci` never downloads a browser: Playwright's npm packages carry no install
+script, so acquiring a browser is always an explicit `playwright install`.
+
+**Do not run `npx playwright install --with-deps`.** The `--with-deps` half
+needs root and will fail; the dependencies it wants are already installed. Plain
+`npx playwright install` is the supported form.
+
+A `playwright install` prunes browser directories no linked Playwright asks
+for, which for a project on another version means it removes the baseline's
+links. That is correct behaviour and it only ever removes links — the payload is
+on the rootfs. `rainier-browsers link` puts them back.
+
+### Firefox and WebKit are not supported
+
+Only Chromium is. `npx playwright install firefox` or `webkit` will download
+the browser and then fail to launch, because their shared libraries are not in
+this image: Firefox additionally needs GTK 3, `libdbus-glib`, `libavcodec` and
+an X client stack, and WebKit needs four GStreamer plugin sets, `libsoup3`,
+`libenchant`, EGL/GLES and more — together several hundred megabytes of
+packages, for browsers whose engines this platform's own suites do not target.
+`npx playwright install-deps` cannot supply them from inside a session at all.
+
+A project that needs cross-browser coverage runs it somewhere else. Adding
+either engine here is a bounded change to the Dockerfile and a real size
+review; it has not been made.
+
+### Sandboxing, and what is actually isolating the browser
+
+"Chromium sandbox" describes two layers that work together in a hosted
+session.
+
+**The project must request Chromium's own sandbox.** Playwright defaults
+`chromiumSandbox` to `false`, so a project that wants the browser sandbox must
+set it explicitly. Rainier's browser qualification projects do this for every
+Chromium launch. The image and driver never add `--no-sandbox`, and the image
+contract tests reject that flag in executable qualification code.
+
+**The container remains the outer boundary.** A session still runs as uid 1000
+with `no-new-privileges`, a read-only rootfs, a noexec `/tmp`, its own network
+namespace, no host mount, no Docker socket, and the hosted runner's seccomp and
+AppArmor profiles. Chromium's sandbox is an additional process boundary inside
+that container; it does not replace the container boundary.
+
+**Hosted Rainier admits only the namespace operations Chromium needs.** The
+Cloud security profile permits Chromium's exact `clone(CLONE_NEWUSER|SIGCHLD)`
+and `unshare(CLONE_NEWUSER|CLONE_NEWNS)` forms, the x86_64 clone shape used by
+its safe-empty-directory helper, plus the AppArmor `userns` permission. The
+hosted browser qualification runs the real web suite under those profiles and
+fails if Chromium cannot initialize its sandbox. A local
+Docker host with stricter policies must load an equivalent reviewed profile;
+Rainier never falls back to `--no-sandbox`. Core keeps a public, test-only
+snapshot of this boundary in `testdata/session-security/`; its structural test
+and image workflow no longer need to check out Rainier Cloud. The runtime
+policy remains Cloud-owned and is qualified independently.
+
+**No broad privilege is needed.** The session does not use `--privileged`,
+`--cap-add`, `seccomp=unconfined`, `apparmor=unconfined`, host networking,
+host IPC, a wider mount, or a debugging socket. Playwright's
+`--remote-debugging-pipe` uses file descriptors rather than a listening port,
+and each launch receives a fresh profile under the session's temporary
+filesystem.
+
+### `/dev/shm` is 64 MiB, and that is fine here
+
+Docker's default, and the driver does not change it. Chromium is famous for
+crashing in containers with a small `/dev/shm` — and Playwright passes
+`--disable-dev-shm-usage` on **every** Chromium launch, which moves those
+allocations to `/tmp`, a per-container tmpfs bounded by half of RAM. A suite
+driven by Playwright is unaffected. A tool that launches Chromium itself
+without that flag can still exhaust it; pass the flag rather than asking for a
+wider container.
+
+### Fonts
+
+`fonts-liberation` (metric-compatible with Arial, Times and Courier, which is
+what Chrome for Testing expects), `fonts-dejavu-core` (Latin, Greek, Cyrillic)
+and `fonts-noto-color-emoji`. A browser with no fonts renders every glyph as a
+box, which makes a screenshot artifact useless and a text-measuring assertion a
+flake, so this is a rendering dependency rather than a nicety — the smoke
+measures ten 100px Arial capital Ms and requires the ~833px that Liberation
+gives, which a DejaVu fallback (791px) would fail.
+
+**CJK is deliberately absent.** `fonts-wqy-zenhei` and `fonts-ipafont-gothic`
+are ~35 MiB for a script most suites never assert on. A suite that needs it
+should say so; adding it is a bounded change to the Dockerfile.
+
+### What this costs
+
+Measured by the build and reported by the smoke on every qualification run, so
+read it off the run rather than off this page:
+
+On the qualified candidate (linux/amd64, the default pinned base; run
+[34378290786](https://github.com/tokencanopy/rainier/actions/runs/34378290786)):
+
+| | |
+|---|---|
+| Shared libraries and fonts | **26 packages, 30,744 KiB (≈30 MiB)** |
+| The browser payload | **272,100 KiB (≈266 MiB)** under `/usr/local/lib/rainier-browsers` |
+| Whole image, with it | **2,725,950,441 bytes, 28 layers** — up from 2,416,401,380 and 22 layers, so **+295 MiB and +6 layers** |
+| Compressed, in the pull | ~117 MiB (`chrome-headless-shell-linux64.zip` 114.3 MiB + ffmpeg 2.3 MiB), plus the apt layer |
+| Per session, on the workspace volume | two directories of symlinks and empty marker files — kilobytes |
+| Startup cost | none: docker copies the links when it creates the volume, and no entrypoint step touches them |
+
+Read the first two off the run rather than off this table, which is one build
+old the moment it is written: the apt layer diffs its own package set and
+writes `/usr/local/share/rainier-browser-size.txt`,
+`images/session/browsers.sh` appends the browser payload to the same file, and
+the smoke reports both as workflow notices on the pull request being approved.
+
+Dropping the browser would return ~296 MiB; adding the full Chrome for Testing
+build would cost ~393 MiB more. Both are one line of `images/session/browsers.sh`
+and a checksum, and the [rollout runbook](https://github.com/tokencanopy/rainier-cloud/blob/main/docs/runbooks/default-environment-rollout.md)
+step 2 is where the pull cost is reviewed against them.
+
+A project that pins another Playwright pays ~114 MiB of download once per
+workspace, onto the volume, where it survives suspend and resume.
+
+### Egress
+
+One host, for both artifacts:
+
+| Host | What needs it |
+|---|---|
+| `cdn.playwright.dev` | `npx playwright install` for any browser or revision the image does not carry, including the full Chrome for Testing build |
+| `playwright.download.prss.microsoft.com` | Playwright's documented fallback mirror; only tried when the first fails |
+| `registry.npmjs.org` | `npm ci` of the project's own Playwright, like any other dependency |
+
+Nothing is needed at all for a project on the pinned version: the baseline is
+in the image and the suite runs on `--network none`. Which of these an
+environment gets is a control-plane decision and not this image's to make.
+
+**A test web server has to be on loopback.** A session's `http_proxy` points at
+the egress proxy and its `no_proxy` carries `localhost` and `127.0.0.1`, which
+Chromium reads. A dev server on `127.0.0.1` — which is what Playwright's
+`webServer` starts and what Vite, Next and the rest bind by default — is
+reached directly. A suite that instead addressed the container by its own
+hostname or its non-loopback address would send the request to the egress proxy
+and be refused; bind and address loopback.
+
 ## Why this base image, and not a Dev Containers one
 
 The choice was between a pinned Debian/Ubuntu **Dev Containers base image** and
@@ -396,6 +630,7 @@ survivable:
 go test ./internal/driver/ -run TestSession   # the contract, no docker needed
 make session-image                            # build it
 make session-image-smoke                      # what --version cannot tell you
+make session-image-browser-e2e                # a real Playwright project, twice
 ```
 
 `internal/driver/image_contract_test.go` reads the `Dockerfile` and the
@@ -427,7 +662,28 @@ all. The shell of those two helpers is separately exercised against stub
 binaries in `internal/driver/image_services_test.go`, which needs no docker and
 catches the behavioural failures (a stop that waits on the wrong thing, a
 server bound to the wrong interface, a cluster created with the wrong locale)
-that reading the script does not. Every probe runs in a container wearing the
+that reading the script does not. The shell of `rainier-browsers` is exercised
+the same way in `internal/driver/image_browser_test.go`, including the case
+that matters most — a `link` that would overwrite a browser the project
+installed itself.
+
+It also runs the browser: it checks that the baseline is root-owned and
+unwritable, that a freshly created workspace volume already carries the cache
+links, that the preinstalled build is the one the `Dockerfile` pins, that every
+shared library resolves, that a page renders and screenshots at 1280x800 and at
+390x844, that Arial lays out at Liberation's metrics rather than a fallback's,
+and that no browser process survives the run. Chromium's own sandbox is
+asserted when qualification loads the reviewed seccomp and AppArmor fixture;
+the smoke script fails closed if Chromium exits without its sandbox. Which
+policy a production host applies remains a host property and is qualified by
+Rainier Cloud separately.
+
+`scripts/session-image-browser-e2e.sh` is the third piece and the only one with
+a network, deliberately: it stages a sample project that has never been in the
+image, `npm ci`s its locked dependencies from the registry, and then runs its
+Playwright suite twice on `--network none` — a real navigation, assertions on
+real layout at a desktop and a phone viewport, a screenshot, and a deliberate
+failure whose trace, screenshot and video it then goes looking for. Every probe runs in a container wearing the
 driver's own restrictions with **no network at all**, and nothing is relaxed to
 make a check pass — a check that cannot pass under the real contract is
 reporting a real defect in the image.
@@ -541,3 +797,22 @@ useful local diagnostics, not qualification of the shipping AMD64 image.
 Authenticated agent workloads and cold dependency downloads under hosted
 egress policy remain a separate no-setup environment gate on approved canary
 capacity; never replace a runner holding active work to obtain that evidence.
+
+
+### Browser cache recovery after an image change
+
+After restoring a workspace onto a different browser-image revision, run
+`rainier-browsers link`. It links the new baseline and invalidates completion
+markers for Rainier-owned revisions whose image-local payload no longer exists.
+The project's normal `npx playwright install` can then fetch an older pinned
+revision again; project-installed browser directories are preserved. This is an
+explicit recovery step for existing volumes, not an automatic image migration.
+`PLAYWRIGHT_BROWSERS_PATH=0` uses Playwright's package-local cache and is not
+managed by this helper; use the project's installer for that mode.
+
+The session-image CI runs `make session-image-security-policy` and
+`make session-image-browser-e2e` in addition to its offline image checks. The
+sample project explicitly enables `chromiumSandbox: true`, and the image job
+loads the public test-only seccomp and AppArmor snapshot. Cloud's hosted browser
+qualification runs the web suite under its independently reviewed runtime
+profiles. Both checks are release gates for the supported browser path.

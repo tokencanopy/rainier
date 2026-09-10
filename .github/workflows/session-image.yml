@@ -7,7 +7,10 @@ on:
       - .dockerignore
       - images/session/**
       - scripts/session-image-*.sh
+      - scripts/session-image-security-policy-test.py
       - internal/driver/image*test.go
+      - testdata/session-security/**
+      - Makefile
       - .github/workflows/session-image.yml
   workflow_dispatch:
 
@@ -31,7 +34,45 @@ jobs:
         env:
           RAINIER_SESSION_IMAGE: rainier-session:qualify
         run: go test ./internal/driver -run '^(TestSessionImage|TestImageSmoke)' -count=1
+      # Chromium must use its own sandbox; enable user namespaces on this disposable CI host.
+      - name: Enable Chromium sandbox user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # This public snapshot exercises the browser boundary without requiring
+      # a cross-repository token. Rainier Cloud owns and qualifies its runtime
+      # policy independently; the fixture's hashes and exact rules are checked
+      # before the profile is loaded.
+      - name: Validate the public browser policy fixture
+        run: make session-image-security-policy
+      - name: Load the reviewed Chromium AppArmor policy
+        run: sudo apparmor_parser -r testdata/session-security/rainier-codex-bwrap.apparmor
       - name: Functional smoke with no network or credentials
+        env:
+          SECCOMP: ${{ github.workspace }}/testdata/session-security/codex-bwrap-seccomp-docker-27.5.1.json
+          APPARMOR: rainier-codex-bwrap
+        id: image-smoke
+        continue-on-error: true
         run: make session-image-smoke SESSION_IMAGE=rainier-session:qualify
+      # A Chromium sandbox failure can be a host-level denial after the
+      # browser has exited. Emit only coarse category flags; raw kernel audit
+      # records must stay on the runner and never enter public logs.
+      - name: Summarize host security denials
+        if: steps.image-smoke.outcome == 'failure'
+        run: |
+          if sudo dmesg --color=never 2>/dev/null | grep -Eqi 'apparmor.*DENIED'; then
+            echo apparmor-denial-observed
+          else
+            echo no-apparmor-denial-observed
+          fi
+          if sudo dmesg --color=never 2>/dev/null | grep -Eqi 'seccomp|SECCOMP'; then
+            echo seccomp-denial-observed
+          else
+            echo no-seccomp-denial-observed
+          fi
+          exit 1
+      - name: Browser end to end in a fresh project
+        env:
+          SECCOMP: ${{ github.workspace }}/testdata/session-security/codex-bwrap-seccomp-docker-27.5.1.json
+          APPARMOR: rainier-codex-bwrap
+        run: make session-image-browser-e2e SESSION_IMAGE=rainier-session:qualify
       - name: Image size
         run: docker image inspect -f '{{.Size}} bytes; {{.Architecture}}' rainier-session:qualify

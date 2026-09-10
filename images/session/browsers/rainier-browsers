@@ -1,0 +1,150 @@
+#!/bin/sh
+# rainier-browsers — the session image's preinstalled browser baseline, and the
+# link between it and the cache a project's own Playwright reads.
+#
+# The baseline lives root-owned under /usr/local/lib/rainier-browsers, on the
+# read-only rootfs. Playwright looks for browsers in
+# $PLAYWRIGHT_BROWSERS_PATH, which this image sets to
+# /workspace/.cache/ms-playwright — writable, on the volume, and the same place
+# Playwright would have chosen on its own from $XDG_CACHE_HOME. `link` fills
+# that cache with directories whose payload is a symlink into the baseline, so
+# a fresh session launches the pinned browser with nothing downloaded, and a
+# project that pins a different Playwright still installs its own revision
+# beside it and wins.
+#
+# The image runs `link` at build time, and docker copies the result onto a
+# freshly created workspace volume, so an ordinary session never has to run
+# this. It is here for the two cases that are not ordinary: a workspace volume
+# created before this image existed, and a `playwright install` that pruned the
+# links as unused (it does that to any browser directory no linked Playwright
+# asks for, which is the correct behaviour and only ever removes the links).
+#
+# It installs nothing, downloads nothing, needs no privilege, and never touches
+# a browser directory a project installed itself.
+set -eu
+
+PREFIX=${RAINIER_BROWSERS_PREFIX:-/usr/local/lib/rainier-browsers}
+MANIFEST=/usr/local/share/rainier-browsers.json
+# The marker that says a browser directory in the cache is a link to the
+# baseline rather than something a project downloaded. Without it `link` would
+# have to guess, and guessing wrong means deleting somebody's install.
+OURS=.rainier-baseline
+
+usage() {
+  cat <<'USAGE'
+usage: rainier-browsers <command>
+
+  status   what is installed, where, and what a project's Playwright resolves
+  link     (re)create the baseline's entries in the Playwright browser cache
+  path     print the Playwright browser cache directory
+  version  print the pinned Playwright version and Chromium build
+
+The baseline is read-only. A project that needs another browser or another
+revision runs its own `npx playwright install`, which writes into the cache
+`path` prints and needs cdn.playwright.dev.
+USAGE
+}
+
+registry_dir() {
+  if [ "${PLAYWRIGHT_BROWSERS_PATH:-}" = 0 ]; then
+    echo "PLAYWRIGHT_BROWSERS_PATH=0 selects a package-local cache; use the project Playwright installer or unset this override" >&2
+    return 2
+  fi
+  if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ]; then
+    printf '%s\n' "$PLAYWRIGHT_BROWSERS_PATH"
+  else
+    printf '%s/ms-playwright\n' "${XDG_CACHE_HOME:-$HOME/.cache}"
+  fi
+}
+
+playwright_version() {
+  [ -r "$MANIFEST" ] || { printf 'unknown\n'; return 0; }
+  sed -n 's/.*"playwrightVersion": *"\([^"]*\)".*/\1/p' "$MANIFEST" | head -1
+}
+
+# A cache entry is the baseline's to manage only while it still says so. A
+# project's own install replaces the whole directory, marker included.
+is_ours() { [ -f "$1/$OURS" ]; }
+
+link_one() {
+  src=$1 dst=$2
+  if [ -e "$dst" ] && ! is_ours "$dst"; then
+    printf 'skip  %s (installed by this workspace, not the baseline)\n' "$dst"
+    return 0
+  fi
+  mkdir -p "$dst"
+  printf '%s\n' "$src" > "$dst/$OURS"
+  # Playwright's two markers. They are ordinary writable files in the cache
+  # rather than symlinks into the read-only baseline, because Playwright
+  # rewrites DEPENDENCIES_VALIDATED every thirty days and a failed write there
+  # costs an ldd sweep on every launch afterwards.
+  : > "$dst/INSTALLATION_COMPLETE"
+  : > "$dst/DEPENDENCIES_VALIDATED"
+  for entry in "$src"/*; do
+    name=${entry##*/}
+    case "$name" in
+      INSTALLATION_COMPLETE|DEPENDENCIES_VALIDATED|"$OURS"|'*') continue ;;
+    esac
+    [ -n "$dst" ] && [ -n "$name" ] || { echo "invalid browser cache entry" >&2; return 1; }
+    rm -rf -- "${dst:?}/${name:?}"
+    ln -s "$entry" "$dst/$name"
+  done
+  printf 'link  %s -> %s\n' "$dst" "$src"
+}
+
+cmd_link() {
+  [ -d "$PREFIX" ] || { echo "no browser baseline at $PREFIX" >&2; exit 1; }
+  reg=$(registry_dir)
+  mkdir -p "$reg"
+  # An upgraded image may have retired a revision whose cache links survived
+  # on the workspace volume. Playwright skips download when this marker exists,
+  # even if the linked payload is gone. Invalidate only our stale markers;
+  # leave project installs and any other workspace files untouched.
+  for dst in "$reg"/*; do
+    [ -d "$dst" ] && [ ! -L "$dst" ] && is_ours "$dst" || continue
+    source_path=$(cat "$dst/$OURS")
+    if [ ! -d "$source_path" ]; then
+      rm -f "$dst/INSTALLATION_COMPLETE" "$dst/DEPENDENCIES_VALIDATED"
+      printf 'repair  %s (retired baseline; project installer may download it)\n' "$dst"
+    fi
+  done
+  for src in "$PREFIX"/*; do
+    [ -d "$src" ] || continue
+    link_one "$src" "$reg/${src##*/}"
+  done
+}
+
+cmd_status() {
+  reg=$(registry_dir)
+  printf 'playwright pin   %s\n' "$(playwright_version)"
+  printf 'baseline         %s\n' "$PREFIX"
+  printf 'browser cache    %s\n' "$reg"
+  [ -d "$PREFIX" ] || { echo "the baseline is missing" >&2; exit 1; }
+  for src in "$PREFIX"/*; do
+    [ -d "$src" ] || continue
+    name=${src##*/}
+    state=absent
+    if [ -d "$reg/$name" ]; then
+      if is_ours "$reg/$name"; then state=linked; else state="installed by this workspace"; fi
+    fi
+    printf '%-40s %s\n' "$name" "$state"
+  done
+  # The one thing a version table cannot tell you: whether the binary in the
+  # cache runs in this container, as this user, right now.
+  for exe in "$reg"/*/*/chrome-headless-shell; do
+    [ -x "$exe" ] || continue
+    printf 'runs             %s (%s)\n' "$("$exe" --version 2>&1 | head -1)" "$exe"
+  done
+}
+
+case "${1:-}" in
+  status) cmd_status ;;
+  link) cmd_link ;;
+  path) registry_dir ;;
+  version)
+    printf 'playwright %s\n' "$(playwright_version)"
+    sed -n 's/.*"browserVersion": *"\([^"]*\)".*/chromium \1/p' "$MANIFEST" 2>/dev/null | head -1
+    ;;
+  -h|--help|help|'') usage ;;
+  *) usage >&2; exit 2 ;;
+esac
