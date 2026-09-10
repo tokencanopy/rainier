@@ -55,6 +55,19 @@ type Context struct {
 	// machine. It is per context because a session id means nothing on
 	// another server.
 	CurrentSession string `json:"current_session,omitempty"`
+
+	// LastControlSession and LastControlGeneration are the session this
+	// device last held terminal control of, and the controller generation it
+	// was granted under. They exist so `rainier info` can say "this device"
+	// without the API ever naming another client: nobody else can hold a
+	// generation without advancing past it, so a live lease still at the
+	// number this device was granted is this device's.
+	//
+	// One session, not a table: it is bounded, and the session a person
+	// wants that answer about is the one they were just in. A generation is
+	// stored as a decimal string for the same reason it travels as one.
+	LastControlSession    string `json:"last_control_session,omitempty"`
+	LastControlGeneration string `json:"last_control_generation,omitempty"`
 }
 
 // Hosted reports whether this context came from a hosted edge. A recorded

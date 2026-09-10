@@ -45,6 +45,27 @@ import (
 // detachKey is Ctrl-].
 const detachKey = 0x1d
 
+// takeKey is Ctrl-\, the one key binding conditional ownership adds. It sits
+// beside Ctrl-] deliberately: the two keys that are about the ATTACH rather
+// than about the terminal are adjacent and neither is a printing character.
+//
+// It is intercepted only inside a negotiated attach — one where the server
+// actually answered with a mode. Against a plane that does not speak
+// conditional ownership it is forwarded as an ordinary byte, so nothing about
+// today's key handling changes for a client that never negotiated.
+const takeKey = 0x1c
+
+// The three notices, which are UI copy and nothing more: no identity, no
+// device, no session content. They are constants so a test asserts the
+// sentence rather than a substring of it, and so the wording changes in one
+// place.
+const (
+	NoticeViewing     = "[viewing — another device has control; press Ctrl-\\ to take it]"
+	NoticeTaken       = "[another device took control; press Ctrl-\\ to take it back]"
+	NoticeHaveControl = "[you have control]"
+	NoticeStale       = "[somebody else got there first; press Ctrl-\\ to try again]"
+)
+
 // attachReadLimit matches sessiond/runnerd/controld's own raised read limit
 // (see internal/server/server.go): a snapshot replaying a large scrollback
 // is the biggest frame this splice ever carries in either direction.
@@ -85,6 +106,39 @@ type Outcome struct {
 	Reason   Reason
 	LastSeq  uint64
 	ExitCode int
+	// Mode is what this attach held when it ended: terminal.ModeControl,
+	// terminal.ModeView, or "" when nothing was negotiated — an attach that
+	// asked for no conditional ownership, or one against a plane that does
+	// not speak it. A caller reconnects as what it actually had, which is
+	// what keeps a device that was superseded while it was away from taking
+	// control back on its own.
+	Mode string
+	// Generation is the controller generation this attach was last
+	// acknowledged at. It is the value a reconnect presents, and the value
+	// `info` compares against to answer "is it this device?".
+	Generation uint64
+}
+
+// Options is what an attach asks for about ownership. The zero value asks for
+// nothing, which is an attach exactly as it behaved before conditional
+// ownership existed — what cmd/rattach and every direct-to-sandbox caller
+// wants, and what a caller gets by not thinking about it.
+type Options struct {
+	// Control advertises the capability. Without it the server sends today's
+	// message set and this attach types unconditionally.
+	Control bool
+	// Mode is terminal.ModeControl (claim control when it is free) or
+	// terminal.ModeView (never claim). Empty means control.
+	Mode string
+	// Expected is the generation this device last held. It makes the claim
+	// conditional: take control only while the session is still at this
+	// generation. It is what a RECONNECT presents.
+	Expected uint64
+	// Take sends exactly one claim if the attach comes back as a viewer —
+	// `rainier attach --take`. Exactly one, and never again: a client that
+	// re-claimed every time it was refused would be two devices fighting for
+	// a keyboard instead of one person deciding.
+	Take bool
 }
 
 func (e *DialError) Error() string { return e.err.Error() }
@@ -149,11 +203,32 @@ func Cursor(given bool, since uint64) uint64 {
 // otherwise byte-identical; the separator is the only thing that has to be
 // right.
 func withSince(wsURL string, since uint64) string {
+	return appendParam(wsURL, "since", strconv.FormatUint(since, 10))
+}
+
+// withOwnership puts the conditional-ownership request on the attach URL. A
+// caller that asks for nothing gets the URL back unchanged, which is what
+// keeps a direct-to-sandbox attach byte-identical to what it always was.
+func withOwnership(wsURL string, o Options) string {
+	if !o.Control {
+		return wsURL
+	}
+	wsURL = appendParam(wsURL, terminal.ParamControl, terminal.CapabilityControl)
+	if o.Mode == terminal.ModeView {
+		wsURL = appendParam(wsURL, terminal.ParamMode, terminal.ModeView)
+	}
+	if o.Expected > 0 {
+		wsURL = appendParam(wsURL, terminal.ParamExpected, strconv.FormatUint(o.Expected, 10))
+	}
+	return wsURL
+}
+
+func appendParam(wsURL, key, value string) string {
 	sep := "?"
 	if strings.Contains(wsURL, "?") {
 		sep = "&"
 	}
-	return wsURL + sep + "since=" + strconv.FormatUint(since, 10)
+	return wsURL + sep + key + "=" + url.QueryEscape(value)
 }
 
 // ScanDetach reports the index of the first Ctrl-] byte in buf, or -1 if
@@ -217,16 +292,16 @@ func RestoreTerminal(stdin, stdout *os.File) error {
 // session_not_ready — callers (cmd/rainier's `new`, retrying an attach
 // immediately after create) should match on that sentinel rather than
 // inspecting error text.
-func Run(ctx context.Context, wsURL string, header http.Header, since uint64) (Outcome, error) {
-	return runWithIO(ctx, wsURL, header, since, os.Stdin, os.Stdout)
+func Run(ctx context.Context, wsURL string, header http.Header, since uint64, o Options) (Outcome, error) {
+	return runWithIO(ctx, wsURL, header, since, o, os.Stdin, os.Stdout)
 }
 
-func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint64, stdin *os.File, stdout io.Writer) (Outcome, error) {
+func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint64, o Options, stdin *os.File, stdout io.Writer) (Outcome, error) {
 	var opts *websocket.DialOptions
 	if header != nil {
 		opts = &websocket.DialOptions{HTTPHeader: header}
 	}
-	c, resp, err := websocket.Dial(ctx, withSince(wsURL, since), opts)
+	c, resp, err := websocket.Dial(ctx, withOwnership(withSince(wsURL, since), o), opts)
 	if err != nil {
 		if resp != nil {
 			// A response came back but didn't upgrade (a plain HTTP error
@@ -270,17 +345,32 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 	}
 	defer restore()
 
+	own := newOwnership(o)
+
 	var resizeDone chan struct{}
 	var resizeWG sync.WaitGroup
 	var winch chan os.Signal
 	if isTTY {
 		sendSize := func() {
 			w, h, err := term.GetSize(fd)
-			if err == nil {
-				wsjson.Write(ctx, c, terminal.ClientMessage{Type: "resize", Cols: w, Rows: h})
+			if err != nil {
+				return
+			}
+			// The opening resize always goes: it is the message the attach
+			// protocol requires first, and it is what sizes the session. Every
+			// LATER one is the controller's to send — a viewer's would be
+			// dropped at the plane and discarded at the pty, and the terminal
+			// follows whoever is typing.
+			if own.mayType() {
+				wsjson.Write(ctx, c, terminal.ClientMessage{
+					Type: "resize", Cols: w, Rows: h, Generation: terminal.GenOf(own.stamp())})
 			}
 		}
-		sendSize() // required first message
+		// The required first message, sent before any answer can have
+		// arrived, and therefore never stamped and never suppressed.
+		if w, h, err := term.GetSize(fd); err == nil {
+			wsjson.Write(ctx, c, terminal.ClientMessage{Type: "resize", Cols: w, Rows: h})
+		}
 
 		winch = make(chan os.Signal, 1)
 		signal.Notify(winch, syscall.SIGWINCH)
@@ -355,11 +445,28 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 				restore()
 				seq := lastSeq.Load()
 				stdoutMu.Unlock()
-				finish(Outcome{Reason: Disconnected, LastSeq: seq}, nil)
+				mode, gen := own.state()
+				finish(Outcome{Reason: Disconnected, LastSeq: seq, Mode: mode, Generation: gen}, nil)
 				return
+			}
+			if isOwnershipMessage(m.Type) {
+				notice := own.observe(m)
+				stdoutMu.Lock()
+				if notice != "" && !decided.Load() {
+					writeNotice(stdout, notice)
+				}
+				stdoutMu.Unlock()
+				if claim, ok := ownTakeClaim(own); ok {
+					wsjson.Write(ctx, c, claim)
+				}
+				continue
 			}
 			switch m.Type {
 			case "snapshot", "output":
+				// Terminal traffic without an answer means a plane that does
+				// not speak conditional ownership. From here this attach is
+				// an ordinary one, byte for byte.
+				own.settleLegacy()
 				stdoutMu.Lock()
 				if !decided.Load() {
 					n, writeErr := stdout.Write(m.Data)
@@ -383,6 +490,7 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 				// who is free to touch os.Stdout the instant Run returns.
 				stdoutMu.Unlock()
 			case "exit":
+				own.settleLegacy()
 				if !claim() {
 					return
 				}
@@ -390,7 +498,8 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 				restore()
 				fmt.Fprintf(stdout, "\r\n[session process exited: %d]\r\n", m.ExitCode)
 				stdoutMu.Unlock()
-				finish(Outcome{Reason: Exited, LastSeq: lastSeq.Load(), ExitCode: m.ExitCode}, nil)
+				mode, gen := own.state()
+				finish(Outcome{Reason: Exited, LastSeq: lastSeq.Load(), ExitCode: m.ExitCode, Mode: mode, Generation: gen}, nil)
 				return
 			default:
 				if !claim() {
@@ -420,15 +529,33 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 				// killed externally).
 				return
 			}
-			detach := ScanDetach(buf[:n])
-			if detach < 0 {
-				wsjson.Write(ctx, c, terminal.ClientMessage{Type: "stdin", Data: append([]byte(nil), buf[:n]...)})
+			// send is the one place local bytes become a frame: a viewer's
+			// keystrokes stop here, and a controller's carry the generation
+			// they were typed under so a frame that outlives its authority is
+			// discarded rather than executed.
+			send := func(b []byte) {
+				if len(b) == 0 || !own.mayType() {
+					return
+				}
+				wsjson.Write(ctx, c, terminal.ClientMessage{
+					Type: "stdin", Data: append([]byte(nil), b...), Generation: terminal.GenOf(own.stamp())})
+			}
+			at, key := scanKeys(buf[:n], own.keyActive())
+			if key == keyNone {
+				send(buf[:n])
 				continue
 			}
-			// Forward whatever preceded the detach key in this chunk before
-			// detaching; anything after it in the same chunk is discarded.
-			if detach > 0 {
-				wsjson.Write(ctx, c, terminal.ClientMessage{Type: "stdin", Data: append([]byte(nil), buf[:detach]...)})
+			// Forward whatever preceded the key in this chunk; anything after
+			// it in the same chunk is discarded, as it always has been.
+			send(buf[:at])
+			if key == keyTake {
+				if msg, ok := own.claim(); ok {
+					wsjson.Write(ctx, c, msg)
+				}
+				// Nothing is printed when this device already has control:
+				// the answer to "take control" when you have it is silence,
+				// not a line of noise over somebody's editor.
+				continue
 			}
 			if !claim() {
 				return
@@ -438,7 +565,8 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 			seq := lastSeq.Load()
 			fmt.Fprintf(stdout, "\r\n[detached at seq %d; session still running]\r\n", seq)
 			stdoutMu.Unlock()
-			finish(Outcome{Reason: Detached, LastSeq: seq}, nil)
+			mode, gen := own.state()
+			finish(Outcome{Reason: Detached, LastSeq: seq, Mode: mode, Generation: gen}, nil)
 			return
 		}
 	}()
@@ -522,4 +650,15 @@ func readStdin(done func() bool, stdin *os.File, buf []byte) (n int, err error, 
 			return 0, fmt.Errorf("polling stdin: event %#x", fds[0].Revents), false
 		}
 	}
+}
+
+// ownTakeClaim is --take spending its one claim: the attach came back a
+// viewer, the user asked for control on the command line, and this is the
+// single message that asks for it. Exactly once, and never in response to
+// being refused — that is the difference between a request and a loop.
+func ownTakeClaim(o *ownership) (terminal.ClientMessage, bool) {
+	if !o.takeOnce() {
+		return terminal.ClientMessage{}, false
+	}
+	return o.claim()
 }

@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -301,6 +302,22 @@ type session struct {
 	CreatedAt     string `json:"created_at"`
 	UpdatedAt     string `json:"updated_at"`
 	LastEventAt   string `json:"last_event_at"`
+	// Controller is who may type: the generation in force and whether
+	// anybody currently holds it. It names nobody — the API does not
+	// disclose another client's identity — so "this device" is something the
+	// CLI works out from the generation it was last granted, not something
+	// the server tells it. Absent from an older server, which reads as
+	// "nobody has control", and is the truth there: nothing was ever
+	// conditional.
+	Controller controllerView `json:"controller"`
+}
+
+// controllerView is the session view's additive controller object. The
+// generation is a decimal STRING on the wire, so it is one here: a uint64
+// past 2^53 would be silently wrong as a JSON number.
+type controllerView struct {
+	Generation string `json:"generation"`
+	Held       bool   `json:"held"`
 }
 
 type sessionEnvelope struct {
@@ -1615,6 +1632,45 @@ func attachWithRetrySleep(cfg cli.Config, id string, since uint64, sleep func(ti
 }
 
 func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(time.Duration), initialWait time.Duration) error {
+	return attachWithRetryOwned(cfg, id, since, defaultOwnership(), sleep, initialWait)
+}
+
+// defaultOwnership is what a plain `rainier attach` asks for: claim control
+// when it is free, and view when somebody else has it. It is zero-click on
+// one laptop — the case that has always worked — and honest on two devices.
+func defaultOwnership() attachio.Options {
+	return attachio.Options{Control: true, Mode: terminal.ModeControl}
+}
+
+// reconnectOwnership is what the NEXT attempt asks for, and it is the whole
+// of "reconnect is conditional". A device that had control presents the
+// generation it held, so it resumes only while nobody took it — and comes
+// back a viewer, saying so, when somebody did. A device that was viewing
+// stays a viewer rather than quietly acquiring control because a network blip
+// happened to free it.
+//
+// Nothing here ever claims on its own. --take is spent by the attempt that
+// used it and is not renewed: a client that re-claimed on every reconnect
+// would be two devices fighting over a keyboard, which is the failure this
+// whole task exists to remove.
+func reconnectOwnership(prev attachio.Options, out attachio.Outcome) attachio.Options {
+	next := prev
+	next.Take = false
+	switch out.Mode {
+	case terminal.ModeControl:
+		next.Mode = terminal.ModeControl
+		next.Expected = out.Generation
+	case terminal.ModeView:
+		next.Mode = terminal.ModeView
+		next.Expected = 0
+	}
+	// An empty mode is a server that never answered: nothing was negotiated,
+	// so the request stays exactly what it was.
+	return next
+}
+
+func attachWithRetryOwned(cfg cli.Config, id string, since uint64, own attachio.Options,
+	sleep func(time.Duration), initialWait time.Duration) error {
 	// Emulator modes are not termios. Keep them across cursor-only reconnects
 	// (which need not replay their enable sequences), but never leave the local
 	// shell interpreting mouse movement as typed input on final return.
@@ -1653,8 +1709,9 @@ func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(t
 		}
 		header.Set("Authorization", "Bearer "+c.Token)
 		attemptStarted := time.Now()
-		outcome, err := attachio.Run(ctx, wsURL, header, since)
+		outcome, err := attachio.Run(ctx, wsURL, header, since, own)
 		if err == nil {
+			rememberControl(cfg, id, outcome)
 			if outcome.Reason != attachio.Disconnected {
 				return nil
 			}
@@ -1664,6 +1721,7 @@ func attachWithRetryBudget(cfg cli.Config, id string, since uint64, sleep func(t
 			established = true
 			authRetried = false
 			since = outcome.LastSeq
+			own = reconnectOwnership(own, outcome)
 			if time.Since(attemptStarted) >= 10*time.Second {
 				backoff = 100 * time.Millisecond
 			}
@@ -1902,7 +1960,7 @@ func formatAge(rfc3339 string) string {
 // failed setup's full output, and what the disconnect line's advice means
 // when it fires before the first frame — and `--since N` resumes after N.
 func runAttach(args []string) error {
-	ref, cursor, replay, err := attachFlags(args)
+	ref, cursor, replay, own, err := attachFlags(args)
 	if err != nil {
 		return err
 	}
@@ -1914,7 +1972,7 @@ func runAttach(args []string) error {
 	if err := prepareAttach(c, id, replay); err != nil {
 		return err
 	}
-	if err := attachWithRetry(cfg, id, cursor); err != nil {
+	if err := attachWithRetryOwned(cfg, id, cursor, own, nil, 60*time.Second); err != nil {
 		return err
 	}
 	if err := rememberCurrentSession(id, cfg); err != nil {
@@ -2073,16 +2131,29 @@ func getSessionContext(ctx context.Context, c *cli.Client, id string) (session, 
 // The third return value is what turns `--since` into the documented
 // diagnostic override: passing it means "show me the log", which is a request
 // prepareAttach honors even for a session it would otherwise refuse.
-func attachFlags(args []string) (ref string, cursor uint64, replay bool, err error) {
+func attachFlags(args []string) (ref string, cursor uint64, replay bool, own attachio.Options, err error) {
 	fs := flag.NewFlagSet("attach", flag.ExitOnError)
 	since := fs.Uint64("since", 0, "resume from sequence number; 0 replays the whole event log (omit for the current screen)")
+	view := fs.Bool("view", false, "watch without ever claiming control")
+	take := fs.Bool("take", false, "take control on attach, even if another device has it")
 	fs.Parse(reorderArgs(fs, args))
 	passed := passedFlags(fs)["since"]
 	selector, err := requireSelector(fs, "attach")
 	if err != nil {
-		return "", 0, false, err
+		return "", 0, false, attachio.Options{}, err
 	}
-	return selector, attachio.Cursor(passed, *since), passed, nil
+	if *view && *take {
+		return "", 0, false, attachio.Options{}, commandError{
+			message: "--view and --take ask for opposite things; pass one or neither"}
+	}
+	own = defaultOwnership()
+	switch {
+	case *view:
+		own.Mode = terminal.ModeView
+	case *take:
+		own.Take = true
+	}
+	return selector, attachio.Cursor(passed, *since), passed, own, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -3666,4 +3737,51 @@ func reorderArgs(fs *flag.FlagSet, args []string) []string {
 		}
 	}
 	return append(flags, positional...)
+}
+
+// rememberControl records what this device held on this session, so `rainier
+// info` can answer "is it me?" without the API ever naming another client.
+// The generation is enough: nobody else can hold generation N without
+// advancing past it, so a live lease still at the number this device was
+// granted is this device's.
+//
+// A failure to write is not worth failing an attach over — the terminal
+// worked, and the worst case is one line of `info` reading "another device"
+// about a session this device controls.
+func rememberControl(cfg cli.Config, id string, out attachio.Outcome) {
+	if out.Mode == "" {
+		return // nothing was negotiated; there is nothing to remember
+	}
+	held := ""
+	if out.Mode == terminal.ModeControl {
+		held = strconv.FormatUint(out.Generation, 10)
+	}
+	_ = cli.UpdateConfig(func(latest *cli.Config) error {
+		name := cfg.ActiveName()
+		ctx, ok := latest.Contexts[name]
+		if !ok {
+			return nil
+		}
+		// held is empty when this device ended as a viewer, which forgets
+		// the generation rather than leaving a stale claim to it behind.
+		ctx.LastControlSession, ctx.LastControlGeneration = id, held
+		latest.UpdateContext(name, ctx)
+		return nil
+	})
+}
+
+// controllerLine renders `info`'s Controller row from what the server says
+// and what this device remembers. Three answers, and no fourth: the API
+// discloses whether somebody holds control, never who, so "another device" is
+// the honest name for everybody that is not this one.
+func controllerLine(cfg cli.Config, s session) string {
+	if !s.Controller.Held {
+		return "none"
+	}
+	ctx, ok := cfg.Active()
+	if ok && ctx.LastControlSession == s.ID && ctx.LastControlGeneration != "" &&
+		ctx.LastControlGeneration == s.Controller.Generation {
+		return "this device"
+	}
+	return "another device"
 }

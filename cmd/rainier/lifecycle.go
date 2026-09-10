@@ -79,6 +79,10 @@ func printInfo(w io.Writer, cfg cli.Config, s session) {
 	fmt.Fprintf(w, "Last event:   %s\n", safeField(dashIfEmpty(s.LastEventAt)))
 	fmt.Fprintf(w, "Updated:      %s\n", safeField(dashIfEmpty(s.UpdatedAt)))
 	fmt.Fprintf(w, "Environment:  %s\n", safeField(dashIfEmpty(s.Environment)))
+	// Who may type. Three answers and no fourth: the API says whether
+	// somebody holds control, never who, so everybody that is not this
+	// device is "another device".
+	fmt.Fprintf(w, "Controller:   %s\n", controllerLine(cfg, s))
 	if agent := sessionAgent(s); agent != "" {
 		fmt.Fprintf(w, "Agent:        %s\n", safeField(agent))
 	}

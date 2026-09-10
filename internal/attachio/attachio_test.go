@@ -123,7 +123,7 @@ func TestRunDialsWithTheCursor(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			_, _ = Run(context.Background(), tc.url("ws"+strings.TrimPrefix(ts.URL, "http")), nil, tc.since)
+			_, _ = Run(context.Background(), tc.url("ws"+strings.TrimPrefix(ts.URL, "http")), nil, tc.since, Options{})
 
 			select {
 			case got := <-queries:
@@ -263,7 +263,7 @@ func TestRunNoRaceOnFloodedOutputDuringDetach(t *testing.T) {
 	}
 	runDone := make(chan runResult, 1)
 	go func() {
-		out, err := Run(context.Background(), wsURL, nil, 0)
+		out, err := Run(context.Background(), wsURL, nil, 0, Options{})
 		runDone <- runResult{out: out, err: err}
 	}()
 
@@ -315,7 +315,7 @@ func TestRunSessionNotReadyMapsToSentinel(t *testing.T) {
 	defer ts.Close()
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/attach"
 
-	_, err := Run(context.Background(), wsURL, nil, 0)
+	_, err := Run(context.Background(), wsURL, nil, 0, Options{})
 	if err == nil {
 		t.Fatal("Run: want an error for a 503 response, got nil")
 	}
@@ -342,7 +342,7 @@ func TestRunNon503DialErrorDoesNotMatchSentinel(t *testing.T) {
 	defer ts.Close()
 	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/attach"
 
-	_, err := Run(context.Background(), wsURL, nil, 0)
+	_, err := Run(context.Background(), wsURL, nil, 0, Options{})
 	if err == nil {
 		t.Fatal("Run: want an error for a 500 response, got nil")
 	}
@@ -363,7 +363,7 @@ func TestRunTransportErrorIsNotADialError(t *testing.T) {
 	closedURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/attach"
 	ts.Close() // nothing is listening here any more
 
-	_, err := Run(context.Background(), closedURL, nil, 0)
+	_, err := Run(context.Background(), closedURL, nil, 0, Options{})
 	if err == nil {
 		t.Fatal("Run: want a transport error, got nil")
 	}
@@ -413,7 +413,7 @@ func TestRunReportsDisconnectCursor(t *testing.T) {
 		close(drainDone)
 	}()
 
-	outcome, err := Run(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 9)
+	outcome, err := Run(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 9, Options{})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -437,7 +437,7 @@ func TestRunReportsDisconnectCursor(t *testing.T) {
 		c.Close(websocket.StatusGoingAway, "synthetic interruption before first frame")
 	}))
 	defer beforeFrame.Close()
-	outcome, err = Run(context.Background(), "ws"+strings.TrimPrefix(beforeFrame.URL, "http")+"/attach", nil, 23)
+	outcome, err = Run(context.Background(), "ws"+strings.TrimPrefix(beforeFrame.URL, "http")+"/attach", nil, 23, Options{})
 	if err != nil {
 		t.Fatalf("Run before first frame: %v", err)
 	}
@@ -458,7 +458,7 @@ func TestRunReportsDisconnectCursor(t *testing.T) {
 		wsjson.Write(r.Context(), c, terminal.ServerMessage{Type: "exit", ExitCode: 7})
 	}))
 	defer exitServer.Close()
-	outcome, err = Run(context.Background(), "ws"+strings.TrimPrefix(exitServer.URL, "http")+"/attach", nil, 23)
+	outcome, err = Run(context.Background(), "ws"+strings.TrimPrefix(exitServer.URL, "http")+"/attach", nil, 23, Options{})
 	if err != nil {
 		t.Fatalf("Run exit: %v", err)
 	}
@@ -491,7 +491,7 @@ func TestRunPreservesSinceAllBeforeFirstFrame(t *testing.T) {
 	}
 	defer stdinR.Close()
 	defer stdinW.Close()
-	outcome, err := runWithIO(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, terminal.SinceAll, stdinR, io.Discard)
+	outcome, err := runWithIO(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, terminal.SinceAll, Options{}, stdinR, io.Discard)
 	if err != nil {
 		t.Fatalf("runWithIO: %v", err)
 	}
@@ -523,7 +523,7 @@ func TestRunRejectsPermanentWebSocketClose(t *testing.T) {
 	defer stdinW.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
-	_, err = runWithIO(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 0, stdinR, io.Discard)
+	_, err = runWithIO(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 0, Options{}, stdinR, io.Discard)
 	if err == nil || websocket.CloseStatus(err) != websocket.StatusPolicyViolation {
 		t.Fatalf("runWithIO error = %v, want policy close", err)
 	}
@@ -558,7 +558,7 @@ func TestRunRejectsUnknownServerMessage(t *testing.T) {
 	defer stdinW.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
-	_, err = runWithIO(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 0, stdinR, io.Discard)
+	_, err = runWithIO(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 0, Options{}, stdinR, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "unsupported server message type") {
 		t.Fatalf("runWithIO error = %v, want permanent unknown-message error", err)
 	}
@@ -587,7 +587,7 @@ func TestRunDoesNotAdvanceCursorAfterShortOutputWrite(t *testing.T) {
 	defer stdinR.Close()
 	defer stdinW.Close()
 	w := &shortWriter{}
-	outcome, err := runWithIO(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 9, stdinR, w)
+	outcome, err := runWithIO(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 9, Options{}, stdinR, w)
 	if !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("runWithIO error = %v, want io.ErrShortWrite", err)
 	}
@@ -672,7 +672,7 @@ func TestRunDiscardsTTYInputQueuedDuringDial(t *testing.T) {
 	defer slave.Close()
 	done := make(chan error, 1)
 	go func() {
-		_, err := runWithIO(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 0, slave, io.Discard)
+		_, err := runWithIO(context.Background(), "ws"+strings.TrimPrefix(ts.URL, "http")+"/attach", nil, 0, Options{}, slave, io.Discard)
 		done <- err
 	}()
 	<-handlerStarted

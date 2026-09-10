@@ -31,7 +31,7 @@ func main() {
 	})
 
 	ctx := context.Background()
-	outcome, err := attachio.Run(ctx, attachio.AttachURL(*baseURL, *session), nil, attachio.Cursor(given, *since))
+	outcome, err := attachio.Run(ctx, attachio.AttachURL(*baseURL, *session), nil, attachio.Cursor(given, *since), attachio.Options{})
 	if err != nil {
 		log.Fatal(err)
 	}
