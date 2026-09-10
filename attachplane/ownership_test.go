@@ -758,3 +758,94 @@ func awaitSpliced(t *testing.T, f *attachFixture) {
 		return false
 	}, "the attach's first forwarded frame")
 }
+
+// awaitViewerSpliced proves this attach's splice is running when the ordinary
+// probe cannot: a viewer's own frames are dropped at the plane, so the frame
+// that proves it has to travel the other way. It matters because a handoff
+// needs the sandbox's socket, and an attach that has not been spliced yet
+// installs nothing and therefore waits for nothing.
+func awaitViewerSpliced(t *testing.T, f *attachFixture) {
+	t.Helper()
+	f.sandbox.write(t, terminal.ServerMessage{Type: "output", Seq: 1, Data: []byte("x")})
+	awaitType(t, f.stream, "output")
+}
+
+// awaitGeneration blocks until the shared lease reaches want, so a test can
+// sequence one claim behind another's store write without sleeping for it.
+func awaitGeneration(t *testing.T, l *fakeLease, want uint64) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		l.mu.Lock()
+		got := l.gen
+		l.mu.Unlock()
+		if got >= want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("the lease never reached generation %d (it is at %d)", want, got)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// TestAClaimSupersededWhileItWaitedIsNeverToldItHasControl closes the window
+// a claim opens on itself. A claim advances the generation in the store and
+// then waits — for as long as the acknowledgement timeout allows — for the
+// sandbox to confirm the binding. A second claim can win inside that wait, so
+// by the time the first one wakes up the generation it holds has already been
+// superseded.
+//
+// Announcing "attached, control" anyway breaks the one rule this design has:
+// at most one controller at any moment. Nothing double-executes — the fence
+// is at the pty and holds — but until the next heartbeat the user's screen
+// says they have control while every keystroke they type is discarded, and a
+// second device has been told exactly the same thing.
+//
+// The interleaving is made deterministic rather than raced: the first
+// attach's sandbox predates the protocol and never acknowledges, so its claim
+// waits out the whole timeout, while the second attach's sandbox answers at
+// once.
+func TestAClaimSupersededWhileItWaitedIsNeverToldItHasControl(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 500 * time.Millisecond})
+	lease := &fakeLease{gen: 1}
+
+	a := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_a"}, false)
+	awaitType(t, a.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, a)
+	b := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_b"}, true)
+	awaitType(t, b.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, b)
+
+	a.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
+	// a has won generation 2 in the store and is now blocked on an
+	// acknowledgement that will never come. b claims over it from there.
+	awaitGeneration(t, lease, 2)
+	b.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(2)}
+
+	deadline := time.After(5 * time.Second)
+	for done := false; !done; {
+		select {
+		case m := <-a.stream.out:
+			if m.Type == terminal.TypeAttached && m.Mode == terminal.ModeControl {
+				t.Fatalf("a claim superseded while it waited was told it has control at generation %q; "+
+					"two devices are now printing [you have control]", m.Generation)
+			}
+			if m.Type == terminal.TypeStale {
+				if m.Generation.Value() != 3 {
+					t.Fatalf("the superseded claim was told generation %q, want the 3 that exists", m.Generation)
+				}
+				done = true
+			}
+		case <-deadline:
+			t.Fatal("the superseded claim was never answered at all")
+		}
+	}
+
+	// And the winner is told what it actually won.
+	got, _ := awaitType(t, b.stream, terminal.TypeAttached)
+	if got.Mode != terminal.ModeControl || got.Generation.Value() != 3 {
+		t.Fatalf("the winning claim = %s at %q, want control at 3", got.Mode, got.Generation)
+	}
+}

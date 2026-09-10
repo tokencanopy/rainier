@@ -72,10 +72,59 @@ func (o *ownership) get() (mode string, gen uint64) {
 	return o.mode, o.gen
 }
 
-func (o *ownership) set(mode string, gen uint64) {
+// advance moves this attach to (mode, gen) unless that would move it
+// BACKWARDS, and reports whether it moved. A generation older than the one
+// this attach already holds names a decision something has since superseded,
+// and acting on it would announce control that has already gone elsewhere.
+//
+// The window it closes belongs to a claim. A claim advances the generation in
+// the store and then waits, for as long as the acknowledgement timeout
+// allows, for the sandbox to confirm the binding; a second claim can win
+// inside that wait. Without this, the first claim wakes up and overwrites its
+// own displacement.
+func (o *ownership) advance(mode string, gen uint64) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if gen < o.gen {
+		return false
+	}
 	o.mode, o.gen = mode, gen
+	return true
+}
+
+// demoteTo makes this attach a viewer, at the newer of the generation it
+// already holds and gen, and returns the generation it now holds. It is the
+// one transition that cannot refuse: being wrong about the number is
+// survivable, believing you still have control is not, so a demotion whose
+// generation could not be read still demotes.
+func (o *ownership) demoteTo(gen uint64) uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if gen > o.gen {
+		o.gen = gen
+	}
+	o.mode = terminal.ModeView
+	return o.gen
+}
+
+// displaceTo moves this attach to gen because a peer took control, doing the
+// check and the write under ONE hold of this attach's own lock. Split in two,
+// a claim landing between them overwrites the displacement it lost to and
+// tells its client it has control.
+//
+// It returns the mode this attach WAS in — a controller has to be fenced in
+// its sandbox before anybody is told anything, a viewer only carries a new
+// number — and whether it moved at all. An attach already at or past gen is
+// left alone: naming it a generation it has passed would walk its client
+// backwards.
+func (o *ownership) displaceTo(gen uint64) (was string, moved bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.gen >= gen {
+		return o.mode, false
+	}
+	was, o.mode, o.gen = o.mode, terminal.ModeView, gen
+	return was, true
 }
 
 func (o *ownership) controlling() bool {
@@ -210,7 +259,19 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 		return
 	}
 	_ = o.installAndWait(ctx, terminal.ModeControl, gen)
-	o.set(terminal.ModeControl, gen)
+	if !o.advance(terminal.ModeControl, gen) {
+		// Somebody claimed over this one while it was waiting for the
+		// sandbox. The generation it won was real and is already superseded,
+		// so it gets the answer a lost race gets — and the binding this
+		// claim installed is re-pointed at what this attach actually is now,
+		// so the sandbox's copy agrees with the plane's. The pty fence had
+		// already made that binding inert, at a generation the session has
+		// passed; this is what stops it lingering until the next handoff.
+		mode, current := o.get()
+		_ = o.install(ctx, mode, current)
+		o.sendStale(ctx)
+		return
+	}
 	o.plane.displace(ctx, o, gen, true)
 	o.send(ctx, terminal.ServerMessage{
 		Type: terminal.TypeAttached, Mode: terminal.ModeControl, Generation: terminal.GenOf(gen)})
@@ -268,7 +329,7 @@ func (o *ownership) demote(ctx context.Context) uint64 {
 		}
 	}
 	_ = o.installAndWait(ctx, terminal.ModeView, current)
-	o.set(terminal.ModeView, current)
+	current = o.demoteTo(current)
 	o.send(ctx, terminal.ServerMessage{
 		Type: terminal.TypeControlChanged, Mode: terminal.ModeView, Generation: terminal.GenOf(current)})
 	return current
@@ -398,24 +459,24 @@ func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wai
 		return
 	}
 	for _, other := range p.owners.peers(winner) {
-		mode, otherGen := other.get()
-		if otherGen >= gen {
+		// The check and the write are ONE step, under that peer's own lock:
+		// between them, a claim of its own could otherwise land and overwrite
+		// the displacement it has just lost to.
+		was, moved := other.displaceTo(gen)
+		if !moved {
 			continue
 		}
-		if mode != terminal.ModeControl {
-			// A viewer stays a viewer; only the number it would claim from
-			// changes, and its client reads that silently.
-			other.set(mode, gen)
-			other.send(ctx, terminal.ServerMessage{
-				Type: terminal.TypeControlChanged, Mode: terminal.ModeView, Generation: terminal.GenOf(gen)})
-			continue
+		if was == terminal.ModeControl {
+			// It believed it was typing, so its sandbox has to be told before
+			// anybody is told anything else.
+			if wait {
+				_ = other.installAndWait(ctx, terminal.ModeView, gen)
+			} else {
+				_ = other.install(ctx, terminal.ModeView, gen)
+			}
 		}
-		other.set(terminal.ModeView, gen)
-		if wait {
-			_ = other.installAndWait(ctx, terminal.ModeView, gen)
-		} else {
-			_ = other.install(ctx, terminal.ModeView, gen)
-		}
+		// A viewer stays a viewer; only the number it would claim from
+		// changes, and its client reads that silently.
 		other.send(ctx, terminal.ServerMessage{
 			Type: terminal.TypeControlChanged, Mode: terminal.ModeView, Generation: terminal.GenOf(gen)})
 	}
