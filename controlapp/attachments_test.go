@@ -493,6 +493,10 @@ func attachmentRunningSession() control.Session {
 }
 
 type attachmentFixture struct {
+	// now is the fake clock every lease in these tests is measured against;
+	// a test moves it rather than sleeping, which is the only way a 30s lease
+	// is worth testing at all.
+	now       time.Time
 	svc       *AttachmentService
 	auth      *attachmentFakeAuthorizer
 	policy    *attachmentFakePolicy
@@ -506,6 +510,7 @@ type attachmentFixture struct {
 func newAttachmentFixture(t *testing.T) *attachmentFixture {
 	t.Helper()
 	fx := &attachmentFixture{
+		now:       time.Unix(1_700_000_000, 0).UTC(),
 		auth:      &attachmentFakeAuthorizer{},
 		policy:    &attachmentFakePolicy{},
 		sessions:  &attachmentFakeSessions{found: true, row: attachmentRunningSession()},
@@ -521,7 +526,7 @@ func newAttachmentFixture(t *testing.T) *attachmentFixture {
 		Transport:  fx.transport,
 		Broker:     fx.broker,
 		Events:     fx.events,
-		Clock:      attachmentFakeClock(func() time.Time { return time.Unix(0, 0) }),
+		Clock:      attachmentFakeClock(func() time.Time { return fx.now }),
 		IDs:        fx.ids,
 		UnitOfWork: directUOW{},
 	})
@@ -799,4 +804,253 @@ func (f *attachmentFakeSessions) RenewControllerLease(_ context.Context, ws cont
 	f.row.ControllerHolder = l.Holder
 	f.row.ControllerLeaseExpiresAt = l.ExpiresAt
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// conditional controller ownership
+// ---------------------------------------------------------------------------
+
+// attachNegotiated runs one negotiated attach and returns the target the
+// broker was handed, which is the whole of what the application granted.
+func attachNegotiated(t *testing.T, fx *attachmentFixture, cmd control.AttachTerminal) control.AttachTarget {
+	t.Helper()
+	cmd.SessionID = "sess_example"
+	cmd.Negotiated = true
+	if err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), cmd,
+		&attachmentRecordingTerminalStream{}); err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	fx.broker.mu.Lock()
+	defer fx.broker.mu.Unlock()
+	return fx.broker.lastTarget
+}
+
+// TestJourney1IdleSessionAttachClaimsControl is step 1: a laptop attaching to
+// a session nobody is using becomes the controller at generation 1, with no
+// flag, no prompt and no second round trip.
+func TestJourney1IdleSessionAttachClaimsControl(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	target := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController})
+	if target.Mode != control.AttachmentController {
+		t.Fatalf("mode = %q, want controller", target.Mode)
+	}
+	if target.ControllerGeneration != 1 {
+		t.Fatalf("generation = %d, want 1", target.ControllerGeneration)
+	}
+	if target.Controller == nil {
+		t.Fatal("a negotiated attach was handed no lease keeper")
+	}
+	// It claimed conditionally, from the generation it read, and never
+	// through the unconditional grant.
+	fx.sessions.mu.Lock()
+	defer fx.sessions.mu.Unlock()
+	if fx.sessions.casCalls != 1 || fx.sessions.nextCalls != 0 {
+		t.Fatalf("cas calls = %d, unconditional calls = %d; want 1 and 0",
+			fx.sessions.casCalls, fx.sessions.nextCalls)
+	}
+	if fx.sessions.row.ControllerHolder == "" {
+		t.Fatal("the winner took the generation but never took the lease")
+	}
+	if !fx.sessions.row.ControllerLeaseExpiresAt.Equal(fx.now.Add(control.ControllerLeaseTTL)) {
+		t.Fatalf("lease expiry = %v, want now + %s", fx.sessions.row.ControllerLeaseExpiresAt, control.ControllerLeaseTTL)
+	}
+}
+
+// TestJourney2SecondAttachUnderALiveLeaseIsAViewer is step 2: the phone gets
+// the screen and the output, and it is told which generation is in force so
+// it can decide to take control from it.
+func TestJourney2SecondAttachUnderALiveLeaseIsAViewer(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	first := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController})
+	second := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController})
+
+	if second.Mode != control.AttachmentViewer {
+		t.Fatalf("the second attach's mode = %q, want viewer", second.Mode)
+	}
+	if second.ControllerGeneration != first.ControllerGeneration {
+		t.Fatalf("the viewer was told generation %d, want the live one (%d)",
+			second.ControllerGeneration, first.ControllerGeneration)
+	}
+	if second.Controller == nil {
+		t.Fatal("a viewer was handed no keeper, so it can never take control")
+	}
+	fx.sessions.mu.Lock()
+	defer fx.sessions.mu.Unlock()
+	if fx.sessions.casCalls != 1 {
+		t.Fatalf("cas calls = %d; a viewer attach must not even attempt a claim", fx.sessions.casCalls)
+	}
+}
+
+// TestJourney5ACrashedControllersLeaseExpires is step 5's second half: a
+// client that died without releasing holds control for the lease TTL and no
+// longer, so the next attach claims with no click. The clock moves; nothing
+// sleeps, and nothing sweeps.
+func TestJourney5ACrashedControllersLeaseExpires(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController})
+
+	// One second before the lease runs out, the dead device still holds it.
+	fx.now = fx.now.Add(control.ControllerLeaseTTL - time.Second)
+	if got := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController}); got.Mode != control.AttachmentViewer {
+		t.Fatalf("mode inside the lease = %q, want viewer", got.Mode)
+	}
+	// One second after, it does not.
+	fx.now = fx.now.Add(2 * time.Second)
+	got := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController})
+	if got.Mode != control.AttachmentController {
+		t.Fatalf("mode after the lease expired = %q, want controller", got.Mode)
+	}
+	if got.ControllerGeneration != 2 {
+		t.Fatalf("generation = %d, want 2", got.ControllerGeneration)
+	}
+}
+
+// TestJourney5ReleasingAdvancesAndFrees is step 5's first half: a clean
+// release frees control immediately AND advances the generation, so the
+// departing controller's already-sent bytes are fenced and the next attach
+// claims without waiting out anything.
+func TestJourney5ReleasingAdvancesAndFrees(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	target := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController})
+	if err := target.Controller.Release(context.Background(), target.ControllerGeneration); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	fx.sessions.mu.Lock()
+	row := fx.sessions.row
+	fx.sessions.mu.Unlock()
+	if row.ControllerGeneration != 2 {
+		t.Fatalf("generation after release = %d, want 2 — a release that does not advance leaves the leaver's bytes executable", row.ControllerGeneration)
+	}
+	if row.ControllerHolder != "" {
+		t.Fatalf("holder after release = %q, want vacant", row.ControllerHolder)
+	}
+	// And with no waiting: the very next attach is the controller.
+	next := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController})
+	if next.Mode != control.AttachmentController || next.ControllerGeneration != 3 {
+		t.Fatalf("the attach after a release = %q at %d, want controller at 3", next.Mode, next.ControllerGeneration)
+	}
+	// Releasing a generation somebody else has already taken is not an
+	// error: it is the state the caller was asking for.
+	if err := target.Controller.Release(context.Background(), 1); err != nil {
+		t.Fatalf("a stale release: %v", err)
+	}
+}
+
+// TestJourney6ReconnectIsConditional is step 6: presenting a generation is
+// how a returning controller stays honest. Still holding it resumes control;
+// having been superseded comes back a viewer, at the generation that actually
+// exists now — never an auto-claim.
+func TestJourney6ReconnectIsConditional(t *testing.T) {
+	t.Run("still holds it", func(t *testing.T) {
+		fx := newAttachmentFixture(t)
+		first := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController})
+		back := attachNegotiated(t, fx, control.AttachTerminal{
+			Mode: control.AttachmentController, ExpectedGeneration: first.ControllerGeneration})
+		if back.Mode != control.AttachmentController {
+			t.Fatalf("mode = %q, want controller", back.Mode)
+		}
+		if back.ControllerGeneration != 2 {
+			t.Fatalf("generation = %d, want 2 — a resumed stream is a new binding", back.ControllerGeneration)
+		}
+	})
+	t.Run("was superseded", func(t *testing.T) {
+		fx := newAttachmentFixture(t)
+		first := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController})
+		// Somebody else took control while this device was away.
+		if _, err := first.Controller.Claim(context.Background(), first.ControllerGeneration); err != nil {
+			t.Fatalf("the take-over: %v", err)
+		}
+		back := attachNegotiated(t, fx, control.AttachTerminal{
+			Mode: control.AttachmentController, ExpectedGeneration: first.ControllerGeneration})
+		if back.Mode != control.AttachmentViewer {
+			t.Fatalf("mode = %q, want viewer — a reconnect must never take control back on its own", back.Mode)
+		}
+		if back.ControllerGeneration != 2 {
+			t.Fatalf("the returning device was told generation %d, want the current 2", back.ControllerGeneration)
+		}
+	})
+}
+
+// TestNegotiatedViewerNeverClaims pins --view: whatever the session's state,
+// an attach that asked to view does not touch the generation.
+func TestNegotiatedViewerNeverClaims(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	got := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentViewer})
+	if got.Mode != control.AttachmentViewer || got.ControllerGeneration != 0 {
+		t.Fatalf("mode %q at generation %d, want viewer at 0", got.Mode, got.ControllerGeneration)
+	}
+	fx.sessions.mu.Lock()
+	defer fx.sessions.mu.Unlock()
+	if fx.sessions.casCalls != 0 || fx.sessions.nextCalls != 0 {
+		t.Fatalf("a --view attach claimed: cas %d, unconditional %d", fx.sessions.casCalls, fx.sessions.nextCalls)
+	}
+}
+
+// TestLegacyAttachIsRecordedAsATakeOver is the old client + new plane
+// pairing, at the layer that decides it. A client that cannot be told it is a
+// viewer is admitted as the controller unconditionally — and that advance is
+// exactly what fences and notifies a negotiated client attached at the same
+// time, which is the only safe way to admit it.
+func TestLegacyAttachIsRecordedAsATakeOver(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	negotiated := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController})
+
+	if err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
+		SessionID: "sess_example", Mode: control.AttachmentController, // Negotiated deliberately false
+	}, &attachmentRecordingTerminalStream{}); err != nil {
+		t.Fatalf("legacy attach: %v", err)
+	}
+	fx.broker.mu.Lock()
+	legacy := fx.broker.lastTarget
+	fx.broker.mu.Unlock()
+
+	if legacy.Mode != control.AttachmentController {
+		t.Fatalf("a legacy attach's mode = %q, want controller", legacy.Mode)
+	}
+	if legacy.Controller != nil {
+		t.Fatal("a legacy attach was handed a keeper; it has no way to use one")
+	}
+	if legacy.ControllerGeneration <= negotiated.ControllerGeneration {
+		t.Fatalf("a legacy attach did not advance the generation: %d, want more than %d",
+			legacy.ControllerGeneration, negotiated.ControllerGeneration)
+	}
+	// The negotiated client that was the controller a moment ago now finds
+	// its heartbeat refused, which is how it learns and how it is fenced.
+	if err := negotiated.Controller.Renew(context.Background(), negotiated.ControllerGeneration); !errors.Is(err, control.ErrStale) {
+		t.Fatalf("the displaced controller's heartbeat: err = %v, want ErrStale", err)
+	}
+}
+
+// TestTwoDevicesRacingFromOneGenerationHaveOneWinner is step 3 at the
+// application layer: the repository decides it, and the service must not
+// soften the answer into two controllers.
+func TestTwoDevicesRacingFromOneGenerationHaveOneWinner(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	seed := attachNegotiated(t, fx, control.AttachTerminal{Mode: control.AttachmentController})
+	from := seed.ControllerGeneration
+
+	var wg sync.WaitGroup
+	results := make([]error, 2)
+	for i := range results {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, results[i] = seed.Controller.Claim(context.Background(), from)
+		}()
+	}
+	wg.Wait()
+
+	winners := 0
+	for i, err := range results {
+		switch {
+		case err == nil:
+			winners++
+		case errors.Is(err, control.ErrStale):
+		default:
+			t.Fatalf("claim %d: %v", i, err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("%d of 2 claims from generation %d won; want exactly 1", winners, from)
+	}
 }

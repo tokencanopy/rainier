@@ -55,7 +55,11 @@ func serve(ctx context.Context, c *websocket.Conn, s *session.Session, since uin
 	if err := wsjson.Read(ctx, c, &first); err != nil || first.Type != "resize" {
 		return
 	}
-	att, err := s.Attach(since, session.Size{Cols: first.Cols, Rows: first.Rows})
+	// A direct attach has no control plane above it to grant a binding, so
+	// the attachment is unbound and unconditional — which is what this
+	// endpoint has always been, and what the single-box debugging tools that
+	// use it still need it to be.
+	att, err := s.Attach(since, session.Size{Cols: first.Cols, Rows: first.Rows}, session.Binding{})
 	if err != nil {
 		return
 	}
@@ -118,9 +122,9 @@ func serve(ctx context.Context, c *websocket.Conn, s *session.Session, since uin
 		}
 		switch m.Type {
 		case "stdin":
-			s.Stdin(m.Data)
+			s.Stdin(att.ID, m.Generation.Value(), m.Data)
 		case "resize":
-			s.SetSize(att.ID, session.Size{Cols: m.Cols, Rows: m.Rows})
+			s.SetSize(att.ID, m.Generation.Value(), session.Size{Cols: m.Cols, Rows: m.Rows})
 		}
 	}
 }

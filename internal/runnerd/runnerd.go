@@ -1028,7 +1028,10 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 		c.CloseNow()
 		return
 	}
-	hub.AttachClient(r.Context(), relay.WSConn(c), since, first.Cols, first.Rows)
+	// The runner's own local attach endpoint is a single-box debugging tool
+	// with no control plane above it: it grants no binding, so the attachment
+	// is unconditional exactly as it has always been.
+	hub.AttachClient(r.Context(), relay.WSConn(c), relay.Open{Since: since, Cols: first.Cols, Rows: first.Rows})
 }
 
 // readFirstResize reads exactly one terminal.ClientMessage off a freshly attached

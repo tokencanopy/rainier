@@ -65,7 +65,7 @@ func drainN(t *testing.T, ch <-chan terminal.ServerMessage, n int) []terminal.Se
 func TestFreshAttachGetsSnapshotThenLive(t *testing.T) {
 	s, fp := newFakeSession(t)
 	fp.onOutput([]byte("hello"))
-	a, err := s.Attach(0, Size{20, 5})
+	a, err := s.Attach(0, Size{20, 5}, Binding{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,11 +84,11 @@ func TestResumeReplaysOnlyMissedFrames(t *testing.T) {
 	s, fp := newFakeSession(t)
 	fp.onOutput([]byte("one"))
 	fp.onOutput([]byte("two"))
-	a, _ := s.Attach(0, Size{20, 5})
+	a, _ := s.Attach(0, Size{20, 5}, Binding{})
 	snap := recv(t, a.Msgs) // snapshot at seq 2
 	s.Detach(a.ID)
 	fp.onOutput([]byte("three"))
-	b, _ := s.Attach(snap.Seq, Size{20, 5})
+	b, _ := s.Attach(snap.Seq, Size{20, 5}, Binding{})
 	m := recv(t, b.Msgs)
 	if m.Type != "output" || string(m.Data) != "three" {
 		t.Fatalf("resume = %+v", m)
@@ -112,7 +112,7 @@ func TestSinceAllReplaysTheWholeLog(t *testing.T) {
 		fp.onOutput([]byte{byte('a' + i%26)})
 	}
 
-	a, err := s.Attach(terminal.SinceAll, Size{20, 5})
+	a, err := s.Attach(terminal.SinceAll, Size{20, 5}, Binding{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestSinceAllReplaysTheWholeLog(t *testing.T) {
 // of nothing would open with silence instead.
 func TestSinceAllOnAnEmptyLogFallsBackToSnapshot(t *testing.T) {
 	s, _ := newFakeSession(t)
-	a, err := s.Attach(terminal.SinceAll, Size{20, 5})
+	a, err := s.Attach(terminal.SinceAll, Size{20, 5}, Binding{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,13 @@ func TestSinceAllOnAnEmptyLogFallsBackToSnapshot(t *testing.T) {
 
 func TestStdinForwarded(t *testing.T) {
 	s, fp := newFakeSession(t)
-	s.Stdin([]byte("x"))
+	a, err := s.Attach(0, Size{20, 5}, Binding{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.Stdin(a.ID, 0, []byte("x")) {
+		t.Fatal("an unbound attachment's stdin was fenced; it must behave exactly as it did before bindings existed")
+	}
 	select {
 	case got := <-fp.stdin:
 		if string(got) != "x" {
@@ -166,10 +172,10 @@ func TestStdinForwarded(t *testing.T) {
 
 func TestSmallestViewerResizesProc(t *testing.T) {
 	s, fp := newFakeSession(t)
-	a, _ := s.Attach(0, Size{120, 40})
+	a, _ := s.Attach(0, Size{120, 40}, Binding{})
 	recv(t, a.Msgs)
 	<-fp.resizes // 120x40 from first attach
-	b, _ := s.Attach(0, Size{80, 50})
+	b, _ := s.Attach(0, Size{80, 50}, Binding{})
 	recv(t, b.Msgs)
 	got := <-fp.resizes
 	if got != (Size{80, 40}) {
@@ -187,7 +193,7 @@ func TestReplayLargerThanBufferDoesNotDeadlock(t *testing.T) {
 	for i := 0; i < n; i++ {
 		fp.onOutput([]byte{byte('a' + i%26)})
 	}
-	a, err := s.Attach(1, Size{20, 5})
+	a, err := s.Attach(1, Size{20, 5}, Binding{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +211,7 @@ func TestReplayLargerThanBufferDoesNotDeadlock(t *testing.T) {
 // message, not just send it.
 func TestExitSendsExitThenClosesViewerChannel(t *testing.T) {
 	s, fp := newFakeSession(t)
-	a, err := s.Attach(0, Size{20, 5})
+	a, err := s.Attach(0, Size{20, 5}, Binding{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +238,7 @@ func TestAttachAfterExitGetsSnapshotThenExit(t *testing.T) {
 	s, fp := newFakeSession(t)
 	fp.Stop()
 	<-s.Exited() // deterministic: exit goroutine has fully run
-	a, err := s.Attach(0, Size{20, 5})
+	a, err := s.Attach(0, Size{20, 5}, Binding{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +273,7 @@ func TestConcurrentAttachDuringExitNeverStrands(t *testing.T) {
 		done := make(chan *Attachment, 8)
 		go func() {
 			for j := 0; j < 4; j++ {
-				if a, err := s.Attach(0, Size{20, 5}); err == nil {
+				if a, err := s.Attach(0, Size{20, 5}, Binding{}); err == nil {
 					done <- a
 				}
 			}

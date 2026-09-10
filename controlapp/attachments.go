@@ -2,6 +2,8 @@ package controlapp
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"slices"
 	"sync/atomic"
@@ -153,22 +155,165 @@ func (s *AttachmentService) attachable(row control.Session) bool {
 	}
 }
 
-// grantGeneration returns the controller generation a target carries: a
-// viewer attaches under the row's current value; a controller asks the
-// repository to advance it. The generation is the repository's — durable,
-// shared by every replica — and this service keeps none of its own.
-func (s *AttachmentService) grantGeneration(ctx context.Context, row control.Session, mode control.AttachmentMode) (uint64, error) {
-	if mode == control.AttachmentViewer {
-		return row.ControllerGeneration, nil
-	}
-	gen, err := s.sessions.NextControllerGeneration(ctx, row.WorkspaceID, row.ID)
+// controllerKeeper is control.ControllerLeaseKeeper bound to one attach: one
+// workspace, one session, one opaque holder. It is what a broker drives a
+// handoff through, and it is the only thing that crosses that seam — no
+// repository, no workspace-wide authority, nothing about any other session.
+type controllerKeeper struct {
+	sessions control.SessionRepository
+	clock    control.Clock
+	ws       control.WorkspaceID
+	id       control.SessionID
+	holder   string
+}
+
+var _ control.ControllerLeaseKeeper = controllerKeeper{}
+
+// Claim advances the generation from expected and takes the lease. The two
+// statements are safe in this order because the generation is the authority
+// and the lease is only the hint: a renew that lands after somebody else's
+// claim fails on the generation fence, so a loser cannot install a lease over
+// a winner's authority. A claim that wins the advance and then cannot take
+// the lease is still a claim — the generation is granted — and the heartbeat
+// will install the lease on its next pass.
+func (k controllerKeeper) Claim(ctx context.Context, expected uint64) (uint64, error) {
+	gen, err := k.sessions.CompareAndAdvanceControllerGeneration(ctx, k.ws, k.id, expected)
 	if err != nil {
-		if errors.Is(err, control.ErrNotFound) {
-			return 0, control.ErrNotFound
+		if errors.Is(err, control.ErrStale) {
+			return 0, control.ErrStale
 		}
 		return 0, portError(err)
 	}
+	if err := k.Renew(ctx, gen); err != nil && !errors.Is(err, control.ErrStale) {
+		return 0, err
+	}
 	return gen, nil
+}
+
+// Renew extends the lease under a generation this attach was granted. Its
+// ErrStale is how a controller displaced by an attach on another replica
+// finds out: nothing pushed it a message, its own heartbeat simply stopped
+// being accepted.
+func (k controllerKeeper) Renew(ctx context.Context, generation uint64) error {
+	err := k.sessions.RenewControllerLease(ctx, k.ws, k.id, control.ControllerLease{
+		Generation: generation,
+		Holder:     k.holder,
+		ExpiresAt:  k.clock.Now().Add(control.ControllerLeaseTTL),
+	})
+	if err != nil {
+		if errors.Is(err, control.ErrStale) {
+			return control.ErrStale
+		}
+		return portError(err)
+	}
+	return nil
+}
+
+// Release gives up control by ADVANCING the generation, which vacates the
+// lease and fences everything this attach had already sent in the same step.
+// A release that is already stale is still a release: somebody else holds
+// control, which is precisely the state the caller was asking for.
+func (k controllerKeeper) Release(ctx context.Context, generation uint64) error {
+	if generation == 0 {
+		return nil
+	}
+	if _, err := k.sessions.CompareAndAdvanceControllerGeneration(ctx, k.ws, k.id, generation); err != nil {
+		if errors.Is(err, control.ErrStale) {
+			return nil
+		}
+		return portError(err)
+	}
+	return nil
+}
+
+// grant decides what one attach actually gets: its mode, the generation it
+// holds, and the keeper it runs the rest of its life through.
+//
+// An UNNEGOTIATED attach behaves exactly as it did before conditional
+// ownership existed. A viewer reads the row's current generation; a
+// controller advances it unconditionally. That is deliberate rather than
+// grandfathered: a client that cannot be told it is a viewer cannot be made
+// one without silently breaking it, so a legacy attach is recorded as a
+// take-over, and a negotiated client attached at the same time is fenced and
+// told — which is a great deal better than two clients typing into one shell.
+//
+// A NEGOTIATED attach is conditional. A viewer never claims. A controller
+// with an expected generation claims only from it, which is what makes a
+// reconnecting device come back as a viewer instead of taking control from
+// whoever has it. A controller without one claims only while nobody holds a
+// live lease. Every refusal lands the attach in AttachmentViewer under the
+// current generation — never an error, because "somebody else is typing" is
+// an answer, not a failure.
+func (s *AttachmentService) grant(ctx context.Context, row control.Session,
+	cmd control.AttachTerminal) (control.AttachmentMode, uint64, control.ControllerLeaseKeeper, error) {
+	if !cmd.Negotiated {
+		if cmd.Mode == control.AttachmentViewer {
+			return control.AttachmentViewer, row.ControllerGeneration, nil, nil
+		}
+		gen, err := s.sessions.NextControllerGeneration(ctx, row.WorkspaceID, row.ID)
+		if err != nil {
+			if errors.Is(err, control.ErrNotFound) {
+				return "", 0, nil, control.ErrNotFound
+			}
+			return "", 0, nil, portError(err)
+		}
+		return control.AttachmentController, gen, nil, nil
+	}
+
+	keeper := controllerKeeper{sessions: s.sessions, clock: s.clock,
+		ws: row.WorkspaceID, id: row.ID, holder: newHolderID()}
+	if cmd.Mode == control.AttachmentViewer {
+		return control.AttachmentViewer, row.ControllerGeneration, keeper, nil
+	}
+
+	expected := cmd.ExpectedGeneration
+	if expected == 0 {
+		// No generation of its own: claim only while control is actually
+		// free. A live lease means somebody is typing, and the honest answer
+		// is to attach as a viewer and say who has it.
+		if control.ControllerLeaseOf(row).Live(s.clock.Now()) {
+			return control.AttachmentViewer, row.ControllerGeneration, keeper, nil
+		}
+		expected = row.ControllerGeneration
+	}
+	gen, err := keeper.Claim(ctx, expected)
+	switch {
+	case err == nil:
+		return control.AttachmentController, gen, keeper, nil
+	case errors.Is(err, control.ErrStale):
+		return s.viewerAfterStaleClaim(ctx, row, keeper)
+	default:
+		return "", 0, nil, err
+	}
+}
+
+// viewerAfterStaleClaim re-reads the row so a refused claimant is told the
+// generation that actually exists now, rather than the one it lost a race
+// from — which is the value it would have to claim from to try again. A read
+// that fails falls back to the generation it already had: the attach is a
+// viewer either way, and a viewer's generation is information, not authority.
+func (s *AttachmentService) viewerAfterStaleClaim(ctx context.Context, row control.Session,
+	keeper control.ControllerLeaseKeeper) (control.AttachmentMode, uint64, control.ControllerLeaseKeeper, error) {
+	current, err := s.sessions.GetSession(ctx, row.WorkspaceID, row.ID)
+	if err != nil {
+		return control.AttachmentViewer, row.ControllerGeneration, keeper, nil
+	}
+	return control.AttachmentViewer, current.ControllerGeneration, keeper, nil
+}
+
+// newHolderID mints the opaque identity one attach holds its lease under: 8
+// crypto/rand bytes, hex. It is not a user, device, account or session
+// identifier and never leaves the control plane — the only thing derived from
+// it that any client can see is the boolean "somebody holds control".
+func newHolderID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		// The OS entropy source is broken. A predictable holder would let a
+		// second attach extend a lease it does not hold, so this fails the
+		// attach rather than guessing.
+		return ""
+	}
+	return hex.EncodeToString(b)
 }
 
 // AttachTerminal authorizes and fences one terminal attach, then hands the
@@ -200,7 +345,7 @@ func (s *AttachmentService) AttachTerminal(ctx context.Context, scope control.Sc
 	if err != nil {
 		return err
 	}
-	generation, err := s.grantGeneration(ctx, row, cmd.Mode)
+	mode, generation, keeper, err := s.grant(ctx, row, cmd)
 	if err != nil {
 		return err
 	}
@@ -211,6 +356,8 @@ func (s *AttachmentService) AttachTerminal(ctx context.Context, scope control.Sc
 		RunnerID:             row.RunnerID,
 		PlacementGeneration:  row.PlacementGeneration,
 		ControllerGeneration: generation,
+		Mode:                 mode,
+		Controller:           keeper,
 	}
 	if err := s.broker.Attach(ctx, target, stream); err != nil {
 		_ = stream.Close(control.ErrUnavailable)

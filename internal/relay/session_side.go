@@ -132,7 +132,12 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 		}
 		switch f.Type {
 		case FrameOpen:
-			att, err := s.Attach(f.Since, session.Size{Cols: f.Cols, Rows: f.Rows})
+			// The binding rides the frame that opens the attachment, so it is
+			// installed before a byte of screen is queued — no acknowledgement
+			// to order against, and nothing for a late frame to slip past. An
+			// older plane sends no mode, which leaves the attachment unbound
+			// and therefore unconditional, exactly as it is today.
+			att, err := s.Attach(f.Since, session.Size{Cols: f.Cols, Rows: f.Rows}, frameBinding(f))
 			if err != nil {
 				write(Frame{Type: FrameClose, AttachID: f.AttachID})
 				continue
@@ -175,9 +180,25 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 			}
 			switch cm.Type {
 			case "stdin":
-				s.Stdin(cm.Data)
+				s.Stdin(att.ID, cm.Generation.Value(), cm.Data)
 			case "resize":
-				s.SetSize(att.ID, session.Size{Cols: cm.Cols, Rows: cm.Rows})
+				s.SetSize(att.ID, cm.Generation.Value(), session.Size{Cols: cm.Cols, Rows: cm.Rows})
+			case terminal.TypeControl:
+				// A mid-attach handoff. Install it, then say so: the plane
+				// does not tell a taker it has control until this
+				// acknowledgement comes back, which is what closes the window
+				// where the previous controller's already-sent keystroke
+				// could still execute.
+				gen := cm.Generation.Value()
+				if !s.Bind(att.ID, session.Binding{Bound: true, Mode: cm.Mode, Generation: gen}) {
+					continue
+				}
+				ack, err := json.Marshal(terminal.ServerMessage{
+					Type: terminal.TypeControlAck, Mode: cm.Mode, Generation: cm.Generation})
+				if err != nil {
+					continue
+				}
+				write(Frame{Type: FrameServer, AttachID: f.AttachID, Payload: ack})
 			}
 		case FrameClose:
 			mu.Lock()
@@ -201,4 +222,14 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 			}
 		}
 	}
+}
+
+// frameBinding reads the controller binding off an opening frame. A frame
+// with no mode is an older plane's, and leaves the attachment unbound — which
+// the session reads as today's unconditional attachment.
+func frameBinding(f Frame) session.Binding {
+	if f.Mode == "" {
+		return session.Binding{}
+	}
+	return session.Binding{Bound: true, Mode: f.Mode, Generation: f.Gen}
 }

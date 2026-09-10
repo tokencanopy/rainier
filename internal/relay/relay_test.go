@@ -120,7 +120,7 @@ func TestRelayAttachStreamsOutput(t *testing.T) {
 	defer hub.Close()
 
 	client, hubClient := newPipe()
-	go hub.AttachClient(ctx, hubClient, 0, 80, 24)
+	go hub.AttachClient(ctx, hubClient, Open{Cols: 80, Rows: 24})
 
 	// Client should receive a snapshot frame first (as a FrameServer wrapping a
 	// terminal.ServerMessage of type "snapshot"), then output after we send stdin.
@@ -194,7 +194,7 @@ func TestControlFramesReachHub(t *testing.T) {
 
 	// Terminal mux still works over the same conn after a control write.
 	client, hubClient := newPipe()
-	go hub.AttachClient(ctx, hubClient, 0, 80, 24)
+	go hub.AttachClient(ctx, hubClient, Open{Cols: 80, Rows: 24})
 	first := readServerMsg(t, client)
 	if first.Type != "snapshot" {
 		t.Fatalf("first msg = %s, want snapshot", first.Type)
@@ -366,7 +366,7 @@ func TestControlRPCRoundTripBothDirections(t *testing.T) {
 	// Act 3 — the terminal mux still works, in both directions, after control
 	// traffic has crossed the conn both ways.
 	client, hubClient := newPipe()
-	go hub.AttachClient(ctx, hubClient, 0, 80, 24)
+	go hub.AttachClient(ctx, hubClient, Open{Cols: 80, Rows: 24})
 	first := readServerMsg(t, client)
 	if first.Type != "snapshot" {
 		t.Fatalf("first msg = %s, want snapshot", first.Type)
@@ -450,7 +450,7 @@ func TestSessionConnDeathClosesClient(t *testing.T) {
 	defer hub.Close()
 
 	client, hubClient := newPipe()
-	go hub.AttachClient(ctx, hubClient, 0, 80, 24)
+	go hub.AttachClient(ctx, hubClient, Open{Cols: 80, Rows: 24})
 
 	// Wait for the snapshot so the attachment is fully live end to end
 	// (session.Attach'd, registered in the Hub) before killing the conn.
