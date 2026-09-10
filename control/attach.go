@@ -87,6 +87,15 @@ type AttachTarget struct {
 	// client that cannot be told about one. A negotiated attach carries one
 	// whether or not MayClaim is set, because a viewer reads its own
 	// generation through it.
+	//
+	// Two invariants tie the three fields together, and an application that
+	// breaks either is describing an attach that cannot exist: Controller is
+	// non-nil exactly when Negotiated is set, and MayClaim implies
+	// Negotiated. A broker that is handed one anyway resolves it in the
+	// direction that costs nobody anything — a keeper without the flag is a
+	// composer written before the flag existed and still means what a keeper
+	// has always meant, while a claim without a keeper has nothing to
+	// exercise and is refused.
 	Controller ControllerLeaseKeeper
 }
 

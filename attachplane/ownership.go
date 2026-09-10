@@ -75,11 +75,21 @@ func newOwnership(p *Plane, target control.AttachTarget) *ownership {
 	if target.Mode == control.AttachmentViewer {
 		mode = terminal.ModeView
 	}
+	// Negotiated is read forgivingly in the one direction that cannot cost
+	// anybody anything. A target carrying a keeper but not the flag is a
+	// composer written before the flag existed, and a keeper has always meant
+	// exactly this; reading it as unnegotiated would silently stop telling
+	// that client its mode, its generation and every handoff, and from the
+	// client's end it would look like an older plane.
+	//
+	// MayClaim is read the other way: it is a privilege, and one that needs a
+	// keeper to exercise, so it is never inferred and never wider than what
+	// the target actually carries.
 	return &ownership{
 		plane:      p,
 		session:    target.SessionID,
-		negotiated: target.Negotiated,
-		mayClaim:   target.MayClaim,
+		negotiated: target.Negotiated || target.Controller != nil,
+		mayClaim:   target.MayClaim && target.Controller != nil,
 		keeper:     target.Controller,
 		mode:       mode,
 		gen:        target.ControllerGeneration,
@@ -271,10 +281,10 @@ func (o *ownership) acked(gen uint64) {
 // exists now, which is the one this client would have to claim from to try
 // again — never an error, because losing a race is an answer.
 func (o *ownership) claim(ctx context.Context, expected uint64) {
-	if !o.negotiated || o.keeper == nil {
+	if !o.negotiated {
 		return
 	}
-	if !o.mayClaim {
+	if !o.mayClaim || o.keeper == nil {
 		// This client may watch and may not drive: the host's policy answers
 		// differently for a viewer and a controller, which is the whole
 		// reason those are two facts on the target. It is told its claim did
@@ -282,6 +292,10 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 		// own would be a message every client would have to learn for an
 		// answer that is already "you are still a viewer" — and the store is
 		// never touched, so an unauthorized claim costs nothing anywhere.
+		//
+		// A negotiated attach is ANSWERED either way. Returning in silence
+		// would leave the take-control key doing nothing at all, which is the
+		// one outcome a client cannot tell from a broken connection.
 		_, current := o.get()
 		o.announceStale(ctx, current)
 		return

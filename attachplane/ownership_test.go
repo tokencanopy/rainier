@@ -187,6 +187,16 @@ func startViewOnlyAttach(t *testing.T, p *Plane, h *fakeHost, ts *httptest.Serve
 func startAttachAs(t *testing.T, p *Plane, h *fakeHost, ts *httptest.Server,
 	mode control.AttachmentMode, gen uint64, keeper control.ControllerLeaseKeeper, acks, mayClaim bool) *attachFixture {
 	t.Helper()
+	return startAttachOn(t, p, h, ts, mode, gen, keeper, acks, keeper != nil, mayClaim)
+}
+
+// startAttachOn is the same with the target's two ownership facts set
+// independently of the keeper, so a test can build the incoherent targets the
+// contract says cannot exist and pin what a broker does with one anyway.
+func startAttachOn(t *testing.T, p *Plane, h *fakeHost, ts *httptest.Server,
+	mode control.AttachmentMode, gen uint64, keeper control.ControllerLeaseKeeper,
+	acks, negotiated, mayClaim bool) *attachFixture {
+	t.Helper()
 	sandbox := newFakeSandbox(acks)
 	h.dialBack = func(at *runner.Attach) { sandbox.serve(t, ts, at) }
 
@@ -195,7 +205,7 @@ func startAttachAs(t *testing.T, p *Plane, h *fakeHost, ts *httptest.Server,
 	target := brokerTarget("sess_example", "vm1")
 	target.Mode = mode
 	target.ControllerGeneration = gen
-	target.Negotiated = keeper != nil
+	target.Negotiated = negotiated
 	target.MayClaim = mayClaim
 	target.Controller = keeper
 
@@ -1136,5 +1146,41 @@ func TestARefusedClaimIsNeverToldGenerationZero(t *testing.T) {
 	m, _ := awaitType(t, f.stream, terminal.TypeStale)
 	if m.Generation.Value() != 7 {
 		t.Fatalf("a refused claim whose generation read failed was told %q, want the 7 this attach holds", m.Generation)
+	}
+}
+
+// TestATargetThatPredatesTheNegotiatedFlagIsStillToldEverything pins how a
+// broker reads a target built before Negotiated existed. Such a composer sets
+// the keeper and nothing else, and a keeper has always meant exactly this
+// attach negotiated — so it is read that way. Read the other way, an
+// installed client would stop being told its mode, its generation and every
+// handoff, and from its end that is indistinguishable from an older plane.
+func TestATargetThatPredatesTheNegotiatedFlagIsStillToldEverything(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{})
+	lease := &fakeLease{gen: 6}
+	f := startAttachOn(t, p, h, ts, control.AttachmentViewer, 6,
+		fakeKeeper{lease, "att_aaaa"}, true, false /* negotiated unset */, true)
+
+	m, _ := awaitType(t, f.stream, terminal.TypeAttached)
+	if m.Mode != terminal.ModeView || m.Generation.Value() != 6 {
+		t.Fatalf("a target with a keeper and no flag was told %s at %q, want view at 6", m.Mode, m.Generation)
+	}
+}
+
+// TestANegotiatedClaimIsAlwaysAnswered pins the other half. A target with the
+// flag and no keeper is the incoherent case in the other direction — a
+// composer bug the contract forbids — and the honest answer is that the claim
+// did not land, not silence: a take-control key that produces nothing at all
+// is the one outcome a client cannot tell from a broken connection.
+func TestANegotiatedClaimIsAlwaysAnswered(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{})
+	f := startAttachOn(t, p, h, ts, control.AttachmentViewer, 6,
+		nil /* no keeper */, true, true /* negotiated */, true /* and told it may claim */)
+
+	awaitType(t, f.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, f)
+	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(6)}
+	if m, _ := awaitType(t, f.stream, terminal.TypeStale); m.Generation.Value() != 6 {
+		t.Fatalf("the claim was answered %q, want the 6 this attach holds", m.Generation)
 	}
 }

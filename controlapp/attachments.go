@@ -195,6 +195,20 @@ func (k controllerKeeper) Claim(ctx context.Context, expected uint64) (uint64, e
 	if err := k.policy.AuthorizeAttachment(ctx, k.scope, k.resource, control.AttachmentController); err != nil {
 		return 0, control.ErrDenied
 	}
+	return k.claimAuthorized(ctx, expected)
+}
+
+// claimAuthorized is the same claim with the policy question already
+// answered, for the one caller that has just asked it: the attach-time grant
+// of a negotiated CONTROLLER attach, which the service admitted on exactly
+// this mode microseconds earlier.
+//
+// Asking twice is neither free nor harmless. It doubles a Cloud
+// collaboration-grant lookup on the attach path, and a policy backend that
+// blinks between the two calls would fail the attach ErrDenied — reporting a
+// dependency outage to a user as "not authorized to attach to this session"
+// — after the door had already said yes.
+func (k controllerKeeper) claimAuthorized(ctx context.Context, expected uint64) (uint64, error) {
 	gen, err := k.sessions.CompareAndAdvanceControllerGeneration(ctx, k.ws, k.id, expected)
 	if err != nil {
 		if errors.Is(err, control.ErrStale) {
@@ -318,7 +332,7 @@ func (s *AttachmentService) grant(ctx context.Context, scope control.Scope, reso
 	if control.ControllerLeaseOf(row).Live(s.clock.Now()) && cmd.ExpectedGeneration != row.ControllerGeneration {
 		return control.AttachmentViewer, row.ControllerGeneration, keeper, nil
 	}
-	gen, err := keeper.Claim(ctx, row.ControllerGeneration)
+	gen, err := keeper.claimAuthorized(ctx, row.ControllerGeneration)
 	switch {
 	case err == nil:
 		return control.AttachmentController, gen, keeper, nil
@@ -368,9 +382,13 @@ func newHolderID() (string, error) {
 // privilege it might REACH is asked for separately, here and again in
 // controllerKeeper.Claim.
 //
-// A negotiated controller attach has already been authorized for exactly
-// this, so it is not asked twice. An unnegotiated attach has no way to send a
-// claim at all.
+// A negotiated controller attach was admitted on this very mode a moment ago,
+// so it is not asked again here, and neither is the claim the grant below
+// makes on its behalf. An unnegotiated attach has no way to send a claim at
+// all. What every negotiated attach does cost is one policy call per claim it
+// makes afterwards — worth knowing for a host whose policy is a network call
+// or an audited decision, and deliberate: a cached answer cannot honour a
+// grant revoked mid-attach.
 func (s *AttachmentService) mayClaim(ctx context.Context, scope control.Scope,
 	resource control.Resource, cmd control.AttachTerminal) bool {
 	switch {

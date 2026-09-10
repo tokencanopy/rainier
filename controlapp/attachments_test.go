@@ -1151,6 +1151,36 @@ func TestAClaimSurvivesAStoreThatIsBrieflyUnusable(t *testing.T) {
 	}
 }
 
+// TestAnAttachAsksTheHostsPolicyOnceAtTheDoor pins the cost of the seam. The
+// attach-time grant of a negotiated controller attach is the one claim whose
+// policy question was answered microseconds earlier, on the very same mode,
+// so it is not asked again — a host whose policy is a network call or an
+// audited decision pays once per attach, and a backend that blinks between
+// two identical calls cannot turn a dependency outage into "not authorized".
+//
+// The claims that follow on the client's own stream ARE asked, every time,
+// which is what honours a grant revoked mid-attach.
+func TestAnAttachAsksTheHostsPolicyOnceAtTheDoor(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	if err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
+		SessionID: "sess_example", Mode: control.AttachmentController, Negotiated: true,
+	}, &attachmentRecordingTerminalStream{}); err != nil {
+		t.Fatalf("a negotiated control attach: %v", err)
+	}
+	if got := fx.policy.modes(); len(got) != 1 || got[0] != control.AttachmentController {
+		t.Fatalf("the policy was asked %v; want exactly one controller question", got)
+	}
+
+	// And the mid-attach claim asks for itself.
+	target := fx.broker.target()
+	if _, err := target.Controller.Claim(context.Background(), target.ControllerGeneration); err != nil {
+		t.Fatalf("a mid-attach claim: %v", err)
+	}
+	if got := fx.policy.modes(); len(got) != 2 {
+		t.Fatalf("the policy was asked %v; a mid-attach claim must ask for itself", got)
+	}
+}
+
 // TestAViewOnlyPrincipalWatchesAndMayNotClaim is the mode-aware attachment
 // policy from both sides at once, which is the whole reason that seam exists:
 // a host that grants viewing without granting driving — the Cloud
