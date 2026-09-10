@@ -173,8 +173,11 @@ func (b broker) Attach(ctx context.Context, target control.AttachTarget, stream 
 		// claim keeps; an attach is a take-over like any other.
 		p.displace(ctx, own, generation, true)
 	}
-	own.send(ctx, terminal.ServerMessage{
-		Type: terminal.TypeAttached, Mode: mode, Generation: terminal.GenOf(generation)})
+	// What it is told, and what its sandbox is opened as, is what it IS after
+	// that loop rather than what the application granted before it:
+	// displacing every peer waits on each one's sandbox, and another attach
+	// can claim control inside that wait.
+	mode, generation = own.announceOpening(ctx)
 
 	attachID := randHex(8) // 16 hex characters, crypto/rand
 	pa := &pendingAttach{stream: stream, own: own, done: make(chan struct{})}

@@ -40,6 +40,22 @@ type ownership struct {
 	keeper     control.ControllerLeaseKeeper
 	stream     control.TerminalStream
 
+	// announce serialises everything that TELLS this client what it is, and
+	// holds the state read and the message that reports it together. Without
+	// that, a claim answers itself with a mode it read before it spent
+	// seconds displacing its peers, while a peer that won inside that wait
+	// has already sent the correction — the two land in the wrong order and
+	// the client is left believing it has control it does not have. Nothing
+	// corrects that: a client that believes it is the controller sends no
+	// claim, and this attach's heartbeat renews nothing, because the plane
+	// knows it is a viewer.
+	//
+	// It is only ever taken alone. A claim finishes displacing every peer
+	// before it announces anything about itself, and a displacement takes the
+	// peer's announce and no other, so two attaches can never each hold one
+	// and wait for the other's.
+	announce sync.Mutex
+
 	// handoff serialises the install-and-wait pairs on this attach. The
 	// client pump (a claim, a release) and the heartbeat (a demotion after a
 	// stale renew) can both reach one, and they share one acknowledgement
@@ -267,7 +283,7 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 		// answer that is already "you are still a viewer" — and the store is
 		// never touched, so an unauthorized claim costs nothing anywhere.
 		_, current := o.get()
-		o.send(ctx, terminal.ServerMessage{Type: terminal.TypeStale, Generation: terminal.GenOf(current)})
+		o.announceStale(ctx, current)
 		return
 	}
 	gen, err := o.keeper.Claim(ctx, expected)
@@ -276,22 +292,70 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 		return
 	}
 	_ = o.installAndWait(ctx, terminal.ModeControl, gen)
-	if !o.advance(terminal.ModeControl, gen) {
-		// Somebody claimed over this one while it was waiting for the
-		// sandbox. The generation it won was real and is already superseded,
-		// so it gets the answer a lost race gets — and the binding this
-		// claim installed is re-pointed at what this attach actually is now,
-		// so the sandbox's copy agrees with the plane's. The pty fence had
-		// already made that binding inert, at a generation the session has
-		// passed; this is what stops it lingering until the next handoff.
-		mode, current := o.get()
-		_ = o.install(ctx, mode, current)
-		o.sendStale(ctx)
+	if o.advance(terminal.ModeControl, gen) {
+		o.plane.displace(ctx, o, gen, true)
+	}
+	// And only now is this client told, because only now is it true. There
+	// are TWO waits between winning the generation and answering — this
+	// attach's own acknowledgement, and then one per displaced peer's
+	// sandbox, each up to the acknowledgement timeout — and another claim can
+	// win inside either. Both are answered by the same question, asked once,
+	// at the end: does this attach still hold the generation it won?
+	o.announceClaim(ctx, gen)
+}
+
+// announceClaim answers one claim, reading what this attach holds inside the
+// hold that sends the answer. It says "attached, control" only while this
+// attach still holds gen; a claim that has been superseded gets what a lost
+// race gets, and the binding it installed is re-pointed at what this attach
+// actually is now, so the sandbox's copy agrees with the plane's. The pty
+// fence had already made that binding inert, at a generation the session has
+// passed; this is what stops it lingering until the next handoff.
+func (o *ownership) announceClaim(ctx context.Context, gen uint64) {
+	o.announce.Lock()
+	defer o.announce.Unlock()
+	mode, current := o.get()
+	if mode == terminal.ModeControl && current == gen {
+		o.send(ctx, terminal.ServerMessage{
+			Type: terminal.TypeAttached, Mode: terminal.ModeControl, Generation: terminal.GenOf(gen)})
 		return
 	}
-	o.plane.displace(ctx, o, gen, true)
+	_ = o.install(ctx, mode, current)
+	o.send(ctx, terminal.ServerMessage{Type: terminal.TypeStale, Generation: terminal.GenOf(current)})
+}
+
+// announceOpening tells a newly opened attach what it is, reading the mode
+// and generation inside the hold that sends them, and returns what it said. An
+// attach granted control displaces its peers first and can lose control
+// inside that loop, so the client must be told what it IS rather than what it
+// was granted a moment ago.
+func (o *ownership) announceOpening(ctx context.Context) (string, uint64) {
+	o.announce.Lock()
+	defer o.announce.Unlock()
+	mode, gen := o.get()
 	o.send(ctx, terminal.ServerMessage{
-		Type: terminal.TypeAttached, Mode: terminal.ModeControl, Generation: terminal.GenOf(gen)})
+		Type: terminal.TypeAttached, Mode: mode, Generation: terminal.GenOf(gen)})
+	return mode, gen
+}
+
+// announceViewer tells this client the generation moved and it is a viewer
+// under it, at whatever generation this attach holds when the message is
+// actually written. It is the notice a displacement and a demotion both send.
+func (o *ownership) announceViewer(ctx context.Context) uint64 {
+	o.announce.Lock()
+	defer o.announce.Unlock()
+	_, gen := o.get()
+	o.send(ctx, terminal.ServerMessage{
+		Type: terminal.TypeControlChanged, Mode: terminal.ModeView, Generation: terminal.GenOf(gen)})
+	return gen
+}
+
+// announceStale tells this client its claim did not land, and the generation
+// it would have to claim from to try again.
+func (o *ownership) announceStale(ctx context.Context, gen uint64) {
+	o.announce.Lock()
+	defer o.announce.Unlock()
+	o.send(ctx, terminal.ServerMessage{Type: terminal.TypeStale, Generation: terminal.GenOf(gen)})
 }
 
 // sendStale answers a refused claim with the current generation. A read that
@@ -304,7 +368,7 @@ func (o *ownership) sendStale(ctx context.Context) {
 			current = gen
 		}
 	}
-	o.send(ctx, terminal.ServerMessage{Type: terminal.TypeStale, Generation: terminal.GenOf(current)})
+	o.announceStale(ctx, current)
 }
 
 // release gives up control without giving up the attach: the generation
@@ -346,10 +410,8 @@ func (o *ownership) demote(ctx context.Context) uint64 {
 		}
 	}
 	_ = o.installAndWait(ctx, terminal.ModeView, current)
-	current = o.demoteTo(current)
-	o.send(ctx, terminal.ServerMessage{
-		Type: terminal.TypeControlChanged, Mode: terminal.ModeView, Generation: terminal.GenOf(current)})
-	return current
+	o.demoteTo(current)
+	return o.announceViewer(ctx)
 }
 
 // heartbeat renews the lease while this attach holds control, on the stream's
@@ -494,8 +556,7 @@ func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wai
 		}
 		// A viewer stays a viewer; only the number it would claim from
 		// changes, and its client reads that silently.
-		other.send(ctx, terminal.ServerMessage{
-			Type: terminal.TypeControlChanged, Mode: terminal.ModeView, Generation: terminal.GenOf(gen)})
+		other.announceViewer(ctx)
 	}
 }
 

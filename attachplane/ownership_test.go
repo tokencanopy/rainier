@@ -931,3 +931,114 @@ func TestAViewOnlyAttachIsToldEverythingAndClaimsNothing(t *testing.T) {
 		t.Fatalf("an unauthorized claim moved the generation to %d", gen)
 	}
 }
+
+// TestAClaimSupersededWhileItDisplacedIsNeverToldItHasControl is the second
+// half of the same rule, and the longer window by far. A claim answers itself
+// only after it has displaced every peer on this replica, and that loop waits
+// on each displaced peer's SANDBOX — for as long as the acknowledgement
+// timeout allows, per peer. Another claim can win inside that wait.
+//
+// Reporting the mode read before the loop would tell a client it holds
+// control that has already moved, and nothing would ever correct it: a client
+// that believes it is the controller sends no claim of its own, and this
+// attach's heartbeat renews nothing because the plane knows it is a viewer.
+func TestAClaimSupersededWhileItDisplacedIsNeverToldItHasControl(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 700 * time.Millisecond})
+	lease := &fakeLease{gen: 1, holder: "att_aaaa"}
+
+	// The incumbent's sandbox predates the protocol, so displacing it costs
+	// the whole timeout — which is the window under test.
+	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_aaaa"}, false)
+	awaitType(t, laptop.stream, terminal.TypeAttached)
+	<-laptop.sandbox.ready
+
+	phone := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_bbbb"}, true)
+	awaitType(t, phone.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, phone)
+	tablet := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_cccc"}, true)
+	awaitType(t, tablet.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, tablet)
+
+	phone.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
+	// The phone has won generation 2 and is inside its displace loop, waiting
+	// on the laptop's sandbox for an acknowledgement that will never come.
+	awaitSandbox(t, laptop.sandbox, func(got []terminal.ClientMessage) bool {
+		for _, m := range got {
+			if m.Type == terminal.TypeControl && m.Mode == terminal.ModeView && m.Generation.Value() == 2 {
+				return true
+			}
+		}
+		return false
+	}, "the displaced incumbent's new binding")
+	tablet.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(2)}
+
+	deadline := time.After(5 * time.Second)
+	for done := false; !done; {
+		select {
+		case m := <-phone.stream.out:
+			if m.Type == terminal.TypeAttached && m.Mode == terminal.ModeControl {
+				t.Fatalf("a claim superseded while it displaced its peers was told it has control at %q; "+
+					"nothing will ever correct it", m.Generation)
+			}
+			if m.Type == terminal.TypeStale {
+				if m.Generation.Value() != 3 {
+					t.Fatalf("the superseded claim was told generation %q, want the 3 that exists", m.Generation)
+				}
+				done = true
+			}
+		case <-deadline:
+			t.Fatal("the superseded claim was never answered at all")
+		}
+	}
+	if got, _ := awaitType(t, tablet.stream, terminal.TypeAttached); got.Generation.Value() != 3 {
+		t.Fatalf("the winning claim = %s at %q, want control at 3", got.Mode, got.Generation)
+	}
+}
+
+// TestATakeOverAtAttachTimeIsToldWhatItIsAfterItDisplaced is the same rule on
+// the attach path. A take-over that IS an attach displaces every peer before
+// it answers, and that loop waits on each displaced peer's sandbox; a claim
+// on an existing attach can win inside it. What the opening `attached` says
+// has to be what this attach holds when the message is written, not what the
+// application granted before the loop began.
+func TestATakeOverAtAttachTimeIsToldWhatItIsAfterItDisplaced(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 700 * time.Millisecond})
+	lease := &fakeLease{gen: 1, holder: "att_aaaa"}
+
+	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_aaaa"}, false)
+	awaitType(t, laptop.stream, terminal.TypeAttached)
+	<-laptop.sandbox.ready
+	tablet := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_cccc"}, true)
+	awaitType(t, tablet.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, tablet)
+
+	// The application admits a new controller attach: it has already advanced
+	// the generation before the broker is called at all.
+	gen, err := (fakeKeeper{lease, "att_dddd"}).Claim(context.Background(), 1)
+	if err != nil || gen != 2 {
+		t.Fatalf("the application's own claim = %d, %v; want 2, nil", gen, err)
+	}
+	phone := startAttach(t, p, h, ts, control.AttachmentController, 2, fakeKeeper{lease, "att_dddd"}, true)
+
+	// It is now inside its displace loop, waiting on the incumbent's sandbox.
+	awaitSandbox(t, laptop.sandbox, func(got []terminal.ClientMessage) bool {
+		for _, m := range got {
+			if m.Type == terminal.TypeControl && m.Mode == terminal.ModeView && m.Generation.Value() == 2 {
+				return true
+			}
+		}
+		return false
+	}, "the displaced incumbent's new binding")
+	tablet.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(2)}
+	if m, _ := awaitType(t, tablet.stream, terminal.TypeAttached); m.Generation.Value() != 3 {
+		t.Fatalf("the claim that won = %s at %q, want control at 3", m.Mode, m.Generation)
+	}
+
+	m, _ := awaitType(t, phone.stream, terminal.TypeAttached)
+	if m.Mode == terminal.ModeControl {
+		t.Fatalf("an attach displaced before it was ever told anything was told it has control at %q", m.Generation)
+	}
+	if m.Generation.Value() != 3 {
+		t.Fatalf("the displaced attach opened at generation %q, want the 3 that exists", m.Generation)
+	}
+}
