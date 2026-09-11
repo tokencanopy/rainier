@@ -209,6 +209,14 @@ func (h *Hub) AttachClient(ctx context.Context, client Conn, o Open) error {
 			h.mu.Lock()
 			delete(h.clients, id)
 			h.mu.Unlock()
+			// And the socket itself, which was the one exit of the five in
+			// this file that did not. A read error is not a closed conn: a
+			// websocket whose peer half-closed, or whose read simply failed,
+			// still holds an fd — and the attach-back dial has no deferred
+			// CloseNow of its own, so it sat in CLOSE_WAIT for runnerd's
+			// life. With `rainier exec` that is one descriptor per COMMAND
+			// rather than per human detach, which walks a CI loop to EMFILE.
+			client.Close()
 			return err
 		}
 		fr, _ := Encode(Frame{Type: FrameClient, AttachID: id, Payload: raw})

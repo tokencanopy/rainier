@@ -494,3 +494,53 @@ func TestSessionConnDeathClosesClient(t *testing.T) {
 		t.Fatal("client conn was never closed after session conn death — cascade failed")
 	}
 }
+
+// closeRecorder is a client conn whose Read fails at once and whose Close is
+// observable. A pipeConn cannot stand in for it: both ends of a pipeConn share
+// one closed signal, so "the hub closed this client" and "the test closed it"
+// would be indistinguishable — which is exactly the confusion that let the
+// missing Close below go unnoticed.
+type closeRecorder struct {
+	readErr error
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func (c *closeRecorder) Read(context.Context) ([]byte, error) { return nil, c.readErr }
+func (c *closeRecorder) Write(context.Context, []byte) error  { return nil }
+func (c *closeRecorder) Close() error                         { c.once.Do(func() { close(c.closed) }); return nil }
+
+// TestAttachClientClosesTheClientItGaveUpOn is one socket per attachment, and
+// with `rainier exec` one socket per COMMAND.
+//
+// AttachClient has five exits. Four of them close the client conn; the
+// client-read-error branch wrote its FrameClose, deleted the map entry and
+// returned without one. A read error is not a closed conn — the runner's
+// attach-back dial has no deferred CloseNow of its own — so the websocket sat
+// in CLOSE_WAIT for runnerd's whole life. At one per human detach that is a
+// slow leak; at one per `rainier exec` in a CI loop it is EMFILE.
+func TestAttachClientClosesTheClientItGaveUpOn(t *testing.T) {
+	sessConn, runConn := newPipe()
+	defer sessConn.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	hub := NewHub(ctx, runConn)
+	defer hub.Close()
+
+	client := &closeRecorder{readErr: io.ErrUnexpectedEOF, closed: make(chan struct{})}
+	if err := hub.AttachClient(ctx, client, Open{Cols: 80, Rows: 24}); err == nil {
+		t.Fatal("AttachClient returned nil for a client whose Read failed")
+	}
+	select {
+	case <-client.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the hub gave up on a client and never closed its socket")
+	}
+	hub.mu.Lock()
+	n := len(hub.clients)
+	hub.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("the hub still holds %d client(s) after giving up on the only one", n)
+	}
+}
