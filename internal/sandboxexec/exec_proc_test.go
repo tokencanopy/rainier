@@ -64,10 +64,33 @@ func TestExecSubprocessTarget(t *testing.T) {
 		os.Exit(0)
 	case "signal-self":
 		syscall.Kill(os.Getpid(), syscall.SIGTERM)
-		select {}
+		// A SLEEP and not `select {}`. A test binary invoked with only
+		// -test.run has no timer goroutine, so parking every goroutine is
+		// what the runtime's deadlock detector kills instantly — which turned
+		// the two lifetime tests below into tests of a corpse. Bounded, so a
+		// failed run cannot leave one behind; the same shape "hold" uses.
+		time.Sleep(30 * time.Second)
 	case "sleep":
 		fmt.Fprint(os.Stdout, "up")
-		select {}
+		time.Sleep(30 * time.Second)
+	case "ignore-term":
+		// Refuses to die politely, which is what the escalation exists for.
+		signal.Notify(make(chan os.Signal, 1), syscall.SIGTERM)
+		fmt.Fprint(os.Stdout, "up")
+		time.Sleep(30 * time.Second)
+	case "group":
+		// A child in the SAME process group as its parent — no Setpgid, so
+		// it inherits the group the spawner made — that does NOT hold the
+		// parent's pipes. It is the MINUS SIGN's witness: kill(pid) reaps the
+		// leader and leaves this one running, kill(-pgid) takes both, and
+		// nothing else in the suite can tell the two apart.
+		child := exec.Command(os.Args[0], "-test.run=^TestExecSubprocessTarget$")
+		child.Env = append(os.Environ(), "RAINIER_EXEC_TEST_TARGET=hold")
+		if err := child.Start(); err != nil {
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stdout, "gc %d\n", child.Process.Pid)
+		time.Sleep(30 * time.Second)
 	case "grandchild":
 		// A child that outlives its parent HOLDING THE SAME PIPES: the case
 		// the drain's grandchild rule exists for. Without that rule EOF never
@@ -327,6 +350,112 @@ func TestRealExecKillsTheProcessGroup(t *testing.T) {
 	if syscall.Signal(first[1]) != syscall.SIGTERM {
 		t.Fatalf("the first signal was %v, want SIGTERM", syscall.Signal(first[1]))
 	}
+}
+
+// TestRealExecKillsGrandchildrenInTheGroup is the minus sign with a witness
+// that is a PROCESS rather than a recorded argument. The child spawns a
+// grandchild in its own process group and does not hand it the pipes, so
+// nothing about the drain can end it: signalling the leader alone leaves it
+// running, and only kill(-pgid) reaps it.
+//
+// It exists because the recorded-argument assertion is one `if` away from
+// being deleted by somebody who reads it as belt and braces. This one fails
+// with a process still alive on the machine.
+func TestRealExecKillsGrandchildrenInTheGroup(t *testing.T) {
+	r, rec, _ := realRunner(t, "group")
+	a := r.OpenExec(targetSpec())
+	if m := <-a.Msgs(); m.Type != terminal.TypeExecStarted {
+		t.Fatalf("first message = %q", m.Type)
+	}
+
+	var gc int
+	var out strings.Builder
+	waitForExec(t, func() bool {
+		select {
+		case m, ok := <-a.Msgs():
+			if !ok {
+				t.Fatal("the attachment closed before the grandchild was reported")
+			}
+			if m.Type == terminal.TypeExecStdout {
+				out.Write(m.Data)
+			}
+		default:
+			return false
+		}
+		_, err := fmt.Sscanf(out.String(), "gc %d", &gc)
+		return err == nil && gc > 0
+	}, "the child never reported its grandchild")
+
+	a.Close()
+	// kill() signals on a goroutine by design (exec.go's kill), so this is a
+	// poll rather than an assumption about scheduling.
+	waitForExec(t, func() bool { return len(rec.calls()) > 0 },
+		"a caller disconnect signalled nothing")
+	waitForExec(t, func() bool { return processGone(gc) },
+		"the grandchild outlived the kill: the signal went to the leader, not to the GROUP")
+
+	for _, c := range rec.calls() {
+		if c[0] >= 0 {
+			t.Fatalf("a signal went to pid %d, not to the process GROUP (-pid)", c[0])
+		}
+	}
+	drainAttachment(t, a)
+}
+
+// TestRealExecEscalatesToSIGKILL is the other half of the kill rule: a child
+// that ignores SIGTERM is not left running because it was asked nicely. The
+// grace is milliseconds here rather than the production five seconds, which is
+// the only thing the Runner's own field is for.
+func TestRealExecEscalatesToSIGKILL(t *testing.T) {
+	r, rec, _ := realRunner(t, "ignore-term")
+	r.grace = 200 * time.Millisecond
+	a := r.OpenExec(targetSpec())
+	if m := <-a.Msgs(); m.Type != terminal.TypeExecStarted {
+		t.Fatalf("first message = %q", m.Type)
+	}
+	waitForExec(t, func() bool {
+		select {
+		case m, ok := <-a.Msgs():
+			return ok && m.Type == terminal.TypeExecStdout && string(m.Data) == "up"
+		default:
+			return false
+		}
+	}, "the child never printed")
+
+	a.Close()
+	waitForExec(t, func() bool {
+		for _, c := range rec.calls() {
+			if syscall.Signal(c[1]) == syscall.SIGKILL {
+				return true
+			}
+		}
+		return false
+	}, "a child that ignored SIGTERM was never escalated to SIGKILL")
+	for _, c := range rec.calls() {
+		if c[0] >= 0 {
+			t.Fatalf("a signal went to pid %d, not to the process GROUP (-pid)", c[0])
+		}
+	}
+	drainAttachment(t, a)
+}
+
+// processGone reports whether pid is no longer a running process. A zombie
+// counts as gone: whether an orphan has been reaped yet is a property of
+// whatever adopted it, not of the signal this test is about.
+func processGone(pid int) bool {
+	if err := syscall.Kill(pid, 0); err != nil {
+		return true
+	}
+	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
+		// "pid (comm) state ..." — comm can contain spaces and parentheses,
+		// so the state is the first field after the LAST ')'.
+		if i := strings.LastIndexByte(string(b), ')'); i >= 0 {
+			if f := strings.Fields(string(b)[i+1:]); len(f) > 0 && f[0] == "Z" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // waitForExec polls until cond or fails, so a test never hangs the suite. It
