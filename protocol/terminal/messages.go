@@ -7,7 +7,11 @@
 // anywhere else.
 package terminal
 
-import "strconv"
+import (
+	"strconv"
+
+	"github.com/tokencanopy/rainier/protocol/runner"
+)
 
 // SinceAll is the attach cursor that asks for the WHOLE event log, first
 // entry onward — what `rainier attach --since 0` (and `new`'s auto-attach)
@@ -61,6 +65,16 @@ type ClientMessage struct {
 	// was typing and never the client's own claim about it, which is what
 	// keeps the fence out of reach of the peer it is fencing.
 	Generation Gen `json:"gen,omitempty"`
+	// Exec is the command an "exec_start" opens with — the required first
+	// message of an exec attachment, and the only message that ever carries
+	// it. It is the runner protocol's ExecSpec rather than a second copy of
+	// it, so the spec a caller composed is the spec the sandbox validates,
+	// with no re-encoding between them.
+	Exec *runner.ExecSpec `json:"exec,omitempty"`
+	// Signal is the signal an "exec_signal" asks the sandbox to deliver to
+	// the exec's process group: SignalTERM or SignalINT and nothing else. A
+	// sandbox refuses every other word rather than translating it.
+	Signal string `json:"signal,omitempty"`
 }
 
 // ServerMessage is one message a session sends out to a viewer. Type is
@@ -85,7 +99,108 @@ type ServerMessage struct {
 	// that lost a claim can decide whether to claim again from it), and the
 	// generation being confirmed on a "control_ack".
 	Generation Gen `json:"gen,omitempty"`
+	// Signal is the signal that killed an exec's process on an "exec_exit",
+	// spelled as a name ("TERM", "KILL", "SEGV"). Exactly one of ExitCode
+	// and Signal is meaningful on an exec_exit, and Signal being non-empty
+	// is what says which: a process killed by a signal has no exit code, and
+	// reporting 0 for one would tell a script the command succeeded.
+	Signal string `json:"signal,omitempty"`
+	// Reason is an "exec_error"'s machine-readable cause, from the closed
+	// vocabulary below. It is closed because the CLI maps it to an exit code
+	// and a sentence, and because free-form prose from inside a sandbox is a
+	// string somebody's terminal renders.
+	Reason string `json:"reason,omitempty"`
+	// PID is the process id an "exec_started" reports for a DETACHED exec —
+	// the one fact its caller needs, since `rainier exec s -- kill <pid>` is
+	// how a detached process is stopped. It is absent on an attached exec,
+	// whose lifetime is its caller's and which therefore has nothing to
+	// address later.
+	PID int `json:"pid,omitempty"`
 }
+
+// ---------------------------------------------------------------------------
+// exec
+// ---------------------------------------------------------------------------
+
+// The message types an exec attachment adds. Exec reuses ClientMessage and
+// ServerMessage rather than introducing a third pair: the plane forwards
+// whole messages of these two types, and a third would mean a third decode at
+// every hop. Only the type words are new.
+//
+// Client → server:
+//
+//	TypeExecStart    the spec; MUST be the first message on an exec
+//	                 attachment, and is the only one that carries Exec
+//	TypeExecStdinEOF the caller's stdin reached EOF; close the child's
+//	                 stdin. It is an explicit frame because a socket that is
+//	                 still open cannot express "no more input", and `cat`
+//	                 with a pipe on the other end must terminate
+//	TypeExecSignal   deliver Signal to the exec's process GROUP
+//
+// "stdin" and "resize" are reused as-is, and neither ever carries a
+// generation on an exec attachment: a plane does not stamp an exec frame and
+// a sandbox does not read one off it.
+//
+// Server → client:
+//
+//	TypeExecStarted  the process exists. This is the HANDSHAKE: a plane
+//	                 accepts an exec only from a sandbox that sent it, and
+//	                 not one byte of the caller's stdin is forwarded before
+//	                 it. A sandbox that predates exec answers a snapshot
+//	                 instead, which is what makes an old sandbox a clean
+//	                 refusal rather than a terminal attachment nobody asked
+//	                 for
+//	TypeExecStdout   the command's stdout (and, under --tty, everything,
+//	                 because a pty has one stream)
+//	TypeExecStderr   the command's stderr
+//	TypeExecExit     ExitCode, or Signal when a signal killed it
+//	TypeExecError    Reason, from the closed vocabulary below
+const (
+	TypeExecStart    = "exec_start"
+	TypeExecStdinEOF = "exec_stdin_eof"
+	TypeExecSignal   = "exec_signal"
+	TypeExecStarted  = "exec_started"
+	TypeExecStdout   = "exec_stdout"
+	TypeExecStderr   = "exec_stderr"
+	TypeExecExit     = "exec_exit"
+	TypeExecError    = "exec_error"
+)
+
+// The two signals an exec attachment may ask for, and the only two. They are
+// the ones a caller's own Ctrl-C and its process's termination map onto;
+// anything else is a request to do something to a process inside a sandbox
+// that the caller can express by running `kill` in that sandbox, where it is
+// audited like any other command.
+const (
+	SignalTERM = "TERM"
+	SignalINT  = "INT"
+)
+
+// ExecError's closed vocabulary. Every one of them means the command did not
+// run, which is why the CLI maps the whole set to 126 except ReasonNotFound
+// (127) and ReasonUnsupported (1, with the version sentence).
+//
+//	ReasonUnsupported  this sandbox does not know what an exec is — an old
+//	                   sessiond, detected by the missing exec_started
+//	ReasonNotFound     argv[0] was not found on the SESSION's PATH
+//	ReasonNotExecutable argv[0] was found and is not executable
+//	ReasonCwdRefused   --cwd is not inside the workspace, or leaves it
+//	                   through a symbolic link
+//	ReasonEnvRefused   an --env name the env rule refuses; the message names
+//	                   the VARIABLE'S NAME and nothing else, never its value
+//	ReasonLogRefused   --log is missing, is not inside the workspace, or
+//	                   could not be opened
+//	ReasonTooManyExecs this session already has the maximum number of
+//	                   concurrent execs
+const (
+	ReasonUnsupported   = "unsupported"
+	ReasonNotFound      = "not_found"
+	ReasonNotExecutable = "not_executable"
+	ReasonCwdRefused    = "cwd_refused"
+	ReasonEnvRefused    = "env_refused"
+	ReasonLogRefused    = "log_refused"
+	ReasonTooManyExecs  = "too_many_execs"
+)
 
 // ---------------------------------------------------------------------------
 // conditional controller ownership

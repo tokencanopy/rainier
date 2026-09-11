@@ -3,7 +3,11 @@
 // for one attachment, tagged by AttachID.
 package relay
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/tokencanopy/rainier/protocol/runner"
+)
 
 type FrameType uint8
 
@@ -45,9 +49,21 @@ type Frame struct {
 	// attachment is unbound, which the session reads as today's
 	// unconditional attachment. Both are omitempty for that reason: a peer
 	// that sets neither writes the bytes it has always written.
-	Mode    string `json:"m,omitempty"`
-	Gen     uint64 `json:"g,omitempty"`
-	Payload []byte `json:"p,omitempty"`
+	Mode string `json:"m,omitempty"`
+	Gen  uint64 `json:"g,omitempty"`
+	// Kind and Exec are a FrameOpen's attachment KIND: absent (runner.KindTerminal)
+	// opens the session's pty exactly as it always has, runner.KindExec opens a
+	// process this attachment creates and owns, with Exec naming it.
+	//
+	// Both are omitempty, so a terminal FrameOpen is byte-identical to the one
+	// this hop has always written (pinned by TestTerminalFrameWireShape). A
+	// FrameOpen carrying KindExec on a sessiond that predates the field falls
+	// into today's terminal branch and answers a snapshot — which is exactly
+	// why the plane requires a positive `exec_started` before it forwards
+	// anything, and why that handshake, not this field, is the fence.
+	Kind    string           `json:"k,omitempty"`
+	Exec    *runner.ExecSpec `json:"x,omitempty"`
+	Payload []byte           `json:"p,omitempty"`
 }
 
 // ControlEvent is the JSON payload a FrameControl carries: a message about

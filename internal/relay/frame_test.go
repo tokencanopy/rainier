@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 func TestFrameRoundTrip(t *testing.T) {
@@ -120,5 +122,85 @@ func TestAnUnboundFrameIsTheBytesItAlwaysWas(t *testing.T) {
 	}
 	if got.Mode != "control" || got.Gen != 4 {
 		t.Fatalf("decoded binding = %q at %d, want control at 4", got.Mode, got.Gen)
+	}
+}
+
+// TestTerminalFrameWireShape is the exec half of the promise above. sessiond
+// ships in the session image and a session keeps the one it booted with for
+// life, so a TERMINAL frame's bytes are read by builds that predate exec by
+// months: they must not change, and the two fields exec adds are omitempty
+// exactly so they do not.
+func TestTerminalFrameWireShape(t *testing.T) {
+	for _, f := range []Frame{
+		{Type: FrameOpen, AttachID: 7, Since: 3, Cols: 80, Rows: 24},
+		{Type: FrameOpen, AttachID: 7, Cols: 80, Rows: 24, Mode: "control", Gen: 4},
+		{Type: FrameClient, AttachID: 7, Payload: []byte(`{"type":"stdin"}`)},
+		{Type: FrameServer, AttachID: 7, Payload: []byte(`{"type":"output"}`)},
+		{Type: FrameClose, AttachID: 7},
+		{Type: FrameControl, Payload: []byte(`{"kind":"setup_done"}`)},
+	} {
+		raw, err := Encode(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), `"k"`) || strings.Contains(string(raw), `"x"`) {
+			t.Fatalf("a terminal frame leaked an exec field: %s", raw)
+		}
+	}
+}
+
+// TestExecFrameWireShape pins the bytes an exec open actually writes, and
+// that the spec round-trips through the hop unchanged — the frame is the last
+// place the command could be mangled before the sandbox validates it.
+func TestExecFrameWireShape(t *testing.T) {
+	raw, err := Encode(Frame{Type: FrameOpen, AttachID: 7, Cols: 80, Rows: 24,
+		Kind: runner.KindExec, Exec: &runner.ExecSpec{Argv: []string{"git", "status"}, TTY: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"t":0,"a":7,"c":80,"r":24,"k":"exec","x":{"argv":["git","status"],"tty":true}}`
+	if string(raw) != want {
+		t.Fatalf("an exec open frame = %s\nwant %s", raw, want)
+	}
+
+	got, err := Decode(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Kind != runner.KindExec || got.Exec == nil ||
+		len(got.Exec.Argv) != 2 || got.Exec.Argv[1] != "status" || !got.Exec.TTY {
+		t.Fatalf("decoded exec open = %+v", got)
+	}
+}
+
+// TestAnExecFrameOnAnOldDecoderIsATerminalOpen is the third row of the
+// compatibility matrix, at the hop where it happens: a sessiond that predates
+// the Kind field decodes an exec FrameOpen into a frame with no kind — an
+// ordinary terminal open — because unknown JSON keys are dropped. That is
+// exactly why the plane requires a positive exec_started before it forwards a
+// byte, and this test exists so the claim is checked rather than asserted.
+func TestAnExecFrameOnAnOldDecoderIsATerminalOpen(t *testing.T) {
+	raw, err := Encode(Frame{Type: FrameOpen, AttachID: 7, Cols: 80, Rows: 24,
+		Kind: runner.KindExec, Exec: &runner.ExecSpec{Argv: []string{"git"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// oldFrame is the struct as it was before exec: the same tags, without
+	// the two this change added.
+	var old struct {
+		Type     FrameType `json:"t"`
+		AttachID uint64    `json:"a"`
+		Since    uint64    `json:"s,omitempty"`
+		Cols     int       `json:"c,omitempty"`
+		Rows     int       `json:"r,omitempty"`
+		Mode     string    `json:"m,omitempty"`
+		Gen      uint64    `json:"g,omitempty"`
+		Payload  []byte    `json:"p,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &old); err != nil {
+		t.Fatalf("an old build could not decode an exec frame at all: %v", err)
+	}
+	if old.Type != FrameOpen || old.AttachID != 7 || old.Cols != 80 || old.Rows != 24 {
+		t.Fatalf("an old build decoded an exec open as %+v", old)
 	}
 }
