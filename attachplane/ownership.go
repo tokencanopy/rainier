@@ -284,6 +284,21 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 	if !o.negotiated {
 		return
 	}
+	if o.controlling() {
+		// Re-claiming from yourself buys nothing and costs plenty: it
+		// advances the generation, fences the keystrokes this client has
+		// already sent, re-installs a binding the sandbox has, and spends an
+		// acknowledgement timeout on every peer — to arrive at the answer the
+		// client already had. The first-party CLI refuses to send one
+		// (internal/attachio's own claim()); nothing stopped another client,
+		// and a claim is client-triggered and unlimited by design.
+		//
+		// It is still ANSWERED, with what this attach holds, because a
+		// take-control key that produces nothing at all is the one outcome a
+		// client cannot tell from a broken connection.
+		o.announceAs(ctx, terminal.TypeAttached, 0)
+		return
+	}
 	if !o.mayClaim || o.keeper == nil {
 		// This client may watch and may not drive: the host's policy answers
 		// differently for a viewer and a controller, which is the whole
@@ -296,8 +311,7 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 		// A negotiated attach is ANSWERED either way. Returning in silence
 		// would leave the take-control key doing nothing at all, which is the
 		// one outcome a client cannot tell from a broken connection.
-		_, current := o.get()
-		o.announceStale(ctx, current)
+		o.announceAs(ctx, terminal.TypeStale, 0)
 		return
 	}
 	gen, err := o.keeper.Claim(ctx, expected)
@@ -314,62 +328,67 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 	// attach's own acknowledgement, and then one per displaced peer's
 	// sandbox, each up to the acknowledgement timeout — and another claim can
 	// win inside either. Both are answered by the same question, asked once,
-	// at the end: does this attach still hold the generation it won?
-	o.announceClaim(ctx, gen)
-}
-
-// announceClaim answers one claim, reading what this attach holds inside the
-// hold that sends the answer. It says "attached, control" only while this
-// attach still holds gen; a claim that has been superseded gets what a lost
-// race gets, and the binding it installed is re-pointed at what this attach
-// actually is now, so the sandbox's copy agrees with the plane's. The pty
-// fence had already made that binding inert, at a generation the session has
-// passed; this is what stops it lingering until the next handoff.
-func (o *ownership) announceClaim(ctx context.Context, gen uint64) {
-	o.announce.Lock()
-	defer o.announce.Unlock()
-	mode, current := o.get()
+	// at the end and inside the hold that sends the answer: does this attach
+	// still hold the generation it won?
+	mode, current := o.announceAs(ctx, terminal.TypeAttached, gen)
 	if mode == terminal.ModeControl && current == gen {
-		o.send(ctx, terminal.ServerMessage{
-			Type: terminal.TypeAttached, Mode: terminal.ModeControl, Generation: terminal.GenOf(gen)})
 		return
 	}
+	// It does not: something won inside one of those waits, and the client
+	// has just been told so. The binding this claim installed is re-pointed
+	// at what this attach actually is, so the sandbox's copy agrees with the
+	// plane's — the pty fence had already made it inert, at a generation the
+	// session has passed, and this is what stops it lingering until the next
+	// handoff.
+	//
+	// It happens OUTSIDE the announce hold. A sandbox that is slow to take
+	// this write would otherwise hold this attach's announce mutex, and the
+	// first thing a peer displacing this attach needs is that mutex — so one
+	// slow sandbox would stall somebody else's handoff. Reading the state a
+	// second time is safe: claims on one attach are handled inline on its own
+	// client pump, so nothing can promote this attach between the two reads.
 	_ = o.install(ctx, mode, current)
-	o.send(ctx, terminal.ServerMessage{Type: terminal.TypeStale, Generation: terminal.GenOf(current)})
 }
 
-// announceOpening tells a newly opened attach what it is, reading the mode
-// and generation inside the hold that sends them, and returns what it said. An
-// attach granted control displaces its peers first and can lose control
-// inside that loop, so the client must be told what it IS rather than what it
-// was granted a moment ago.
-func (o *ownership) announceOpening(ctx context.Context) (string, uint64) {
+// announceAs sends ONE ownership message, and it is the only place any of
+// them is sent. It takes the announce hold, reads the mode and the generation
+// under it, and reports what it READ — no caller can assert a mode it did not
+// read, because no caller supplies one. Three rounds of review found that
+// defect on three different paths; this is the version of the fix that cannot
+// recur.
+//
+// won is the generation a claim answer is answering at, and zero on every
+// other path. Both of the decisions that depend on the state are made HERE,
+// under the hold that writes the message:
+//
+//   - a claim that no longer holds what it won is answered the way a lost
+//     race is answered, because that is what it is now;
+//   - a `stale` that would tell a LIVE controller it is a viewer is sent as
+//     `attached control` instead. A client that reads `controller.generation`
+//     and claims from a value it no longer holds is refused by the store, and
+//     answering that refusal with `stale` would make the session's own
+//     controller stop typing for the rest of its lease.
+//
+// It returns the mode and generation it reported.
+func (o *ownership) announceAs(ctx context.Context, typ string, won uint64) (string, uint64) {
 	o.announce.Lock()
 	defer o.announce.Unlock()
 	mode, gen := o.get()
-	o.send(ctx, terminal.ServerMessage{
-		Type: terminal.TypeAttached, Mode: mode, Generation: terminal.GenOf(gen)})
+	switch {
+	case typ == terminal.TypeAttached && won != 0 && (mode != terminal.ModeControl || gen != won):
+		typ = terminal.TypeStale
+	case typ == terminal.TypeStale && mode == terminal.ModeControl:
+		typ = terminal.TypeAttached
+	}
+	m := terminal.ServerMessage{Type: typ, Generation: terminal.GenOf(gen)}
+	if typ != terminal.TypeStale {
+		// `stale` carries a generation and nothing else: it is a refusal, not
+		// a statement about what this attach is, and it has never carried a
+		// mode on the wire.
+		m.Mode = mode
+	}
+	o.send(ctx, m)
 	return mode, gen
-}
-
-// announceViewer tells this client the generation moved and it is a viewer
-// under it, at whatever generation this attach holds when the message is
-// actually written. It is the notice a displacement and a demotion both send.
-func (o *ownership) announceViewer(ctx context.Context) uint64 {
-	o.announce.Lock()
-	defer o.announce.Unlock()
-	_, gen := o.get()
-	o.send(ctx, terminal.ServerMessage{
-		Type: terminal.TypeControlChanged, Mode: terminal.ModeView, Generation: terminal.GenOf(gen)})
-	return gen
-}
-
-// announceStale tells this client its claim did not land, and the generation
-// it would have to claim from to try again.
-func (o *ownership) announceStale(ctx context.Context, gen uint64) {
-	o.announce.Lock()
-	defer o.announce.Unlock()
-	o.send(ctx, terminal.ServerMessage{Type: terminal.TypeStale, Generation: terminal.GenOf(gen)})
 }
 
 // sendStale answers a refused claim with the current generation. A read that
@@ -389,7 +408,15 @@ func (o *ownership) sendStale(ctx context.Context) {
 			current = gen
 		}
 	}
-	o.announceStale(ctx, current)
+	// Record what the store says before answering, so the answer is read out
+	// of this attach's state rather than asserted over it. displaceTo is the
+	// right write for exactly the two cases this has: an attach BEHIND the
+	// store lost the race and is a viewer at the current generation, and an
+	// attach at or past it is left alone — which is a controller whose client
+	// claimed with an `expected` it no longer holds, and which announceAs
+	// then answers with the control it still has.
+	o.displaceTo(current)
+	o.announceAs(ctx, terminal.TypeStale, 0)
 }
 
 // release gives up control without giving up the attach: the generation
@@ -432,7 +459,8 @@ func (o *ownership) demote(ctx context.Context) uint64 {
 	}
 	_ = o.installAndWait(ctx, terminal.ModeView, current)
 	o.demoteTo(current)
-	return o.announceViewer(ctx)
+	_, gen := o.announceAs(ctx, terminal.TypeControlChanged, 0)
+	return gen
 }
 
 // heartbeat renews the lease while this attach holds control, on the stream's
@@ -581,8 +609,11 @@ func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wai
 			}
 		}
 		// A viewer stays a viewer; only the number it would claim from
-		// changes, and its client reads that silently.
-		other.announceViewer(ctx)
+		// changes, and its client reads that silently. What the notice SAYS
+		// is read at send time, not asserted here: a peer that won its own
+		// claim inside this loop is told it has control, rather than being
+		// told it is a viewer and then corrected.
+		other.announceAs(ctx, terminal.TypeControlChanged, 0)
 	}
 }
 

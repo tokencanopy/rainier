@@ -177,7 +177,10 @@ func (b broker) Attach(ctx context.Context, target control.AttachTarget, stream 
 	// that loop rather than what the application granted before it:
 	// displacing every peer waits on each one's sandbox, and another attach
 	// can claim control inside that wait.
-	mode, generation = own.announceOpening(ctx)
+	// announceAs reads them inside the hold that sends them, so what this
+	// client is told is what this attach IS at that instant rather than what
+	// the application granted before the loop began.
+	mode, generation = own.announceAs(ctx, terminal.TypeAttached, 0)
 
 	attachID := randHex(8) // 16 hex characters, crypto/rand
 	pa := &pendingAttach{stream: stream, own: own, done: make(chan struct{})}

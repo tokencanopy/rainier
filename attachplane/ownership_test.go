@@ -742,9 +742,12 @@ func TestATakeOverAtAttachTimeWaitsForTheSandboxToo(t *testing.T) {
 func TestThePlaneStampsItsOwnViewOverTheClients(t *testing.T) {
 	p, h, ts := newTestPlane(t, Options{})
 	lease := &fakeLease{gen: 1, holder: "att_laptop"}
-	a := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_laptop"}, true)
+	// A viewer, because a claim from the CONTROLLER is answered without
+	// touching the store: a client that already has control has nothing to
+	// win, and re-claiming would fence its own in-flight keystrokes.
+	a := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_phone"}, true)
 	awaitType(t, a.stream, terminal.TypeAttached)
-	<-a.sandbox.ready
+	awaitViewerSpliced(t, a)
 
 	// It takes control, so the plane now holds generation 2 — and then sends
 	// a keystroke stamped with the one it used to hold.
@@ -1300,5 +1303,167 @@ func TestDisplaceAtGenerationZeroTouchesNobody(t *testing.T) {
 
 	if mode, gen := peer.get(); mode != terminal.ModeControl || gen != 2 {
 		t.Fatalf("a displacement at generation zero moved a peer to %s at %d, want control at 2", mode, gen)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// what a client is told is what the plane READ (fourth review, findings 2/5/6)
+// ---------------------------------------------------------------------------
+
+// TestAControllerThatClaimsFromAStaleGenerationKeepsControl is the fourth
+// review's second finding end to end, and it needs no race at all. A client
+// that reads `controller.generation` — which this branch newly exposes — and
+// claims from a value it no longer holds used to reach the store, be refused
+// ErrStale, and be answered `stale`: its client switched to viewer and stopped
+// typing while the plane still forwarded for it and its own heartbeat kept
+// renewing its lease. Nobody could type for the rest of the 30s lease, and
+// every new negotiated attach was admitted a viewer behind it.
+//
+// Two things close it, and this pins both from the client's side: a claim from
+// the current controller never reaches the store at all, and no announcement
+// asserts a mode it did not read.
+func TestAControllerThatClaimsFromAStaleGenerationKeepsControl(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{})
+	lease := &fakeLease{gen: 4, holder: "att_aaaa"}
+	keeper := &countingKeeper{fakeKeeper: fakeKeeper{lease, "att_aaaa"}}
+	f := startAttach(t, p, h, ts, control.AttachmentController, 4, keeper, true)
+	if m, _ := awaitType(t, f.stream, terminal.TypeAttached); m.Mode != terminal.ModeControl {
+		t.Fatalf("the controller opened as %s, want control", m.Mode)
+	}
+	awaitSpliced(t, f)
+
+	// The generation it presents is one this session left long ago.
+	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
+
+	deadline := time.After(5 * time.Second)
+	for answered := false; !answered; {
+		select {
+		case m := <-f.stream.out:
+			if m.Type == terminal.TypeStale {
+				t.Fatalf("the session's own controller was told stale@%q; its client stops typing "+
+					"while its heartbeat keeps renewing the lease", m.Generation)
+			}
+			if m.Type == terminal.TypeAttached {
+				if m.Mode != terminal.ModeControl || m.Generation.Value() != 4 {
+					t.Fatalf("the controller's claim was answered %s at %q, want control at 4",
+						m.Mode, m.Generation)
+				}
+				answered = true
+			}
+		case <-deadline:
+			t.Fatal("the controller's claim was never answered at all")
+		}
+	}
+	if n := keeper.n.Load(); n != 0 {
+		t.Fatalf("%d claim(s) from the current controller reached the store", n)
+	}
+
+	// And it is still typing, under the generation it never left.
+	f.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("ls\r")}
+	awaitSandbox(t, f.sandbox, func(got []terminal.ClientMessage) bool {
+		for _, m := range got {
+			if m.Type == "stdin" {
+				if m.Generation.Value() != 4 {
+					t.Fatalf("the controller's keystroke was stamped %q, want the 4 it holds", m.Generation)
+				}
+				return true
+			}
+		}
+		return false
+	}, "the controller's keystroke")
+}
+
+// TestAClaimFromTheCurrentControllerNeverAdvancesTheGeneration is the same
+// rule at the store. A claim is client-triggered and deliberately unlimited,
+// and one from the attach that already holds control advances the generation,
+// re-installs a binding the sandbox already has, fences the keystrokes this
+// client has already sent, and spends an acknowledgement timeout on every
+// peer — all to reach an answer the client already had.
+func TestAClaimFromTheCurrentControllerNeverAdvancesTheGeneration(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{})
+	lease := &fakeLease{gen: 1, holder: "att_aaaa"}
+	keeper := &countingKeeper{fakeKeeper: fakeKeeper{lease, "att_aaaa"}}
+	f := startAttach(t, p, h, ts, control.AttachmentController, 1, keeper, true)
+	awaitType(t, f.stream, terminal.TypeAttached)
+	awaitSpliced(t, f)
+
+	// The honest version: the generation it actually holds.
+	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
+	if m, _ := awaitType(t, f.stream, terminal.TypeAttached); m.Generation.Value() != 1 {
+		t.Fatalf("a claim from the controller answered generation %q, want the 1 it holds", m.Generation)
+	}
+	if n := keeper.n.Load(); n != 0 {
+		t.Fatalf("%d claim(s) from the current controller reached the store", n)
+	}
+	lease.mu.Lock()
+	gen, holder := lease.gen, lease.holder
+	lease.mu.Unlock()
+	if gen != 1 || holder != "att_aaaa" {
+		t.Fatalf("after a self-claim the lease is generation %d held by %q, want 1 and att_aaaa", gen, holder)
+	}
+}
+
+// TestAStaleAnswerNeverTellsALiveControllerItIsAViewer is the announcement
+// half on its own, one level below the client pump — because the pump's own
+// guard is not the only way in, and because one function deciding this under
+// the hold that writes the message is the whole point of announceAs.
+//
+// The mirror case is in the same test: an attach BEHIND the store really did
+// lose, and is told the generation it would have to claim from.
+func TestAStaleAnswerNeverTellsALiveControllerItIsAViewer(t *testing.T) {
+	p, _, _ := newTestPlane(t, Options{})
+	for _, tc := range []struct {
+		name     string
+		mode     string
+		held     uint64
+		store    uint64
+		wantType string
+		wantMode string
+		wantGen  uint64
+	}{
+		{"the live controller", terminal.ModeControl, 4, 4, terminal.TypeAttached, terminal.ModeControl, 4},
+		{"an attach the session left behind", terminal.ModeView, 9, 10, terminal.TypeStale, "", 10},
+		{"a controller the session left behind", terminal.ModeControl, 5, 7, terminal.TypeStale, "", 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lease := &fakeLease{gen: tc.store, holder: "att_holder"}
+			stream := newScriptedStream()
+			o := &ownership{plane: p, session: "sess_example", negotiated: true, mayClaim: true,
+				keeper: fakeKeeper{lease, "att_aaaa"}, stream: stream,
+				mode: tc.mode, gen: tc.held, ack: make(chan uint64, 1)}
+
+			o.sendStale(context.Background())
+
+			m := stream.nextServerMsg(t)
+			if m.Type != tc.wantType || m.Mode != tc.wantMode || m.Generation.Value() != tc.wantGen {
+				t.Fatalf("a refused claim from %s at %d (store at %d) was answered %q %s at %q; "+
+					"want %q %s at %d", tc.mode, tc.held, tc.store,
+					m.Type, m.Mode, m.Generation, tc.wantType, tc.wantMode, tc.wantGen)
+			}
+		})
+	}
+}
+
+// TestADisplacementNoticeReportsTheModeItReads pins the other half-path the
+// fold closed. The notice a displacement and a demotion send used to hard-code
+// `view`, so it could tell a live controller — one that won its own claim
+// inside the loop that is displacing it — that it is a viewer, at a generation
+// it holds the lease on.
+func TestADisplacementNoticeReportsTheModeItReads(t *testing.T) {
+	for _, mode := range []string{terminal.ModeControl, terminal.ModeView} {
+		t.Run(mode, func(t *testing.T) {
+			stream := newScriptedStream()
+			o := &ownership{negotiated: true, stream: stream, mode: mode, gen: 5,
+				ack: make(chan uint64, 1)}
+
+			if got, gen := o.announceAs(context.Background(), terminal.TypeControlChanged, 0); got != mode || gen != 5 {
+				t.Fatalf("announceAs reported %s at %d, want %s at 5", got, gen, mode)
+			}
+			m := stream.nextServerMsg(t)
+			if m.Type != terminal.TypeControlChanged || m.Mode != mode || m.Generation.Value() != 5 {
+				t.Fatalf("a %s attach was sent %q %s at %q, want control_changed %s at 5",
+					mode, m.Type, m.Mode, m.Generation, mode)
+			}
+		})
 	}
 }
