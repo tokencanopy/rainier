@@ -1134,7 +1134,7 @@ func TestFinishReleasesOnlyTheGenerationItActuallyHeld(t *testing.T) {
 		lease := &fakeLease{gen: 2, holder: "att_bbbb"}
 		keeper := &recordingKeeper{fakeKeeper: fakeKeeper{lease, "att_aaaa"}}
 		o := &ownership{plane: p, session: "sess_example", negotiated: true, mayClaim: true,
-			keeper: keeper, mode: terminal.ModeControl, gen: 1, ack: make(chan uint64, 1)}
+			keeper: keeper, mode: terminal.ModeControl, gen: 1, announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
 		p.owners.add(o)
 
 		var wg sync.WaitGroup
@@ -1223,7 +1223,7 @@ func TestANegotiatedClaimIsAlwaysAnswered(t *testing.T) {
 // alone, because naming it a number it has passed would walk its client
 // backwards.
 func TestDisplaceToRefusesAGenerationThisAttachHasPassed(t *testing.T) {
-	o := &ownership{mode: terminal.ModeControl, gen: 3}
+	o := &ownership{mode: terminal.ModeControl, gen: 3, announce: make(chan struct{}, 1)}
 	switch was, moved := o.displaceTo(2); {
 	case moved:
 		t.Fatal("a displacement to an older generation moved an attach that has passed it")
@@ -1246,7 +1246,7 @@ func TestDisplaceToRefusesAGenerationThisAttachHasPassed(t *testing.T) {
 // refuses) or after it (which then advances over it).
 func TestDisplaceToAndAdvanceAreEachOneStep(t *testing.T) {
 	for range 2000 {
-		o := &ownership{mode: terminal.ModeView, gen: 1}
+		o := &ownership{mode: terminal.ModeView, gen: 1, announce: make(chan struct{}, 1)}
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() { defer wg.Done(); o.advance(terminal.ModeControl, 3) }()
@@ -1264,7 +1264,7 @@ func TestDisplaceToAndAdvanceAreEachOneStep(t *testing.T) {
 // moving the number down would leave this attach — and its client — claiming
 // from a generation that has been superseded, refused every time.
 func TestDemoteToNeverWalksTheGenerationBack(t *testing.T) {
-	o := &ownership{mode: terminal.ModeControl, gen: 5}
+	o := &ownership{mode: terminal.ModeControl, gen: 5, announce: make(chan struct{}, 1)}
 	if got, moved := o.demoteTo(5, 3); got != 5 || !moved {
 		t.Fatalf("demoteTo(5, 3) at generation 5 returned %d, %v; want 5, true", got, moved)
 	}
@@ -1273,7 +1273,7 @@ func TestDemoteToNeverWalksTheGenerationBack(t *testing.T) {
 	}
 	// And it still demotes at a generation it cannot read: being wrong about
 	// the number is survivable, believing you still have control is not.
-	o = &ownership{mode: terminal.ModeControl, gen: 5}
+	o = &ownership{mode: terminal.ModeControl, gen: 5, announce: make(chan struct{}, 1)}
 	if got, moved := o.demoteTo(5, 5); got != 5 || !moved {
 		t.Fatalf("demoteTo(5, 5) returned %d, %v; want 5, true", got, moved)
 	}
@@ -1290,7 +1290,7 @@ func TestDemoteToNeverWalksTheGenerationBack(t *testing.T) {
 // demoting it anyway leaves the plane saying viewer while the store says this
 // attach holds the lease: nobody types until the lease expires.
 func TestDemoteToRefusesAGenerationThisAttachHasLeft(t *testing.T) {
-	o := &ownership{mode: terminal.ModeControl, gen: 3}
+	o := &ownership{mode: terminal.ModeControl, gen: 3, announce: make(chan struct{}, 1)}
 	if got, moved := o.demoteTo(1, 3); moved {
 		t.Fatalf("a demotion decided at generation 1 demoted an attach at 3 (to %d)", got)
 	}
@@ -1306,7 +1306,7 @@ func TestDemoteToRefusesAGenerationThisAttachHasLeft(t *testing.T) {
 // through, or the winner is told "somebody else got there first" about a
 // generation it owns and holds the lease on.
 func TestAdvanceAcceptsTheGenerationThisAttachAlreadyHolds(t *testing.T) {
-	o := &ownership{mode: terminal.ModeView, gen: 4}
+	o := &ownership{mode: terminal.ModeView, gen: 4, announce: make(chan struct{}, 1)}
 	if !o.advance(terminal.ModeControl, 4) {
 		t.Fatal("a claim was refused its own generation")
 	}
@@ -1324,8 +1324,8 @@ func TestAdvanceAcceptsTheGenerationThisAttachAlreadyHolds(t *testing.T) {
 // the session to a generation none of them could ever claim from.
 func TestDisplaceAtGenerationZeroTouchesNobody(t *testing.T) {
 	p, _, _ := newTestPlane(t, Options{})
-	winner := &ownership{plane: p, session: "sess_example"}
-	peer := &ownership{plane: p, session: "sess_example", mode: terminal.ModeControl, gen: 2}
+	winner := &ownership{plane: p, session: "sess_example", announce: make(chan struct{}, 1)}
+	peer := &ownership{plane: p, session: "sess_example", mode: terminal.ModeControl, gen: 2, announce: make(chan struct{}, 1)}
 	p.owners.add(winner)
 	p.owners.add(peer)
 
@@ -1384,8 +1384,16 @@ func TestAControllerThatClaimsFromAStaleGenerationKeepsControl(t *testing.T) {
 			t.Fatal("the controller's claim was never answered at all")
 		}
 	}
+	// The press cost the store one READ and no claim at all: the generation
+	// the client named is not the question, what this attach still holds is.
 	if n := keeper.n.Load(); n != 0 {
 		t.Fatalf("%d claim(s) from the current controller reached the store", n)
+	}
+	lease.mu.Lock()
+	gen, holder := lease.gen, lease.holder
+	lease.mu.Unlock()
+	if gen != 4 || holder != "att_aaaa" {
+		t.Fatalf("a refused claim left the lease at generation %d held by %q, want 4 and att_aaaa", gen, holder)
 	}
 
 	// And it is still typing, under the generation it never left.
@@ -1433,6 +1441,99 @@ func TestAClaimFromTheCurrentControllerNeverAdvancesTheGeneration(t *testing.T) 
 	}
 }
 
+// TestAControllerDisplacedElsewhereRecoversOnOnePress is why the guard above
+// is about AGREEMENT rather than about being the controller. A controller
+// displaced by an attach on another replica is told nothing: it reads
+// `control` at this plane until its own heartbeat renewal is refused, up to
+// one interval later. Its user cannot type and presses the take-control key,
+// which is the one thing they can do — and answering that from memory would
+// tell them they have control, at a generation somebody else's lease has
+// passed, with the store never consulted.
+func TestAControllerDisplacedElsewhereRecoversOnOnePress(t *testing.T) {
+	// The heartbeat is long, so the press is the only thing that can correct
+	// this attach — which is the window under test.
+	p, h, ts := newTestPlane(t, Options{HeartbeatInterval: time.Hour})
+	lease := &fakeLease{gen: 1, holder: "att_here"}
+	f := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_here"}, true)
+	awaitType(t, f.stream, terminal.TypeAttached)
+	awaitSpliced(t, f)
+
+	// Another replica's attach takes control. Nothing tells this one.
+	if _, err := (fakeKeeper{lease, "att_elsewhere"}).Claim(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
+
+	m, _ := awaitType(t, f.stream, terminal.TypeStale)
+	if m.Generation.Value() != 2 {
+		t.Fatalf("the press was answered stale@%q, want the 2 that exists now", m.Generation)
+	}
+	// And the client now holds a generation one more press can take.
+	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(2)}
+	got, _ := awaitType(t, f.stream, terminal.TypeAttached)
+	if got.Mode != terminal.ModeControl || got.Generation.Value() != 3 {
+		t.Fatalf("the second press = %s at %q, want control at 3", got.Mode, got.Generation)
+	}
+}
+
+// blockedConn is a sandbox socket that has stopped draining: every write
+// blocks until its context runs out. It is not a broken socket — nothing
+// fails, nothing closes — which is what makes it the hard case.
+type blockedConn struct{}
+
+func (blockedConn) Read(ctx context.Context) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (blockedConn) Write(ctx context.Context, _ []byte) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (blockedConn) Close() error { return nil }
+
+// TestAClaimWhoseBindingNeverLandedGivesTheGenerationBack is the phantom
+// controller, and it is unrecoverable if the claim takes control anyway. The
+// store CAS succeeds, so the generation and the lease are this attach's; the
+// binding write to its sandbox does not land, so the pty keeps discarding
+// everything it types; and nothing corrects it — the heartbeat renews happily
+// because the lease genuinely is this attach's, and the client's next press
+// is answered out of the same wrong state.
+//
+// A claim that cannot be fenced at the sandbox is therefore not a claim. The
+// generation goes back, and the client is told what exists now.
+func TestAClaimWhoseBindingNeverLandedGivesTheGenerationBack(t *testing.T) {
+	p, _, _ := newTestPlane(t, Options{ControlAckTimeout: 100 * time.Millisecond})
+	lease := &fakeLease{gen: 1}
+	stream := newScriptedStream()
+	o := &ownership{plane: p, session: "sess_example", negotiated: true, mayClaim: true,
+		keeper: fakeKeeper{lease, "att_aaaa"}, stream: stream, mode: terminal.ModeView, gen: 1,
+		announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
+	o.bindRunner(blockedConn{})
+
+	o.claim(context.Background(), 1)
+
+	if mode, gen := o.get(); mode != terminal.ModeView {
+		t.Fatalf("an attach whose binding never reached its sandbox took control at %d; "+
+			"the pty discards everything it types and nothing will correct it", gen)
+	}
+	m := stream.nextServerMsg(t)
+	if m.Type != terminal.TypeStale {
+		t.Fatalf("the claim was answered %q %s at %q, want stale", m.Type, m.Mode, m.Generation)
+	}
+	lease.mu.Lock()
+	gen, holder := lease.gen, lease.holder
+	lease.mu.Unlock()
+	if holder != "" {
+		t.Fatalf("the generation it could not use is still held by %q", holder)
+	}
+	if m.Generation.Value() != gen {
+		t.Fatalf("the client was told generation %q while the store is at %d; "+
+			"its next press would be refused too", m.Generation, gen)
+	}
+}
+
 // TestAStaleAnswerNeverTellsALiveControllerItIsAViewer is the announcement
 // half on its own, one level below the client pump — because the pump's own
 // guard is not the only way in, and because one function deciding this under
@@ -1460,7 +1561,7 @@ func TestAStaleAnswerNeverTellsALiveControllerItIsAViewer(t *testing.T) {
 			stream := newScriptedStream()
 			o := &ownership{plane: p, session: "sess_example", negotiated: true, mayClaim: true,
 				keeper: fakeKeeper{lease, "att_aaaa"}, stream: stream,
-				mode: tc.mode, gen: tc.held, ack: make(chan uint64, 1)}
+				mode: tc.mode, gen: tc.held, announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
 
 			o.sendStale(context.Background())
 
@@ -1485,7 +1586,7 @@ func TestADisplacementNoticeReportsTheModeItReads(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			stream := newScriptedStream()
 			o := &ownership{plane: p, negotiated: true, stream: stream, mode: mode, gen: 5,
-				ack: make(chan uint64, 1)}
+				announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
 
 			if got, gen := o.announceAs(context.Background(), terminal.TypeControlChanged, 0); got != mode || gen != 5 {
 				t.Fatalf("announceAs reported %s at %d, want %s at 5", got, gen, mode)
@@ -1821,7 +1922,7 @@ func (c ackingConn) Close() error { return nil }
 func TestAStaleAcknowledgementNeverCostsTheNextHandoffItsWait(t *testing.T) {
 	p, _, _ := newTestPlane(t, Options{ControlAckTimeout: 2 * time.Second})
 	o := &ownership{plane: p, session: "sess_example", mode: terminal.ModeControl, gen: 2,
-		ack: make(chan uint64, 1)}
+		announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
 	o.bindRunner(ackingConn{o})
 	// The previous handoff's acknowledgement, arriving after it gave up.
 	o.acked(2)

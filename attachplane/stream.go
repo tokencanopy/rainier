@@ -123,15 +123,35 @@ func (s wsTerminalStream) Receive(ctx context.Context) (terminal.ClientMessage, 
 // scrollback, and a slow link must be able to take one. What it catches is a
 // peer that is not draining at all.
 func (s wsTerminalStream) Send(ctx context.Context, m terminal.ServerMessage) error {
-	ctx, cancel := context.WithTimeout(ctx, clientWriteTimeout)
+	wctx, cancel := context.WithTimeout(ctx, clientWriteTimeout)
 	defer cancel()
-	if err := wsjson.Write(ctx, s.c, m); err != nil {
-		if ctx.Err() != nil {
-			// Out of time rather than broken: the socket is still open and
-			// still not draining, so end it here. CloseNow rather than a
-			// close frame, because a peer that will not read a message will
-			// not read a close reason either — and it takes the one close so
-			// a later Close does not log a failure that says nothing.
+	if err := wsjson.Write(wctx, s.c, m); err != nil {
+		if wctx.Err() != nil && ctx.Err() == nil {
+			// THIS stream's budget ran out, not the caller's: the socket is
+			// still open and has taken nothing for a minute, so end it.
+			// CloseNow rather than a close frame, because a peer that will
+			// not read a message will not read a close reason either — and it
+			// takes the one close, so a later Close does not log a failure
+			// that says nothing.
+			//
+			// coder/websocket also tears a connection down when a write
+			// that is IN FLIGHT runs out of time, so on that path this is
+			// belt and braces. It is here for the path the library cannot
+			// see — a write that never acquired the conn's write lock, and
+			// so never reached the socket at all — and because the rule this
+			// stream owes its caller ("a client that has taken nothing for a
+			// minute is closed") should not rest on another package's
+			// implementation detail. TestAWedgedClientIsClosedRatherThanHeld
+			// pins the property; which of the two closes does it is not
+			// something a test can, or should, tell apart.
+			//
+			// The caller's own deadline expiring is a different thing
+			// entirely. A handoff's courtesy notice carries seconds, and a
+			// websocket serialises its writes, so such a notice queued behind
+			// a large snapshot expires while waiting for the write lock —
+			// without the socket having failed at anything. Closing there
+			// would let one take-over on the session disconnect a client that
+			// is merely reading a scrollback over a slow link.
 			s.once.Do(func() { _ = s.c.CloseNow() })
 		}
 		return err

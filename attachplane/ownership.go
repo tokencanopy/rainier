@@ -54,7 +54,14 @@ type ownership struct {
 	// before it announces anything about itself, and a displacement takes the
 	// peer's announce and no other, so two attaches can never each hold one
 	// and wait for the other's.
-	announce sync.Mutex
+	//
+	// It is a channel rather than a sync.Mutex because ACQUIRING it has to be
+	// bounded too. A message to a client that has stopped reading is held for
+	// as long as that socket's own write deadline allows, and a peer
+	// displacing this attach needs this hold: a mutex would put the peer's
+	// handoff behind that client, which is the whole failure this round
+	// removed from the writes themselves.
+	announce chan struct{}
 
 	// handoff serialises the install-and-wait pairs on this attach. The
 	// client pump (a claim, a release) and the heartbeat (a demotion after a
@@ -93,6 +100,7 @@ func newOwnership(p *Plane, target control.AttachTarget) *ownership {
 		keeper:     target.Controller,
 		mode:       mode,
 		gen:        target.ControllerGeneration,
+		announce:   make(chan struct{}, 1),
 		ack:        make(chan uint64, 1),
 	}
 }
@@ -197,16 +205,15 @@ func (o *ownership) send(ctx context.Context, m terminal.ServerMessage) {
 	if !o.negotiated {
 		return
 	}
-	// Bounded, always, and by the same deadline every other peer-facing step
-	// of a handoff gets. These are single small JSON objects on an already
-	// open socket, and every one of them is a COURTESY — a displaced peer's
-	// mechanism is its own heartbeat and its fence at the pty, not this
-	// message. Unbounded, one client that has stopped reading holds this
-	// attach's announce mutex for as long as it likes, and the first thing a
-	// peer displacing this attach needs is that mutex: one paused browser tab
-	// would then freeze every handoff on the session.
-	ctx, cancel := o.plane.step(ctx)
-	defer cancel()
+	// The CALLER's context decides how long this may take, and the two kinds
+	// of caller want opposite things. A message this attach is owed — the
+	// opening `attached`, the answer to its own claim — carries no deadline
+	// of its own and is bounded only by the socket's write deadline, because
+	// dropping it leaves a client believing something untrue. A message about
+	// somebody else's handoff carries one acknowledgement timeout, because it
+	// is a courtesy: the mechanism behind it is the peer's own heartbeat and
+	// its fence at the pty, and a handoff must never wait on a client that
+	// has stopped reading.
 	_ = o.stream.Send(ctx, m)
 }
 
@@ -319,16 +326,34 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 	if !o.negotiated {
 		return
 	}
-	if o.controlling() {
-		// Re-claiming from yourself buys nothing and costs plenty: it
-		// advances the generation, fences the keystrokes this client has
-		// already sent, re-installs a binding the sandbox has, and spends an
-		// acknowledgement timeout on every peer — to arrive at the answer the
-		// client already had. The first-party CLI refuses to send one
-		// (internal/attachio's own claim()); nothing stopped another client,
-		// and a claim is client-triggered and unlimited by design.
+	if mode, gen := o.get(); mode == terminal.ModeControl {
+		// A claim from the attach this plane already believes is the
+		// controller. Taking it at face value would advance the generation,
+		// fence the keystrokes this client has already sent, re-install a
+		// binding the sandbox has and spend an acknowledgement timeout on
+		// every peer — to arrive at the answer the client already had. The
+		// first-party CLI refuses to send one (internal/attachio's own
+		// claim()); nothing at the plane stopped another client, and a claim
+		// is client-triggered and unlimited by design.
 		//
-		// It is still ANSWERED, with what this attach holds, because a
+		// But the BELIEF is checked before it is answered, with a read that
+		// advances nothing. A controller displaced by an attach on another
+		// replica is told nothing at all: it reads `control` here until its
+		// own heartbeat renewal is refused, up to one interval later, and
+		// this press is its user's only way out of that. Answering it from
+		// memory would confirm control that has already gone elsewhere and
+		// close the one door out.
+		//
+		// A read that fails leaves the belief standing: the store being
+		// briefly unusable is not evidence that this attach lost anything,
+		// and the heartbeat is what settles it either way.
+		if o.keeper != nil {
+			if current, _, err := o.keeper.State(ctx); err == nil && current != gen {
+				o.sendStale(ctx)
+				return
+			}
+		}
+		// It is still the controller, and it is told so — because a
 		// take-control key that produces nothing at all is the one outcome a
 		// client cannot tell from a broken connection.
 		o.announceAs(ctx, terminal.TypeAttached, 0)
@@ -354,7 +379,25 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 		o.sendStale(ctx)
 		return
 	}
-	_ = o.installAndWait(ctx, terminal.ModeControl, gen)
+	if err := o.installAndWait(ctx, terminal.ModeControl, gen); err != nil {
+		// The generation is this attach's and its sandbox has no binding for
+		// it. Taking control here would produce a controller nothing can
+		// repair: the pty discards every keystroke, because that attachment's
+		// binding still says what it said before, and the heartbeat renews
+		// happily — the lease genuinely IS this attach's — so the plane never
+		// notices and the client's own take-control key is answered out of
+		// the same wrong state.
+		//
+		// So give the generation back. The lease is vacated and advanced,
+		// which frees it for whoever asks next (including this client, on its
+		// next press), and the answer names the generation that now exists.
+		// A sandbox that simply never acknowledges is NOT this case: that is
+		// an older sessiond, installAndWait returns nil for it, and the
+		// handoff proceeds fenced at the plane alone.
+		_ = o.keeper.Release(ctx, gen)
+		o.sendStale(ctx)
+		return
+	}
 	if o.advance(terminal.ModeControl, gen) {
 		o.plane.displace(ctx, o, gen, true)
 	}
@@ -406,8 +449,17 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 //
 // It returns the mode and generation it reported.
 func (o *ownership) announceAs(ctx context.Context, typ string, won uint64) (string, uint64) {
-	o.announce.Lock()
-	defer o.announce.Unlock()
+	select {
+	case o.announce <- struct{}{}:
+	case <-ctx.Done():
+		// Somebody else is mid-sentence to this client and ctx says we are
+		// out of time — a peer's displacement giving up on a client that is
+		// not draining. The message this would have sent is a courtesy in
+		// every path that carries a deadline; the caller's own paths carry
+		// none, so they wait.
+		return o.get()
+	}
+	defer func() { <-o.announce }()
 	mode, gen := o.get()
 	switch {
 	case typ == terminal.TypeAttached && won != 0 && (mode != terminal.ModeControl || gen != won):
@@ -685,7 +737,14 @@ func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wai
 			// SAYS is read at send time, not asserted here: a peer that won
 			// its own claim inside this loop is told it has control, rather
 			// than being told it is a viewer and then corrected.
-			other.announceAs(ctx, terminal.TypeControlChanged, 0)
+			//
+			// Under its own deadline, like every other step: this notice is
+			// the one thing in a handoff that goes to a client, and a client
+			// that cannot take it is exactly the client that must not hold
+			// the taker.
+			nctx, cancel := p.step(ctx)
+			defer cancel()
+			other.announceAs(nctx, terminal.TypeControlChanged, 0)
 		}()
 	}
 	wg.Wait()
