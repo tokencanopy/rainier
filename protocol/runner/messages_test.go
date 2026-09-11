@@ -356,6 +356,9 @@ func TestAnUnboundDialAttachIsTheBytesItAlwaysWas(t *testing.T) {
 	}
 	if back.Mode != "view" || back.Generation != 9 {
 		t.Fatalf("decoded binding = %q at %d, want view at 9", back.Mode, back.Generation)
+	}
+}
+
 // TestCapacityCountsOnTheWire pins the tag names of the two counts that split
 // Used by what a sandbox is doing. Both ends read them off the wire by name,
 // and a Go-side test that goes through the struct would go green against a

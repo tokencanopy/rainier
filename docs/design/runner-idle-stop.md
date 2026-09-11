@@ -73,24 +73,42 @@ other mutable field:
 - `attachments int` — live attachments over this session's hub, incremented and decremented
   around **both** attach fronts (the local `/attach` handler and the agent's
   `dial_attach` dial-back). Any attachment counts; the runner does not know or care whether
-  a viewer holds the controller lease.
+  a viewer holds the controller lease. Counted from the moment the session is known to be
+  attaching — before the websocket upgrade, before the dial-back's dial — because a viewer
+  controld has already paired is a viewer arriving, and the handshake crosses their network.
+  A handshake that then fails releases the count but does **not** stamp `lastDetachAt`: the
+  local `/attach` surface has no authentication, and a client looping on a failed dial would
+  otherwise push every deadline on the runner out indefinitely.
 - `childExitedAt time.Time` — when `sessiond` reported `child_exited` for the current
   sandbox boot. Zero means "the child is running, as far as this runner has been told".
-- `boot uint64` — which sandbox boot the entry is on. Every control frame carries the token
-  its connection was registered under, and a `child_exited` naming any other boot is dropped.
-  A control frame can outlive its boot: a hub read loop stalled writing to a wedged viewer
-  drains its buffered frames whenever it comes back, which can be after the sandbox has been
-  stopped, resumed and re-registered. Without this, that buffered exit lands on the new boot
-  and the runner stops a session whose agent is working. It is the same guard, for the same
-  reason, as `hubDied`'s `deadHub` parameter. `resumed()` closes the old epoch too, for the
-  window between the resume and the new registration.
+- `boot uint64` — which sandbox boot the entry is on. Every control frame carries the epoch
+  its connection **read** at `/register`, and a `child_exited` or a stage failure naming any
+  other is dropped. A control frame can outlive its boot: a hub read loop stalled writing to
+  a wedged viewer drains its buffered frames whenever it comes back, which can be after the
+  sandbox has been stopped, resumed and re-registered. Without this, that buffered exit lands
+  on the new boot and the runner stops a session whose agent is working. Same guard, same
+  reason, as `hubDied`'s `deadHub`.
+
+  Read, not minted, and only `resumed()` moves it — which matters as much as the guard
+  itself. An epoch per *registration* would open one on a plain sessiond redial too, where
+  the container never restarted and the child never changed; `sessiond` re-sends only events
+  it never delivered, so a `child_exited` already in flight across that redial would be
+  dropped and never sent again, and that finished session would hold its slot for the life of
+  the runner, silently. Only a container restart can change the child, only a cold resume
+  restarts it (nothing sets a docker restart policy — sandboxes run with `--rm`), so that is
+  where the epoch moves. `resumed()` moving it also covers the seconds between the resume and
+  the restarted sandbox's registration.
 - `bootFailed bool` — this session's setup/clone/init chain failed. Such a session is never
   auto-stopped: its child exits with the failing stage, so half an hour later it looks
   exactly like a finished agent — but attaching to a failed session to read the log that
   says why is the whole reason the CLI permits it, and neither a stopped sandbox (no hub)
-  nor a `failed` row (not resumable) can serve that. It holds its slot until someone removes
-  it. Reclaiming those is #85's, and the trade is deliberate: the incident this change exists
-  for was fourteen *finished* sessions, not failed ones.
+  nor a `failed` row (not resumable) can serve that. It holds its slot until the session is
+  removed — which, since `failed` is a terminal state, reconciliation does of its own accord
+  at the next runner reconnect. Cleared by a cold resume, which re-runs the whole boot chain,
+  and boot-guarded like the child exit so a late report cannot pin a healthy session. The
+  trade is deliberate: the incident this change exists for was fourteen *finished* sessions,
+  not failed ones, and a time-boxed diagnosis window is a better answer than either extreme
+  once #85's admission work has somewhere to put it.
 - `lastDetachAt time.Time` — when the most recent attachment ended.
 
 ### The rule
@@ -213,12 +231,13 @@ timeout measured in tens of minutes.
 | an attach arrives as the stop fires | whoever takes the registry lock first wins. The attachment is counted from the moment the session is known to be attaching — before the websocket upgrade and before the first client frame, which crosses the client's network — so a viewer mid-handshake already prevents the stop. One that lands after the claim rides a container that is being stopped and dies with it; the client's reconnect resumes the session, which is what `rainier attach` does with a stopped session anyway. Narrowing that last window needs the attach path to be able to *cancel* an in-flight stop, which is #85's admission machinery, not this. |
 | a warm suspend, a resume or a snapshot is in flight | not idle: `driverOps > 0`. Without this a sweep could turn an operator's `docker pause` — which deliberately KEEPS the slot — into a stop that releases it, or stop a container mid-`docker commit`. |
 | a `docker stop` or `docker ps` hangs | bounded (30s and 5s, the same bounds this package already uses for a driver call off a background goroutine), so a wedged daemon cannot park the single sweep goroutine for good. A stop that keeps failing is retried on each sweep, with no backoff: one driver call and one log line per interval per stuck session. |
-| a `Delete` overtakes an in-flight stop | the stop's rollback and its landing state are both compare-and-swap on `"suspending"`, so neither can wipe `Delete`'s `"destroying"` marker — the marker that stops the register goroutine from destroying the container a second time and reporting the session dead. |
+| a `Delete` overtakes an in-flight stop | the stop's claim, its rollback and its landing state are all conditional on the entry still being the one it claimed, so none of them can wipe `Delete`'s `"destroying"` marker — the marker that stops the register goroutine from destroying the container a second time and reporting the session dead. That conditionality has one cost, worth naming: if a stop fails *and* the hub died first (so `hubDied` already normalized `"suspending"` to `"suspended"`), the rollback is skipped and the entry reads `"suspended"` over a container the stop did not stop. A dead sessiond almost always means the container really did go, `Docker.Resume` is status-aware, and the next announce corrects it either way. |
+| a stop reports failure but the container stopped anyway | `docker stop` killed at its bound leaves the *daemon* still stopping the container. So a failed stop does not assume: it asks the driver what the container is doing, and lands the entry where the answer says. Believing the error would roll the entry back to `"running"`, the container would die seconds later, and the register goroutine would read that as a crash — destroying the container and reporting a merely idle session dead. If the driver cannot answer either, the entry is left `"suspending"`, the conservative marker, and the next sweep re-checks. |
 | a session that failed to boot | never stopped; see `bootFailed` above. |
 | `drv.Suspend` fails | the entry rolls back to `"running"`, exactly as `Op` does; no event, no log line, and the next sweep tries again |
 | the container dies on its own first | the crash path removes the entry; a claim on a removed entry fails |
 | runnerd restarts | `Recover` rebuilds entries from labelled containers with no `childExitedAt` — the exit was only ever in memory. Recovered sessions are treated as "child running" and are not auto-stopped until they report a new exit (they won't). Safe direction, and a durable activity record is #85's. |
-| `sessiond`'s conn drops and it redials | the fact is kept, not reset: the redial does not restart the child, and `sessiond` re-sends only events it never delivered. |
+| `sessiond`'s conn drops and it redials | the fact is kept, and so is one still in flight across the redial: the redial does not restart the child, so it does not move the boot epoch. This is load-bearing precisely because `sessiond` re-sends only events it never delivered. |
 
 ## The cold-resume fence, and what this change does about it
 

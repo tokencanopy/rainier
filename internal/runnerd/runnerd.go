@@ -208,6 +208,17 @@ func (s *Server) Recover(ctx context.Context) error {
 		e := &sessionEntry{id: l.SessionID, handle: l.Handle.ID, state: state}
 		s.reg.put(l.SessionID, e)
 	}
+	// The exemption is worth saying out loud where an operator will see it: a
+	// recovered session is never an idle auto-stop candidate until it reports a
+	// child exit, because the exit that would make it one lived only in the
+	// memory of the process that just died. A redeploy onto a box full of
+	// finished sessions reclaims none of them, and the alternative — assuming
+	// the child of a session this process never watched has finished — is the
+	// direction that stops working agents.
+	if len(listed) > 0 {
+		log.Printf("runnerd: recovered %d session(s) from labeled containers; none is an idle auto-stop candidate until it reports a child exit", len(listed))
+		return nil
+	}
 	log.Printf("runnerd: recovered %d session(s) from labeled containers", len(listed))
 	return nil
 }
@@ -454,16 +465,16 @@ func (s *Server) opTarget(id string) (handle, state string, err error) {
 // with an empty ref (it has no environment to name, so the driver mints the
 // tag) and the agent with controld's content-addressed rainier-env: ref.
 func (s *Server) OpSnapshot(ctx context.Context, id, ref string) (string, error) {
+	// Before the guard, like Op's: `docker commit` runs against a LIVE
+	// container and takes minutes on a large image, and a sweep that stopped
+	// the session underneath it would break both the commit and the
+	// environment cache built on it.
+	s.reg.beginOp(id)
+	defer s.reg.endOp(id)
 	handle, err := s.opHandle(id)
 	if err != nil {
 		return "", err
 	}
-	// `docker commit` runs against a LIVE container and takes minutes on a
-	// large image. A sweep that stopped the session underneath it would break
-	// the commit and the environment cache built on it, so a snapshot in
-	// flight takes the session out of idle auto-stop for its duration.
-	s.reg.beginOp(id)
-	defer s.reg.endOp(id)
 	snap, err := s.drv.Snapshot(ctx, handle, ref, s.stripEnvFor(id))
 	if err != nil {
 		return "", err
@@ -539,6 +550,12 @@ func envKeys(env map[string]string) []string {
 // this function has no business knowing about. Snapshot has its own entry
 // point — see OpSnapshot.
 func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
+	// Marked before the handle is even read, so there is no gap between the
+	// guard and the mark for a sweep to land in: from here on this session is
+	// not idle, whatever this op turns out to be. An unknown or still-starting
+	// id makes both calls no-ops.
+	s.reg.beginOp(id)
+	defer s.reg.endOp(id)
 	handle, err := s.opHandle(id)
 	if err != nil {
 		return err
@@ -560,13 +577,11 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 			s.reg.beginColdSuspend(id)
 			return s.coldSuspend(ctx, id, handle)
 		}
-		// Bracketed, unlike the cold branch above, because a warm suspend
-		// has no state marker of its own: the entry reads "running" for the
-		// whole of `docker pause`, and a sweep that claimed it in that window
-		// would turn an operator's pause — which deliberately KEEPS the slot
-		// — into a stop that releases it. See registry.beginOp.
-		s.reg.beginOp(id)
-		defer s.reg.endOp(id)
+		// The bracket at the top of this function is what covers this branch:
+		// a warm suspend has no state marker of its own, so the entry reads
+		// "running" for the whole of `docker pause`, and a sweep that claimed
+		// it in that window would turn an operator's pause — which
+		// deliberately KEEPS the slot — into a stop that releases it.
 		if err := s.drv.Suspend(ctx, handle, warm); err != nil {
 			return err
 		}
@@ -578,10 +593,6 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 		s.reg.setState(id, "suspended")
 		return nil
 	case "resume":
-		// Same bracket as the warm suspend: a session mid-`docker start` is
-		// not a session to stop.
-		s.reg.beginOp(id)
-		defer s.reg.endOp(id)
 		if err := s.drv.Resume(ctx, handle); err != nil {
 			return err
 		}
@@ -604,12 +615,58 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 // landing state, and the same rollback when the daemon refuses.
 func (s *Server) coldSuspend(ctx context.Context, id, handle string) error {
 	if err := s.drv.Suspend(ctx, handle, false); err != nil {
-		s.reg.releaseColdSuspend(id) // stop failed: we're still running
+		s.settleFailedColdSuspend(id, handle)
 		return err
 	}
 	s.reg.finishColdSuspend(id)
 	return nil
 }
+
+// settleFailedColdSuspend decides where a stop that REPORTED failure leaves the
+// entry, by asking the driver what the container is actually doing rather than
+// assuming it is still running.
+//
+// The assumption is not safe, and bounding the stop is what made it unsafe: a
+// `docker stop` killed at its deadline leaves the DAEMON still stopping the
+// container. Rolling the entry back to "running" there is a lie that costs the
+// session — the container dies seconds later, the register goroutine reads a
+// "running" entry, takes it for a crash, destroys the container and reports the
+// session dead. A merely idle session, gone, for a stop that worked.
+//
+//   - container still running: the stop really did fail. Roll back; the next
+//     sweep, or the operator's retry, tries again.
+//   - container stopped, paused or created: the stop landed after all. Land the
+//     entry where a successful stop would have.
+//   - container gone: not this function's business. Roll back so the
+//     hub-death tail can do what it does for any container that vanished —
+//     confirm it with its own Inspect, reclaim the entry, keep the workspace,
+//     and report the session dead, which is what it is.
+//   - no answer at all: change nothing. "suspending" is the conservative
+//     marker — it keeps the register goroutine from destroying a container this
+//     runner cannot speak for, and hubDied normalizes it to "suspended" if the
+//     container really did die.
+//
+// Its own context, not the caller's: the caller's is very likely the one that
+// just expired, and an Inspect on a dead context answers nothing.
+func (s *Server) settleFailedColdSuspend(id, handle string) {
+	ctx, cancel := context.WithTimeout(context.Background(), coldSuspendSettleTimeout)
+	h, err := s.drv.Inspect(ctx, handle)
+	cancel()
+	if err != nil {
+		log.Printf("session %s: a stop reported failure and the driver cannot say what the container is doing (%v); leaving the entry parked rather than guessing", id, err)
+		return
+	}
+	if h.State == driver.StateRunning || h.State == driver.StateGone {
+		s.reg.releaseColdSuspend(id)
+		return
+	}
+	log.Printf("session %s: the stop reported failure but the container is %v; landing it as stopped", id, h.State)
+	s.reg.finishColdSuspend(id)
+}
+
+// coldSuspendSettleTimeout bounds that Inspect. Same bound as the one
+// register's hub-death tail uses for the same question.
+const coldSuspendSettleTimeout = 30 * time.Second
 
 // Delete tears down a session: close its hub (if it ever registered) before
 // removing the registry entry and destroying the driver resource, then
@@ -733,13 +790,12 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.SetReadLimit(16 << 20)
-	// Opened BEFORE the hub, because NewHubWithControl starts the read loop:
-	// a token minted afterwards would leave a window in which this
-	// connection's own first frames name an epoch the entry has not adopted
-	// yet. Every control frame from this conn carries it, and the registry
-	// drops the ones that name a boot the session has moved past — see
-	// sessionEntry.boot.
-	boot := s.reg.newBoot(id)
+	// Read BEFORE the hub, because NewHubWithControl starts the read loop.
+	// Every control frame from this conn carries it, and the registry drops
+	// the ones that name a boot the session has moved past. Note READ, not
+	// minted: a redial is not a new boot — only a cold resume restarts the
+	// container, and that is where the epoch moves. See registry.currentBoot.
+	boot := s.reg.currentBoot(id)
 	hub := relay.NewHubWithControl(r.Context(), relay.WSConn(c), func(payload []byte) {
 		// On its own goroutine, deliberately: this runs on the hub's read
 		// loop, the single goroutine demultiplexing every attachment
@@ -902,7 +958,7 @@ func (s *Server) routeControl(id string, boot uint64, payload []byte) {
 		// lets you attach to a failed session precisely to read the log that
 		// says why, and neither a stopped sandbox (no hub) nor a failed row
 		// (not resumable) can serve that. See sessionEntry.bootFailed.
-		s.reg.markBootFailed(id)
+		s.reg.markBootFailed(id, boot)
 		if stage == "setup" {
 			s.fireEventDetail(id, "setup_failed", setupFailedDetail(ev.RC, ev.Tail))
 			return
@@ -1094,12 +1150,17 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 	// leave a real viewer invisible to a sweep for as long as their round trip
 	// takes, and stop the session under them.
 	s.reg.attachStarted(id)
-	// The closure is load-bearing: a deferred call's ARGUMENTS are evaluated
-	// where the defer is written, so `defer s.reg.attachEnded(id, s.now())`
-	// would stamp the detach with the time of the ATTACH — which reads as an
-	// attachment that ended the moment it began, and idle-stops a session
-	// somebody is watching.
-	defer func() { s.reg.attachEnded(id, s.now()) }()
+	// pumped stays false unless this dial gets as far as bridging the client
+	// to the session, so a handshake that never completed releases the count
+	// without moving the idle clock — see registry.attachEnded.
+	//
+	// The closure is load-bearing for a second reason: a deferred call's
+	// ARGUMENTS are evaluated where the defer is written, so
+	// `defer s.reg.attachEnded(id, s.now(), true)` would stamp the detach with
+	// the time of the ATTACH — an attachment that ended the moment it began,
+	// which idle-stops a session somebody is watching.
+	pumped := false
+	defer func() { s.reg.attachEnded(id, s.now(), pumped) }()
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
@@ -1114,6 +1175,7 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 		c.CloseNow()
 		return
 	}
+	pumped = true
 	// The runner's own local attach endpoint is a single-box debugging tool
 	// with no control plane above it: it grants no binding, so the attachment
 	// is unconditional exactly as it has always been.

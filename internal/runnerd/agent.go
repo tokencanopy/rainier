@@ -291,6 +291,13 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 			// DIFFERENT runner is still fenced by the runner identity the
 			// service checks first. Carrying the generation on `resume` is the
 			// real fix and is a separate change (protocol + control plane).
+			//
+			// The test is on the state rather than on which call site
+			// produced it, and that is right for both producers: reannounce
+			// renders the same word for the same registry state, and it is
+			// equally a report about the sandbox this runner holds right
+			// now, whose generation is equally unknowable to it. Anything
+			// NEW that fires this state would have to be one too.
 			if m.Session != "" && m.State != "suspended_cold" {
 				m.PlacementGeneration = s.reg.placementGeneration(m.Session)
 			}
@@ -646,6 +653,20 @@ func (s *Server) dialAttachBack(ctx context.Context, m runner.ToRunner, cfg Agen
 		return
 	}
 
+	// Counted from here — before the dial, not after it and the hub wait —
+	// because this is the front that carries viewers in fleet mode, and
+	// controld has already paired a client to this attachment by the time the
+	// command arrives. Fifteen seconds of dial and hub wait during which the
+	// session looked idle is fifteen seconds in which the sweep could stop it
+	// under a viewer who is already on their way in.
+	s.reg.attachStarted(m.Session)
+	// pumped, and the closure, for the two reasons the local /attach front
+	// spells out: a dial that never became an attachment must release the
+	// count without moving the idle clock, and a deferred call's arguments
+	// would be evaluated here rather than at the detach.
+	pumped := false
+	defer func() { s.reg.attachEnded(m.Session, s.now(), pumped) }()
+
 	hdr := http.Header{"Authorization": {"Bearer " + cfg.Token}}
 	// The timeout covers the handshake only, and deliberately sits under
 	// controld's pairing TTL: a blackholed target must not park this
@@ -672,10 +693,7 @@ func (s *Server) dialAttachBack(ctx context.Context, m runner.ToRunner, cfg Agen
 	// The same idle accounting the local /attach front keeps, for the same
 	// reason: a session with a viewer on it is not idle whichever door that
 	// viewer came through, and the idle timer restarts when they leave.
-	s.reg.attachStarted(m.Session)
-	// In a closure, not as a deferred call's argument: see the local /attach
-	// front for what that difference costs.
-	defer func() { s.reg.attachEnded(m.Session, s.now()) }()
+	pumped = true
 	// Blocks for the life of the attach; the hub owns the conn's teardown on
 	// either side dying (its readLoop closes clients when the session conn
 	// dies, AttachClient closes the attachment when the client does).

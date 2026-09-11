@@ -388,7 +388,14 @@ func (r *registry) attachStarted(id string) {
 // controld-supplied id) would otherwise leave a permanently negative count on
 // the new entry, which reads as "fewer than no attachments" and would be
 // indistinguishable from an attached session forever after.
-func (r *registry) attachEnded(id string, at time.Time) {
+// pumped says whether this attachment ever became one — whether it got as far
+// as bridging the client to the session. A handshake that failed (the upgrade,
+// or the first client frame that never came) still decrements the count, which
+// is what keeps a dropped dial from pinning a session open, but must NOT move
+// the idle clock: the local /attach surface has no authentication, so a client
+// looping on a failed dial once a minute would otherwise push every deadline on
+// this runner out indefinitely, and nothing would say why.
+func (r *registry) attachEnded(id string, at time.Time, pumped bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.items[id]
@@ -398,7 +405,9 @@ func (r *registry) attachEnded(id string, at time.Time) {
 	if e.attachments > 0 {
 		e.attachments--
 	}
-	e.lastDetachAt = at
+	if pumped {
+		e.lastDetachAt = at
+	}
 }
 
 // childExited records that sessiond reported this session's child process
@@ -425,30 +434,39 @@ func (r *registry) childExited(id string, boot uint64, at time.Time) {
 	}
 }
 
-// newBoot opens a fresh sandbox-boot epoch for id and returns its token, which
-// the caller carries on every control frame from that connection. Called by
-// register BEFORE the hub exists, so there is no window in which a frame from
-// the new connection arrives while the entry still names the old boot.
+// currentBoot returns the sandbox-boot epoch id is on, which register READS
+// (rather than mints) and every control frame from that connection then
+// carries. Zero for a session that has never been cold-resumed, and for one
+// this registry does not hold — a frame for a session that has been deleted
+// matches nothing either way.
 //
-// An unknown id still gets a token: register checks existence separately, and
-// a token that matches no entry simply makes every frame on that connection a
-// no-op, which is what a frame for a session that has been deleted should be.
-func (r *registry) newBoot(id string) uint64 {
+// Reading rather than minting is the whole point, and it took a review round
+// to get right. A new epoch per REGISTRATION would open one on a plain
+// sessiond redial too, where the container never restarted and the child never
+// changed — and sessiond re-sends only events it never delivered, so a
+// child_exited already in flight across that redial would be dropped here and
+// never sent again. That session then holds its slot for the life of the
+// runner, silently: the very incident this feature exists to end. Only a
+// restart of the container can change the child, only a cold resume restarts
+// it, and resumed() is where the epoch therefore moves.
+func (r *registry) currentBoot(id string) uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.nextBoot++
 	if e, ok := r.items[id]; ok {
-		e.boot = r.nextBoot
+		return e.boot
 	}
-	return r.nextBoot
+	return 0
 }
 
 // markBootFailed records that this session's boot chain failed, which takes it
-// out of idle auto-stop for good — see sessionEntry.bootFailed.
-func (r *registry) markBootFailed(id string) {
+// out of idle auto-stop until it is cold-resumed — see sessionEntry.bootFailed.
+// Boot-guarded exactly like childExited: a stage failure that outlived its boot
+// describes a sandbox this session has already left, and letting it pin a
+// healthy one out of auto-stop would be the same lost slot by another route.
+func (r *registry) markBootFailed(id string, boot uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.items[id]; ok {
+	if e, ok := r.items[id]; ok && e.boot == boot {
 		e.bootFailed = true
 	}
 }
@@ -487,6 +505,11 @@ func (r *registry) endOp(id string) {
 // entry is counted here while `docker ps` no longer counts it. A consumer of
 // these numbers must treat them as a split of what this runner believes it
 // holds, not as an arithmetic partition of `used`.
+//
+// idleExited also includes a session whose BOOT failed, which idle auto-stop
+// deliberately never reclaims (see sessionEntry.bootFailed). The count says
+// what is up with no agent in it, which is the truth about the machine; it is
+// not a promise about what the sweep will hand back.
 func (r *registry) counts() (active, idleExited int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -557,10 +580,14 @@ func (r *registry) claimIdle(id string, idle time.Duration, now time.Time) (hand
 // the "suspending" state and the cold flag, in one lock, for the reasons
 // claimIdle spells out. It is claimIdle's unconditional sibling — an
 // operator's stop asks no questions about idleness.
+// It leaves a "destroying" entry alone, for the same reason releaseColdSuspend
+// does: a Delete that got there first owns the entry, and overwriting its
+// marker is what makes the register goroutine destroy the container a second
+// time and report the session dead instead of destroyed.
 func (r *registry) beginColdSuspend(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.items[id]; ok {
+	if e, ok := r.items[id]; ok && e.state != "destroying" {
 		e.state = "suspending"
 		e.coldSuspended = true
 	}
@@ -619,6 +646,9 @@ func (r *registry) resumed(id string) {
 		e.coldSuspended = false
 		e.childExitedAt = time.Time{}
 		e.lastDetachAt = time.Time{}
+		// The new boot runs the whole chain again (setup, clone, init), so a
+		// previous boot's failure says nothing about it.
+		e.bootFailed = false
 		// And close the old boot, so a control frame still in flight from the
 		// sandbox that has just been restarted cannot land its child's exit on
 		// the new one. The register that is about to arrive opens the next

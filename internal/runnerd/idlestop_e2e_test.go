@@ -390,3 +390,54 @@ func TestIdleStopEventCarriesNoPlacementGeneration(t *testing.T) {
 			ev.PlacementGeneration)
 	}
 }
+
+// TestAChildExitAcrossARedialIsRecordedEndToEnd drives the redial through the
+// real /register handler, which is where the "read the boot epoch, don't mint
+// one" rule actually lives — the unit test next door can only pin the registry
+// half of it.
+//
+// Two connections for one session, the older delivering a frame after the
+// newer has registered, is exactly the production shape: sessiond survives a
+// conn drop and redials, and a hub read loop that was stalled writing to a
+// wedged viewer drains its buffered frames whenever it comes back. The child
+// exit on that older conn is the only copy — sessiond re-sends only what it
+// never delivered — so dropping it leaves a finished session holding its slot
+// for the life of the runner, with nothing in the log to say so.
+func TestAChildExitAcrossARedialIsRecordedEndToEnd(t *testing.T) {
+	clk := newFakeClock()
+	rd := New(driver.NewFake(4), "", "", "")
+	rd.now = clk.now
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+	ctx := context.Background()
+
+	id, first := dialSandbox(t, rd, srv)
+	firstHub, _ := rd.reg.hub(id)
+
+	// The redial: a second /register for the same session, same container.
+	base := strings.Replace(srv.URL, "http", "ws", 1)
+	c, _, err := websocket.Dial(ctx, base+"/register?session="+id, nil)
+	if err != nil {
+		t.Fatalf("redial /register: %v", err)
+	}
+	defer c.CloseNow()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if h, ok := rd.reg.hub(id); ok && h != firstHub {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the redial never installed a new hub")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The frame that was already in flight on the first connection lands now.
+	first.send(t, relay.ControlEvent{Kind: "child_exited", RC: 0})
+	waitForChildExit(t, rd, id)
+
+	clk.set(31 * time.Minute)
+	if stops := rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 1 {
+		t.Fatalf("sweep stopped %v, want the session — its agent finished before the redial", stops)
+	}
+}
