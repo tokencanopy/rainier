@@ -1333,3 +1333,57 @@ func TestARecreatedSessionIdRefusesTheDeadSandboxsChildExit(t *testing.T) {
 		t.Fatalf("stopped %v after the new child exited, want the session", stops)
 	}
 }
+
+// TestRecoveredSessionsAreInNeitherCount: the counts a runner puts on the wire
+// are most consulted about the box that has just come back, and that is the
+// one case this feature cannot reclaim anything on. Recover rebuilds entries
+// with no child-exit fact — it lived only in the memory of the process that
+// died — so counting them as "active" would report sixteen working agents
+// about sixteen sessions whose agents finished hours ago, and the only
+// intended consumer (a status line) would print the wrong sentence. They are
+// in neither count until the runner is told what the child is doing.
+func TestRecoveredSessionsAreInNeitherCount(t *testing.T) {
+	ctx := context.Background()
+	fd := driver.NewFake(4)
+	for _, id := range []string{"sess-recovered-1", "sess-recovered-2"} {
+		if _, err := fd.Create(ctx, driver.Spec{SessionID: id, Image: "img.invalid"}); err != nil {
+			t.Fatalf("seed the container: %v", err)
+		}
+	}
+	clk := newFakeClock()
+	rd := New(fd, "", "", "")
+	rd.now = clk.now
+	if err := rd.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if active, idleExited := rd.reg.counts(); active != 0 || idleExited != 0 {
+		t.Fatalf("counts after recovery = active %d, idle_exited %d; want 0 and 0 — this runner has not been told what either child is doing", active, idleExited)
+	}
+	if used, _, err := fd.Capacity(ctx); err != nil || used != 2 {
+		t.Fatalf("used = %d (%v), want 2 — the sandboxes still hold their slots", used, err)
+	}
+
+	// One of them reports its child's exit: the runner now knows, so that
+	// session leaves the exemption and is an auto-stop candidate from here.
+	boot := rd.reg.currentBoot("sess-recovered-1")
+	rd.routeControl("sess-recovered-1", boot, []byte(`{"kind":"child_exited","rc":0}`))
+	if active, idleExited := rd.reg.counts(); active != 0 || idleExited != 1 {
+		t.Fatalf("counts after one exit = active %d, idle_exited %d; want 0 and 1", active, idleExited)
+	}
+	clk.set(30 * time.Minute)
+	if stops := rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 1 || stops[0] != "sess-recovered-1" {
+		t.Fatalf("stopped %v, want just sess-recovered-1", stops)
+	}
+
+	// The other is cold-resumed: the driver restarted it, so its child is a
+	// process tree this runner watched start, and `active` can say so.
+	if err := rd.Op(ctx, "sess-recovered-2", "suspend", false); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := rd.Op(ctx, "sess-recovered-2", "resume", false); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if active, idleExited := rd.reg.counts(); active != 1 || idleExited != 0 {
+		t.Fatalf("counts after the resume = active %d, idle_exited %d; want 1 and 0", active, idleExited)
+	}
+}

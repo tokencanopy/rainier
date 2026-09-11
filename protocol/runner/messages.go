@@ -138,7 +138,12 @@ type FromRunner struct {
 	//
 	// Active+IdleExited is at most Used and usually less: a warm-suspended
 	// sandbox and one still being created each hold a slot and are in neither
-	// count, because neither has a child this runner can speak for.
+	// count, because neither has a child this runner can speak for. So is a
+	// session a restarted runnerd rebuilt from its labelled container: what
+	// its child is doing lived only in the memory of the process that died,
+	// and a runner that has just come back reports "used 16, active 0,
+	// idle_exited 0" rather than claiming sixteen working agents on a box
+	// where every one of them may have finished hours ago.
 	Active     int    `json:"active"`
 	IdleExited int    `json:"idle_exited"`
 	ReqID      uint64 `json:"req_id,omitempty"`  // result: correlates ToRunner.ReqID

@@ -72,6 +72,22 @@ type sessionEntry struct {
 	// killing a commit halfway. The cold suspend and Delete don't need this:
 	// each marks the state before its driver call.
 	driverOps int
+	// recovered marks an entry that Recover rebuilt from a labelled container
+	// after a runnerd restart, rather than one this process created and
+	// watched. Such an entry's childExitedAt is zero because the exit fact
+	// lived only in the memory of the process that died — not because this
+	// runner has been told the child is running — so it is carried in NEITHER
+	// capacity count until something tells the runner what the child is
+	// doing. Counting it as "active" is the misleading answer on the one box
+	// the sweep will reclaim nothing on: sixteen finished sessions would
+	// report sixteen working agents. See registry.counts.
+	//
+	// Cleared by the two things that make the runner able to speak for the
+	// child again: a child_exited report for this boot (the session is now
+	// genuinely idle-exited, and an auto-stop candidate), and a resume the
+	// driver says RESTARTED the container (a new process tree this runner did
+	// watch start).
+	recovered bool
 	// bootFailed records that this session's boot chain failed (setup, clone
 	// or init). Such a session is deliberately never idle-stopped: the whole
 	// reason the CLI lets you attach to a failed session is to read the log
@@ -466,6 +482,11 @@ func (r *registry) childExited(id string, boot uint64, at time.Time) {
 		// working. See sessionEntry.boot.
 		return
 	}
+	// The report is what takes a recovered session out of the count
+	// exemption: this runner has now been told what its child is doing, which
+	// is the only thing Recover could not know. Cleared even on a repeat
+	// delivery, which is idempotent and says the same thing.
+	e.recovered = false
 	if e.childExitedAt.IsZero() {
 		e.childExitedAt = at
 	}
@@ -535,6 +556,16 @@ func (r *registry) endOp(id string) {
 // a warm-suspended sandbox and one still being created each hold a slot and
 // are in neither count, which is the honest answer rather than a made-up one.
 //
+// A session Recover rebuilt after a runnerd restart is in neither count until
+// it says what its child is doing, for the same reason: its zero
+// childExitedAt is an absence of knowledge, not a running child. Reporting
+// "16 active" about a box of sixteen finished sessions — the one case this
+// feature cannot reclaim anything on — would be a confident lie, where
+// "active 0, idle_exited 0, used 16" is already legible as "this runner is not
+// telling me" (see protocol/runner.FromRunner.Active). The cost is that a
+// recovered session whose agent really is working is not counted either; the
+// runner cannot tell those apart, and only the safe direction is available.
+//
 // So the two normally sum to less than `used`, not more — but not
 // invariably: register's hub-death tail deliberately KEEPS an entry as
 // "running" when the driver cannot say whether its container survived
@@ -551,7 +582,7 @@ func (r *registry) counts() (active, idleExited int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, e := range r.items {
-		if e.state != "running" {
+		if e.state != "running" || e.recovered {
 			continue
 		}
 		if e.childExitedAt.IsZero() {
@@ -704,6 +735,10 @@ func (r *registry) resumed(id string, restarted bool) {
 	}
 	e.childExitedAt = time.Time{}
 	e.lastDetachAt = time.Time{}
+	// A restart this runner made is a process tree it watched start, so a
+	// recovered session stops being one the moment it is cold-resumed: its
+	// child is running, and `active` can say so.
+	e.recovered = false
 	// The new boot runs the whole chain again (setup, clone, init), so a
 	// previous boot's failure says nothing about it.
 	e.bootFailed = false

@@ -205,7 +205,12 @@ func (s *Server) Recover(ctx context.Context) error {
 		if l.Handle.State == driver.StateSuspended {
 			state = "suspended"
 		}
-		e := &sessionEntry{id: l.SessionID, handle: l.Handle.ID, state: state}
+		// recovered: the exit fact lived only in the memory of the process
+		// that just died, so this runner knows neither that the child is
+		// running nor that it has finished. It says so — the entry is in
+		// neither capacity count — until a child_exited or a cold resume
+		// tells it. See sessionEntry.recovered.
+		e := &sessionEntry{id: l.SessionID, handle: l.Handle.ID, state: state, recovered: true}
 		s.reg.put(l.SessionID, e)
 	}
 	// The exemption is worth saying out loud where an operator will see it: a

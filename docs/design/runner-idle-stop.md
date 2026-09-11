@@ -180,9 +180,15 @@ On a successful stop:
 3. Two additive fields on every `FromRunner`, beside the `Used`/`Total` that already ride
    there: `active` (sandboxes up whose child has not exited) and `idle_exited` (sandboxes up
    whose child has exited). Both are counted from the registry, not the driver.
-   `active + idle_exited <= used`: a warm-suspended sandbox and one still being created hold
-   a slot and are in neither count. An old controld ignores unknown fields; a new controld
-   reading a zero from an old runner reads the same "unknown" it has today.
+   `active + idle_exited <= used`: a warm-suspended sandbox, one still being created, and
+   one a restarted runnerd rebuilt from its labelled container each hold a slot and are in
+   neither count. The last of those is deliberate rather than incidental — what a recovered
+   session's child is doing lived only in the memory of the process that died, so a runner
+   that has just come back reports `used 16, active 0, idle_exited 0` instead of claiming
+   sixteen working agents on a box where every one of them may have finished hours ago, and
+   a consumer already reads a zero pair as "this runner is not telling me". An old controld
+   ignores unknown fields; a new controld reading a zero from an old runner reads the same
+   "unknown" it has today.
 
 ### Where the fact is reset
 
@@ -264,7 +270,7 @@ timeout measured in tens of minutes.
 | the docker daemon restarts under a warm-paused session | its container is stopped, not paused, and the resume that follows is a start. The driver says so, the fact is cleared, and the new agent is treated as new. |
 | `drv.Suspend` fails | the entry rolls back to `"running"`, exactly as `Op` does; no event, no log line, and the next sweep tries again |
 | the container dies on its own first | the crash path removes the entry; a claim on a removed entry fails |
-| runnerd restarts | `Recover` rebuilds entries from labelled containers with no `childExitedAt` — the exit was only ever in memory. Recovered sessions are treated as "child running" and are not auto-stopped until they report a new exit (they won't). Safe direction, and a durable activity record is #85's. |
+| runnerd restarts | `Recover` rebuilds entries from labelled containers with no `childExitedAt` — the exit was only ever in memory. Recovered sessions are not auto-stopped until they report a new exit (they won't), and are carried in **neither** capacity count until they do, so the numbers do not claim a box of finished sessions is a box of working agents. A session that reports an exit, or that a cold resume restarts, leaves the exemption. Safe direction, and a durable activity record is #85's. |
 | `sessiond`'s conn drops and it redials | the fact is kept, and so is one still in flight across the redial: the redial does not restart the child, so it does not move the boot epoch. This is load-bearing precisely because `sessiond` re-sends only events it never delivered. |
 
 ## The cold-resume fence, and what this change does about it
@@ -295,10 +301,15 @@ the control plane, and is recorded as a follow-up on the PR.
   `AttachClient` sets no read deadline, so a viewer whose laptop lid closed counts as attached
   until TCP gives up. Safe direction (never stops a watched session) but it is the one input
   this feature trusts absolutely, and a liveness signal on attachments would be worth having.
-- **`active + idle_exited` is not an arithmetic partition of `used`.** It is usually less, but
-  `register`'s hub-death tail deliberately keeps an entry as `"running"` when the driver
-  cannot say whether its container survived, and such an entry is counted while `docker ps`
-  no longer counts it. A consumer must read the pair as what this runner believes it holds.
+- **`active + idle_exited` is not an arithmetic partition of `used`.** It is usually less
+  (a warm-suspended sandbox, one still being created, and one `Recover` rebuilt are in
+  neither), but it can also exceed what the driver counts: `register`'s hub-death tail
+  deliberately keeps an entry as `"running"` when the driver cannot say whether its container
+  survived, and such an entry is counted while `docker ps` no longer counts it. A consumer
+  must read the pair as what this runner believes it holds.
+- **A recovered session whose agent really is working is counted as neither.** The exemption
+  above is one-directional by necessity: a restarted runner cannot tell a finished child from
+  a busy one, and the only safe answer is to say nothing about either until it is told.
 - **A container that dies while the runner cannot ask the driver about it.** If a sandbox
   dies and `Inspect` then fails, `register`'s tail deliberately keeps the entry as `"running"`
   rather than risk destroying a live container. A resume issued for such an entry — which the
