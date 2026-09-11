@@ -126,10 +126,30 @@ func splice(ctx context.Context, client control.TerminalStream, runner runnerCon
 				// way to notice. Nothing about the frame is logged.
 				return
 			}
-			if m.Type == terminal.TypeControlAck {
+			switch m.Type {
+			case terminal.TypeControlAck:
 				// The sandbox confirming a binding. It belongs to the
 				// handoff, not to the client, and goes no further.
 				own.acked(m.Generation.Value())
+				continue
+			case terminal.TypeAttached, terminal.TypeStale, terminal.TypeControlChanged:
+				// The client-facing ownership vocabulary, and the mirror of
+				// the client pump's rule about the sandbox-facing one. These
+				// three are the PLANE's: announceAs is the only thing that
+				// sends one, and it reads the mode and the generation under
+				// the announce hold so that what a client is told is what
+				// the plane knows. A sandbox's copy is not a handoff. A
+				// client told `attached control 99` by its sandbox prints
+				// [you have control], stops sending claims — a client that
+				// believes it is the controller never claims — and types
+				// into a plane that drops every frame, with detaching as its
+				// only way out.
+				//
+				// Only a broken or compromised sessiond sends one, and such
+				// a sandbox could execute the keystrokes itself, so this is
+				// hardening rather than a fence. Dropped rather than fatal:
+				// ending the attach would hand a buggy sandbox a way to
+				// disconnect every client watching it.
 				continue
 			}
 			if client.Send(ctx, m) != nil {

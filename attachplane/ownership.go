@@ -351,7 +351,7 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 		// and the heartbeat is what settles it either way.
 		if o.keeper != nil {
 			if current, _, err := o.keeper.State(ctx); err == nil && current != gen {
-				o.sendStale(ctx)
+				_ = o.sendStale(ctx)
 				return
 			}
 		}
@@ -378,7 +378,7 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 	}
 	gen, err := o.keeper.Claim(ctx, expected)
 	if err != nil {
-		o.sendStale(ctx)
+		_ = o.sendStale(ctx)
 		return
 	}
 	if err := o.installAndWait(ctx, terminal.ModeControl, gen); err != nil {
@@ -397,7 +397,17 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 		// an older sessiond, installAndWait returns nil for it, and the
 		// handoff proceeds fenced at the plane alone.
 		_ = o.keeper.Release(ctx, gen)
-		o.sendStale(ctx)
+		// And everybody else is told the number that now exists. The
+		// generation moved TWICE for this claim — once to win it, once to
+		// give it back — and the attach that was the controller when it
+		// started is still `control` in the plane, still forwarded for, until
+		// its own heartbeat renewal is refused up to one interval later.
+		// Every viewer's next press is refused once too, for want of a number
+		// nobody sent them: the exact case displace's own doc says the viewer
+		// notice exists for. Nothing here is racing a taker — the generation
+		// has already moved past this claim, and this attach is not becoming
+		// the controller — so the fan-out does not wait.
+		o.plane.displace(ctx, o, o.sendStale(ctx), false)
 		return
 	}
 	if o.advance(terminal.ModeControl, gen) {
@@ -480,8 +490,9 @@ func (o *ownership) announceAs(ctx context.Context, typ string, won uint64) (str
 	return mode, gen
 }
 
-// sendStale answers a refused claim with the current generation. A read that
-// fails still gets an answer: the client must learn its claim did not land.
+// sendStale answers a refused claim with the current generation, and returns
+// the generation it answered with. A read that fails still gets an answer: the
+// client must learn its claim did not land.
 //
 // It falls back to the generation this attach already holds rather than to
 // zero, for the reason demote does. Zero is a generation no row can ever be
@@ -490,7 +501,7 @@ func (o *ownership) announceAs(ctx context.Context, typ string, won uint64) (str
 // and attaches again. A stale-but-real generation is refused exactly as zero
 // would be, and in the common case, where the read merely timed out, it is
 // still the number that takes control in one press.
-func (o *ownership) sendStale(ctx context.Context) {
+func (o *ownership) sendStale(ctx context.Context) uint64 {
 	_, current := o.get()
 	if o.keeper != nil {
 		if gen, _, err := o.keeper.State(ctx); err == nil {
@@ -505,7 +516,8 @@ func (o *ownership) sendStale(ctx context.Context) {
 	// claimed with an `expected` it no longer holds, and which announceAs
 	// then answers with the control it still has.
 	o.displaceTo(current)
-	o.announceAs(ctx, terminal.TypeStale, 0)
+	_, gen := o.announceAs(ctx, terminal.TypeStale, 0)
+	return gen
 }
 
 // release gives up control without giving up the attach: the generation

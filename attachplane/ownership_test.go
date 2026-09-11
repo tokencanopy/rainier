@@ -2217,3 +2217,149 @@ func TestAPeerAlreadyAtTheNewGenerationIsStillToldAboutIt(t *testing.T) {
 			"and it finds out only when its binding wait times out %s from now", ackTimeout)
 	}
 }
+
+// TestAClaimThatGivesItsGenerationBackTellsThePeersToo is the give-back's
+// other half. A claim whose binding never reached its sandbox hands the
+// generation back rather than becoming a phantom controller — that much the
+// fourth round fixed — but it told nobody except the client that asked.
+//
+// So the store sits two generations on with a VACANT holder, while the attach
+// that was the controller when the claim started is still `control` in the
+// plane and still forwarded for, until its own heartbeat renewal is refused
+// up to one interval later. Every viewer's next press is refused once too,
+// about a session nobody is driving, for want of a number nobody sent them.
+func TestAClaimThatGivesItsGenerationBackTellsThePeersToo(t *testing.T) {
+	// No heartbeat: A's own renewal is the slow path this notice exists to
+	// get ahead of, and a test that let it run would pass on it.
+	p, h, ts := newTestPlane(t, Options{
+		HeartbeatInterval: time.Hour, ControlAckTimeout: 100 * time.Millisecond})
+	lease := &fakeLease{gen: 1, holder: "att_aaaa"}
+	a := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_aaaa"}, true)
+	awaitType(t, a.stream, terminal.TypeAttached)
+	awaitSpliced(t, a)
+
+	// B watches, and its sandbox socket has stopped draining: its claim wins
+	// the generation in the store and then cannot install the binding that
+	// would make the generation mean anything at the pty.
+	stream := newScriptedStream()
+	b := &ownership{plane: p, session: "sess_example", negotiated: true, mayClaim: true,
+		keeper: fakeKeeper{lease, "att_bbbb"}, stream: stream, mode: terminal.ModeView, gen: 1,
+		announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
+	b.bindRunner(blockedConn{})
+	p.owners.add(b)
+	t.Cleanup(func() { p.owners.remove(b) })
+
+	b.claim(context.Background(), 1)
+
+	// The claimer is told what exists now: 1 was taken, 2 was given back, so 3.
+	if m := stream.nextServerMsg(t); m.Type != terminal.TypeStale || m.Generation.Value() != 3 {
+		t.Fatalf("the claimer was answered %q at %q, want stale at 3", m.Type, m.Generation)
+	}
+	lease.mu.Lock()
+	gen, holder := lease.gen, lease.holder
+	lease.mu.Unlock()
+	if gen != 3 || holder != "" {
+		t.Fatalf("the lease is at %d held by %q, want 3 and vacant", gen, holder)
+	}
+
+	// And so is the device that had control, by the time the claim is
+	// answered — not up to a heartbeat interval later. Without this it keeps
+	// a screen that says it is typing, and the plane keeps carrying its
+	// keystrokes to a pty that has already stopped executing them.
+	select {
+	case m := <-a.stream.out:
+		if m.Type != terminal.TypeControlChanged || m.Mode != terminal.ModeView ||
+			m.Generation.Value() != 3 {
+			t.Fatalf("the previous controller was sent %q %s at %q, want control_changed view at 3",
+				m.Type, m.Mode, m.Generation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the claim gave its generation back and told nobody but itself: the device that " +
+			"had control is still `control` in the plane, and every viewer's next press is " +
+			"refused about a session nobody is driving")
+	}
+	awaitSandbox(t, a.sandbox, func(got []terminal.ClientMessage) bool {
+		for _, msg := range got {
+			if msg.Type == terminal.TypeControl && msg.Mode == terminal.ModeView &&
+				msg.Generation.Value() == 3 {
+				return true
+			}
+		}
+		return false
+	}, "the previous controller's viewer binding")
+}
+
+// TestASandboxsOwnershipMessagesNeverReachTheClient is the mirror of
+// TestAClientsControlVerbNeverReachesTheSandbox, on the pump that had no such
+// rule. The client pump drops `control` and `control_ack` because those are
+// the plane's verbs; the runner pump consumed `control_ack` and forwarded
+// everything else verbatim, so a sandbox could tell a client it has control.
+//
+// A client told that prints [you have control], stops sending claims — a
+// client that believes it is the controller never claims — and types into a
+// plane that drops every frame. Its only way out is detaching. Only a broken
+// or compromised sessiond sends one, and that sandbox could run the
+// keystrokes itself, so this is hardening; it is also the same sentence the
+// other pump already says.
+func TestASandboxsOwnershipMessagesNeverReachTheClient(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{})
+	lease := &fakeLease{gen: 1, holder: "att_aaaa"}
+	viewer := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_bbbb"}, true)
+	if m, _ := awaitType(t, viewer.stream, terminal.TypeAttached); m.Mode != terminal.ModeView {
+		t.Fatalf("the attach opened as %s, want view", m.Mode)
+	}
+	awaitViewerSpliced(t, viewer)
+
+	for _, m := range []terminal.ServerMessage{
+		{Type: terminal.TypeAttached, Mode: terminal.ModeControl, Generation: terminal.GenOf(99)},
+		{Type: terminal.TypeControlChanged, Mode: terminal.ModeControl, Generation: terminal.GenOf(99)},
+		{Type: terminal.TypeStale, Generation: terminal.GenOf(99)},
+	} {
+		viewer.sandbox.write(t, m)
+	}
+	// The splice is still carrying the terminal, which is what a dropped
+	// frame must not cost: ending the attach would give a buggy sandbox a
+	// way to disconnect every client watching it.
+	viewer.sandbox.write(t, terminal.ServerMessage{Type: "output", Seq: 2, Data: []byte("still watching")})
+
+	got, before := awaitType(t, viewer.stream, "output")
+	if got.Seq != 2 {
+		t.Fatalf("the output that followed arrived as seq %d, want 2", got.Seq)
+	}
+	for _, kind := range before {
+		if isPlaneOwnershipMessage(kind) {
+			t.Fatalf("the sandbox's %q reached the client; only announceAs may say what an "+
+				"attach is, and a client told otherwise stops claiming and types into nothing", kind)
+		}
+	}
+	// And it is still a viewer, told so by nobody but the plane.
+	if mode, gen := ownerOf(t, p, "sess_example", viewer).get(); mode != terminal.ModeView || gen != 1 {
+		t.Fatalf("the attach is %s at %d, want view at 1", mode, gen)
+	}
+}
+
+// isPlaneOwnershipMessage names the three messages announceAs owns, which are
+// the three the runner pump drops.
+func isPlaneOwnershipMessage(kind string) bool {
+	switch kind {
+	case terminal.TypeAttached, terminal.TypeStale, terminal.TypeControlChanged:
+		return true
+	}
+	return false
+}
+
+// ownerOf returns the plane's ownership for f's attach, which is the only
+// place its mode and generation actually live.
+func ownerOf(t *testing.T, p *Plane, session control.SessionID, f *attachFixture) *ownership {
+	t.Helper()
+	awaitOwners(t, p, session, 1)
+	p.owners.mu.Lock()
+	defer p.owners.mu.Unlock()
+	for o := range p.owners.m[session] {
+		if o.stream == f.stream {
+			return o
+		}
+	}
+	t.Fatal("the plane is not serving this attach")
+	return nil
+}
