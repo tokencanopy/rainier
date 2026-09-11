@@ -454,6 +454,12 @@ var reservedEnv = map[string]bool{
 	"NODE_OPTIONS": true, "NODE_REPL_EXTERNAL_MODULE": true,
 	"PYTHONSTARTUP": true, "PYTHONEXECUTABLE": true,
 	"PERL5OPT": true, "PERL5DB": true, "RUBYOPT": true,
+	// The JVM's option channels, which are NODE_OPTIONS by another name under
+	// this list's own rubric: each is read by the runtime or its build tool
+	// before a line of the requested program runs. (BASH_FUNC_…%% needs no
+	// entry — the name pattern already refuses it.)
+	"JAVA_TOOL_OPTIONS": true, "_JAVA_OPTIONS": true,
+	"MAVEN_OPTS": true, "GRADLE_OPTS": true,
 }
 
 // The bounds on one caller-supplied variable. They are far above any real

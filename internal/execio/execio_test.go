@@ -25,6 +25,24 @@ import (
 // the exit-code policy
 // ---------------------------------------------------------------------------
 
+// TestThePublishedExitCodesAreWhatIsPublished. §6.1 of the command contract
+// publishes these three numbers and a script's `if` is written against them,
+// so they are LITERALS here rather than the constants under test: 126 and 127
+// are saved by the end-to-end suite, and 125 — the one a caller sees whenever
+// a session ends under its command — was pinned nowhere at all.
+func TestThePublishedExitCodesAreWhatIsPublished(t *testing.T) {
+	if ExitNoStatus != 125 {
+		t.Fatalf("ExitNoStatus = %d, want 125: accepted, but no exit status ever "+
+			"arrived", ExitNoStatus)
+	}
+	if ExitNotExecutable != 126 {
+		t.Fatalf("ExitNotExecutable = %d, want 126", ExitNotExecutable)
+	}
+	if ExitNotFound != 127 {
+		t.Fatalf("ExitNotFound = %d, want 127", ExitNotFound)
+	}
+}
+
 // TestExitCodeFor is the whole contract as a pure function: the command's
 // status IS the CLI's status, and Rainier's own failures use the codes the
 // shell vocabulary already reserves for a wrapper.

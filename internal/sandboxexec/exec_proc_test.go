@@ -169,6 +169,17 @@ func realRunnerWithGrace(t *testing.T, mode string, grace time.Duration,
 	return NewRunner(root, env, spawner.Start), rec, root
 }
 
+// resolved is a path with its symlinks followed, which is what a process's own
+// `pwd` reports and therefore what an expectation about one has to be.
+func resolved(t *testing.T, path string) string {
+	t.Helper()
+	out, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("resolving %s: %v", path, err)
+	}
+	return out
+}
+
 // withCwd is targetSpec with a working directory, spelled as a helper so the
 // spec construction stays one line at each call site.
 func withCwd(s runner.ExecSpec, cwd string) runner.ExecSpec {
@@ -263,15 +274,22 @@ func TestRealExecRunsInTheRequestedCwd(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// The expectation is symlink-RESOLVED, because the product is: the cwd
+	// goes through workspace.Resolve, and t.TempDir on a mac is under
+	// /var, which is a symlink to /private/var. Comparing `pwd` against the
+	// unresolved path failed make verify deterministically on any
+	// maintainer's machine, for a rule the code gets right.
+	wantSub := resolved(t, filepath.Join(root, "sub"))
 	got := collectExec(t, r.OpenExec(withCwd(targetSpec(), "sub")))
-	if got.stdout != filepath.Join(root, "sub") {
-		t.Fatalf("cwd = %q, want %q", got.stdout, filepath.Join(root, "sub"))
+	if got.stdout != wantSub {
+		t.Fatalf("cwd = %q, want %q", got.stdout, wantSub)
 	}
 
 	// And with no --cwd it is the workspace root.
+	wantRoot := resolved(t, root)
 	got = collectExec(t, r.OpenExec(targetSpec()))
-	if got.stdout != root {
-		t.Fatalf("default cwd = %q, want the workspace root %q", got.stdout, root)
+	if got.stdout != wantRoot {
+		t.Fatalf("default cwd = %q, want the workspace root %q", got.stdout, wantRoot)
 	}
 }
 
@@ -593,7 +611,17 @@ func TestRealExecAcceptsALargeStream(t *testing.T) {
 				t.Fatalf("the generator exited %d", m.ExitCode)
 			}
 		case terminal.TypeExecError:
-			t.Skipf("this machine has no /bin/sh or dd: %s", m.Reason)
+			// Skip ONLY for the two reasons that mean "this machine does not
+			// have the tools". Every other reason — too_many_execs,
+			// cwd_refused, env_refused, stdin_overrun, no_answer — is the
+			// regression this test exists to catch, and skipping on it turned
+			// each of them into a green SKIP.
+			switch m.Reason {
+			case terminal.ReasonNotFound, terminal.ReasonNotExecutable:
+				t.Skipf("this machine has no /bin/sh or dd: %s", m.Reason)
+			default:
+				t.Fatalf("the flood was refused with %q", m.Reason)
+			}
 		}
 	}
 	if !exitSeen {

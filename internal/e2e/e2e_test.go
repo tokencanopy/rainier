@@ -3210,7 +3210,16 @@ func TestExecJourney(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := filepath.Join(root, "sub") + "\n1\nyes\n"
+		// The expectation is symlink-RESOLVED, because the product is:
+		// workspace.Resolve is the containment check, and t.TempDir on a mac
+		// is under /var, a symlink to /private/var. Comparing `pwd` against
+		// the unresolved path failed `make verify` deterministically on any
+		// maintainer's machine, for a rule the code gets right.
+		sub, err := filepath.EvalSymlinks(filepath.Join(root, "sub"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := sub + "\n1\nyes\n"
 		if out != want {
 			t.Fatalf("output = %q, want %q (result %+v)", out, want, res)
 		}

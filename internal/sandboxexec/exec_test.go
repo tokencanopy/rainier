@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -187,6 +188,24 @@ func testRunner(t *testing.T, start Starter) (*Runner, string) {
 	t.Helper()
 	root := t.TempDir()
 	return NewRunner(root, []string{"PATH=/usr/bin:/bin", "HOME=/home/agent"}, start), root
+}
+
+// firstExecMessage takes the attachment's first message under a short bound.
+// It is what turns a refusal regression into a FAILURE rather than a timeout:
+// a refusal is the first thing an attachment says, and an exec that was
+// wrongly accepted says exec_started and then runs.
+func firstExecMessage(t *testing.T, a relay.ExecAttachment) terminal.ServerMessage {
+	t.Helper()
+	select {
+	case m, ok := <-a.Msgs():
+		if !ok {
+			t.Fatal("the attachment closed without saying anything at all")
+		}
+		return m
+	case <-time.After(5 * time.Second):
+		t.Fatal("the attachment said nothing")
+		return terminal.ServerMessage{}
+	}
 }
 
 // drain reads an attachment to the end, which is how a test sees the whole
@@ -566,6 +585,35 @@ func TestExecKillsTheProcessWhenItsCallerGoes(t *testing.T) {
 // the concurrency cap
 // ---------------------------------------------------------------------------
 
+// TestThePublishedCapsAreWhatIsPublished. §3.9 of the command contract says
+// "at most 8" and the design says four of those may be detached, so these are
+// LITERALS here: reading them back out of the code under test made setting
+// MaxConcurrent to 9999 a change no test noticed, which is the opposite of
+// what a published number is for.
+func TestThePublishedCapsAreWhatIsPublished(t *testing.T) {
+	if MaxConcurrent != 8 {
+		t.Fatalf("MaxConcurrent = %d; the contract publishes 8 concurrent execs "+
+			"per session and a caller's retry loop is written against it", MaxConcurrent)
+	}
+	if MaxDetached != 4 {
+		t.Fatalf("MaxDetached = %d; the design publishes 4, and the refusal for "+
+			"the fifth names that number", MaxDetached)
+	}
+	if MaxDetached >= MaxConcurrent {
+		t.Fatal("the detached sub-cap must leave room for the exec that stops one: " +
+			"`rainier exec s -- kill <pid>` needs a slot of its own")
+	}
+	if ptyDefaultCols != 80 || ptyDefaultRows != 24 {
+		t.Fatalf("the default pty is %dx%d, want 80x24 — what a terminal that "+
+			"named no size gets is a thing a caller sees", ptyDefaultCols, ptyDefaultRows)
+	}
+	if stdinQueueBytes != 8<<20 {
+		t.Fatalf("stdinQueueBytes = %d, want 8 MiB: the bound the design states, "+
+			"and the one TestOrdinaryStdinIsNeverRefused is written against",
+			stdinQueueBytes)
+	}
+}
+
 // TestExecCapRefusesTheNinth pins the fork-bomb bound. Eight is slack rather
 // than a working limit; what matters is that the ninth is refused BEFORE
 // anything is spawned, and that a finished exec gives its slot back.
@@ -674,12 +722,22 @@ func TestExecRefusesACwdOutsideTheWorkspace(t *testing.T) {
 // short list of refusals is exactly the names that turn "run this command"
 // into "run something else".
 func TestExecEnvRule(t *testing.T) {
+	// The refusal table is DERIVED from the code's own list rather than
+	// transcribed from it. Transcribing left six of the reserved names named
+	// by no test at all, and a name added to the list later would have joined
+	// them; deriving means the table cannot fall behind.
 	refused := []string{
 		"", "1BAD", "BAD-NAME", "BAD NAME", "lower case name",
-		"RAINIER_DIAL", "RAINIER_SESSION",
-		"HOME", "PATH", "SHELL", "IFS",
-		"LD_PRELOAD", "LD_LIBRARY_PATH",
-		"GIT_CONFIG_GLOBAL", "GIT_SSH_COMMAND", "GIT_ASKPASS",
+	}
+	for name := range reservedEnv {
+		refused = append(refused, name)
+	}
+	for _, prefix := range reservedEnvPrefixes {
+		refused = append(refused, prefix+"SOMETHING", prefix+"0")
+	}
+	sort.Strings(refused)
+	if len(refused) < len(reservedEnv) {
+		t.Fatal("the derived table is smaller than the list it is derived from")
 	}
 	for _, name := range refused {
 		t.Run("refused "+name, func(t *testing.T) {
@@ -688,9 +746,20 @@ func TestExecEnvRule(t *testing.T) {
 			spec := withTool(t, r, "tool")
 			const value = "s3cr3t-value"
 			spec.Env = map[string]string{name: value}
-			msgs := drainAttachment(t, r.OpenExec(spec))
-			if len(msgs) != 1 || msgs[0].Reason != terminal.ReasonEnvRefused {
-				t.Fatalf("env %q got %+v, want one exec_error env_refused", name, msgs)
+			a := r.OpenExec(spec)
+			// The REFUSAL is asserted before the close is waited for, and
+			// that is not a style preference: an exec that was wrongly
+			// accepted spawns and runs, so waiting for the attachment to
+			// close costs the whole drain budget for every case — a policy
+			// regression would be a CI timeout across forty subtests rather
+			// than a test that says which rule broke.
+			first := firstExecMessage(t, a)
+			if first.Type != terminal.TypeExecError || first.Reason != terminal.ReasonEnvRefused {
+				t.Fatalf("env %q got %+v, want exec_error env_refused", name, first)
+			}
+			msgs := append([]terminal.ServerMessage{first}, drainAttachment(t, a)...)
+			if len(msgs) != 1 {
+				t.Fatalf("env %q got %+v, want ONE exec_error", name, msgs)
 			}
 			// The refusal says the reason and nothing else. Values are
 			// secrets as often as not: never logged, never audited, never
@@ -1373,8 +1442,10 @@ func TestAPtySizeIsClampedRatherThanRefused(t *testing.T) {
 	for name, tc := range map[string]struct {
 		cols, rows, wantCols, wantRows int
 	}{
-		"none at all":   {0, 0, ptyDefaultCols, ptyDefaultRows},
-		"negative":      {-1, -1, ptyDefaultCols, ptyDefaultRows},
+		// Literals, not ptyDefaultCols/Rows: a table that reads the value it
+		// is checking cannot notice it change.
+		"none at all":   {0, 0, 80, 24},
+		"negative":      {-1, -1, 80, 24},
 		"past a uint16": {65536, 100000, 65535, 65535},
 		"ordinary":      {100, 40, 100, 40},
 	} {
@@ -1574,4 +1645,53 @@ func TestADetachedExecReturnsItsSlotWhenItEnds(t *testing.T) {
 
 	// And the next one is accepted rather than refused.
 	runOneDetached("run-next.log")
+}
+
+// TestStdinJustUnderTheBoundIsNeverRefused is what makes stdinQueueBytes a
+// number rather than a comment. TestOrdinaryStdinIsNeverRefused paces its feed
+// into a child that consumes instantly, so the queue never accumulates at all
+// — shrinking the bound from 8 MiB to 8 KiB survived it. This one blocks the
+// child and writes to just under the bound, which is precisely the case the
+// bound decides.
+func TestStdinJustUnderTheBoundIsNeverRefused(t *testing.T) {
+	start := newFakeStarter()
+	r, _ := testRunner(t, start.start)
+	spec := withTool(t, r, "tool")
+
+	a := r.OpenExec(spec)
+	p := start.await(t)
+	if m := <-a.Msgs(); m.Type != terminal.TypeExecStarted {
+		t.Fatalf("first message = %q", m.Type)
+	}
+	// The child reads NOTHING, so every byte below stays in the queue.
+	p.blockWrites()
+
+	const chunk = 64 << 10
+	buf := make([]byte, chunk)
+	// One chunk short of the bound: the last accepted write is the one that
+	// brings the queue to exactly stdinQueueBytes.
+	for sent := 0; sent+chunk <= stdinQueueBytes; sent += chunk {
+		a.Client(terminal.ClientMessage{Type: "stdin", Data: buf})
+	}
+
+	// Nothing was refused, and the exec is still live: it is a caller ahead of
+	// a slow child, which is the ordinary shape of a pipe.
+	select {
+	case m, ok := <-a.Msgs():
+		if !ok {
+			t.Fatal("a caller that stayed inside the bound had its exec ended")
+		}
+		t.Fatalf("a caller that stayed inside the bound was answered %+v", m)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if r.LiveCount() != 1 {
+		t.Fatalf("live count = %d, want the exec still running", r.LiveCount())
+	}
+
+	p.exit(Status{Code: 0})
+	for _, m := range drainAttachment(t, a) {
+		if m.Type == terminal.TypeExecError {
+			t.Fatalf("a caller inside the bound was refused: %q", m.Reason)
+		}
+	}
 }
