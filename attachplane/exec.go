@@ -188,8 +188,8 @@ var ErrExecFirstMessage = errors.New("controld: the first exec message must be a
 // older sessiond answers a Kind it does not know with — closes the socket as
 // unsupported, having forwarded nothing.
 func execSplice(ctx context.Context, client control.TerminalStream, sandbox runnerConn,
-	ackTimeout time.Duration) {
-	started, err := awaitExecStarted(ctx, sandbox, execHandshakeTimeout)
+	ackTimeout, handshakeTimeout time.Duration) {
+	started, err := awaitExecStarted(ctx, sandbox, handshakeTimeout)
 	if err != nil {
 		// The client is told in its own vocabulary before the socket goes:
 		// a close reason is a string a CLI has to pattern-match, a message
@@ -265,7 +265,7 @@ func execSplice(ctx context.Context, client control.TerminalStream, sandbox runn
 	<-done // let the second pump exit before returning
 }
 
-// execHandshakeTimeout bounds the sandbox's first message on an exec.
+// defaultExecHandshakeTimeout bounds the sandbox's first message on an exec.
 //
 // It is deliberately NOT the acknowledgement timeout an ownership handoff
 // uses, even though both are "one small frame on an already-open socket".
@@ -279,7 +279,7 @@ func execSplice(ctx context.Context, client control.TerminalStream, sandbox runn
 // It is still short enough to be a fence rather than a wait: a sandbox that
 // does not know what an exec is answers its snapshot in microseconds, so the
 // case this exists to catch is never the one that spends the budget.
-const execHandshakeTimeout = 10 * time.Second
+const defaultExecHandshakeTimeout = 10 * time.Second
 
 // awaitExecStarted reads the sandbox's first message under that budget and
 // requires it to be an `exec_started`.

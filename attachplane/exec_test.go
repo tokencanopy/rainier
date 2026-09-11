@@ -172,7 +172,15 @@ func TestExecRequiresExecStarted(t *testing.T) {
 // none of those things, and saying so would be a false statement a caller
 // would act on.
 func TestExecRefusesASilentSandbox(t *testing.T) {
-	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 150 * time.Millisecond})
+	// ExecHandshakeTimeout, not ControlAckTimeout. The latter only bounds the
+	// exec_error SEND, so passing it here looked like configuring the budget
+	// and configured nothing — this test burned the full production ten
+	// seconds, ten times the next slowest in the package and 66s at -count=5.
+	started := time.Now()
+	p, h, ts := newTestPlane(t, Options{
+		ControlAckTimeout:    150 * time.Millisecond,
+		ExecHandshakeTimeout: 150 * time.Millisecond,
+	})
 	hold := make(chan struct{})
 	h.dialBack = func(at *runner.Attach) {
 		c, _, err := dialAttachBack(t, ts, at.AttachID, testRunnerToken)
@@ -195,6 +203,37 @@ func TestExecRefusesASilentSandbox(t *testing.T) {
 	}
 	if err := stream.closeReason(t); !errors.Is(err, errExecNoAnswer) {
 		t.Fatalf("closed with %v, want errExecNoAnswer", err)
+	}
+	if took := time.Since(started); took > 5*time.Second {
+		t.Fatalf("the silent-sandbox refusal took %s; the budget is meant to be "+
+			"configurable and this test is meant to configure it", took)
+	}
+}
+
+// TestTheProductionExecHandshakeBudget pins the value the budget above
+// defaults to, separately from the test that shortens it. Ten seconds is not
+// the acknowledgement timeout even though both are "one small frame on an
+// already-open socket": that one acknowledges a binding already installed,
+// and this one waits for a SPAWN — a path resolution, a symlink-resolving
+// containment check on a caller-named directory, possibly a log file created
+// on a cold filesystem, and a fork. The cost of being wrong is telling a user
+// their session predates the feature.
+func TestTheProductionExecHandshakeBudget(t *testing.T) {
+	if defaultExecHandshakeTimeout != 10*time.Second {
+		t.Fatalf("the exec handshake budget is %s, want 10s", defaultExecHandshakeTimeout)
+	}
+	if defaultExecHandshakeTimeout <= defaultControlAckTimeout {
+		t.Fatal("the handshake budget must be longer than the acknowledgement one: " +
+			"it waits for a fork, not for a frame")
+	}
+	p := New(&fakeHost{}, Options{})
+	if p.execHandshake != defaultExecHandshakeTimeout {
+		t.Fatalf("a zero ExecHandshakeTimeout became %s, want the default %s",
+			p.execHandshake, defaultExecHandshakeTimeout)
+	}
+	p = New(&fakeHost{}, Options{ExecHandshakeTimeout: 3 * time.Second})
+	if p.execHandshake != 3*time.Second {
+		t.Fatalf("ExecHandshakeTimeout was not honoured: %s", p.execHandshake)
 	}
 }
 
