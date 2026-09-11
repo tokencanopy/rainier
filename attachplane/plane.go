@@ -340,6 +340,13 @@ func (p *Plane) handleAttachBack(w http.ResponseWriter, r *http.Request) {
 	// Release the client handler once the splice is over, whatever ends it.
 	defer close(pa.done)
 
+	// Which splice claims the socket is decided by what was PARKED, never by
+	// anything the runner says: the runner was told which kind to open and is
+	// not asked what it opened.
+	if pa.exec {
+		execSplice(r.Context(), pa.stream, wsRunnerConn{c}, p.ackTimeout)
+		return
+	}
 	splice(r.Context(), pa.stream, wsRunnerConn{c}, pa.own)
 }
 

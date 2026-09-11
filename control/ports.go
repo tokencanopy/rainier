@@ -29,9 +29,18 @@ const (
 	ActionResume   Action = "resume"
 	ActionSnapshot Action = "snapshot"
 	ActionAttach   Action = "attach"
-	ActionDiff     Action = "diff"
-	ActionPush     Action = "push"
-	ActionPull     Action = "pull"
+	// ActionExec is the audit label for one command run inside a session's
+	// sandbox. It is deliberately an EVENT label and not an authorization
+	// verb: exec is authorized as ActionAttach, because it grants nothing a
+	// controller attach does not already grant, and because a new verb would
+	// reach every existing Authorizer adapter as a word it has never seen —
+	// which a correctly written adapter fails closed on, disabling exec on
+	// every self-hosted installation until its adapter learned it. An
+	// EventRecorder, by contrast, records what it is handed.
+	ActionExec Action = "exec"
+	ActionDiff Action = "diff"
+	ActionPush Action = "push"
+	ActionPull Action = "pull"
 )
 
 // ResourceKind is the closed resource-kind vocabulary of the frozen

@@ -301,6 +301,7 @@ func (s *Server) compose() error {
 	attachSvc, err := controlapp.NewAttachmentService(controlapp.AttachmentOptions{
 		Authorizer: auth, Policy: auth, Sessions: sessions, Transport: s.transport,
 		Broker: s.broker, Events: events, Clock: clock, IDs: ids, UnitOfWork: uow,
+		ExecBroker:       s.attach.ExecBroker(),
 		MaxTransferBytes: s.cfg.MaxTransferBytes,
 	})
 	if err != nil {
@@ -343,6 +344,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v0/sessions/{id}/resume", s.requireUser(s.handleResumeSession))
 	mux.HandleFunc("POST /v0/sessions/{id}/snapshot", s.requireUser(s.handleSnapshotSession))
 	mux.HandleFunc("GET /v0/sessions/{id}/attach", s.requireUser(s.handleClientAttach))
+	// Its own route, never a parameter on attach: an old plane answers 404
+	// here, where it would have silently opened a terminal attachment there.
+	mux.HandleFunc("GET /v0/sessions/{id}/exec", s.requireUser(s.handleClientExec))
 
 	// Workspace inspection — the session's working tree, read and written
 	// from outside. The diff is team-visible like the other session reads

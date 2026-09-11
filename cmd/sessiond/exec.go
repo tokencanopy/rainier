@@ -1252,33 +1252,3 @@ func (d *execDrain) watch() {
 		}
 	}
 }
-
-// execProcName is what an exec is AUDITED as: the base name of argv[0],
-// capped, and refused entirely when it is not printable ASCII. Never an
-// argument, never the environment, never the cwd, never a byte of input or
-// output. "Somebody ran git in this session at this time" is the whole of
-// what the record says, which is enough to answer the question an audit log
-// is for without turning the log into a transcript.
-//
-// It lives here, beside the spawn, so the one rule about what may be recorded
-// has one definition; the control plane calls it.
-func execProcName(argv []string) string {
-	if len(argv) == 0 {
-		return "?"
-	}
-	name := filepath.Base(argv[0])
-	const maxName = 64
-	// "", ".", ".." and "/" are what Base makes of an empty or root-ish
-	// argv[0]. None of them names a command, so each is recorded as the same
-	// "?" a non-printable one is.
-	if name == "" || name == "." || name == ".." ||
-		strings.ContainsRune(name, os.PathSeparator) || len(name) > maxName {
-		return "?"
-	}
-	for i := 0; i < len(name); i++ {
-		if name[i] < 0x20 || name[i] > 0x7e {
-			return "?"
-		}
-	}
-	return name
-}

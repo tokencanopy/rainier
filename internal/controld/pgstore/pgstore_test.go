@@ -272,13 +272,13 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	if want := embeddedMigrationVersions(t); !slices.Equal(applied, want) {
 		t.Fatalf("schema_migrations = %v, want every embedded migration in order %v", applied, want)
 	}
-	// This release's head is 13: a database that stopped at 0003 runs the
+	// This release's head is 14: a database that stopped at 0003 runs the
 	// expand step (0007), the contract step (0008), the events table
 	// (0009), the agent credentials table (0010), the tombstone (0011), the
-	// durable revoke fence (0012), and the controller lease (0013) in the
-	// same start.
-	if head := applied[len(applied)-1]; head != 13 {
-		t.Fatalf("head migration = %d, want 13", head)
+	// durable revoke fence (0012), the controller lease (0013), and the exec
+	// event's command name (0014) in the same start.
+	if head := applied[len(applied)-1]; head != 14 {
+		t.Fatalf("head migration = %d, want 14", head)
 	}
 
 	// The legacy session survived, and its new columns read as "never exited"
@@ -852,5 +852,53 @@ func TestRecordedEventsLandInTheirWorkspace(t *testing.T) {
 	}
 	if cpu != 1.5 || mem != 2 || storage != 3 || network != 4 || tokens != 5 {
 		t.Fatalf("usage columns: %v %d %d %d %d", cpu, mem, storage, network, tokens)
+	}
+}
+
+// TestExecEventRecordsTheCommandNameOnly reads the one column migration 0014
+// added, in SQL, because that is where an audit reader will find it.
+//
+// The bound is the point rather than an implementation detail: this column
+// can hold "git" and can never hold an argument, an environment variable, a
+// working directory or a byte of output — the application caps and sanitises
+// the name before it gets here (control.Event.Command), and a row for any
+// other action carries the empty string because none of them ran a command.
+func TestExecEventRecordsTheCommandNameOnly(t *testing.T) {
+	st := freshStore(t, startPostgres(t), t.Name())
+	ctx := context.Background()
+	if err := st.EnsureWorkspace(ctx, "ws_alpha"); err != nil {
+		t.Fatal(err)
+	}
+	resource := control.Resource{Kind: control.ResourceSession, WorkspaceID: "ws_alpha",
+		ID: "sess_example", CreatorID: "act_a"}
+	if err := st.Record(ctx, control.Event{ID: "evt_exec", WorkspaceID: "ws_alpha",
+		ActorID: "act_a", Action: control.ActionExec, Resource: resource,
+		At: time.Now().UTC(), PlacementGeneration: 3, Command: "git"}); err != nil {
+		t.Fatal(err)
+	}
+	// An attach in the same table: the column exists for every row and is
+	// empty on the ones that ran nothing.
+	if err := st.Record(ctx, control.Event{ID: "evt_attach", WorkspaceID: "ws_alpha",
+		ActorID: "act_a", Action: control.ActionAttach, Resource: resource,
+		At: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+
+	for id, want := range map[string]struct {
+		action  control.Action
+		command string
+	}{
+		"evt_exec":   {control.ActionExec, "git"},
+		"evt_attach": {control.ActionAttach, ""},
+	} {
+		var action, command string
+		if err := st.pool.QueryRow(ctx,
+			`SELECT action, command FROM events WHERE id = $1`, id).Scan(&action, &command); err != nil {
+			t.Fatalf("%s: %v", id, err)
+		}
+		if action != string(want.action) || command != want.command {
+			t.Fatalf("%s = action %q command %q, want %q and %q",
+				id, action, command, want.action, want.command)
+		}
 	}
 }

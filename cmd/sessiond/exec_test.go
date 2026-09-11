@@ -963,33 +963,3 @@ func TestDetachRequiresALogInsideTheWorkspace(t *testing.T) {
 		t.Fatalf("a refused detach spawned %d processes", spawned)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// the audit name
-// ---------------------------------------------------------------------------
-
-// TestExecProcNameIsTheCommandNameAlone pins what an audit event may say.
-// "Somebody ran git in this session at this time" is the whole of it: never
-// an argument, never the environment, never the cwd, never a byte or a length
-// of input or output.
-func TestExecProcNameIsTheCommandNameAlone(t *testing.T) {
-	for _, tc := range []struct {
-		argv []string
-		want string
-	}{
-		{[]string{"git", "push", "--force", "origin", "main"}, "git"},
-		{[]string{"/usr/bin/make", "test"}, "make"},
-		{[]string{"./scripts/deploy.sh"}, "deploy.sh"},
-		{nil, "?"},
-		{[]string{""}, "?"},
-		{[]string{"/"}, "?"},
-		{[]string{"wéird"}, "?"},
-		{[]string{"with\x1b[2Jescape"}, "?"},
-		{[]string{strings.Repeat("a", 65)}, "?"},
-		{[]string{strings.Repeat("a", 64)}, strings.Repeat("a", 64)},
-	} {
-		if got := execProcName(tc.argv); got != tc.want {
-			t.Fatalf("execProcName(%q) = %q, want %q", tc.argv, got, tc.want)
-		}
-	}
-}

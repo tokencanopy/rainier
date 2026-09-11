@@ -242,6 +242,19 @@ func attachCloseReason(err error) (websocket.StatusCode, string) {
 		return websocket.StatusTryAgainLater, "session not ready"
 	case errors.Is(err, errAttachEnded):
 		return websocket.StatusTryAgainLater, "the attach ended"
+	case errors.Is(err, ErrExecFirstMessage):
+		return websocket.StatusPolicyViolation, "first exec message must be exec_start"
+	case errors.Is(err, errExecUnsupported):
+		// A sandbox that cannot exec is not going to start being able to, so
+		// this is a policy violation rather than an invitation to retry. The
+		// client has already been sent an exec_error{unsupported}, which is
+		// the field it actually switches on; this is what a packet capture
+		// and a proxy log see.
+		return websocket.StatusPolicyViolation, "exec unsupported by this sandbox"
+	case errors.Is(err, errExecEnded):
+		return websocket.StatusNormalClosure, "the exec ended"
+	case errors.Is(err, control.ErrUnsupported):
+		return websocket.StatusPolicyViolation, "exec unsupported by this server"
 	default:
 		return websocket.StatusTryAgainLater, "runner unreachable"
 	}

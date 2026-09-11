@@ -178,4 +178,17 @@ type Event struct {
 	// a session happened under, so usage is attributed to exactly one
 	// generation; zero for an event about any other resource.
 	PlacementGeneration uint64
+	// Command is the NAME of the command an ActionExec event ran, and
+	// nothing else: the base name of argv[0], capped at 64 bytes, and "?"
+	// when it is not printable ASCII. Empty on every other action.
+	//
+	// The cap and the vocabulary are the point rather than an
+	// implementation detail. "Somebody ran git in this session at this
+	// time" is the whole of what this field may say, which answers the
+	// question an audit log is for without turning the log into a
+	// transcript. It is NEVER an argument, never an environment name or
+	// value, never a working directory, and never a byte or a length of
+	// input or output — each of which is a secret as often as not, and none
+	// of which an audit reader needs to know that a command was run.
+	Command string
 }
