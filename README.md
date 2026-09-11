@@ -35,7 +35,7 @@ Rainier is currently at **v0 (terminal happy path)**. One `controld` (Postgres-b
 - **Deployment Guide:** [`docs/deploy-gce.md`](docs/deploy-gce.md)
 - **Terminal Ownership:** [`docs/terminal-controller-ownership.md`](docs/terminal-controller-ownership.md) — who may type when several devices are attached to one session, and how the three parties that implement it interoperate across releases
 - **Session Image:** [`docs/session-image.md`](docs/session-image.md) — the default coding environment every session runs, what is in it, and how it is pinned and smoke tested
-- **Design — `rainier exec`:** [`docs/design/rainier-exec.md`](docs/design/rainier-exec.md) — running one command inside a live session's sandbox non-interactively: transport, protocol, exit codes, and how it stays out of the terminal's controller lease (proposed; waits on the terminal-ownership change)
+- **Running a command in a session:** [`docs/design/rainier-exec.md`](docs/design/rainier-exec.md) — `rainier exec` runs one command inside a live session's sandbox non-interactively and exits with its status: transport, protocol, exit codes, and how it stays out of the terminal's controller lease. The command contract is [`docs/cli-v0-contract.md`](docs/cli-v0-contract.md) §3.9.
 - **Architecture Specs:**
   - [Rainier Overview](docs/superpowers/specs/2026-08-27-rainier-design.md)
   - [Control Plane (`controld`)](docs/superpowers/specs/2026-08-28-plan3-controld-design.md)

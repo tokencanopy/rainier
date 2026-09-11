@@ -1,4 +1,4 @@
-package main
+package sandboxexec
 
 import (
 	"fmt"
@@ -116,13 +116,13 @@ func targetSpec(args ...string) runner.ExecSpec {
 
 // realRunner builds a runner over the real spawner, with this test binary on
 // the session's PATH under the name `target` and a recorder around the kill.
-func realRunner(t *testing.T, mode string, extraEnv ...string) (*execRunner, *killRecorder, string) {
+func realRunner(t *testing.T, mode string, extraEnv ...string) (*Runner, *killRecorder, string) {
 	t.Helper()
 	return realRunnerWithGrace(t, mode, 0, extraEnv...)
 }
 
 func realRunnerWithGrace(t *testing.T, mode string, grace time.Duration,
-	extraEnv ...string) (*execRunner, *killRecorder, string) {
+	extraEnv ...string) (*Runner, *killRecorder, string) {
 	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
@@ -136,14 +136,14 @@ func realRunnerWithGrace(t *testing.T, mode string, grace time.Duration,
 	root := t.TempDir()
 
 	rec := &killRecorder{}
-	spawner := execSpawner{kill: rec.kill, drainGrace: grace}
+	spawner := Spawner{kill: rec.kill, drainGrace: grace}
 	env := append([]string{
 		"PATH=" + binDir,
 		"RAINIER_EXEC_TEST_TARGET=" + mode,
 		// The test binary must not re-run the whole suite in the child.
 		"GOTRACEBACK=none",
 	}, extraEnv...)
-	return newExecRunner(root, env, spawner.start), rec, root
+	return NewRunner(root, env, spawner.Start), rec, root
 }
 
 // withCwd is targetSpec with a working directory, spelled as a helper so the
@@ -187,7 +187,7 @@ type execResult struct {
 func collectExec(t *testing.T, a relay.ExecAttachment) execResult {
 	t.Helper()
 	var r execResult
-	for _, m := range drain(t, a) {
+	for _, m := range drainAttachment(t, a) {
 		r.types = append(r.types, m.Type)
 		switch m.Type {
 		case terminal.TypeExecStdout:
@@ -292,7 +292,7 @@ func TestRealExecStdinEOFTerminatesTheCommand(t *testing.T) {
 	}
 }
 
-// TestRealExecKillsTheProcessGroup is the reason execProcess.Signal negates
+// TestRealExecKillsTheProcessGroup is the reason process.Signal negates
 // the pid. A child spawns grandchildren that inherit its pipes, and
 // signalling the leader alone leaves them holding the far end.
 func TestRealExecKillsTheProcessGroup(t *testing.T) {
@@ -314,7 +314,7 @@ func TestRealExecKillsTheProcessGroup(t *testing.T) {
 	}, "the child never printed")
 
 	a.Close()
-	drain(t, a)
+	drainAttachment(t, a)
 
 	calls := rec.calls()
 	if len(calls) == 0 {

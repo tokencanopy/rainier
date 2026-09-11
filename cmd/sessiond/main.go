@@ -22,6 +22,7 @@ import (
 	"github.com/tokencanopy/rainier/internal/eventlog"
 	"github.com/tokencanopy/rainier/internal/reap"
 	"github.com/tokencanopy/rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/sandboxexec"
 	"github.com/tokencanopy/rainier/internal/server"
 	"github.com/tokencanopy/rainier/internal/session"
 	"github.com/tokencanopy/rainier/protocol/runner"
@@ -192,7 +193,9 @@ func main() {
 	// the container's, plus the boot chain's exports — which is what makes
 	// `claude --continue` and `git status` work inside an exec and what
 	// argv[0] is looked up on.
-	execs := newExecRunner(workspaceRoot, execSessionEnv(os.Environ(), chainVars), newExecSpawner().start)
+	execs := sandboxexec.NewRunner(workspaceRoot,
+		sandboxexec.SessionEnv(os.Environ(), envAssignments(chainVars)),
+		sandboxexec.NewSpawner().Start)
 
 	go func() {
 		<-s.Exited()
@@ -287,7 +290,7 @@ func main() {
 // deliberate — an event queues across a reconnect, a request does not (see
 // rpcConn).
 func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, events <-chan []byte,
-	rpc *rpcDispatcher, execs *execRunner) {
+	rpc *rpcDispatcher, execs *sandboxexec.Runner) {
 	backoff := time.Second
 	var pending [][]byte // control payloads no connection has accepted yet
 	for {

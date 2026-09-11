@@ -156,39 +156,96 @@ func TestExecWithAnUnreachableRunner(t *testing.T) {
 	assertErrCode(t, resp, "runner_unreachable")
 }
 
-// TestExecOnARunnerWithoutTheCapability is 501: the runner announced no
-// `exec.v1`, so the plane refuses early rather than spending a dial-back to
-// find out. It is a pre-check and not the fence — the sandbox's own
-// exec_started is that — but it turns a close reason into a status code.
-func TestExecOnARunnerWithoutTheCapability(t *testing.T) {
-	fx := newExecFixture(t)
-	// Re-announce the runner without the capability, as a runnerd older than
-	// exec would have.
-	rows, err := fx.st.Fleet().ListRunners(context.Background(), installPool)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var row control.Runner
-	for _, r := range rows {
-		if r.ID == "vm1" {
-			row = r
-		}
-	}
-	row.Capabilities = nil
-	row.Generation++
-	if err := fx.st.Fleet().UpsertRunner(context.Background(), installPool, row); err != nil {
-		t.Fatal(err)
-	}
+// TestExecReadinessStatusTable is the readiness half of the design's status
+// table, every row, as a pure decision.
+//
+// The last row is here rather than against a live fleet on purpose: a runnerd
+// built from this tree ALWAYS announces exec.v1 — it is a fact about the
+// build, not a flag an operator sets — so "a runner that cannot forward an
+// exec" is a state the in-process fixture cannot be put into without racing
+// the announce that undoes it. The decision is what matters, and it is here;
+// that the route asks it is covered by TestExecOnARunnerWithoutTheCapability
+// being impossible to write and by the handler having exactly one call site.
+func TestExecReadinessStatusTable(t *testing.T) {
+	running := control.Session{ID: "sess_example", State: control.StateRunning, RunnerID: "vm1"}
+	yes := func() bool { return true }
+	no := func() bool { return false }
 
-	c, resp, err := dialExec(t, fx.ts, fx.id, fx.tok)
-	if err == nil {
-		c.CloseNow()
-		t.Fatal("exec on a runner without exec.v1 was upgraded")
+	for name, tc := range map[string]struct {
+		row        control.Session
+		connected  bool
+		supports   func() bool
+		wantStatus int
+		wantCode   string
+		wantState  control.SessionState
+	}{
+		"running, connected, capable": {running, true, yes, 0, "", ""},
+		"suspended": {control.Session{State: control.StateSuspendedWarm, RunnerID: "vm1"},
+			true, yes, http.StatusConflict, "session_not_running", control.StateSuspendedWarm},
+		"queued": {control.Session{State: control.StateQueued},
+			true, yes, http.StatusConflict, "session_not_running", control.StateQueued},
+		"failed": {control.Session{State: control.StateFailed, RunnerID: "vm1"},
+			true, yes, http.StatusConflict, "session_not_running", control.StateFailed},
+		"destroyed": {control.Session{State: control.StateDestroyed},
+			true, yes, http.StatusConflict, "session_not_running", control.StateDestroyed},
+		"runner gone": {running, false, yes,
+			http.StatusServiceUnavailable, "runner_unreachable", ""},
+		"runner cannot exec": {running, true, no,
+			http.StatusNotImplemented, "exec_unsupported", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, refused := execReadiness(tc.row, tc.connected, tc.supports)
+			if tc.wantStatus == 0 {
+				if refused {
+					t.Fatalf("a ready session was refused %+v", got)
+				}
+				return
+			}
+			if !refused || got.status != tc.wantStatus || got.code != tc.wantCode {
+				t.Fatalf("got (%+v, %v), want status %d code %q",
+					got, refused, tc.wantStatus, tc.wantCode)
+			}
+			if got.state != tc.wantState {
+				t.Fatalf("the refusal named state %q, want %q", got.state, tc.wantState)
+			}
+			// And a 409 renders the state into the BODY, which is the one
+			// fact that makes "not running" actionable.
+			rec := httptest.NewRecorder()
+			got.write(rec)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("rendered %d, want %d", rec.Code, tc.wantStatus)
+			}
+			var body struct {
+				Error struct{ Code, Message string } `json:"error"`
+				State string                         `json:"state"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Error.Code != tc.wantCode {
+				t.Fatalf("body code = %q", body.Error.Code)
+			}
+			if tc.wantStatus == http.StatusConflict && body.State != string(tc.wantState) {
+				t.Fatalf("the 409 body carried state %q, want %q", body.State, tc.wantState)
+			}
+		})
 	}
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501", resp.StatusCode)
+}
+
+// TestExecReadinessAsksTheStoreOnlyWhenItHasTo: the capability check is a
+// store read, and a caller refused earlier must not pay for one.
+func TestExecReadinessAsksTheStoreOnlyWhenItHasTo(t *testing.T) {
+	asked := 0
+	count := func() bool { asked++; return true }
+	execReadiness(control.Session{State: control.StateSuspendedWarm}, true, count)
+	execReadiness(control.Session{State: control.StateRunning, RunnerID: "vm1"}, false, count)
+	if asked != 0 {
+		t.Fatalf("the capability read ran %d times for callers refused before it", asked)
 	}
-	assertErrCode(t, resp, "exec_unsupported")
+	execReadiness(control.Session{State: control.StateRunning, RunnerID: "vm1"}, true, count)
+	if asked != 1 {
+		t.Fatalf("the capability read ran %d times, want once", asked)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -462,6 +519,13 @@ func TestExecRefusesAMalformedSpecBeforeTheRunner(t *testing.T) {
 	writeClient(t, cli, terminal.ClientMessage{Type: terminal.TypeExecStart,
 		Exec: &runner.ExecSpec{Argv: []string{"git"}, Cwd: "/etc"}})
 
+	// NAMED, not just refused: the socket is already upgraded, so a status
+	// code has nowhere to go, and a caller closed without a word would report
+	// "the connection ended" for a cwd it could have fixed.
+	if m := readServer(t, cli); m.Type != terminal.TypeExecError ||
+		m.Reason != terminal.ReasonCwdRefused {
+		t.Fatalf("the caller was told %+v, want exec_error cwd_refused", m)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, _, err := cli.Read(ctx); err == nil {
@@ -491,5 +555,40 @@ func TestExecRouteIsNotAnAttachParameter(t *testing.T) {
 	open := fx.sd.nextOpen(t)
 	if open.Kind != runner.KindTerminal || open.Exec != nil {
 		t.Fatalf("attach?kind=exec opened %+v; the parameter must mean nothing", open)
+	}
+}
+
+// TestRunnerSupportsExecIsAPreCheckThatFailsOpen pins the capability rule as a
+// unit, including the two ways it is deliberately WRONG in the permissive
+// direction. A store that cannot answer, or a runner with no row yet, yields
+// "supported" — because the sandbox's own exec_started is the authoritative
+// fence one round trip later, and refusing on a failed store read would 501 a
+// perfectly good exec because the database blinked.
+func TestRunnerSupportsExecIsAPreCheckThatFailsOpen(t *testing.T) {
+	s, st, _ := newAttachControld(t)
+	ctx := context.Background()
+
+	seed := func(id string, caps []string) {
+		t.Helper()
+		if err := st.Fleet().UpsertRunner(ctx, installPool, control.Runner{
+			ID: control.RunnerID(id), PoolID: installPool, Connected: true,
+			CapacityTotal: 4, Capabilities: caps}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed("vm-new", []string{"gpu", runner.CapabilityExecV1})
+	seed("vm-old", []string{"gpu"})
+	seed("vm-bare", nil)
+
+	for id, want := range map[string]bool{
+		"vm-new":  true,
+		"vm-old":  false,
+		"vm-bare": false,
+		// No row at all: the permissive answer, on purpose.
+		"vm-unknown": true,
+	} {
+		if got := s.runnerSupportsExec(ctx, control.RunnerID(id)); got != want {
+			t.Fatalf("runnerSupportsExec(%s) = %v, want %v", id, got, want)
+		}
 	}
 }

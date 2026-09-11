@@ -63,6 +63,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -76,8 +77,11 @@ import (
 	"github.com/tokencanopy/rainier/internal/controld"
 	"github.com/tokencanopy/rainier/internal/controld/pgstore"
 	"github.com/tokencanopy/rainier/internal/driver"
+	"github.com/tokencanopy/rainier/internal/execio"
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/internal/runnerd"
+	"github.com/tokencanopy/rainier/internal/sandboxexec"
+	"github.com/tokencanopy/rainier/protocol/runner"
 	"github.com/tokencanopy/rainier/protocol/terminal"
 	"github.com/tokencanopy/rainier/protocol/workspace"
 )
@@ -534,6 +538,44 @@ type scriptedSessiond struct {
 	// served records every inbound method, in order — what the sandbox was
 	// actually ASKED, as opposed to what came back out of the API.
 	served []string
+
+	// execs is the REAL sandbox exec runner — the same one a container's
+	// sessiond composes — over a workspace this scene owns. It is the whole
+	// reason an exec scene can claim to be end to end: everything else in
+	// this file scripts a sandbox's answers, and an exec's answer is a
+	// process that actually ran.
+	//
+	// nil until execReady is called, because most scenes have no business
+	// spawning anything and a runner with a workspace is a directory.
+	execs    *sandboxexec.Runner
+	execRoot string
+	execAtts map[uint64]relay.ExecAttachment
+}
+
+// execReady gives this sandbox a real exec runner rooted at a directory the
+// scene owns, and returns that directory so a test can look at what the
+// command did.
+func (ss *scriptedSessiond) execReady(t *testing.T) string {
+	t.Helper()
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if ss.execs != nil {
+		return ss.execRoot
+	}
+	ss.execRoot = t.TempDir()
+	// The session environment, exactly as sessiond composes it: this
+	// process's own — which stands in for the container's — plus the boot
+	// chain's exports.
+	ss.execs = sandboxexec.NewRunner(ss.execRoot,
+		sandboxexec.SessionEnv(os.Environ(), []string{"RAINIER_E2E=1"}),
+		sandboxexec.NewSpawner().Start)
+	return ss.execRoot
+}
+
+func (ss *scriptedSessiond) execRunner() *sandboxexec.Runner {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.execs
 }
 
 // rpcHandler serves one inbound method, in the same shape cmd/sessiond's own
@@ -628,6 +670,10 @@ func (ss *scriptedSessiond) serve() {
 		}
 		switch f.Type {
 		case relay.FrameOpen:
+			if f.Kind == runner.KindExec {
+				ss.openExec(ctx, f)
+				continue
+			}
 			for _, m := range ss.openFrames(f.Since) {
 				ss.send(ctx, f.AttachID, m)
 			}
@@ -636,13 +682,72 @@ func (ss *scriptedSessiond) serve() {
 			if json.Unmarshal(f.Payload, &m) != nil {
 				continue
 			}
+			if att := ss.execAttachment(f.AttachID); att != nil {
+				att.Client(m)
+				continue
+			}
 			if m.Type == "stdin" {
 				ss.send(ctx, f.AttachID, terminal.ServerMessage{Type: "output", Seq: 2, Data: m.Data})
+			}
+		case relay.FrameClose:
+			if att := ss.takeExecAttachment(f.AttachID); att != nil {
+				att.Close()
 			}
 		case relay.FrameControl:
 			ss.onControl(f.Payload)
 		}
 	}
+}
+
+// openExec runs one exec through the real runner and pumps its messages back,
+// which is the same demux internal/relay's own serveSession does — repeated
+// here because this file speaks relay frames directly rather than through it.
+//
+// A sandbox with no exec runner simply closes the attachment, which is
+// deliberately indistinguishable from one that predates the Kind field: the
+// caller never receives an exec_started, and the plane refuses on the missing
+// handshake.
+func (ss *scriptedSessiond) openExec(ctx context.Context, f relay.Frame) {
+	execs := ss.execRunner()
+	if execs == nil || f.Exec == nil {
+		raw, err := relay.Encode(relay.Frame{Type: relay.FrameClose, AttachID: f.AttachID})
+		if err == nil {
+			ss.conn.Write(ctx, raw)
+		}
+		return
+	}
+	att := execs.OpenExec(*f.Exec)
+	ss.mu.Lock()
+	if ss.execAtts == nil {
+		ss.execAtts = map[uint64]relay.ExecAttachment{}
+	}
+	ss.execAtts[f.AttachID] = att
+	ss.mu.Unlock()
+	go func() {
+		for m := range att.Msgs() {
+			ss.send(ctx, f.AttachID, m)
+		}
+		ss.mu.Lock()
+		delete(ss.execAtts, f.AttachID)
+		ss.mu.Unlock()
+		if raw, err := relay.Encode(relay.Frame{Type: relay.FrameClose, AttachID: f.AttachID}); err == nil {
+			ss.conn.Write(ctx, raw)
+		}
+	}()
+}
+
+func (ss *scriptedSessiond) execAttachment(id uint64) relay.ExecAttachment {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.execAtts[id]
+}
+
+func (ss *scriptedSessiond) takeExecAttachment(id uint64) relay.ExecAttachment {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	att := ss.execAtts[id]
+	delete(ss.execAtts, id)
+	return att
 }
 
 func (ss *scriptedSessiond) send(ctx context.Context, attachID uint64, m terminal.ServerMessage) {
@@ -2916,4 +3021,418 @@ func agentEgressHosts() []string {
 		hosts = append(hosts, p.Egress...)
 	}
 	return hosts
+}
+
+// ---------------------------------------------------------------------------
+// Scene 14 — `rainier exec`: the whole path, into a real process
+// ---------------------------------------------------------------------------
+
+// execScene stands the fleet up with one running session whose sandbox has a
+// REAL exec runner, and returns the fleet, the session id and the workspace
+// root that sandbox will resolve --cwd and --log against.
+func execScene(t *testing.T, name string) (*fleet, string, string) {
+	t.Helper()
+	f := newFleet(t)
+	f.addRunner("vm-a", 2)
+	f.waitRunner("vm-a", true, 30*time.Second)
+
+	created := f.create(name)
+	f.waitSessions(60*time.Second, "the session to reach running", func(rows map[string]apiSession) bool {
+		return rows[created.ID].State == "running"
+	})
+	root := f.sessiond(created.ID).execReady(t)
+	return f, created.ID, root
+}
+
+// exec runs one command through the WHOLE path — the CLI's own loop
+// (internal/execio), controld's exec route, the plane's pairing and its
+// exec_started handshake, the runner's dial-back, the relay's framing, and a
+// real fork/exec at the far end — and returns what the caller would have
+// seen.
+func (f *fleet) exec(id string, spec runner.ExecSpec, stdin *os.File) (execio.Result, string, string, error) {
+	f.t.Helper()
+	var out, errs bytes.Buffer
+	res, err := execio.Run(f.ctx, f.wsBase()+"/v0/sessions/"+id+"/exec", execio.Options{
+		Spec:   spec,
+		Stdin:  stdin,
+		Stdout: &out,
+		Stderr: &errs,
+		Header: http.Header{"Authorization": {"Bearer " + f.token}},
+	})
+	return res, out.String(), errs.String(), err
+}
+
+// shellSpec is a command that needs a shell, named explicitly — which is the
+// whole of exec's no-shell rule: argv is exec'd directly, and a caller who
+// wants a shell types one.
+func shellSpec(script string) runner.ExecSpec {
+	return runner.ExecSpec{Argv: []string{"/bin/sh", "-c", script}}
+}
+
+// TestExecJourney is the design's acceptance list, run end to end against a
+// real process: the exit status is the answer, the streams stay apart, a
+// signal reports 128+N, a missing command is 127, a cwd outside the workspace
+// is 126 with the reason named, and a large stream arrives whole.
+//
+// Every one of these has a unit test somewhere below it. What this scene adds
+// is that the answer survives five hops — and that is where a protocol field
+// with the wrong tag, a plane that forwards the wrong message type, or a
+// runner that drops the spec would show up.
+func TestExecJourney(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("this machine has no /bin/sh")
+	}
+	f, id, root := execScene(t, "execs")
+
+	t.Run("true exits 0", func(t *testing.T) {
+		res, _, _, err := f.exec(id, shellSpec("exit 0"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code, ok := execio.ExitCodeFor(res); code != 0 || !ok {
+			t.Fatalf("exit = (%d, %v), want (0, true); result %+v", code, ok, res)
+		}
+	})
+
+	t.Run("exit 7 exits 7", func(t *testing.T) {
+		res, out, errs, err := f.exec(id, shellSpec("echo out; echo err >&2; exit 7"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code, _ := execio.ExitCodeFor(res); code != 7 {
+			t.Fatalf("exit = %d, want 7; result %+v", code, res)
+		}
+		if out != "out\n" {
+			t.Fatalf("stdout = %q, want %q", out, "out\n")
+		}
+		if errs != "err\n" {
+			t.Fatalf("stderr = %q, want %q", errs, "err\n")
+		}
+	})
+
+	t.Run("a killed command exits 128+N", func(t *testing.T) {
+		res, _, _, err := f.exec(id, shellSpec("kill -TERM $$; sleep 30"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		code, _ := execio.ExitCodeFor(res)
+		if code != 143 {
+			t.Fatalf("a SIGTERM'd command exits %d, want 143 (128+15); result %+v", code, res)
+		}
+	})
+
+	t.Run("a missing command exits 127", func(t *testing.T) {
+		res, _, _, err := f.exec(id, runner.ExecSpec{Argv: []string{"definitely-not-installed"}}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Reason != terminal.ReasonNotFound {
+			t.Fatalf("reason = %q, want not_found; result %+v", res.Reason, res)
+		}
+		if code, _ := execio.ExitCodeFor(res); code != 127 {
+			t.Fatalf("exit = %d, want 127", code)
+		}
+	})
+
+	t.Run("a cwd outside the workspace exits 126", func(t *testing.T) {
+		spec := shellSpec("pwd")
+		spec.Cwd = "/etc"
+		res, _, _, err := f.exec(id, spec, nil)
+		// The plane shape-checks an absolute path outside /workspace before
+		// it carries it anywhere — and NAMES the refusal, so a caller learns
+		// what to fix rather than "the connection ended".
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Reason != terminal.ReasonCwdRefused {
+			t.Fatalf("a cwd of /etc produced %+v", res)
+		}
+		if code, _ := execio.ExitCodeFor(res); code != 126 {
+			t.Fatalf("a refused cwd exits %d, want 126", code)
+		}
+
+		// A RELATIVE escape reaches the sandbox, which is the hop that owns
+		// the answer, and comes back named.
+		spec.Cwd = "escape"
+		if err := os.Symlink(t.TempDir(), filepath.Join(root, "escape")); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		res, _, _, err = f.exec(id, spec, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Reason != terminal.ReasonCwdRefused {
+			t.Fatalf("a cwd through a symlink out of the workspace produced %+v", res)
+		}
+		if code, _ := execio.ExitCodeFor(res); code != 126 {
+			t.Fatalf("exit = %d, want 126", code)
+		}
+	})
+
+	t.Run("the cwd and the environment are the session's", func(t *testing.T) {
+		if err := os.Mkdir(filepath.Join(root, "sub"), 0o755); err != nil && !os.IsExist(err) {
+			t.Fatal(err)
+		}
+		spec := shellSpec("pwd; echo $RAINIER_E2E; echo $CALLER_SET")
+		spec.Cwd = "sub"
+		spec.Env = map[string]string{"CALLER_SET": "yes"}
+		res, out, _, err := f.exec(id, spec, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := filepath.Join(root, "sub") + "\n1\nyes\n"
+		if out != want {
+			t.Fatalf("output = %q, want %q (result %+v)", out, want, res)
+		}
+	})
+
+	t.Run("stdin and its EOF terminate a reader", func(t *testing.T) {
+		in := filepath.Join(root, "input")
+		if err := os.WriteFile(in, []byte("piped through five hops"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		fh, err := os.Open(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer fh.Close()
+		res, out, _, err := f.exec(id, shellSpec("cat"), fh)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != "piped through five hops" {
+			t.Fatalf("cat produced %q (result %+v)", out, res)
+		}
+		if code, _ := execio.ExitCodeFor(res); code != 0 {
+			t.Fatalf("cat exited %d", code)
+		}
+	})
+
+	t.Run("a large stream arrives whole", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("the flood is a long test")
+		}
+		const want = 8 << 20
+		res, out, _, err := f.exec(id,
+			shellSpec("dd if=/dev/zero bs=65536 count=128 2>/dev/null"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(out) != want {
+			t.Fatalf("received %d bytes, want %d — backpressure dropped output (result %+v)",
+				len(out), want, res)
+		}
+		if code, _ := execio.ExitCodeFor(res); code != 0 {
+			t.Fatalf("the generator exited %d", code)
+		}
+	})
+}
+
+// TestExecLeavesTheTerminalAlone is the composition rule with conditional
+// controller ownership, end to end: an exec runs while somebody is attached,
+// and nothing about the terminal moves — not a byte into the scrollback, not
+// the controller generation, not the lease.
+//
+// It is the one property the whole "second KIND of attachment" design exists
+// to protect: `rainier exec s -- cat huge.log` must not scribble a megabyte
+// into the screen of a session somebody is watching.
+func TestExecLeavesTheTerminalAlone(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("this machine has no /bin/sh")
+	}
+	f, id, _ := execScene(t, "quiet")
+
+	// Somebody is attached and watching.
+	viewer := f.attach(id, attachio.Cursor(false, 0))
+	viewer.expect(snapshotFor(id))
+
+	before := f.list()[id]
+
+	res, out, _, err := f.exec(id, shellSpec("echo this-must-not-reach-the-terminal"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "this-must-not-reach-the-terminal\n" {
+		t.Fatalf("the exec's own caller got %q (result %+v)", out, res)
+	}
+
+	// The viewer heard nothing of it. This is the assertion, and it is
+	// stronger than a silence probe: the NEXT thing the viewer receives is
+	// the echo of its own keystroke, so if a single byte of the exec had
+	// reached the session it would arrive here instead.
+	viewer.stdin("still typing")
+	viewer.expect("still typing")
+
+	// And the session's own row is where it was: an exec changes nothing
+	// about the session it ran in.
+	after := f.list()[id]
+	if after.State != before.State || after.Runner != before.Runner {
+		t.Fatalf("an exec changed the session row: %+v -> %+v", before, after)
+	}
+}
+
+// TestExecKillsTheCommandWhenItsCallerGoes is the v1 lifetime rule end to
+// end: an exec's life is its caller's. The process is killed — SIGTERM to its
+// process GROUP, then SIGKILL — so a caller that hangs up does not leave work
+// running in a sandbox nobody is watching.
+func TestExecKillsTheCommandWhenItsCallerGoes(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("this machine has no /bin/sh")
+	}
+	f, id, root := execScene(t, "hangup")
+
+	marker := filepath.Join(root, "still-running")
+	ctx, cancel := context.WithCancel(f.ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = execio.Run(ctx, f.wsBase()+"/v0/sessions/"+id+"/exec", execio.Options{
+			Spec:   shellSpec("touch " + marker + "; sleep 120"),
+			Header: http.Header{"Authorization": {"Bearer " + f.token}},
+		})
+	}()
+
+	// Wait until the command is genuinely running.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("the command never started")
+		}
+		time.Sleep(pollInterval)
+	}
+
+	// The caller goes away.
+	cancel()
+	<-done
+
+	// The exec slot comes back, which is the sandbox's own record that the
+	// process is gone.
+	ss := f.sessiond(id)
+	deadline = time.Now().Add(30 * time.Second)
+	for ss.execRunner().LiveCount() != 0 {
+		if !time.Now().Before(deadline) {
+			t.Fatalf("the caller hung up and %d exec(s) are still running",
+				ss.execRunner().LiveCount())
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
+// TestDetachedExecOutlivesItsCaller is the amendment's motivating case, end
+// to end: `rainier exec s -- claude --continue` has to survive the CLI
+// exiting, with its output in the file the caller named — and it has to die
+// with its session, which is the bound that keeps it from being a leak.
+func TestDetachedExecOutlivesItsCaller(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("this machine has no /bin/sh")
+	}
+	f, id, root := execScene(t, "detached")
+
+	spec := shellSpec("echo started; sleep 120")
+	spec.Detach, spec.LogPath = true, "run.log"
+	res, out, _, err := f.exec(id, spec, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Started || res.PID <= 0 || !res.Detached {
+		t.Fatalf("a detached exec answered %+v", res)
+	}
+	if out != "" {
+		t.Fatalf("a detached exec streamed %q; its output belongs in its log", out)
+	}
+	if code, ok := execio.ExitCodeFor(res); code != 0 || !ok {
+		t.Fatalf("a detached exec exits (%d, %v), want (0, true)", code, ok)
+	}
+
+	// Its output is in the file the caller named, and the process is still
+	// there with its caller long gone.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		body, err := os.ReadFile(filepath.Join(root, "run.log"))
+		if err == nil && strings.Contains(string(body), "started") {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("the detached process never wrote to its log")
+		}
+		time.Sleep(pollInterval)
+	}
+	if err := syscall.Kill(res.PID, 0); err != nil {
+		t.Fatalf("the detached process died with its caller: %v", err)
+	}
+
+	// The SESSION ending is what ends it. That is the whole lifetime rule.
+	f.sessiond(id).execRunner().KillAll()
+	deadline = time.Now().Add(30 * time.Second)
+	for syscall.Kill(res.PID, 0) == nil {
+		if !time.Now().Before(deadline) {
+			t.Fatal("the session's shutdown did not reap the detached process")
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
+// TestExecRefusalsEndToEnd is the design's status table, from the client's
+// side: each refusal is a status code the CLI can act on, answered before the
+// socket is upgraded.
+func TestExecRefusalsEndToEnd(t *testing.T) {
+	f, id, _ := execScene(t, "refusals")
+
+	t.Run("an unknown session is 404 not_found", func(t *testing.T) {
+		_, _, _, err := f.exec("sess_nope", runner.ExecSpec{Argv: []string{"true"}}, nil)
+		var de *execio.DialError
+		if !errors.As(err, &de) || de.Status != http.StatusNotFound || de.Code != "not_found" {
+			t.Fatalf("got %v, want a 404 not_found", err)
+		}
+	})
+
+	t.Run("a stopped session is 409 with its state", func(t *testing.T) {
+		if err := f.client().Do(http.MethodPost, "/v0/sessions/"+id+"/suspend", nil, nil); err != nil {
+			t.Fatalf("suspend: %v", err)
+		}
+		f.waitSessions(60*time.Second, "the session to stop", func(rows map[string]apiSession) bool {
+			return strings.HasPrefix(rows[id].State, "suspended")
+		})
+		_, _, _, err := f.exec(id, runner.ExecSpec{Argv: []string{"true"}}, nil)
+		var de *execio.DialError
+		if !errors.As(err, &de) || de.Status != http.StatusConflict {
+			t.Fatalf("got %v, want a 409", err)
+		}
+		if de.Code != "session_not_running" || !strings.HasPrefix(de.State, "suspended") {
+			t.Fatalf("the 409 carried code %q state %q", de.Code, de.State)
+		}
+	})
+}
+
+// TestExecAgainstASandboxThatCannotExec is the permanent row of the
+// compatibility matrix, end to end: a session whose sandbox predates exec
+// answers a TERMINAL open, the plane refuses on the missing exec_started, and
+// the caller gets a clean named failure rather than somebody else's screen.
+func TestExecAgainstASandboxThatCannotExec(t *testing.T) {
+	f := newFleet(t)
+	f.addRunner("vm-a", 2)
+	f.waitRunner("vm-a", true, 30*time.Second)
+	created := f.create("old-sandbox")
+	f.waitSessions(60*time.Second, "the session to reach running", func(rows map[string]apiSession) bool {
+		return rows[created.ID].State == "running"
+	})
+	// Deliberately NOT execReady: this sandbox has no exec runner at all,
+	// which is the shape a sessiond that predates the feature has.
+
+	res, out, _, err := f.exec(created.ID, runner.ExecSpec{Argv: []string{"true"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Reason != terminal.ReasonUnsupported || res.Started {
+		t.Fatalf("result = %+v, want an unsupported refusal", res)
+	}
+	if out != "" {
+		t.Fatalf("the agent's screen leaked to an exec caller: %q", out)
+	}
+	if code, ok := execio.ExitCodeFor(res); ok {
+		t.Fatalf("an unsupported sandbox decided the exit code (%d); it is Rainier's own failure", code)
+	}
 }

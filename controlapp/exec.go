@@ -127,8 +127,15 @@ func (s *AttachmentService) ExecCommand(ctx context.Context, scope control.Scope
 		control.AttachmentController); err != nil {
 		return control.ErrDenied
 	}
-	if err := ValidateExec(cmd); err != nil {
-		return err
+	if reason := ExecRefusal(cmd); reason != "" {
+		// Named, not just refused. The socket is already upgraded, so a
+		// status code has nowhere to go — and a caller closed without a word
+		// would report "the connection ended before the command reported an
+		// exit status" for a cwd it could have fixed. The reason travels in
+		// the same closed vocabulary the sandbox's own refusals use, so the
+		// CLI maps it to the same exit code either way.
+		tellExecRefusal(ctx, stream, reason)
+		return control.ErrInvalid
 	}
 	// RUNNING, and only running. Attach also admits a `failed` session whose
 	// runner is still connected, because the whole point of that attach is to
@@ -234,63 +241,74 @@ func ExecCommandName(argv []string) string {
 	return name
 }
 
-// ValidateExec is the SHAPE check the plane applies before it carries a
-// command anywhere. It is deliberately not the whole check: the sandbox
-// re-derives every path against the filesystem it actually has, and re-reads
-// every environment name, because the last hop before a syscall trusts
-// nobody. This is the hop before it, refusing early what can be refused
-// without a filesystem.
+// tellExecRefusal sends one exec_error and closes, so a caller refused at the
+// plane learns the same thing it would have learned from the sandbox.
+func tellExecRefusal(ctx context.Context, stream control.TerminalStream, reason string) {
+	_ = stream.Send(ctx, terminal.ServerMessage{Type: terminal.TypeExecError, Reason: reason})
+}
+
+// ExecRefusal is the SHAPE check, answering in the closed wire vocabulary: it
+// returns the reason this command will not be carried, or the empty string
+// when it will. The sandbox applies the same rules again against the
+// filesystem it actually has, because the last hop before a syscall trusts
+// nobody; this is the hop before it, refusing early what can be refused
+// without a filesystem, and naming it in the words the CLI already maps to an
+// exit code.
 //
-// It is exported so a host's own route can apply the same rule before it
-// upgrades a socket, which is the only place a shape error can still be a
-// status code.
-func ValidateExec(cmd ExecCommand) error {
-	if len(cmd.Argv) == 0 || cmd.Argv[0] == "" || len(cmd.Argv) > maxExecArgv {
-		return control.ErrInvalid
+// It is exported so a host writing its own route refuses the same things with
+// the same words, rather than inventing a second vocabulary for the same
+// answers.
+func ExecRefusal(cmd ExecCommand) string {
+	switch {
+	case len(cmd.Argv) == 0, cmd.Argv[0] == "", len(cmd.Argv) > maxExecArgv:
+		return terminal.ReasonNotFound
 	}
 	total := 0
 	for _, arg := range cmd.Argv {
 		if strings.ContainsRune(arg, 0) {
-			return control.ErrInvalid
+			return terminal.ReasonNotFound
 		}
 		total += len(arg)
 	}
 	if total > maxExecArgvBytes {
-		return control.ErrInvalid
+		return terminal.ReasonNotFound
 	}
 	if len(cmd.Env) > maxExecEnv {
-		return control.ErrInvalid
+		return terminal.ReasonEnvRefused
 	}
 	for name, value := range cmd.Env {
 		if name == "" || strings.ContainsRune(name, 0) ||
 			strings.ContainsRune(name, '=') || strings.ContainsRune(value, 0) {
-			return control.ErrInvalid
+			return terminal.ReasonEnvRefused
 		}
 	}
 	if cmd.Cwd != "" {
 		if err := workspace.ValidatePath(cmd.Cwd); err != nil {
-			return control.ErrInvalid
+			return terminal.ReasonCwdRefused
 		}
 	}
-	// --log is required with --detach and refused without it. A log for an
-	// attached exec would be a second, silent copy of a stream the caller is
-	// already reading; a detached run with nowhere for its output to go is
-	// the half-feature the design refused to ship.
 	switch {
 	case cmd.Detach && cmd.Log == "":
-		return control.ErrInvalid
+		return terminal.ReasonLogRefused
 	case !cmd.Detach && cmd.Log != "":
-		return control.ErrInvalid
+		return terminal.ReasonLogRefused
 	case cmd.Detach:
 		if err := workspace.ValidatePath(cmd.Log); err != nil {
-			return control.ErrInvalid
+			return terminal.ReasonLogRefused
 		}
 	}
-	// A size without a terminal is a size for nothing. It is not refused —
-	// a client that sends one is harmless — but a terminal without a size
-	// would leave the sandbox opening a pty at 0x0, which no program draws
-	// on.
 	if cmd.TTY && (cmd.Cols <= 0 || cmd.Rows <= 0) {
+		// A terminal with no size would leave the sandbox opening a pty at
+		// 0x0, which no program draws on.
+		return terminal.ReasonNotExecutable
+	}
+	return ""
+}
+
+// ValidateExec is ExecRefusal as a sentinel, for the callers that only need
+// to know whether a command is carryable.
+func ValidateExec(cmd ExecCommand) error {
+	if ExecRefusal(cmd) != "" {
 		return control.ErrInvalid
 	}
 	return nil

@@ -111,28 +111,69 @@ func (s *Server) mayExec(w http.ResponseWriter, r *http.Request, u User, id stri
 		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to run commands in this session")
 		return false
 	}
+	connected := row.RunnerID != "" && s.runnerConnected(string(row.RunnerID))
+	if refusal, refused := execReadiness(row, connected,
+		func() bool { return s.runnerSupportsExec(r.Context(), row.RunnerID) }); refused {
+		refusal.write(w)
+		return false
+	}
+	return true
+}
+
+// execRefusal is one row of the design's status table: what to answer, and
+// the state to name when the answer is a conflict.
+type execRefusal struct {
+	status  int
+	code    string
+	message string
+	state   control.SessionState
+}
+
+func (e execRefusal) write(w http.ResponseWriter) {
+	if e.status == http.StatusConflict {
+		// The one answer that carries more than the envelope. "Not running"
+		// is only actionable if the caller is told WHICH not-running it is: a
+		// suspended session is one `rainier resume` away and a destroyed one
+		// is not.
+		writeJSON(w, http.StatusConflict, execConflict{
+			Error: errorBody{Code: e.code, Message: e.message},
+			State: string(e.state),
+		})
+		return
+	}
+	writeErr(w, e.status, e.code, e.message)
+}
+
+// execReadiness is the readiness half of the status table as a pure decision,
+// so every row of it is testable without a live fleet — which the last one,
+// "the runner cannot forward an exec", otherwise is not: a runnerd built from
+// this tree always announces exec.v1, on purpose.
+//
+// supportsExec is a function rather than a boolean because it is a store
+// read, and a caller refused earlier must not pay for one.
+func execReadiness(row control.Session, connected bool, supportsExec func() bool) (execRefusal, bool) {
 	// Not running: a conflict with the resource's current state, with the
 	// state named. A suspended session is deliberately NOT resumed — resuming
 	// costs minutes, can fail, and changes what the caller is billed for, so
 	// `rainier exec s -- git status` must never be an expensive surprise. A
 	// script that means it writes `rainier resume s && rainier exec s -- …`.
 	if row.State != control.StateRunning {
-		writeExecConflict(w, row.State)
-		return false
+		return execRefusal{status: http.StatusConflict, code: "session_not_running",
+			message: fmt.Sprintf("session is %s, not running", row.State),
+			state:   row.State}, true
 	}
-	if row.RunnerID == "" || !s.runnerConnected(string(row.RunnerID)) {
+	if !connected {
 		// 503 rather than attach's 502: the runner is a dependency that is
 		// expected back, and 503 is the code a client retries on. A gateway
 		// that turns a 502 into a retry is guessing.
-		writeErr(w, http.StatusServiceUnavailable, "runner_unreachable", "runner is not connected")
-		return false
+		return execRefusal{status: http.StatusServiceUnavailable,
+			code: "runner_unreachable", message: "runner is not connected"}, true
 	}
-	if !s.runnerSupportsExec(r.Context(), row.RunnerID) {
-		writeErr(w, http.StatusNotImplemented, "exec_unsupported",
-			"the runner holding this session cannot run commands in it")
-		return false
+	if !supportsExec() {
+		return execRefusal{status: http.StatusNotImplemented, code: "exec_unsupported",
+			message: "the runner holding this session cannot run commands in it"}, true
 	}
-	return true
+	return execRefusal{}, false
 }
 
 // execConflict is the 409's body: the standard envelope with the session's
@@ -142,14 +183,6 @@ func (s *Server) mayExec(w http.ResponseWriter, r *http.Request, u User, id stri
 type execConflict struct {
 	Error errorBody `json:"error"`
 	State string    `json:"state"`
-}
-
-func writeExecConflict(w http.ResponseWriter, state control.SessionState) {
-	writeJSON(w, http.StatusConflict, execConflict{
-		Error: errorBody{Code: "session_not_running",
-			Message: fmt.Sprintf("session is %s, not running", state)},
-		State: string(state),
-	})
 }
 
 // runnerSupportsExec reports whether the runner holding this session

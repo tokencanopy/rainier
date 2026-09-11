@@ -1,14 +1,31 @@
 # `rainier exec` — running one command inside a live session
 
-`rainier exec <session> [--tty] [--cwd DIR] [--env K=V]... -- <command> [args...]`
+`rainier exec <session> [--tty] [--cwd DIR] [--env K=V]... [--detach --log PATH] -- <command> [args...]`
 runs a command inside an existing session's sandbox, as the session's own
 user, streams its stdout and stderr (or a PTY) back to the caller, forwards
 stdin when the caller has one, and exits with the command's exit code.
 
-It builds on [conditional controller
-ownership](2026-09-10-conditional-controller-ownership.md) (PR #84) and is
-written against that branch's shape, not against the older attach path.
-Implementation waits for #84 to merge.
+**Status: implemented.** It builds on conditional controller ownership (#84,
+merged) and is written against that shape, not against the older attach path.
+
+Four things changed between this document being approved and being built, and
+each is written into the section it belongs to rather than left as an
+addendum. They are listed here so a reader of the original can find them:
+
+1. **`--detach` is in scope for v1**, in the minimal shape described under
+   [Scope](#scope) and [Detached exec](#detached-exec). The motivating use
+   case — `rainier exec s -- claude --continue …` to resume an interrupted
+   unattended run — needs the process to outlive the caller, and the reasons
+   this document gave for deferring it turn out to be answerable in one
+   paragraph each rather than in a design of their own.
+2. **`argv[0]` resolves on the SESSION's PATH**, the one sessiond composed
+   for the agent, never sessiond's own.
+3. **End of input is an explicit frame**, `exec_stdin_eof`, because a socket
+   that is still open cannot express "no more input" and `cat` with a pipe on
+   the other end has to terminate. (The message table below said `exec_eof`;
+   the built name is `exec_stdin_eof`, which says which stream it ends.)
+4. **A session that is deleted or suspended mid-exec is 125**, the same as a
+   sandbox that died, with the caller's message naming which.
 
 ## Problem
 
@@ -43,11 +60,11 @@ that same machinery, not a second machinery.
 ## Scope
 
 In: one command, one sandbox, streamed both ways, exit code returned, `--tty`,
-`--cwd`, `--env`, `--json`. The self-hosted route, the CLI, and what Cloud has
-to add to route the same call.
+`--cwd`, `--env`, `--json`, and a minimal `--detach`. The self-hosted route,
+the CLI, and what Cloud has to add to route the same call.
 
-Out: see [Non-goals](#non-goals). In particular there is no detached exec in
-v1, and no timeout the server imposes.
+Out: see [Non-goals](#non-goals). In particular there is no timeout the server
+imposes.
 
 ## Model
 
@@ -167,12 +184,45 @@ grace, then `SIGKILL` to the group. The group matters for the reason
 grandchildren that inherit the pipes, and signalling the leader alone leaves
 them holding the far end.
 
-Killing rather than orphaning is the v1 answer because the alternative is a
-half-feature: a process that survives its caller needs somewhere for its
-output to go, a way to be listed, a way to be killed, and a way to be reaped
-when the session is suspended. That is `--detach`, and it is **out of scope
-for v1** ([non-goals](#non-goals)). Until it exists, an exec's lifetime is its
-caller's, which is a rule a script can reason about.
+Killing rather than orphaning is the answer for an ATTACHED exec, which is
+every exec that did not ask otherwise. An exec's lifetime is its caller's,
+which is a rule a script can reason about.
+
+### Detached exec
+
+`--detach` is the exception, and it is in scope for v1 because the case that
+motivates this whole design needs it: `rainier exec s -- claude --continue …`
+resumes an interrupted unattended run, and an unattended run whose supervisor
+has to sit on a socket for six hours is not unattended.
+
+This document originally deferred it on the grounds that "a process that
+survives its caller needs somewhere for its output to go, a way to be listed,
+a way to be killed, and a way to be reaped when the session is suspended".
+Three of those four have one-line answers, and the fourth turns out not to be
+needed:
+
+- **Somewhere for its output to go** — `--log PATH`, named by the caller,
+  required with `--detach`, and resolved inside `/workspace` exactly as
+  `--cwd` is. A detached process writing outside the tree its session owns is
+  the same escape `--cwd` refuses, by a slower route.
+- **A way to be killed** — `rainier exec s -- kill <pid>`. The sandbox answers
+  `exec_started{pid}` and closes the attachment; the CLI prints the pid on
+  stdout and exits 0. There is no `rainier exec --kill`, because a sandbox
+  already has a perfectly good one and it is audited like any other command.
+- **A way to be reaped** — the session. A detached process is killed when the
+  session is suspended, stopped or destroyed, on the same path that kills the
+  agent's child. It is never killed by its caller disconnecting; that is the
+  entire difference the flag makes.
+- **A way to be listed** — not needed in v1, and deliberately not built. The
+  caller has the pid, the sandbox has `ps`, and a listing API would be a
+  second source of truth about processes the sandbox already knows about.
+
+The process is spawned in its own process group with stdin on `/dev/null`,
+and it counts against the same eight-exec cap an attached one does, because
+it is a process in the same container.
+
+`--detach` and `--tty` are refused together: a detached command has no
+terminal to attach one to.
 
 ## Protocol changes
 
@@ -240,7 +290,7 @@ type would mean a third decode at every hop. New type words only.
 |---|---|---|
 | client → server | `exec_start` | `Exec` — the spec above; must be the first message |
 | client → server | `stdin` | `Data`; no `gen`, ever |
-| client → server | `exec_eof` | — (close the process's stdin) |
+| client → server | `exec_stdin_eof` | — (close the process's stdin) |
 | client → server | `resize` | `Cols`, `Rows`; `--tty` only, ignored otherwise |
 | client → server | `exec_signal` | `Signal` — `"TERM"` or `"INT"`, nothing else |
 | server → client | `exec_started` | — the process exists; **the handshake** |
@@ -250,7 +300,7 @@ type would mean a third decode at every hop. New type words only.
 | server → client | `exec_error` | `Reason` — a closed vocabulary, never free prose |
 
 `exec_error`'s vocabulary is `unsupported`, `not_found`, `not_executable`,
-`cwd_refused`, `env_refused`, `too_many_execs`. It is closed because the CLI
+`cwd_refused`, `env_refused`, `log_refused`, `too_many_execs`. It is closed because the CLI
 maps it to an exit code and a sentence, and because a free-form string from
 inside a sandbox is a string a user's terminal renders.
 
@@ -320,6 +370,19 @@ terminal, not a shell. A caller who wants a shell types one — `rainier exec s
 -- sh -c 'cd src && make'` — which is visible in what they typed and in what
 is audited.
 
+**The PATH is the session's.** `argv[0]` is resolved against the `PATH` of the
+environment composed above — the agent's — and never against `sessiond`'s own
+ambient one. `os/exec`'s `LookPath` reads the ambient one, and the two are the
+same string only by coincidence; the day they differ is the day a session's
+environment adds a toolchain, and `rainier exec s -- make` has to find the
+`make` the agent would have found. A name containing a slash is a path and is
+never searched for, exactly as a shell treats it, and a relative one resolves
+against the exec's own cwd. A candidate that exists but is not executable does
+not end the search — it is remembered, so that a stray non-executable `make`
+early on the path does not shadow the real one, and it is what turns the
+answer from `not_found` (127) into `not_executable` (126) when nothing
+runnable is found.
+
 **Pty.** Under `--tty`, `pty.StartWithSize` with the caller's size, exactly
 `StartProc`'s mechanism. A pty has one stream, so `--tty` merges stdout and
 stderr into `exec_stdout` — which is why it is a flag and not the default, and
@@ -355,6 +418,15 @@ The rule that makes the third row safe is worth stating on its own: **a new
 plane accepts an exec only from a sandbox that said `exec_started`.** No byte
 of the caller's stdin is forwarded before it, so a sandbox that answered a
 snapshot has received nothing.
+
+Each row is pinned by a test, in both directions:
+
+| Pairing | Pinned by |
+|---|---|
+| **new client + old plane** | `cmd/rainier`'s `TestExecDialFailureSentences` (a 404 with no envelope is the version sentence) and `TestExecURLIsItsOwnRoute` (it is not an attach URL). `internal/controld`'s `TestExecRouteIsNotAnAttachParameter` is the negative half: `attach?kind=exec` opens a TERMINAL attachment and means nothing. |
+| **old client + new plane** | `protocol/{runner,terminal}`'s `TestExecIsAdditiveOnTheDialAttach`, `TestExecMessagesAreAdditive`, and `internal/relay`'s `TestTerminalFrameWireShape` — every existing message and frame is byte-identical, so an old client's traffic is unchanged. |
+| **new plane + old sandbox** | `attachplane`'s `TestExecRequiresExecStarted` (a snapshot, an output, an exit, an attached, and stdout-before-the-handshake are each refused, with no stdin forwarded) and `TestExecRefusesASilentSandbox`; `internal/controld`'s `TestExecAgainstAnOldSandboxIsRefusedCleanly`; `internal/e2e`'s `TestExecAgainstASandboxThatCannotExec`. |
+| **new sandbox + old plane** | `internal/relay`'s `TestAnExecFrameOnAnOldDecoderIsATerminalOpen` (an exec frame decodes on a build that predates the field as an ordinary terminal open) and `TestFrameOpenRoutesByKind` (an absent kind reaches `session.Attach` exactly as today). |
 
 ## API and CLI contract
 
@@ -585,6 +657,16 @@ client, the CLI exits **125** with `the connection to the session ended before
 the command reported an exit status`. The command's effects on the workspace
 are whatever they were; nothing pretends otherwise.
 
+**The session is deleted or suspended mid-exec.** The same 125, and the same
+reason: from the caller's side these are one event — the connection ended
+without a status — and inventing a distinction the CLI cannot actually observe
+would be worse than admitting the one it can. What it does do is NAME which,
+by re-reading the session once, briefly and best-effort, on its way out: "the
+session was stopped before the command reported an exit status", or "deleted",
+or "the session's sandbox ended". A person reading a build log can act on the
+difference; a script reading the exit code does not have to learn a fourth
+reserved number to get it.
+
 ## Verification
 
 One seam per hop, so that nothing needs a container to be tested except the
@@ -598,6 +680,7 @@ thing that is actually about containers.
 | **controlapp policy** | Table over (policy grants control / grants view only / grants neither) asserting `AuthorizeAttachment` is asked with `AttachmentController` **exactly once** per exec, that a refusal is `control.ErrDenied` → `403`, and that a view-only principal is refused rather than silently downgraded — the attach path's "admit as a viewer" rule has no meaning here, because there is no reduced exec. |
 | **route** | The status table above, each row pinned pre-upgrade: `404`, `403`, `409` *with the state in the body*, `503`, `501`. Plus: a sandbox whose first server message is a `snapshot` closes `exec_unsupported` and forwards no stdin. |
 | **CLI exit mapping** | `exitCodeFor(result)` as a pure function, table-tested over exit 0/1/7/255, signal TERM/KILL, no-status, not-found, not-executable, cwd-refused — and a test that rainier's own sentences never reach stdout. |
+| **the CLI's own loop** | `internal/execio` is its own package, and its tests drive it over a real websocket against a scripted plane: the spec in the first message, the streams apart, stdin and its explicit EOF, a signal rather than a code, a connection that dies mid-run, and every refused upgrade's envelope. |
 | **e2e** | In `internal/e2e`, through a real relay into a real container: `-- sh -c 'echo out; echo err >&2; exit 7'` asserting stream separation and exit 7; `--tty` asserting merged output and a size; a flood (`yes | head -c 50M`) asserting every byte arrives and no viewer's scrollback changed; and a disconnect asserting the process is gone. |
 
 ## Rollout
@@ -622,9 +705,10 @@ Each step is separately revertable, and no step requires the one after it.
 
 ## Non-goals
 
-- **Detached exec.** No `--detach`, no exec that outlives its caller, no list
-  of running execs, no reattach. It needs output durability, a listing, a kill
-  path and a suspend story; it is a design of its own.
+- **A listing of running execs, or reattaching to one.** `--detach` ships
+  without either (see [Detached exec](#detached-exec)): the caller has the
+  pid, the sandbox has `ps`, and a reattach would need the output durability
+  a log file already provides.
 - **File copy.** `rainier push` and `rainier pull` exist and are bounded,
   checked and resumable. `exec … -- tar` is not a supported way to move files
   and gets no help from this design.

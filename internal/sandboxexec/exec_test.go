@@ -1,4 +1,4 @@
-package main
+package sandboxexec
 
 import (
 	"encoding/json"
@@ -38,7 +38,7 @@ type fakeProc struct {
 	onStderr func([]byte) error
 
 	done   chan struct{}
-	status execStatus
+	status Status
 	once   sync.Once
 }
 
@@ -73,15 +73,15 @@ func (p *fakeProc) Signal(sig syscall.Signal) error {
 	// A real SIGKILL to a process group ends the process; the fake honours
 	// that so the runner's grace-then-kill path terminates in a test.
 	if sig == syscall.SIGKILL || sig == syscall.SIGTERM {
-		p.exit(execStatus{Signal: execSignalWireName(sig)})
+		p.exit(Status{Signal: signalWireName(sig)})
 	}
 	return nil
 }
 
-func (p *fakeProc) Wait() execStatus { <-p.done; return p.status }
-func (p *fakeProc) Pid() int         { return p.pid }
+func (p *fakeProc) Wait() Status { <-p.done; return p.status }
+func (p *fakeProc) Pid() int     { return p.pid }
 
-func (p *fakeProc) exit(st execStatus) {
+func (p *fakeProc) exit(st Status) {
 	p.once.Do(func() {
 		p.status = st
 		close(p.done)
@@ -102,7 +102,7 @@ func (p *fakeProc) stdinBytes() ([]byte, bool) {
 
 type fakeStarter struct {
 	mu      sync.Mutex
-	reqs    []execRequest
+	reqs    []Request
 	procs   []*fakeProc
 	err     error
 	started chan *fakeProc
@@ -112,7 +112,7 @@ func newFakeStarter() *fakeStarter {
 	return &fakeStarter{started: make(chan *fakeProc, 16)}
 }
 
-func (f *fakeStarter) start(req execRequest, onStdout, onStderr func([]byte) error) (execProc, error) {
+func (f *fakeStarter) start(req Request, onStdout, onStderr func([]byte) error) (Proc, error) {
 	f.mu.Lock()
 	f.reqs = append(f.reqs, req)
 	err := f.err
@@ -129,7 +129,7 @@ func (f *fakeStarter) start(req execRequest, onStdout, onStderr func([]byte) err
 	return p, nil
 }
 
-func (f *fakeStarter) lastRequest(t *testing.T) execRequest {
+func (f *fakeStarter) lastRequest(t *testing.T) Request {
 	t.Helper()
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -155,15 +155,15 @@ func (f *fakeStarter) await(t *testing.T) *fakeProc {
 // helpers
 // ---------------------------------------------------------------------------
 
-func testRunner(t *testing.T, start execStarter) (*execRunner, string) {
+func testRunner(t *testing.T, start Starter) (*Runner, string) {
 	t.Helper()
 	root := t.TempDir()
-	return newExecRunner(root, []string{"PATH=/usr/bin:/bin", "HOME=/home/agent"}, start), root
+	return NewRunner(root, []string{"PATH=/usr/bin:/bin", "HOME=/home/agent"}, start), root
 }
 
 // drain reads an attachment to the end, which is how a test sees the whole
 // conversation an exec had with its caller.
-func drain(t *testing.T, a relay.ExecAttachment) []terminal.ServerMessage {
+func drainAttachment(t *testing.T, a relay.ExecAttachment) []terminal.ServerMessage {
 	t.Helper()
 	var out []terminal.ServerMessage
 	timeout := time.After(10 * time.Second)
@@ -197,7 +197,7 @@ func execSpecIn(root string, argv ...string) runner.ExecSpec {
 
 // withTool puts an executable named `name` on the runner's session PATH and
 // returns the spec that names it.
-func withTool(t *testing.T, r *execRunner, name string) runner.ExecSpec {
+func withTool(t *testing.T, r *Runner, name string) runner.ExecSpec {
 	t.Helper()
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\n"), 0o755); err != nil {
@@ -223,9 +223,9 @@ func TestExecReportsTheCommandsExitCode(t *testing.T) {
 
 			a := r.OpenExec(spec)
 			p := start.await(t)
-			p.exit(execStatus{Code: code})
+			p.exit(Status{Code: code})
 
-			msgs := drain(t, a)
+			msgs := drainAttachment(t, a)
 			if got := types(msgs); len(got) != 2 ||
 				got[0] != terminal.TypeExecStarted || got[1] != terminal.TypeExecExit {
 				t.Fatalf("message types = %v, want [exec_started exec_exit]", got)
@@ -249,9 +249,9 @@ func TestExecReportsASignalRatherThanACode(t *testing.T) {
 
 	a := r.OpenExec(spec)
 	p := start.await(t)
-	p.exit(execStatus{Signal: "killed"})
+	p.exit(Status{Signal: "killed"})
 
-	msgs := drain(t, a)
+	msgs := drainAttachment(t, a)
 	last := msgs[len(msgs)-1]
 	if last.Type != terminal.TypeExecExit || last.Signal != "killed" || last.ExitCode != 0 {
 		t.Fatalf("signalled exit = %+v", last)
@@ -272,10 +272,10 @@ func TestExecStartedIsAlwaysFirst(t *testing.T) {
 		for i := 0; i < 20; i++ {
 			_ = p.onStdout([]byte("x"))
 		}
-		p.exit(execStatus{})
+		p.exit(Status{})
 	}()
 
-	msgs := drain(t, a)
+	msgs := drainAttachment(t, a)
 	if msgs[0].Type != terminal.TypeExecStarted {
 		t.Fatalf("the first message was %q, want exec_started", msgs[0].Type)
 	}
@@ -298,11 +298,11 @@ func TestExecSeparatesStdoutFromStderr(t *testing.T) {
 	go func() {
 		_ = p.onStdout([]byte("out"))
 		_ = p.onStderr([]byte("err"))
-		p.exit(execStatus{})
+		p.exit(Status{})
 	}()
 
 	var out, errs string
-	for _, m := range drain(t, a) {
+	for _, m := range drainAttachment(t, a) {
 		switch m.Type {
 		case terminal.TypeExecStdout:
 			out += string(m.Data)
@@ -343,7 +343,7 @@ func TestExecBackpressureDropsNothing(t *testing.T) {
 				return
 			}
 		}
-		p.exit(execStatus{})
+		p.exit(Status{})
 	}()
 
 	var got strings.Builder
@@ -405,8 +405,8 @@ func TestExecForwardsStdinAndItsEOF(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	p.exit(execStatus{})
-	drain(t, a)
+	p.exit(Status{})
+	drainAttachment(t, a)
 }
 
 // TestExecResizeAndSignalReachTheProcess pins the two client messages that
@@ -447,8 +447,8 @@ func TestExecResizeAndSignalReachTheProcess(t *testing.T) {
 	if !sawINT {
 		t.Fatalf("signals = %v, want SIGINT among them", p.sentSignals())
 	}
-	p.exit(execStatus{})
-	drain(t, a)
+	p.exit(Status{})
+	drainAttachment(t, a)
 }
 
 // TestExecDropsTheOwnershipVocabulary is the mirror of the rule #84 put on
@@ -479,8 +479,8 @@ func TestExecDropsTheOwnershipVocabulary(t *testing.T) {
 	if sigs := p.sentSignals(); len(sigs) != 0 {
 		t.Fatalf("an ownership message signalled the process: %v", sigs)
 	}
-	p.exit(execStatus{})
-	for _, m := range drain(t, a) {
+	p.exit(Status{})
+	for _, m := range drainAttachment(t, a) {
 		switch m.Type {
 		case terminal.TypeAttached, terminal.TypeStale,
 			terminal.TypeControlChanged, terminal.TypeControlAck:
@@ -510,7 +510,7 @@ func TestExecKillsTheProcessWhenItsCallerGoes(t *testing.T) {
 	}
 
 	a.Close()
-	drain(t, a)
+	drainAttachment(t, a)
 
 	var sawTERM bool
 	for _, s := range p.sentSignals() {
@@ -521,8 +521,8 @@ func TestExecKillsTheProcessWhenItsCallerGoes(t *testing.T) {
 	if !sawTERM {
 		t.Fatalf("signals after a caller disconnect = %v, want SIGTERM", p.sentSignals())
 	}
-	if r.liveCount() != 0 {
-		t.Fatalf("the exec slot was not released: %d still live", r.liveCount())
+	if r.LiveCount() != 0 {
+		t.Fatalf("the exec slot was not released: %d still live", r.LiveCount())
 	}
 }
 
@@ -540,7 +540,7 @@ func TestExecCapRefusesTheNinth(t *testing.T) {
 
 	var live []relay.ExecAttachment
 	var procs []*fakeProc
-	for i := 0; i < maxConcurrentExecs; i++ {
+	for i := 0; i < MaxConcurrent; i++ {
 		a := r.OpenExec(spec)
 		live = append(live, a)
 		procs = append(procs, start.await(t))
@@ -550,7 +550,7 @@ func TestExecCapRefusesTheNinth(t *testing.T) {
 	}
 
 	refused := r.OpenExec(spec)
-	msgs := drain(t, refused)
+	msgs := drainAttachment(t, refused)
 	if len(msgs) != 1 || msgs[0].Type != terminal.TypeExecError ||
 		msgs[0].Reason != terminal.ReasonTooManyExecs {
 		t.Fatalf("the ninth exec got %+v, want one exec_error too_many_execs", msgs)
@@ -558,17 +558,17 @@ func TestExecCapRefusesTheNinth(t *testing.T) {
 	start.mu.Lock()
 	spawned := len(start.procs)
 	start.mu.Unlock()
-	if spawned != maxConcurrentExecs {
+	if spawned != MaxConcurrent {
 		t.Fatalf("the refused exec spawned something: %d processes", spawned)
 	}
 
 	// A finished exec gives its slot back.
-	procs[0].exit(execStatus{})
-	drain(t, live[0])
+	procs[0].exit(Status{})
+	drainAttachment(t, live[0])
 	deadline := time.Now().Add(5 * time.Second)
-	for r.liveCount() != maxConcurrentExecs-1 {
+	for r.LiveCount() != MaxConcurrent-1 {
 		if time.Now().After(deadline) {
-			t.Fatalf("live count stuck at %d", r.liveCount())
+			t.Fatalf("live count stuck at %d", r.LiveCount())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -613,7 +613,7 @@ func TestExecRefusesACwdOutsideTheWorkspace(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			s := spec
 			s.Cwd = cwd
-			msgs := drain(t, r.OpenExec(s))
+			msgs := drainAttachment(t, r.OpenExec(s))
 			if len(msgs) != 1 || msgs[0].Reason != terminal.ReasonCwdRefused {
 				t.Fatalf("cwd %q got %+v, want one exec_error cwd_refused", cwd, msgs)
 			}
@@ -629,8 +629,8 @@ func TestExecRefusesACwdOutsideTheWorkspace(t *testing.T) {
 	if got := start.lastRequest(t).Dir; got != filepath.Join(root, "inside") {
 		t.Fatalf("cwd resolved to %q", got)
 	}
-	p.exit(execStatus{})
-	drain(t, a)
+	p.exit(Status{})
+	drainAttachment(t, a)
 }
 
 // TestExecEnvRule is the rule about NAMES, and the reason it is a rule rather
@@ -652,7 +652,7 @@ func TestExecEnvRule(t *testing.T) {
 			spec := withTool(t, r, "tool")
 			const value = "s3cr3t-value"
 			spec.Env = map[string]string{name: value}
-			msgs := drain(t, r.OpenExec(spec))
+			msgs := drainAttachment(t, r.OpenExec(spec))
 			if len(msgs) != 1 || msgs[0].Reason != terminal.ReasonEnvRefused {
 				t.Fatalf("env %q got %+v, want one exec_error env_refused", name, msgs)
 			}
@@ -675,7 +675,7 @@ func TestExecEnvRule(t *testing.T) {
 		r, _ := testRunner(t, start.start)
 		spec := withTool(t, r, "tool")
 		spec.Env = map[string]string{"OK_NAME": "a\x00b"}
-		msgs := drain(t, r.OpenExec(spec))
+		msgs := drainAttachment(t, r.OpenExec(spec))
 		if len(msgs) != 1 || msgs[0].Reason != terminal.ReasonEnvRefused {
 			t.Fatalf("a NUL value got %+v", msgs)
 		}
@@ -694,8 +694,8 @@ func TestExecEnvRule(t *testing.T) {
 				t.Fatalf("env = %v, want %q in it", env, want)
 			}
 		}
-		p.exit(execStatus{})
-		drain(t, a)
+		p.exit(Status{})
+		drainAttachment(t, a)
 	})
 }
 
@@ -717,7 +717,7 @@ func TestExecEnvRefusalIsDeterministic(t *testing.T) {
 		r, _ := testRunner(t, start.start)
 		spec := withTool(t, r, "tool")
 		spec.Env = map[string]string{"PATH": "x", "HOME": "y", "1BAD": "z"}
-		msgs := drain(t, r.OpenExec(spec))
+		msgs := drainAttachment(t, r.OpenExec(spec))
 		if len(msgs) != 1 || msgs[0].Reason != terminal.ReasonEnvRefused {
 			t.Fatalf("run %d got %+v", i, msgs)
 		}
@@ -751,8 +751,8 @@ func TestExecLooksArgvZeroUpOnTheSessionPath(t *testing.T) {
 	if len(req.Argv) != 2 || req.Argv[0] != "make" {
 		t.Fatalf("argv = %v; the child must still see the name the caller typed", req.Argv)
 	}
-	p.exit(execStatus{})
-	drain(t, a)
+	p.exit(Status{})
+	drainAttachment(t, a)
 }
 
 // TestExecLookupFailures keeps 127 and 126 apart, because a caller's script
@@ -784,7 +784,7 @@ func TestExecLookupFailures(t *testing.T) {
 		"an absolute path that is not there": {[]string{"/nope/nope"}, terminal.ReasonNotFound},
 	} {
 		t.Run(name, func(t *testing.T) {
-			msgs := drain(t, r.OpenExec(runner.ExecSpec{Argv: tc.argv}))
+			msgs := drainAttachment(t, r.OpenExec(runner.ExecSpec{Argv: tc.argv}))
 			if len(msgs) != 1 || msgs[0].Type != terminal.TypeExecError || msgs[0].Reason != tc.want {
 				t.Fatalf("%v got %+v, want one exec_error %s", tc.argv, msgs, tc.want)
 			}
@@ -814,8 +814,8 @@ func TestExecPathSearchSkipsANonExecutable(t *testing.T) {
 	if got := start.lastRequest(t).Path; got != real {
 		t.Fatalf("resolved to %q, want %q", got, real)
 	}
-	p.exit(execStatus{})
-	drain(t, a)
+	p.exit(Status{})
+	drainAttachment(t, a)
 }
 
 // TestExecComposesTheSessionEnvironment pins what a child starts from: this
@@ -823,10 +823,9 @@ func TestExecPathSearchSkipsANonExecutable(t *testing.T) {
 // the boot chain's exports. Without them `git status` in an exec would find
 // no credential helper and no identity.
 func TestExecComposesTheSessionEnvironment(t *testing.T) {
-	env := execSessionEnv(
+	env := SessionEnv(
 		[]string{"PATH=/usr/bin", "HOME=/home/agent", "PATH=/usr/bin:/opt/bin"},
-		[]envVar{{Name: "GIT_CONFIG_GLOBAL", Value: "/workspace/.rainier/gitconfig"},
-			{Name: "GIT_TERMINAL_PROMPT", Value: "0"}})
+		[]string{"GIT_CONFIG_GLOBAL=/workspace/.rainier/gitconfig", "GIT_TERMINAL_PROMPT=0"})
 	if !contains(env, "GIT_CONFIG_GLOBAL=/workspace/.rainier/gitconfig") ||
 		!contains(env, "GIT_TERMINAL_PROMPT=0") || !contains(env, "HOME=/home/agent") {
 		t.Fatalf("composed env = %v", env)
@@ -856,8 +855,8 @@ func TestExecTTYAddsTERM(t *testing.T) {
 	if !req.TTY || req.Cols != 100 || req.Rows != 40 {
 		t.Fatalf("the pty request = %+v", req)
 	}
-	p.exit(execStatus{})
-	drain(t, a)
+	p.exit(Status{})
+	drainAttachment(t, a)
 
 	// And without --tty there is no TERM to inherit from the exec itself.
 	plain := withTool(t, r, "tool2")
@@ -866,8 +865,8 @@ func TestExecTTYAddsTERM(t *testing.T) {
 	if contains(start.lastRequest(t).Env, "TERM=xterm-256color") {
 		t.Fatal("a non-tty exec was given a TERM it has no terminal for")
 	}
-	p2.exit(execStatus{})
-	drain(t, a2)
+	p2.exit(Status{})
+	drainAttachment(t, a2)
 }
 
 // ---------------------------------------------------------------------------
@@ -887,7 +886,7 @@ func TestDetachedExecReportsAPidAndCloses(t *testing.T) {
 
 	a := r.OpenExec(spec)
 	p := start.await(t)
-	msgs := drain(t, a)
+	msgs := drainAttachment(t, a)
 	if len(msgs) != 1 || msgs[0].Type != terminal.TypeExecStarted || msgs[0].PID != p.Pid() {
 		t.Fatalf("a detached exec answered %+v, want one exec_started with pid %d", msgs, p.Pid())
 	}
@@ -906,7 +905,7 @@ func TestDetachedExecReportsAPidAndCloses(t *testing.T) {
 	if sigs := p.sentSignals(); len(sigs) != 0 {
 		t.Fatalf("a detached exec was signalled by its caller's disconnect: %v", sigs)
 	}
-	if r.liveCount() != 1 {
+	if r.LiveCount() != 1 {
 		t.Fatalf("a detached exec stopped counting against the cap while still running")
 	}
 
@@ -950,7 +949,7 @@ func TestDetachRequiresALogInsideTheWorkspace(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			s := spec
 			s.Detach, s.LogPath = tc.detach, tc.log
-			msgs := drain(t, r.OpenExec(s))
+			msgs := drainAttachment(t, r.OpenExec(s))
 			if len(msgs) != 1 || msgs[0].Reason != terminal.ReasonLogRefused {
 				t.Fatalf("got %+v, want one exec_error log_refused", msgs)
 			}
