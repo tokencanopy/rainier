@@ -562,18 +562,35 @@ type attachmentFakePolicy struct {
 	calls    int
 	lastMode control.AttachmentMode
 	asked    []control.AttachmentMode
+	// principals is the identity each question's CONTEXT carried, in the
+	// same order as asked. A host policy resolves its caller from the
+	// context — that is what ownerOrAdmin and every hosted authorizer do —
+	// so a fake that ignored the context could not tell a question about the
+	// attaching user from a question about nobody, which is exactly the
+	// defect it failed to see.
+	principals []string
 }
 
-func (f *attachmentFakePolicy) AuthorizeAttachment(_ context.Context, _ control.Scope, _ control.Resource, mode control.AttachmentMode) error {
+func (f *attachmentFakePolicy) AuthorizeAttachment(ctx context.Context, _ control.Scope, _ control.Resource, mode control.AttachmentMode) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	f.lastMode = mode
 	f.asked = append(f.asked, mode)
+	who, _ := testPrincipalFrom(ctx)
+	f.principals = append(f.principals, who)
 	if f.deny != nil && f.deny[mode] {
 		return control.ErrDenied
 	}
 	return f.err
+}
+
+// principalsAsked is the identity every question this policy was asked
+// carried, in order, with "" for a question about nobody.
+func (f *attachmentFakePolicy) principalsAsked() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.principals...)
 }
 
 // modes is every mode this policy was asked about, in order. The FIRST is the

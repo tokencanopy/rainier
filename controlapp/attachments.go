@@ -171,9 +171,55 @@ type controllerKeeper struct {
 	policy   AttachmentPolicy
 	scope    control.Scope
 	resource control.Resource
+	// identity is the context that AUTHORIZED this attach, captured where
+	// the keeper was built and carried for the attach's whole life. It is
+	// the answer to "who is asking" on every policy question this keeper
+	// asks later, and it has to be captured because by then there is nobody
+	// to ask: a mid-attach claim is handled on the RUNNER's dial-back
+	// request, which is authenticated as a runner and carries no principal
+	// at all, so a policy that resolves its caller from the context would
+	// refuse the session's own creator.
+	//
+	// Values only, and never the runner's — see policyContext. A nil
+	// identity is a keeper built without one, which asks exactly as it did
+	// before.
+	identity context.Context
 	ws       control.WorkspaceID
 	id       control.SessionID
 	holder   string
+}
+
+// policyContext is the context one of this keeper's policy questions is asked
+// on: the VALUES of the context that authorized the attach, and the deadline
+// and cancellation of the call being made now.
+//
+// Both halves are deliberate. The values are the authorizing context's alone
+// and are never merged with the live call's, because the live call is the
+// runner's dial-back — a runner must not be able to contribute a value to an
+// authorization decision about a user. The deadline and cancellation are the
+// live call's alone, because a policy that is a network call must die with
+// the claim that asked it, and a captured context must not be able to keep
+// one alive after the attach is gone.
+//
+// The keeper's STORE calls are not routed through this. They are not
+// authorization decisions, they are already fenced by the generation, and a
+// host repository that reads a request-scoped value (a transaction handle,
+// say) must see the context of the call it is actually serving.
+type policyContext struct {
+	context.Context                 // the live call: deadline, cancellation, Err
+	identity        context.Context // the attach that was authorized: values only
+}
+
+func (c policyContext) Value(key any) any { return c.identity.Value(key) }
+
+// authorizing returns the context this keeper's policy questions are asked
+// on. A keeper with no captured identity asks on the caller's own context,
+// which is what every composer got before this existed.
+func (k controllerKeeper) authorizing(ctx context.Context) context.Context {
+	if k.identity == nil {
+		return ctx
+	}
+	return policyContext{Context: ctx, identity: k.identity}
 }
 
 var _ control.ControllerLeaseKeeper = controllerKeeper{}
@@ -192,7 +238,8 @@ var _ control.ControllerLeaseKeeper = controllerKeeper{}
 // attach's: the generation is the authority and the lease is only the hint,
 // so the claim stands and the heartbeat installs the lease on its next pass.
 func (k controllerKeeper) Claim(ctx context.Context, expected uint64) (uint64, error) {
-	if err := k.policy.AuthorizeAttachment(ctx, k.scope, k.resource, control.AttachmentController); err != nil {
+	if err := k.policy.AuthorizeAttachment(k.authorizing(ctx),
+		k.scope, k.resource, control.AttachmentController); err != nil {
 		return 0, control.ErrDenied
 	}
 	return k.claimAuthorized(ctx, expected)
@@ -226,6 +273,14 @@ func (k controllerKeeper) claimAuthorized(ctx context.Context, expected uint64) 
 // ErrStale is how a controller displaced by an attach on another replica
 // finds out: nothing pushed it a message, its own heartbeat simply stopped
 // being accepted.
+//
+// It asks the host's policy NOTHING, and neither do Release or State. That is
+// what lets them run on the runner's dial-back context — the heartbeat, a
+// release on the way out, the read behind a refusal — and it is asserted by a
+// test, so that a policy question added to one of them without routing it
+// through authorizing() fails rather than silently refusing every heartbeat.
+// A claim is the only privilege here; extending a lease the store already
+// granted is not a second decision.
 func (k controllerKeeper) Renew(ctx context.Context, generation uint64) error {
 	err := k.sessions.RenewControllerLease(ctx, k.ws, k.id, control.ControllerLease{
 		Generation: generation,
@@ -316,9 +371,17 @@ func (s *AttachmentService) grant(ctx context.Context, scope control.Scope, reso
 	if err != nil {
 		return "", 0, nil, err
 	}
+	// ctx here is AttachTerminal's — the client's own authorized request,
+	// the one place in this module where the context still carries the
+	// caller. Capturing it is what lets a claim made later, on the runner's
+	// dial-back, be authorized against the person who opened the attach.
+	// WithoutCancel because only the values are wanted: the stored context
+	// carries no Done channel for anything to wait on and no deadline for
+	// anything to inherit.
 	keeper := controllerKeeper{sessions: s.sessions, clock: s.clock,
 		policy: s.policy, scope: scope, resource: resource,
-		ws: row.WorkspaceID, id: row.ID, holder: holder}
+		identity: context.WithoutCancel(ctx),
+		ws:       row.WorkspaceID, id: row.ID, holder: holder}
 	if cmd.Mode == control.AttachmentViewer {
 		return control.AttachmentViewer, row.ControllerGeneration, keeper, nil
 	}
