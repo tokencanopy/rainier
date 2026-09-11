@@ -118,6 +118,9 @@ func (sessionExtEnvironmentRepo) UpdateEnvironment(context.Context, control.Work
 func (sessionExtEnvironmentRepo) DeleteEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID) error {
 	return nil
 }
+func (sessionExtEnvironmentRepo) DeleteEnvironmentUnlessReferenced(context.Context, control.WorkspaceID, control.EnvironmentID, []control.SessionState) error {
+	return nil
+}
 func (sessionExtEnvironmentRepo) CountSessionsByEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID, []control.SessionState) (int, error) {
 	return 0, nil
 }

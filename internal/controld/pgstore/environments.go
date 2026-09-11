@@ -340,6 +340,44 @@ func (r pgEnvironments) DeleteEnvironment(ctx context.Context, ws control.Worksp
 	return nil
 }
 
+// DeleteEnvironmentUnlessReferenced folds the check into the DELETE's own
+// WHERE clause, so the decision and the write are one statement instead of
+// the separate CountSessionsByEnvironment-then-DeleteEnvironment pair.
+func (r pgEnvironments) DeleteEnvironmentUnlessReferenced(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID, states []control.SessionState) error {
+	if ws == "" {
+		return control.ErrInvalid
+	}
+	sql := `DELETE FROM environments WHERE workspace_id = $1 AND id = $2 AND NOT EXISTS (
+		SELECT 1 FROM sessions WHERE workspace_id = $1 AND environment_id = $2`
+	args := []any{string(ws), string(id)}
+	if len(states) > 0 {
+		strs := make([]string, len(states))
+		for i, st := range states {
+			strs[i] = string(st)
+		}
+		args = append(args, strs)
+		sql += ` AND state = ANY($3)`
+	}
+	sql += `)`
+	ct, err := r.s.q(ctx).Exec(ctx, sql, args...)
+	if err != nil {
+		return unavailable("delete environment unless referenced", err)
+	}
+	if ct.RowsAffected() > 0 {
+		return nil
+	}
+	// Zero rows means either the environment is already gone or it is still
+	// referenced; disambiguate with a read, the same stale-vs-not-found shape
+	// SetEnvironmentSnapshot already uses.
+	if _, err := r.GetEnvironment(ctx, ws, id); err != nil {
+		if errors.Is(err, control.ErrNotFound) {
+			return control.ErrNotFound
+		}
+		return unavailable("delete environment unless referenced", err)
+	}
+	return control.ErrConflict
+}
+
 func (r pgEnvironments) CountSessionsByEnvironment(ctx context.Context, ws control.WorkspaceID, envID control.EnvironmentID, states []control.SessionState) (int, error) {
 	if ws == "" {
 		return 0, control.ErrInvalid

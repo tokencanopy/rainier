@@ -479,6 +479,9 @@ func (fakeEnvironmentRepository) UpdateEnvironment(context.Context, control.Work
 func (fakeEnvironmentRepository) DeleteEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID) error {
 	return nil
 }
+func (fakeEnvironmentRepository) DeleteEnvironmentUnlessReferenced(context.Context, control.WorkspaceID, control.EnvironmentID, []control.SessionState) error {
+	return nil
+}
 func (fakeEnvironmentRepository) CountSessionsByEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID, []control.SessionState) (int, error) {
 	return 0, nil
 }

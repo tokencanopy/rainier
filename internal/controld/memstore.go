@@ -653,6 +653,33 @@ func (r memEnvironments) DeleteEnvironment(ctx context.Context, ws control.Works
 	return nil
 }
 
+// DeleteEnvironmentUnlessReferenced holds m.mu across the whole check and
+// delete, one critical section instead of the two lock acquisitions
+// CountSessionsByEnvironment and DeleteEnvironment used separately.
+func (r memEnvironments) DeleteEnvironmentUnlessReferenced(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID, states []control.SessionState) error {
+	if ws == "" {
+		return control.ErrInvalid
+	}
+	m := r.m
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := environmentKey{ws, id}
+	if _, ok := m.environments[key]; !ok {
+		return control.ErrNotFound
+	}
+	for k, s := range m.sessions {
+		if k.ws != ws || s.EnvironmentID != id {
+			continue
+		}
+		if len(states) == 0 || slices.Contains(states, s.State) {
+			return control.ErrConflict
+		}
+	}
+	delete(m.environments, key)
+	delete(m.snapshots, key)
+	return nil
+}
+
 func (r memEnvironments) CountSessionsByEnvironment(ctx context.Context, ws control.WorkspaceID, envID control.EnvironmentID, states []control.SessionState) (int, error) {
 	if ws == "" {
 		return 0, control.ErrInvalid
