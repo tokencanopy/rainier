@@ -1126,8 +1126,8 @@ func TestFinishReleasesOnlyTheGenerationItActuallyHeld(t *testing.T) {
 
 		var wg sync.WaitGroup
 		wg.Add(2)
-		go func() { defer wg.Done(); o.demoteTo(2) }() // the heartbeat, finishing
-		go func() { defer wg.Done(); o.finish() }()    // the client, disconnecting
+		go func() { defer wg.Done(); o.demoteTo(1, 2) }() // the heartbeat, finishing
+		go func() { defer wg.Done(); o.finish() }()       // the client, disconnecting
 		wg.Wait()
 
 		for _, gen := range keeper.released() {
@@ -1252,20 +1252,37 @@ func TestDisplaceToAndAdvanceAreEachOneStep(t *testing.T) {
 // from a generation that has been superseded, refused every time.
 func TestDemoteToNeverWalksTheGenerationBack(t *testing.T) {
 	o := &ownership{mode: terminal.ModeControl, gen: 5}
-	if got := o.demoteTo(3); got != 5 {
-		t.Fatalf("demoteTo(3) at generation 5 returned %d, want 5", got)
+	if got, moved := o.demoteTo(5, 3); got != 5 || !moved {
+		t.Fatalf("demoteTo(5, 3) at generation 5 returned %d, %v; want 5, true", got, moved)
 	}
 	if mode, gen := o.get(); mode != terminal.ModeView || gen != 5 {
-		t.Fatalf("after demoteTo(3): %s at %d, want view at 5", mode, gen)
+		t.Fatalf("after demoteTo(5, 3): %s at %d, want view at 5", mode, gen)
 	}
 	// And it still demotes at a generation it cannot read: being wrong about
 	// the number is survivable, believing you still have control is not.
 	o = &ownership{mode: terminal.ModeControl, gen: 5}
-	if got := o.demoteTo(5); got != 5 {
-		t.Fatalf("demoteTo(5) returned %d, want 5", got)
+	if got, moved := o.demoteTo(5, 5); got != 5 || !moved {
+		t.Fatalf("demoteTo(5, 5) returned %d, %v; want 5, true", got, moved)
 	}
 	if mode, _ := o.get(); mode != terminal.ModeView {
 		t.Fatalf("after demoteTo at its own generation: mode %q, want view", mode)
+	}
+}
+
+// TestDemoteToRefusesAGenerationThisAttachHasLeft is the guard every other
+// transition already had. A demotion is an answer about ONE generation — the
+// one this attach held when the heartbeat's renewal was refused — and it can
+// be in flight across a store read and a bounded sandbox wait. An attach that
+// won a newer generation inside that window has left the question behind, and
+// demoting it anyway leaves the plane saying viewer while the store says this
+// attach holds the lease: nobody types until the lease expires.
+func TestDemoteToRefusesAGenerationThisAttachHasLeft(t *testing.T) {
+	o := &ownership{mode: terminal.ModeControl, gen: 3}
+	if got, moved := o.demoteTo(1, 3); moved {
+		t.Fatalf("a demotion decided at generation 1 demoted an attach at 3 (to %d)", got)
+	}
+	if mode, gen := o.get(); mode != terminal.ModeControl || gen != 3 {
+		t.Fatalf("after a refused demotion: %s at %d, want control at 3", mode, gen)
 	}
 }
 
@@ -1656,4 +1673,103 @@ func TestAStalledExControllerIsFencedEvenThoughItsNoticeCouldNotBeDelivered(t *t
 			t.Fatal("a displaced controller's keystroke was still carried")
 		}
 	}
+}
+
+// gatedKeeper holds a demotion still, in the one place a demotion spends real
+// time: the store read that asks what generation exists now. The test opens
+// the gate when it has arranged the interleaving it wants to see, so the
+// window under test is deterministic rather than raced.
+type gatedKeeper struct {
+	fakeKeeper
+	stale   atomic.Bool // renewals are refused while this is armed
+	gate    chan struct{}
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (k *gatedKeeper) Renew(ctx context.Context, generation uint64) error {
+	if k.stale.Load() {
+		return control.ErrStale
+	}
+	return k.fakeKeeper.Renew(ctx, generation)
+}
+
+func (k *gatedKeeper) State(ctx context.Context) (uint64, bool, error) {
+	k.once.Do(func() { close(k.entered) })
+	<-k.gate
+	return k.fakeKeeper.State(ctx)
+}
+
+// TestADemotionThatWasSupersededDoesNotDemote is the fourth review's third
+// finding, driven through the real plane. The interleaving is the one the
+// heartbeat makes possible and nothing else corrects:
+//
+//  1. the laptop holds control at generation 1, and a renewal is refused —
+//     something on another replica took over — so it starts demoting itself;
+//  2. that demotion blocks in the store read that asks what generation exists;
+//  3. the phone claims and takes generation 2, displacing the laptop;
+//  4. the laptop's own client takes it back at generation 3;
+//  5. the demotion decided at generation 1 wakes up.
+//
+// Demoting there leaves the plane calling the laptop a viewer while the store
+// says the laptop holds the lease at 3: it cannot type, its heartbeat renews
+// a lease nobody can use, and every new negotiated attach behind it is
+// admitted a viewer — for the rest of the 30s lease.
+func TestADemotionThatWasSupersededDoesNotDemote(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{HeartbeatInterval: 10 * time.Millisecond,
+		ControlAckTimeout: 250 * time.Millisecond})
+	lease := &fakeLease{gen: 1, holder: "att_aaaa"}
+	keeper := &gatedKeeper{fakeKeeper: fakeKeeper{lease, "att_aaaa"},
+		gate: make(chan struct{}), entered: make(chan struct{})}
+
+	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, keeper, true)
+	awaitType(t, laptop.stream, terminal.TypeAttached)
+	awaitSpliced(t, laptop)
+	phone := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_bbbb"}, true)
+	awaitType(t, phone.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, phone)
+
+	// (1) and (2): the renewal is refused and the demotion parks in the store.
+	keeper.stale.Store(true)
+	<-keeper.entered
+
+	// (3) the phone takes control...
+	phone.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
+	if m, _ := awaitType(t, phone.stream, terminal.TypeAttached); m.Generation.Value() != 2 {
+		t.Fatalf("the phone's claim landed at %q, want 2", m.Generation)
+	}
+	if m, _ := awaitType(t, laptop.stream, terminal.TypeControlChanged); m.Mode != terminal.ModeView {
+		t.Fatalf("the displaced laptop was told %s, want view", m.Mode)
+	}
+	// (4) ...and the laptop takes it straight back.
+	laptop.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(2)}
+	if m, _ := awaitType(t, laptop.stream, terminal.TypeAttached); m.Mode != terminal.ModeControl ||
+		m.Generation.Value() != 3 {
+		t.Fatalf("the laptop took control back as %s at %q, want control at 3", m.Mode, m.Generation)
+	}
+
+	// (5) the demotion decided at generation 1 finishes. Renewals are honest
+	// again from here: this attach really does hold the lease at 3.
+	keeper.stale.Store(false)
+	close(keeper.gate)
+
+	// The notice it sends says what the attach IS, which is the controller.
+	m, _ := awaitType(t, laptop.stream, terminal.TypeControlChanged)
+	if m.Mode != terminal.ModeControl || m.Generation.Value() != 3 {
+		t.Fatalf("a superseded demotion told the session's controller it is %s at %q; "+
+			"the store says it holds generation 3", m.Mode, m.Generation)
+	}
+	// And it is still typing, under the generation it won.
+	laptop.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("ls\r")}
+	awaitSandbox(t, laptop.sandbox, func(got []terminal.ClientMessage) bool {
+		for _, m := range got {
+			if m.Type == "stdin" {
+				if m.Generation.Value() != 3 {
+					t.Fatalf("the controller's keystroke was stamped %q, want the 3 it holds", m.Generation)
+				}
+				return true
+			}
+		}
+		return false
+	}, "the controller's keystroke")
 }

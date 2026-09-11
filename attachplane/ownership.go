@@ -123,19 +123,37 @@ func (o *ownership) advance(mode string, gen uint64) bool {
 	return true
 }
 
-// demoteTo makes this attach a viewer, at the newer of the generation it
-// already holds and gen, and returns the generation it now holds. It is the
-// one transition that cannot refuse: being wrong about the number is
-// survivable, believing you still have control is not, so a demotion whose
-// generation could not be read still demotes.
-func (o *ownership) demoteTo(gen uint64) uint64 {
+// demoteTo makes this attach a viewer at the newer of the generation it
+// already holds and gen, reporting the generation it now holds and whether it
+// moved. from is the generation the demotion was DECIDED at: a demotion is an
+// answer about one generation, and an attach that has since moved past that
+// generation has left the question behind.
+//
+// Every other transition refuses a backwards move (advance, displaceTo), and
+// this one used to be the exception — the justification being that getting
+// the number wrong is survivable while believing you still have control is
+// not. That is true of the NUMBER and was applied to the MODE. A heartbeat
+// demotion decided at generation N can spend a store read and a bounded
+// sandbox wait in flight, and this attach can win N+1 in that window through
+// a claim of its own; demoting it then leaves the plane saying viewer while
+// the store says this attach holds the lease — nobody can type until the
+// lease expires. Which is the outcome the unconditional write was there to
+// prevent, arrived at from the other side.
+//
+// Being wrong about the number is still survivable, so a demotion whose
+// generation could not be read still demotes at the generation this attach
+// already held.
+func (o *ownership) demoteTo(from, gen uint64) (uint64, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.gen > from {
+		return o.gen, false
+	}
 	if gen > o.gen {
 		o.gen = gen
 	}
 	o.mode = terminal.ModeView
-	return o.gen
+	return o.gen, true
 }
 
 // displaceTo moves this attach to gen because a peer took control, doing the
@@ -456,10 +474,13 @@ func (o *ownership) release(ctx context.Context) {
 	o.plane.displace(ctx, o, o.demote(ctx), false)
 }
 
-// demote turns this attach into a viewer and says so, in that order: the
-// sandbox learns the current generation and that this attachment is not the
-// controller under it, then the client is told. It returns the generation it
-// demoted to.
+// demote turns this attach into a viewer and says so: the plane stops
+// forwarding for it, the sandbox learns the current generation and that this
+// attachment is not the controller under it, and then the client is told what
+// this attach now IS. It returns the generation it demoted to.
+//
+// It is a decision about the generation this attach holds when it starts, and
+// it does nothing to an attach that has since moved past it — see demoteTo.
 //
 // A demotion whose current generation cannot be read still demotes — being
 // wrong about the number is survivable, believing you still have control is
@@ -468,14 +489,24 @@ func (o *ownership) release(ctx context.Context) {
 // as a claim from zero would be, while the common case, where the read merely
 // timed out, still leaves the client able to take control in one press.
 func (o *ownership) demote(ctx context.Context) uint64 {
-	_, current := o.get()
+	// The generation this demotion is ABOUT, read before the store call that
+	// can outlive its own answer. demoteTo refuses a demotion this attach has
+	// moved past, and this is what it compares against.
+	_, from := o.get()
+	current := from
 	if o.keeper != nil {
 		if gen, _, err := o.keeper.State(ctx); err == nil {
 			current = gen
 		}
 	}
-	_ = o.installAndWait(ctx, terminal.ModeView, current)
-	o.demoteTo(current)
+	// The plane's own half of the fence goes first: it is a single locked
+	// write that cannot fail, and it stops this attach being forwarded for at
+	// once. The sandbox is told only if the demotion still stands — installing
+	// a viewer binding for an attach that has since WON a newer generation
+	// would fence the controller it just became.
+	if gen, moved := o.demoteTo(from, current); moved {
+		_ = o.installAndWait(ctx, terminal.ModeView, gen)
+	}
 	_, gen := o.announceAs(ctx, terminal.TypeControlChanged, 0)
 	return gen
 }
