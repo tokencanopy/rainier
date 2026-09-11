@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -86,7 +87,7 @@ func (h *fakeHost) nextCmd(t *testing.T) runner.ToRunner {
 	select {
 	case m := <-h.cmds:
 		return m
-	case <-time.After(5 * time.Second):
+	case <-time.After(testDeadline):
 		t.Fatal("no command reached the runner within 5s")
 		return runner.ToRunner{}
 	}
@@ -105,7 +106,18 @@ func newTestPlane(t *testing.T, o Options) (*Plane, *fakeHost, *httptest.Server)
 		cmds:  make(chan runner.ToRunner, 8),
 	}
 	if o.Logf == nil {
-		o.Logf = t.Logf
+		// A pairing that is never claimed logs when its TTL expires, which
+		// is fifteen seconds after the test that opened it — long after that
+		// test has finished, and t.Logf on a finished test panics the whole
+		// binary. The guard turns that into silence, so a test's own leak
+		// cannot take down every other test's run.
+		var done atomic.Bool
+		t.Cleanup(func() { done.Store(true) })
+		o.Logf = func(format string, a ...any) {
+			if !done.Load() {
+				t.Logf(format, a...)
+			}
+		}
 	}
 	p := New(h, o)
 	mux := http.NewServeMux()
@@ -182,15 +194,35 @@ type scriptedStream struct {
 	// a splice pump outlive the attach it belongs to.
 	dead chan struct{}
 	once sync.Once
+
+	// stalled stands in for a client that has stopped READING its socket: a
+	// closed lid, a TCP zero window, a paused browser tab. Sends block until
+	// the test drains it, or until their own context runs out — which is
+	// exactly what a real socket whose peer never reads does, and the reason
+	// nothing in the plane may write to a peer without a deadline.
+	stalled  atomic.Bool
+	draining chan struct{}
 }
 
 func newScriptedStream() *scriptedStream {
 	return &scriptedStream{
-		in:     make(chan terminal.ClientMessage, 8),
-		out:    make(chan terminal.ServerMessage, 8),
-		closed: make(chan error, 1),
-		dead:   make(chan struct{}),
+		in:       make(chan terminal.ClientMessage, 8),
+		out:      make(chan terminal.ServerMessage, 8),
+		closed:   make(chan error, 1),
+		dead:     make(chan struct{}),
+		draining: make(chan struct{}),
 	}
+}
+
+// stall makes every later Send block, as a socket does once its peer has
+// stopped reading it.
+func (s *scriptedStream) stall() { s.stalled.Store(true) }
+
+// drain lets the stalled sends through again. A test uses it to prove the
+// client was only wedged, never closed — nothing about it was broken.
+func (s *scriptedStream) drain() {
+	s.stalled.Store(false)
+	close(s.draining)
 }
 
 func (s *scriptedStream) Receive(ctx context.Context) (terminal.ClientMessage, error) {
@@ -205,6 +237,15 @@ func (s *scriptedStream) Receive(ctx context.Context) (terminal.ClientMessage, e
 }
 
 func (s *scriptedStream) Send(ctx context.Context, m terminal.ServerMessage) error {
+	if s.stalled.Load() {
+		select {
+		case <-s.draining:
+		case <-s.dead:
+			return io.EOF
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	select {
 	case s.out <- m:
 		return nil
@@ -228,7 +269,7 @@ func (s *scriptedStream) closeReason(t *testing.T) error {
 	select {
 	case err := <-s.closed:
 		return err
-	case <-time.After(5 * time.Second):
+	case <-time.After(testDeadline):
 		t.Fatal("the broker never closed the stream")
 		return nil
 	}
@@ -239,7 +280,7 @@ func (s *scriptedStream) nextServerMsg(t *testing.T) terminal.ServerMessage {
 	select {
 	case m := <-s.out:
 		return m
-	case <-time.After(5 * time.Second):
+	case <-time.After(testDeadline):
 		t.Fatal("no server message reached the client stream within 5s")
 		return terminal.ServerMessage{}
 	}
@@ -321,7 +362,7 @@ func TestUnpairedAttachTimesOutAtThePairTTL(t *testing.T) {
 		if !errors.Is(err, control.ErrUnavailable) {
 			t.Fatalf("Attach after the pairing TTL = %v, want ErrUnavailable", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testDeadline):
 		t.Fatal("Attach never returned after the pairing TTL")
 	}
 	if got := stream.closeReason(t); !errors.Is(got, errAttachNoDialBack) {
@@ -467,7 +508,7 @@ func TestBrokerAsksTheRunnerToDialBack(t *testing.T) {
 		if !errors.Is(err, control.ErrUnavailable) {
 			t.Fatalf("Attach after the pairing TTL = %v, want ErrUnavailable", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testDeadline):
 		t.Fatal("Attach never returned after the pairing TTL")
 	}
 	if got := stream.closeReason(t); !errors.Is(got, errAttachNoDialBack) {
@@ -544,7 +585,7 @@ func TestBrokerSplicesBothDirections(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Attach after a spliced attach ended = %v, want nil", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testDeadline):
 		t.Fatal("Attach never returned after the runner half closed")
 	}
 	if n := pendingAttaches(p); n != 0 {

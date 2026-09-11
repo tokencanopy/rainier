@@ -846,3 +846,11 @@ func TestAnswerPutStaleEmptySetPreservesRelogin(t *testing.T) {
 		t.Fatal("stale empty write erased the new login")
 	}
 }
+
+func (f *agentFakeSessions) CompareAndAdvanceControllerGeneration(_ context.Context, _ control.WorkspaceID, _ control.SessionID, expected uint64) (uint64, error) {
+	return expected + 1, nil
+}
+
+func (f *agentFakeSessions) RenewControllerLease(context.Context, control.WorkspaceID, control.SessionID, control.ControllerLease) error {
+	return nil
+}

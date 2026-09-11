@@ -33,6 +33,7 @@ Autonomous coding agents (Claude Code, Codex, Gemini CLI, and others) are transf
 Rainier is currently at **v0 (terminal happy path)**. One `controld` (Postgres-backed REST + WebSocket API, GitHub identity, least-loaded placement, credential vault) fronts N `runnerd` VMs that dial it outbound, and the `rainier` CLI drives the whole fleet. Sessions clone your repositories at boot and push back as you.
 
 - **Deployment Guide:** [`docs/deploy-gce.md`](docs/deploy-gce.md)
+- **Terminal Ownership:** [`docs/terminal-controller-ownership.md`](docs/terminal-controller-ownership.md) — who may type when several devices are attached to one session, and how the three parties that implement it interoperate across releases
 - **Session Image:** [`docs/session-image.md`](docs/session-image.md) — the default coding environment every session runs, what is in it, and how it is pinned and smoke tested
 - **Architecture Specs:**
   - [Rainier Overview](docs/superpowers/specs/2026-08-27-rainier-design.md)

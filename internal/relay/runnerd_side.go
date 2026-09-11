@@ -71,33 +71,51 @@ func NewHubWithControl(ctx context.Context, sessionConn Conn, onControl func(pay
 func (h *Hub) readLoop() {
 	defer func() {
 		h.mu.Lock()
-		for id, cl := range h.clients { cl.Close(); delete(h.clients, id) }
+		for id, cl := range h.clients {
+			cl.Close()
+			delete(h.clients, id)
+		}
 		h.mu.Unlock()
 	}()
 	for {
 		raw, err := h.conn.Read(h.ctx)
-		if err != nil { h.cancel(); return }
+		if err != nil {
+			h.cancel()
+			return
+		}
 		f, err := Decode(raw)
-		if err != nil { continue }
+		if err != nil {
+			continue
+		}
 		if f.Type == FrameControl {
 			// Handled before the client lookup: a control frame carries
 			// AttachID 0, which is never a client id (ids start at 1), so
 			// the demux below would drop it as "unknown attachment".
-			if h.onControl != nil { h.onControl(f.Payload) }
+			if h.onControl != nil {
+				h.onControl(f.Payload)
+			}
 			continue
 		}
-		h.mu.Lock(); client := h.clients[f.AttachID]; h.mu.Unlock()
-		if client == nil { continue }
+		h.mu.Lock()
+		client := h.clients[f.AttachID]
+		h.mu.Unlock()
+		if client == nil {
+			continue
+		}
 		switch f.Type {
 		case FrameServer:
 			// Forward the terminal.ServerMessage payload verbatim to the client.
 			if client.Write(h.ctx, f.Payload) != nil {
-				h.mu.Lock(); delete(h.clients, f.AttachID); h.mu.Unlock()
+				h.mu.Lock()
+				delete(h.clients, f.AttachID)
+				h.mu.Unlock()
 				client.Close()
 			}
 		case FrameClose:
 			client.Close()
-			h.mu.Lock(); delete(h.clients, f.AttachID); h.mu.Unlock()
+			h.mu.Lock()
+			delete(h.clients, f.AttachID)
+			h.mu.Unlock()
 		}
 	}
 }
@@ -127,27 +145,49 @@ func (h *Hub) readLoop() {
 // coder/websocket's lock is context-aware.
 func (h *Hub) SendControl(payload []byte) error {
 	b, err := Encode(Frame{Type: FrameControl, AttachID: 0, Payload: payload})
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	return h.conn.Write(h.ctx, b)
+}
+
+// Open is what one attachment opens with: the client's cursor and terminal
+// size, plus the controller binding the control plane granted it. Mode is
+// empty — and Generation zero — when no plane granted one, which leaves the
+// attachment unbound and unconditional at the session, exactly as it is
+// today.
+//
+// It is a struct rather than five parameters because the binding travels with
+// the cursor and the size or it travels not at all: an attachment that
+// installed its size and then its binding would have a window between them,
+// and this hop is the last place that window could open.
+type Open struct {
+	Since      uint64
+	Cols, Rows int
+	Mode       string
+	Generation uint64
 }
 
 // AttachClient bridges a client conn to a new attachment over the session
 // conn: it opens the attachment (FrameOpen), then pumps client → session as
 // FrameClient until the client disconnects, at which point it tells the
 // session to close the attachment too. Blocks until the client conn errors.
-func (h *Hub) AttachClient(ctx context.Context, client Conn, since uint64, cols, rows int) error {
+func (h *Hub) AttachClient(ctx context.Context, client Conn, o Open) error {
 	h.mu.Lock()
 	h.next++
 	id := h.next
 	h.clients[id] = client
 	h.mu.Unlock()
 
-	open, _ := Encode(Frame{Type: FrameOpen, AttachID: id, Since: since, Cols: cols, Rows: rows})
+	open, _ := Encode(Frame{Type: FrameOpen, AttachID: id, Since: o.Since, Cols: o.Cols, Rows: o.Rows,
+		Mode: o.Mode, Gen: o.Generation})
 	if err := h.conn.Write(h.ctx, open); err != nil {
 		// Session conn is already dead: this client would otherwise stay
 		// registered in h.clients (and its caller left hanging with no
 		// FrameOpen ever having reached the session) forever.
-		h.mu.Lock(); delete(h.clients, id); h.mu.Unlock()
+		h.mu.Lock()
+		delete(h.clients, id)
+		h.mu.Unlock()
 		client.Close()
 		return err
 	}
@@ -158,7 +198,9 @@ func (h *Hub) AttachClient(ctx context.Context, client Conn, since uint64, cols,
 		if err != nil {
 			cl, _ := Encode(Frame{Type: FrameClose, AttachID: id})
 			h.conn.Write(h.ctx, cl)
-			h.mu.Lock(); delete(h.clients, id); h.mu.Unlock()
+			h.mu.Lock()
+			delete(h.clients, id)
+			h.mu.Unlock()
 			return err
 		}
 		fr, _ := Encode(Frame{Type: FrameClient, AttachID: id, Payload: raw})
@@ -167,7 +209,9 @@ func (h *Hub) AttachClient(ctx context.Context, client Conn, since uint64, cols,
 			// a session-conn write failure instead: readLoop is likely
 			// already gone (its own h.conn.Read errored too), so nothing
 			// will ever close this client conn or notify it otherwise.
-			h.mu.Lock(); delete(h.clients, id); h.mu.Unlock()
+			h.mu.Lock()
+			delete(h.clients, id)
+			h.mu.Unlock()
 			client.Close()
 			return err
 		}

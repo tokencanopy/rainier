@@ -59,7 +59,8 @@ Sessions:
                     [--name N] [--agent claude|codex] [--detach] [-- CMD ...]
   ls                List your sessions  [--all] [--verbose] [--json]
   info <session>    Everything about one session  [--json]
-  attach <session>  Reopen its terminal; Ctrl-] detaches and leaves it running
+  attach <session>  Reopen its terminal; Ctrl-] detaches and leaves it running,
+                    Ctrl-\ takes control when another device has it
   stop <session>    Stop it, keeping its files; billing is unchanged
   delete <session>  Destroy it permanently  [--yes]
 
@@ -201,10 +202,22 @@ means the server would refuse it, not that a word looked wrong.
 A failed session's reason is included, sanitized. --json carries the raw API
 facts — state, reachable, child_exit_code — beside the derived ones.`
 	case "attach":
-		help = `usage: rainier attach <session> [--since N]
+		help = `usage: rainier attach <session> [--since N] [--view | --take]
 
 Open the session's current terminal screen. Ctrl-] detaches and leaves the
 session running. A stopped session is resumed first and waited for.
+
+One device at a time may type; everyone else watches. Attaching takes
+control when nobody has it, which is every single-device attach, and
+otherwise attaches as a viewer and says so. Ctrl-\ takes control, and tells
+the device that had it. Ctrl-] releases control as it detaches, so the next
+attach needs no key at all.
+
+  --view    watch without ever claiming control; Ctrl-\ does nothing
+  --take    take control on attach, even if another device has it
+
+Reconnecting after a disconnect resumes control only if nobody took it in
+the meantime; if somebody did, it comes back as a viewer and says so.
 
 A running sandbox stays attachable after its child exits. A failed session
 is attachable while its runner is reachable. --since requests diagnostic

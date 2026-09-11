@@ -22,6 +22,24 @@ type viewer struct {
 	id   int
 	ch   chan terminal.ServerMessage
 	size Size
+	bind Binding
+}
+
+// Binding is what the control plane says one attachment is: whether it may
+// write to the pty, and under which controller generation. It arrives with
+// the attachment (a relay FrameOpen, a dial_attach) or on a later "control"
+// message, and it is the only thing that decides whether a byte from that
+// attachment reaches the process.
+//
+// The zero value is UNBOUND, and unbound means "no control plane told me
+// anything", which is today's attachment: it may write. That is the
+// compatibility rule for an older plane, and it is safe for the reason it is
+// written down — under the old message set only one client could be sending,
+// because the old plane had no way to admit a second one as anything else.
+type Binding struct {
+	Bound      bool
+	Mode       string
+	Generation uint64
 }
 
 type Session struct {
@@ -34,6 +52,16 @@ type Session struct {
 	size    Size
 	exited  chan struct{}
 	exitC   int
+	// controllerGen is the highest controller generation any binding has
+	// told this session about. It is the session's own fence: a bound
+	// attachment writes only while its binding still matches it, so a frame
+	// from a controller that has since been displaced is discarded HERE,
+	// where it would otherwise be typed into somebody's shell, however far
+	// along the path it already was when the handoff happened.
+	//
+	// It only ever goes up. A late frame carrying a superseded binding
+	// cannot walk it backwards.
+	controllerGen uint64
 }
 
 func New(cfg Config, start func(argv []string, cols, rows int, onOutput func([]byte)) (Proc, error)) (*Session, error) {
@@ -127,9 +155,10 @@ type Attachment struct {
 // The last two both fall back to the snapshot when the log cannot answer
 // them (an empty log, or a cursor already past its end): a viewer must
 // never open on silence with no screen and no size.
-func (s *Session) Attach(since uint64, size Size) (*Attachment, error) {
+func (s *Session) Attach(since uint64, size Size, bind Binding) (*Attachment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.observeLocked(bind)
 
 	from, all := since, since == terminal.SinceAll
 	if all {
@@ -153,7 +182,7 @@ func (s *Session) Attach(since uint64, size Size) (*Attachment, error) {
 	if replay {
 		chCap = len(entries) + 256
 	}
-	v := &viewer{id: s.nextID, ch: make(chan terminal.ServerMessage, chCap), size: size}
+	v := &viewer{id: s.nextID, ch: make(chan terminal.ServerMessage, chCap), size: size, bind: bind}
 	s.nextID++
 	s.viewers[v.id] = v
 
@@ -195,20 +224,113 @@ func (s *Session) Detach(id int) {
 	}
 }
 
-func (s *Session) Stdin(p []byte) { s.proc.Write(p) }
+// Stdin writes p into the pty on behalf of attachment id, under the
+// generation the frame was sent with, and reports whether it was executed.
+//
+// This is the fence, and it is here — at the process — rather than only at
+// the plane, because the plane is not where input executes: a keystroke
+// accepted from a controller that was displaced a moment later can already be
+// past it. Everything a terminal sends goes through this one door, including
+// the bytes a terminal writes back in answer to a query, so none of it needs
+// a rule of its own.
+func (s *Session) Stdin(id int, gen uint64, p []byte) bool {
+	s.mu.Lock()
+	v, ok := s.viewers[id]
+	allowed := ok && s.mayWriteLocked(v, gen)
+	s.mu.Unlock()
+	if !allowed {
+		return false
+	}
+	s.proc.Write(p)
+	return true
+}
 
-func (s *Session) SetSize(id int, size Size) {
+// mayWriteLocked is the whole execution rule, in one place:
+//
+//   - an UNBOUND attachment writes. No control plane told this session
+//     anything about it, which means an older plane, and under the old
+//     message set only one client could have been sending.
+//   - a BOUND attachment writes only while it is the controller AND its
+//     generation is still the session's current one AND the frame was sent
+//     under that same generation. A viewer never writes; a displaced
+//     controller never writes again; a frame stamped with a superseded
+//     generation is discarded however long it was in flight.
+func (s *Session) mayWriteLocked(v *viewer, gen uint64) bool {
+	if !v.bind.Bound {
+		return true
+	}
+	return v.bind.Mode == terminal.ModeControl &&
+		v.bind.Generation == s.controllerGen &&
+		gen == s.controllerGen
+}
+
+// Bind installs a new binding on a live attachment — a mid-attach handoff —
+// and reports whether the attachment still exists. The session's own fence
+// moves with it, so a take-over installed here fences every other attachment
+// before this call returns.
+func (s *Session) Bind(id int, bind Binding) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if v, ok := s.viewers[id]; ok {
-		v.size = size
-		s.applySizeLocked()
+	v, ok := s.viewers[id]
+	if !ok {
+		return false
+	}
+	if !v.bind.Bound {
+		// An attachment that was OPENED unbound is never bound later. A
+		// plane that grants a binding grants it on the frame that opens the
+		// attachment — that is what leaves no window between the size and
+		// the binding — so a handoff arriving on an attachment that never
+		// had one did not come from a plane. It came from whatever is on the
+		// other end of an unmanaged attach socket, and honouring it would
+		// let that end name its own mode and its own generation at the pty.
+		return false
+	}
+	s.observeLocked(bind)
+	v.bind = bind
+	// The controller may have changed, and the pty follows the controller.
+	s.applySizeLocked()
+	return true
+}
+
+// observeLocked walks the session's fence up to a binding's generation. It
+// never walks it back down: a frame carrying a superseded binding must not be
+// able to un-displace the controller that superseded it.
+func (s *Session) observeLocked(bind Binding) {
+	if bind.Bound && bind.Generation > s.controllerGen {
+		s.controllerGen = bind.Generation
 	}
 }
 
+// SetSize records attachment id's terminal size and, if that attachment is
+// entitled to move the pty, applies it. A viewer's size is remembered — it
+// becomes load-bearing the moment that viewer takes control — and ignored:
+// the pty follows the controller, so a phone watching a laptop's session does
+// not squeeze the laptop's terminal down to phone width.
+func (s *Session) SetSize(id int, gen uint64, size Size) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.viewers[id]
+	if !ok {
+		return false
+	}
+	v.size = size
+	if !s.mayWriteLocked(v, gen) {
+		return false
+	}
+	s.applySizeLocked()
+	return true
+}
+
+// applySizeLocked resizes the pty to what its CONTROLLERS ask for. With one
+// attachment that is the same rule it has always been. With several it is the
+// rule that makes a viewer harmless: a session whose controllers have all
+// gone keeps the size it had rather than snapping to whoever is watching.
 func (s *Session) applySizeLocked() {
 	var sizes []Size
 	for _, v := range s.viewers {
+		if !s.mayWriteLocked(v, v.bind.Generation) {
+			continue
+		}
 		sizes = append(sizes, v.size)
 	}
 	eff, ok := EffectiveSize(sizes)

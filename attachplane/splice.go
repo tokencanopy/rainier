@@ -48,9 +48,21 @@ func (w wsRunnerConn) Close() error { return w.c.CloseNow() }
 // client speaks whole terminal messages across control.TerminalStream, while
 // the runner's dial-back socket is raw frames — and protocol/terminal is the
 // wire format on both, so re-encoding between them is lossless. The plane
-// still interprets nothing: a message is decoded to be forwarded and for no
-// other reason, and none of it is logged.
-func splice(ctx context.Context, client control.TerminalStream, runner runnerConn) {
+// still interprets nothing about the TERMINAL: a message is decoded to be
+// forwarded and for no other reason, and none of it is logged.
+//
+// Ownership is the one thing it does interpret, and only its own vocabulary:
+// a claim or a release from the client, an acknowledgement from the sandbox,
+// and the generation stamped on everything it carries the other way. own is
+// never nil on a plane serving an attach — a legacy client has one too, so
+// that its frames are stamped and an unstamped frame reaching a sandbox means
+// an older plane and nothing else.
+func splice(ctx context.Context, client control.TerminalStream, runner runnerConn, own *ownership) {
+	own.bindRunner(runner)
+	hbCtx, stopHeartbeat := context.WithCancel(ctx)
+	defer stopHeartbeat()
+	go own.heartbeat(hbCtx)
+
 	done := make(chan struct{}, 2)
 	go func() {
 		defer func() { done <- struct{}{} }()
@@ -58,6 +70,37 @@ func splice(ctx context.Context, client control.TerminalStream, runner runnerCon
 			m, err := client.Receive(ctx)
 			if err != nil {
 				return
+			}
+			switch m.Type {
+			case terminal.TypeClaim:
+				// Handled inline rather than on a goroutine of its own: a
+				// client that just asked for control has nothing else to say
+				// until it hears back, and one claim at a time per attach is
+				// the invariant that makes the answer meaningful.
+				own.claim(ctx, m.Expected.Value())
+				continue
+			case terminal.TypeRelease:
+				own.release(ctx)
+				continue
+			case terminal.TypeControl, terminal.TypeControlAck:
+				// The sandbox-facing control verbs. They are the PLANE's —
+				// `install` writes them straight onto the runner socket —
+				// and a client's copy of one is not a handoff, it is a
+				// client asking the sandbox to install a binding nobody
+				// granted. Carrying it would let any attach name its own
+				// mode and its own generation at the pty: a viewer could
+				// promote itself, and a generation past every generation
+				// this session will ever reach would fence everybody
+				// forever. It goes no further.
+				continue
+			case "stdin", "resize":
+				if !own.mayForward() {
+					// A viewer's keystroke, or a displaced controller's. The
+					// pty would discard it; not carrying it is cheaper and
+					// says the same thing.
+					continue
+				}
+				m = own.stamp(m)
 			}
 			raw, err := json.Marshal(m)
 			if err != nil {
@@ -82,6 +125,32 @@ func splice(ctx context.Context, client control.TerminalStream, runner runnerCon
 				// dropping it would leave a client missing output it has no
 				// way to notice. Nothing about the frame is logged.
 				return
+			}
+			switch m.Type {
+			case terminal.TypeControlAck:
+				// The sandbox confirming a binding. It belongs to the
+				// handoff, not to the client, and goes no further.
+				own.acked(m.Generation.Value())
+				continue
+			case terminal.TypeAttached, terminal.TypeStale, terminal.TypeControlChanged:
+				// The client-facing ownership vocabulary, and the mirror of
+				// the client pump's rule about the sandbox-facing one. These
+				// three are the PLANE's: announceAs is the only thing that
+				// sends one, and it reads the mode and the generation under
+				// the announce hold so that what a client is told is what
+				// the plane knows. A sandbox's copy is not a handoff. A
+				// client told `attached control 99` by its sandbox prints
+				// [you have control], stops sending claims — a client that
+				// believes it is the controller never claims — and types
+				// into a plane that drops every frame, with detaching as its
+				// only way out.
+				//
+				// Only a broken or compromised sessiond sends one, and such
+				// a sandbox could execute the keystrokes itself, so this is
+				// hardening rather than a fence. Dropped rather than fatal:
+				// ending the attach would hand a buggy sandbox a way to
+				// disconnect every client watching it.
+				continue
 			}
 			if client.Send(ctx, m) != nil {
 				return

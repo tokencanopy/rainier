@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -41,6 +42,14 @@ var (
 	// errAttachIDCollision is the refusal to overwrite another client's
 	// parked pairing (see attachTable.park).
 	errAttachIDCollision = errors.New("controld: attach id collision")
+	// errAttachNotSpliced is a handoff attempted before the runner's
+	// dial-back arrived: there is no sandbox socket to install a binding on
+	// yet. Claims are only read inside the splice, which binds that socket
+	// first, so it is unreachable from a client — it is what a peer's
+	// displacement gets when that peer is still waiting for its own
+	// dial-back, and the answer is to proceed: the generation has already
+	// moved, and the binding rides the frame that opens that attachment.
+	errAttachNotSpliced = errors.New("controld: the attach is not spliced yet")
 	// errAttachEnded is an attach that ran and is over — one side of the
 	// splice stopped, and the other is being closed after it.
 	errAttachEnded = errors.New("controld: the attach ended")
@@ -49,6 +58,32 @@ var (
 // ---------------------------------------------------------------------------
 // control.TerminalStream over the client socket
 // ---------------------------------------------------------------------------
+
+const (
+	// defaultClientWriteBase is the part of one message's budget that does
+	// not depend on its size. See Send: it is not a liveness budget for a
+	// handoff (Plane.step is that, and it is seconds), it is the point at
+	// which a socket that has taken NOTHING is closed rather than held.
+	defaultClientWriteBase = 60 * time.Second
+	// defaultClientWriteRate is the throughput a client has to sustain on a
+	// large frame to keep its socket. It buys the rest of the budget:
+	// without it the base would be a whole-write deadline, and the largest
+	// frame attachReadLimit allows would demand ≈273 KB/s of a client that
+	// is making perfectly steady progress — more than a 2 Mbit/s link has.
+	// At this rate that frame gets 60s + 256s instead.
+	//
+	// It is deliberately a floor rather than an estimate of anybody's link.
+	// A client slower than this over sixteen megabytes is not going to
+	// render the scrollback either.
+	//
+	// The trade it makes is explicit: a socket that takes NOTHING is still
+	// closed, but a wedged client carrying the largest frame is now held for
+	// five minutes rather than one, and a new attach's first byte waits up
+	// to one Plane.step behind a wedged peer's courtesy notice whether or
+	// not that peer moved. Both cost one goroutine, one fd and one table
+	// entry; being disconnected mid-scrollback costs a person their session.
+	defaultClientWriteRate = 64 << 10 // bytes per second
+)
 
 // ClientStream wraps an accepted client websocket as the control.TerminalStream
 // the application (and this plane's broker) speaks. It also sets the socket's
@@ -59,8 +94,17 @@ var (
 // The caller keeps the socket's own lifetime — a handler that accepted it
 // still defers its CloseNow — and hands the reason it ends with to Close.
 func ClientStream(c *websocket.Conn) control.TerminalStream {
+	return clientStream(c, defaultClientWriteBase, defaultClientWriteRate)
+}
+
+// clientStream is the same over a write budget the caller picks, which is how
+// a test drives the wedged-client path without spending a minute on it. The
+// two knobs are FIELDS rather than package variables: nothing in the package
+// takes t.Parallel() today, and a package variable three tests write is a
+// race waiting for the first one that does.
+func clientStream(c *websocket.Conn, base time.Duration, rate int) wsTerminalStream {
 	c.SetReadLimit(attachReadLimit)
-	return wsTerminalStream{c: c, once: &sync.Once{}}
+	return wsTerminalStream{c: c, once: &sync.Once{}, base: base, rate: rate}
 }
 
 // wsTerminalStream is the typed adapter between the client's websocket and
@@ -76,7 +120,33 @@ func ClientStream(c *websocket.Conn) control.TerminalStream {
 type wsTerminalStream struct {
 	c    *websocket.Conn
 	once *sync.Once
+	// base and rate are this stream's write budget; see budget and Send.
+	base time.Duration
+	rate int
 }
+
+// budget is how long ONE message carrying payload bytes of terminal data may
+// take. The fixed part is what a socket that has taken nothing gets; the rest
+// is the time that message needs on the wire at the slowest rate this stream
+// will keep a client for. A message with no payload — every ownership
+// message, every acknowledgement — gets exactly the base.
+//
+// The rate is against the bytes that reach the SOCKET, not the payload:
+// terminal.ServerMessage.Data is a []byte, which JSON carries base64-encoded,
+// so four wire bytes leave for every three of payload. Budgeting the payload
+// instead would quietly demand a third more throughput than the rate
+// promises.
+func (s wsTerminalStream) budget(payload int) time.Duration {
+	if s.rate <= 0 {
+		return s.base
+	}
+	return s.base + time.Duration(wireSize(payload))*time.Second/time.Duration(s.rate)
+}
+
+// wireSize is payload bytes as base64, rounded up to the 4-byte group the
+// encoding emits. The rest of a terminal message is a few dozen bytes of
+// field names and is not worth counting.
+func wireSize(payload int) int { return (payload + 2) / 3 * 4 }
 
 var _ control.TerminalStream = wsTerminalStream{}
 
@@ -91,9 +161,57 @@ func (s wsTerminalStream) Receive(ctx context.Context) (terminal.ClientMessage, 
 	return m, nil
 }
 
-// Send writes one server message to the client.
+// Send writes one server message to the client, under a deadline of its own.
+//
+// The deadline is what keeps a client that has stopped READING from holding
+// the plane that is writing to it. A socket whose peer never drains it (a
+// closed lid, a TCP zero window, a paused browser tab) accepts a little and
+// then accepts nothing, and no RST ever arrives to end it — so an unbounded
+// write to it is an unbounded wait, in whatever goroutine happened to be
+// carrying it. The plane's handoffs no longer wait on any single client
+// (Plane.step bounds those), and this is the other half: the socket itself is
+// eventually closed rather than held open forever with a writer parked on it.
+//
+// It is deliberately far above any frame a live client could be slow with —
+// the biggest thing this stream ever carries is a snapshot replaying a large
+// scrollback, and a slow link must be able to take one, which is why the
+// budget SCALES with the payload rather than being one number for every
+// frame. What it catches is a peer that is not draining at all.
 func (s wsTerminalStream) Send(ctx context.Context, m terminal.ServerMessage) error {
-	return wsjson.Write(ctx, s.c, m)
+	wctx, cancel := context.WithTimeout(ctx, s.budget(len(m.Data)))
+	defer cancel()
+	if err := wsjson.Write(wctx, s.c, m); err != nil {
+		if wctx.Err() != nil && ctx.Err() == nil {
+			// THIS stream's budget ran out, not the caller's: the socket is
+			// still open and has taken nothing for a minute, so end it.
+			// CloseNow rather than a close frame, because a peer that will
+			// not read a message will not read a close reason either — and it
+			// takes the one close, so a later Close does not log a failure
+			// that says nothing.
+			//
+			// coder/websocket also tears a connection down when a write
+			// that is IN FLIGHT runs out of time, so on that path this is
+			// belt and braces. It is here for the path the library cannot
+			// see — a write that never acquired the conn's write lock, and
+			// so never reached the socket at all — and because the rule this
+			// stream owes its caller ("a client that has taken nothing for a
+			// minute is closed") should not rest on another package's
+			// implementation detail. TestAWedgedClientIsClosedRatherThanHeld
+			// pins the property; which of the two closes does it is not
+			// something a test can, or should, tell apart.
+			//
+			// The caller's own deadline expiring is a different thing
+			// entirely. A handoff's courtesy notice carries seconds, and a
+			// websocket serialises its writes, so such a notice queued behind
+			// a large snapshot expires while waiting for the write lock —
+			// without the socket having failed at anything. Closing there
+			// would let one take-over on the session disconnect a client that
+			// is merely reading a scrollback over a slow link.
+			s.once.Do(func() { _ = s.c.CloseNow() })
+		}
+		return err
+	}
+	return nil
 }
 
 // Close ends the socket with the one close code and fixed reason its error

@@ -29,6 +29,17 @@ const (
 	// defaultPairTTL bounds how long a parked client socket waits for its
 	// runner to dial back before the plane closes it (design §5).
 	defaultPairTTL = 15 * time.Second
+	// defaultControlAckTimeout bounds how long a handoff waits for the
+	// sandbox to confirm the new generation before proceeding without it. It
+	// is short because it is a single round trip over an already-open socket,
+	// and it exists at all because a sandbox that predates this protocol
+	// never answers — a new plane must require nothing an old one cannot
+	// supply.
+	defaultControlAckTimeout = 2 * time.Second
+	// releaseTimeout bounds the store call a departing controller makes on
+	// its way out. Its own context is already cancelled by then, so this is
+	// the whole budget for the release.
+	releaseTimeout = 5 * time.Second
 )
 
 // Host is what a plane needs from its host: the three things it cannot know
@@ -59,16 +70,32 @@ type Options struct {
 	// dial-back that never came. It never receives a terminal message, a byte
 	// of one, or a length of one. Zero means log.Printf.
 	Logf func(string, ...any)
+	// HeartbeatInterval is how often a controlling attach renews its lease,
+	// and therefore how quickly one displaced from another replica notices.
+	// Zero means control.ControllerHeartbeatInterval, which is a sixth of the
+	// lease, so a single missed renewal never costs anybody control.
+	HeartbeatInterval time.Duration
+	// ControlAckTimeout bounds a handoff's wait for the sandbox to confirm
+	// the new generation. Zero means two seconds.
+	ControlAckTimeout time.Duration
 }
 
 // Plane is one replica's attach plane: the pairings it is waiting on, the
 // dial-back endpoint they are claimed through, and the broker that mints
 // them. Its zero value is not usable — construct it with New.
 type Plane struct {
-	host     Host
-	ttl      time.Duration
-	logf     func(string, ...any)
-	attaches *attachTable
+	host       Host
+	ttl        time.Duration
+	heartbeat  time.Duration
+	ackTimeout time.Duration
+	logf       func(string, ...any)
+	attaches   *attachTable
+	// owners is the live attaches this replica is serving, by session, so a
+	// take-over can tell the device it displaced at once rather than leaving
+	// it to notice at its next heartbeat. The state is replica-local for the
+	// same reason the pairing table is; the heartbeat is what makes
+	// displacement work between replicas.
+	owners *ownerTable
 }
 
 // New returns a plane over h. It panics on a nil host: a plane without one
@@ -84,7 +111,29 @@ func New(h Host, o Options) *Plane {
 	if o.Logf == nil {
 		o.Logf = log.Printf
 	}
-	return &Plane{host: h, ttl: o.PairTTL, logf: o.Logf, attaches: newAttachTable()}
+	if o.HeartbeatInterval <= 0 {
+		o.HeartbeatInterval = control.ControllerHeartbeatInterval
+	}
+	if o.ControlAckTimeout <= 0 {
+		o.ControlAckTimeout = defaultControlAckTimeout
+	}
+	return &Plane{host: h, ttl: o.PairTTL, heartbeat: o.HeartbeatInterval, ackTimeout: o.ControlAckTimeout,
+		logf: o.Logf, attaches: newAttachTable(), owners: newOwnerTable()}
+}
+
+// step bounds ONE peer-facing step of a handoff: a binding written to a
+// sandbox, a wait for its acknowledgement, a notice written to a client. One
+// acknowledgement timeout is the budget for each, because each is a single
+// small frame on an already-open socket and because a step that cannot finish
+// inside it is a socket that is not draining — and the fence a handoff
+// depends on is the store's generation and the pty's, both of which are
+// already in force by the time any of these run.
+//
+// Nothing in this package writes to a peer without one. That is the property,
+// not the individual call sites: an unbounded write to a peer is how one
+// paused client froze every handoff on a session.
+func (p *Plane) step(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, p.ackTimeout)
 }
 
 // Broker returns the plane behind control.AttachmentBroker, for the
@@ -114,14 +163,53 @@ var _ control.AttachmentBroker = broker{}
 // broker either splices the stream or ends it, never both and never neither.
 func (b broker) Attach(ctx context.Context, target control.AttachTarget, stream control.TerminalStream) error {
 	p := b.p
+	// Everything this attach holds, and everything it can do about it —
+	// registered BEFORE the first message is read, which is the whole reason
+	// it is up here. The application has already advanced the generation for
+	// a controller attach by the time this is called, so an attach that
+	// joined the table only after that read would be a controller no peer
+	// could see for the length of it: a claim on another attach takes its
+	// peer list without this one, never displaces it, and both clients are
+	// then told they have control. That read is bounded by
+	// attachFirstMsgTimeout — fifteen seconds, on a client that need only be
+	// slow.
+	own := newOwnership(p, target)
+	own.stream = stream
+	p.owners.add(own)
+	defer own.finish()
+
 	first, err := attachFirstResize(ctx, stream)
 	if err != nil {
 		_ = stream.Close(err)
 		return err
 	}
 
+	// A negotiated client is told its mode and generation HERE — before the
+	// pairing, and therefore before the first snapshot or output byte can
+	// possibly reach it. What it is told is read now, not above: a peer may
+	// have displaced this attach while it was still opening.
+	mode, generation := own.get()
+	if mode == terminal.ModeControl {
+		// Whoever held control before this attach no longer does: the
+		// application already advanced the generation. Tell them, and — for
+		// the ones this replica is serving — wait until their sandbox has
+		// the new binding BEFORE this attach is told it has control, so that
+		// no keystroke the previous controller has already sent can still
+		// execute after the answer. That is the same order a mid-attach
+		// claim keeps; an attach is a take-over like any other.
+		p.displace(ctx, own, generation, true)
+	}
+	// What it is told, and what its sandbox is opened as, is what it IS after
+	// that loop rather than what the application granted before it:
+	// displacing every peer waits on each one's sandbox, and another attach
+	// can claim control inside that wait.
+	// announceAs reads them inside the hold that sends them, so what this
+	// client is told is what this attach IS at that instant rather than what
+	// the application granted before the loop began.
+	mode, generation = own.announceAs(ctx, terminal.TypeAttached, 0)
+
 	attachID := randHex(8) // 16 hex characters, crypto/rand
-	pa := &pendingAttach{stream: stream, done: make(chan struct{})}
+	pa := &pendingAttach{stream: stream, own: own, done: make(chan struct{})}
 	// Park before sending: the runner can dial back the instant it reads the
 	// command, and an entry that isn't there yet would be refused.
 	if !p.attaches.park(attachID, pa) {
@@ -137,6 +225,10 @@ func (b broker) Attach(ctx context.Context, target control.AttachTarget, stream 
 		Cols:      first.Cols,
 		Rows:      first.Rows,
 		TargetURL: p.host.BackURL(attachID),
+		// The binding travels with the command that opens the attachment, so
+		// the sandbox installs it before it queues a byte of screen.
+		Mode:       mode,
+		Generation: generation,
 	}}
 	if err := p.host.Send(target.PoolID, target.RunnerID, dial); err != nil {
 		// The command never left this process, so no runner can ever claim
@@ -248,7 +340,7 @@ func (p *Plane) handleAttachBack(w http.ResponseWriter, r *http.Request) {
 	// Release the client handler once the splice is over, whatever ends it.
 	defer close(pa.done)
 
-	splice(r.Context(), pa.stream, wsRunnerConn{c})
+	splice(r.Context(), pa.stream, wsRunnerConn{c}, pa.own)
 }
 
 // ---------------------------------------------------------------------------

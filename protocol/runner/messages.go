@@ -292,4 +292,18 @@ type Attach struct {
 	Cols      int    `json:"cols"`
 	Rows      int    `json:"rows"`
 	TargetURL string `json:"target_url"` // ws(s) URL of THIS controld replica's attach-back endpoint
+	// Mode and Generation are the controller binding the control plane
+	// granted this attach: terminal.ModeControl or terminal.ModeView, and the
+	// controller generation it holds. They travel here, on the command that
+	// opens the attachment, so that the sandbox installs the binding in the
+	// same step it creates the attachment — before a single byte of screen
+	// has been queued, and with no acknowledgement round trip to order
+	// against.
+	//
+	// Both are omitempty and both are absent from an older control plane's
+	// command. A sandbox that receives no binding treats the attachment as
+	// today's unconditional one, because under the old message set only one
+	// client could be sending.
+	Mode       string `json:"mode,omitempty"`
+	Generation uint64 `json:"controller_generation,omitempty"`
 }

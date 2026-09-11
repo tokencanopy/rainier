@@ -158,6 +158,12 @@ type Server struct {
 	// above).
 	transport control.RunnerTransport
 	broker    control.AttachmentBroker
+
+	// clock is the one this replica measures time with, shared by the
+	// services and by the read model — the controller lease's expiry is
+	// derived on a read, and a derivation only this process can make is a
+	// derivation only this process's clock can be right about.
+	clock control.Clock
 }
 
 // New validates cfg, applies defaults, and returns a Server over st.
@@ -210,8 +216,9 @@ func New(st Store, cfg Config) (*Server, error) {
 	}
 
 	s := &Server{
-		st:  st,
-		cfg: cfg,
+		st:    st,
+		cfg:   cfg,
+		clock: systemClock{},
 	}
 	// The runner plane is built before the services because it IS the
 	// transport they are composed over; its host reaches back through s for
@@ -251,7 +258,7 @@ func (s *Server) compose() error {
 		envs     = s.st.Environments()
 		fleet    = s.st.Fleet()
 		pools    = installationPools{st: s.st}
-		clock    = systemClock{}
+		clock    = s.clock
 		ids      = idGenerator{}
 		ckpts    = pinnedCheckpoints{st: s.st}
 		// The store is both the host's atomicity and its event record: an

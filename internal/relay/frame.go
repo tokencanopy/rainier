@@ -32,9 +32,21 @@ type Frame struct {
 	// omitempty is why "the whole log" has a value of its own instead of
 	// being spelled 0 — a zero Since is absent from these bytes entirely, so
 	// this hop cannot tell an explicit 0 from a Frame that never set it.
-	Since   uint64 `json:"s,omitempty"`
-	Cols    int    `json:"c,omitempty"`
-	Rows    int    `json:"r,omitempty"`
+	Since uint64 `json:"s,omitempty"`
+	Cols  int    `json:"c,omitempty"`
+	Rows  int    `json:"r,omitempty"`
+	// Mode and Gen are a FrameOpen's controller binding: which of
+	// terminal.ModeControl / terminal.ModeView the attachment is, and the
+	// controller generation it holds. They are the last hop of the binding
+	// the control plane granted, and they ride the frame that opens the
+	// attachment so the session installs them before it queues a screen.
+	//
+	// Absent — an older control plane, or an older runner — means the
+	// attachment is unbound, which the session reads as today's
+	// unconditional attachment. Both are omitempty for that reason: a peer
+	// that sets neither writes the bytes it has always written.
+	Mode    string `json:"m,omitempty"`
+	Gen     uint64 `json:"g,omitempty"`
 	Payload []byte `json:"p,omitempty"`
 }
 

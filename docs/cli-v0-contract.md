@@ -37,7 +37,7 @@ rainier status [--verbose]
 rainier new [--name NAME] [--agent claude|codex] [--detach] [-- CMD ARGS...]
 rainier ls [--all] [--verbose] [--json]
 rainier info <session> [--json]
-rainier attach <session>
+rainier attach <session> [--view | --take]
 rainier stop <session>
 rainier delete <session> [--yes]
 
@@ -254,6 +254,13 @@ Failure presence is included with fixed diagnostic guidance. Raw failure prose
 is omitted because it can contain secrets unknown to the local credential store. Raw provider errors, terminal contents,
 credentials, and internal database details are never shown.
 
+A `Controller:` line reports who may type: `this device`, `another device`, or
+`none`. It has three answers and no fourth. The API says whether somebody
+holds control, never who — that is a fact about another person's session — so
+"this device" is derived locally, from the generation this CLI was last
+granted: nobody else can hold a generation without advancing past it, so a
+live lease still at that number is this device's.
+
 ### 3.6 `rainier attach <session>`
 
 Dispatched on the **raw** state, because the endpoint's rules are stated in raw
@@ -269,8 +276,52 @@ states and a display word groups states the endpoint treats differently.
 - `dead`, `canceled`, `destroyed`: a clear result naming the accurate
   lifecycle.
 - an unknown state: attempted; the server decides.
-- Ctrl-] detaches locally and leaves the remote session running.
+- Ctrl-] detaches locally and leaves the remote session running, and releases
+  control as it goes, so the next attach claims it with no key press.
 - `--since` remains the diagnostic replay and overrides every refusal above.
+
+**Who may type.** At most one attached device controls a session at any
+moment; every other attach is a viewer that receives the screen and the output
+and whose input is discarded. This is invisible on one laptop and is the whole
+point on a laptop and a phone.
+
+- A plain `attach` claims control when nobody holds it — which is every
+  single-device attach — and attaches as a viewer when somebody does, printing
+  one line naming that another device has control and the key that takes it.
+- `--view` never claims, and never types: it is held on the client from the
+  first byte rather than from the server's answer, so it means the same thing
+  against a server that does not implement conditional ownership — where a
+  plain attach would take control unconditionally. Ctrl-\ is inert for the
+  life of the attach, and silently so, the way it already is on a device that
+  has control. "Never claims" is the whole of the flag; a person who wants
+  the key back attaches without it. A plain attach that comes back a **viewer**
+  after a disconnect asks for view mode too and keeps its key — the flag is a
+  separate fact from the mode being requested.
+- `--take` takes control on attach, once, even from a live holder, and its one
+  claim is spent by the first answer whatever that answer said: an attach that
+  opened holding control does not take it back later, on its own, when
+  somebody else takes it. `--view` and `--take` ask for opposite things and
+  are refused together.
+- **Ctrl-\** takes control inside a live attach and tells the device that had
+  it, which drops to viewer and keeps showing output. Either side may take it
+  back the same way. There is no confirmation prompt: the change is one key
+  press away from being undone and the other side is told.
+- Ctrl-\ is intercepted ONLY in an attach the server answered. Against a
+  server that does not implement conditional ownership it is forwarded to the
+  remote application as an ordinary byte, and the attach behaves exactly as it
+  did before this existed.
+- A viewer's resize is ignored. The terminal size follows the controller, so a
+  phone watching does not squeeze a laptop's terminal to phone width.
+- **Reconnect is conditional.** A controller that reconnects within its lease
+  presents the generation it held and resumes control only while nobody took
+  it; if somebody did, it comes back as a viewer and says so. A connection
+  that merely dropped resumes: the attach released on its way out, so nobody
+  holds control, and control nobody holds is claimed by whoever asks. A viewer
+  stays a viewer. The CLI never claims control on its own — not on reconnect,
+  and not in answer to a refusal.
+- Control is a 30-second lease renewed every 5 seconds while the attach is
+  live. A device that crashes without releasing holds control for at most the
+  lease, after which the next attach claims it.
 - A successful attach records `current` when it returns; a refused connection
   leaves it unchanged. The original context is retained across context switches.
 
@@ -598,6 +649,21 @@ the boolean and `child_exit_code` the nullable integer the API sent, with the
 key always present so a consumer cannot mistake "absent" for "older server". A
 client that wants exactly what the control plane said reads those three and
 ignores the rest.
+
+The API's session view carries one further object, additively — nothing else
+in it changed:
+
+```json
+"controller": {"generation": "3", "held": true}
+```
+
+`generation` is the controller generation currently in force, as a DECIMAL
+STRING because it is a `uint64` and a JSON number past 2^53 is silently wrong
+in a browser. `held` is whether anybody holds it right now. It names nobody: a
+client learns that somebody has control, never who or on what device. Both
+keys are always present; a server that predates them sends neither, which
+reads as "nobody has control" and is the truth there, because nothing was ever
+conditional.
 
 The derived fields are **additive and separately named** — `lifecycle`,
 `process`, `connection`, and an `actions` object — so nothing overwrites a fact

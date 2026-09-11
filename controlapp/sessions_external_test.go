@@ -196,3 +196,12 @@ func TestExternalPackageConsumesTheSeam(t *testing.T) {
 		t.Fatalf("environment = %+v", env)
 	}
 }
+
+func (sessionExtSessionRepo) CompareAndAdvanceControllerGeneration(_ context.Context, _ control.WorkspaceID, _ control.SessionID, expected uint64) (uint64, error) {
+	_ = expected
+	return 0, nil
+}
+
+func (sessionExtSessionRepo) RenewControllerLease(context.Context, control.WorkspaceID, control.SessionID, control.ControllerLease) error {
+	return nil
+}

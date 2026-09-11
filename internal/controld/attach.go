@@ -58,7 +58,12 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 	// costs a full replay, never an error the client can do anything about.
 	since, _ := strconv.ParseUint(r.URL.Query().Get("since"), 10, 64)
 
-	if !s.mayAttach(w, r, u, id) {
+	// What the client asked for about control, read before the upgrade like
+	// every other refusable thing: a 403 is a status code, and a status code
+	// has nowhere to go once the socket is a websocket.
+	asked := attachplane.RequestedOwnership(r.URL.Query())
+
+	if !s.mayAttach(w, r, u, id, asked) {
 		return
 	}
 
@@ -103,9 +108,11 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 	stream := attachplane.ClientStream(c)
 	ctx := attachplane.WithSince(withUser(r.Context(), u), since)
 	err = s.attachments.AttachTerminal(ctx, userScope(u), control.AttachTerminal{
-		SessionID: control.SessionID(id),
-		Since:     since,
-		Mode:      control.AttachmentController,
+		SessionID:          control.SessionID(id),
+		Since:              since,
+		Mode:               asked.Mode,
+		Negotiated:         asked.Negotiated,
+		ExpectedGeneration: asked.Expected,
 	}, stream)
 	if err != nil {
 		_ = stream.Close(err)
@@ -120,9 +127,19 @@ func (s *Server) handleClientAttach(w http.ResponseWriter, r *http.Request, u Us
 // not touch exists and is starting.
 //
 // The decision itself is not a second implementation: it is the same
-// ownerOrAdmin policy adapter, asked the same question about the same
-// resource, and the service's own answer downstream stays authoritative.
-func (s *Server) mayAttach(w http.ResponseWriter, r *http.Request, u User, id string) bool {
+// ownerOrAdmin policy adapter, asked the same questions about the same
+// resource, in the same order the service asks them — the mode the client
+// asked for, and then, for a negotiated controller the policy refuses,
+// whether it may watch instead. A client that would be admitted as a viewer
+// downstream must not be answered 403 here, or the two halves disagree and
+// the caller gets a status code for an attach the service means to accept.
+// The service's own answer stays authoritative; this one only refuses what
+// the service would refuse too.
+//
+// Taking control later is a privilege of its own and is authorized where it
+// is exercised, on the claim, not here.
+func (s *Server) mayAttach(w http.ResponseWriter, r *http.Request, u User, id string,
+	asked attachplane.Ownership) bool {
 	row, err := s.st.Sessions().GetSession(r.Context(), installWorkspace, control.SessionID(id))
 	if err != nil {
 		if errors.Is(err, control.ErrNotFound) {
@@ -135,12 +152,21 @@ func (s *Server) mayAttach(w http.ResponseWriter, r *http.Request, u User, id st
 	}
 	resource := control.Resource{Kind: control.ResourceSession, WorkspaceID: installWorkspace,
 		ID: string(row.ID), CreatorID: row.CreatorID}
-	if err := (ownerOrAdmin{}).AuthorizeAttachment(withUser(r.Context(), u), userScope(u),
-		resource, control.AttachmentController); err != nil {
-		writeErr(w, http.StatusForbidden, "forbidden", "not authorized to attach to this session")
-		return false
+	ctx := withUser(r.Context(), u)
+	if err := (ownerOrAdmin{}).AuthorizeAttachment(ctx, userScope(u), resource, asked.Mode); err == nil {
+		return true
 	}
-	return true
+	// A negotiated client that asked for control and may watch is admitted as
+	// a viewer by the service. Self-hosted never gets here — ownerOrAdmin
+	// answers both questions the same way — but the two checks have to ask
+	// the same thing, or a host with a narrower policy gets a 403 for an
+	// attach its own service would accept.
+	if asked.Negotiated && asked.Mode == control.AttachmentController &&
+		(ownerOrAdmin{}).AuthorizeAttachment(ctx, userScope(u), resource, control.AttachmentViewer) == nil {
+		return true
+	}
+	writeErr(w, http.StatusForbidden, "forbidden", "not authorized to attach to this session")
+	return false
 }
 
 // waitRunning polls id's row until the session is attachable, bounded by

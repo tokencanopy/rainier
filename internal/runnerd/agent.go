@@ -648,7 +648,10 @@ func (s *Server) dialAttachBack(ctx context.Context, m runner.ToRunner, cfg Agen
 	// Blocks for the life of the attach; the hub owns the conn's teardown on
 	// either side dying (its readLoop closes clients when the session conn
 	// dies, AttachClient closes the attachment when the client does).
-	hub.AttachClient(ctx, relay.WSConn(c), at.Since, at.Cols, at.Rows)
+	hub.AttachClient(ctx, relay.WSConn(c), relay.Open{
+		Since: at.Since, Cols: at.Cols, Rows: at.Rows,
+		Mode: at.Mode, Generation: at.Generation,
+	})
 }
 
 // attachDialTimeout bounds one attach-back handshake. It sits below

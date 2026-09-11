@@ -187,3 +187,12 @@ func (attachmentExtTerminalStream) Receive(context.Context) (terminal.ClientMess
 }
 func (attachmentExtTerminalStream) Send(context.Context, terminal.ServerMessage) error { return nil }
 func (attachmentExtTerminalStream) Close(error) error                                  { return nil }
+
+func (attachmentExtSessions) CompareAndAdvanceControllerGeneration(_ context.Context, _ control.WorkspaceID, _ control.SessionID, expected uint64) (uint64, error) {
+	_ = expected
+	return expected + 1, nil
+}
+
+func (attachmentExtSessions) RenewControllerLease(context.Context, control.WorkspaceID, control.SessionID, control.ControllerLease) error {
+	return nil
+}

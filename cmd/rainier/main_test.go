@@ -1129,7 +1129,7 @@ func TestAttachFlagsCursor(t *testing.T) {
 		{"--since N resumes", []string{"my-box", "--since", "19"}, "my-box", 19, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ref, cursor, replay, err := attachFlags(tc.args)
+			ref, cursor, replay, _, err := attachFlags(tc.args)
 			if err != nil {
 				t.Fatalf("attachFlags(%q): %v", tc.args, err)
 			}

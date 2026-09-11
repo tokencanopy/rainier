@@ -38,22 +38,30 @@ func TestFrameRoundTrip(t *testing.T) {
 // added, so an event must never start carrying an empty id/ok/payload/stage.
 func TestControlEventWireShape(t *testing.T) {
 	ev, err := json.Marshal(ControlEvent{Kind: "setup_done"})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	if string(ev) != `{"kind":"setup_done"}` {
 		t.Fatalf("plain event on the wire = %s, want {\"kind\":\"setup_done\"}", ev)
 	}
 	for _, tag := range []string{"id", "ok", "payload", "stage", "rc", "tail"} {
-		if strings.Contains(string(ev), `"`+tag+`"`) { t.Fatalf("empty event leaked %q: %s", tag, ev) }
+		if strings.Contains(string(ev), `"`+tag+`"`) {
+			t.Fatalf("empty event leaked %q: %s", tag, ev)
+		}
 	}
 
 	req, err := json.Marshal(ControlEvent{Kind: "req:mint_git_credential", ID: 3, Payload: json.RawMessage(`{"host":"github.com"}`)})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	if string(req) != `{"kind":"req:mint_git_credential","id":3,"payload":{"host":"github.com"}}` {
 		t.Fatalf("request on the wire = %s", req)
 	}
 
 	resp, err := json.Marshal(ControlEvent{Kind: "resp", ID: 3, OK: true, Payload: json.RawMessage(`{"token":"x"}`)})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	if string(resp) != `{"kind":"resp","id":3,"ok":true,"payload":{"token":"x"}}` {
 		t.Fatalf("response on the wire = %s", resp)
 	}
@@ -61,13 +69,17 @@ func TestControlEventWireShape(t *testing.T) {
 	// Stage rides the same struct (T7's stage_failed); pin its tag now so the
 	// field it is spelled with cannot drift before the task that sends it.
 	fail, err := json.Marshal(ControlEvent{Kind: "stage_failed", Stage: "clone", RC: 128, Tail: "fatal: repo not found"})
-	if err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
 	if string(fail) != `{"kind":"stage_failed","stage":"clone","rc":128,"tail":"fatal: repo not found"}` {
 		t.Fatalf("stage failure on the wire = %s", fail)
 	}
 
 	var back ControlEvent
-	if err := json.Unmarshal(resp, &back); err != nil { t.Fatal(err) }
+	if err := json.Unmarshal(resp, &back); err != nil {
+		t.Fatal(err)
+	}
 	if back.Kind != "resp" || back.ID != 3 || !back.OK || string(back.Payload) != `{"token":"x"}` {
 		t.Fatalf("response round trip mangled: %+v", back)
 	}
@@ -76,5 +88,37 @@ func TestControlEventWireShape(t *testing.T) {
 func TestDecodeRejectsGarbage(t *testing.T) {
 	if _, err := Decode([]byte("not json")); err == nil {
 		t.Fatal("expected error decoding garbage")
+	}
+}
+
+// TestAnUnboundFrameIsTheBytesItAlwaysWas is the cross-version promise on
+// this hop, which is the one between runnerd and sessiond — two halves that
+// ship in different artifacts and roll on different days. The binding is
+// additive, so a peer that sets neither field writes exactly the bytes it
+// wrote before the field existed, and an older peer reading a newer one's
+// frame sees only members it already knows.
+func TestAnUnboundFrameIsTheBytesItAlwaysWas(t *testing.T) {
+	raw, err := Encode(Frame{Type: FrameOpen, AttachID: 7, Since: 3, Cols: 80, Rows: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"t":0,"a":7,"s":3,"c":80,"r":24}`
+	if string(raw) != want {
+		t.Fatalf("an unbound open frame = %s, want %s", raw, want)
+	}
+
+	// And the binding round-trips when it IS set, which is the other half:
+	// an omitempty that never carried its value would fence nobody.
+	bound, err := Encode(Frame{Type: FrameOpen, AttachID: 7, Cols: 80, Rows: 24,
+		Mode: "control", Gen: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := Decode(bound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != "control" || got.Gen != 4 {
+		t.Fatalf("decoded binding = %q at %d, want control at 4", got.Mode, got.Gen)
 	}
 }

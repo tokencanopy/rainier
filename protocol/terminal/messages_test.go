@@ -107,3 +107,61 @@ func TestUnknownFieldsTolerated(t *testing.T) {
 		t.Fatalf("message mangled: %+v", m)
 	}
 }
+
+// TestUnnegotiatedMessagesAreByteIdentical is the compatibility promise in
+// its most direct form: a peer that uses none of the conditional-ownership
+// fields must put exactly the same bytes on the wire it always has. Every
+// field this task added is omitempty for this reason, and a future one that
+// forgets fails here rather than in somebody's terminal.
+func TestUnnegotiatedMessagesAreByteIdentical(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  any
+		want string
+	}{
+		{"stdin", terminal.ClientMessage{Type: "stdin", Data: []byte("hi")}, `{"type":"stdin","data":"aGk="}`},
+		{"resize", terminal.ClientMessage{Type: "resize", Cols: 80, Rows: 24}, `{"type":"resize","cols":80,"rows":24}`},
+		{"snapshot", terminal.ServerMessage{Type: "snapshot", Seq: 3, Data: []byte("s"), Cols: 80, Rows: 24},
+			`{"type":"snapshot","seq":3,"data":"cw==","cols":80,"rows":24}`},
+		{"output", terminal.ServerMessage{Type: "output", Seq: 4, Data: []byte("o")}, `{"type":"output","seq":4,"data":"bw=="}`},
+		{"exit", terminal.ServerMessage{Type: "exit", ExitCode: 2}, `{"type":"exit","exitCode":2}`},
+	} {
+		b, err := json.Marshal(tc.msg)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if string(b) != tc.want {
+			t.Errorf("%s = %s, want %s", tc.name, b, tc.want)
+		}
+	}
+}
+
+// TestGenIsADecimalString pins the one thing about generations that a browser
+// would otherwise get silently wrong: they are decimal strings, exact past
+// 2^53, and anything unparseable reads as zero rather than as an error nobody
+// could act on.
+func TestGenIsADecimalString(t *testing.T) {
+	if got := terminal.GenOf(0); got != "" {
+		t.Errorf("GenOf(0) = %q, want the empty string so it leaves the wire entirely", got)
+	}
+	const big = uint64(1) << 60
+	g := terminal.GenOf(big)
+	if g != "1152921504606846976" {
+		t.Errorf("GenOf(2^60) = %q", g)
+	}
+	if got := g.Value(); got != big {
+		t.Errorf("round trip = %d, want %d", got, big)
+	}
+	for _, bad := range []terminal.Gen{"", "x", "-1", "1.0", " 1"} {
+		if got := bad.Value(); got != 0 {
+			t.Errorf("Gen(%q).Value() = %d, want 0", bad, got)
+		}
+	}
+	b, err := json.Marshal(terminal.ServerMessage{Type: terminal.TypeAttached, Mode: terminal.ModeControl, Generation: terminal.GenOf(3)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"type":"attached","mode":"control","gen":"3"}`; string(b) != want {
+		t.Errorf("attached = %s, want %s", b, want)
+	}
+}

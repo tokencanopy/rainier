@@ -189,7 +189,9 @@ func (st *fleetFakeStore) setSessionSetupHash(ws control.WorkspaceID, id control
 }
 
 // nextControllerGeneration is the store's controller lease: one counter per
-// stored row, advanced on every call.
+// stored row, advanced on every call, and the lease vacated with it as the
+// port requires — this is the unconditional take-over, and it displaces
+// whoever held control.
 func (st *fleetFakeStore) nextControllerGeneration(ws control.WorkspaceID, id control.SessionID) (uint64, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -199,6 +201,8 @@ func (st *fleetFakeStore) nextControllerGeneration(ws control.WorkspaceID, id co
 		return 0, control.ErrNotFound
 	}
 	s.ControllerGeneration++
+	s.ControllerHolder = ""
+	s.ControllerLeaseExpiresAt = time.Time{}
 	m[id] = s
 	return s.ControllerGeneration, nil
 }
@@ -2130,4 +2134,12 @@ func TestReconcileAdoptsAnUnplacedLiveRow(t *testing.T) {
 	if err != nil || len(res.Destroy) != 1 || res.Destroy[0] != "sess_elsewhere" {
 		t.Fatalf("duplicate: res=%+v err=%v", res, err)
 	}
+}
+
+func (f *fleetFakeSessions) CompareAndAdvanceControllerGeneration(_ context.Context, _ control.WorkspaceID, _ control.SessionID, expected uint64) (uint64, error) {
+	return expected + 1, nil
+}
+
+func (f *fleetFakeSessions) RenewControllerLease(context.Context, control.WorkspaceID, control.SessionID, control.ControllerLease) error {
+	return nil
 }

@@ -215,3 +215,12 @@ type fleetExtResolver struct{}
 func (fleetExtResolver) ResolveLaunchMaterial(context.Context, control.Session, *control.Environment) (controlapp.LaunchMaterial, error) {
 	return controlapp.LaunchMaterial{}, nil
 }
+
+func (fleetExtSessions) CompareAndAdvanceControllerGeneration(_ context.Context, _ control.WorkspaceID, _ control.SessionID, expected uint64) (uint64, error) {
+	_ = expected
+	return 0, nil
+}
+
+func (fleetExtSessions) RenewControllerLease(context.Context, control.WorkspaceID, control.SessionID, control.ControllerLease) error {
+	return nil
+}

@@ -23,10 +23,30 @@ const (
 // AttachTerminal is the command for AttachTerminal. Since is the attach
 // cursor (terminal.SinceAll for the whole log, 0 for a snapshot of the
 // current screen). Mode distinguishes viewer from controller intent.
+//
+// Negotiated and ExpectedGeneration are the conditional half, and both are
+// optional: a command that sets neither has exactly the semantics it had
+// before they existed, which is what a client that negotiates nothing sends.
 type AttachTerminal struct {
 	SessionID SessionID
 	Since     uint64
 	Mode      AttachmentMode
+	// Negotiated reports that this client understands conditional ownership.
+	// It changes what CONTROLLER intent means. An unnegotiated controller
+	// attach is admitted unconditionally, because a client that cannot be
+	// told it is a viewer cannot be made one without breaking it; it is
+	// therefore recorded as a take-over, so a negotiated client attached at
+	// the same time is fenced and told. A negotiated controller attach claims
+	// only when control is actually free, and is admitted as a viewer when it
+	// is not.
+	Negotiated bool
+	// ExpectedGeneration is the generation this client last held, and turns
+	// the claim into a conditional one: take control only while the session
+	// is still at this generation, and become a viewer otherwise. It is what
+	// a reconnecting controller presents, so that a device superseded while
+	// it was away comes back honestly instead of taking control from whoever
+	// now has it. Zero means "I hold no generation".
+	ExpectedGeneration uint64
 }
 
 // AttachTarget is the fully resolved binding an AttachmentBroker needs to
@@ -39,6 +59,44 @@ type AttachTarget struct {
 	RunnerID             RunnerID
 	PlacementGeneration  uint64
 	ControllerGeneration uint64
+	// Mode is the mode the application actually GRANTED, which is not always
+	// the one the command asked for: a controller attach arriving while
+	// somebody else holds a live lease is granted AttachmentViewer.
+	Mode AttachmentMode
+	// Negotiated reports that this client advertised conditional ownership
+	// and can therefore be TOLD things: `attached`, `stale`,
+	// `control_changed`. A broker sends none of them to a client that
+	// negotiated nothing, because it cannot decode them.
+	Negotiated bool
+	// MayClaim reports that this client may TAKE control mid-attach — what
+	// the take-control key does.
+	//
+	// It is a fact of its own, and deliberately not inferred from Negotiated
+	// or from Controller being non-nil, because a host policy can grant
+	// viewing without granting driving. Such a client must still be told its
+	// mode and its generation, and must still never be admitted a
+	// controller; one boolean cannot say both. A broker refuses its claims
+	// without leaving the replica; the keeper's own Claim asks the policy
+	// again, and that answer is the authority.
+	MayClaim bool
+	// Controller is the live half of the lease — claim, renew, release —
+	// bound by the application to this workspace, session and attach. A
+	// broker drives a handoff through it and is never handed a repository.
+	//
+	// It is nil when the attach was not negotiated: there is no lease for a
+	// client that cannot be told about one. A negotiated attach carries one
+	// whether or not MayClaim is set, because a viewer reads its own
+	// generation through it.
+	//
+	// Two invariants tie the three fields together, and an application that
+	// breaks either is describing an attach that cannot exist: Controller is
+	// non-nil exactly when Negotiated is set, and MayClaim implies
+	// Negotiated. A broker that is handed one anyway resolves it in the
+	// direction that costs nobody anything — a keeper without the flag is a
+	// composer written before the flag existed and still means what a keeper
+	// has always meant, while a claim without a keeper has nothing to
+	// exercise and is refused.
+	Controller ControllerLeaseKeeper
 }
 
 // TerminalStream is the transport adapter over complete terminal protocol
