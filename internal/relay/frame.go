@@ -70,9 +70,11 @@ type Frame struct {
 // the session as a whole rather than about any one viewer. It has three
 // shapes, distinguished by Kind and ID:
 //
-//   - An EVENT — "setup_done", "setup_failed"/"stage_failed", "child_exited" —
-//     is fire-and-forget, carries ID 0, and travels upward only (sessiond →
-//     runnerd), where runnerd turns it into an rwire event for controld.
+//   - An EVENT — "setup_done", "setup_failed"/"stage_failed", "child_exited",
+//     "suspending"/"suspend_ready" — is fire-and-forget and carries ID 0. Most
+//     travel upward only (sessiond → runnerd), where runnerd turns them into
+//     rwire events for controld; the suspend pair is the one that travels both
+//     ways and stays between runnerd and the sandbox.
 //   - A REQUEST is Kind "req:<method>" with an ID greater than zero. Either
 //     end may originate one: the sandbox asking controld to mint a git
 //     credential goes up, a diff or a push/pull goes down.
@@ -90,6 +92,28 @@ type Frame struct {
 // ControlSender.Send, Hub.SendControl, and both control handlers alike — but
 // owning the shape is what keeps a field rename from silently becoming a
 // dropped event.
+// The two kinds of the suspend handshake. They are constants rather than
+// literals because both ends of the hop are in different repositories'
+// worth of build lineage — runnerd runs on the host and sessiond ships inside
+// the session image, so a typo on one side would be a silently ignored frame
+// rather than a compile error.
+const (
+	// KindSuspending is runnerd telling a sandbox it is about to be FROZEN.
+	// It is sent before `docker pause`, which sessiond never sees as a signal:
+	// a paused sessiond receives no SIGTERM, so without this the exec runner's
+	// KillAll — the one bound on a detached exec's life — would never run on
+	// the default `rainier stop`.
+	//
+	// A sessiond that predates it logs an unknown kind and drops it, and
+	// runnerd's acknowledgement wait expires and pauses anyway, which is
+	// exactly the behaviour the fleet has today.
+	KindSuspending = "suspending"
+	// KindSuspendReady is the sandbox saying its execs are gone (or that it
+	// gave up waiting for one). It carries nothing: runnerd is waiting for the
+	// FACT, and a count would be a number nobody acts on.
+	KindSuspendReady = "suspend_ready"
+)
+
 type ControlEvent struct {
 	Kind string `json:"kind"`
 	// ID correlates a request with its one response. It is per-direction and

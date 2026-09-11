@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -87,6 +88,17 @@ type Server struct {
 	// never registered" would otherwise take ten seconds each — and it is only
 	// ever written immediately after New, before this server serves anything.
 	hubWait time.Duration
+	// suspendAcks is the one waiter per session for a sandbox's
+	// `suspend_ready`. It is keyed by session and holds at most one entry,
+	// because two concurrent suspends of one session are already a caller
+	// bug and neither could be told apart by an acknowledgement that carries
+	// nothing. A `suspend_ready` arriving with no waiter is dropped.
+	suspendMu   sync.Mutex
+	suspendAcks map[string]chan struct{}
+	// suspendWait is how long a warm suspend gives the sandbox to say its
+	// execs are gone. A field rather than a constant so a test does not spend
+	// the production budget; only ever written immediately after New.
+	suspendWait time.Duration
 }
 
 // SetOnEvent installs f as the session-event callback (nil clears it).
@@ -164,7 +176,8 @@ func (e *egressError) Unwrap() error { return e.err }
 
 func New(drv driver.Driver, dialBase, egressAdmin, proxyURL string) *Server {
 	return &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin,
-		proxyURL: proxyURL, hubWait: defaultHubWait}
+		proxyURL: proxyURL, hubWait: defaultHubWait, suspendWait: defaultSuspendWait,
+		suspendAcks: map[string]chan struct{}{}}
 }
 
 // Recover rebuilds the in-memory registry from the driver's labeled
@@ -523,6 +536,17 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 	}
 	switch op {
 	case "suspend":
+		// Every exec this session is running ends BEFORE the container is
+		// frozen or stopped. A cold suspend gets there on its own — `docker
+		// stop` delivers the SIGTERM sessiond's own handler answers — but a
+		// warm one is `docker pause`, which delivers nothing, and without
+		// this a detached `claude --continue` would be frozen and resumed
+		// rather than reaped, contradicting both the CLI's help text and the
+		// design's lifetime rule. Sent only for the warm case, so the cold
+		// path keeps exactly the shape it has today.
+		if warm {
+			s.quiesceExecs(id)
+		}
 		if !warm {
 			// Cold suspend (docker stop) kills the container's sessiond,
 			// which closes its /register conn — the exact same socket-level
@@ -840,6 +864,11 @@ func (s *Server) routeControl(id string, payload []byte) {
 			return
 		}
 		s.fireEventDetail(id, "stage_failed", stageFailedDetail(stage, ev.RC, ev.Tail))
+	case relay.KindSuspendReady:
+		// The sandbox's execs are gone and the container may be frozen. It
+		// stays between this process and that sandbox: controld asked for a
+		// suspend and is waiting for THAT answer, not for this step of it.
+		s.deliverSuspendAck(id)
 	case "credential_rejected":
 		// A git operation in the sandbox was refused by GitHub. The vault mints
 		// optimistically (no GitHub round-trip per mint, design §4.2), so an
@@ -899,6 +928,82 @@ func (s *Server) routeControl(id string, payload []byte) {
 			Payload: rpcErrorPayload("this runner has no controld connection")}); err != nil {
 			log.Printf("session %s: refusing %q locally: %v", id, method, err)
 		}
+	}
+}
+
+// defaultSuspendWait is how long a warm suspend gives a sandbox to say its
+// execs are gone.
+//
+// It is a little longer than the sandbox's own quiesce budget, so the ordinary
+// answer is the acknowledgement rather than this timeout; a sandbox that
+// predates the notice never answers at all and spends the whole of it, which
+// is the one case where a `rainier stop` gets slower than it is today. That is
+// bounded, it happens only for sessions created before exec shipped, and the
+// alternative is a lifetime rule that is false.
+const defaultSuspendWait = 7 * time.Second
+
+// quiesceExecs tells the sandbox it is about to be frozen and waits for it to
+// say its execs are gone.
+//
+// Best effort by construction, and every way it can fail ends in "pause
+// anyway": a session that never registered a hub has no sandbox to tell, a
+// sessiond that predates the notice logs an unknown kind and drops it, and a
+// conn that has died takes the whole question with it. None of those is worse
+// than today, where the notice is not sent at all.
+func (s *Server) quiesceExecs(id string) {
+	hub, ok := s.reg.hub(id)
+	if !ok {
+		return
+	}
+	b, err := json.Marshal(relay.ControlEvent{Kind: relay.KindSuspending})
+	if err != nil {
+		log.Printf("session %s: encoding the suspend notice: %v", id, err)
+		return
+	}
+	ack := s.armSuspendAck(id)
+	defer s.disarmSuspendAck(id)
+	if err := hub.SendControl(b); err != nil {
+		log.Printf("session %s: sending the suspend notice: %v; suspending anyway", id, err)
+		return
+	}
+	select {
+	case <-ack:
+	case <-time.After(s.suspendWait):
+		log.Printf("session %s: the sandbox did not acknowledge the suspend within %s "+
+			"(a sandbox created before exec shipped never will); suspending anyway",
+			id, s.suspendWait)
+	}
+}
+
+// armSuspendAck registers this session's one waiter, replacing any stale
+// entry: a previous suspend that timed out left one behind, and a
+// `suspend_ready` for it would otherwise satisfy this one.
+func (s *Server) armSuspendAck(id string) chan struct{} {
+	ch := make(chan struct{})
+	s.suspendMu.Lock()
+	s.suspendAcks[id] = ch
+	s.suspendMu.Unlock()
+	return ch
+}
+
+func (s *Server) disarmSuspendAck(id string) {
+	s.suspendMu.Lock()
+	delete(s.suspendAcks, id)
+	s.suspendMu.Unlock()
+}
+
+// deliverSuspendAck wakes this session's waiter, once. A `suspend_ready` with
+// no waiter is a late answer to a suspend that already gave up, and dropping
+// it is the whole of what there is to do.
+func (s *Server) deliverSuspendAck(id string) {
+	s.suspendMu.Lock()
+	ch, ok := s.suspendAcks[id]
+	if ok {
+		delete(s.suspendAcks, id)
+	}
+	s.suspendMu.Unlock()
+	if ok {
+		close(ch)
 	}
 }
 

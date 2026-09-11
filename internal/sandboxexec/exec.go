@@ -322,6 +322,35 @@ func (r *Runner) KillAll() {
 	}
 }
 
+// KillAllAndWait is KillAll plus the wait for the processes to actually be
+// gone, reporting how many were still live when the budget ran out.
+//
+// It exists because KillAll signals on a goroutine per exec by design, so it
+// returns while the SIGTERMs are still in flight — which is fine for a
+// process that is about to be SIGKILLed by its container going away, and is
+// not fine at all for a WARM suspend. `docker pause` freezes the container
+// through the freezer cgroup: a signal that has been sent but not yet acted
+// on stays pending, and the kill grace's own escalation timer stops with
+// everything else, so the process a caller was told died is still there on
+// resume. The sandbox has to be able to say "they are gone" before it is
+// frozen, and this is what lets it.
+//
+// The budget is the caller's because the two callers want different things: a
+// suspend waits out the kill grace so the SIGKILL escalation completes, while
+// a shutdown already has its own bound and its container is leaving.
+func (r *Runner) KillAllAndWait(budget time.Duration) int {
+	r.KillAll()
+	deadline := time.Now().Add(budget)
+	for r.LiveCount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(killPollInterval)
+	}
+	return r.LiveCount()
+}
+
+// killPollInterval is how often KillAllAndWait re-checks. Short enough to be
+// invisible next to a stop, long enough not to spin.
+const killPollInterval = 20 * time.Millisecond
+
 // reserve takes one of the session's exec slots, reporting false when they
 // are all taken. The count is checked and taken in one locked step, so eight
 // callers racing produce eight execs and not nine.
@@ -901,6 +930,18 @@ func (a *attachment) emit(m terminal.ServerMessage) error {
 	defer a.out.RUnlock()
 	if a.outClosed {
 		return errAttachmentClosed
+	}
+	// `closing` is checked FIRST and not merely as one arm of the select
+	// below. Once a kill has begun both arms are ready — the outbox has room
+	// and `closing` is shut — and a select picks either, so an exec killed by
+	// its session would report the SIGTERM that killed it as an ordinary
+	// exec_exit about half the time. The contract is that a session which
+	// ended under an exec is 125 with a sentence naming WHICH end it was, not
+	// a 143 a script would read as the command's own answer.
+	select {
+	case <-a.closing:
+		return errAttachmentClosed
+	default:
 	}
 	select {
 	case a.msgs <- m:

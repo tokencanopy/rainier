@@ -578,6 +578,25 @@ func (ss *scriptedSessiond) execRunner() *sandboxexec.Runner {
 	return ss.execs
 }
 
+// quiesce is this sandbox's answer to a suspend notice: every exec ends, and
+// runnerd is told when they are gone so the container can be frozen without a
+// half-delivered signal pending inside it. It is the same pair of steps
+// cmd/sessiond's quiesceExecs takes, over the same real runner.
+func (ss *scriptedSessiond) quiesce(ctx context.Context) {
+	if execs := ss.execRunner(); execs != nil {
+		execs.KillAllAndWait(6 * time.Second)
+	}
+	b, err := json.Marshal(relay.ControlEvent{Kind: relay.KindSuspendReady})
+	if err != nil {
+		return
+	}
+	raw, err := relay.Encode(relay.Frame{Type: relay.FrameControl, AttachID: 0, Payload: b})
+	if err != nil {
+		return
+	}
+	ss.conn.Write(ctx, raw)
+}
+
 // rpcHandler serves one inbound method, in the same shape cmd/sessiond's own
 // RPCHandler has: the request's body in, the response's body out, and an error
 // that becomes an ok:false answer carrying its message.
@@ -693,7 +712,7 @@ func (ss *scriptedSessiond) serve() {
 				att.Close()
 			}
 		case relay.FrameControl:
-			ss.onControl(f.Payload)
+			ss.onControl(ctx, f.Payload)
 		}
 	}
 }
@@ -817,12 +836,21 @@ const mintMethod = "mint_git_credential"
 // once. Anything unroutable is dropped, never fatal: the frame crossed a
 // container boundary, and a malformed one must not take the session's whole
 // conn down with it.
-func (ss *scriptedSessiond) onControl(payload []byte) {
+func (ss *scriptedSessiond) onControl(ctx context.Context, payload []byte) {
 	var ev relay.ControlEvent
 	if err := json.Unmarshal(payload, &ev); err != nil {
 		return
 	}
 	switch {
+	case ev.Kind == relay.KindSuspendReady:
+		// Upward only; a sandbox never receives its own acknowledgement.
+		return
+	case ev.Kind == relay.KindSuspending:
+		// The two lines a real sessiond runs, and for the same reason: the
+		// container is about to be FROZEN, which delivers no signal, so this
+		// is the only chance every exec — detached ones included — gets to
+		// end before the freezer cgroup stops the clock on it.
+		go ss.quiesce(ctx)
 	case ev.Kind == "resp":
 		if ev.ID == 0 {
 			return
@@ -3377,7 +3405,123 @@ func TestDetachedExecOutlivesItsCaller(t *testing.T) {
 	}
 }
 
-// TestExecRefusalsEndToEnd is the design's status table, from the client's
+// TestStoppingASessionReapsItsDetachedExec is the lifetime rule on the path
+// users actually take.
+//
+// The default `rainier stop` is a WARM suspend — docker pause — which freezes
+// the sandbox without ever delivering it a signal, so the shutdown handler
+// that calls KillAll never ran and a detached `claude --continue` was frozen
+// and resumed rather than reaped. The CLI's own help says "it dies with its
+// session when it is stopped" and the design states the same lifetime bound;
+// this is what makes both true.
+//
+// It drives the real stop — controld's suspend route, the runner command,
+// runnerd's warm Op and the control frame it now sends first — rather than
+// reaching into the runner's KillAll, which is exactly the wiring the previous
+// test could not see.
+func TestStoppingASessionReapsItsDetachedExec(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("this machine has no /bin/sh")
+	}
+	f, id, root := execScene(t, "stop-reaps")
+
+	spec := shellSpec("echo started; sleep 120")
+	spec.Detach, spec.LogPath = true, "run.log"
+	res, _, _, err := f.exec(id, spec, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Started || res.PID <= 0 {
+		t.Fatalf("a detached exec answered %+v", res)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		body, err := os.ReadFile(filepath.Join(root, "run.log"))
+		if err == nil && strings.Contains(string(body), "started") {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("the detached process never wrote to its log")
+		}
+		time.Sleep(pollInterval)
+	}
+
+	// The default stop: warm, which is the whole point.
+	if err := f.client().Do(http.MethodPost, "/v0/sessions/"+id+"/suspend", nil, nil); err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+	f.waitSessions(60*time.Second, "the session to stop", func(rows map[string]apiSession) bool {
+		return strings.HasPrefix(rows[id].State, "suspended")
+	})
+
+	if err := syscall.Kill(res.PID, 0); err == nil {
+		t.Fatal("the session was stopped and its detached exec is still running")
+	}
+	if n := f.sessiond(id).execRunner().LiveCount(); n != 0 {
+		t.Fatalf("%d exec slot(s) are still held after the session was stopped", n)
+	}
+}
+
+// TestStoppingASessionEndsAnInFlightExec is the other half of amendment 4:
+// a caller whose session is stopped under it learns so, rather than blocking
+// until somebody resumes the session hours later.
+//
+// The caller reads a connection that ended with no exit status — exit 125 —
+// which is the one thing the exit code can carry, and the CLI names WHICH end
+// it was by re-reading the session on its way out.
+func TestStoppingASessionEndsAnInFlightExec(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("this machine has no /bin/sh")
+	}
+	f, id, root := execScene(t, "stop-ends")
+	marker := filepath.Join(root, "running")
+
+	type outcome struct {
+		res execio.Result
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := execio.Run(f.ctx, f.wsBase()+"/v0/sessions/"+id+"/exec", execio.Options{
+			Spec:   shellSpec("touch " + marker + "; sleep 120"),
+			Header: http.Header{"Authorization": {"Bearer " + f.token}},
+		})
+		done <- outcome{res, err}
+	}()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatal("the command never started")
+		}
+		time.Sleep(pollInterval)
+	}
+
+	if err := f.client().Do(http.MethodPost, "/v0/sessions/"+id+"/suspend", nil, nil); err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("the exec failed rather than ending: %v", got.err)
+		}
+		if got.res.ExitCode != nil || got.res.Signal != "" {
+			t.Fatalf("a stopped session reported an exit status: %+v", got.res)
+		}
+		if code, ok := execio.ExitCodeFor(got.res); !ok || code != execio.ExitNoStatus {
+			t.Fatalf("a stopped session exits (%d, %v), want (%d, true)",
+				code, ok, execio.ExitNoStatus)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the session was stopped and the exec caller is still waiting")
+	}
+}
+
+// TestExecRefusalsEndToEnd is the design's status table, from the client's// TestExecRefusalsEndToEnd is the design's status table, from the client's
 // side: each refusal is a status code the CLI can act on, answered before the
 // socket is upgraded.
 func TestExecRefusalsEndToEnd(t *testing.T) {

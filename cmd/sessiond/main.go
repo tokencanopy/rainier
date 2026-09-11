@@ -197,6 +197,21 @@ func main() {
 		sandboxexec.SessionEnv(os.Environ(), envAssignments(chainVars)),
 		sandboxexec.NewSpawner().Start)
 
+	// The OTHER end of an exec's lifetime, and the one a signal cannot reach.
+	// The default `rainier stop` is a WARM suspend — `docker pause` — which
+	// freezes this process without ever delivering it a SIGTERM, so the
+	// handler below never runs and a detached `claude --continue` would be
+	// frozen and resumed rather than reaped. runnerd sends this notice just
+	// before it pauses the container and waits for the acknowledgement, which
+	// is what makes "it dies with its session when it is stopped" — what the
+	// CLI's help says and what the design's lifetime rule states — true on
+	// the path users actually take.
+	if rpc != nil {
+		rpc.RegisterEventHandler(relay.KindSuspending, func(relay.ControlEvent) {
+			quiesceExecs(execs, rpc)
+		})
+	}
+
 	go func() {
 		<-s.Exited()
 		code := s.ExitCode()
@@ -336,6 +351,54 @@ func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, e
 			return
 		}
 		backoff = nextBackoff(backoff)
+	}
+}
+
+// execQuiesceBudget bounds how long the sandbox waits for its execs to be
+// GONE before acknowledging a suspend.
+//
+// It is longer than sandboxexec's own kill grace on purpose: that grace is
+// what separates the SIGTERM from the SIGKILL, and acknowledging in between
+// would freeze the container with the escalation still on a timer that the
+// freezer cgroup then stops. Every session that is running no exec at all —
+// which is nearly every stop — acknowledges immediately and pays none of it.
+const execQuiesceBudget = 6 * time.Second
+
+// execKiller is the exec runner as the suspend path needs it, named as an
+// interface so the wiring below is testable without a sandbox to have
+// processes in.
+type execKiller interface {
+	KillAllAndWait(budget time.Duration) int
+}
+
+// eventNotifier is the one method the acknowledgement needs.
+type eventNotifier interface {
+	Notify(relay.ControlEvent) error
+}
+
+// quiesceExecs ends every exec this session is running — DETACHED ones
+// included, because their lifetime is the session's — and tells runnerd when
+// they are gone so the container can be frozen without a half-delivered
+// signal pending inside it.
+//
+// It waits for the processes rather than for the signals: KillAll signals on a
+// goroutine per exec by design, so returning as soon as it does would
+// acknowledge a suspend while the SIGTERMs were still in flight. Each exec's
+// attachment closes as its process goes, which is what ends the caller's
+// stream — the caller reads a connection that ended with no exit status, exits
+// 125, and is told "the session was stopped before the command reported an
+// exit status".
+//
+// The acknowledgement is sent even when the budget expires. runnerd pauses
+// anyway when it hears nothing, so staying silent would only make the stop
+// slower; saying so is what puts the reason in this session's log.
+func quiesceExecs(execs execKiller, notifier eventNotifier) {
+	if n := execs.KillAllAndWait(execQuiesceBudget); n > 0 {
+		log.Printf("%d exec(s) had not ended %s after the suspend notice; "+
+			"acknowledging anyway", n, execQuiesceBudget)
+	}
+	if err := notifier.Notify(relay.ControlEvent{Kind: relay.KindSuspendReady}); err != nil {
+		log.Printf("acknowledging the suspend: %v", err)
 	}
 }
 

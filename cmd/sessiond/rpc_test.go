@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -383,4 +384,164 @@ func TestRPCRepliesGoBackOnTheArrivingConnection(t *testing.T) {
 	if n := second.tries(); n != 0 {
 		t.Fatalf("%d frames written to the connection that replaced it, want 0", n)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// the suspend notice
+// ---------------------------------------------------------------------------
+
+// recordingExecs is the exec runner as the suspend path sees it.
+type recordingExecs struct {
+	mu     sync.Mutex
+	budget time.Duration
+	calls  int
+	left   int
+}
+
+func (r *recordingExecs) KillAllAndWait(budget time.Duration) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	r.budget = budget
+	return r.left
+}
+
+func (r *recordingExecs) state() (int, time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls, r.budget
+}
+
+// recordingSender records the payloads a dispatcher sends upstream.
+type recordingSender struct {
+	mu   sync.Mutex
+	sent [][]byte
+	err  error
+}
+
+func (s *recordingSender) Send(p []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	s.sent = append(s.sent, append([]byte(nil), p...))
+	return nil
+}
+
+func (s *recordingSender) events() []relay.ControlEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]relay.ControlEvent, 0, len(s.sent))
+	for _, p := range s.sent {
+		var ev relay.ControlEvent
+		if json.Unmarshal(p, &ev) == nil {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// suspendWired is the dispatcher wired the way main wires it, so these tests
+// exercise the frame's whole journey through sessiond — OnControl's kind
+// dispatch, the event handler, the kill, and the acknowledgement — rather than
+// calling quiesceExecs directly.
+func suspendWired(execs execKiller) (*rpcDispatcher, *recordingSender) {
+	d := newRPCDispatcher()
+	sender := &recordingSender{}
+	d.online(sender)
+	d.RegisterEventHandler(relay.KindSuspending, func(relay.ControlEvent) {
+		quiesceExecs(execs, d)
+	})
+	return d, sender
+}
+
+func suspendFrame(t *testing.T) []byte {
+	t.Helper()
+	b, err := json.Marshal(relay.ControlEvent{Kind: relay.KindSuspending})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestASuspendNoticeEndsEveryExec is the fix for the lifetime rule the CLI's
+// help text states and the code did not have.
+//
+// The default `rainier stop` is a WARM suspend — docker pause — which freezes
+// this process without ever delivering it a SIGTERM, so the shutdown handler
+// that calls KillAll never runs. A detached `claude --continue` was therefore
+// frozen and resumed rather than reaped. runnerd now sends this notice first,
+// and the sandbox answers it.
+func TestASuspendNoticeEndsEveryExec(t *testing.T) {
+	execs := &recordingExecs{}
+	d, sender := suspendWired(execs)
+
+	d.OnControl(suspendFrame(t))
+
+	calls, budget := execs.state()
+	if calls != 1 {
+		t.Fatalf("a suspend notice killed the execs %d times, want exactly once", calls)
+	}
+	if budget != execQuiesceBudget {
+		t.Fatalf("the kill was given %s, want the quiesce budget %s", budget, execQuiesceBudget)
+	}
+	got := sender.events()
+	if len(got) != 1 || got[0].Kind != relay.KindSuspendReady {
+		t.Fatalf("the sandbox answered %+v, want one %s", got, relay.KindSuspendReady)
+	}
+	if got[0].ID != 0 {
+		t.Fatalf("the acknowledgement carries id %d; it is an event, not a response", got[0].ID)
+	}
+}
+
+// TestASuspendNoticeIsAcknowledgedEvenWhenAnExecWillNotDie: runnerd freezes the
+// container when it hears nothing, so a sandbox that gave up waiting has every
+// reason to say so and none to stay silent.
+func TestASuspendNoticeIsAcknowledgedEvenWhenAnExecWillNotDie(t *testing.T) {
+	execs := &recordingExecs{left: 2}
+	d, sender := suspendWired(execs)
+
+	d.OnControl(suspendFrame(t))
+
+	got := sender.events()
+	if len(got) != 1 || got[0].Kind != relay.KindSuspendReady {
+		t.Fatalf("a sandbox with a stubborn exec answered %+v, want one %s",
+			got, relay.KindSuspendReady)
+	}
+}
+
+// TestAnUnknownControlKindIsStillDropped: the event registry must not turn
+// every unrecognised kind into something that runs. A sandbox is the far end
+// of a channel that also carries a session's terminal traffic.
+func TestAnUnknownControlKindIsStillDropped(t *testing.T) {
+	execs := &recordingExecs{}
+	d, sender := suspendWired(execs)
+
+	b, err := json.Marshal(relay.ControlEvent{Kind: "not_a_kind_this_build_knows"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.OnControl(b)
+
+	if calls, _ := execs.state(); calls != 0 {
+		t.Fatalf("an unknown control kind ran the suspend handler %d times", calls)
+	}
+	if got := sender.events(); len(got) != 0 {
+		t.Fatalf("an unknown control kind produced %+v", got)
+	}
+}
+
+// TestAPanickingEventHandlerDoesNotTakeTheSessionDown: event handlers run on
+// relay's per-frame goroutines, and this process by design outlives its agent,
+// its connection and every viewer.
+func TestAPanickingEventHandlerDoesNotTakeTheSessionDown(t *testing.T) {
+	d := newRPCDispatcher()
+	d.online(&recordingSender{})
+	d.RegisterEventHandler("boom", func(relay.ControlEvent) { panic("handler bug") })
+	b, err := json.Marshal(relay.ControlEvent{Kind: "boom"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.OnControl(b) // must return rather than unwind the process
 }
