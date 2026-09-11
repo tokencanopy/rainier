@@ -196,6 +196,17 @@ reports `restarted bool`, true only where it ran a start, and `resumed()` clears
 bookkeeping (and closes the boot epoch) on exactly that. Nothing above the driver can work it
 out: `Inspect` folds paused, exited and created into one `StateSuspended`.
 
+It clears only when that resume is also the one that brought a **parked** entry back.
+`docker start` on an already-started container exits 0, so a second resume reports a restart
+as honestly as the first — and two are a real shape, since the control plane dispatches the
+command before it transitions the row, so two racing clients both send one. Consuming the
+transition is what keeps the epoch from moving twice, which would move it out from under a
+connection that is already live.
+
+Guarding on the *hub pointer* instead of an epoch — the shape `hubDied` uses — was considered
+and rejected: it makes the guard per-connection again, and would drop a `child_exited` in
+flight across a plain redial, which is the failure this epoch exists to avoid.
+
 An earlier version keyed this on a flag the runner set when it *asked* for a cold suspend, and
 the two come apart in both directions — each breaking one half of the design:
 
@@ -288,6 +299,13 @@ the control plane, and is recorded as a follow-up on the PR.
   `register`'s hub-death tail deliberately keeps an entry as `"running"` when the driver
   cannot say whether its container survived, and such an entry is counted while `docker ps`
   no longer counts it. A consumer must read the pair as what this runner believes it holds.
+- **A container that dies while the runner cannot ask the driver about it.** If a sandbox
+  dies and `Inspect` then fails, `register`'s tail deliberately keeps the entry as `"running"`
+  rather than risk destroying a live container. A resume issued for such an entry — which the
+  control plane never sends (it resumes only a `suspended_*` row) but the local dev surface
+  can — restarts the container without clearing the previous child's exit, because the entry
+  did not look parked. The safe resolution would need the one thing that is unavailable in
+  exactly that situation: an answer from the driver.
 - **`cmd/runnerd`'s wiring is not covered by a test** (the package has none, and `main` is not
   factored for one). Deleting the `go s.RunIdleStop(...)` line would leave the suite green.
 

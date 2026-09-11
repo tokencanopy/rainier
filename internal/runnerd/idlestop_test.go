@@ -1221,3 +1221,58 @@ func TestADeleteThatFailsDoesNotUnstopAStoppedContainer(t *testing.T) {
 		t.Fatalf("state = %q, want %q — the container really is stopped", state, "suspended")
 	}
 }
+
+// alwaysRestartedDriver reports a restart from every resume — two racing
+// `docker start`s that both inspected a stopped container, the second of which
+// succeeds against an already-started one.
+type alwaysRestartedDriver struct{ *driver.Fake }
+
+func (d *alwaysRestartedDriver) Resume(ctx context.Context, id string) (bool, error) {
+	if _, err := d.Fake.Resume(ctx, id); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// TestASecondResumeDoesNotMoveTheEpochAgain: the control plane dispatches a
+// resume to the runner before it transitions the row, so two clients racing an
+// attach both send one. If the restarted sandbox registers between the two,
+// a second epoch bump moves it out from under that live connection — its
+// child's exit dropped, its slot never reclaimed, nothing in the log.
+func TestASecondResumeDoesNotMoveTheEpochAgain(t *testing.T) {
+	clk := newFakeClock()
+	ar := &alwaysRestartedDriver{Fake: driver.NewFake(4)}
+	rd := New(ar, "", "", "")
+	rd.now = clk.now
+	h := &idleHarness{t: t, clk: clk, rd: rd, fd: ar.Fake, id: "sess-idle-1", boot: map[string]uint64{}}
+	h.create(h.id)
+	ctx := context.Background()
+
+	h.run(30*time.Minute, idleStep{at: 0, act: childExits})
+	h.run(30*time.Minute, idleStep{at: 30 * time.Minute, act: sweeps})
+
+	// The first resume restarts the container and opens the new epoch.
+	h.clk.set(31 * time.Minute)
+	if err := h.rd.Op(ctx, h.id, "resume", false); err != nil {
+		t.Fatalf("first resume: %v", err)
+	}
+	// The restarted sandbox registers and captures it.
+	h.register(h.id)
+	live := h.boot[h.id]
+
+	// The second resume lands now.
+	if err := h.rd.Op(ctx, h.id, "resume", false); err != nil {
+		t.Fatalf("second resume: %v", err)
+	}
+	if got := h.rd.reg.currentBoot(h.id); got != live {
+		t.Fatalf("the epoch moved to %d after a second resume; the live connection is now deaf", got)
+	}
+
+	// So this sandbox's own child exit still counts, and its slot comes back.
+	h.clk.set(2 * time.Hour)
+	h.rd.routeControl(h.id, live, []byte(`{"kind":"child_exited","rc":0}`))
+	h.clk.set(2*time.Hour + 31*time.Minute)
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 1 {
+		t.Fatalf("sweep stopped %v, want the session", stops)
+	}
+}

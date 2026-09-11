@@ -563,9 +563,7 @@ func (r *registry) idleSessions(idle time.Duration, now time.Time) []string {
 // reason: `docker stop` kills the container's sessiond, closing the /register
 // conn, and the register goroutine must read that as a deliberate stop rather
 // than a crash — otherwise it destroys the container this is only trying to
-// park. coldSuspended is set here, before the stop rather than after it, so
-// that a hub death racing ahead of the stop's completion cannot leave the
-// entry looking pause-suspended.
+// park.
 func (r *registry) claimIdle(id string, idle time.Duration, now time.Time) (handle string, idleFor time.Duration, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -656,8 +654,21 @@ func (r *registry) resumed(id string, restarted bool) {
 	if !ok {
 		return
 	}
+	// Read before it is overwritten: only the resume that actually brings a
+	// PARKED entry back can be the one that restarted it. `docker start` on an
+	// an already-started container exits 0, so a second resume reports a
+	// restart just as honestly as the first — and two are a real shape, since
+	// the control plane dispatches the command before it transitions the row,
+	// so two racing clients both send one. Without this, the second bumps the
+	// epoch again; if the restarted sandbox registered in between, that bump
+	// moves the epoch out from under a connection that is already live, and
+	// its child's exit is dropped — the session's slot never comes back, and
+	// nothing says why. Consuming the transition is what the intent flag used
+	// to give for free, and this keeps it while the answer comes from the
+	// driver.
+	wasParked := e.state != "running"
 	e.state = "running"
-	if !restarted {
+	if !restarted || !wasParked {
 		return
 	}
 	e.childExitedAt = time.Time{}
