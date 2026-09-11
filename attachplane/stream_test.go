@@ -17,17 +17,17 @@ import (
 // it, with the peer reading nothing until drain is closed. It is a client that
 // is alive and slow, which is a different thing from one that is wedged — and
 // the difference is what these two tests are about.
-func clientPair(t *testing.T, drain <-chan struct{}) chan control.TerminalStream {
+func clientPair(t *testing.T, drain <-chan struct{}) (control.TerminalStream, *websocket.Conn) {
 	t.Helper()
 	served := make(chan struct{})
-	accepted := make(chan control.TerminalStream, 1)
+	accepted := make(chan *websocket.Conn, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
 		defer c.CloseNow()
-		accepted <- ClientStream(c)
+		accepted <- c
 		<-served
 	}))
 	t.Cleanup(func() { close(served); ts.Close() })
@@ -48,7 +48,8 @@ func clientPair(t *testing.T, drain <-chan struct{}) chan control.TerminalStream
 			}
 		}
 	}()
-	return accepted
+	c := <-accepted
+	return ClientStream(c), c
 }
 
 // TestACourtesyNoticeNeverClosesAHealthyClient is the other side of the write
@@ -63,30 +64,31 @@ func clientPair(t *testing.T, drain <-chan struct{}) chan control.TerminalStream
 // The rule is that this stream closes on ITS OWN budget and on nobody else's.
 func TestACourtesyNoticeNeverClosesAHealthyClient(t *testing.T) {
 	drain := make(chan struct{})
-	stream := <-clientPair(t, drain)
+	defer close(drain)
+	stream, conn := clientPair(t, drain)
 
-	// The snapshot goes out under no deadline of its own, as the splice's
-	// output pump sends it.
-	snapshot := make(chan error, 1)
-	go func() {
-		snapshot <- stream.Send(context.Background(),
-			terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: make([]byte, 8<<20)})
-	}()
-	// Long enough that the snapshot owns the socket's write lock.
-	time.Sleep(100 * time.Millisecond)
+	// The snapshot, as the splice's output pump has it: a writer that owns
+	// the socket and has not finished. Holding the lock explicitly is what
+	// makes the queue below a fact rather than a hope.
+	w, err := conn.Writer(context.Background(), websocket.MessageText)
+	if err != nil {
+		t.Fatalf("taking the write lock: %v", err)
+	}
 
 	// And now a handoff's courtesy notice, with a handoff's deadline.
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	if err := stream.Send(ctx, terminal.ServerMessage{
 		Type: terminal.TypeControlChanged, Mode: terminal.ModeView, Generation: "2"}); err == nil {
-		t.Log("the notice landed; this run proved nothing about the socket being kept")
+		t.Fatal("the notice was written while another writer held the socket")
 	}
 
-	// The client was slow, not broken.
-	close(drain)
-	if err := <-snapshot; err != nil {
+	// The snapshot finishes, and the client is still there.
+	if _, err := w.Write([]byte(`{"type":"snapshot"}`)); err != nil {
 		t.Fatalf("a courtesy notice timing out killed a healthy client mid-snapshot: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("finishing the snapshot: %v", err)
 	}
 	if err := stream.Send(context.Background(), terminal.ServerMessage{Type: "output", Seq: 2}); err != nil {
 		t.Fatalf("the client was closed by somebody else's deadline: %v", err)
@@ -94,42 +96,43 @@ func TestACourtesyNoticeNeverClosesAHealthyClient(t *testing.T) {
 }
 
 // TestAClientThatNeverDrainsIsClosedFromBehindTheWriteLock is the case the
-// explicit close IS for. A write blocked on the conn's write lock never
-// reaches the socket, so the websocket library's own teardown — which fires
-// when a write in FLIGHT runs out of time — never happens. Without a close of
-// our own, a client that has taken nothing for the whole of this stream's
-// budget would be held open with writers parked behind it.
+// explicit close IS for. A write that never acquires the conn's write lock
+// never reaches the socket, so the websocket library's own teardown — which
+// fires when a write in FLIGHT runs out of time — never happens. Without a
+// close of our own, a client that has taken nothing for the whole of this
+// stream's budget would be left open with writers parked behind it.
 func TestAClientThatNeverDrainsIsClosedFromBehindTheWriteLock(t *testing.T) {
 	restore := clientWriteTimeout
 	clientWriteTimeout = 300 * time.Millisecond
-	t.Cleanup(func() { clientWriteTimeout = restore })
+	defer func() { clientWriteTimeout = restore }()
 
 	never := make(chan struct{}) // a peer that never reads a byte
-	stream := <-clientPair(t, never)
+	defer close(never)
+	stream, conn := clientPair(t, never)
 
-	blocked := make(chan error, 1)
+	// Somebody else owns the socket and is not giving it back.
+	if _, err := conn.Writer(context.Background(), websocket.MessageText); err != nil {
+		t.Fatalf("taking the write lock: %v", err)
+	}
+	// The socket is closed when this fires, so a read that would otherwise
+	// block forever is how the test sees it happen.
+	closed := make(chan error, 1)
 	go func() {
-		blocked <- stream.Send(context.Background(),
-			terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: make([]byte, 8<<20)})
+		_, _, err := conn.Read(context.Background())
+		closed <- err
 	}()
-	time.Sleep(100 * time.Millisecond)
 
-	// This one never gets the write lock, so it expires holding nothing —
-	// and it is what has to notice that the socket is not draining.
 	started := time.Now()
 	if err := stream.Send(context.Background(), terminal.ServerMessage{Type: "output", Seq: 2}); err == nil {
-		t.Fatal("a write to a client that never read anything succeeded")
+		t.Fatal("a write that never got the socket reported success")
 	}
 	if elapsed := time.Since(started); elapsed > 5*time.Second {
 		t.Fatalf("the queued write took %s to give up", elapsed)
 	}
 	select {
-	case err := <-blocked:
-		if err == nil {
-			t.Fatal("the client that never read took an 8MB snapshot")
-		}
+	case <-closed:
 	case <-time.After(5 * time.Second):
-		t.Fatal("the socket was still held open behind a client that never read a byte")
+		t.Fatal("the socket was left open behind a client that had taken nothing for its whole budget")
 	}
 }
 
@@ -148,30 +151,9 @@ func TestAWedgedClientIsClosedRatherThanHeld(t *testing.T) {
 	clientWriteTimeout = 250 * time.Millisecond
 	t.Cleanup(func() { clientWriteTimeout = restore })
 
-	served := make(chan struct{})
-	accepted := make(chan control.TerminalStream, 1)
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := websocket.Accept(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer c.CloseNow()
-		accepted <- ClientStream(c)
-		<-served // hold the handler open for the whole test
-	}))
-	t.Cleanup(func() { close(served); ts.Close() })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	// The client that never reads. Nothing about it is broken: it is dialed,
-	// upgraded, and simply never calls Read.
-	client, _, err := websocket.Dial(ctx, "ws"+ts.URL[len("http"):], nil)
-	if err != nil {
-		t.Fatalf("dialing the test client: %v", err)
-	}
-	defer client.CloseNow()
-
-	stream := <-accepted
+	never := make(chan struct{}) // the client that never reads
+	defer close(never)
+	stream, _ := clientPair(t, never)
 	// Big frames, because the kernel's own buffers take the first megabytes
 	// whatever the peer does. One of these writes blocks with nothing left to
 	// unblock it.
