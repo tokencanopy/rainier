@@ -165,6 +165,17 @@ else.
   questions the same way (a caller who may attach may drive), so none of this
   is visible there.
 
+  What is asked live is the **question**; who it is asked about is the
+  identity that **opened the attach**, captured when the attach was
+  authorized. It has to be: a claim arrives on the socket the runner dialed
+  back, which is authenticated as a runner and carries no person at all, so
+  there is nobody on that call to ask about. A grant read out of stored state
+  — a collaboration grant, a session's creator — is therefore honoured at the
+  next press, while a **role** a host resolves per request is the one the
+  attach was admitted with for as long as the attach lives. The mechanism for
+  a membership that is revoked mid-attach is closing the connection, not
+  refusing its next claim.
+
   There is **one message for both refusals**, and the CLI renders it
   `[somebody else got there first; press Ctrl-\ to try again]`. For a
   principal the host's policy refuses, that sentence is wrong about the cause
