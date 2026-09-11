@@ -121,6 +121,21 @@ func New(h Host, o Options) *Plane {
 		logf: o.Logf, attaches: newAttachTable(), owners: newOwnerTable()}
 }
 
+// step bounds ONE peer-facing step of a handoff: a binding written to a
+// sandbox, a wait for its acknowledgement, a notice written to a client. One
+// acknowledgement timeout is the budget for each, because each is a single
+// small frame on an already-open socket and because a step that cannot finish
+// inside it is a socket that is not draining — and the fence a handoff
+// depends on is the store's generation and the pty's, both of which are
+// already in force by the time any of these run.
+//
+// Nothing in this package writes to a peer without one. That is the property,
+// not the individual call sites: an unbounded write to a peer is how one
+// paused client froze every handoff on a session.
+func (p *Plane) step(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, p.ackTimeout)
+}
+
 // Broker returns the plane behind control.AttachmentBroker, for the
 // application's attachment service to hand authorized streams to.
 func (p *Plane) Broker() control.AttachmentBroker { return broker{p} }

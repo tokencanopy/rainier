@@ -194,15 +194,35 @@ type scriptedStream struct {
 	// a splice pump outlive the attach it belongs to.
 	dead chan struct{}
 	once sync.Once
+
+	// stalled stands in for a client that has stopped READING its socket: a
+	// closed lid, a TCP zero window, a paused browser tab. Sends block until
+	// the test drains it, or until their own context runs out — which is
+	// exactly what a real socket whose peer never reads does, and the reason
+	// nothing in the plane may write to a peer without a deadline.
+	stalled  atomic.Bool
+	draining chan struct{}
 }
 
 func newScriptedStream() *scriptedStream {
 	return &scriptedStream{
-		in:     make(chan terminal.ClientMessage, 8),
-		out:    make(chan terminal.ServerMessage, 8),
-		closed: make(chan error, 1),
-		dead:   make(chan struct{}),
+		in:       make(chan terminal.ClientMessage, 8),
+		out:      make(chan terminal.ServerMessage, 8),
+		closed:   make(chan error, 1),
+		dead:     make(chan struct{}),
+		draining: make(chan struct{}),
 	}
+}
+
+// stall makes every later Send block, as a socket does once its peer has
+// stopped reading it.
+func (s *scriptedStream) stall() { s.stalled.Store(true) }
+
+// drain lets the stalled sends through again. A test uses it to prove the
+// client was only wedged, never closed — nothing about it was broken.
+func (s *scriptedStream) drain() {
+	s.stalled.Store(false)
+	close(s.draining)
 }
 
 func (s *scriptedStream) Receive(ctx context.Context) (terminal.ClientMessage, error) {
@@ -217,6 +237,15 @@ func (s *scriptedStream) Receive(ctx context.Context) (terminal.ClientMessage, e
 }
 
 func (s *scriptedStream) Send(ctx context.Context, m terminal.ServerMessage) error {
+	if s.stalled.Load() {
+		select {
+		case <-s.draining:
+		case <-s.dead:
+			return io.EOF
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	select {
 	case s.out <- m:
 		return nil

@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
@@ -58,6 +59,13 @@ var (
 // control.TerminalStream over the client socket
 // ---------------------------------------------------------------------------
 
+// clientWriteTimeout bounds one write to a client socket. See Send: it is not
+// a liveness budget for a handoff (Plane.step is that, and it is seconds), it
+// is the point at which a socket that has taken nothing at all is closed
+// rather than held. A variable so a test can drive the wedged-client path
+// without spending a minute on it.
+var clientWriteTimeout = 60 * time.Second
+
 // ClientStream wraps an accepted client websocket as the control.TerminalStream
 // the application (and this plane's broker) speaks. It also sets the socket's
 // read limit: a snapshot replaying a large scrollback is the biggest frame
@@ -99,9 +107,36 @@ func (s wsTerminalStream) Receive(ctx context.Context) (terminal.ClientMessage, 
 	return m, nil
 }
 
-// Send writes one server message to the client.
+// Send writes one server message to the client, under a deadline of its own.
+//
+// The deadline is what keeps a client that has stopped READING from holding
+// the plane that is writing to it. A socket whose peer never drains it (a
+// closed lid, a TCP zero window, a paused browser tab) accepts a little and
+// then accepts nothing, and no RST ever arrives to end it — so an unbounded
+// write to it is an unbounded wait, in whatever goroutine happened to be
+// carrying it. The plane's handoffs no longer wait on any single client
+// (Plane.step bounds those), and this is the other half: the socket itself is
+// eventually closed rather than held open forever with a writer parked on it.
+//
+// It is deliberately far above any frame a live client could be slow with —
+// the biggest thing this stream ever carries is a snapshot replaying a large
+// scrollback, and a slow link must be able to take one. What it catches is a
+// peer that is not draining at all.
 func (s wsTerminalStream) Send(ctx context.Context, m terminal.ServerMessage) error {
-	return wsjson.Write(ctx, s.c, m)
+	ctx, cancel := context.WithTimeout(ctx, clientWriteTimeout)
+	defer cancel()
+	if err := wsjson.Write(ctx, s.c, m); err != nil {
+		if ctx.Err() != nil {
+			// Out of time rather than broken: the socket is still open and
+			// still not draining, so end it here. CloseNow rather than a
+			// close frame, because a peer that will not read a message will
+			// not read a close reason either — and it takes the one close so
+			// a later Close does not log a failure that says nothing.
+			s.once.Do(func() { _ = s.c.CloseNow() })
+		}
+		return err
+	}
+	return nil
 }
 
 // Close ends the socket with the one close code and fixed reason its error

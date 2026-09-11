@@ -179,6 +179,16 @@ func (o *ownership) send(ctx context.Context, m terminal.ServerMessage) {
 	if !o.negotiated {
 		return
 	}
+	// Bounded, always, and by the same deadline every other peer-facing step
+	// of a handoff gets. These are single small JSON objects on an already
+	// open socket, and every one of them is a COURTESY — a displaced peer's
+	// mechanism is its own heartbeat and its fence at the pty, not this
+	// message. Unbounded, one client that has stopped reading holds this
+	// attach's announce mutex for as long as it likes, and the first thing a
+	// peer displacing this attach needs is that mutex: one paused browser tab
+	// would then freeze every handoff on the session.
+	ctx, cancel := o.plane.step(ctx)
+	defer cancel()
 	_ = o.stream.Send(ctx, m)
 }
 
@@ -220,6 +230,13 @@ func (o *ownership) install(ctx context.Context, mode string, gen uint64) error 
 	if err != nil {
 		return err
 	}
+	// Bounded like every other peer-facing step. A runner socket that is not
+	// draining must not hold a handoff open: the generation has already moved
+	// in the store, this attachment's pty fence is already in force, and a
+	// write that cannot land inside one acknowledgement timeout is not going
+	// to make the handoff any safer by landing later.
+	ctx, cancel := o.plane.step(ctx)
+	defer cancel()
 	return runner.Write(ctx, raw)
 }
 
@@ -588,33 +605,59 @@ func (t *ownerTable) peers(o *ownership) []*ownership {
 // has control while a keystroke the previous controller has already sent
 // could still execute; a release does not, because the generation it is
 // announcing has already moved and there is nobody it could be racing.
+//
+// It is a BOUNDED FAN-OUT, and that is the whole of its liveness. Every peer
+// is reached on its own goroutine, so one peer's socket is never in front of
+// another's, and every peer-facing step inside it carries its own deadline,
+// so a peer that cannot be reached never holds the taker. Walked serially
+// with unbounded writes — which is what this was — a single client that had
+// stopped reading (a closed lid, a zero window, a paused tab: no RST, so
+// nothing closes it) froze every handoff on the session: the taker's own
+// claim had already advanced the store, so nobody could type, and the taker
+// was never told it had won.
+//
+// It still returns only when the fan-out is done, because the contract's
+// ordering depends on it: the taker is not told it has control until the
+// displaced controllers' sandboxes have the new binding. What changed is the
+// bound — two acknowledgement timeouts in total, rather than none at all,
+// once per peer, in a queue.
 func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wait bool) {
+	var wg sync.WaitGroup
 	// Zero needs no guard of its own: no row is ever at generation zero, so
 	// every attach is already at or past it and displaceTo refuses each one.
 	for _, other := range p.owners.peers(winner) {
 		// The check and the write are ONE step, under that peer's own lock:
 		// between them, a claim of its own could otherwise land and overwrite
-		// the displacement it has just lost to.
+		// the displacement it has just lost to. It stays on this goroutine,
+		// ahead of the fan-out: every displaced peer stops being forwarded
+		// for at once, whatever its socket is doing.
 		was, moved := other.displaceTo(gen)
 		if !moved {
 			continue
 		}
-		if was == terminal.ModeControl {
-			// It believed it was typing, so its sandbox has to be told before
-			// anybody is told anything else.
-			if wait {
-				_ = other.installAndWait(ctx, terminal.ModeView, gen)
-			} else {
-				_ = other.install(ctx, terminal.ModeView, gen)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if was == terminal.ModeControl {
+				// It believed it was typing, so its sandbox has to be told
+				// before anybody is told anything else.
+				sctx, cancel := p.step(ctx)
+				if wait {
+					_ = other.installAndWait(sctx, terminal.ModeView, gen)
+				} else {
+					_ = other.install(sctx, terminal.ModeView, gen)
+				}
+				cancel()
 			}
-		}
-		// A viewer stays a viewer; only the number it would claim from
-		// changes, and its client reads that silently. What the notice SAYS
-		// is read at send time, not asserted here: a peer that won its own
-		// claim inside this loop is told it has control, rather than being
-		// told it is a viewer and then corrected.
-		other.announceAs(ctx, terminal.TypeControlChanged, 0)
+			// A viewer stays a viewer; only the number it would claim from
+			// changes, and its client reads that silently. What the notice
+			// SAYS is read at send time, not asserted here: a peer that won
+			// its own claim inside this loop is told it has control, rather
+			// than being told it is a viewer and then corrected.
+			other.announceAs(ctx, terminal.TypeControlChanged, 0)
+		}()
 	}
+	wg.Wait()
 }
 
 // ---------------------------------------------------------------------------

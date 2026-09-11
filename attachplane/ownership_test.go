@@ -1450,10 +1450,11 @@ func TestAStaleAnswerNeverTellsALiveControllerItIsAViewer(t *testing.T) {
 // inside the loop that is displacing it — that it is a viewer, at a generation
 // it holds the lease on.
 func TestADisplacementNoticeReportsTheModeItReads(t *testing.T) {
+	p, _, _ := newTestPlane(t, Options{})
 	for _, mode := range []string{terminal.ModeControl, terminal.ModeView} {
 		t.Run(mode, func(t *testing.T) {
 			stream := newScriptedStream()
-			o := &ownership{negotiated: true, stream: stream, mode: mode, gen: 5,
+			o := &ownership{plane: p, negotiated: true, stream: stream, mode: mode, gen: 5,
 				ack: make(chan uint64, 1)}
 
 			if got, gen := o.announceAs(context.Background(), terminal.TypeControlChanged, 0); got != mode || gen != 5 {
@@ -1465,5 +1466,194 @@ func TestADisplacementNoticeReportsTheModeItReads(t *testing.T) {
 					mode, m.Type, m.Mode, m.Generation, mode)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// a peer that stopped reading holds nobody (fourth review, finding 1)
+// ---------------------------------------------------------------------------
+
+// stalledPeer starts a viewer attach and wedges its client socket: it is
+// attached, nothing about it is broken, and it has stopped reading. No RST
+// ever arrives for such a client, so nothing closes it and nothing times it
+// out at the transport — which is precisely why every write the plane makes
+// to a peer has to carry its own deadline.
+func stalledPeer(t *testing.T, p *Plane, h *fakeHost, ts *httptest.Server,
+	gen uint64, keeper control.ControllerLeaseKeeper) *attachFixture {
+	t.Helper()
+	f := startAttach(t, p, h, ts, control.AttachmentViewer, gen, keeper, true)
+	awaitType(t, f.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, f)
+	f.stream.stall()
+	return f
+}
+
+// TestAStuckPeerDoesNotStallAClaim is the fourth review's blocker, and it
+// needs no concurrency at all — one viewer that stopped reading is the whole
+// setup.
+//
+// The taker's claim has already advanced the store by the time the plane
+// walks its peers, so the previous controller is fenced and nobody may type.
+// Walked serially with an unbounded write, the notice to the stuck viewer
+// never returned: the taker was never told it had won, its client stayed in
+// `view` and sent nothing, and its own heartbeat renewed a lease it did not
+// know it held. Zero working controllers for the life of the attach.
+func TestAStuckPeerDoesNotStallAClaim(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 250 * time.Millisecond})
+	lease := &fakeLease{gen: 1, holder: "att_laptop"}
+
+	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_laptop"}, true)
+	awaitType(t, laptop.stream, terminal.TypeAttached)
+	awaitSpliced(t, laptop)
+	stuck := stalledPeer(t, p, h, ts, 1, fakeKeeper{lease, "att_stuck"})
+
+	phone := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_phone"}, true)
+	awaitType(t, phone.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, phone)
+
+	phone.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
+	m, _ := awaitType(t, phone.stream, terminal.TypeAttached)
+	if m.Mode != terminal.ModeControl || m.Generation.Value() != 2 {
+		t.Fatalf("the winning claim was answered %s at %q, wanted control at 2", m.Mode, m.Generation)
+	}
+
+	// The peer that could not be reached cost the taker nothing: what it
+	// missed is the notice, and its own heartbeat and its pty fence are what
+	// the design leans on for it. (That it is fenced at the plane regardless
+	// is TestAStalledExControllerIsFencedEvenThoughItsNoticeCouldNotBeDelivered.)
+	stuck.stream.drain()
+}
+
+// TestAStuckPeerDoesNotStallANewControllerAttach is the same wedge on the
+// attach path, where it was worse: the displacement runs BEFORE the client
+// socket is parked and before the dial_attach is sent, so one stuck viewer
+// stopped a brand-new controller attach from ever reaching its runner. The
+// new client sat on an upgraded socket with no output and no close.
+func TestAStuckPeerDoesNotStallANewControllerAttach(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 250 * time.Millisecond})
+	lease := &fakeLease{gen: 1, holder: "att_laptop"}
+
+	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_laptop"}, true)
+	awaitType(t, laptop.stream, terminal.TypeAttached)
+	awaitSpliced(t, laptop)
+	h.nextCmd(t) // the laptop's own dial_attach, so the next one read is the taker's
+	stuck := stalledPeer(t, p, h, ts, 1, fakeKeeper{lease, "att_stuck"})
+	h.nextCmd(t)
+
+	// The application admits a new controller attach: it advanced the
+	// generation before the broker was called at all.
+	if gen, err := (fakeKeeper{lease, "att_new"}).Claim(context.Background(), 1); err != nil || gen != 2 {
+		t.Fatalf("the application's own claim = %d, %v; want 2, nil", gen, err)
+	}
+	newer := startAttach(t, p, h, ts, control.AttachmentController, 2, fakeKeeper{lease, "att_new"}, true)
+
+	if cmd := h.nextCmd(t); cmd.Type != "dial_attach" || cmd.Attach == nil {
+		t.Fatalf("the new controller attach sent %+v, want a dial_attach", cmd)
+	}
+	if m, _ := awaitType(t, newer.stream, terminal.TypeAttached); m.Mode != terminal.ModeControl {
+		t.Fatalf("the new controller attach opened as %s at %q, want control", m.Mode, m.Generation)
+	}
+	stuck.stream.drain()
+}
+
+// TestOneStalledPeerDoesNotHideAnothersDisplacement is the other half of the
+// fan-out: peers are reached in parallel, so a peer that cannot be reached is
+// never IN FRONT of one that can. Walked serially, everything behind the
+// stalled socket — including the controller that has to be told it was
+// displaced, and fenced at its sandbox — was simply never visited.
+//
+// The serial version fails this whenever a stalled peer is walked first,
+// which is two times in three here; the fan-out passes it every time, and the
+// suite runs it under -race -count=20.
+func TestOneStalledPeerDoesNotHideAnothersDisplacement(t *testing.T) {
+	// The heartbeat is turned off for the length of this test, because it is
+	// the fallback being measured against: a displaced controller learns from
+	// its own renewal being refused within one interval whatever the plane
+	// does. What is under test is the notice the plane owes it AT ONCE.
+	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 250 * time.Millisecond,
+		HeartbeatInterval: time.Hour})
+	lease := &fakeLease{gen: 1, holder: "att_laptop"}
+
+	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_laptop"}, true)
+	awaitType(t, laptop.stream, terminal.TypeAttached)
+	awaitSpliced(t, laptop)
+	stuckA := stalledPeer(t, p, h, ts, 1, fakeKeeper{lease, "att_stuck_a"})
+	stuckB := stalledPeer(t, p, h, ts, 1, fakeKeeper{lease, "att_stuck_b"})
+
+	phone := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_phone"}, true)
+	awaitType(t, phone.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, phone)
+
+	phone.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
+
+	m, _ := awaitType(t, laptop.stream, terminal.TypeControlChanged)
+	if m.Mode != terminal.ModeView || m.Generation.Value() != 2 {
+		t.Fatalf("the displaced controller was told %s at %q, want view at 2", m.Mode, m.Generation)
+	}
+	// And its sandbox was told, which is the fence the taker's answer depends
+	// on — behind two sockets that are not draining.
+	awaitSandbox(t, laptop.sandbox, func(got []terminal.ClientMessage) bool {
+		for _, m := range got {
+			if m.Type == terminal.TypeControl && m.Mode == terminal.ModeView && m.Generation.Value() == 2 {
+				return true
+			}
+		}
+		return false
+	}, "the displaced controller's new binding")
+	stuckA.stream.drain()
+	stuckB.stream.drain()
+}
+
+// TestAStalledExControllerIsFencedEvenThoughItsNoticeCouldNotBeDelivered is
+// the case the design's own tradeoff rests on. The notice a displaced peer
+// gets is a courtesy; its fence is not, and neither is the plane's refusal to
+// carry what it types. A controller whose client stopped reading is fenced at
+// its sandbox and at the plane before the taker is told anything, and the
+// message it never received costs it nothing but the notice.
+func TestAStalledExControllerIsFencedEvenThoughItsNoticeCouldNotBeDelivered(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 250 * time.Millisecond})
+	lease := &fakeLease{gen: 1, holder: "att_laptop"}
+
+	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_laptop"}, true)
+	awaitType(t, laptop.stream, terminal.TypeAttached)
+	awaitSpliced(t, laptop)
+	laptop.stream.stall()
+
+	phone := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_phone"}, true)
+	awaitType(t, phone.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, phone)
+
+	phone.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
+	if m, _ := awaitType(t, phone.stream, terminal.TypeAttached); m.Generation.Value() != 2 {
+		t.Fatalf("the winning claim was answered %s at %q, want control at 2", m.Mode, m.Generation)
+	}
+
+	// Its sandbox has the viewer binding at the new generation...
+	awaitSandbox(t, laptop.sandbox, func(got []terminal.ClientMessage) bool {
+		for _, m := range got {
+			if m.Type == terminal.TypeControl && m.Mode == terminal.ModeView && m.Generation.Value() == 2 {
+				return true
+			}
+		}
+		return false
+	}, "the stalled ex-controller's new binding")
+	// ...and the plane carries nothing more from it. The round trip is the
+	// synchronisation point: the phone's keystroke is behind the laptop's on
+	// no queue at all, so it is a fresh assertion rather than a sleep.
+	laptop.stream.drain()
+	laptop.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("y\r")}
+	phone.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("n\r")}
+	awaitSandbox(t, phone.sandbox, func(got []terminal.ClientMessage) bool {
+		for _, m := range got {
+			if m.Type == "stdin" {
+				return true
+			}
+		}
+		return false
+	}, "the new controller's keystroke")
+	for _, got := range laptop.sandbox.received() {
+		if got.Type == "stdin" {
+			t.Fatal("a displaced controller's keystroke was still carried")
+		}
 	}
 }
