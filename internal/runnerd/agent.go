@@ -19,6 +19,7 @@ import (
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/runnerplane"
 )
 
 // AgentConfig configures RunAgent's outbound dial to controld.
@@ -671,11 +672,25 @@ func (s *Server) dialAttachBack(ctx context.Context, m runner.ToRunner, cfg Agen
 // others for no reason a user could see. The operator's list is left exactly
 // as given otherwise — a capability is a claim controld decides whether to
 // schedule on, and this adds one it can always trust.
+//
+// It is appended only when there is ROOM for it. runnerplane refuses a whole
+// registration whose claim carries more than MaxCapabilities, so an operator
+// already passing the maximum would announce one too many after this rolls and
+// never reconnect — a working runner out of the fleet permanently, which is a
+// far worse failure than the 501 this append exists to avoid for what is a
+// cheap pre-check and not the fence. The sandbox's own `exec_started` is the
+// fence, so the only cost of dropping the claim is one wasted round trip.
 func buildCapabilities(declared []string) []string {
 	for _, c := range declared {
 		if c == runner.CapabilityExecV1 {
 			return declared
 		}
+	}
+	if len(declared) >= runnerplane.MaxCapabilities {
+		log.Printf("agent: %d capabilities declared, which is runnerplane's maximum; "+
+			"announcing without %s (exec is still fenced by the sandbox's own handshake)",
+			len(declared), runner.CapabilityExecV1)
+		return declared
 	}
 	return append(append([]string(nil), declared...), runner.CapabilityExecV1)
 }
