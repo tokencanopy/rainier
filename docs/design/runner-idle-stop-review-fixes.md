@@ -183,10 +183,17 @@ The answer is one additive bit, and the vocabulary for it already exists on both
    and `errSuspendInFlight`.
 3. **`controlapp.ErrRunnerConflict`**, returned by `dispatch` when a refusal carries the
    bit, wrapping `control.ErrConflict` exactly as `ErrRunnerRefused` wraps
-   `control.ErrUnavailable`. Nothing downstream needs a new branch: `SuspendSession`,
-   `ResumeSession` and `DeleteSession` already return a dispatch error unchanged, and
-   `writeSessionErr` already checks `control.ErrConflict` first and writes the handler's own
-   sentence — "session cannot be resumed right now", which is what this is.
+   `control.ErrUnavailable`. The services need no new branch — `SuspendSession`,
+   `ResumeSession` and `DeleteSession` already return a dispatch error unchanged — and the
+   status and the code are the row conflict's, deliberately, so a client keying on either
+   sees one retryable refusal.
+4. **One new sentence per handler**, `sessionErrText.RunnerConflict`, taken before the row
+   conflict's. The first draft of this change reused the row's sentence and an adversarial
+   review caught it: those sentences NAME A STATE. `stop`'s row conflict is "session is not
+   running", and a runner refusing a stop is refusing a session that very much is — so the
+   answer would have been one the client can disprove by re-reading the row it just read.
+   `resume` needs no new sentence ("session cannot be resumed right now" is already about
+   the moment, not the state) and falls back to it.
 
 What the person gets afterwards: **409 `conflict`, "session cannot be resumed right now"**,
 exit 1. The exit code does not change — every `rainier` failure that is not a usage error
@@ -196,10 +203,11 @@ in the exit status.
 Two things are NOT fixed, named here rather than discovered later:
 
 - `resumeForAttach` now converges instead of failing at once, and its loop returns success
-  only when the ROW reaches `running`. A refused resume does not move the row, so `rainier
-  attach` polls for its bounded two seconds and then reports the conflict. Better than
-  today's immediate internal error, worse than retrying the resume itself — which is a
-  change to the CLI's retry policy and not to this PR's subject.
+  only when the ROW reaches a state it reads as live (`running`, `creating` or `queued`).
+  A refused resume moves the row to none of those, so `rainier attach` polls for its
+  bounded two seconds and then reports the conflict. Better than today's immediate
+  internal error, worse than retrying the resume itself — which is a change to the CLI's
+  retry policy and not to this PR's subject.
 - **`cmd/rainier`'s stderr rendering for a 409 is poor, and this change does not make it
   good.** `reportError` sends every `*cli.APIError` through `readinessError`, which is a
   CONNECTION diagnosis, so a conflict prints "unexpected HTTP status (409); verify the
@@ -210,6 +218,42 @@ Two things are NOT fixed, named here rather than discovered later:
   ever produced, not just this one. Fixing it means teaching `reportError` that a 4xx
   carrying a server-written message is not a connectivity problem, which is a CLI-wide
   change and belongs in its own PR. On the PR's follow-up list.
+
+### 10. A resume accepted into the gap between the stop and its report
+
+The adversarial review of finding 9's fix found the defect underneath it, and it is the
+more serious of the two: **a stop was releasing its in-flight claim before it had reported
+itself.**
+
+`coldSuspend` released the claim on return (`defer s.reg.endStop(id)`), and `stopIdle` then
+did three more things — read the capacity counts, make a BOUNDED `drv.Capacity` call, write
+its log line — before firing the `suspended_cold` event. A resume arriving in that gap was
+accepted: the entry already read `"suspended"`, the driver restarted the container,
+`ResumeSession` committed `running`, and then this stop's own event landed and parked the
+row on `suspended_cold` over a container that is running again. The event cannot be fenced
+away — an auto-stop deliberately carries no placement generation, and zero fences nothing —
+so the row is simply wrong until somebody resumes again.
+
+That is the "row reads stopped over a live sandbox" end state this design spends two
+sections making impossible, and the window is the widest part of a stop: `idleCapacityTimeout`
+is five seconds, and a busy daemon spends them.
+
+The race predates finding 9's fix. What finding 9's fix does is **aim clients at it**:
+before, the refusal was a 500 and nobody retried; now it is a 409 that this document, the
+CLI's conflict vocabulary and every operator are told means "try again", and a client
+retrying a resume until it stops being refused walks straight into the gap. A refusal
+advertised as retryable has to be honest about when it ends.
+
+So the claim is now the caller's to release, not `coldSuspend`'s: `Op`'s stop pairs it with
+a `defer` (it has nothing to report — controld already knows about a stop it dispatched),
+and `stopIdle` holds it until it returns, **with the event fired first** so that nothing a
+wedged `Capacity` call does can delay the one thing a waiting client needs. A resume in the
+gap is refused with the same 409, and the retry finds the row where the stop left it.
+
+The cost is a resume refused for the length of the reporting, bounded by
+`idleCapacityTimeout`. That is the safe direction and a bounded one: a daemon too wedged to
+answer `Capacity` in five seconds is a daemon the resume was not going to get anything from
+either.
 
 ## Alternatives considered
 
@@ -260,6 +304,8 @@ window the `driverOps` interlock already closes for the sweep.
 | a recovered session reports a child exit | it leaves the exemption: counted in `idle_exited`, and an auto-stop candidate from that exit |
 | a recovered session is cold-resumed | the driver reports a restart, the entry is one this runner watched start, and it counts as `active` |
 | a resume arrives while a stop is in flight | 409 `session is being suspended`. For the sweep's stop this is airtight (the `driverOps` interlock); for an operator's stop it is a narrowing |
+| a resume arrives after the container is stopped but before the auto-stop is REPORTED | refused, same 409, because the sweep holds its claim until its event is out. Accepting it would have the control plane commit `running` and then take it back when the stop's own unfenced event landed — a row reading stopped over a container that is running |
+| the `Capacity` call the sweep makes after a stop is slow | the event has already gone out; only the refusal window is extended, bounded by `idleCapacityTimeout` |
 | a resume arrives for an entry parked on `"suspending"` by a stop that could not be read | allowed, and it is the only way back for that session: the guard is on a running stop, not on the state marker |
 | a runner redials while the sweep's stop is in flight | it announces the session as `suspended_cold` (`announceState` renders `"suspending"` that way), reconciliation moves the row there, and a resume dispatched into that window is refused — now as **409 `conflict`, "session cannot be resumed right now"**, not as a 500 |
 | an old controld receives a conflict-flagged refusal | it ignores the unknown field and reports the refusal exactly as it does today: additive, so finding 1's deploy order does not grow a second obligation |
@@ -276,6 +322,14 @@ window the `driverOps` interlock already closes for the sweep.
   stop that could not be read still allowed.
 - A test that `scripts/fleet-up.sh` passes `--idle-stop` with the `IDLE_STOP` override, in
   the package that owns the flag's meaning.
+- For finding 10, a unit test whose driver stalls the capacity reading the sweep takes
+  after the stop: the container is already suspended, the auto-stop event has already been
+  fired, and a resume is still refused — and once the report is done, the same resume is
+  accepted and nothing the stop had left to say undoes it. Fails with the claim released by
+  `coldSuspend` again.
+- For the runner-conflict sentences, a table over `stop`, `snapshot` and `delete`: each
+  answers a runner-reported conflict with its own sentence rather than the row's, which
+  names a state the refusal does not claim.
 - For finding 9, one test per seam plus one that crosses all of them: the agent's result
   for a refused resume carries the bit; every member of `opConflicts` is a 409 on the local
   front AND a conflict on the wire (the anti-drift pin, which fails the moment the two

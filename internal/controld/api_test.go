@@ -4467,3 +4467,60 @@ func TestControllerHeldIsMeasuredOnTheServersClock(t *testing.T) {
 		t.Fatal("an expired lease still reads as held; expiry is passive and must be derived on the read")
 	}
 }
+
+// TestARunnerConflictDoesNotBorrowTheRowsSentence. A runner's "not yet" and a
+// row in the wrong state are both 409 `conflict` — deliberately, so a client
+// keying on the status or the code sees one retryable refusal — but they are
+// not the same statement, and the handlers' Conflict sentences NAME A STATE.
+// `stop` is the clearest case: its row conflict is "session is not running",
+// and a runner refusing a stop is refusing a session that very much is. A
+// handler that reused that sentence would tell a person something the row
+// they just read disproves.
+//
+// Unreachable from today's runnerd for stop and snapshot (only Op's resume
+// arm returns errSuspendInFlight), and pinned anyway: the conflict set is one
+// shared list read by every result arm, so the first sentinel added to it
+// arrives in three commands that never had one.
+func TestARunnerConflictDoesNotBorrowTheRowsSentence(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, state, want string
+	}{
+		{"suspend", http.MethodPost, "/suspend?warm=true", string(control.StateRunning), "session cannot be stopped right now"},
+		{"snapshot", http.MethodPost, "/snapshot", string(control.StateRunning), "session cannot be snapshotted right now"},
+		{"delete", http.MethodDelete, "", string(control.StateRunning), "session cannot be deleted right now"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, st, ts := newTestControld(t)
+			f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
+				Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
+			waitConnected(t, s, "vm1")
+			awaitReconciled(t, f)
+
+			owner, tok := loginUser(t, st, "alice", "member")
+			id := "sess_rc_" + tc.name
+			seedSession(t, st, control.Session{ID: control.SessionID(id), CreatorID: control.ActorID(owner.ID),
+				State: control.SessionState(tc.state), RunnerID: "vm1"})
+
+			type result struct{ resp *http.Response }
+			resc := make(chan result, 1)
+			go func() {
+				resc <- result{doRequest(t, ts, tc.method, "/v0/sessions/"+id+tc.path, tok, nil, nil)}
+			}()
+			f.replyConflict(t, f.nextCmd(t), "session is being suspended")
+
+			resp := (<-resc).resp
+			raw := readBody(t, resp)
+			if resp.StatusCode != http.StatusConflict {
+				t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
+			}
+			e := decodeErrBody(t, raw)
+			if e.Error.Code != "conflict" {
+				t.Errorf("code = %q, want conflict", e.Error.Code)
+			}
+			if e.Error.Message != tc.want {
+				t.Errorf("message = %q, want %q — the row's own conflict sentence names a state "+
+					"the runner's refusal does not claim", e.Error.Message, tc.want)
+			}
+		})
+	}
+}

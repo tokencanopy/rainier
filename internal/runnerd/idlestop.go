@@ -129,6 +129,24 @@ func (s *Server) stopIdle(ctx context.Context, id string, idle time.Duration) bo
 	if !ok {
 		return false
 	}
+	// The claim is held until this function returns — past the driver call,
+	// past the event — and NOT released by coldSuspend, which is where it
+	// used to end. A stop is not finished when the container is stopped, it
+	// is finished when controld has been told: between those two points the
+	// entry reads "suspended" and a resume would be accepted, the row would
+	// commit `running`, and then this stop's own `suspended_cold` event —
+	// deliberately unfenced, since an auto-stop carries no placement
+	// generation — would land and park the row over a container that is
+	// running again. Refusing that resume with errSuspendInFlight is the
+	// answer, and it is the honest one: a client that is told "not yet"
+	// retries, and the retry finds the row where the event left it.
+	//
+	// The cost is that a resume is refused for as long as the reporting below
+	// takes, which is bounded by idleCapacityTimeout and is ordinarily
+	// microseconds. The event goes out FIRST for that reason: nothing a
+	// wedged Capacity call does can delay the one thing a client is waiting
+	// for.
+	defer s.reg.endStop(id)
 	// Bounded, like every other driver call this runner makes off a request
 	// goroutine (register's post-hub-death Inspect takes 30s, the agent's
 	// piggybacked Capacity 5s). cmd/runnerd runs this loop on a background
@@ -144,6 +162,10 @@ func (s *Server) stopIdle(ctx context.Context, id string, idle time.Duration) bo
 		log.Printf("session %s: idle auto-stop could not stop the container: %v", id, err)
 		return false
 	}
+	// Before the reporting, and before the claim above is released: see the
+	// defer at the top of this function for what a resume accepted between
+	// the stop and this event would do to the row.
+	s.fireEventDetail(id, "suspended_cold", "idle for "+idleFor.Round(time.Second).String())
 	active, idleExited := s.reg.counts()
 	// One capacity call per session actually stopped — not per sweep tick —
 	// because "what this stop freed" is the number worth logging and it is
@@ -163,6 +185,5 @@ func (s *Server) stopIdle(ctx context.Context, id string, idle time.Duration) bo
 	}
 	log.Printf("runnerd: idle auto-stop session=%s idle=%s slots_free=%s slots_total=%s active=%d idle_exited=%d",
 		id, idleFor.Round(time.Second), free, slots, active, idleExited)
-	s.fireEventDetail(id, "suspended_cold", "idle for "+idleFor.Round(time.Second).String())
 	return true
 }

@@ -413,14 +413,23 @@ func (s *Server) sessionOp(w http.ResponseWriter, r *http.Request) {
 	mapOpErr(w, s.Op(ctx, id, op, warm), func() { w.WriteHeader(http.StatusNoContent) })
 }
 
-// opConflicts are the refusals that mean "not yet" rather than "this failed":
-// the command is well formed and the session exists, but the runner is in the
-// middle of something the command cannot be interleaved with. Both of this
-// runner's surfaces answer them as a conflict — 409 on the local HTTP front
-// (mapOpErr, which gives each its own sentence), and FromRunner.Conflict on
-// the control connection (the agent's result arms) — and both read this one
-// list, because two lists is exactly how the control path came to report a
-// 409 as a 500 in the first place.
+// opConflicts are the refusals of an OP (suspend, resume, snapshot, destroy)
+// that mean "not yet" rather than "this failed": the command is well formed
+// and the session exists, but the runner is in the middle of something the
+// command cannot be interleaved with. Both of this runner's surfaces answer
+// them as a conflict — 409 on the local HTTP front (mapOpErr, which gives
+// each its own sentence), and FromRunner.Conflict on the control connection
+// (the agent's result arms) — and both read this one list, because two lists
+// is exactly how the control path came to report a 409 as a 500 in the first
+// place.
+//
+// errSessionExists is NOT here, though the create handler answers it 409 too
+// (see the create route). It is the one refusal whose two surfaces disagree
+// on purpose: on the control path the agent's create arm reports an id that
+// already exists as OK, because the desired state — a session under this id —
+// is reached, and a result that said `ok: true, conflict: true` would be two
+// answers to one question. The anti-drift test states that exemption rather
+// than leaving it to be rediscovered.
 var opConflicts = []error{errSessionStarting, errSuspendInFlight}
 
 // opConflict reports whether err is one of them. Nil is not a conflict, and
@@ -440,9 +449,11 @@ func opConflict(err error) bool {
 // HTTP surface has always returned, or calls onOK to write the success response
 // (which varies: 204 for delete/suspend/resume, a JSON ref for snapshot).
 //
-// Every 409 arm here is a member of opConflicts, and a test pins that: the two
-// must stay the same set, or a refusal is a conflict to a person holding a
-// terminal and an internal error to the control plane.
+// Every 409 arm HERE is a member of opConflicts, and a test pins that in both
+// directions: the two must stay the same set, or a refusal is a conflict to a
+// person holding a terminal and an internal error to the control plane. The
+// create route writes its own 409 without passing through here, which is the
+// one deliberate exemption — see opConflicts.
 func mapOpErr(w http.ResponseWriter, err error, onOK func()) {
 	switch {
 	case err == nil:
@@ -613,6 +624,11 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 			// inferred from this mark — the driver reports it; see
 			// registry.resumed.
 			s.reg.beginColdSuspend(id)
+			// Pairs with beginColdSuspend's increment. An operator's stop has
+			// nothing to report after the driver call — controld already
+			// knows about a stop it dispatched — so the claim ends with this
+			// function, unlike the sweep's, which holds it across its event.
+			defer s.reg.endStop(id)
 			return s.coldSuspend(ctx, id, handle)
 		}
 		// The bracket at the top of this function is what covers this branch:
@@ -686,12 +702,14 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 // runner's own idle auto-stop — go through this one function, so the two can
 // never drift into meaning different things: the same driver call, the same
 // landing state, and the same rollback when the daemon refuses.
+// It does NOT release the in-flight claim its caller took. That is
+// deliberate and it is load-bearing for the sweep: a stop is not finished
+// when the container is stopped, it is finished when the runner has REPORTED
+// it, and a resume accepted between those two points is accepted against a
+// row the auto-stop event is about to park. Each caller therefore pairs its
+// own claim — Op with a defer, stopIdle after its event is out. See
+// registry.endStop and stopIdle.
 func (s *Server) coldSuspend(ctx context.Context, id, handle string) error {
-	// Pairs with the increment both claims take (claimIdle's and
-	// beginColdSuspend's), which is what makes "a stop is running against this
-	// container" a fact a concurrent resume can read — as opposed to the state
-	// marker, which a stop that could not be read deliberately leaves behind.
-	defer s.reg.endStop(id)
 	if err := s.drv.Suspend(ctx, handle, false); err != nil {
 		s.settleFailedColdSuspend(id, handle)
 		return err

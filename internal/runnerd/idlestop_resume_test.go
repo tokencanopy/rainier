@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -153,5 +154,118 @@ func TestAParkedStopThatCouldNotBeReadIsStillResumable(t *testing.T) {
 	}
 	if got := h.entry(h.id).state; got != "running" {
 		t.Fatalf("entry state after the resume = %q, want %q", got, "running")
+	}
+}
+
+// slowReportDriver stalls the capacity reading stopIdle takes AFTER the
+// container is stopped — the bounded call that says what the stop freed. It
+// stands in for the window between "the container is stopped" and "controld
+// has been told", which on a busy or wedged daemon is the widest part of a
+// stop and the part nothing else in this package can hold open.
+type slowReportDriver struct {
+	*driver.Fake
+	once    sync.Once
+	entered chan struct{} // closed when the reporting has started
+	release chan struct{} // closed by the test to let it finish
+}
+
+func newSlowReportDriver() *slowReportDriver {
+	return &slowReportDriver{Fake: driver.NewFake(4),
+		entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (d *slowReportDriver) Capacity(ctx context.Context) (int, int, error) {
+	d.once.Do(func() { close(d.entered) })
+	<-d.release
+	return d.Fake.Capacity(ctx)
+}
+
+// TestAResumeIsRefusedUntilTheAutoStopHasBeenReported closes the gap the
+// resume guard used to leave at its own end. A stop is not finished when the
+// container is stopped; it is finished when controld has been TOLD. Between
+// those two points the entry already reads "suspended", so a resume was
+// accepted, the control plane committed `running` — and then this stop's own
+// `suspended_cold` event landed and parked the row over a container that was
+// running again. That event cannot be fenced away: an auto-stop deliberately
+// carries no placement generation, and zero fences nothing.
+//
+// The end state is the one the design doc calls unacceptable — a row reading
+// stopped over a live sandbox, which `rainier attach` can only fix by
+// resuming again — and this change's own 409 is what aims clients at it, by
+// telling them the refusal is worth retrying. So the refusal now lasts until
+// the event is out.
+//
+// Fails without the fix: with the claim released by coldSuspend, the resume
+// below is accepted and the driver is asked to restart a container the sweep
+// is still reporting as stopped.
+func TestAResumeIsRefusedUntilTheAutoStopHasBeenReported(t *testing.T) {
+	ctx := context.Background()
+	clk := newFakeClock()
+	sd := newSlowReportDriver()
+	rd := New(sd, "", "", "")
+	rd.now = clk.now
+
+	events := make(chan string, 8)
+	rd.SetOnEvent(func(id, state, detail string) { events <- state })
+	// fired drains what the runner has reported so far. The session's own
+	// lifecycle puts other states on this channel (a child_exited when the
+	// agent finishes); only the auto-stop's is the subject here.
+	fired := func() []string {
+		var out []string
+		for {
+			select {
+			case s := <-events:
+				out = append(out, s)
+			default:
+				return out
+			}
+		}
+	}
+
+	h := &idleHarness{t: t, clk: clk, rd: rd, fd: sd.Fake, id: "sess-idle-1", boot: map[string]uint64{}}
+	h.create(h.id)
+	h.run(30*time.Minute, idleStep{at: 0, act: childExits})
+	h.clk.set(30 * time.Minute)
+
+	swept := make(chan []string, 1)
+	go func() { swept <- rd.sweepIdle(ctx, 30*time.Minute) }()
+	<-sd.entered
+
+	// The container is already stopped and the entry already says so — the
+	// stop's only unfinished business is telling controld.
+	if got := h.entry(h.id).state; got != "suspended" {
+		t.Fatalf("entry state mid-report = %q, want %q", got, "suspended")
+	}
+	if got := h.state(); got != driver.StateSuspended {
+		t.Fatalf("container state mid-report = %v, want %v", got, driver.StateSuspended)
+	}
+	// And the event is already out, so a client that is told "not yet" and
+	// retries finds the row where this stop left it rather than racing it.
+	if got := fired(); !slices.Contains(got, "suspended_cold") {
+		t.Fatalf("events fired by the time the reporting started = %v; the auto-stop's own is not "+
+			"among them, so a client waiting on the refusal is waiting on a capacity call", got)
+	}
+
+	if err := rd.Op(ctx, h.id, "resume", false); !errors.Is(err, errSuspendInFlight) {
+		t.Fatalf("resume before the stop was reported = %v, want %v", err, errSuspendInFlight)
+	}
+	if got := h.state(); got != driver.StateSuspended {
+		t.Fatalf("the refused resume restarted the container: state = %v", got)
+	}
+
+	close(sd.release)
+	if stops := <-swept; len(stops) != 1 || stops[0] != h.id {
+		t.Fatalf("sweep stopped %v, want the session", stops)
+	}
+	// Once the stop is wholly done the same resume is accepted, and nothing
+	// this stop had left to say can undo it.
+	if err := rd.Op(ctx, h.id, "resume", false); err != nil {
+		t.Fatalf("resume after the stop was reported: %v", err)
+	}
+	if got := h.entry(h.id).state; got != "running" {
+		t.Fatalf("entry state after the resume = %q, want running", got)
+	}
+	if got := fired(); slices.Contains(got, "suspended_cold") {
+		t.Fatalf("a second suspended_cold followed the resume: %v", got)
 	}
 }

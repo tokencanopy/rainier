@@ -439,6 +439,9 @@ func (f *fleet) startRunner(name string, drv *driver.Fake, wrap ...func(*driver.
 	// unstarted and its handler installed once the Server exists.
 	ts := httptest.NewUnstartedServer(nil)
 	wsBase := "ws://" + ts.Listener.Addr().String()
+	if len(wrap) > 1 {
+		f.t.Fatalf("startRunner(%s): %d decorators, want at most one", name, len(wrap))
+	}
 	var d driver.Driver = drv
 	if len(wrap) == 1 && wrap[0] != nil {
 		d = wrap[0](drv)

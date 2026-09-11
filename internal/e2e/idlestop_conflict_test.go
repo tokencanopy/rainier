@@ -38,7 +38,13 @@ func (h *heldColdSuspend) wrap(fake *driver.Fake) driver.Driver {
 func (h *heldColdSuspend) Suspend(ctx context.Context, id string, warm bool) error {
 	if !warm {
 		h.once.Do(func() { close(h.entered) })
-		<-h.release
+		// ctx as well as the release, so a scene that fails before releasing
+		// leaves no goroutine parked here for the rest of the package's run.
+		select {
+		case <-h.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	return h.Fake.Suspend(ctx, id, warm)
 }
@@ -131,13 +137,26 @@ func TestIdleAutoStopRefusesAResumeAsAConflict(t *testing.T) {
 		t.Errorf("state after the refused resume = %q, want suspended_cold", after.State)
 	}
 
-	// The stop lands, and the refusal proves to have meant "not yet": the
-	// same command, from the same client, brings the session back.
+	// The stop lands, and the refusal proves to have meant "not yet": the same
+	// command, from the same client, brings the session back.
+	//
+	// Retried against the ROW rather than against the resume's own status,
+	// because two known races sit in this window and neither is what the scene
+	// is about. The resume can still arrive before `docker stop` has returned
+	// (refused again, correctly); and the auto-stop's own `suspended_cold`
+	// event — deliberately unfenced, since it carries no placement generation
+	// (internal/runnerd/agent.go, and the PR's follow-up 2) — can land AFTER
+	// the resume and put the row back to stopped over a container that is now
+	// running. Both converge: the event fires once, and the next pass resumes
+	// again.
 	close(held.release)
-	waitUntil(t, 60*time.Second, "the refused resume to succeed once the stop has landed", func() bool {
-		return f.client().Do(http.MethodPost, "/v0/sessions/"+created.ID+"/resume", nil, nil) == nil
-	})
-	f.waitSessions(60*time.Second, "the resumed session to read running", func(rows map[string]apiSession) bool {
-		return rows[created.ID].State == "running"
-	})
+	resumed := func() bool {
+		if f.list()[created.ID].State == "running" {
+			return true
+		}
+		// A refusal here is expected and retried; the assertion is the row.
+		_ = f.client().Do(http.MethodPost, "/v0/sessions/"+created.ID+"/resume", nil, nil)
+		return f.list()[created.ID].State == "running"
+	}
+	waitUntil(t, 60*time.Second, "the session to come back once the stop has landed", resumed)
 }

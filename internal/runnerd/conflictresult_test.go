@@ -62,6 +62,16 @@ func TestTheTwoSurfacesAgreeOnWhichRefusalsAreConflicts(t *testing.T) {
 	if opConflict(nil) {
 		t.Fatal("a nil error reads as a conflict")
 	}
+	// The one refusal whose two surfaces disagree on purpose. The create
+	// route answers errSessionExists 409 without going through mapOpErr,
+	// because on the control path the agent reports that id collision as OK —
+	// the desired state is reached — and `ok: true, conflict: true` would be
+	// two answers to one question. Stated here so the exemption is a decision
+	// on the record rather than a gap someone finds later.
+	if opConflict(errSessionExists) {
+		t.Fatal("errSessionExists is flagged as a conflict, but the agent reports it as a SUCCESS: " +
+			"the result would claim to be both")
+	}
 }
 
 // TestARefusedResumeReachesControldAsAConflict drives the refusal up the real
