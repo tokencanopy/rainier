@@ -1,0 +1,233 @@
+# `rainier exec` — the review fixes
+
+Companion to [`rainier-exec.md`](rainier-exec.md), which is the design of the
+feature. This document is the design of the **corrections** an independent
+Opus review of that implementation asked for: four blocking or
+should-fix-before-merge defects, seventeen should-fixes, and a handful of
+one-line nits. It exists because several of the fixes are not one-liners —
+three of them change a protocol, a lifetime rule, or a package's public
+surface — and because the review's own framing ("this mutant survives the
+entire suite") is a statement about what the *tests* have to become, not only
+about what the code has to become.
+
+**Status: implemented**, on the same branch as the feature.
+
+## Problem
+
+The reviewer executed every guarantee it could and found the security,
+lifecycle, compatibility and controller-ownership stories clean. What it found
+instead falls into five groups, and grouping them is what makes the fix set
+readable:
+
+1. **The suite does not hold the code down.** Two real-process lifetime tests
+   were testing a corpse — the subprocess target was `select {}` in a test
+   binary with no timer goroutine, which the runtime's deadlock detector kills
+   on some platforms — so the process-*group* rule, the SIGTERM→SIGKILL
+   escalation and the detached-exec lifetime had no witness. Four further
+   guarantees had mutants that survived the whole tree, three published
+   constants were read back out of the code under test, and the one real
+   backpressure test turned every regression into a green `SKIP`.
+2. **Two resource defects that exec turns from rare into per-command.** A relay
+   exit that writes `FrameClose` without closing the client socket leaks one fd
+   per exec; `kill()` is documented idempotent and is not, so a stdin overrun
+   can arm two thousand kill timers.
+3. **A lifetime rule the shipped help text asserts and the code does not.**
+   The default `rainier stop` is a *warm* suspend — `docker pause` — and
+   `KillAll` was wired only to sessiond's SIGTERM handler, which a paused
+   sessiond never receives. A detached exec was therefore frozen and resumed,
+   not reaped, while `rainier exec --help` says "it dies with its session when
+   it is stopped".
+4. **Two unbounded waits on the exec path.** A slow exec caller holds the relay
+   conn's single writer and stalls every viewer and the session RPC behind it;
+   and `reap.AwaitStatus` can park a waiter forever when the reaped-outcome
+   table evicts its entry, which exec is what makes reachable — before exec,
+   exactly one pid was ever awaited.
+5. **Documentation that drifted from the code it ships with**, in the places
+   the compatibility and release stories depend on.
+
+## Scope
+
+In: every fix the review asked for, each with a test that fails without it.
+
+Out: the one finding the review recorded as out of scope (`controllerKeeper.Claim`
+asking the policy with the runner's dial-back context, which is `b22b225`/#84
+and not this branch), and the two design gaps the feature's own open questions
+4–6 already record as deliberate.
+
+## The fixes, and the decisions inside them
+
+Most are mechanical. Six are not.
+
+### A detached exec dies on a warm suspend (finding 3)
+
+The rule the design and the CLI both state is that an exec's lifetime is
+bounded by its **session**: it outlives its caller, never its session. The
+implementation delivered that for a cold stop and a destroy (both of which
+deliver SIGTERM to sessiond) and not for the default `rainier stop`, which is
+`docker pause`.
+
+Two options, and the first is taken:
+
+- **Kill execs on the warm transition too.** The rule stays what is written and
+  what a user is told, and `--detach` keeps a bound a script can rely on.
+- Change the rule to "frozen with the sandbox on a warm stop". Cheaper, but it
+  makes `--detach`'s lifetime depend on a flag most callers never pass, and it
+  would mean a `claude --continue` resuming hours later inside a session
+  somebody stopped on purpose.
+
+Mechanism: runnerd sends a **suspend control frame** down the session's relay
+conn immediately before `drv.Suspend(ctx, handle, warm)` and waits a short,
+bounded time for the sandbox's acknowledgement before pausing it. sessiond
+answers by calling `Runner.KillAll`, which closes every exec attachment; the
+relay's forwarder then sends the `FrameClose` that ends each in-flight exec's
+stream, so the caller sees the connection end with no exit status — exit 125 —
+and `execEndedSentence` re-reads the session and says *"the session was
+stopped before the command reported an exit status"*, which is the branch the
+amendment intended and which was unreachable on the default path.
+
+Compatibility, both directions, is why this is an event and not a new required
+handshake:
+
+| Pairing | Behaviour |
+|---|---|
+| new runnerd + **old sessiond** | The frame is an unknown control kind; sessiond logs and drops it. runnerd's ack wait expires after its budget and the pause proceeds — exactly today's behaviour, which is the one the fleet has now. |
+| old runnerd + **new sessiond** | No frame is ever sent. Nothing changes. |
+
+The wait is bounded rather than best-effort because `docker pause` uses the
+freezer cgroup: a SIGTERM delivered and then frozen is a signal that is still
+pending on resume, which is the failure this is fixing rather than a different
+spelling of it.
+
+Cold suspend and destroy are deliberately untouched: `docker stop` already
+delivers the SIGTERM that runs the existing handler, and a destroyed
+container's processes are gone by definition.
+
+### The reaper's two new failure modes (finding 7)
+
+`internal/reap` is a drive-by in the exec PR — it bounds a pre-existing orphan
+leak — and it stays in the PR rather than being split out, because **exec is
+what makes every pid awaited**. Before this branch, exactly one pid (the
+agent's) was awaited, once, at boot. After it, every exec awaits by pid for the
+life of a session, which is what turns two latent bugs into reachable ones:
+
+- **An evicted entry parks its waiter forever.** `AwaitStatus` loops on
+  `cond.Wait()` with no escape, and `sandboxexec` has no fallback — `ok ==
+  false` means "no reaper", so an exec whose record was evicted would never
+  report a status and would hold one of the eight slots indefinitely. Fix: an
+  **eviction tombstone**. A record dropped by the bound leaves a marker; a
+  waiter that finds one returns `(Status{}, false)` and the caller's
+  `cmd.Wait` takes over, which is the same fallback a host build already uses.
+- **A pid wraparound can hand an exec somebody else's status.** `codes[pid]`
+  carries no epoch, so a fresh exec whose pid matches a stale *unclaimed*
+  orphan entry reads that orphan's outcome. Fix: every record is stamped with a
+  **monotonic sequence**, and a caller takes a `reap.Mark()` immediately before
+  `cmd.Start()`. `AwaitStatus(pid, mark)` ignores any record older than the
+  mark — an entry that existed before this child did cannot be this child's.
+
+This is Linux-only code and the development sandbox is Linux, so both are
+tested here rather than reasoned about.
+
+### A slow exec caller no longer stalls the session (finding 8)
+
+The exec forwarder's `write()` takes the relay conn's single writer and uses
+the `ServeSession` context, which lives as long as the session. A caller
+draining at a couple of kilobytes a second never trips the plane's 20-second
+budget and holds that writer indefinitely; behind it, the agent's terminal
+output and the session RPC wait.
+
+`connWriter.writeWithin(f, d)` is the bound. Two things are bounded, and the
+difference between them is worth stating because the outcomes differ:
+
+- **Acquiring the writer.** If another writer holds it past the budget, this
+  exec is dropped and closed and the conn is untouched.
+- **The write itself.** A WebSocket frame cannot be abandoned half-written, so
+  the transport's own answer to an expired write deadline is to close the conn
+  (coder/websocket `setupWriteTimeout`). That is the honest bound: the
+  alternative is an unbounded freeze of everything else on the session.
+  sessiond's `dialLoop` redials within its one-second backoff, so the cost is a
+  reconnect rather than a session.
+
+The budget is five seconds per frame, which is a floor of ≈8.7 KB/s on the
+largest frame the exec path produces (a 32 KiB `readChunk` is 43,692 wire
+bytes after two base64 hops). It is deliberately far below any link a person
+runs `rainier exec` over and far above the ~2 KB/s the review measured a stall
+at. A dropped exec is a clean 125 with a sentence, never a truncated stream.
+
+This remains a mitigation and not the cure — the cure is a writer per
+attachment — but it is now an actual bound, which is what the feature's open
+question 4 claimed and did not have.
+
+### `MaxDetached` gets its own word (finding 12)
+
+Four concurrent detached execs is a real sub-cap of the eight-exec cap, it was
+documented nowhere, and the fifth one was refused with the sentence *"this
+session is already running as many commands as it may"* with four of eight
+slots free. It gets its own reason word, `too_many_detached`, its own CLI
+sentence, and a line in both the design and §3.9. The vocabulary test is
+changed to iterate the **code's** table rather than the test's `want`, so the
+next word cannot drift out of the documented set the way `no_answer` and
+`stdin_overrun` did.
+
+### `exec.v1` can no longer take a runner out of the fleet (finding 2)
+
+`buildCapabilities` appended `exec.v1` unconditionally; `runnerplane` caps an
+announce at 32 capabilities and refuses the **whole registration** past it. An
+operator already passing 32 `--capability` flags would announce 33 after the
+first rollout step and never reconnect — a worse failure than the 501 the
+append exists to avoid, for what the design itself calls "a cheap pre-check,
+not the fence". It is appended only when there is room, and the drop is logged.
+
+### The isolation claim gets a guard (finding 20)
+
+"Nothing in this package imports `internal/session`" is the load-bearing
+sentence of the whole "second kind, not a flag" design, and adding that import
+failed no test. A small `go/parser` test over the package's own files asserts
+it, in the package where the claim is written.
+
+## Edge cases
+
+- **A suspend frame that arrives while an exec is mid-spawn.** `arm` already
+  handles a kill that lands between the slot being taken and the process
+  existing; the suspend path reaches the same `kill()`.
+- **A suspend frame on a session with no execs.** `KillAll` over an empty table
+  is a no-op and the acknowledgement is immediate.
+- **A second suspend frame.** `kill()` is now genuinely idempotent (finding 9),
+  so a repeated suspend signals nothing twice.
+- **An exec whose record is evicted while it is also the child `cmd.Wait` can
+  reap.** The tombstone hands the outcome to `cmd.Wait`, which on Linux under a
+  reaper returns `ECHILD` — so the status is "no status", exit 125, which is
+  honest and is what the caller would have got from a hang, sooner.
+- **A pid mark taken before `cmd.Start` on a spawn that fails.** No record is
+  ever awaited; the mark is discarded.
+- **`writeWithin` on a conn whose context is already cancelled.** Returns at
+  once, drops the exec, and the outer read loop's own cleanup runs anyway.
+- **Post-EOF stdin (finding 10).** `pumpStdin` returns on EOF and nothing drains
+  the queue afterwards, so 8 MiB of late stdin could kill a *finished* command
+  as `stdin_overrun`. EOF is recorded and later stdin is dropped, which is what
+  a closed pipe does.
+- **A `--tty` exec's EOF.** Unchanged: a pty has one stream, so EOF is the
+  terminal's own EOT and there is no descriptor to close.
+
+## Verification
+
+Every fix lands with a test that fails without it. The ones that are not
+obvious:
+
+| Fix | The test, and what fails without it |
+|---|---|
+| 1 | The subprocess target sleeps rather than parking every goroutine, and a new `grandchild` case (`sh -c 'sleep 300 & sleep 300'`) gives the **minus sign** a witness: signalling the leader alone leaves the grandchild alive, which the test polls `rec.calls()` for. |
+| 2 | `TestAgentAnnouncesItsCapabilities` gains the 32-capability boundary case. |
+| 3 | Through the real path: a sessiond fixture receives the suspend frame and its exec runner's processes are gone afterwards; a second test drives runnerd's warm `Op` and asserts the frame is sent before the driver's `Suspend`. |
+| 4 | An fd census across 50 exec cycles, which is what makes a one-socket-per-command leak visible at all. |
+| 5 | One assertion per surviving mutant: the `--json` stream swap, the `KillAll` wiring, the detached slot release, and `ExecClientStream`'s budget. |
+| 7 | Linux-only, executed here: an eviction with a waiter parked on the evicted pid, and a stale unclaimed record a later mark must ignore. |
+| 8 | A wedged exec frame with a viewer and a `ControlSender` behind it, asserting both get out. |
+| 9 | Two thousand post-overrun messages produce exactly one group signal. |
+| 13 | The seeded non-exec runner is dialled, and the route's 501 is pinned on the route rather than on the pure decision alone. |
+| 14 | `fakeSessiond` records **every** client frame regardless of kind, so a pre-handshake stdin leak cannot route into a branch the assertion does not watch. |
+| 16 | The published constants are literals in the test, and one stdin case writes to just under the bound asserting *no* `stdin_overrun`. |
+| 20 | The import guard itself. |
+
+Gates: `make verify`, repotest on both adapters with zero skips,
+`go test ./internal/e2e/ -race`, the exec packages at `-race -count=10`, and a
+goroutine-and-fd census across 50 exec cycles.
