@@ -393,25 +393,50 @@ holds the lease, which is the case it is most wanted in.
 has one stream — everything the command writes arrives on rainier's stdout; the local window size is sent at open and on every SIGWINCH,
 and it resizes *that exec's* pty and nothing else. `--cwd` must resolve inside
 `/workspace`, symlinks included. `--env` sets one variable per flag; names
-must match `^[A-Za-z_][A-Za-z0-9_]*$`, must not be in the `RAINIER_*`
-namespace, and must not be one of `HOME`, `PATH`, `SHELL`, `IFS`,
-`LD_PRELOAD`, `LD_LIBRARY_PATH`, `GIT_CONFIG_GLOBAL`, `GIT_SSH_COMMAND`,
-`GIT_ASKPASS` — each of which turns "run this command" into "run something
-else". A refusal names the **variable's name and nothing else**; values are
-never logged, audited or quoted.
+must match `^[A-Za-z_][A-Za-z0-9_]*$`, and must not be **reserved**.
+
+The reserved set is a rule rather than a short list, and this document said
+nine names where the code refuses about forty plus four prefixes — so
+`--env EDITOR=vi` got a 126 this section said could not happen. What is
+reserved is every name that turns "run this command" into "run something
+else": the namespaces `RAINIER_*`, `LD_*`, `GIT_CONFIG_KEY_*` and
+`GIT_CONFIG_VALUE_*` entire, plus the names that are `--eval` by another
+spelling — the shell's own (`HOME`, `PATH`, `SHELL`, `IFS`, `BASH_ENV`, `ENV`,
+`SHELLOPTS`, `BASHOPTS`, `PS4`), git's run-something-else surface
+(`GIT_CONFIG*`, `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `GIT_EXTERNAL_DIFF`,
+`GIT_PAGER`, `GIT_EDITOR`, and the rest), the editor and pager channels
+(`EDITOR`, `VISUAL`, `PAGER`, `SSH_ASKPASS`), and the interpreter option
+channels (`NODE_OPTIONS`, `PYTHONSTARTUP`, `PERL5OPT`, `RUBYOPT`,
+`JAVA_TOOL_OPTIONS`, `MAVEN_OPTS`, `GRADLE_OPTS`, and their neighbours).
+`internal/sandboxexec`'s `reservedEnv` is the list, and it is allowed to grow:
+it protects the audit record's meaning rather than a privilege boundary — a
+caller who may exec at all may run `sh -c` — so a name added to it is not a
+contract change.
+
+A refusal names the **variable's name and nothing else**; values are never
+logged, audited or quoted.
 
 `--detach` leaves the command running after the CLI exits. It requires
 `--log PATH` (resolved inside `/workspace` exactly like `--cwd`), prints the
 pid on stdout and exits 0. There is no listing and no kill command:
 `rainier exec <session> -- kill <pid>` is the way, and a detached process dies
 with its session when the session is stopped, deleted or destroyed — never
-when its caller disconnects. A non-detached command **is** killed when its
-caller disconnects (`SIGTERM` to its process group, five seconds, `SIGKILL`).
+when its caller disconnects. "Stopped" includes the DEFAULT `rainier stop`,
+which is a warm suspend: the sandbox is told to end its commands before it is
+frozen, so a detached run does not survive a stop-and-resume. A non-detached
+command **is** killed when its caller disconnects (`SIGTERM` to its process
+group, five seconds, `SIGKILL`).
+
+At most **four** of the eight concurrent commands may be detached, refused
+with its own reason rather than the eight-command one: a detached process
+holds its slot for as long as it runs, and the command that stops one is
+itself a command that needs a slot.
 
 Ctrl-C forwards `SIGINT` to the command; a second press leaves, which kills
 it. There is no server-imposed timeout: a build legitimately runs for an hour
 and a wrong number is worse than none. A caller bounds it with
-`timeout 600 rainier exec …`. At most 8 commands run in one session at once.
+`timeout 600 rainier exec …`. At most 8 commands run in one session at once,
+of which at most 4 may be detached.
 
 #### Route
 
@@ -426,8 +451,14 @@ is written to the access log of every proxy between the caller and the cell.
 | session not found, or not visible to the caller | `404` | `not_found` |
 | policy refuses the controller question | `403` | `forbidden` |
 | session is not `running` | `409` | `session_not_running`, body carries `"state"` |
-| runner not connected, or the sandbox never confirms | `503` | `runner_unreachable` |
-| runner cannot forward an exec | `501` | `exec_unsupported` |
+| runner not connected | `503` | `runner_unreachable` |
+| the runner cannot forward an exec, or this server has no exec plane | `501` | `exec_unsupported` |
+
+A sandbox that never confirms is deliberately not a row: the handshake happens
+after the upgrade, where a status code has nowhere to go, so the caller is told
+in the protocol instead — an `exec_error` naming `unsupported` (this session
+was created before exec shipped) or `no_answer` (the sandbox said nothing in
+time) and then a close.
 
 Two differ from `attach` deliberately. `attach` **waits** for a session to
 reach `running`, because a person who just typed `rainier new` is legitimately
@@ -781,8 +812,12 @@ reconstructing it from an environment's connectors.
 - Human output → stdout. This includes help that was explicitly requested.
 - Diagnostics, warnings, errors, and usage printed because an invocation was
   wrong → stderr.
-- Exit 0 success, 1 operational or server failure, 2 invalid invocation.
-  `rainier exec` is the one command whose exit code is not Rainier's own: the
+- Exit 0 success, 1 operational or server failure, 2 invalid invocation —
+  for every command except `rainier exec`, which is carved out below. (That
+  carve-out is the one place in this document `rainier exec` changed an
+  existing sentence rather than adding to it: the rule above used to be
+  universal.)
+- `rainier exec` is the one command whose exit code is not Rainier's own: the
   command it ran decides it, and Rainier's own failures there use 125/126/127
   — the codes `env(1)` and the shell already reserve for a wrapper. See §3.9.
 - Output format never changes because stdout is a pipe. `--json` is the only

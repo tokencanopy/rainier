@@ -7,6 +7,10 @@ stdin when the caller has one, and exits with the command's exit code.
 
 **Status: implemented.** It builds on conditional controller ownership (#84,
 merged) and is written against that shape, not against the older attach path.
+The corrections an independent review asked for after it was built are
+designed in
+[`rainier-exec-review-fixes.md`](rainier-exec-review-fixes.md); this document
+carries their outcomes inline rather than as an appendix.
 
 Four things changed between this document being approved and being built, and
 each is written into the section it belongs to rather than left as an
@@ -210,9 +214,19 @@ needed:
   stdout and exits 0. There is no `rainier exec --kill`, because a sandbox
   already has a perfectly good one and it is audited like any other command.
 - **A way to be reaped** — the session. A detached process is killed when the
-  session is suspended, stopped or destroyed, on the same path that kills the
-  agent's child. It is never killed by its caller disconnecting; that is the
-  entire difference the flag makes.
+  session is suspended, stopped or destroyed. It is never killed by its caller
+  disconnecting; that is the entire difference the flag makes.
+
+  Two paths, because a session can end in two ways. A cold stop and a destroy
+  deliver `sessiond` a SIGTERM, and its handler ends every exec. The DEFAULT
+  `rainier stop` is a warm suspend — `docker pause` — which delivers nothing at
+  all: the freezer cgroup stops the process where it stands, so a detached run
+  would be frozen and resumed rather than reaped, and an in-flight exec's
+  caller would block until somebody resumed the session. So runnerd sends the
+  sandbox a `suspending` control event before it pauses the container and waits
+  (bounded) for the `suspend_ready` that says the execs are gone. A sessiond
+  that predates the event logs an unknown kind and drops it, and the wait
+  expires and the pause proceeds — which is the behaviour a fleet has today.
 - **A way to be listed** — not needed in v1, and deliberately not built. The
   caller has the pid, the sandbox has `ps`, and a listing API would be a
   second source of truth about processes the sandbox already knows about.
@@ -220,6 +234,16 @@ needed:
 The process is spawned in its own process group with stdin on `/dev/null`,
 and it counts against the same eight-exec cap an attached one does, because
 it is a process in the same container.
+
+It also counts against a **smaller cap of its own: at most four of the eight
+may be detached**, refused as `exec_error{too_many_detached}`. A detached
+process holds its slot for as long as it runs, which can be hours, and the
+only way to stop one is `rainier exec s -- kill <pid>` — which is itself an
+exec and needs a slot. A session that filled all eight with detached work would
+have no way left to stop any of it, with no listing and no kill API to fall
+back on. The word is its own because reusing `too_many_execs` told the fifth
+caller "this session is already running as many commands as it may" with half
+the slots free.
 
 `--detach` and `--tty` are refused together: a detached command has no
 terminal to attach one to.
@@ -300,9 +324,23 @@ type would mean a third decode at every hop. New type words only.
 | server → client | `exec_error` | `Reason` — a closed vocabulary, never free prose |
 
 `exec_error`'s vocabulary is `unsupported`, `not_found`, `not_executable`,
-`cwd_refused`, `env_refused`, `log_refused`, `too_many_execs`. It is closed because the CLI
-maps it to an exit code and a sentence, and because a free-form string from
-inside a sandbox is a string a user's terminal renders.
+`cwd_refused`, `env_refused`, `log_refused`, `too_many_execs`,
+`too_many_detached`, `no_answer` and `stdin_overrun`. It is closed because the
+CLI maps it to an exit code and a sentence, and because a free-form string from
+inside a sandbox is a string a user's terminal renders — and it is published
+here as `terminal.ExecReasons()` rather than as prose, so
+`TestExecReasonsAreClosedBothWays` fails when a word is added to one and not
+the other. The last three arrived after this list was first written and drifted
+out of it for exactly that reason:
+
+- `too_many_detached` — the DETACHED sub-cap below, which is a smaller number
+  than the eight, and therefore a different sentence and a different remedy.
+- `no_answer` — the sandbox said nothing in time. Kept apart from
+  `unsupported`, which means "this session was created before exec shipped" and
+  is permanent.
+- `stdin_overrun` — the caller sent more input than the sandbox will hold for a
+  command that is not reading it. The one reason that can arrive AFTER
+  `exec_started`, because it is about the input rather than the command.
 
 `ClientMessage` gains `Exec *ExecSpec` and `Signal string`; `ServerMessage`
 gains `Signal string` and `Reason string`. `ExitCode` is reused as-is,
@@ -406,9 +444,21 @@ the CLI says so in help.
 
 **Reaping.** `sessiond` installs a `SIGCHLD` reaper at boot and is the single
 authoritative waiter on Linux. An exec's wait therefore goes through
-`reap.AwaitExit(pid)` and then a best-effort `cmd.Wait()`, the way
+`reap.AwaitStatus(pid, mark)` and then a best-effort `cmd.Wait()`, the way
 `session/proc.go` does. `cmd.Wait()` alone would race the reaper and report
 `ECHILD` instead of a status.
+
+Two things about that wait are exec's doing, because exec is what makes it
+happen more than once. Before this, exactly one pid — the agent's — was ever
+awaited, once, at boot; now every exec awaits by pid for the life of a
+session. So: the reaped-outcome table is bounded (an unclaimed orphan entry is
+the ordinary shape of `git fetch` spawning `git-remote-https`, and a session
+outliving everything else means an unbounded map is a leak measured in weeks),
+an EVICTED entry leaves a tombstone so its waiter is told "no status here" and
+falls back to `cmd.Wait` rather than parking forever, and every record carries
+a monotonic sequence that a caller takes a `reap.Mark()` of immediately before
+forking — `pid_max` is 32768, so a long-lived session wraps, and an outcome
+recorded before this child existed cannot be this child's.
 
 **Concurrency.** At most 8 concurrent execs per session; the ninth is refused
 `exec_error{too_many_execs}` before anything is spawned. Eight is slack rather
@@ -427,7 +477,7 @@ pairings:
 |---|---|
 | **new client + old plane** | `404` on `/v0/sessions/{id}/exec`. The CLI prints `this Rainier does not support exec (the control plane is older than the CLI)` and exits 1. Nothing degrades into an attach, which is the whole reason exec is a route. |
 | **old client + new plane** | Nothing. An old CLI never calls the route; every existing route is byte-identical. |
-| **new plane + old sandbox** | The plane refuses early when the runner announces no `exec.v1`, with `501 exec_unsupported`. When the runner is new but the *session's* `sessiond` is old — the permanent case above — the old `serveSession` reads a `FrameOpen` whose `Kind` it does not know and opens a **terminal** attachment, answering with a `snapshot`. So the plane requires a positive `exec_started` as the first server message and waits `defaultControlAckTimeout` (2s) for it; anything else, including a `snapshot`, closes the socket with `exec_unsupported`. The handshake, not the capability, is the fence — the capability only saves the round trip. |
+| **new plane + old sandbox** | The plane refuses early when the runner announces no `exec.v1`, with `501 exec_unsupported`. When the runner is new but the *session's* `sessiond` is old — the permanent case above — the old `serveSession` reads a `FrameOpen` whose `Kind` it does not know and opens a **terminal** attachment, answering with a `snapshot`. So the plane requires a positive `exec_started` as the first server message and waits `attachplane.Options.ExecHandshakeTimeout` (10s by default) for it — deliberately not the acknowledgement timeout, because that one acknowledges a binding already installed and this one waits for a SPAWN. Anything else, including a `snapshot`, closes the socket with `exec_unsupported`; a sandbox that says NOTHING in that budget gets `no_answer`, which is a different word for a different fact. The handshake, not the capability, is the fence — the capability only saves the round trip. |
 | **new sandbox + old plane** | Nothing. The new `serveSession` branches on `Kind`, an old plane never sets it, and every frame it does send takes the terminal branch it always took. |
 
 The rule that makes the third row safe is worth stating on its own: **a new
@@ -446,8 +496,12 @@ Each row is pinned by a test, in both directions:
 
 ## API and CLI contract
 
-Additive to [`docs/cli-v0-contract.md`](../cli-v0-contract.md). Nothing in
-that document changes meaning.
+Additive to [`docs/cli-v0-contract.md`](../cli-v0-contract.md), with exactly
+one exception, stated here because "additive" was not literally true: §6.1's
+exit-code sentence ("0 success, 1 operational or server failure, 2 invalid
+invocation") was universal and is now carved out for `rainier exec`, whose
+status is the command's. The bytes of the sentence are unchanged; its scope is
+not, and §6.1 now says so.
 
 ### Route
 
@@ -460,8 +514,18 @@ code has nowhere to go once the socket is a websocket.
 | session not found (or not visible to the caller) | `404` | `not_found` |
 | policy refuses the controller question | `403` | `forbidden` |
 | session is not `running` | `409` | `session_not_running`, body carries `"state"` |
-| runner not connected, or the sandbox never confirms | `503` | `runner_unreachable` |
-| runner has no `exec.v1` | `501` | `exec_unsupported` |
+| runner not connected | `503` | `runner_unreachable` |
+| runner has no `exec.v1`, or this host composed no exec plane | `501` | `exec_unsupported` |
+
+A sandbox that never confirms is deliberately **not** in that table. It cannot
+be: the dial-back and the handshake both happen after the upgrade, so there is
+no status code left to send. The caller is told in the protocol instead — an
+`exec_error{unsupported}` or `exec_error{no_answer}` and then a close — which
+is the field a CLI switches on rather than a string it has to pattern-match.
+Every row that IS in the table is answered pre-upgrade, including the
+no-exec-plane 501: `controlapp` answers `ErrUnsupported` only once the socket
+is a websocket, so the route asks `AttachmentService.ExecSupported` before it
+upgrades.
 
 Two of these differ from `attach` deliberately.
 
@@ -595,8 +659,13 @@ mechanism for:
   not a legal `--cwd`; a command inherits the environment that makes an agent
   work, which is what a typed command already inherits;
 - **changing egress** — same container, same netns, same allowlist;
-- **escaping the session's lifetime** — the process dies with its caller, and
-  with the session.
+- **escaping the session's lifetime** — an attached command dies with its
+  caller, and every command dies with the SESSION. `--detach` (see [Detached
+  exec](#detached-exec)) is the one exception to the first half and no
+  exception at all to the second: it outlives its caller, which is its whole
+  point, and it is killed when the session is suspended, stopped or destroyed,
+  including on the default warm stop. That bound is what keeps `--detach` from
+  being a way to leave a process running in somebody's account indefinitely.
 
 The one thing it adds that typing does not is **concurrency**, which is
 bounded at 8 per session.
@@ -647,13 +716,28 @@ What this design did **not** originally account for is where that backpressure
 lands. Every attachment on a session shares one relay conn and one writer on
 it (`relay.connWriter`), so an exec caller that has stopped reading eventually
 backs that writer up — and while it is backed up, the agent's terminal output
-and the session RPC wait behind it. The mitigation that is in this version is
-a shorter write budget for an exec caller than for a viewer (twenty seconds of
-taking *nothing*, against a viewer's minute): an exec caller is a script
-rather than a person watching a screen, and it loses nothing by being
-disconnected and re-run, while a viewer disconnected mid-scrollback loses
-their session. The cure is a writer per attachment rather than one per conn,
-which is a change to the relay; it is [open question 4](#open-questions).
+and the session RPC wait behind it.
+
+Two things bound it, and only the second is a bound on the case that actually
+happens. At the PLANE, an exec caller gets a shorter write budget than a viewer
+(twenty seconds of taking *nothing*, against a viewer's minute): an exec caller
+is a script rather than a person watching a screen, and it loses nothing by
+being disconnected and re-run, while a viewer disconnected mid-scrollback loses
+their session. But a caller that takes *almost* nothing never trips that — each
+individual write completes inside twenty seconds — and holds the writer
+indefinitely. So at the SANDBOX, each exec frame gets its own five-second write
+deadline (`connWriter.writeWithin`), which on the largest frame this path
+produces is a floor of about 8.7 KB/s; a frame that misses it means this exec's
+only reader is gone, so the exec is dropped and its process group killed. The
+caller sees a connection that ended with no exit status — 125, with a sentence
+— rather than a truncated stream.
+
+Missing the WRITER costs only that exec; a write that itself expires closes the
+relay conn, because a WebSocket frame cannot be abandoned half-written.
+`sessiond`'s dial loop redials within its one-second backoff, which is the
+honest trade against an unbounded freeze of everything else on the session. The
+cure is still a writer per attachment rather than one per conn, which is a
+change to the relay; it is [open question 4](#open-questions).
 
 **Stdin flood.** The opposite hop has the opposite answer, and for the same
 reason turned around. A caller's stdin arrives on the relay's *demux* — the
@@ -801,9 +885,13 @@ Each step is separately revertable, and no step requires the one after it.
    the agent's terminal and the session RPC behind it. Exec makes this easier
    to reach than attach did — an exec caller legitimately stops reading, where
    a person watching a screen does not — and the mitigation in this version is
-   a shorter write budget for exec callers rather than a fix.
+   a per-frame write deadline at the sandbox plus a shorter plane-side budget,
+   rather than a fix. It is a real bound now (a wedged exec holds the writer
+   for at most five seconds), but the cost of reaching it is a conn reset
+   rather than a dropped attachment, which only a writer per attachment
+   removes.
    **Recommendation: give each attachment its own writer**, as a change to
-   `internal/relay` rather than to this design, and revisit the budget
+   `internal/relay` rather than to this design, and revisit the budgets
    afterwards.
 5. **Stdin flow control.** Because the demux cannot block, a caller's stdin is
    buffered to a bound and an overrun ends the exec with
