@@ -22,7 +22,7 @@ func TestAttachFlagsAskForOwnership(t *testing.T) {
 		{"the default claims when control is free", []string{"box1"},
 			attachio.Options{Control: true, Mode: terminal.ModeControl}},
 		{"--view never claims", []string{"box1", "--view"},
-			attachio.Options{Control: true, Mode: terminal.ModeView}},
+			attachio.Options{Control: true, Mode: terminal.ModeView, NeverClaim: true}},
 		{"--take claims once", []string{"--take", "box1"},
 			attachio.Options{Control: true, Mode: terminal.ModeControl, Take: true}},
 	} {

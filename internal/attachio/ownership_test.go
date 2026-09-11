@@ -585,7 +585,7 @@ func TestViewNeverClaimsWhateverTheUserPresses(t *testing.T) {
 	p := newFakePlane(
 		terminal.ServerMessage{Type: terminal.TypeAttached, Mode: terminal.ModeView, Generation: terminal.GenOf(7)},
 		terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
-	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeView})
+	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeView, NeverClaim: true})
 
 	if _, err := run.stdin.Write([]byte{takeKey}); err != nil {
 		t.Fatal(err)
@@ -606,5 +606,38 @@ func TestViewNeverClaimsWhateverTheUserPresses(t *testing.T) {
 	}
 	if out := run.detach(t); out.Mode != terminal.ModeView || out.Generation != 7 {
 		t.Fatalf("a --view attach ended %s at %d, want view at 7", out.Mode, out.Generation)
+	}
+}
+
+// TestAReconnectedViewerKeepsItsTakeControlKey is the other side of --view,
+// and the reason "never claim" is a flag of its own rather than something
+// read back off the mode.
+//
+// cmd/rainier's reconnectOwnership asks for view mode on every reconnect
+// whose previous attach came back a viewer — so a device superseded while
+// its Wi-Fi was out does not take control back on a network blip. Those
+// Options are byte-identical to --view's but for NeverClaim, and this device
+// must still be able to press the take-control key: it is the only way back,
+// because the plane promotes an attach only in answer to a claim.
+func TestAReconnectedViewerKeepsItsTakeControlKey(t *testing.T) {
+	p := newFakePlane(
+		terminal.ServerMessage{Type: terminal.TypeAttached, Mode: terminal.ModeView, Generation: terminal.GenOf(7)},
+		terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
+	// Exactly what reconnectOwnership builds after an attach that ended in
+	// view mode: the mode is view and the flag is not set.
+	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeView})
+
+	if _, err := run.stdin.Write([]byte{takeKey}); err != nil {
+		t.Fatal(err)
+	}
+	claim := p.awaitFrame(t, func(m terminal.ClientMessage) bool { return m.Type == terminal.TypeClaim })
+	if claim.Expected.Value() != 7 {
+		t.Fatalf("the reconnected viewer claimed from %q, want the 7 it was told about", claim.Expected)
+	}
+	p.extra <- terminal.ServerMessage{
+		Type: terminal.TypeAttached, Mode: terminal.ModeControl, Generation: terminal.GenOf(8)}
+	run.awaitPrinted(t, NoticeHaveControl)
+	if out := run.detach(t); out.Mode != terminal.ModeControl || out.Generation != 8 {
+		t.Fatalf("the reconnected viewer ended %s at %d, want control at 8", out.Mode, out.Generation)
 	}
 }

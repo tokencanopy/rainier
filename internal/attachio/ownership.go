@@ -19,8 +19,12 @@ import (
 // ordinary byte, stamp nothing — which is what settled=false means here.
 type ownership struct {
 	asked     bool // this attach advertised the capability
-	askedView bool // --view: this attach asked never to claim
-	take      bool // --take: claim once if it comes back a viewer
+	askedView bool // this attach asked to attach in view mode
+	// neverClaim is --view, which is NOT the same fact as askedView: a plain
+	// attach reconnecting after it was superseded also asks for view mode,
+	// and that device must keep its take-control key. See Options.NeverClaim.
+	neverClaim bool
+	take       bool // --take: claim once if it comes back a viewer
 
 	mu sync.Mutex
 	// settled is the one bit an answer sets, and it means both things it
@@ -35,7 +39,7 @@ type ownership struct {
 }
 
 func newOwnership(o Options) *ownership {
-	own := &ownership{asked: o.Control, take: o.Take, gen: o.Expected}
+	own := &ownership{asked: o.Control, neverClaim: o.NeverClaim, take: o.Take, gen: o.Expected}
 	if o.Control && o.Mode == terminal.ModeView {
 		// --view is the user's instruction, not a request the server may
 		// ignore. Holding it locally from the first byte is what makes it
@@ -168,6 +172,11 @@ func (o *ownership) takeOnce() bool {
 // place that decides what this client claims. It covers the take-control key
 // and --take's single claim alike.
 //
+// It reads neverClaim and NOT askedView. A plain attach that came back a
+// viewer after a disconnect asks for view mode too, and taking its
+// take-control key away for the rest of the process — silently, with no way
+// back but detaching — is not what "reconnect is conditional" means.
+//
 // Ctrl-\ is therefore swallowed under --view rather than forwarded: a --view
 // attach sends no input at all, so forwarding it would reach the same nowhere
 // with more moving parts. Nothing is printed, which is what the key already
@@ -175,7 +184,7 @@ func (o *ownership) takeOnce() bool {
 func (o *ownership) claim() (terminal.ClientMessage, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.askedView || !o.settled || o.mode == terminal.ModeControl {
+	if o.neverClaim || !o.settled || o.mode == terminal.ModeControl {
 		return terminal.ClientMessage{}, false
 	}
 	return terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(o.gen)}, true

@@ -2150,6 +2150,10 @@ func attachFlags(args []string) (ref string, cursor uint64, replay bool, own att
 	switch {
 	case *view:
 		own.Mode = terminal.ModeView
+		// And it stays a non-claimer across reconnects, which reading the
+		// flag back off Mode could not do: a plain attach that came back a
+		// viewer asks for exactly this mode and keeps its take-control key.
+		own.NeverClaim = true
 	case *take:
 		own.Take = true
 	}

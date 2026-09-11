@@ -139,6 +139,19 @@ type Options struct {
 	// re-claimed every time it was refused would be two devices fighting for
 	// a keyboard instead of one person deciding.
 	Take bool
+	// NeverClaim is `rainier attach --view`: this attach claims nothing, by
+	// any route, for its whole life — not the take-control key and not Take.
+	//
+	// It is a SEPARATE fact from Mode, and that is the whole reason it
+	// exists. Mode says what this attach is requesting right now, and a
+	// plain attach that came back a viewer after a disconnect requests
+	// exactly what --view requests: cmd/rainier's reconnectOwnership sets
+	// Mode to view so a device superseded while it was away does not take
+	// control back on a network blip. That device must still be able to
+	// press the take-control key. Reading the flag off Mode would take the
+	// key away from it for the rest of the process, silently, with no way
+	// back short of detaching.
+	NeverClaim bool
 }
 
 func (e *DialError) Error() string { return e.err.Error() }
@@ -565,9 +578,10 @@ func runWithIO(ctx context.Context, wsURL string, header http.Header, since uint
 				if msg, ok := own.claim(); ok {
 					wsjson.Write(ctx, c, msg)
 				}
-				// Nothing is printed when this device already has control:
-				// the answer to "take control" when you have it is silence,
-				// not a line of noise over somebody's editor.
+				// Nothing is printed when this client sends no claim:
+				// the answer to "take control" when you already have it is
+				// silence, not a line of noise over somebody's editor, and
+				// --view asked for a session it never types into.
 				continue
 			}
 			if !claim() {
