@@ -8,12 +8,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 
 	"github.com/tokencanopy/rainier/internal/reap"
 	"github.com/tokencanopy/rainier/internal/relay"
@@ -1130,9 +1132,26 @@ func (p *execProcess) reap(drain *execDrain) {
 
 func execStatusOf(code int, sig syscall.Signal) execStatus {
 	if sig != 0 {
-		return execStatus{Signal: sig.String()}
+		return execStatus{Signal: execSignalWireName(sig)}
 	}
 	return execStatus{Code: code}
+}
+
+// execSignalWireName is the SHORT name an exec_exit carries: "TERM", not
+// "SIGTERM" and not the Go runtime's "terminated".
+//
+// The runtime's spelling is an implementation detail of this sandbox, and a
+// CLI that had to recognise it would be coupled to the sandbox's language —
+// which is the wrong way round, since the CLI is what turns the answer into
+// the shell's 128+N. A signal this build's table does not name travels as its
+// decimal number, so a caller still reports a correct 128+N rather than a
+// wrong one.
+func execSignalWireName(sig syscall.Signal) string {
+	name := unix.SignalName(sig)
+	if name == "" {
+		return strconv.Itoa(int(sig))
+	}
+	return strings.TrimPrefix(name, "SIG")
 }
 
 // execStatusOfWait reads cmd.Wait's error, which is the non-Linux path (no
@@ -1146,7 +1165,7 @@ func execStatusOfWait(err error) execStatus {
 		return execStatus{Code: -1}
 	}
 	if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-		return execStatus{Signal: ws.Signal().String()}
+		return execStatus{Signal: execSignalWireName(ws.Signal())}
 	}
 	return execStatus{Code: ee.ExitCode()}
 }

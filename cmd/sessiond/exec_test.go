@@ -73,7 +73,7 @@ func (p *fakeProc) Signal(sig syscall.Signal) error {
 	// A real SIGKILL to a process group ends the process; the fake honours
 	// that so the runner's grace-then-kill path terminates in a test.
 	if sig == syscall.SIGKILL || sig == syscall.SIGTERM {
-		p.exit(execStatus{Signal: sig.String()})
+		p.exit(execStatus{Signal: execSignalWireName(sig)})
 	}
 	return nil
 }

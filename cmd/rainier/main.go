@@ -110,6 +110,8 @@ func main() {
 		err = runContext(rest)
 	case "workspace":
 		err = runWorkspace(rest)
+	case "exec":
+		err = runExec(rest)
 
 	default:
 		// help, --help, -h and version never reach here: handleHelpVersion
@@ -123,8 +125,15 @@ func main() {
 		// One exit for every command: redacted on stderr, with the server's
 		// stable code and request id when it has them, and 2 rather than 1
 		// when the invocation itself was wrong (contract §6.1, §6.3).
+		//
+		// The one error that prints NOTHING is a command `rainier exec` ran
+		// that exited non-zero on its own: it has already said whatever it
+		// had to say on its own streams, and a line of Rainier's would
+		// corrupt the output of `rainier exec s -- cat f`.
 		cfg, _ := cli.Load()
-		reportError(cfg, os.Stderr, err)
+		if !silentError(err) {
+			reportError(cfg, os.Stderr, err)
+		}
 		os.Exit(exitCodeFor(err))
 	}
 }
@@ -246,6 +255,21 @@ ADVANCED — environments and secrets
   lands in your shell history:  cat token.txt | rainier secret set GH_TOKEN
   Values are write-only: the API never gives one back, and "secret ls" shows
   names and timestamps only.
+
+ADVANCED — running a command in a session
+  exec <session> [--tty] [--cwd DIR] [--env K=V]... [--json] -- CMD [ARGS...]
+  exec <session> --detach --log PATH -- CMD [ARGS...]
+
+  Runs one command inside a live session's sandbox, as the session's user,
+  and exits with the command's exit status. There is no shell: argv is
+  exec'd directly, so name one if you want one (-- sh -c 'cd src && make').
+  --tty allocates a terminal and MERGES stdout with stderr, because a pty
+  has one stream. --detach leaves the command running after this CLI exits,
+  prints its pid and exits 0; stop it the way you stop any process —
+  exec <session> -- kill <pid> — and it dies with its session.
+
+  An exec does not take the terminal's controller lease and its output never
+  reaches the session's scrollback: attach --since 0 never replays it.
 
 ADVANCED — transfer and snapshots
   push <local-dir> <session>:<path>

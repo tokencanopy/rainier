@@ -166,6 +166,38 @@ const (
 	TypeExecError    = "exec_error"
 )
 
+// ExitSignalNumber is the number behind the name an `exec_exit` carries, so a
+// caller can report the shell's 128+N for a command a signal killed.
+//
+// The names are SHORT ("TERM", not "SIGTERM" and not "terminated") because
+// they are wire vocabulary: a Go runtime's own spelling of a signal is an
+// implementation detail of the sandbox, and a client that had to recognise it
+// would be coupled to the sandbox's language. An unknown name may also be a
+// bare decimal, which is what a sandbox sends for a signal this table does
+// not have — so a new signal reports a correct 128+N instead of a wrong one.
+//
+// The numbers are Linux's, which is what a sandbox is. They are written out
+// rather than taken from syscall so that this package stays free of a
+// platform: it is the wire, and the browser that renders the next consumer of
+// it has no syscall package at all.
+func ExitSignalNumber(name string) (int, bool) {
+	if n, ok := exitSignalNumbers[name]; ok {
+		return n, true
+	}
+	if n, err := strconv.Atoi(name); err == nil && n > 0 && n < 128 {
+		return n, true
+	}
+	return 0, false
+}
+
+var exitSignalNumbers = map[string]int{
+	"HUP": 1, "INT": 2, "QUIT": 3, "ILL": 4, "TRAP": 5, "ABRT": 6, "BUS": 7,
+	"FPE": 8, "KILL": 9, "USR1": 10, "SEGV": 11, "USR2": 12, "PIPE": 13,
+	"ALRM": 14, "TERM": 15, "STKFLT": 16, "CHLD": 17, "CONT": 18, "STOP": 19,
+	"TSTP": 20, "TTIN": 21, "TTOU": 22, "URG": 23, "XCPU": 24, "XFSZ": 25,
+	"VTALRM": 26, "PROF": 27, "WINCH": 28, "IO": 29, "PWR": 30, "SYS": 31,
+}
+
 // The two signals an exec attachment may ask for, and the only two. They are
 // the ones a caller's own Ctrl-C and its process's termination map onto;
 // anything else is a request to do something to a process inside a sandbox

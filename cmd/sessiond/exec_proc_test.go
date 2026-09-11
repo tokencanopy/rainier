@@ -228,7 +228,7 @@ func TestRealExecStreamsAndExits(t *testing.T) {
 func TestRealExecReportsASignal(t *testing.T) {
 	r, _, _ := realRunner(t, "signal-self")
 	got := collectExec(t, r.OpenExec(targetSpec()))
-	if got.signal != "terminated" {
+	if got.signal != terminal.SignalTERM {
 		t.Fatalf("a self-signalled process reported code %d signal %q",
 			got.exitCode, got.signal)
 	}
