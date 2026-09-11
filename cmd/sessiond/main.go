@@ -120,6 +120,12 @@ func main() {
 	// the unix socket is how a process inside the container (the git credential
 	// helper) reaches it. Handler registration happens here, at boot, for the
 	// same reason.
+	// chainVars is what the boot chain exports to the AGENT — GIT_CONFIG_GLOBAL
+	// and the no-prompting rules. It is hoisted out of the relay-mode block
+	// below because the exec runner needs it too: an exec that could not find
+	// the credential helper or the session's git identity would be a `git
+	// status` that works for the agent and not for a script.
+	var chainVars []envVar
 	var rpc *rpcDispatcher
 	// agents keeps this session's agent homes equal to the control plane's
 	// custody for as long as the session lives. It stays nil when the create
@@ -146,6 +152,7 @@ func main() {
 			// session failed.
 			log.Fatalf("boot chain: %v", err)
 		}
+		chainVars = chainEnv
 		argv = chainArgv(chainEnv, stages, argv)
 
 		// The agent homes. The fetch that fills them runs on its own goroutine,
@@ -175,6 +182,17 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// The exec runner: `rainier exec`'s end in the sandbox. It is built BESIDE
+	// the session and is handed to the relay rather than to it, because an
+	// exec's output must never reach the emulator, the event log or any
+	// viewer's screen. It starts nothing until a caller asks.
+	//
+	// Its environment is the one the agent got — this process's own, which is
+	// the container's, plus the boot chain's exports — which is what makes
+	// `claude --continue` and `git status` work inside an exec and what
+	// argv[0] is looked up on.
+	execs := newExecRunner(workspaceRoot, execSessionEnv(os.Environ(), chainVars), newExecSpawner().start)
 
 	go func() {
 		<-s.Exited()
@@ -208,6 +226,11 @@ func main() {
 		// Graceful: ask the agent to exit; the exit path closes viewers and the
 		// process ends when the child is reaped. Give it a moment, then hard-exit.
 		s.Stop()
+		// And every exec with it, DETACHED ones included. This is the bound on
+		// a detached exec's life: it outlives its caller, never its session.
+		// A suspend, a stop and a destroy all arrive here, which is why it is
+		// this path rather than three.
+		execs.KillAll()
 		// The last thing an agent wrote is usually the thing worth keeping — a
 		// login completed seconds before the session was torn down — and the
 		// sync's two-second tick must not be what decides whether it survives.
@@ -228,7 +251,7 @@ func main() {
 		if len(stages) > 0 {
 			startStageWatcher(stageCtx, s.Stop, stages, *logPath, events)
 		}
-		dialLoop(context.Background(), *dial, *sessionID, s, events, rpc)
+		dialLoop(context.Background(), *dial, *sessionID, s, events, rpc, execs)
 		return
 	}
 
@@ -253,12 +276,18 @@ func main() {
 // this loop's, and there may not be one at the moment they land — see
 // serveConn.
 //
+// execs is the exec runner the relay hands exec attachments to. It is
+// threaded through here rather than reached for globally because an exec is
+// per-SESSION — its concurrency cap, its environment and the processes it has
+// to kill at shutdown all belong to this sandbox and to no other.
+//
 // rpc is the session-RPC dispatcher, which this loop owns the connection half
 // of: it handles the control frames arriving on each conn, and holds that
 // conn's sender for as long as it lives. The asymmetry with events is
 // deliberate — an event queues across a reconnect, a request does not (see
 // rpcConn).
-func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, events <-chan []byte, rpc *rpcDispatcher) {
+func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, events <-chan []byte,
+	rpc *rpcDispatcher, execs *execRunner) {
 	backoff := time.Second
 	var pending [][]byte // control payloads no connection has accepted yet
 	for {
@@ -285,7 +314,7 @@ func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, e
 			// cannot arrive, and a handler that outlives the conn answers over
 			// the (now dead) conn its request came in on rather than over a
 			// later one — see rpc.go.
-			sender, errc := relay.ServeSessionWithControl(ctx, relay.WSConn(c), s, rpc.OnControl)
+			sender, errc := relay.ServeSessionWithExec(ctx, relay.WSConn(c), s, rpc.OnControl, execs)
 			rpc.online(sender)
 			var relayErr error
 			pending, relayErr = serveConn(sender, errc, events, pending)

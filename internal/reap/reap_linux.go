@@ -19,7 +19,7 @@ const prSetChildSubreaper = 36
 var (
 	mu      sync.Mutex
 	cond    = sync.NewCond(&mu)
-	codes   = map[int]int{} // pid -> exit code, for pids the reaper has reaped
+	codes   = map[int]Status{} // pid -> outcome, for pids the reaper has reaped
 	started bool
 )
 
@@ -51,7 +51,7 @@ func Start() {
 					break
 				} // no more reapable now
 				mu.Lock()
-				codes[pid] = ws.ExitStatus()
+				codes[pid] = statusOf(ws)
 				cond.Broadcast()
 				mu.Unlock()
 			}
@@ -59,21 +59,46 @@ func Start() {
 	}()
 }
 
-// AwaitExit blocks until the reaper has reaped pid, returning (code, true).
-// Only meaningful after Start(); if the reaper is not running it returns (0,false).
-func AwaitExit(pid int) (int, bool) {
+// statusOf reads a wait status into the portable outcome. A process killed by
+// a signal has NO exit status — ExitStatus() on such a status is meaningless
+// — which is why the two facts are separate fields rather than one integer
+// with reserved values: `rainier exec` reports 128+N for a signal and the
+// command's own code otherwise, and a command may legitimately exit 137.
+func statusOf(ws syscall.WaitStatus) Status {
+	if ws.Signaled() {
+		return Status{Signal: ws.Signal()}
+	}
+	return Status{Code: ws.ExitStatus()}
+}
+
+// AwaitStatus blocks until the reaper has reaped pid, returning its whole
+// outcome — the exit code, or the signal that killed it. Only meaningful
+// after Start(); if the reaper is not running it returns (Status{}, false)
+// and the caller falls back to its own wait.
+func AwaitStatus(pid int) (Status, bool) {
 	mu.Lock()
 	defer mu.Unlock()
 	if !started {
-		return 0, false
+		return Status{}, false
 	}
 	for {
-		if c, ok := codes[pid]; ok {
+		if st, ok := codes[pid]; ok {
 			delete(codes, pid)
-			return c, true
+			return st, true
 		}
 		cond.Wait()
 	}
+}
+
+// AwaitExit is AwaitStatus reporting the exit code alone, which is what the
+// session's own agent needs: a signalled agent reports -1, exactly as
+// cmd.Wait would have.
+func AwaitExit(pid int) (int, bool) {
+	st, ok := AwaitStatus(pid)
+	if !ok {
+		return 0, false
+	}
+	return st.ExitCode(), true
 }
 
 func setChildSubreaper() error {

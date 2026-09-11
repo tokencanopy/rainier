@@ -4,6 +4,8 @@ package relay
 import (
 	"context"
 	"sync"
+
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // Conn is the minimal transport interface relay logic runs against, so it's
@@ -166,6 +168,12 @@ type Open struct {
 	Cols, Rows int
 	Mode       string
 	Generation uint64
+	// Kind and Exec are the attachment's KIND and, for runner.KindExec, the
+	// command it runs. Empty is the terminal, which is what every control
+	// plane older than the field sends; the runner forwards both verbatim and
+	// interprets neither, exactly as it forwards the binding.
+	Kind string
+	Exec *runner.ExecSpec
 }
 
 // AttachClient bridges a client conn to a new attachment over the session
@@ -180,7 +188,7 @@ func (h *Hub) AttachClient(ctx context.Context, client Conn, o Open) error {
 	h.mu.Unlock()
 
 	open, _ := Encode(Frame{Type: FrameOpen, AttachID: id, Since: o.Since, Cols: o.Cols, Rows: o.Rows,
-		Mode: o.Mode, Gen: o.Generation})
+		Mode: o.Mode, Gen: o.Generation, Kind: o.Kind, Exec: o.Exec})
 	if err := h.conn.Write(h.ctx, open); err != nil {
 		// Session conn is already dead: this client would otherwise stay
 		// registered in h.clients (and its caller left hanging with no

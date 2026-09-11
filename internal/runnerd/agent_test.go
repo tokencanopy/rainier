@@ -882,9 +882,16 @@ func TestAgentCreateWithoutSetupLeavesTheSpecEmpty(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestAgentAnnouncesItsCapabilities pins the operator's configured
-// capabilities onto the announce verbatim and in order. They are claims about
-// this runner and nothing else, so the agent neither invents nor reorders
-// them; controld is where they are validated.
+// capabilities onto the announce verbatim and in order, with the BUILD's own
+// appended after them. They are claims about this runner and nothing else, so
+// the agent neither invents nor reorders the operator's; controld is where
+// they are validated.
+//
+// `exec.v1` is the exception that proves the rule: whether this runnerd can
+// forward an exec dial-back is decided by the code it was compiled from, not
+// by a flag somebody remembered to pass, and an operator who had to remember
+// would produce a fleet where `rainier exec` works on some runners and 501s
+// on others for no reason a user could see.
 func TestAgentAnnouncesItsCapabilities(t *testing.T) {
 	rd := New(driver.NewFake(4), "", "", "")
 
@@ -896,8 +903,33 @@ func TestAgentAnnouncesItsCapabilities(t *testing.T) {
 		Capabilities: caps})
 
 	ann := fc.nextConn(t).readAnnounce(t)
-	if !slices.Equal(ann.Capabilities, caps) {
-		t.Fatalf("announce Capabilities = %v, want %v", ann.Capabilities, caps)
+	want := append(append([]string(nil), caps...), runner.CapabilityExecV1)
+	if !slices.Equal(ann.Capabilities, want) {
+		t.Fatalf("announce Capabilities = %v, want %v", ann.Capabilities, want)
+	}
+}
+
+// TestAgentAnnouncesExecOnceAndOnlyOnce: the build token is appended, not
+// duplicated, and an operator who spells it out by hand is left alone rather
+// than corrected.
+func TestAgentAnnouncesExecOnceAndOnlyOnce(t *testing.T) {
+	for _, declared := range [][]string{nil, {}, {"gpu"}, {runner.CapabilityExecV1},
+		{"gpu", runner.CapabilityExecV1}} {
+		got := buildCapabilities(declared)
+		seen := 0
+		for _, c := range got {
+			if c == runner.CapabilityExecV1 {
+				seen++
+			}
+		}
+		if seen != 1 {
+			t.Fatalf("buildCapabilities(%v) = %v, want exec.v1 exactly once", declared, got)
+		}
+		for i, c := range declared {
+			if got[i] != c {
+				t.Fatalf("buildCapabilities(%v) = %v; it reordered the operator's list", declared, got)
+			}
+		}
 	}
 }
 

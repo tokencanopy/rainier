@@ -300,7 +300,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 
 	used, total, _ := s.drv.Capacity(ctx)
 	ann := runner.FromRunner{Type: "announce", Proto: runner.ProtocolVersion, Runner: cfg.RunnerName,
-		Sessions: s.Announce(), Used: used, Total: total, Capabilities: cfg.Capabilities}
+		Sessions: s.Announce(), Used: used, Total: total, Capabilities: buildCapabilities(cfg.Capabilities)}
 	if err := wsjson.Write(connCtx, c, ann); err != nil {
 		return false, err // nothing can have been accepted before the announce
 	}
@@ -651,7 +651,33 @@ func (s *Server) dialAttachBack(ctx context.Context, m runner.ToRunner, cfg Agen
 	hub.AttachClient(ctx, relay.WSConn(c), relay.Open{
 		Since: at.Since, Cols: at.Cols, Rows: at.Rows,
 		Mode: at.Mode, Generation: at.Generation,
+		// The kind and the command are forwarded verbatim and interpreted
+		// nowhere in this process: what an exec IS belongs to the sandbox,
+		// which is the only party that can resolve a path, read an
+		// environment or spawn anything. A runner that forwards them is the
+		// whole of what `exec.v1` claims.
+		Kind: at.Kind, Exec: at.Exec,
 	})
+}
+
+// buildCapabilities is what this runner announces: the operator's own
+// --capability claims, plus the ones that are facts about the BUILD rather
+// than claims about the machine.
+//
+// `exec.v1` is such a fact. Whether this runnerd can forward an exec
+// dial-back is decided by the code it was compiled from, not by a flag an
+// operator remembered to pass, and an operator who had to remember would
+// produce a fleet where `rainier exec` works on some runners and 501s on
+// others for no reason a user could see. The operator's list is left exactly
+// as given otherwise — a capability is a claim controld decides whether to
+// schedule on, and this adds one it can always trust.
+func buildCapabilities(declared []string) []string {
+	for _, c := range declared {
+		if c == runner.CapabilityExecV1 {
+			return declared
+		}
+	}
+	return append(append([]string(nil), declared...), runner.CapabilityExecV1)
 }
 
 // attachDialTimeout bounds one attach-back handshake. It sits below

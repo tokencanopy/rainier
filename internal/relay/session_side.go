@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/tokencanopy/rainier/internal/session"
+	"github.com/tokencanopy/rainier/protocol/runner"
 	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
@@ -66,7 +67,7 @@ func (c *ControlSender) Send(payload []byte) error {
 // raw terminal.ClientMessage into s.Stdin/s.SetSize; FrameClose calls s.Detach.
 // Returns when conn.Read errors (conn closed).
 func ServeSession(ctx context.Context, conn Conn, s *session.Session) error {
-	return serveSession(ctx, conn, s, newConnWriter(ctx, conn), nil)
+	return serveSession(ctx, conn, s, newConnWriter(ctx, conn), nil, nil)
 }
 
 // ServeSessionWithControl is ServeSession plus a control channel in both
@@ -98,15 +99,38 @@ func ServeSession(ctx context.Context, conn Conn, s *session.Session) error {
 // afterwards: a nil second receive would read as "the relay is fine", so
 // callers take the value once and treat that as the end of this conn's life.
 func ServeSessionWithControl(ctx context.Context, conn Conn, s *session.Session, onControl func(payload []byte)) (*ControlSender, <-chan error) {
+	return ServeSessionWithExec(ctx, conn, s, onControl, nil)
+}
+
+// ServeSessionWithExec is ServeSessionWithControl plus the second KIND of
+// attachment this conn can carry: ex answers the FrameOpens whose Kind is
+// runner.KindExec, and the session answers every other one exactly as it
+// always has.
+//
+// ex may be nil, and a nil one is not an error — it is a sandbox that cannot
+// exec, which answers an exec open by closing the attachment. That is
+// deliberately the same thing an older sessiond does with a Kind it has never
+// heard of (it opens a terminal attachment and sends a snapshot): in both
+// cases the caller never receives an `exec_started`, and the plane refuses on
+// the missing handshake rather than on anything it had to be told.
+func ServeSessionWithExec(ctx context.Context, conn Conn, s *session.Session,
+	onControl func(payload []byte), ex Execer) (*ControlSender, <-chan error) {
 	w := newConnWriter(ctx, conn)
 	errc := make(chan error, 1)
-	go func() { errc <- serveSession(ctx, conn, s, w, onControl) }()
+	go func() { errc <- serveSession(ctx, conn, s, w, onControl, ex) }()
 	return &ControlSender{w: w}, errc
 }
 
-func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWriter, onControl func(payload []byte)) error {
+func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWriter,
+	onControl func(payload []byte), ex Execer) error {
 	var mu sync.Mutex
 	atts := map[uint64]*session.Attachment{}
+	// execs is the second attachment table, keyed by the same ids. An
+	// attachment is in exactly one of the two for its whole life — the kind
+	// is decided by the frame that opens it and never changes — so
+	// FrameClient and FrameClose route by looking in both, and an exec id is
+	// never handed to s.Attach, s.Bind or s.Stdin.
+	execs := map[uint64]ExecAttachment{}
 	// Every frame this loop and its per-attachment forwarder goroutines emit
 	// goes through the shared writer, which a ControlSender may be writing
 	// through too — see connWriter.
@@ -123,7 +147,15 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 				s.Detach(att.ID)
 			}
 			atts = map[uint64]*session.Attachment{}
+			// An exec whose conn died has lost the one consumer its output
+			// was ever for, so it is closed — which kills its process group
+			// unless it was detached, whose lifetime is the session's.
+			dead := execs
+			execs = map[uint64]ExecAttachment{}
 			mu.Unlock()
+			for _, e := range dead {
+				e.Close()
+			}
 			return err
 		}
 		f, err := Decode(raw)
@@ -132,6 +164,45 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 		}
 		switch f.Type {
 		case FrameOpen:
+			if f.Kind == runner.KindExec {
+				// Its own branch, and it never touches session.Session: an
+				// exec's output must never reach the emulator, the event log
+				// or another viewer's screen, and the cheapest way to
+				// guarantee that is for the code path not to have the session
+				// in its hands at all.
+				if ex == nil || f.Exec == nil {
+					write(Frame{Type: FrameClose, AttachID: f.AttachID})
+					continue
+				}
+				att := ex.OpenExec(*f.Exec)
+				mu.Lock()
+				execs[f.AttachID] = att
+				mu.Unlock()
+				go func(id uint64, a ExecAttachment) {
+					for msg := range a.Msgs() {
+						p, err := json.Marshal(msg)
+						if err != nil {
+							continue
+						}
+						// A blocking write, which is the point: it is what
+						// stops the sandbox reading the process's pipes while
+						// this conn is not draining, so the process blocks on
+						// write(2) and no byte of its output is dropped.
+						if write(Frame{Type: FrameServer, AttachID: id, Payload: p}) != nil {
+							mu.Lock()
+							delete(execs, id)
+							mu.Unlock()
+							a.Close()
+							return
+						}
+					}
+					write(Frame{Type: FrameClose, AttachID: id})
+					mu.Lock()
+					delete(execs, id)
+					mu.Unlock()
+				}(f.AttachID, att)
+				continue
+			}
 			// The binding rides the frame that opens the attachment, so it is
 			// installed before a byte of screen is queued — no acknowledgement
 			// to order against, and nothing for a late frame to slip past. An
@@ -174,7 +245,16 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 			}
 			mu.Lock()
 			att := atts[f.AttachID]
+			exc := execs[f.AttachID]
 			mu.Unlock()
+			if exc != nil {
+				// An exec's client messages go to its own process and never
+				// to the pty. Nothing here reads a generation off them: a
+				// plane does not stamp an exec frame, and an exec that sent a
+				// claim would have nothing to claim.
+				exc.Client(cm)
+				continue
+			}
 			if att == nil {
 				continue
 			}
@@ -204,9 +284,14 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 			mu.Lock()
 			att := atts[f.AttachID]
 			delete(atts, f.AttachID)
+			exc := execs[f.AttachID]
+			delete(execs, f.AttachID)
 			mu.Unlock()
 			if att != nil {
 				s.Detach(att.ID)
+			}
+			if exc != nil {
+				exc.Close()
 			}
 		case FrameControl:
 			// Its own case, never the attachment demux: a control frame
