@@ -17,12 +17,32 @@ import (
 const prSetChildSubreaper = 36
 
 var (
-	mu      sync.Mutex
-	cond    = sync.NewCond(&mu)
-	codes   = map[int]Status{} // pid -> outcome, for pids the reaper has reaped
-	order   []int              // insertion order of `codes`, for the bound below
+	mu    sync.Mutex
+	cond  = sync.NewCond(&mu)
+	codes = map[int]record{} // pid -> outcome, for pids the reaper has reaped
+	order []int              // insertion order of `codes`, for the bound below
+	// tombs is the eviction TOMBSTONE table: a pid whose outcome the bound
+	// below dropped, with the sequence that outcome carried. Without it a
+	// waiter whose entry was evicted loops on cond.Wait() forever and its
+	// caller never reports a status — which before exec was a pid awaited
+	// once at boot and is now every exec, for a session's life.
+	tombs      = map[int]uint64{}
+	tombsOrder []int
+	// seq is the monotonic stamp every record carries, and the thing a caller
+	// takes a Mark of immediately before fork. pids wrap (pid_max is 32768 by
+	// default), so a fresh child can land on a pid an UNCLAIMED orphan entry
+	// still holds; without the stamp its waiter reads that orphan's status as
+	// its own and never corrects it.
+	seq     uint64
 	started bool
 )
+
+// record is one reaped outcome and when it was reaped, relative to the marks
+// callers take.
+type record struct {
+	st  Status
+	seq uint64
+}
 
 // maxUnclaimed bounds how many reaped outcomes may sit waiting for a caller
 // that is never going to ask.
@@ -38,9 +58,11 @@ var (
 // The oldest are dropped first, which is the safe direction: a waiter is
 // normally already waiting when its child exits, so an entry that has sat
 // through a thousand later exits is one nobody is coming for. A dropped entry
-// that somebody IS waiting for leaves that waiter blocked in AwaitStatus,
-// which is why the bound is far above any real concurrency — the cap is eight
-// execs plus the agent.
+// that somebody IS waiting for leaves a TOMBSTONE, so that waiter is told "no
+// status here" and falls back to its own cmd.Wait rather than parking
+// forever; the bound is still far above any real concurrency — the cap is
+// eight execs plus the agent — so the tombstone is the safety net and not the
+// mechanism.
 const maxUnclaimed = 4096
 
 // Start installs the SIGCHLD reaper. Safe to call once. After Start, AwaitExit
@@ -71,7 +93,8 @@ func Start() {
 					break
 				} // no more reapable now
 				mu.Lock()
-				record(pid, statusOf(ws))
+				seq++
+				remember(pid, record{st: statusOf(ws), seq: seq})
 				cond.Broadcast()
 				mu.Unlock()
 			}
@@ -79,17 +102,37 @@ func Start() {
 	}()
 }
 
-// record keeps one reaped outcome, dropping the oldest when the table is at
-// its bound. Callers hold mu.
-func record(pid int, st Status) {
+// remember keeps one reaped outcome, dropping the oldest — and leaving a
+// tombstone for it — when the table is at its bound. Callers hold mu.
+func remember(pid int, r record) {
 	if _, dup := codes[pid]; !dup {
 		order = append(order, pid)
 	}
-	codes[pid] = st
+	// A pid being recorded again is a wraparound onto an unclaimed entry. Its
+	// tombstone, if it has one, is older still and must not outlive it.
+	forgetTomb(pid)
+	codes[pid] = r
 	for len(order) > maxUnclaimed {
 		oldest := order[0]
 		order = order[1:]
+		evicted := codes[oldest]
 		delete(codes, oldest)
+		entomb(oldest, evicted.seq)
+	}
+}
+
+// entomb marks a pid's outcome as dropped rather than never-reaped, under the
+// same bound and for the same reason: a tombstone nobody comes for is itself
+// an entry that would grow without limit.
+func entomb(pid int, seq uint64) {
+	if _, dup := tombs[pid]; !dup {
+		tombsOrder = append(tombsOrder, pid)
+	}
+	tombs[pid] = seq
+	for len(tombsOrder) > maxUnclaimed {
+		oldest := tombsOrder[0]
+		tombsOrder = tombsOrder[1:]
+		delete(tombs, oldest)
 	}
 }
 
@@ -100,6 +143,20 @@ func forget(pid int) {
 	for i, p := range order {
 		if p == pid {
 			order = append(order[:i], order[i+1:]...)
+			break
+		}
+	}
+}
+
+// forgetTomb removes a tombstone and its place in the order. Callers hold mu.
+func forgetTomb(pid int) {
+	if _, ok := tombs[pid]; !ok {
+		return
+	}
+	delete(tombs, pid)
+	for i, p := range tombsOrder {
+		if p == pid {
+			tombsOrder = append(tombsOrder[:i], tombsOrder[i+1:]...)
 			break
 		}
 	}
@@ -117,20 +174,64 @@ func statusOf(ws syscall.WaitStatus) Status {
 	return Status{Code: ws.ExitStatus()}
 }
 
+// Mark is the sequence this table is at right now. A caller takes one
+// IMMEDIATELY BEFORE it forks and hands it back to AwaitStatus, which then
+// ignores any outcome recorded before that instant.
+//
+// It is the answer to pid reuse. pid_max is 32768 by default, so a long-lived
+// session spawning a command per CI step wraps; an unclaimed orphan entry —
+// `git fetch`'s git-remote-https is the ordinary shape of one — can still hold
+// the pid the next fork gets, and a waiter with no mark would read that
+// orphan's status as its own and never correct it. An entry that existed
+// before this child did cannot be this child's, and a monotonic counter is the
+// cheapest way to say so.
+//
+// Zero is a legal mark and means "anything": it is what a caller that cannot
+// take one passes, and it restores the old behaviour exactly.
+func Mark() uint64 {
+	mu.Lock()
+	defer mu.Unlock()
+	return seq
+}
+
 // AwaitStatus blocks until the reaper has reaped pid, returning its whole
-// outcome — the exit code, or the signal that killed it. Only meaningful
-// after Start(); if the reaper is not running it returns (Status{}, false)
-// and the caller falls back to its own wait.
-func AwaitStatus(pid int) (Status, bool) {
+// outcome — the exit code, or the signal that killed it.
+//
+// since is a Mark taken before the fork; an outcome recorded at or before it
+// belongs to some earlier holder of this pid and is discarded rather than
+// returned.
+//
+// It reports false in three cases, and the caller's answer to all three is the
+// same — fall back to its own cmd.Wait: the reaper is not running (a host
+// build, a test), the reaper is running but this outcome was EVICTED by the
+// table's bound, or the caller passed a mark no record can satisfy. Before the
+// tombstone the second case simply never returned.
+func AwaitStatus(pid int, since uint64) (Status, bool) {
 	mu.Lock()
 	defer mu.Unlock()
 	if !started {
 		return Status{}, false
 	}
 	for {
-		if st, ok := codes[pid]; ok {
+		if r, ok := codes[pid]; ok {
 			forget(pid)
-			return st, true
+			if r.seq > since {
+				return r.st, true
+			}
+			// Some earlier holder of this pid. Dropped, and the wait goes on
+			// for the outcome this caller is actually waiting for.
+			continue
+		}
+		if seq, ok := tombs[pid]; ok {
+			forgetTomb(pid)
+			if seq > since {
+				// This child's outcome existed and was evicted. Saying so is
+				// what lets cmd.Wait take over instead of this parking
+				// forever — which held one of the eight exec slots for the
+				// life of the session.
+				return Status{}, false
+			}
+			continue
 		}
 		cond.Wait()
 	}
@@ -139,8 +240,8 @@ func AwaitStatus(pid int) (Status, bool) {
 // AwaitExit is AwaitStatus reporting the exit code alone, which is what the
 // session's own agent needs: a signalled agent reports -1, exactly as
 // cmd.Wait would have.
-func AwaitExit(pid int) (int, bool) {
-	st, ok := AwaitStatus(pid)
+func AwaitExit(pid int, since uint64) (int, bool) {
+	st, ok := AwaitStatus(pid, since)
 	if !ok {
 		return 0, false
 	}

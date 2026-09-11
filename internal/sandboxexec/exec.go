@@ -1212,7 +1212,14 @@ func (s Spawner) grace() time.Duration {
 // running as anybody but the session's own user.
 func (s Spawner) Start(req Request, onStdout, onStderr func([]byte) error) (Proc, error) {
 	cmd := &exec.Cmd{Path: req.Path, Args: req.Argv, Dir: req.Dir, Env: req.Env}
-	p := &process{cmd: cmd, kill: s.kill, done: make(chan struct{})}
+	// The reaper mark, taken before any of the three branches forks. An
+	// outcome recorded before this instant belongs to some earlier holder of
+	// whatever pid this child gets — pid_max is 32768 and a session spawning a
+	// command per CI step wraps — and reading an orphan's status as this
+	// exec's would report a code the caller acts on. Before exec, exactly one
+	// pid was ever awaited, once, at boot; now every exec awaits by pid for a
+	// session's life, which is what turns this from latent into reachable.
+	p := &process{cmd: cmd, kill: s.kill, done: make(chan struct{}), mark: reap.Mark()}
 
 	switch {
 	case req.Detach:
@@ -1310,6 +1317,9 @@ type process struct {
 	// overtake the output that preceded it.
 	done   chan struct{}
 	status Status
+	// mark is the reaper's sequence immediately before this child was forked;
+	// see reap.Mark.
+	mark uint64
 
 	// fdmu guards this process's descriptors against being CLOSED while
 	// another goroutine is using one. It is a read/write lock rather than a
@@ -1416,13 +1426,18 @@ func (p *process) Wait() Status {
 // session/proc.go goes through reap.
 func (p *process) reap(drain *drain) {
 	pid := p.cmd.Process.Pid
-	if st, ok := reap.AwaitStatus(pid); ok {
+	if st, ok := reap.AwaitStatus(pid, p.mark); ok {
 		p.status = statusOf(st.Code, st.Signal)
 		// The child is already reaped, so this returns ECHILD; it is called
 		// only to release the Go-side resources.
 		_ = p.cmd.Wait()
 	} else {
-		// No reaper (a host build, a test): cmd.Wait is the waiter.
+		// Either there is no reaper (a host build, a test) or there is one
+		// and this outcome was evicted by its table's bound. cmd.Wait is the
+		// waiter for both: under a reaper it answers ECHILD, which becomes
+		// "no status" and therefore the caller's 125 — which is honest, and
+		// is the alternative to an exec that never reports at all and holds
+		// one of the eight slots for the life of the session.
 		p.status = statusOfWait(p.cmd.Wait())
 	}
 	if drain != nil {
