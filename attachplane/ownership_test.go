@@ -301,7 +301,7 @@ func TestAViewerIsToldSoAndItsInputNeverLeavesThePlane(t *testing.T) {
 func TestAnUnnegotiatedAttachGetsTodaysMessageSetAndStampedFrames(t *testing.T) {
 	p, h, ts := newTestPlane(t, Options{})
 	f := startAttach(t, p, h, ts, control.AttachmentController, 7, nil, true)
-	<-f.sandbox.ready
+	awaitSpliced(t, f)
 
 	f.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("ls\r")}
 	f.sandbox.write(t, terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
@@ -345,7 +345,7 @@ func TestJourney3And4AClaimIsAnsweredOnlyAfterTheSandboxHasTheFence(t *testing.T
 	lease := &fakeLease{gen: 1, holder: "att_laptop"}
 	f := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_phone"}, true)
 	awaitType(t, f.stream, terminal.TypeAttached)
-	<-f.sandbox.ready
+	awaitViewerSpliced(t, f)
 
 	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
 	m, _ := awaitType(t, f.stream, terminal.TypeAttached)
@@ -394,7 +394,7 @@ func TestALostClaimIsAnsweredStaleWithTheCurrentGeneration(t *testing.T) {
 	lease := &fakeLease{gen: 9, holder: "att_other"}
 	f := startAttach(t, p, h, ts, control.AttachmentViewer, 9, fakeKeeper{lease, "att_late"}, true)
 	awaitType(t, f.stream, terminal.TypeAttached)
-	<-f.sandbox.ready
+	awaitViewerSpliced(t, f)
 
 	// Somebody else claimed in the meantime, from the generation this client
 	// is about to present.
@@ -425,11 +425,11 @@ func TestADisplacedControllerIsToldAtOnce(t *testing.T) {
 
 	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_laptop"}, true)
 	awaitType(t, laptop.stream, terminal.TypeAttached)
-	<-laptop.sandbox.ready
+	awaitSpliced(t, laptop)
 
 	phone := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_phone"}, true)
 	awaitType(t, phone.stream, terminal.TypeAttached)
-	<-phone.sandbox.ready
+	awaitViewerSpliced(t, phone)
 
 	phone.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
 	if m, _ := awaitType(t, phone.stream, terminal.TypeAttached); m.Generation.Value() != 2 {
@@ -474,7 +474,7 @@ func TestAStaleHeartbeatDemotesAControllerFromAnotherReplica(t *testing.T) {
 	lease := &fakeLease{gen: 1, holder: "att_here"}
 	f := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_here"}, true)
 	awaitType(t, f.stream, terminal.TypeAttached)
-	<-f.sandbox.ready
+	awaitSpliced(t, f)
 
 	// Another replica's attach takes control. This one is told nothing.
 	if _, err := (fakeKeeper{lease, "att_elsewhere"}).Claim(context.Background(), 1); err != nil {
@@ -495,7 +495,7 @@ func TestReleasingAdvancesTheGenerationAndDemotes(t *testing.T) {
 	lease := &fakeLease{gen: 1, holder: "att_aaaa"}
 	f := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_aaaa"}, true)
 	awaitType(t, f.stream, terminal.TypeAttached)
-	<-f.sandbox.ready
+	awaitSpliced(t, f)
 
 	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeRelease}
 	m, _ := awaitType(t, f.stream, terminal.TypeControlChanged)
@@ -525,7 +525,7 @@ func TestDetachingReleasesControl(t *testing.T) {
 	lease := &fakeLease{gen: 1, holder: "att_aaaa"}
 	f := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_aaaa"}, true)
 	awaitType(t, f.stream, terminal.TypeAttached)
-	<-f.sandbox.ready
+	awaitSpliced(t, f)
 
 	f.close()
 	select {
@@ -550,7 +550,7 @@ func TestAnOldSandboxNeverAcksAndTheHandoffStillHappens(t *testing.T) {
 	lease := &fakeLease{gen: 1, holder: "att_other"}
 	f := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_phone"}, false)
 	awaitType(t, f.stream, terminal.TypeAttached)
-	<-f.sandbox.ready
+	awaitViewerSpliced(t, f)
 
 	started := time.Now()
 	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
@@ -613,7 +613,7 @@ func TestAClientsControlVerbNeverReachesTheSandbox(t *testing.T) {
 	a := startAttach(t, p, h, ts, control.AttachmentController, 1,
 		fakeKeeper{lease, "att_laptop"}, true)
 	awaitType(t, a.stream, terminal.TypeAttached)
-	<-a.sandbox.ready
+	awaitSpliced(t, a)
 
 	a.stream.in <- terminal.ClientMessage{
 		Type: terminal.TypeControl, Mode: terminal.ModeView, Generation: terminal.GenOf(2)}
@@ -662,11 +662,11 @@ func TestAViewerLearnsWhenControlIsFreed(t *testing.T) {
 	lease := &fakeLease{gen: 1, holder: "att_laptop"}
 	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_laptop"}, true)
 	awaitType(t, laptop.stream, terminal.TypeAttached)
-	<-laptop.sandbox.ready
+	awaitSpliced(t, laptop)
 
 	phone := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_phone"}, true)
 	awaitType(t, phone.stream, terminal.TypeAttached)
-	<-phone.sandbox.ready
+	awaitViewerSpliced(t, phone)
 
 	// The laptop gives control up without leaving.
 	laptop.stream.in <- terminal.ClientMessage{Type: terminal.TypeRelease}
@@ -698,12 +698,12 @@ func TestALegacyAttachDisplacesANegotiatedControllerAndSaysSo(t *testing.T) {
 	lease := &fakeLease{gen: 1, holder: "att_laptop"}
 	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_laptop"}, true)
 	awaitType(t, laptop.stream, terminal.TypeAttached)
-	<-laptop.sandbox.ready
+	awaitSpliced(t, laptop)
 
 	// A client that negotiates nothing: no keeper, and the generation the
 	// application advanced unconditionally on its behalf.
 	legacy := startAttach(t, p, h, ts, control.AttachmentController, 2, nil, true)
-	<-legacy.sandbox.ready
+	awaitSpliced(t, legacy)
 
 	m, _ := awaitType(t, laptop.stream, terminal.TypeControlChanged)
 	if m.Mode != terminal.ModeView || m.Generation.Value() != 2 {
@@ -1000,7 +1000,7 @@ func TestAClaimSupersededWhileItDisplacedIsNeverToldItHasControl(t *testing.T) {
 	// the whole timeout — which is the window under test.
 	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_aaaa"}, false)
 	awaitType(t, laptop.stream, terminal.TypeAttached)
-	<-laptop.sandbox.ready
+	awaitSpliced(t, laptop)
 
 	phone := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_bbbb"}, true)
 	awaitType(t, phone.stream, terminal.TypeAttached)
@@ -1057,7 +1057,7 @@ func TestATakeOverAtAttachTimeIsToldWhatItIsAfterItDisplaced(t *testing.T) {
 
 	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_aaaa"}, false)
 	awaitType(t, laptop.stream, terminal.TypeAttached)
-	<-laptop.sandbox.ready
+	awaitSpliced(t, laptop)
 	tablet := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_cccc"}, true)
 	awaitType(t, tablet.stream, terminal.TypeAttached)
 	awaitViewerSpliced(t, tablet)
