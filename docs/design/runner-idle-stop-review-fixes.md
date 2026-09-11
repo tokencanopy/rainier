@@ -193,12 +193,23 @@ exit 1. The exit code does not change — every `rainier` failure that is not a 
 is 1 — and saying so is the point: the fix is in the class, the code and the sentence, not
 in the exit status.
 
-What is NOT fixed, and is named here rather than discovered later: `resumeForAttach` now
-converges instead of failing at once, and its loop returns success only when the ROW
-reaches `running`. A refused resume does not move the row, so `rainier attach` polls for
-its bounded two seconds and then reports the conflict. That is a better answer than today's
-immediate internal error and a worse one than retrying the resume itself, which is a change
-to the CLI's retry policy and not to this PR's subject.
+Two things are NOT fixed, named here rather than discovered later:
+
+- `resumeForAttach` now converges instead of failing at once, and its loop returns success
+  only when the ROW reaches `running`. A refused resume does not move the row, so `rainier
+  attach` polls for its bounded two seconds and then reports the conflict. Better than
+  today's immediate internal error, worse than retrying the resume itself — which is a
+  change to the CLI's retry policy and not to this PR's subject.
+- **`cmd/rainier`'s stderr rendering for a 409 is poor, and this change does not make it
+  good.** `reportError` sends every `*cli.APIError` through `readinessError`, which is a
+  CONNECTION diagnosis, so a conflict prints "unexpected HTTP status (409); verify the
+  configured server with your administrator" rather than the sentence the server wrote for
+  a person. The error VALUE is right (`conflict: session cannot be resumed right now`, which
+  is what `rainier attach` surfaces and what a script reads), and the stable code is on the
+  second line — but the prose is wrong, and it has been wrong for every 409 this CLI has
+  ever produced, not just this one. Fixing it means teaching `reportError` that a 4xx
+  carrying a server-written message is not a connectivity problem, which is a CLI-wide
+  change and belongs in its own PR. On the PR's follow-up list.
 
 ## Alternatives considered
 
