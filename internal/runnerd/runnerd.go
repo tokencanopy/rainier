@@ -92,11 +92,12 @@ type Server struct {
 	// session has to sit idle can be a table row rather than a sleep. A field
 	// written only immediately after New, like hubWait, and never again.
 	//
-	// Both sides of every duration this server computes come from here, so in
-	// production both carry Go's monotonic reading and the subtraction uses
-	// it — an NTP step cannot make a session look idle early. Nothing on this
-	// path calls UTC/Round/Truncate or marshals these times, which is what
-	// would strip that reading.
+	// Both sides of every duration the IDLE path computes come from here (the
+	// unrelated waits — waitHub's deadline, the agent's backoff — still read
+	// time.Now directly), so in production both carry Go's monotonic reading
+	// and the subtraction uses it: an NTP step cannot make a session look idle
+	// early. Nothing on this path calls UTC/Round/Truncate or marshals these
+	// times, which is what would strip that reading.
 	now func() time.Time
 	// idleSweep is how often RunIdleStop looks for idle sessions. Zero — the
 	// value New leaves — means "derive it from the timeout" (see
@@ -457,6 +458,12 @@ func (s *Server) OpSnapshot(ctx context.Context, id, ref string) (string, error)
 	if err != nil {
 		return "", err
 	}
+	// `docker commit` runs against a LIVE container and takes minutes on a
+	// large image. A sweep that stopped the session underneath it would break
+	// the commit and the environment cache built on it, so a snapshot in
+	// flight takes the session out of idle auto-stop for its duration.
+	s.reg.beginOp(id)
+	defer s.reg.endOp(id)
 	snap, err := s.drv.Snapshot(ctx, handle, ref, s.stripEnvFor(id))
 	if err != nil {
 		return "", err
@@ -553,6 +560,13 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 			s.reg.beginColdSuspend(id)
 			return s.coldSuspend(ctx, id, handle)
 		}
+		// Bracketed, unlike the cold branch above, because a warm suspend
+		// has no state marker of its own: the entry reads "running" for the
+		// whole of `docker pause`, and a sweep that claimed it in that window
+		// would turn an operator's pause — which deliberately KEEPS the slot
+		// — into a stop that releases it. See registry.beginOp.
+		s.reg.beginOp(id)
+		defer s.reg.endOp(id)
 		if err := s.drv.Suspend(ctx, handle, warm); err != nil {
 			return err
 		}
@@ -564,6 +578,10 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 		s.reg.setState(id, "suspended")
 		return nil
 	case "resume":
+		// Same bracket as the warm suspend: a session mid-`docker start` is
+		// not a session to stop.
+		s.reg.beginOp(id)
+		defer s.reg.endOp(id)
 		if err := s.drv.Resume(ctx, handle); err != nil {
 			return err
 		}
@@ -586,10 +604,10 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 // landing state, and the same rollback when the daemon refuses.
 func (s *Server) coldSuspend(ctx context.Context, id, handle string) error {
 	if err := s.drv.Suspend(ctx, handle, false); err != nil {
-		s.reg.releaseIdle(id) // stop failed: we're still running
+		s.reg.releaseColdSuspend(id) // stop failed: we're still running
 		return err
 	}
-	s.reg.setState(id, "suspended")
+	s.reg.finishColdSuspend(id)
 	return nil
 }
 
@@ -715,6 +733,13 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.SetReadLimit(16 << 20)
+	// Opened BEFORE the hub, because NewHubWithControl starts the read loop:
+	// a token minted afterwards would leave a window in which this
+	// connection's own first frames name an epoch the entry has not adopted
+	// yet. Every control frame from this conn carries it, and the registry
+	// drops the ones that name a boot the session has moved past — see
+	// sessionEntry.boot.
+	boot := s.reg.newBoot(id)
 	hub := relay.NewHubWithControl(r.Context(), relay.WSConn(c), func(payload []byte) {
 		// On its own goroutine, deliberately: this runs on the hub's read
 		// loop, the single goroutine demultiplexing every attachment
@@ -732,7 +757,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		// belongs to — both ends match on that id, never on arrival order
 		// (which is exactly why the id is on the wire). A control channel
 		// that grows ORDERED events needs a queue here instead.
-		go s.routeControl(id, payload)
+		go s.routeControl(id, boot, payload)
 	})
 	if !s.reg.setHub(id, hub) {
 		// The entry vanished between our existence check above and now — a
@@ -842,7 +867,7 @@ func (s *Server) RemoveWorkspace(ctx context.Context, id string) error {
 // escalated: this arrives from inside a container over a conn that also
 // carries every viewer's terminal traffic, and the one thing that must not
 // happen is a malformed frame taking the session down with it.
-func (s *Server) routeControl(id string, payload []byte) {
+func (s *Server) routeControl(id string, boot uint64, payload []byte) {
 	var ev relay.ControlEvent
 	if err := json.Unmarshal(payload, &ev); err != nil {
 		log.Printf("session %s: undecodable control payload (%d bytes): %v", id, len(payload), err)
@@ -870,6 +895,14 @@ func (s *Server) routeControl(id string, payload []byte) {
 			stage = "setup"
 		}
 		log.Printf("session %s: the %s stage failed (rc %d)", id, stage, ev.RC)
+		// A session that never finished booting is kept out of idle
+		// auto-stop for good. Its child exits with the failing stage, so it
+		// would otherwise look like a finished agent half an hour later — and
+		// stopping it takes away the only thing left to do with it: the CLI
+		// lets you attach to a failed session precisely to read the log that
+		// says why, and neither a stopped sandbox (no hub) nor a failed row
+		// (not resumable) can serve that. See sessionEntry.bootFailed.
+		s.reg.markBootFailed(id)
 		if stage == "setup" {
 			s.fireEventDetail(id, "setup_failed", setupFailedDetail(ev.RC, ev.Tail))
 			return
@@ -902,7 +935,7 @@ func (s *Server) routeControl(id string, payload []byte) {
 		// thing that makes this session a candidate for idle auto-stop, and
 		// nothing else in this runner would remember it. It still changes no
 		// state here — see RunIdleStop for the timeout that does.
-		s.reg.childExited(id, s.now())
+		s.reg.childExited(id, boot, s.now())
 		s.fireEventDetail(id, "child_exited", strconv.Itoa(ev.RC))
 	case "resp":
 		// The sandbox's answer to a request controld sent down. Forwarded
@@ -1054,6 +1087,19 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Counted here — before the upgrade and before the first client frame —
+	// rather than just before the pump. An attachment that has been paired and
+	// is mid-handshake is a viewer arriving, and readFirstResize below waits
+	// on a frame that crosses the client's network: counting after it would
+	// leave a real viewer invisible to a sweep for as long as their round trip
+	// takes, and stop the session under them.
+	s.reg.attachStarted(id)
+	// The closure is load-bearing: a deferred call's ARGUMENTS are evaluated
+	// where the defer is written, so `defer s.reg.attachEnded(id, s.now())`
+	// would stamp the detach with the time of the ATTACH — which reads as an
+	// attachment that ended the moment it began, and idle-stops a session
+	// somebody is watching.
+	defer func() { s.reg.attachEnded(id, s.now()) }()
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
@@ -1068,18 +1114,6 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 		c.CloseNow()
 		return
 	}
-	// An attached session is not idle, however long ago its child exited, and
-	// the timer starts again when this viewer leaves. Counted around the pump
-	// rather than inside the hub because the runner is where the idle
-	// decision is made, and because both attach fronts — this one and the
-	// agent's dial_attach — have to be counted the same way.
-	s.reg.attachStarted(id)
-	// The closure is load-bearing: a deferred call's ARGUMENTS are evaluated
-	// where the defer is written, so `defer s.reg.attachEnded(id, s.now())`
-	// would stamp the detach with the time of the ATTACH — which reads as an
-	// attachment that ended the moment it began, and idle-stops a session
-	// somebody is watching.
-	defer func() { s.reg.attachEnded(id, s.now()) }()
 	// The runner's own local attach endpoint is a single-box debugging tool
 	// with no control plane above it: it grants no binding, so the attachment
 	// is unconditional exactly as it has always been.

@@ -276,7 +276,22 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 		switch m.Type {
 		case "event":
 			m.Generation = ag.generation.Load()
-			if m.Session != "" {
+			// Every event about a session echoes the placement generation its
+			// create carried — except the runner's own idle auto-stop, which
+			// must carry NONE. A cold resume opens a new placement generation
+			// on the control plane's row but sends the runner no new value, so
+			// this entry's is stale by construction from the first resume on;
+			// stamping it would guarantee the report is fenced as stale, and a
+			// fenced auto-stop leaves the row reading "running" over a
+			// container that is stopped — a session `rainier attach` then
+			// refuses to resume and cannot reach, until the runner happens to
+			// reconnect. Zero means "not carried" and fences nothing, which is
+			// safe here specifically because the report is about the sandbox
+			// this runner holds right now, and a session re-placed onto a
+			// DIFFERENT runner is still fenced by the runner identity the
+			// service checks first. Carrying the generation on `resume` is the
+			// real fix and is a separate change (protocol + control plane).
+			if m.Session != "" && m.State != "suspended_cold" {
 				m.PlacementGeneration = s.reg.placementGeneration(m.Session)
 			}
 		case "result":

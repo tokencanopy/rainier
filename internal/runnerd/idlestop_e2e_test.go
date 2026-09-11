@@ -295,3 +295,98 @@ func waitForChildExit(t *testing.T, rd *Server, id string) {
 	}
 	t.Fatalf("session %s never recorded a child exit", id)
 }
+
+// TestAttachCountsBeforeTheFirstClientFrame: the attach front must count a
+// viewer from the moment the session is known to be attaching, not after the
+// first frame arrives from the client's network. A client that has completed
+// the websocket handshake and has not yet sent its resize is a viewer
+// arriving; a sweep that ran in that window used to stop the session under
+// them.
+func TestAttachCountsBeforeTheFirstClientFrame(t *testing.T) {
+	clk := newFakeClock()
+	rd := New(driver.NewFake(4), "", "", "")
+	rd.now = clk.now
+	srv := httptest.NewServer(rd.Handler())
+	defer srv.Close()
+	ctx := context.Background()
+
+	id, sb := dialSandbox(t, rd, srv)
+	sb.send(t, relay.ControlEvent{Kind: "child_exited", RC: 0})
+	waitForChildExit(t, rd, id)
+
+	// Dial, and deliberately send NOTHING: no resize, no stdin.
+	base := strings.Replace(srv.URL, "http", "ws", 1)
+	c, _, err := websocket.Dial(ctx, base+"/attach?session="+id, nil)
+	if err != nil {
+		t.Fatalf("dial /attach: %v", err)
+	}
+	defer c.CloseNow()
+	waitForAttachments(t, rd, id, 1)
+
+	clk.set(10 * time.Hour)
+	if stops := rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 0 {
+		t.Fatalf("stopped %v with a viewer mid-handshake", stops)
+	}
+
+	// And the count still comes back down when that client gives up, so a
+	// handshake that never completes cannot pin the session open forever.
+	c.CloseNow()
+	waitForAttachments(t, rd, id, 0)
+	clk.set(10*time.Hour + 30*time.Minute)
+	if stops := rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 1 {
+		t.Fatalf("stopped %v after the client gave up, want the session", stops)
+	}
+}
+
+// TestIdleStopEventCarriesNoPlacementGeneration is the review's other severe
+// finding. A cold resume opens a NEW placement generation on the control
+// plane's row but sends the runner no new value, so this runner's is stale
+// from the first resume on — and the control plane fences an event whose
+// placement generation is not the row's. A fenced auto-stop would leave the
+// row reading "running" over a container that is stopped: a session `rainier
+// attach` refuses to resume and cannot reach. So this one event carries none,
+// where every other event about a session still carries the one its create
+// did.
+func TestIdleStopEventCarriesNoPlacementGeneration(t *testing.T) {
+	const placementGen = 7
+	clk := newFakeClock()
+	rd, srv, conn := runnerWithControld(t, func(s *Server) { s.now = clk.now })
+	ctx := context.Background()
+
+	const id = "sess-placed"
+	if err := rd.createWithID(ctx, id, driver.Spec{Image: "img.invalid"}, nil, placementGen); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	base := strings.Replace(srv.URL, "http", "ws", 1)
+	c, _, err := websocket.Dial(ctx, base+"/register?session="+id, nil)
+	if err != nil {
+		t.Fatalf("dial /register: %v", err)
+	}
+	defer c.CloseNow()
+	waitForHub(t, rd, id)
+	sb := &sandbox{c: c, ctx: ctx}
+
+	// Every other event about this session still carries the generation: that
+	// fence is what keeps a report from a sandbox the session has been
+	// re-placed away from out of the row.
+	if m := nextEventOfState(t, conn, "running"); m.PlacementGeneration != placementGen {
+		t.Fatalf("running event placement generation = %d, want %d", m.PlacementGeneration, placementGen)
+	}
+	sb.send(t, relay.ControlEvent{Kind: "child_exited", RC: 0})
+	if m := nextEventOfState(t, conn, "child_exited"); m.PlacementGeneration != placementGen {
+		t.Fatalf("child_exited placement generation = %d, want %d", m.PlacementGeneration, placementGen)
+	}
+
+	clk.set(time.Hour)
+	if stops := rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 1 {
+		t.Fatalf("sweep stopped %v, want [%s]", stops, id)
+	}
+	ev := nextEventOfState(t, conn, "suspended_cold")
+	if ev.Session != id {
+		t.Fatalf("suspended_cold for %q, want %q", ev.Session, id)
+	}
+	if ev.PlacementGeneration != 0 {
+		t.Fatalf("suspended_cold placement generation = %d, want 0 — a stale generation would fence the park",
+			ev.PlacementGeneration)
+	}
+}

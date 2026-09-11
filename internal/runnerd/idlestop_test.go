@@ -56,6 +56,10 @@ type idleHarness struct {
 	fd    *driver.Fake
 	id    string
 	stops []string // every id stopped, across every sweep, in order
+	// boot is the sandbox-boot token the harness's session is currently on,
+	// the one a real /register mints. Control frames carry it, and the
+	// registry drops the ones that name a boot the session has moved past.
+	boot map[string]uint64
 }
 
 // newIdleHarness creates a runner with one running session whose sandbox the
@@ -66,11 +70,29 @@ func newIdleHarness(t *testing.T) *idleHarness {
 	fd := driver.NewFake(4)
 	rd := New(fd, "", "", "")
 	rd.now = clk.now // before anything serves: no goroutine of this server's exists yet
-	h := &idleHarness{t: t, clk: clk, rd: rd, fd: fd, id: "sess-idle-1"}
-	if err := rd.CreateWithID(context.Background(), h.id, driver.Spec{Image: "img.invalid"}, nil); err != nil {
-		t.Fatalf("create: %v", err)
-	}
+	h := &idleHarness{t: t, clk: clk, rd: rd, fd: fd, id: "sess-idle-1", boot: map[string]uint64{}}
+	h.create(h.id)
 	return h
+}
+
+// create adds a session and registers a sandbox boot for it, which is what a
+// container's sessiond dialing /register does.
+func (h *idleHarness) create(id string) {
+	h.t.Helper()
+	if err := h.rd.CreateWithID(context.Background(), id, driver.Spec{Image: "img.invalid"}, nil); err != nil {
+		h.t.Fatalf("create %s: %v", id, err)
+	}
+	h.boot[id] = h.rd.reg.newBoot(id)
+}
+
+// entry returns a value copy of the session's registry entry.
+func (h *idleHarness) entry(id string) sessionEntry {
+	h.t.Helper()
+	e, ok := h.rd.reg.snapshot(id)
+	if !ok {
+		h.t.Fatalf("session %s is not in the registry", id)
+	}
+	return e
 }
 
 // handle returns the driver handle the session's sandbox is under.
@@ -134,7 +156,7 @@ func (h *idleHarness) run(idle time.Duration, s idleStep) {
 	case childExits:
 		// Through the real control-frame path, not the registry accessor: the
 		// fact has to survive routeControl to be worth anything.
-		h.rd.routeControl(h.id, []byte(`{"kind":"child_exited","rc":0}`))
+		h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"child_exited","rc":0}`))
 	case viewerAttaches:
 		h.rd.reg.attachStarted(h.id)
 	case viewerDetaches:
@@ -150,6 +172,12 @@ func (h *idleHarness) run(idle time.Duration, s idleStep) {
 	case sessionResumes:
 		if err := h.rd.Op(ctx, h.id, "resume", false); err != nil {
 			h.t.Fatalf("resume: %v", err)
+		}
+		// A cold resume restarts the container, so a real sessiond dials
+		// /register again and opens the next boot. The harness stands in for
+		// that, which is also what makes the PREVIOUS boot's token stale.
+		if e := h.entry(h.id); e.childExitedAt.IsZero() {
+			h.boot[h.id] = h.rd.reg.newBoot(h.id)
 		}
 	case sweeps:
 		h.stops = append(h.stops, h.rd.sweepIdle(ctx, idle)...)
@@ -386,9 +414,7 @@ func TestIdleStopLeavesTheSessionResumable(t *testing.T) {
 // stop. The line itself is log.Printf, but every number in it comes from here.
 func TestIdleStopReportsWhatItFreed(t *testing.T) {
 	h := newIdleHarness(t)
-	if err := h.rd.CreateWithID(context.Background(), "sess-idle-2", driver.Spec{Image: "img.invalid"}, nil); err != nil {
-		t.Fatalf("create the second session: %v", err)
-	}
+	h.create("sess-idle-2")
 	if active, idleExited := h.rd.reg.counts(); active != 2 || idleExited != 0 {
 		t.Fatalf("counts with two working agents = (%d active, %d idle-exited), want (2, 0)", active, idleExited)
 	}
@@ -587,10 +613,8 @@ func TestIdleStopIdsAreSweptInAStableOrder(t *testing.T) {
 	h := newIdleHarness(t)
 	ctx := context.Background()
 	for _, id := range []string{"sess-idle-9", "sess-idle-3", "sess-idle-5"} {
-		if err := h.rd.CreateWithID(ctx, id, driver.Spec{Image: "img.invalid"}, nil); err != nil {
-			t.Fatalf("create %s: %v", id, err)
-		}
-		h.rd.routeControl(id, []byte(`{"kind":"child_exited","rc":0}`))
+		h.create(id)
+		h.rd.routeControl(id, h.boot[id], []byte(`{"kind":"child_exited","rc":0}`))
 	}
 	h.run(time.Hour, idleStep{at: 0, act: childExits})
 	h.clk.set(time.Hour)
@@ -599,5 +623,277 @@ func TestIdleStopIdsAreSweptInAStableOrder(t *testing.T) {
 	want := []string{"sess-idle-1", "sess-idle-3", "sess-idle-5", "sess-idle-9"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("sweep stopped %v, want %v in id order", got, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// regressions from review
+// ---------------------------------------------------------------------------
+
+// TestStaleChildExitFromAPreviousBootIsIgnored is the review's worst finding:
+// a control frame can outlive the sandbox boot that sent it. A hub read loop
+// stalled writing to a wedged viewer drains its buffered frames whenever it
+// finally comes back — which can be after the sandbox has been stopped,
+// resumed, and re-registered. Without the boot token, that buffered
+// child_exited lands on the NEW boot, and half an hour later the runner stops
+// a session whose agent is working.
+func TestStaleChildExitFromAPreviousBootIsIgnored(t *testing.T) {
+	h := newIdleHarness(t)
+	ctx := context.Background()
+	staleBoot := h.boot[h.id]
+
+	// First life: the agent finishes and the session is idle-stopped.
+	h.run(30*time.Minute, idleStep{at: 0, act: childExits})
+	h.run(30*time.Minute, idleStep{at: 30 * time.Minute, act: sweeps})
+	if len(h.stops) != 1 {
+		t.Fatalf("first life: stopped %v, want one stop", h.stops)
+	}
+
+	// Second life: resumed, a new sessiond registers, a new agent is working.
+	h.run(30*time.Minute, idleStep{at: 31 * time.Minute, act: sessionResumes})
+	if got := h.boot[h.id]; got == staleBoot {
+		t.Fatal("a cold resume left the session on the previous boot's token")
+	}
+	if e := h.entry(h.id); !e.childExitedAt.IsZero() {
+		t.Fatal("a cold resume kept the previous child's exit")
+	}
+
+	// The previous boot's buffered frame finally arrives.
+	h.clk.set(32 * time.Minute)
+	h.rd.routeControl(h.id, staleBoot, []byte(`{"kind":"child_exited","rc":0}`))
+	if e := h.entry(h.id); !e.childExitedAt.IsZero() {
+		t.Fatal("a child_exited from the previous boot was recorded against the new one")
+	}
+
+	// So the working agent is never stopped, however long nobody watches it.
+	h.clk.set(100 * time.Hour)
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 0 {
+		t.Fatalf("stopped %v — a session whose agent is running must never be stopped", stops)
+	}
+	if got := h.state(); got != driver.StateRunning {
+		t.Fatalf("container state = %v, want %v", got, driver.StateRunning)
+	}
+
+	// And the new child's own exit still counts.
+	h.run(30*time.Minute, idleStep{at: 100 * time.Hour, act: childExits})
+	h.clk.set(100*time.Hour + 30*time.Minute)
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 1 {
+		t.Fatalf("stopped %v after the new child exited, want the session", stops)
+	}
+}
+
+// TestColdResumeForgetsThePreviousChild pins the invariant directly rather
+// than through a script that could pass for the wrong reason: after a cold
+// resume there is no child-exit fact at all, so nothing can stop the session
+// until its new agent reports one.
+func TestColdResumeForgetsThePreviousChild(t *testing.T) {
+	h := newIdleHarness(t)
+	h.run(30*time.Minute, idleStep{at: 0, act: childExits})
+	h.run(30*time.Minute, idleStep{at: 30 * time.Minute, act: sweeps})
+	h.run(30*time.Minute, idleStep{at: 31 * time.Minute, act: sessionResumes})
+
+	e := h.entry(h.id)
+	if !e.childExitedAt.IsZero() || !e.lastDetachAt.IsZero() {
+		t.Fatalf("after a cold resume: childExitedAt=%v lastDetachAt=%v, want both zero", e.childExitedAt, e.lastDetachAt)
+	}
+	if e.coldSuspended {
+		t.Fatal("after a cold resume the entry still reads as cold-suspended")
+	}
+	h.clk.set(1000 * time.Hour)
+	if stops := h.rd.sweepIdle(context.Background(), 30*time.Minute); len(stops) != 0 {
+		t.Fatalf("stopped %v — a resumed session's new agent is running", stops)
+	}
+}
+
+// TestOperatorStopThenResumeForgetsThePreviousChild is the same invariant by
+// the other route into a cold park: the operator's stop rather than the
+// runner's.
+func TestOperatorStopThenResumeForgetsThePreviousChild(t *testing.T) {
+	h := newIdleHarness(t)
+	h.run(30*time.Minute, idleStep{at: 0, act: childExits})
+	h.run(30*time.Minute, idleStep{at: 1 * time.Minute, act: operatorStops})
+	h.run(30*time.Minute, idleStep{at: 2 * time.Minute, act: sessionResumes})
+
+	if e := h.entry(h.id); !e.childExitedAt.IsZero() {
+		t.Fatal("a resume after an operator's stop kept the previous child's exit")
+	}
+	h.clk.set(1000 * time.Hour)
+	if stops := h.rd.sweepIdle(context.Background(), 30*time.Minute); len(stops) != 0 {
+		t.Fatalf("stopped %v — a resumed session's new agent is running", stops)
+	}
+}
+
+// blockingDriver holds one driver call open so a test can sweep while it is in
+// flight — the window in which the entry still reads "running" although
+// somebody else is already operating on the container.
+type blockingDriver struct {
+	*driver.Fake
+	entered chan struct{} // closed when the call has started
+	release chan struct{} // closed by the test to let it finish
+	warm    bool          // block Suspend(warm) rather than Snapshot
+}
+
+func newBlockingDriver(warm bool) *blockingDriver {
+	return &blockingDriver{Fake: driver.NewFake(4), entered: make(chan struct{}),
+		release: make(chan struct{}), warm: warm}
+}
+
+func (d *blockingDriver) hold() {
+	close(d.entered)
+	<-d.release
+}
+
+func (d *blockingDriver) Suspend(ctx context.Context, id string, warm bool) error {
+	if d.warm && warm {
+		d.hold()
+	}
+	return d.Fake.Suspend(ctx, id, warm)
+}
+
+func (d *blockingDriver) Snapshot(ctx context.Context, id, ref string, stripEnv []string) (driver.Snapshot, error) {
+	if !d.warm {
+		d.hold()
+	}
+	return d.Fake.Snapshot(ctx, id, ref, stripEnv)
+}
+
+// newBlockedHarness builds a one-session runner over a driver that will block
+// in the named call, with the session already idle.
+func newBlockedHarness(t *testing.T, warm bool) (*idleHarness, *blockingDriver) {
+	t.Helper()
+	clk := newFakeClock()
+	bd := newBlockingDriver(warm)
+	rd := New(bd, "", "", "")
+	rd.now = clk.now
+	h := &idleHarness{t: t, clk: clk, rd: rd, fd: bd.Fake, id: "sess-idle-1", boot: map[string]uint64{}}
+	h.create(h.id)
+	h.run(30*time.Minute, idleStep{at: 0, act: childExits})
+	h.clk.set(10 * time.Hour)
+	return h, bd
+}
+
+// TestWarmSuspendInFlightIsNotStopped: a warm suspend has no state marker of
+// its own — the entry reads "running" for the whole of `docker pause` — so
+// without the in-flight guard a sweep could claim the session mid-pause and
+// turn an operator's pause, which deliberately KEEPS the slot, into a stop
+// that releases it while controld's row says suspended_warm.
+func TestWarmSuspendInFlightIsNotStopped(t *testing.T) {
+	h, bd := newBlockedHarness(t, true)
+	ctx := context.Background()
+
+	done := make(chan error, 1)
+	go func() { done <- h.rd.Op(ctx, h.id, "suspend", true) }()
+	<-bd.entered
+
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 0 {
+		t.Fatalf("stopped %v mid-pause; an operator's warm suspend must not become a stop", stops)
+	}
+	close(bd.release)
+	if err := <-done; err != nil {
+		t.Fatalf("warm suspend: %v", err)
+	}
+	if used := h.used(); used != 1 {
+		t.Fatalf("slots used after the warm suspend = %d, want 1 — a pause holds its slot", used)
+	}
+	if _, state, _ := h.rd.reg.opTarget(h.id); state != "suspended" {
+		t.Fatalf("registry state = %q, want %q", state, "suspended")
+	}
+}
+
+// TestSnapshotInFlightIsNotStopped: `docker commit` runs against a LIVE
+// container and takes minutes. Stopping the session underneath it breaks the
+// commit and the environment cache built on it.
+func TestSnapshotInFlightIsNotStopped(t *testing.T) {
+	h, bd := newBlockedHarness(t, false)
+	ctx := context.Background()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.rd.OpSnapshot(ctx, h.id, "rainier-env:example")
+		done <- err
+	}()
+	<-bd.entered
+
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 0 {
+		t.Fatalf("stopped %v mid-snapshot", stops)
+	}
+	close(bd.release)
+	if err := <-done; err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	// And once the snapshot is done the session is idle again.
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 1 {
+		t.Fatalf("stopped %v after the snapshot finished, want the session", stops)
+	}
+}
+
+// TestAFailedStopDoesNotClobberAConcurrentDelete: a Delete that arrives while
+// `docker stop` is in flight marks the entry "destroying", which is what makes
+// the register goroutine stand down instead of destroying the container a
+// second time and reporting the session dead. A rollback that reset the state
+// unconditionally would wipe that marker.
+func TestAFailedStopDoesNotClobberAConcurrentDelete(t *testing.T) {
+	h := newIdleHarness(t)
+	h.rd.reg.beginColdSuspend(h.id)
+	h.rd.reg.setState(h.id, "destroying") // the Delete that overtook the stop
+
+	h.rd.reg.releaseColdSuspend(h.id)
+	if _, state, _ := h.rd.reg.opTarget(h.id); state != "destroying" {
+		t.Fatalf("state after a failed stop rolled back = %q, want %q", state, "destroying")
+	}
+	h.rd.reg.finishColdSuspend(h.id)
+	if _, state, _ := h.rd.reg.opTarget(h.id); state != "destroying" {
+		t.Fatalf("state after a succeeded stop landed = %q, want %q", state, "destroying")
+	}
+}
+
+// TestFailedBootIsNeverIdleStopped: a session whose boot chain failed has an
+// exited child and no viewer, so it looks exactly like a finished agent. It
+// must be kept anyway — attaching to a failed session to read the log that
+// says why is the whole reason the CLI allows it, and neither a stopped
+// sandbox (no hub) nor a failed row (not resumable) can serve that.
+func TestFailedBootIsNeverIdleStopped(t *testing.T) {
+	for _, kind := range []string{
+		`{"kind":"setup_failed","rc":1,"tail":"boom"}`,
+		`{"kind":"stage_failed","stage":"clone","rc":128,"tail":"nope"}`,
+	} {
+		t.Run(kind, func(t *testing.T) {
+			h := newIdleHarness(t)
+			h.rd.routeControl(h.id, h.boot[h.id], []byte(kind))
+			h.run(30*time.Minute, idleStep{at: 0, act: childExits})
+
+			h.clk.set(1000 * time.Hour)
+			if stops := h.rd.sweepIdle(context.Background(), 30*time.Minute); len(stops) != 0 {
+				t.Fatalf("stopped %v — a session that failed to boot must stay attachable", stops)
+			}
+		})
+	}
+}
+
+// TestRecoveredSessionsAreNeverIdleStopped: after a runnerd restart, Recover
+// rebuilds entries from labelled containers with no child-exit fact — it lived
+// only in the memory of the process that died. Such a session is treated as
+// "child running" and is never stopped, which is the safe direction and the
+// documented one.
+func TestRecoveredSessionsAreNeverIdleStopped(t *testing.T) {
+	ctx := context.Background()
+	fd := driver.NewFake(4)
+	// A container the previous runnerd left behind.
+	if _, err := fd.Create(ctx, driver.Spec{SessionID: "sess-recovered", Image: "img.invalid"}); err != nil {
+		t.Fatalf("seed the container: %v", err)
+	}
+	clk := newFakeClock()
+	rd := New(fd, "", "", "")
+	rd.now = clk.now
+	if err := rd.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if _, ok := rd.reg.get("sess-recovered"); !ok {
+		t.Fatal("the session was not recovered")
+	}
+
+	clk.set(1000 * time.Hour)
+	if stops := rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 0 {
+		t.Fatalf("stopped %v — a recovered session's child is not known to have exited", stops)
 	}
 }

@@ -356,5 +356,40 @@ func TestAnUnboundDialAttachIsTheBytesItAlwaysWas(t *testing.T) {
 	}
 	if back.Mode != "view" || back.Generation != 9 {
 		t.Fatalf("decoded binding = %q at %d, want view at 9", back.Mode, back.Generation)
+// TestCapacityCountsOnTheWire pins the tag names of the two counts that split
+// Used by what a sandbox is doing. Both ends read them off the wire by name,
+// and a Go-side test that goes through the struct would go green against a
+// typo that silently delivered zeros to a real control plane — which is the
+// same "unknown" an old runner sends, so nothing downstream would complain.
+//
+// They are NOT omitempty, deliberately: a runner with nothing idle reports
+// idle_exited 0, and a field that vanished at zero would be indistinguishable
+// on the wire from one that was never sent.
+func TestCapacityCountsOnTheWire(t *testing.T) {
+	b, err := json.Marshal(runner.FromRunner{Type: "announce", Used: 4, Total: 16, Active: 3, IdleExited: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	for _, want := range []string{`"used":4`, `"total":16`, `"active":3`, `"idle_exited":1`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("capacity tags wrong on the wire: want %s in %s", want, got)
+		}
+	}
+	zero, err := json.Marshal(runner.FromRunner{Type: "announce", Total: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"active":0`, `"idle_exited":0`} {
+		if !strings.Contains(string(zero), want) {
+			t.Fatalf("a zero count must still ride the wire: want %s in %s", want, zero)
+		}
+	}
+	var out runner.FromRunner
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Active != 3 || out.IdleExited != 1 {
+		t.Fatalf("round trip mangled the counts: %+v", out)
 	}
 }

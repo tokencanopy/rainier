@@ -127,8 +127,14 @@ type FromRunner struct {
 	// running, IdleExited those that are up with the child gone. Both are
 	// additive to Used/Total and ride every message beside them, so a control
 	// plane can say "16 slots, 3 active, 13 idle" rather than "no free
-	// capacity"; a runner that predates them sends neither and reads as zero,
-	// which is the same "unknown" a control plane has today.
+	// capacity".
+	//
+	// A runner that predates them sends neither, and they read as zero — which
+	// a consumer cannot tell apart from a current runner that is simply
+	// holding nothing. That is a deliberate limit of an additive int, not an
+	// oversight: the pair is only ever meaningful ALONGSIDE Used, and
+	// "active 0, idle_exited 0, used 12" is already legible as "this runner is
+	// not telling me", since twelve slots cannot be held by no sandboxes.
 	//
 	// Active+IdleExited is at most Used and usually less: a warm-suspended
 	// sandbox and one still being created each hold a slot and are in neither

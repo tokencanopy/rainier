@@ -278,7 +278,9 @@ person.
 Two rules it never breaks: a session whose agent is still running is never
 stopped, however long nobody has been watching it (a long unattended build is
 the point), and nothing is ever deleted. A session with any viewer attached is
-not idle, and the timer starts again when the last one leaves.
+not idle, and the timer starts again when the last one leaves. A session whose
+**boot** failed is kept too, however idle: attaching to it to read the log that
+says why is the only thing left to do with it.
 
 Resource-aware admission — memory and disk headroom instead of a fixed count,
 queueing instead of refusing, and one shared idleness signal — is

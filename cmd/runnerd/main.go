@@ -62,12 +62,15 @@ func main() {
 		log.Fatalf("recover: %v", err)
 	}
 
-	// Started after Recover, so the first sweep sees the sessions that
-	// outlived a restart, and before either serving mode takes the
-	// foreground. Recovered sessions are never auto-stopped until they report
-	// a child exit, because the exit that would make them candidates lived
-	// only in the memory of the process that just died — the safe direction,
-	// and a durable activity record is #85's job.
+	// Started after Recover so the sweep cannot race its registry writes, and
+	// before either serving mode takes the foreground.
+	//
+	// Recovered sessions are never auto-stopped until they report a child
+	// exit — the exit that would make them candidates lived only in the memory
+	// of the process that just died. That is the safe direction and it is also
+	// a real gap: a runner restarted onto a box full of finished sessions
+	// reclaims none of them until each is removed by hand. A durable activity
+	// record is #85's job.
 	go s.RunIdleStop(context.Background(), *idleStop)
 
 	log.Printf("runnerd on %s (dial-base %s)", *listen, *dialBase)

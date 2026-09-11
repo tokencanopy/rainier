@@ -17,6 +17,7 @@ package runnerd
 import (
 	"context"
 	"log"
+	"strconv"
 	"time"
 )
 
@@ -25,8 +26,8 @@ import (
 // of when it was due, clamped at both ends: never more than once a second
 // (a timeout of seconds is a test's or a demo's, and a sweep is a lock and a
 // map walk, but there is no reason to spin), and never less than once a
-// minute (a long timeout should not mean a session sits stopped-but-counted
-// for an extra quarter of an hour).
+// minute (a long timeout should not mean a finished session goes on holding a
+// slot for an extra quarter of an hour).
 //
 // The sweep decides against the clock, not against a tick count, so a session
 // is stopped at the first sweep at or after its deadline: up to one interval
@@ -34,6 +35,12 @@ import (
 const (
 	idleSweepMin = time.Second
 	idleSweepMax = time.Minute
+	// idleStopTimeout and idleCapacityTimeout bound the two driver calls one
+	// stop makes. They match the bounds the rest of this package already uses
+	// for a driver call made off a background goroutine: 30s for an operation
+	// on a container, 5s for a capacity reading.
+	idleStopTimeout     = 30 * time.Second
+	idleCapacityTimeout = 5 * time.Second
 )
 
 // idleSweepInterval is how often a timeout of idle is swept for.
@@ -115,29 +122,47 @@ func (s *Server) sweepIdle(ctx context.Context, idle time.Duration) []string {
 // about a stop it dispatched — this one it did not, so the runner says so, in
 // the vocabulary the announce already uses for the same condition. A control
 // plane that has never heard of it logs an unknown state and moves on; the
-// session's row then heals on the next announce.
+// session's row then heals the next time this runner reconnects and
+// re-announces, which is the only time reconciliation runs.
 func (s *Server) stopIdle(ctx context.Context, id string, idle time.Duration) bool {
 	handle, idleFor, ok := s.reg.claimIdle(id, idle, s.now())
 	if !ok {
 		return false
 	}
-	if err := s.coldSuspend(ctx, id, handle); err != nil {
+	// Bounded, like every other driver call this runner makes off a request
+	// goroutine (register's post-hub-death Inspect takes 30s, the agent's
+	// piggybacked Capacity 5s). cmd/runnerd runs this loop on a background
+	// context, and one `docker stop` against a wedged daemon would otherwise
+	// park the single sweep goroutine for good — idle auto-stop silently dead
+	// for the whole runner until it is restarted.
+	stopCtx, cancel := context.WithTimeout(ctx, idleStopTimeout)
+	err := s.coldSuspend(stopCtx, id, handle)
+	cancel()
+	if err != nil {
 		// Rolled back to "running" by coldSuspend, so the next sweep tries
 		// again. No event and no auto-stop log line: nothing happened.
 		log.Printf("session %s: idle auto-stop could not stop the container: %v", id, err)
 		return false
 	}
 	active, idleExited := s.reg.counts()
-	used, total, err := s.drv.Capacity(ctx)
-	free := total - used
-	if err != nil {
+	// One capacity call per session actually stopped — not per sweep tick —
+	// because "what this stop freed" is the number worth logging and it is
+	// only meaningful right after the stop. Bounded for the same reason the
+	// stop is.
+	capCtx, capCancel := context.WithTimeout(ctx, idleCapacityTimeout)
+	used, total, capErr := s.drv.Capacity(capCtx)
+	capCancel()
+	free, slots := strconv.Itoa(total-used), strconv.Itoa(total)
+	if capErr != nil {
 		// The stop itself succeeded; only the count of what it freed is
-		// unavailable. -1 rather than a plausible-looking number, so nobody
-		// reads a guess as a measurement.
-		free = -1
+		// unavailable. Both numbers go out as "unknown" rather than as
+		// plausible-looking ones — a failing Capacity returns a zero used and
+		// whatever total the driver happens to hold, and neither is a
+		// measurement.
+		free, slots = "unknown", "unknown"
 	}
-	log.Printf("runnerd: idle auto-stop session=%s idle=%s slots_free=%d slots_total=%d active=%d idle_exited=%d",
-		id, idleFor.Round(time.Second), free, total, active, idleExited)
+	log.Printf("runnerd: idle auto-stop session=%s idle=%s slots_free=%s slots_total=%s active=%d idle_exited=%d",
+		id, idleFor.Round(time.Second), free, slots, active, idleExited)
 	s.fireEventDetail(id, "suspended_cold", "idle for "+idleFor.Round(time.Second).String())
 	return true
 }
