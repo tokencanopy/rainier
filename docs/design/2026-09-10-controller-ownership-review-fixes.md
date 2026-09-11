@@ -275,3 +275,29 @@ then refused for the life of the attach.
 - Full gates: `make verify`; `go test ./internal/e2e/ -race`;
   `go test -race -count=10` on the repotest race case and on `attachplane`;
   and on Cloud, `make verify` and `make canary` with a real database.
+
+## Sixth review: the state at the END of a write
+
+A sixth independent review of the fifth round's head re-ran the stress set (all
+clean, including the F1, F2 and F3 reproductions), ran 25 mutants (20 caught), and
+found one more instance of the announcement invariant, reached through the one
+gap reading state *inside* the hold does not close: the write itself. A client
+that stopped draining for longer than a handoff's deadline had the notice about
+its displacement give up on its announce hold; the message it then took was the
+one already being written, naming the old state; nothing later corrected it (a
+viewer gets no heartbeat, its stdin is dropped, and a client that believes it
+controls never claims). The fix is in `announceAs`: after the write, re-read, and
+if the state moved under the write, say so as `control_changed`, until it has
+stopped moving. Bounded, because the state only moves forward.
+
+Two smaller slips from the fifth round's own fixes: the client suppressed the
+opening viewer notice on `askedView`, which a reconnect also sets, so a plain
+attach superseded while its network was out came back a viewer and said nothing
+(`neverClaim` is the fact that means "asked to watch"); and the skip for a peer
+that has not been told what it is yet applied only when the handoff had not
+moved it, so a peer granted control and displaced before it finished opening was
+told "somebody took control from you" about control its client never heard it
+had. The skip now asks only whether the peer has been told anything; its opening
+answer reads the state at send time and names the moved state as `attached
+view`. The previous test that pinned the moved peer being told first pinned that
+symptom, and now pins the opening word instead.
