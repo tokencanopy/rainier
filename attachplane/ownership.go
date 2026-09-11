@@ -521,6 +521,24 @@ func (o *ownership) announceAs(ctx context.Context, typ string, won uint64) (str
 		m.Mode = mode
 	}
 	o.send(ctx, m)
+	// What was true when the write began may not be true when it ends. A
+	// client that stopped draining for longer than a handoff's deadline had
+	// the notice about its displacement give up on this hold, and the message
+	// it then takes — the one written above — names the old state. Nothing
+	// later corrects it: a viewer gets no heartbeat, its stdin is dropped at
+	// the plane, and a client that believes it controls sends no claim. So
+	// the correction is made here, by whoever holds the announce hold when
+	// the write ends: re-read, and if the state moved under the write, say
+	// so, until it has stopped moving. Bounded, because every turn needs the
+	// state to have moved again, and it only moves forward.
+	for ctx.Err() == nil {
+		now, at := o.get()
+		if now == mode && at == gen {
+			break
+		}
+		mode, gen = now, at
+		o.send(ctx, terminal.ServerMessage{Type: terminal.TypeControlChanged, Mode: mode, Generation: terminal.GenOf(gen)})
+	}
 	return mode, gen
 }
 
@@ -786,21 +804,6 @@ func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wai
 		// answered the taker, so two screens said "you have control" until
 		// the skipped peer's own wait timed out.
 		was, moved := other.displaceTo(gen)
-		if !moved && !other.spokenTo() {
-			// A peer that has not been told what it is yet, and whose state
-			// this handoff did not move. Its opening `attached` is still
-			// coming and will name exactly what this notice would — while
-			// arriving FIRST would make a courtesy notice that peer's
-			// opening answer, and a client reads its first answer
-			// differently from a later one ("you are watching" against
-			// "somebody took control from you").
-			//
-			// This is not the skip the fix above removed. That one asserted
-			// that a peer's state being current meant its client was
-			// current; this one is about a client that has been told
-			// nothing, and it holds only when there is nothing to tell.
-			continue
-		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -817,6 +820,17 @@ func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wai
 				} else {
 					_ = other.install(ctx, terminal.ModeView, gen)
 				}
+			}
+			if !other.spokenTo() {
+				// A peer that has not been told what it is yet — whether or
+				// not this handoff moved it. Its opening `attached` is still
+				// coming, reads the state at send time, and so names exactly
+				// what this notice would; arriving FIRST would make a courtesy
+				// notice that peer's opening answer, and a client reads its
+				// first answer differently from a later one ("you are
+				// watching" against "somebody took control from you"). Its
+				// sandbox, if it was typing, has already been told above.
+				return
 			}
 			// A viewer stays a viewer; only the number it would claim from
 			// changes, and its client reads that silently. What the notice

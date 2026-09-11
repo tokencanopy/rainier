@@ -2493,9 +2493,12 @@ func TestAnAnnouncementReportsTheStateItFoundWhenItGotTheHold(t *testing.T) {
 // told nothing at all when it opens as the viewer it asked to be, would be
 // told that too.
 //
-// The peer whose state DID move is still announced to, because there the
-// notice is news: that attach was granted control and lost it before it
-// finished opening.
+// That holds whether or not the handoff moved the peer's state. A peer that
+// was granted control and lost it before it finished opening has a client
+// that never heard it had control, so "somebody took control from you" is
+// not news to it; its opening answer reads the state at send time and says
+// `attached view` at the new generation, which is the true first word. Its
+// SANDBOX is still told at once — the install does not wait for the client.
 func TestAPeerThatHasNotBeenToldWhatItIsIsNotToldAboutSomebodyElseFirst(t *testing.T) {
 	p, _, _ := newTestPlane(t, Options{})
 	winner := &ownership{plane: p, session: "sess_example", announce: make(chan struct{}, 1)}
@@ -2521,11 +2524,24 @@ func TestAPeerThatHasNotBeenToldWhatItIsIsNotToldAboutSomebodyElseFirst(t *testi
 			m.Type, m.Mode, m.Generation)
 	default:
 	}
-	// The one the handoff actually moved is told, exactly as before.
-	if m := behind.nextServerMsg(t); m.Type != terminal.TypeControlChanged ||
-		m.Generation.Value() != 4 {
-		t.Fatalf("the displaced peer was sent %q at %q, want control_changed at 4",
-			m.Type, m.Generation)
+	// The one the handoff actually moved is not told first either: its client
+	// has heard nothing, so there is nothing to correct. Its opening answer,
+	// when it comes, names the state the handoff left it in.
+	select {
+	case m := <-behind.out:
+		t.Fatalf("a moved attach that has not been told what it is was sent %q %s at %q first; "+
+			"its opening answer is still coming and names the moved state",
+			m.Type, m.Mode, m.Generation)
+	default:
+	}
+	if m, g := older.get(); m != terminal.ModeView || g != 4 {
+		t.Fatalf("the moved peer's state is %s@%d, want view@4: the fence must not wait for the client", m, g)
+	}
+	older.announceAs(context.Background(), terminal.TypeAttached, 0)
+	if m := behind.nextServerMsg(t); m.Type != terminal.TypeAttached ||
+		m.Mode != terminal.ModeView || m.Generation.Value() != 4 {
+		t.Fatalf("the moved peer's opening answer was %q %s at %q, want attached view at 4",
+			m.Type, m.Mode, m.Generation)
 	}
 	// And once a client HAS been told something, the courtesy notice is owed
 	// to it again — which is the whole of the fix this guards the edge of.
