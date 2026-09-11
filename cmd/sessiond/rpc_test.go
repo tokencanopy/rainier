@@ -392,10 +392,17 @@ func TestRPCRepliesGoBackOnTheArrivingConnection(t *testing.T) {
 
 // recordingExecs is the exec runner as the suspend path sees it.
 type recordingExecs struct {
-	mu     sync.Mutex
-	budget time.Duration
-	calls  int
-	left   int
+	mu       sync.Mutex
+	budget   time.Duration
+	calls    int
+	killAlls int
+	left     int
+}
+
+func (r *recordingExecs) KillAll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.killAlls++
 }
 
 func (r *recordingExecs) KillAllAndWait(budget time.Duration) int {
@@ -544,4 +551,48 @@ func TestAPanickingEventHandlerDoesNotTakeTheSessionDown(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.OnControl(b) // must return rather than unwind the process
+}
+
+// TestAShutdownSignalEndsEveryExec is the OTHER half of the lifetime rule, and
+// the half nothing was checking: a cold stop and a destroy both arrive as a
+// SIGTERM, and deleting execs.KillAll() from that handler left the whole tree
+// green — the end-to-end test reached into the runner's KillAll directly and
+// never exercised the wiring.
+func TestAShutdownSignalEndsEveryExec(t *testing.T) {
+	execs := &recordingExecs{}
+	var order []string
+	onShutdownSignal(
+		func() { order = append(order, "stop-watching") },
+		func() { order = append(order, "stop-agent") },
+		execs,
+		func() { order = append(order, "close-agents") },
+	)
+	execs.mu.Lock()
+	killAlls := execs.killAlls
+	execs.mu.Unlock()
+	if killAlls != 1 {
+		t.Fatalf("a shutdown signal killed the execs %d times, want exactly once — "+
+			"a detached exec outlives its caller, never its session", killAlls)
+	}
+	want := []string{"stop-watching", "stop-agent", "close-agents"}
+	if len(order) != len(want) {
+		t.Fatalf("shutdown ran %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("shutdown ran %v, want %v", order, want)
+		}
+	}
+}
+
+// TestAShutdownSignalWithNoAgentSyncIsStillAShutdown: a session created with
+// no agent manifest has no sync at all, and its execs still have to go.
+func TestAShutdownSignalWithNoAgentSyncIsStillAShutdown(t *testing.T) {
+	execs := &recordingExecs{}
+	onShutdownSignal(func() {}, func() {}, execs, nil)
+	execs.mu.Lock()
+	defer execs.mu.Unlock()
+	if execs.killAlls != 1 {
+		t.Fatalf("killAlls = %d, want 1", execs.killAlls)
+	}
 }

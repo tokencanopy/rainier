@@ -1530,3 +1530,48 @@ func TestPostEOFStdinCannotKillAHealthyCommand(t *testing.T) {
 		t.Fatalf("the child received %q, want only the bytes sent before the EOF", got)
 	}
 }
+
+// TestADetachedExecReturnsItsSlotWhenItEnds is the mutant that four
+// SUCCESSFUL runs would have exposed and no test did: deleting the goroutine
+// that waits out a detached process and releases its slot left the whole tree
+// green, and a session that ran four detached commands could never run
+// another for as long as it lived — with the sentence for the refusal naming
+// the wrong cap.
+func TestADetachedExecReturnsItsSlotWhenItEnds(t *testing.T) {
+	start := newFakeStarter()
+	r, root := testRunner(t, start.start)
+
+	runOneDetached := func(name string) {
+		t.Helper()
+		spec := withTool(t, r, "tool")
+		spec.Detach, spec.LogPath = true, name
+		if err := os.WriteFile(filepath.Join(root, name), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		a := r.OpenExec(spec)
+		p := start.await(t)
+		msgs := drainAttachment(t, a)
+		if len(msgs) != 1 || msgs[0].Type != terminal.TypeExecStarted {
+			t.Fatalf("a detached exec answered %v", types(msgs))
+		}
+		// It runs, and then it ends — the ordinary shape of a detached run.
+		p.exit(Status{Code: 0})
+	}
+
+	// MaxDetached of them, each one finishing.
+	for i := 0; i < MaxDetached; i++ {
+		runOneDetached(fmt.Sprintf("run-%d.log", i))
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for r.LiveCount() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d detached exec(s) that have ENDED still hold their slots; "+
+				"this session can never run another", r.LiveCount())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// And the next one is accepted rather than refused.
+	runOneDetached("run-next.log")
+}

@@ -83,13 +83,7 @@ func runExec(args []string) error {
 		return err
 	}
 
-	o := execio.Options{Spec: spec, Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr}
-	if jsonOut {
-		// §6.2: a --json document is the only thing on stdout, so the
-		// command's own bytes move. Both streams go to stderr as they
-		// arrive, and stdout carries the document after the command exits.
-		o.Stdout, o.Stderr = os.Stderr, os.Stderr
-	}
+	o := execStreams(spec, jsonOut, os.Stdin, os.Stdout, os.Stderr)
 	o.Header = http.Header{"Authorization": {"Bearer " + cli.NewClient(cfg).Token}}
 	if active, ok := cfg.Active(); ok && active.Workspace != "" {
 		// The exec stream is scoped like every other request on a hosted
@@ -102,6 +96,24 @@ func runExec(args []string) error {
 		return execDialFailure(err, ref)
 	}
 	return reportExec(cfg, id, spec, res, jsonOut)
+}
+
+// execStreams is the stream rule, on its own so it can be checked without a
+// server to run a command on.
+//
+// It is the whole reason a script can use `rainier exec`: the command's stdout
+// is rainier's stdout, byte for byte, and everything RAINIER says goes to
+// stderr. Under --json that has to bend exactly once — §6.2 says a --json
+// document is the ONLY thing on stdout — so the command's own bytes move to
+// stderr as they arrive and stdout carries the document after the command
+// exits. A --json run that let the command's stdout through would interleave
+// arbitrary bytes into a document a caller is parsing.
+func execStreams(spec runner.ExecSpec, jsonOut bool, stdin, stdout, stderr *os.File) execio.Options {
+	o := execio.Options{Spec: spec, Stdin: stdin, Stdout: stdout, Stderr: stderr}
+	if jsonOut {
+		o.Stdout, o.Stderr = stderr, stderr
+	}
+	return o
 }
 
 // parseExecArgs splits `<session> [flags] -- <command>`.

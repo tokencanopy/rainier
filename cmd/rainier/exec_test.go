@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -323,3 +324,31 @@ func TestExecJSONSignalIsExclusiveWithTheCode(t *testing.T) {
 // above never reach one, and a stray request would fail loudly rather than
 // touching anything real.
 func testConfigForExec() cli.Config { return cli.Config{} }
+
+// TestExecJSONMovesTheCommandsOwnOutputOffStdout is §6.2's rule, which only
+// execJSON's SHAPE was covered by: deleting the one line that swaps the
+// streams left ./cmd/rainier and ./internal/e2e green, so nothing caught a
+// --json run mixing the command's stdout into the document's stream. A caller
+// parsing that stdout would be parsing a document with arbitrary bytes in
+// front of it.
+func TestExecJSONMovesTheCommandsOwnOutputOffStdout(t *testing.T) {
+	spec := runner.ExecSpec{Argv: []string{"cat", "huge.log"}}
+
+	plain := execStreams(spec, false, os.Stdin, os.Stdout, os.Stderr)
+	if plain.Stdout != os.Stdout || plain.Stderr != os.Stderr {
+		t.Fatalf("without --json the command's streams must be rainier's own, "+
+			"got stdout=%v stderr=%v", plain.Stdout, plain.Stderr)
+	}
+
+	doc := execStreams(spec, true, os.Stdin, os.Stdout, os.Stderr)
+	if doc.Stdout != os.Stderr {
+		t.Fatal("--json left the command's stdout on rainier's stdout; " +
+			"the document is the only thing that may be there")
+	}
+	if doc.Stderr != os.Stderr {
+		t.Fatalf("--json moved the command's stderr somewhere else: %v", doc.Stderr)
+	}
+	if doc.Stdin != os.Stdin {
+		t.Fatal("--json changed where the command's input comes from")
+	}
+}

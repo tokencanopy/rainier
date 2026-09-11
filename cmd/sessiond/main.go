@@ -240,24 +240,11 @@ func main() {
 	signal.Notify(term, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-term
-		stopWatching()
-		// Graceful: ask the agent to exit; the exit path closes viewers and the
-		// process ends when the child is reaped. Give it a moment, then hard-exit.
-		s.Stop()
-		// And every exec with it, DETACHED ones included. This is the bound on
-		// a detached exec's life: it outlives its caller, never its session.
-		// A suspend, a stop and a destroy all arrive here, which is why it is
-		// this path rather than three.
-		execs.KillAll()
-		// The last thing an agent wrote is usually the thing worth keeping — a
-		// login completed seconds before the session was torn down — and the
-		// sync's two-second tick must not be what decides whether it survives.
-		// Placed after Stop so the child already has its signal while this
-		// runs, and bounded by the RPC's own timeout so a control plane that
-		// has gone away cannot hold the shutdown open.
+		var closeAgents func()
 		if agents != nil {
-			agents.close()
+			closeAgents = agents.close
 		}
+		onShutdownSignal(stopWatching, s.Stop, execs, closeAgents)
 		select {
 		case <-s.Exited():
 		case <-time.After(5 * time.Second):
@@ -362,12 +349,44 @@ func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, e
 // would freeze the container with the escalation still on a timer that the
 // freezer cgroup then stops. Every session that is running no exec at all —
 // which is nearly every stop — acknowledges immediately and pays none of it.
+// onShutdownSignal is what a SIGTERM means to this sessiond, on its own so
+// that what it does is checkable rather than only readable.
+//
+// Graceful: ask the agent to exit — the exit path closes viewers and the
+// process ends when the child is reaped — and end every exec with it,
+// DETACHED ones included. That is the bound on a detached exec's life: it
+// outlives its caller, never its session. A cold stop and a destroy both
+// arrive here; the WARM stop, which delivers no signal at all, arrives at
+// quiesceExecs instead.
+//
+// KillAll rather than KillAllAndWait: the caller below already bounds the
+// whole shutdown at five seconds, and a container being stopped has a SIGKILL
+// coming for anything still running. The warm path is the one that has to
+// wait, because a frozen container's processes are not going anywhere.
+//
+// The agent sync closes last. The last thing an agent wrote is usually the
+// thing worth keeping — a login completed seconds before the session was torn
+// down — and the sync's two-second tick must not be what decides whether it
+// survives; placing it after Stop means the child already has its signal
+// while this runs.
+func onShutdownSignal(stopWatching func(), stop func(), execs execKiller, closeAgents func()) {
+	stopWatching()
+	stop()
+	execs.KillAll()
+	if closeAgents != nil {
+		closeAgents()
+	}
+}
+
 const execQuiesceBudget = 6 * time.Second
 
 // execKiller is the exec runner as the suspend path needs it, named as an
 // interface so the wiring below is testable without a sandbox to have
 // processes in.
 type execKiller interface {
+	// KillAll ends every exec and returns as soon as each has been signalled.
+	KillAll()
+	// KillAllAndWait is KillAll plus the wait for the processes to be GONE.
 	KillAllAndWait(budget time.Duration) int
 }
 

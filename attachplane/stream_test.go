@@ -265,3 +265,43 @@ func TestALargeFrameIsGivenTimeInProportionToItself(t *testing.T) {
 			payload, big, scaled)
 	}
 }
+
+// TestExecClientStreamIsOnTheExecBudget is the mitigation finding 8's plane
+// half rests on, and until now `grep -rn 'ExecClientStream|defaultExecWriteBase'`
+// found zero test references: swapping ExecClientStream for ClientStream
+// survived the whole tree.
+//
+// The budgets differ for a reason about the SESSION rather than about the
+// exec. Every attachment on one session shares one relay conn and one writer,
+// so a peer that has stopped reading backs that writer up and the agent's
+// terminal waits behind it. A minute is right for a person watching a screen —
+// being disconnected mid-scrollback costs them their session — and twenty
+// seconds is right for a script that can simply run the command again.
+func TestExecClientStreamIsOnTheExecBudget(t *testing.T) {
+	drain := make(chan struct{})
+	defer close(drain)
+	_, conn := clientPair(t, drain, defaultClientWriteBase, defaultClientWriteRate)
+
+	es, ok := ExecClientStream(conn).(wsTerminalStream)
+	if !ok {
+		t.Fatal("ExecClientStream did not return this package's own stream")
+	}
+	as, ok := ClientStream(conn).(wsTerminalStream)
+	if !ok {
+		t.Fatal("ClientStream did not return this package's own stream")
+	}
+	if es.base != defaultExecWriteBase {
+		t.Fatalf("an exec caller's write base is %s, want %s", es.base, defaultExecWriteBase)
+	}
+	if as.base != defaultClientWriteBase {
+		t.Fatalf("an attach client's write base is %s, want %s", as.base, defaultClientWriteBase)
+	}
+	if es.base == as.base {
+		t.Fatal("an exec caller and a terminal viewer are on the same write budget; " +
+			"the whole point of the exec stream is that they are not")
+	}
+	if es.rate != as.rate {
+		t.Fatalf("the per-byte rate differs (%d vs %d); only the BASE is shorter, so a "+
+			"caller making steady progress on a large frame is unaffected", es.rate, as.rate)
+	}
+}
