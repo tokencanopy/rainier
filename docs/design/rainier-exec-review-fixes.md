@@ -135,27 +135,38 @@ draining at a couple of kilobytes a second never trips the plane's 20-second
 budget and holds that writer indefinitely; behind it, the agent's terminal
 output and the session RPC wait.
 
-`connWriter.writeWithin(f, d)` is the bound. Two things are bounded, and the
-difference between them is worth stating because the outcomes differ:
+`connWriter.writeWithin` is the bound — two of them, because they answer
+different failures and only one is free:
 
-- **Acquiring the writer.** If another writer holds it past the budget, this
-  exec is dropped and closed and the conn is untouched.
-- **The write itself.** A WebSocket frame cannot be abandoned half-written, so
-  the transport's own answer to an expired write deadline is to close the conn
-  (coder/websocket `setupWriteTimeout`). That is the honest bound: the
-  alternative is an unbounded freeze of everything else on the session.
-  sessiond's `dialLoop` redials within its one-second backoff, so the cost is a
-  reconnect rather than a session.
+- **Acquiring the writer**, at thirty seconds. Nothing has been written when it
+  expires, so the conn is untouched and the cost is this exec alone. It is
+  longer than the plane's own per-frame budget on purpose: an exec must not
+  lose its socket merely because some other peer on the conn is being dropped.
+- **The write itself**, at sixty seconds. A WebSocket frame cannot be abandoned
+  half-written, so the transport's answer to an expired write context is to
+  close the conn — which is the right answer only for a conn that is not moving
+  at all, where the plane's budget has already come and gone and nothing will
+  make `ServeSession`'s `Read` fail. It is set an order of magnitude above what
+  a slow peer can reach: one `readChunk` is 58,320 wire bytes after **two**
+  base64 hops (43,724 as `ServerMessage` JSON, then base64 again inside
+  `relay.Frame`), so sixty seconds is under a kilobyte a second.
 
-The budget is five seconds per frame, which is a floor of ≈8.7 KB/s on the
-largest frame the exec path produces (a 32 KiB `readChunk` is 43,692 wire
-bytes after two base64 hops). It is deliberately far below any link a person
-runs `rainier exec` over and far above the ~2 KB/s the review measured a stall
-at. A dropped exec is a clean 125 with a sentence, never a truncated stream.
+A first attempt at this used **one** five-second budget shared between the wait
+and the write, and it was worse than the defect: a caller draining at 64 KiB/s
+— a rate the plane explicitly blesses — tore the session's conn down every five
+seconds, and a frame that spent most of the budget waiting got the remainder to
+write, so contention turned directly into teardown.
 
-This remains a mitigation and not the cure — the cure is a writer per
-attachment — but it is now an actual bound, which is what the feature's open
-question 4 claimed and did not have.
+A dropped exec is TOLD. The forwarder sends its `FrameClose` before returning,
+on the acquire path especially: nothing was written, so the conn is alive and
+nothing else will ever close that client — the hub's cascade fires only on conn
+death and the plane's budget only on a write it never gets to make. Without it
+the CLI waits forever for an exit status that is not coming.
+
+What this does **not** do is take the writer away from a peer holding it inside
+`conn.Write`; nothing can, short of closing the conn. The wedge itself is
+bounded by the plane dropping the slow caller. The cure remains a writer per
+attachment, which is the feature's open question 4.
 
 ### `MaxDetached` gets its own word (finding 12)
 

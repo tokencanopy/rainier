@@ -28,19 +28,22 @@ type connWriter struct {
 	sem  chan struct{}
 	conn Conn
 	ctx  context.Context
-	// execBudget is what an exec frame gets (see execWriteBudget). It is a
-	// field rather than a constant read at the call site so a test can drive
-	// the dropped-consumer path in milliseconds instead of in five seconds,
-	// and so it cannot become a package variable two tests write.
-	execBudget time.Duration
+	// execWait and execDeadline are what an exec frame gets (see
+	// execWriterWait and execWriteDeadline). They are fields rather than
+	// constants read at the call site so a test can drive both paths in
+	// milliseconds instead of in a minute, and so neither can become a
+	// package variable two tests write.
+	execWait     time.Duration
+	execDeadline time.Duration
 }
 
 func newConnWriter(ctx context.Context, conn Conn) *connWriter {
-	return newConnWriterBudget(ctx, conn, execWriteBudget)
+	return newConnWriterBudget(ctx, conn, execWriterWait, execWriteDeadline)
 }
 
-func newConnWriterBudget(ctx context.Context, conn Conn, exec time.Duration) *connWriter {
-	return &connWriter{conn: conn, ctx: ctx, sem: make(chan struct{}, 1), execBudget: exec}
+func newConnWriterBudget(ctx context.Context, conn Conn, wait, deadline time.Duration) *connWriter {
+	return &connWriter{conn: conn, ctx: ctx, sem: make(chan struct{}, 1),
+		execWait: wait, execDeadline: deadline}
 }
 
 func (w *connWriter) write(f Frame) error {
@@ -57,61 +60,84 @@ func (w *connWriter) write(f Frame) error {
 	return w.conn.Write(w.ctx, b)
 }
 
-// execWriteBudget bounds ONE exec frame's trip onto this conn.
+// The two bounds on an exec frame's trip onto this conn. They are different
+// numbers because they answer different failures, and only the first is free.
 //
-// Without it an exec forwarder's write takes the shared writer and uses the
-// ServeSession context, which lives as long as the session: a caller draining
-// at a couple of kilobytes a second never trips the plane's own twenty-second
-// budget (each individual write completes inside it) and holds this writer
-// indefinitely, and behind it the agent's terminal output and the session RPC
-// wait. The plane's budget is a bound on a caller that takes NOTHING; this is
-// the bound on one that takes almost nothing, which is the case that actually
-// stalls a session.
+// WHY THERE ARE BOUNDS AT ALL. Every attachment on one session shares this
+// writer, so an exec forwarder that takes it and waits on the network holds
+// the agent's terminal output and the session RPC behind it. The plane already
+// drops an exec CALLER that is too slow — `attachplane`'s exec stream gives one
+// frame 20s plus a byte allowance at 64 KiB/s, so a caller draining below about
+// 2.8 KB/s loses its socket in roughly twenty seconds, which unwedges this hop.
+// What the plane cannot do is bound the SANDBOX side of the same wedge, and
+// that is what these two are for.
 //
-// Five seconds, against the largest frame this path produces — a 32 KiB
-// readChunk is 43,692 wire bytes after two base64 hops — is a floor of about
-// 8.7 KB/s. That is far below any link a person runs `rainier exec` over and
-// far above the rate a stall is measured at. A caller under it loses its exec
-// with a clean "no exit status" (125) and a sentence, never a truncated
-// stream, and can run the command again.
-const execWriteBudget = 5 * time.Second
+//   - execWriterWait bounds ACQUIRING the writer. Nothing has been written when
+//     it expires, so the conn is untouched and only this exec is dropped. It is
+//     deliberately longer than the plane's own per-frame budget: an exec must
+//     not lose its socket merely because some other peer on this conn is in the
+//     process of being dropped.
+//   - execWriteDeadline bounds the WRITE, and it is a different kind of bound
+//     with a much larger cost, so it is set far above anything a merely slow
+//     peer can reach. A WebSocket frame cannot be abandoned half-written, so
+//     the transport's answer to an expired write context is to close the conn
+//     (coder/websocket's setupWriteTimeout). That is the right answer for the
+//     case it is set for — a conn that is not moving at all, where the plane's
+//     own budget has already come and gone and nothing will ever make
+//     ServeSession's Read fail — because closing it is what makes sessiond
+//     redial. It is the wrong answer for a slow caller, which is why an earlier
+//     version of this bound (five seconds, shared between the wait and the
+//     write) was a defect: a caller draining at 64 KiB/s, a rate the plane
+//     explicitly blesses, tore the session's conn down every five seconds.
+//
+// The arithmetic, for the record, because it was wrong here before: one
+// readChunk is 32 KiB of output; as ServerMessage JSON that is 43,724 bytes,
+// and relay.Frame base64s the payload a SECOND time, so 58,320 bytes reach the
+// wire. Sixty seconds against that is under a kilobyte a second — an order of
+// magnitude below the rate at which the plane has already given up on the
+// caller.
+const (
+	execWriterWait    = 30 * time.Second
+	execWriteDeadline = 60 * time.Second
+)
 
 // errExecWriteBudget is an exec frame that could not be put on the wire inside
-// that budget. It is this exec's consumer being gone in every way that matters.
+// those bounds. It is this exec's consumer being gone in every way that matters.
 var errExecWriteBudget = errors.New("relay: the exec's frame missed its write budget")
 
-// writeWithin is write with a deadline of its own, for the one caller that
-// must not be able to hold this conn's writer indefinitely.
+// writeWithin is write under those two bounds, for the one caller that must
+// not be able to park on this conn's writer forever.
 //
-// Two things are bounded and their outcomes differ, which is worth stating
-// because only one of them is free:
-//
-//   - ACQUIRING the writer. Somebody else is mid-write and has been for longer
-//     than this budget. Nothing has been written, so the conn is untouched and
-//     only this exec is dropped.
-//   - The write ITSELF. A WebSocket frame cannot be abandoned half-written, so
-//     the transport's answer to an expired write deadline is to close the conn
-//     (coder/websocket's setupWriteTimeout). That is the honest bound: the
-//     alternative is an unbounded freeze of everything else on the session,
-//     and sessiond's dial loop redials within its one-second backoff.
-func (w *connWriter) writeWithin(f Frame, d time.Duration) error {
+// The wait and the write get SEPARATE budgets, not one shared deadline. A
+// shared one converts contention into conn teardown: a frame that spent
+// twenty-nine seconds waiting for the writer would get one second to write it,
+// and an expired write deadline closes the conn — so the destructive outcome
+// would become more likely exactly under the load these bounds exist for.
+func (w *connWriter) writeWithin(f Frame, wait, deadline time.Duration) error {
 	b, err := Encode(f)
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(w.ctx, d)
-	defer cancel()
+	waitCtx, cancelWait := context.WithTimeout(w.ctx, wait)
 	select {
 	case w.sem <- struct{}{}:
-	case <-ctx.Done():
+		cancelWait()
+	case <-waitCtx.Done():
+		cancelWait()
 		if w.ctx.Err() != nil {
 			return w.ctx.Err()
 		}
+		// Somebody else has held the writer past this budget. Nothing of this
+		// frame was written, so the conn is untouched and the cost is this
+		// exec alone.
 		return errExecWriteBudget
 	}
 	defer func() { <-w.sem }()
-	if err := w.conn.Write(ctx, b); err != nil {
-		if ctx.Err() != nil && w.ctx.Err() == nil {
+
+	writeCtx, cancel := context.WithTimeout(w.ctx, deadline)
+	defer cancel()
+	if err := w.conn.Write(writeCtx, b); err != nil {
+		if writeCtx.Err() != nil && w.ctx.Err() == nil {
 			return errExecWriteBudget
 		}
 		return err
@@ -294,11 +320,22 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 						// draining would otherwise stall a person's terminal
 						// behind it. See execWriteBudget.
 						if w.writeWithin(Frame{Type: FrameServer, AttachID: id, Payload: p},
-							w.execBudget) != nil {
+							w.execWait, w.execDeadline) != nil {
 							mu.Lock()
 							delete(execs, id)
 							mu.Unlock()
 							a.Close()
+							// And TELL the caller, which is not optional on
+							// the acquire path: nothing was written, so the
+							// conn is alive, and nothing else will ever close
+							// this client — the hub's cascade fires only on
+							// conn death and the plane's own budget only on a
+							// write it never gets to make. Without this the
+							// CLI waits forever for an exit status that is not
+							// coming, which is the one thing exec may not do.
+							// Harmless when the conn really is dead.
+							w.writeWithin(Frame{Type: FrameClose, AttachID: id},
+								w.execWait, w.execDeadline)
 							return
 						}
 					}

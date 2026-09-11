@@ -447,75 +447,162 @@ func (c *wedgingConn) count() int {
 	return len(c.written)
 }
 
-// TestAWedgedExecWriteDoesNotHoldTheSessionsWriter is finding 8, as a
-// measurement rather than a claim.
-//
-// Every attachment on one session shares one relay conn and one writer on it.
-// An exec forwarder's write took that writer and used the ServeSession
-// context, which lives as long as the session — so a caller draining at a
-// couple of kilobytes a second never tripped the plane's twenty-second budget
-// and held the writer indefinitely, and behind it a viewer's snapshot and the
-// session RPC waited. This asserts they get out.
-func TestAWedgedExecWriteDoesNotHoldTheSessionsWriter(t *testing.T) {
-	c := newWedgingConn()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	w := newConnWriter(ctx, c)
-
-	execErr := make(chan error, 1)
-	go func() {
-		execErr <- w.writeWithin(Frame{Type: FrameServer, AttachID: 1,
-			Payload: []byte(`{"type":"exec_stdout"}`)}, 150*time.Millisecond)
-	}()
-	<-c.entered // the exec's frame is in the conn and not coming out
-
-	// The session's own writer — a viewer's screen, or a ControlSender — asks
-	// for its turn while the exec is wedged.
-	termErr := make(chan error, 1)
-	go func() {
-		termErr <- (&ControlSender{w: w}).Send([]byte(`{"kind":"setup_done"}`))
-	}()
-
-	if err := <-execErr; err == nil {
-		t.Fatal("a wedged exec write reported success")
-	}
-	select {
-	case err := <-termErr:
-		if err != nil {
-			t.Fatalf("the session's own control event failed: %v", err)
+// hasFrame reports whether a frame of this type and id has reached the wire.
+func (c *wedgingConn) hasFrame(typ FrameType, id uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, raw := range c.written {
+		if f, err := Decode(raw); err == nil && f.Type == typ && f.AttachID == id {
+			return true
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("a wedged exec caller still holds the session's writer; " +
-			"every viewer and the session RPC are behind it")
 	}
-	if c.count() != 1 {
-		t.Fatalf("%d frames reached the wire, want only the control event — "+
-			"the abandoned exec frame must not be written after its budget", c.count())
-	}
+	return false
 }
 
-// TestWriteWithinDoesNotWaitOutAnotherWritersStall is the other half of the
-// bound: an exec that cannot even get the writer inside its budget is dropped
-// with the conn untouched, because nothing of its frame was ever written.
-func TestWriteWithinDoesNotWaitOutAnotherWritersStall(t *testing.T) {
+// TestAWedgedExecCallerDoesNotParkOnTheWriterForever is the bound that is
+// actually free: an exec that cannot get a turn at the shared writer inside
+// its wait budget is dropped, with NOTHING written and therefore the conn
+// untouched.
+//
+// It is deliberately not named "does not stall the session's writer", which an
+// earlier version of this test claimed. It cannot claim that: the peer holding
+// the writer is holding it in conn.Write, and the only way to take it away is
+// to close the conn — which would stall the session a great deal more. What
+// bounds the wedge itself is the plane's own per-frame budget for an exec
+// caller, which drops the caller and unwedges this hop; see execWriterWait.
+func TestAWedgedExecCallerDoesNotParkOnTheWriterForever(t *testing.T) {
 	c := newWedgingConn()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	w := newConnWriter(ctx, c)
 
+	// Somebody else takes the writer and does not give it back.
 	go func() { _ = w.write(Frame{Type: FrameControl, Payload: []byte(`{"kind":"x"}`)}) }()
 	<-c.entered
 
 	start := time.Now()
 	err := w.writeWithin(Frame{Type: FrameServer, AttachID: 1, Payload: []byte(`{}`)},
-		100*time.Millisecond)
+		100*time.Millisecond, time.Minute)
+	elapsed := time.Since(start)
 	if err == nil {
-		t.Fatal("writeWithin reported success while another writer held the conn")
+		t.Fatal("an exec frame reported success while another writer held the conn")
 	}
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Fatalf("writeWithin waited %s for a writer it was given 100ms to get", elapsed)
+	if elapsed > 3*time.Second {
+		t.Fatalf("the exec waited %s for a writer it was given 100ms to get", elapsed)
+	}
+	// Nothing of it was written, which is what keeps the conn out of it.
+	if n := c.count(); n != 0 {
+		t.Fatalf("%d frames reached the wire; a frame that missed the WAIT must not "+
+			"be written at all", n)
 	}
 	close(c.release)
+}
+
+// TestTheWaitAndTheWriteHaveSeparateBudgets. One shared deadline converts
+// contention into conn teardown: a frame that spent nearly all of it waiting
+// for the writer would get the remainder to write, and an expired WRITE
+// deadline closes the whole conn — so the destructive outcome would become
+// more likely exactly under the load these bounds exist for.
+func TestTheWaitAndTheWriteHaveSeparateBudgets(t *testing.T) {
+	if execWriteDeadline <= execWriterWait {
+		t.Fatalf("the write deadline (%s) must be longer than the wait (%s): the wait "+
+			"costs one exec, the write costs the conn", execWriteDeadline, execWriterWait)
+	}
+	// And the wait must be longer than the budget the PLANE gives an exec
+	// caller (20s plus a byte allowance), or a healthy exec would be dropped
+	// merely because some other peer is in the process of being dropped.
+	if execWriterWait < 25*time.Second {
+		t.Fatalf("execWriterWait is %s; it must outlast the plane's own per-frame "+
+			"budget for an exec caller", execWriterWait)
+	}
+
+	c := newWedgingConn()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// A generous wait and a short write deadline: the frame gets the writer at
+	// once and then spends its own budget in the conn.
+	w := newConnWriterBudget(ctx, c, 5*time.Second, 100*time.Millisecond)
+	start := time.Now()
+	err := w.writeWithin(Frame{Type: FrameServer, AttachID: 1, Payload: []byte(`{}`)},
+		w.execWait, w.execDeadline)
+	if err == nil {
+		t.Fatal("a write that never completed reported success")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("the write took %s; it was given 100ms and must not spend the WAIT "+
+			"budget as well", elapsed)
+	}
+	close(c.release)
+}
+
+// TestADroppedExecTellsItsCaller is the other half of the drop, and the half
+// that was missing.
+//
+// On the WAIT path nothing has been written, so the conn is alive — and
+// nothing else in the system will ever close that client: the hub's cascade
+// fires only on conn death, and the plane's own budget only on a write it
+// never gets to make. Without a FrameClose the CLI blocks forever on an exec
+// the sandbox has already killed, which is the one thing exec may not do (the
+// design promises a clean 125 with a sentence, never a stream that simply
+// stops).
+func TestADroppedExecTellsItsCaller(t *testing.T) {
+	proc := newSilentProc()
+	s, err := session.New(
+		session.Config{Argv: []string{"agent"}, Cols: 80, Rows: 24,
+			LogPath: filepath.Join(t.TempDir(), "s.log")},
+		func(argv []string, cols, rows int, onOutput func([]byte)) (session.Proc, error) {
+			return proc, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A conn whose FIRST write wedges — which is what makes the exec's frame
+	// miss the WAIT — and which passes everything after it, so the conn is
+	// demonstrably alive when the FrameClose has to go out.
+	c := newWedgingConn()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ex := newFakeExecer()
+	w := newConnWriterBudget(ctx, c, 150*time.Millisecond, 10*time.Second)
+	go serveSession(ctx, c, s, w, nil, ex)
+
+	open, err := Encode(Frame{Type: FrameOpen, AttachID: 1, Kind: runner.KindExec,
+		Exec: &runner.ExecSpec{Argv: []string{"true"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.in <- open
+	var a *fakeExecAttachment
+	select {
+	case a = <-ex.open:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no exec was opened")
+	}
+
+	// Somebody else takes the writer and wedges it, so the exec's frame
+	// cannot get a turn inside its 150ms wait.
+	go func() { _ = w.write(Frame{Type: FrameControl, Payload: []byte(`{"kind":"x"}`)}) }()
+	<-c.entered
+	a.msgs <- terminal.ServerMessage{Type: terminal.TypeExecStdout, Data: []byte("x")}
+
+	select {
+	case <-a.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an exec that missed its write budget was left running")
+	}
+	// The writer comes back, and the caller must be told.
+	close(c.release)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if c.hasFrame(FrameClose, 1) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the dropped exec's caller was never sent a FrameClose on a LIVE " +
+				"conn; its CLI waits forever for an exit status that is not coming")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // TestASlowExecConsumerIsDroppedAndClosed is the wiring the budget exists for.
@@ -537,7 +624,7 @@ func TestASlowExecConsumerIsDroppedAndClosed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ex := newFakeExecer()
-	w := newConnWriterBudget(ctx, c, 150*time.Millisecond)
+	w := newConnWriterBudget(ctx, c, 150*time.Millisecond, 150*time.Millisecond)
 	go serveSession(ctx, c, s, w, nil, ex)
 
 	open, err := Encode(Frame{Type: FrameOpen, AttachID: 1, Kind: runner.KindExec,

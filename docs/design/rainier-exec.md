@@ -718,26 +718,38 @@ it (`relay.connWriter`), so an exec caller that has stopped reading eventually
 backs that writer up — and while it is backed up, the agent's terminal output
 and the session RPC wait behind it.
 
-Two things bound it, and only the second is a bound on the case that actually
-happens. At the PLANE, an exec caller gets a shorter write budget than a viewer
-(twenty seconds of taking *nothing*, against a viewer's minute): an exec caller
-is a script rather than a person watching a screen, and it loses nothing by
-being disconnected and re-run, while a viewer disconnected mid-scrollback loses
-their session. But a caller that takes *almost* nothing never trips that — each
-individual write completes inside twenty seconds — and holds the writer
-indefinitely. So at the SANDBOX, each exec frame gets its own five-second write
-deadline (`connWriter.writeWithin`), which on the largest frame this path
-produces is a floor of about 8.7 KB/s; a frame that misses it means this exec's
-only reader is gone, so the exec is dropped and its process group killed. The
-caller sees a connection that ended with no exit status — 125, with a sentence
-— rather than a truncated stream.
+Two bounds, and they answer different failures.
 
-Missing the WRITER costs only that exec; a write that itself expires closes the
-relay conn, because a WebSocket frame cannot be abandoned half-written.
-`sessiond`'s dial loop redials within its one-second backoff, which is the
-honest trade against an unbounded freeze of everything else on the session. The
-cure is still a writer per attachment rather than one per conn, which is a
-change to the relay; it is [open question 4](#open-questions).
+At the PLANE, an exec caller gets a shorter write budget than a viewer (twenty
+seconds of taking *nothing*, against a viewer's minute, plus a byte allowance
+at 64 KiB/s): an exec caller is a script rather than a person watching a
+screen, and it loses nothing by being disconnected and re-run, while a viewer
+disconnected mid-scrollback loses their session. That budget drops a caller
+draining below about 2.8 KB/s within roughly twenty seconds, and dropping the
+caller is what unwedges this hop.
+
+At the SANDBOX, `connWriter.writeWithin` bounds the exec forwarder twice, and
+the two numbers are different because only one of them is free. **Acquiring**
+the writer is bounded at thirty seconds — nothing has been written when that
+expires, so the conn is untouched and the cost is this exec alone, and the
+budget is deliberately longer than the plane's own so a healthy exec is not
+dropped merely because some other peer is in the process of being dropped. The
+**write itself** is bounded at sixty seconds, and that bound is not free: a
+WebSocket frame cannot be abandoned half-written, so the transport's answer to
+an expired write context is to close the conn. It is set an order of magnitude
+above anything a merely slow peer can reach (one readChunk is 58,320 bytes on
+the wire after two base64 hops, so sixty seconds is under a kilobyte a second)
+precisely so it fires only for a conn that is not moving at all — where the
+plane's budget has already come and gone, nothing will ever make
+`ServeSession`'s `Read` fail, and closing it is what makes `sessiond` redial.
+
+A dropped exec is always TOLD: the forwarder sends its `FrameClose` before it
+returns, so the caller sees a connection that ended with no exit status — 125,
+with a sentence — rather than a stream that simply stops.
+
+The cure for the underlying shape is still a writer per attachment rather than
+one per conn, which is a change to the relay; it is
+[open question 4](#open-questions).
 
 **Stdin flood.** The opposite hop has the opposite answer, and for the same
 reason turned around. A caller's stdin arrives on the relay's *demux* — the
@@ -885,11 +897,10 @@ Each step is separately revertable, and no step requires the one after it.
    the agent's terminal and the session RPC behind it. Exec makes this easier
    to reach than attach did — an exec caller legitimately stops reading, where
    a person watching a screen does not — and the mitigation in this version is
-   a per-frame write deadline at the sandbox plus a shorter plane-side budget,
-   rather than a fix. It is a real bound now (a wedged exec holds the writer
-   for at most five seconds), but the cost of reaching it is a conn reset
-   rather than a dropped attachment, which only a writer per attachment
-   removes.
+   a plane-side budget that drops the slow caller plus a sandbox-side bound on
+   acquiring the shared writer. Neither takes the writer away from a peer that
+   is holding it inside `conn.Write`, because a WebSocket frame cannot be
+   abandoned half-written; only a writer per attachment can.
    **Recommendation: give each attachment its own writer**, as a change to
    `internal/relay` rather than to this design, and revisit the budgets
    afterwards.
