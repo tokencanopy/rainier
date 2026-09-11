@@ -75,6 +75,15 @@ type ownership struct {
 	gen    uint64
 	runner runnerConn
 	ack    chan uint64
+	// told records that this attach's client has been sent an ownership
+	// message, which in practice means its opening `attached` has gone out.
+	// An attach is registered in the owner table BEFORE that — it has to be,
+	// or a take-over cannot see it — and the read of its first message that
+	// sits between the two is bounded only by attachFirstMsgTimeout. So a
+	// handoff elsewhere on the session can reach an attach that has not been
+	// told what it is yet, and a courtesy notice arriving first would be the
+	// opening answer as far as that client is concerned. See displace.
+	told bool
 }
 
 func newOwnership(p *Plane, target control.AttachTarget) *ownership {
@@ -169,9 +178,10 @@ func (o *ownership) demoteTo(from, gen uint64) (uint64, bool) {
 // a claim landing between them overwrites the displacement it lost to and
 // tells its client it has control.
 //
-// It returns the mode this attach WAS in — a controller has to be fenced in
-// its sandbox before anybody is told anything, a viewer only carries a new
-// number — and whether it moved at all. An attach already at or past gen is
+// It returns the mode this attach WAS in when it moved, the mode it still IS
+// in when it did not — a controller has to be fenced in its sandbox before
+// anybody is told anything, a viewer only carries a new number — and whether
+// it moved at all. Only the moved case is read: see displace. An attach already at or past gen is
 // left alone: writing a generation it has passed over its state would walk it
 // backwards. Being left alone is a statement about its STATE and not about
 // what its client has heard; the two were conflated once, and displace says
@@ -184,6 +194,14 @@ func (o *ownership) displaceTo(gen uint64) (was string, moved bool) {
 	}
 	was, o.mode, o.gen = o.mode, terminal.ModeView, gen
 	return was, true
+}
+
+// spokenTo reports whether anything has been said to this attach's client
+// yet. See the told field and displace.
+func (o *ownership) spokenTo() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.told
 }
 
 func (o *ownership) controlling() bool {
@@ -404,10 +422,23 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 		// its own heartbeat renewal is refused up to one interval later.
 		// Every viewer's next press is refused once too, for want of a number
 		// nobody sent them: the exact case displace's own doc says the viewer
-		// notice exists for. Nothing here is racing a taker — the generation
-		// has already moved past this claim, and this attach is not becoming
-		// the controller — so the fan-out does not wait.
-		o.plane.displace(ctx, o, o.sendStale(ctx), false)
+		// notice exists for.
+		//
+		// The answer goes out FIRST, on its own line because the order
+		// matters: this client asked a question and the fan-out behind it can
+		// spend an acknowledgement timeout per peer.
+		current := o.sendStale(ctx)
+		// And it WAITS, like a take-over and unlike a release. This is the
+		// only fan-out in the module that can demote a peer which genuinely
+		// holds control — release and finish both demote the caller first, so
+		// their peers are already viewers — and a peer flipped to `view` in
+		// the plane before its sandbox has the matching binding is a peer the
+		// NEXT taker will not wait for: displaceTo hands that taker
+		// `was == view`, it skips installAndWait, and it is answered while
+		// the old binding is still in flight. The pty's own generation fence
+		// still holds, so nothing executes twice; what would not hold is the
+		// ordering this module promises.
+		o.plane.displace(ctx, o, current, true)
 		return
 	}
 	if o.advance(terminal.ModeControl, gen) {
@@ -472,7 +503,10 @@ func (o *ownership) announceAs(ctx context.Context, typ string, won uint64) (str
 		return o.get()
 	}
 	defer func() { <-o.announce }()
-	mode, gen := o.get()
+	o.mu.Lock()
+	mode, gen := o.mode, o.gen
+	o.told = true
+	o.mu.Unlock()
 	switch {
 	case typ == terminal.TypeAttached && won != 0 && (mode != terminal.ModeControl || gen != won):
 		typ = terminal.TypeStale
@@ -752,6 +786,21 @@ func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wai
 		// answered the taker, so two screens said "you have control" until
 		// the skipped peer's own wait timed out.
 		was, moved := other.displaceTo(gen)
+		if !moved && !other.spokenTo() {
+			// A peer that has not been told what it is yet, and whose state
+			// this handoff did not move. Its opening `attached` is still
+			// coming and will name exactly what this notice would — while
+			// arriving FIRST would make a courtesy notice that peer's
+			// opening answer, and a client reads its first answer
+			// differently from a later one ("you are watching" against
+			// "somebody took control from you").
+			//
+			// This is not the skip the fix above removed. That one asserted
+			// that a peer's state being current meant its client was
+			// current; this one is about a client that has been told
+			// nothing, and it holds only when there is nothing to tell.
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

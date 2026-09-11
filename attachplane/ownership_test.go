@@ -1344,9 +1344,11 @@ func TestAdvanceAcceptsTheGenerationThisAttachAlreadyHolds(t *testing.T) {
 }
 
 // TestDisplaceAtGenerationZeroTouchesNobody pins the guard displaceTo is.
-// Zero is not a generation any row is ever at — it is what `finish` passes
-// when its store read failed — so it must demote nobody and leave every
-// attach on the session at the generation it holds.
+// Zero is not a generation any row is ever at. It is what a composer that
+// never set ControllerGeneration hands broker.Attach, and what `release`
+// falls back to when the store read fails and the attach is itself at zero —
+// `finish` displaces only when its read SUCCEEDED — so it must demote nobody
+// and leave every attach on the session at the generation it holds.
 //
 // Every peer is still ANNOUNCED to, because the fan-out no longer decides
 // what a client hears from whether its state moved. What the announcement
@@ -1357,7 +1359,7 @@ func TestDisplaceAtGenerationZeroTouchesNobody(t *testing.T) {
 	stream := newScriptedStream()
 	winner := &ownership{plane: p, session: "sess_example", announce: make(chan struct{}, 1)}
 	peer := &ownership{plane: p, session: "sess_example", negotiated: true, stream: stream,
-		mode: terminal.ModeControl, gen: 2, announce: make(chan struct{}, 1)}
+		mode: terminal.ModeControl, gen: 2, told: true, announce: make(chan struct{}, 1)}
 	p.owners.add(winner)
 	p.owners.add(peer)
 
@@ -2155,7 +2157,11 @@ func TestABindingWriteThatNeverLandsDoesNotHoldTheHandoff(t *testing.T) {
 // meantime, because a client that believes it is the controller sends no
 // claim and this attach's heartbeat renews nothing.
 func TestAPeerAlreadyAtTheNewGenerationIsStillToldAboutIt(t *testing.T) {
-	const ackTimeout = 2 * time.Second
+	// A long acknowledgement timeout, because A's OWN demotion emits the
+	// identical notice when its installAndWait gives up. The assertion below
+	// takes milliseconds; five seconds of margin is what makes the message it
+	// reads unambiguously the fan-out's.
+	const ackTimeout = 5 * time.Second
 	p, h, ts := newTestPlane(t, Options{
 		HeartbeatInterval: 20 * time.Millisecond, ControlAckTimeout: ackTimeout})
 	lease := &fakeLease{gen: 1, holder: "att_aaaa"}
@@ -2192,6 +2198,7 @@ func TestAPeerAlreadyAtTheNewGenerationIsStillToldAboutIt(t *testing.T) {
 		}
 		return false
 	}, "the demoted controller's viewer binding")
+	demoting := time.Now() // A's own wait starts here and runs for ackTimeout
 
 	// (3) B's sandbox acknowledges, so B advances and displaces its peers.
 	close(gate)
@@ -2204,6 +2211,11 @@ func TestAPeerAlreadyAtTheNewGenerationIsStillToldAboutIt(t *testing.T) {
 	// fan-out is done, so by the time B's `attached` is readable A's notice
 	// is in A's queue — and a peer that is skipped has nothing in it until
 	// its own wait times out, a whole acknowledgement timeout later.
+	if waited := time.Since(demoting); waited >= ackTimeout {
+		t.Fatalf("this run spent %s between A's demotion starting and B's claim being answered, "+
+			"which is longer than the %s A's own wait runs for: the notice below could have "+
+			"come from either, so the run cannot say anything", waited, ackTimeout)
+	}
 	select {
 	case m := <-a.stream.out:
 		if m.Type != terminal.TypeControlChanged || m.Mode != terminal.ModeView ||
@@ -2278,15 +2290,23 @@ func TestAClaimThatGivesItsGenerationBackTellsThePeersToo(t *testing.T) {
 			"had control is still `control` in the plane, and every viewer's next press is " +
 			"refused about a session nobody is driving")
 	}
-	awaitSandbox(t, a.sandbox, func(got []terminal.ClientMessage) bool {
-		for _, msg := range got {
-			if msg.Type == terminal.TypeControl && msg.Mode == terminal.ModeView &&
-				msg.Generation.Value() == 3 {
-				return true
-			}
+	// Its sandbox has the binding too, and had it BEFORE the claim returned:
+	// this fan-out waits, like a take-over and unlike a release. A peer
+	// flipped to `view` in the plane while its binding is still in flight is
+	// a peer the next taker will not wait for — displaceTo hands that taker
+	// `was == view`, so it skips installAndWait and is answered with the old
+	// binding still on the wire. Polling for this would pass either way.
+	var installed bool
+	for _, msg := range a.sandbox.received() {
+		if msg.Type == terminal.TypeControl && msg.Mode == terminal.ModeView &&
+			msg.Generation.Value() == 3 {
+			installed = true
 		}
-		return false
-	}, "the previous controller's viewer binding")
+	}
+	if !installed {
+		t.Fatalf("the give-back returned before the previous controller's sandbox had the "+
+			"viewer binding; its sandbox has seen %+v", a.sandbox.received())
+	}
 }
 
 // TestASandboxsOwnershipMessagesNeverReachTheClient is the mirror of
@@ -2454,5 +2474,69 @@ func TestAnAnnouncementReportsTheStateItFoundWhenItGotTheHold(t *testing.T) {
 				"IN, and a client told it is a viewer when it has control never claims again",
 				m.Type, m.Mode, m.Generation)
 		}
+	}
+}
+
+// TestAPeerThatHasNotBeenToldWhatItIsIsNotToldAboutSomebodyElseFirst is the
+// boundary of the fix above. An attach is registered in the owner table
+// before its first message is read — it has to be, or a take-over cannot see
+// it — so there is a window, bounded only by attachFirstMsgTimeout, in which
+// a handoff elsewhere on the session reaches an attach that has not been told
+// what it is yet.
+//
+// Announcing to every peer must not turn a courtesy notice into that
+// client's OPENING answer. A client reads its first answer differently from
+// a later one: `attached view` first means "somebody else is typing, press
+// the key to take it", while `control_changed view` means "somebody took
+// control from you" — about a device that never had it, and followed by the
+// real opening answer saying it a second time. A --view attach, which is
+// told nothing at all when it opens as the viewer it asked to be, would be
+// told that too.
+//
+// The peer whose state DID move is still announced to, because there the
+// notice is news: that attach was granted control and lost it before it
+// finished opening.
+func TestAPeerThatHasNotBeenToldWhatItIsIsNotToldAboutSomebodyElseFirst(t *testing.T) {
+	p, _, _ := newTestPlane(t, Options{})
+	winner := &ownership{plane: p, session: "sess_example", announce: make(chan struct{}, 1)}
+	p.owners.add(winner)
+
+	// Two attaches registered but still reading their first message: one at
+	// the generation the handoff carries, one behind it.
+	current := newScriptedStream()
+	behind := newScriptedStream()
+	atGen := &ownership{plane: p, session: "sess_example", negotiated: true, stream: current,
+		mode: terminal.ModeView, gen: 4, announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
+	older := &ownership{plane: p, session: "sess_example", negotiated: true, stream: behind,
+		mode: terminal.ModeView, gen: 3, announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
+	p.owners.add(atGen)
+	p.owners.add(older)
+
+	p.displace(context.Background(), winner, 4, false)
+
+	select {
+	case m := <-current.out:
+		t.Fatalf("an attach that has not been told what it is was sent %q %s at %q first; "+
+			"its opening answer is still coming and says the same thing",
+			m.Type, m.Mode, m.Generation)
+	default:
+	}
+	// The one the handoff actually moved is told, exactly as before.
+	if m := behind.nextServerMsg(t); m.Type != terminal.TypeControlChanged ||
+		m.Generation.Value() != 4 {
+		t.Fatalf("the displaced peer was sent %q at %q, want control_changed at 4",
+			m.Type, m.Generation)
+	}
+	// And once a client HAS been told something, the courtesy notice is owed
+	// to it again — which is the whole of the fix this guards the edge of.
+	atGen.announceAs(context.Background(), terminal.TypeAttached, 0)
+	if m := current.nextServerMsg(t); m.Type != terminal.TypeAttached {
+		t.Fatalf("the opening answer was %q, want attached", m.Type)
+	}
+	p.displace(context.Background(), winner, 4, false)
+	if m := current.nextServerMsg(t); m.Type != terminal.TypeControlChanged ||
+		m.Mode != terminal.ModeView || m.Generation.Value() != 4 {
+		t.Fatalf("a peer that has been told what it is was sent %q %s at %q, "+
+			"want control_changed view at 4", m.Type, m.Mode, m.Generation)
 	}
 }
