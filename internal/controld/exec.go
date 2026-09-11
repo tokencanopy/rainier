@@ -61,7 +61,11 @@ func (s *Server) handleClientExec(w http.ResponseWriter, r *http.Request, u User
 	// opening exec_start carries the command — never the URL, because a URL
 	// is written to the access log of every proxy between here and the
 	// caller, and an argv in a URL is an argument in a log file.
-	stream := attachplane.ClientStream(c)
+	// The EXEC stream, not the attach one: an exec caller that has stopped
+	// reading backs up the writer every attachment on this session shares, so
+	// it is closed sooner than a person watching a screen would be. See
+	// attachplane.ExecClientStream.
+	stream := attachplane.ExecClientStream(c)
 	ctx := withUser(r.Context(), u)
 	first, err := attachplane.ExecFirstMessage(ctx, stream)
 	if err != nil {

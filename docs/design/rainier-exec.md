@@ -350,6 +350,22 @@ A refusal is `exec_error{env_refused}` naming **the variable's name and
 nothing else**. Values are never logged, never audited, never quoted in an
 error.
 
+The list is longer than three names in the built version, and its PURPOSE is
+easy to misread, so: it is **not a privilege boundary**. A caller who may exec
+at all may run `sh -c` and do whatever the session's user can do, which is the
+whole of [Security](#security) below. What it protects is the audit record's
+meaning and the caller's own expectation — `rainier exec s -- make` should run
+make. So it covers every channel that turns a named binary into a different
+program: the `LD_*` namespace as a PREFIX (because `LD_AUDIT` is `LD_PRELOAD`
+by another name and the loader's list grows), git's `GIT_CONFIG_COUNT` /
+`GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` config injection and its
+`*_COMMAND` / `*_EDITOR` / `*_PAGER` hooks, the shell startup variables
+(`BASH_ENV`, `ENV`, `SHELLOPTS`, `PS4`), and the interpreter option channels
+(`NODE_OPTIONS`, `PERL5OPT`, `RUBYOPT`, `PYTHONSTARTUP`) that are `--eval`
+under another name. It stays a list rather than a prefix wherever a prefix
+would take something real away — `GIT_AUTHOR_NAME` and `PYTHONPATH` are how
+ordinary builds work.
+
 **Cwd.** Default `workspace.WorkspaceRoot` (`/workspace`). `--cwd` is
 resolved with `workspace.Resolve(workspace.WorkspaceRoot, dir)` — the exact
 function push and pull already use, including its symlink-escape check — so
@@ -589,7 +605,9 @@ bounded at 8 per session.
 `EventRecorder` and `UnitOfWork` an attach uses: actor, workspace, session,
 placement generation, timestamp, and **the command name only** — `path.Base
 (argv[0])`, capped at 64 bytes, refused to the event (recorded as `"?"`) if it
-is not printable ASCII. Never arguments. Never the environment — not values,
+is not printable ASCII. It is what was ASKED FOR rather than what ran —
+`-- ./git` is recorded as `git` — because the name is settled at the plane and
+argv[0] is resolved a hop later, in the sandbox; see open question 6. Never arguments. Never the environment — not values,
 not names. Never the cwd. Never a byte, or a length of a byte, of input or
 output. "Somebody ran `git` in this session at this time" is the whole of what
 the record says, and it is enough to answer the question an audit log is for
@@ -624,6 +642,34 @@ deliberate opposite of `session.trySend`'s force-detach, and the reason is the
 consumer count: a stalled terminal viewer is one of many and must not hold the
 session, while a stalled exec caller is the only reader its process will ever
 have.
+
+What this design did **not** originally account for is where that backpressure
+lands. Every attachment on a session shares one relay conn and one writer on
+it (`relay.connWriter`), so an exec caller that has stopped reading eventually
+backs that writer up — and while it is backed up, the agent's terminal output
+and the session RPC wait behind it. The mitigation that is in this version is
+a shorter write budget for an exec caller than for a viewer (twenty seconds of
+taking *nothing*, against a viewer's minute): an exec caller is a script
+rather than a person watching a screen, and it loses nothing by being
+disconnected and re-run, while a viewer disconnected mid-scrollback loses
+their session. The cure is a writer per attachment rather than one per conn,
+which is a change to the relay; it is [open question 4](#open-questions).
+
+**Stdin flood.** The opposite hop has the opposite answer, and for the same
+reason turned around. A caller's stdin arrives on the relay's *demux* — the
+single goroutine that reads every frame for every attachment on the session,
+the terminal's keystrokes and the session RPC included — so blocking there to
+apply backpressure would freeze the session, and would freeze it in a way with
+no way out: the `FrameClose` from a disconnect and the `exec_signal` from a
+Ctrl-C are both frames on the blocked demux.
+
+So stdin is buffered, bounded, and an overrun is a **named refusal**
+(`exec_error{stdin_overrun}`) rather than a silent truncation or a bare
+disconnect. The bound is eight megabytes per exec, which is several seconds of
+a fast link against a command that has stopped reading altogether and nothing
+at all against one that is merely slower than the network for a moment. Real
+flow control — the sandbox telling the plane to stop reading the caller's
+socket — would remove the bound, and is [open question 5](#open-questions).
 
 **PTY resize.** A `resize` on an exec attachment resizes **that exec's own
 pty** and nothing else. It never reaches `session.SetSize`, so it cannot move
@@ -750,3 +796,28 @@ Each step is separately revertable, and no step requires the one after it.
    is worse for every consumer except the one that wants both at once.
    **Recommendation: keep the rule**, and treat "stream *and* structured
    result" as a request for two invocations.
+4. **One writer per conn, or one per attachment.** Every attachment on a
+   session shares `relay.connWriter`, so a peer that stops reading backs up
+   the agent's terminal and the session RPC behind it. Exec makes this easier
+   to reach than attach did — an exec caller legitimately stops reading, where
+   a person watching a screen does not — and the mitigation in this version is
+   a shorter write budget for exec callers rather than a fix.
+   **Recommendation: give each attachment its own writer**, as a change to
+   `internal/relay` rather than to this design, and revisit the budget
+   afterwards.
+5. **Stdin flow control.** Because the demux cannot block, a caller's stdin is
+   buffered to a bound and an overrun ends the exec with
+   `exec_error{stdin_overrun}`. That is honest and bounded, and it is still a
+   bound where the output direction has none.
+   **Recommendation: add a credit to the exec protocol** — the sandbox
+   reporting how much more stdin it will take — when a real workload hits the
+   bound, and not before: a mechanism added against an imagined workload is a
+   mechanism nobody can tune.
+6. **What an audit record's command name is worth.** It is
+   `path.Base(argv[0])` as the CALLER typed it, so `rainier exec s -- ./git`
+   runs a file the caller planted and is recorded as `git`. Recording the
+   RESOLVED path's base would make it a fact, but the resolution happens in
+   the sandbox and the event is written at the plane, one hop earlier.
+   **Recommendation: read the field as "what was asked for" rather than "what
+   ran"**, say so where it is defined, and move the record to the sandbox's
+   answer only if an audit reader ever needs the stronger claim.

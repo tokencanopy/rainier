@@ -226,11 +226,18 @@ func (s *session) run(ctx context.Context, requested time.Time) {
 		case terminal.TypeExecExit:
 			s.res.ExitedAt = time.Now()
 			s.res.Duration = s.res.ExitedAt.Sub(s.res.StartedAt)
-			if m.Signal != "" {
+			switch {
+			case m.Signal != "":
 				s.res.Signal = m.Signal
-			} else {
+			case m.ExitCode >= 0 && m.ExitCode <= 255:
 				code := m.ExitCode
 				s.res.ExitCode = &code
+			default:
+				// A status outside 0–255 is not a status. It matters because
+				// os.Exit masks to eight bits: a sandbox reporting 256 would
+				// make `rainier exec` exit 0, telling a script a failing
+				// command succeeded. Leaving both fields unset reports 125 —
+				// "no exit status ever arrived" — which is exactly true.
 			}
 			return
 		case terminal.TypeExecError:
@@ -454,15 +461,25 @@ func ExitCodeFor(r Result) (code int, ok bool) {
 	case terminal.ReasonNotExecutable, terminal.ReasonCwdRefused,
 		terminal.ReasonEnvRefused, terminal.ReasonLogRefused:
 		return ExitNotExecutable, true
-	case terminal.ReasonUnsupported, terminal.ReasonTooManyExecs:
-		// Neither is the command failing: one is a sandbox that cannot run
-		// commands at all, the other a session already running as many as it
-		// may. Both are Rainier's own failure, which is 1, with a sentence
-		// that says which.
+	case terminal.ReasonUnsupported, terminal.ReasonTooManyExecs,
+		terminal.ReasonNoAnswer, terminal.ReasonStdinOverrun:
+		// None of these is the command failing: a sandbox that cannot run
+		// commands at all, one that did not answer in time, a session already
+		// running as many as it may, or input this caller sent faster than
+		// its command would take it. All four are Rainier's own failure,
+		// which is 1, with a sentence that says which.
 		return 1, false
 	}
 	if !r.Started {
 		return 1, false
+	}
+	if r.Interrupted && r.ExitCode == nil && r.Signal == "" {
+		// The caller pressed Ctrl-C twice and left, which kills the command.
+		// 130 is what a shell reports for a command an interrupt ended, and
+		// it is the honest answer here: the command did not report a status
+		// because this caller stopped waiting for one, not because anything
+		// went wrong with the connection.
+		return 128 + interruptSignalNumber, true
 	}
 	if r.Detached {
 		// The process exists and its caller is done: a detached run's success
@@ -485,6 +502,12 @@ func ExitCodeFor(r Result) (code int, ok bool) {
 }
 
 // errNoStatus is what a caller prints for 125.
+// interruptSignalNumber is SIGINT's, for the 128+N a double Ctrl-C reports.
+var interruptSignalNumber = func() int {
+	n, _ := terminal.ExitSignalNumber(terminal.SignalINT)
+	return n
+}()
+
 var errNoStatus = errors.New(
 	"the connection to the session ended before the command reported an exit status")
 

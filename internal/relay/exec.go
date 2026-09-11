@@ -26,10 +26,14 @@ import (
 // attachment that was refused emits its exec_error and closes, which is
 // exactly the shape of one that ran.
 //
-// A nil Execer is a sandbox that cannot exec at all. serveSession answers an
-// exec FrameOpen on one by closing the attachment without a word, which is
-// indistinguishable — deliberately — from the sandbox that predates this
-// field: no exec_started, so the plane refuses with `exec_unsupported`.
+// A nil Execer is a build that cannot exec at all. serveSession answers an
+// exec FrameOpen on one by closing the attachment: no `exec_started`, so the
+// plane refuses. (It refuses it as "the sandbox did not answer" rather than
+// as "this sandbox predates exec" — the two are different words on purpose,
+// and a build compiled without an exec runner is neither of the shapes a
+// deployed sandbox has. A sessiond that predates the Kind field takes the
+// TERMINAL branch instead and answers a snapshot, which is the case that
+// actually happens in a fleet and the one the handshake is written for.)
 type Execer interface {
 	OpenExec(spec runner.ExecSpec) ExecAttachment
 }

@@ -59,6 +59,11 @@ const (
 	// script cannot fork-bomb a sandbox through a socket. Detached execs
 	// count too, because they are processes in the same container.
 	MaxConcurrent = 8
+	// MaxDetached bounds how many of those may be DETACHED. It is lower than
+	// MaxConcurrent on purpose: a detached process holds its slot for as long
+	// as it runs, and the only way to stop one is `rainier exec s -- kill
+	// <pid>`, which needs a slot of its own. See Runner.reserve.
+	MaxDetached = 4
 	// killGrace is how long a killed exec's process GROUP has between
 	// SIGTERM and SIGKILL. The group matters for the reason files.go already
 	// documents about `git fetch`: the child spawns grandchildren that
@@ -74,21 +79,35 @@ const (
 	outQueue = 8
 	// readChunk is one read from a pipe or a pty.
 	readChunk = 32 << 10
-	// stdinQueueBytes bounds the caller's stdin waiting for a child that
-	// is not reading it, and stdinStall bounds how long a full queue may
-	// hold the relay's demux — which is SHARED with every other attachment on
-	// this conn, including the session's own terminal.
+	// stdinQueueBytes bounds the caller's stdin waiting for a child that is
+	// not reading it. Nothing on the delivery path BLOCKS: Client runs on the
+	// relay demux, which is shared with every other attachment on this conn —
+	// the session's own terminal and the session RPC included — so a wait
+	// there freezes a person's keyboard, and a wait long enough to matter
+	// also keeps the demux from ever reading the FrameClose that would have
+	// ended the exec.
 	//
-	// Blocking is the right answer up to a point: it is what pushes the
-	// caller's stdin back through the socket instead of buffering a pipe's
-	// worth of it here. Past that point it is not, because the demux this
-	// call runs on is what delivers the terminal's keystrokes too. A stall
-	// that outlasts the bound ends the exec (its group is killed and its
-	// caller sees the connection end without an exit status, which is exit
-	// 125), rather than dropping stdin bytes on the floor or freezing
-	// somebody's terminal indefinitely.
-	stdinQueueBytes = 1 << 20
-	stdinStall      = 10 * time.Second
+	// So the queue is generous and the overflow is decisive. A caller feeding
+	// a command that reads its input normally never approaches it; one
+	// feeding a command that reads NONE of it is refused rather than
+	// buffered, by ending the exec — which its caller sees as the connection
+	// ending without an exit status, exit 125. Dropping the bytes instead
+	// would be a silently corrupted stdin, which is worse than either.
+	//
+	// The bound is what it is because the producer is a network: stdin
+	// reaches this sandbox at the speed of the caller's link, and the queue
+	// only grows while the child is slower than that. Eight megabytes is
+	// several seconds of a fast link against a child that has stopped reading
+	// altogether, and nothing at all against one that is merely slower than
+	// the network for a moment. The cost is bounded per session: at most
+	// MaxConcurrent execs, each holding at most this many bytes.
+	//
+	// Real flow control — the sandbox telling the plane to stop reading the
+	// caller's socket — is what would remove the bound entirely, and it is a
+	// protocol addition rather than a constant. It is recorded as an open
+	// question in the design rather than smuggled in here.
+	stdinQueueBytes = 8 << 20
+	stdinQueueDepth = 8192
 	// drainGrace is how long the readers get, AFTER the child has exited,
 	// to reach EOF on pipes a grandchild may still be holding open. The clock
 	// only runs while a reader is parked in Read with nothing arriving: a
@@ -173,7 +192,10 @@ type Runner struct {
 	env   []string
 	start Starter
 	max   int
-	grace time.Duration
+	// maxDetached bounds the part of `max` that detached work may hold; see
+	// reserve.
+	maxDetached int
+	grace       time.Duration
 
 	mu   sync.Mutex
 	live map[*attachment]struct{}
@@ -186,7 +208,8 @@ var _ relay.Execer = (*Runner)(nil)
 // and `git status` work and what argv[0] is looked up on.
 func NewRunner(root string, env []string, start Starter) *Runner {
 	return &Runner{root: root, env: env, start: start,
-		max: MaxConcurrent, grace: killGrace, live: map[*attachment]struct{}{}}
+		max: MaxConcurrent, maxDetached: MaxDetached, grace: killGrace,
+		live: map[*attachment]struct{}{}}
 }
 
 // OpenExec starts one exec and returns its live attachment. It never returns
@@ -195,17 +218,32 @@ func NewRunner(root string, env []string, start Starter) *Runner {
 // closes.
 func (r *Runner) OpenExec(spec runner.ExecSpec) relay.ExecAttachment {
 	a := newAttachment(r)
+	// On its OWN goroutine, and that is not an optimisation. OpenExec is
+	// called inline from the relay's demux — the one goroutine that reads
+	// every frame for every attachment on this session's conn, terminal
+	// input and the session RPC included — so anything slow here freezes the
+	// whole session. Opening a caller-named log file is a filesystem
+	// operation on a path the caller chose, and `open(2)` on a FIFO with no
+	// reader does not return at all.
+	//
+	// Nothing about the message ORDER depends on this being synchronous:
+	// every message an exec will ever send goes through the same channel,
+	// and `exec_started` is put on it before the output callbacks are armed.
+	go r.open(a, spec)
+	return a
+}
 
-	if !r.reserve(a) {
+func (r *Runner) open(a *attachment, spec runner.ExecSpec) {
+	if !r.reserve(a, spec.Detach) {
 		a.refuse(terminal.ReasonTooManyExecs)
-		return a
+		return
 	}
 
 	req, reason := r.validate(spec)
 	if reason != "" {
 		r.release(a)
 		a.refuse(reason)
-		return a
+		return
 	}
 
 	// The callbacks are armed only once the spawn has succeeded, so
@@ -228,7 +266,7 @@ func (r *Runner) OpenExec(spec runner.ExecSpec) relay.ExecAttachment {
 			req.Log.Close()
 		}
 		a.refuse(startFailureReason(err))
-		return a
+		return
 	}
 	// The starter owns the log file's descriptor from here (it is the
 	// child's stdout and stderr); this end has no further use for it.
@@ -236,7 +274,17 @@ func (r *Runner) OpenExec(spec runner.ExecSpec) relay.ExecAttachment {
 		req.Log.Close()
 	}
 
-	a.arm(proc, req.Detach)
+	if !a.arm(proc, req.Detach) {
+		// The session ended underneath this spawn. arm has signalled the
+		// process; the slot comes back when it is gone, and the attachment
+		// was already finished by the kill that beat us here.
+		close(ready)
+		go func() {
+			proc.Wait()
+			r.release(a)
+		}()
+		return
+	}
 	if req.Detach {
 		// A detached exec reports its pid and closes: there is nothing to
 		// stream, because its output is in the file the caller named, and
@@ -250,13 +298,12 @@ func (r *Runner) OpenExec(spec runner.ExecSpec) relay.ExecAttachment {
 			proc.Wait()
 			r.release(a)
 		}()
-		return a
+		return
 	}
 
 	a.emit(terminal.ServerMessage{Type: terminal.TypeExecStarted})
 	close(ready)
 	go a.run()
-	return a
 }
 
 // KillAll ends every exec this session is running, detached ones included.
@@ -278,13 +325,34 @@ func (r *Runner) KillAll() {
 // reserve takes one of the session's exec slots, reporting false when they
 // are all taken. The count is checked and taken in one locked step, so eight
 // callers racing produce eight execs and not nine.
-func (r *Runner) reserve(a *attachment) bool {
+//
+// A DETACHED exec takes a slot from a smaller pool as well, and that second
+// bound is what keeps the feature usable rather than being belt and braces.
+// A detached process holds its slot for as long as it runs, which can be
+// hours; the design's only way to stop one is `rainier exec s -- kill <pid>`,
+// which is itself an exec — so a session that filled all eight slots with
+// detached work would have no way left to stop any of it, and no listing and
+// no kill API to fall back on. Capping detached work below the total leaves
+// room for the command that ends it.
+func (r *Runner) reserve(a *attachment, detached bool) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.live) >= r.max {
 		return false
 	}
+	if detached {
+		n := 0
+		for other := range r.live {
+			if other.isDetached() {
+				n++
+			}
+		}
+		if n >= r.maxDetached {
+			return false
+		}
+	}
 	r.live[a] = struct{}{}
+	a.setDetached(detached)
 	return true
 }
 
@@ -329,18 +397,71 @@ func startFailureReason(err error) string {
 // user's own build legitimately needs arbitrary ones.
 var envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// reservedEnv is the short list of names a caller may not set, each of
-// which turns "run this command" into "run something else" — which is a
-// different request, and one that would arrive unaudited.
+// reservedEnv is the list of names a caller may not set, each of which turns
+// "run this command" into "run something else" — a different request, and one
+// that would arrive unaudited.
+//
+// WHAT THIS IS AND IS NOT. It is not a privilege boundary, and nothing here
+// should be read as one: a caller who may exec at all may run `sh -c` and do
+// whatever the session's user can do, which this design says plainly under
+// Security. What the list protects is the AUDIT RECORD's meaning — "somebody
+// ran git in this session" must not be the record of somebody running
+// something else through git — and the caller's own expectation that
+// `rainier exec s -- make` runs make.
 var reservedEnv = map[string]bool{
 	"HOME": true, "PATH": true, "SHELL": true, "IFS": true,
-	"LD_PRELOAD": true, "LD_LIBRARY_PATH": true,
-	"GIT_CONFIG_GLOBAL": true, "GIT_SSH_COMMAND": true, "GIT_ASKPASS": true,
+	// git's own "run something else" surface. GIT_CONFIG_COUNT/KEY/VALUE is
+	// config injection on the command line, and through it core.sshCommand,
+	// credential.helper and core.pager — which is every one of the others.
+	"GIT_CONFIG_GLOBAL": true, "GIT_CONFIG_SYSTEM": true, "GIT_CONFIG": true,
+	"GIT_CONFIG_COUNT": true, "GIT_SSH_COMMAND": true, "GIT_SSH": true,
+	"GIT_ASKPASS": true, "GIT_EXTERNAL_DIFF": true, "GIT_PROXY_COMMAND": true,
+	"GIT_EDITOR": true, "GIT_PAGER": true, "GIT_SEQUENCE_EDITOR": true,
+	"GIT_DIR": true, "GIT_WORK_TREE": true, "GIT_ALTERNATE_OBJECT_DIRECTORIES": true,
+	"SSH_ASKPASS": true, "EDITOR": true, "VISUAL": true, "PAGER": true,
+	// Shell startup files and trace hooks: each runs code before the command.
+	"BASH_ENV": true, "ENV": true, "SHELLOPTS": true, "BASHOPTS": true, "PS4": true,
+	// Interpreter option channels, which are `--eval` by another name.
+	"NODE_OPTIONS": true, "NODE_REPL_EXTERNAL_MODULE": true,
+	"PYTHONSTARTUP": true, "PYTHONEXECUTABLE": true,
+	"PERL5OPT": true, "PERL5DB": true, "RUBYOPT": true,
 }
 
-// reservedEnvPrefix is the namespace the boot chain, the credential helper
-// and the agent sync address each other in.
-const reservedEnvPrefix = "RAINIER_"
+// The bounds on one caller-supplied variable. They are far above any real
+// name or value, and they exist so that a spec cannot be a way to make this
+// process allocate — or to push an execve over E2BIG, which would be reported
+// as "not executable" rather than as the refusal it is.
+const (
+	maxEnvNameBytes  = 256
+	maxEnvValueBytes = 128 << 10
+)
+
+// reservedEnvPrefixes are the namespaces no caller-supplied name may be in.
+//
+// They are PREFIXES where a prefix takes nothing legitimate away. Every LD_
+// variable the dynamic loader reads exists to change which code runs, and
+// LD_AUDIT is LD_PRELOAD by another name — a list would have to be kept in
+// step with the loader forever. GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n are
+// numbered, so they cannot be listed at all. RAINIER_ is how the boot chain,
+// the credential helper and the agent sync address each other.
+//
+// Everything else stays a list, because a prefix there would take something
+// real away: a session's own build legitimately needs GIT_AUTHOR_NAME, and
+// PYTHONPATH is how half of Python works.
+var reservedEnvPrefixes = []string{"LD_", "RAINIER_", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"}
+
+// reservedEnvName reports whether a caller may not set this name.
+func reservedEnvName(name string) bool {
+	if reservedEnv[name] {
+		return true
+	}
+	for _, prefix := range reservedEnvPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // validate turns a wire spec into a request this sandbox will run, or names
 // the reason it will not. It is the LAST hop before a syscall, so it trusts
@@ -383,7 +504,14 @@ func (r *Runner) validate(spec runner.ExecSpec) (Request, string) {
 
 	req := Request{
 		Argv: spec.Argv, Dir: dir, Env: env,
-		TTY: spec.TTY, Cols: spec.Cols, Rows: spec.Rows, Detach: spec.Detach,
+		// The sizes are CLAMPED, because the pty ioctl takes a uint16 and a
+		// plain conversion turns 65536 into a nought-column terminal — a size
+		// no program draws on, reported as though the caller had asked for it.
+		TTY: spec.TTY, Cols: ptySize(spec.Cols), Rows: ptySize(spec.Rows),
+		Detach: spec.Detach,
+	}
+	if req.TTY && (req.Cols == 0 || req.Rows == 0) {
+		req.Cols, req.Rows = ptyDefaultCols, ptyDefaultRows
 	}
 
 	// The log. Required with --detach and refused without it: a log path for
@@ -432,8 +560,9 @@ func (r *Runner) composeEnv(spec runner.ExecSpec) ([]string, string) {
 		value := spec.Env[name]
 		switch {
 		case !envNamePattern.MatchString(name),
-			strings.HasPrefix(name, reservedEnvPrefix),
-			reservedEnv[name],
+			len(name) > maxEnvNameBytes,
+			len(value) > maxEnvValueBytes,
+			reservedEnvName(name),
 			strings.ContainsRune(value, 0):
 			// The NAME and nothing else. The value is never logged, never
 			// audited and never quoted in an error.
@@ -443,6 +572,30 @@ func (r *Runner) composeEnv(spec runner.ExecSpec) ([]string, string) {
 	}
 	return dedupEnv(env), ""
 }
+
+// ptySize clamps one dimension into what the pty ioctl can carry, and
+// supplies a plain default for a client that named none.
+//
+// The clamp is not tidiness: the ioctl takes a uint16, so a plain conversion
+// turns 65536 into a NOUGHT-column terminal — a size no program draws on,
+// installed as though the caller had asked for it.
+func ptySize(v int) int {
+	switch {
+	case v <= 0:
+		return 0 // caller named none; ptyDefault fills both in together
+	case v > 65535:
+		return 65535
+	default:
+		return v
+	}
+}
+
+// The size a --tty exec opens with when its client named none. A terminal has
+// to be SOME size, and 80x24 is the one every program has a fallback for.
+const (
+	ptyDefaultCols = 80
+	ptyDefaultRows = 24
+)
 
 // sortedKeys is the map's keys in order, so every decision made over a spec's
 // env is deterministic.
@@ -482,8 +635,16 @@ func dedupEnv(env []string) []string {
 	return out
 }
 
-// openLog resolves and opens a detached exec's output file. It is
-// resolved exactly as a cwd is — inside the workspace, symlink escape
+// openLog resolves and opens a detached exec's output file.
+//
+// O_NONBLOCK and the regular-file check are not belt and braces. The path is
+// the CALLER's, and a caller who can run one command can create anything on
+// it: `open(2)` O_WRONLY on a FIFO with no reader never returns — and this
+// used to run on the relay's shared demux, where that froze the whole session
+// — and a character device is a place output goes to be lost. A log has to be
+// a file somebody can read afterwards, which is the point of the flag.
+//
+// The path itself is resolved exactly as a cwd is — inside the workspace, symlink escape
 // included — because a detached process writing outside the tree its session
 // owns is the same escape by a slower route.
 func openLog(root, path string) (*os.File, error) {
@@ -491,7 +652,22 @@ func openLog(root, path string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	return os.OpenFile(resolved, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(resolved,
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NONBLOCK, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		f.Close()
+		if err == nil {
+			err = errors.New("exec: the log path is not a regular file")
+		}
+		return nil, err
+	}
+	// O_NONBLOCK means nothing on a regular file, so the descriptor handed to
+	// the child behaves exactly as one opened without it.
+	return f, nil
 }
 
 // The two lookup failures, kept apart because a caller's script acts on the
@@ -534,7 +710,11 @@ func lookPath(env []string, dir, name string) (string, error) {
 	sawFile := false
 	for _, elem := range filepath.SplitList(envValue(env, "PATH")) {
 		if elem == "" {
-			elem = "."
+			// POSIX: an empty element means the current directory — and the
+			// current directory that matters is the CHILD's, which is this
+			// exec's cwd. Resolving it against sessiond's own would stat one
+			// file and execute another.
+			elem = dir
 		}
 		candidate := filepath.Join(elem, name)
 		err := candidateOK(candidate)
@@ -609,11 +789,22 @@ type attachment struct {
 	msgs   chan terminal.ServerMessage
 	// closing is closed by kill() and by the process's own exit. Every
 	// blocking operation on this attachment selects on it, which is what
-	// keeps a dead consumer from parking a reader goroutine forever and a
-	// child that never reads stdin from parking the relay's shared demux.
+	// keeps a dead consumer from parking a reader goroutine forever.
 	closing   chan struct{}
 	closeOnce sync.Once
-	finishOne sync.Once
+
+	// out guards the OUTBOX against the one race that can crash a sandbox:
+	// closing msgs while a sender is mid-send is a "send on closed channel"
+	// panic, and sessiond has no recover around the relay demux — a panic
+	// there takes the whole session down, and takes it down BEFORE the
+	// shutdown path flushes the agent's last write.
+	//
+	// A sender takes it for reading, so senders do not serialise against
+	// each other; finish takes it for writing, which waits for every
+	// in-flight send to return. That cannot deadlock, because finish closes
+	// `closing` FIRST and every send selects on it.
+	out       sync.RWMutex
+	outClosed bool
 
 	// stdin is the caller's input on its way to the child, on its own
 	// goroutine so that the relay's demux never waits on a pipe.
@@ -623,6 +814,18 @@ type attachment struct {
 	proc     Proc
 	detached bool
 	queued   int // bytes of stdin waiting
+}
+
+func (a *attachment) setDetached(v bool) {
+	a.mu.Lock()
+	a.detached = v
+	a.mu.Unlock()
+}
+
+func (a *attachment) isDetached() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.detached
 }
 
 // stdinPiece is one piece of the caller's input: bytes, or the end of it.
@@ -636,7 +839,7 @@ func newAttachment(r *Runner) *attachment {
 		runner:  r,
 		msgs:    make(chan terminal.ServerMessage, outQueue),
 		closing: make(chan struct{}),
-		stdin:   make(chan stdinPiece, 64),
+		stdin:   make(chan stdinPiece, stdinQueueDepth),
 	}
 }
 
@@ -644,30 +847,61 @@ func (a *attachment) Msgs() <-chan terminal.ServerMessage { return a.msgs }
 
 // arm installs the process and starts the stdin pump. It is called once, and
 // only after a successful spawn.
-func (a *attachment) arm(p Proc, detached bool) {
+//
+// It reports whether the attachment is still live. It can already be closing:
+// the session's own shutdown can land between the slot being taken and the
+// process existing, and a kill that arrived then found no process to signal.
+// The spawn cannot be undone, so the process is ended here instead — which is
+// what keeps "a detached exec dies with its session" true even for one
+// started in the same instant the session was stopped.
+func (a *attachment) arm(p Proc, detached bool) bool {
 	a.mu.Lock()
 	a.proc = p
 	a.detached = detached
 	a.mu.Unlock()
+	select {
+	case <-a.closing:
+		go func() {
+			a.killProc(p)
+			a.finish()
+		}()
+		return false
+	default:
+	}
 	if !detached {
 		go a.pumpStdin()
 	}
+	return true
 }
 
 // refuse emits one exec_error and ends the attachment. The channel has room
 // for it, so this never blocks — a refusal must not be able to wedge on a
 // caller that has already gone.
 func (a *attachment) refuse(reason string) {
-	select {
-	case a.msgs <- terminal.ServerMessage{Type: terminal.TypeExecError, Reason: reason}:
-	default:
+	a.out.RLock()
+	if !a.outClosed {
+		select {
+		case a.msgs <- terminal.ServerMessage{Type: terminal.TypeExecError, Reason: reason}:
+		default:
+		}
 	}
+	a.out.RUnlock()
 	a.finish()
 }
 
 // emit queues one message, blocking until the relay's forwarder takes it or
 // the attachment is closing.
+//
+// The outbox lock is what makes it safe for the session's own shutdown to end
+// an exec at any instant: without it, a KillAll landing between the slot being
+// taken and the process being armed would close msgs under a sender and panic
+// the sandbox.
 func (a *attachment) emit(m terminal.ServerMessage) error {
+	a.out.RLock()
+	defer a.out.RUnlock()
+	if a.outClosed {
+		return errAttachmentClosed
+	}
 	select {
 	case a.msgs <- m:
 		return nil
@@ -688,11 +922,19 @@ func (a *attachment) sendStderr(b []byte) error {
 
 // finish closes the message channel exactly once, which is what tells the
 // relay's forwarder the exec is over and makes it send the FrameClose.
+//
+// `closing` is closed FIRST and the outbox lock is taken SECOND, in that
+// order: every sender selects on `closing`, so the ones already inside the
+// lock return instead of parking, and the ones not yet in it find outClosed.
 func (a *attachment) finish() {
-	a.finishOne.Do(func() {
-		a.closeOnce.Do(func() { close(a.closing) })
-		close(a.msgs)
-	})
+	a.closeOnce.Do(func() { close(a.closing) })
+	a.out.Lock()
+	defer a.out.Unlock()
+	if a.outClosed {
+		return
+	}
+	a.outClosed = true
+	close(a.msgs)
 }
 
 // run waits out an attached exec and reports its outcome. The exit message is
@@ -767,44 +1009,46 @@ func signalNamed(name string) (syscall.Signal, bool) {
 	}
 }
 
-// offerStdin hands one piece of input to the pump, blocking while the queue
-// is over its byte bound and giving up — by ending the exec — if that lasts
-// longer than the stall bound. See stdinQueueBytes for why both halves
-// are there.
+// offerStdin hands one piece of input to the pump WITHOUT EVER BLOCKING. That
+// is the property, not an optimisation: this call runs on the relay's shared
+// demux. See stdinQueueBytes for what overflow means and why it ends the exec
+// rather than dropping bytes.
 func (a *attachment) offerStdin(in stdinPiece) {
-	deadline := time.NewTimer(stdinStall)
-	defer deadline.Stop()
-	for {
-		a.mu.Lock()
-		room := a.queued+len(in.data) <= stdinQueueBytes || a.queued == 0
-		if room {
-			a.queued += len(in.data)
-		}
-		a.mu.Unlock()
-		if room {
-			select {
-			case a.stdin <- in:
-			case <-a.closing:
-				a.mu.Lock()
-				a.queued -= len(in.data)
-				a.mu.Unlock()
-			}
-			return
-		}
-		select {
-		case <-time.After(10 * time.Millisecond):
-		case <-a.closing:
-			return
-		case <-deadline.C:
-			// The caller's input cannot be delivered and the demux this runs
-			// on is shared with the session's terminal. Ending the exec is
-			// honest — its caller sees the connection end without an exit
-			// status, which is exit 125 — where dropping the bytes would be a
-			// silently corrupted stdin.
-			go a.kill()
-			return
-		}
+	a.mu.Lock()
+	over := a.queued > 0 && a.queued+len(in.data) > stdinQueueBytes
+	if !over {
+		a.queued += len(in.data)
 	}
+	a.mu.Unlock()
+	if over {
+		go a.endWith(terminal.ReasonStdinOverrun)
+		return
+	}
+	select {
+	case a.stdin <- in:
+	case <-a.closing:
+		a.mu.Lock()
+		a.queued -= len(in.data)
+		a.mu.Unlock()
+	default:
+		// The queue is under its byte bound and still full, which is what a
+		// caller sending very many very small writes to a child that reads
+		// none of them produces. Same answer, same reason.
+		a.mu.Lock()
+		a.queued -= len(in.data)
+		a.mu.Unlock()
+		go a.endWith(terminal.ReasonStdinOverrun)
+	}
+}
+
+// endWith ends this exec and SAYS WHY first. It is the difference between a
+// caller learning that its input could not be delivered and a caller being
+// told "the connection ended before the command reported an exit status" for
+// something Rainier did on purpose — which would be a misattribution, and the
+// kind a script cannot act on.
+func (a *attachment) endWith(reason string) {
+	_ = a.emit(terminal.ServerMessage{Type: terminal.TypeExecError, Reason: reason})
+	a.kill()
 }
 
 // pumpStdin is the one goroutine that writes the child's stdin. A write that
@@ -862,19 +1106,33 @@ func (a *attachment) kill() {
 	a.mu.Unlock()
 	a.closeOnce.Do(func() { close(a.closing) })
 	if p == nil {
+		// Nothing has been spawned (yet). Ending the attachment is the whole
+		// of what there is to do; a spawn still in flight finds `closing`
+		// closed in arm and ends the process it just made.
 		a.finish()
 		return
 	}
-	_ = p.Signal(syscall.SIGTERM)
+	// The attachment is finished when the process is GONE, whichever path
+	// ended it — a caller disconnect, the session's own shutdown, a spawn
+	// that raced it. finish is idempotent, so the ordinary exit path calling
+	// it too is not a second closing, it is whichever got there first.
 	go func() {
-		done := make(chan struct{})
-		go func() { p.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(a.runner.grace):
-			_ = p.Signal(syscall.SIGKILL)
-		}
+		a.killProc(p)
+		a.finish()
 	}()
+}
+
+// killProc is the signal half on its own: SIGTERM to the process GROUP, a
+// grace period, then SIGKILL to the group.
+func (a *attachment) killProc(p Proc) {
+	_ = p.Signal(syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() { p.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(a.runner.grace):
+		_ = p.Signal(syscall.SIGKILL)
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -36,6 +36,8 @@ type fakeProc struct {
 
 	onStdout func([]byte) error
 	onStderr func([]byte) error
+	// blocked, when set, parks every stdin write until it is closed.
+	blocked chan struct{}
 
 	done   chan struct{}
 	status Status
@@ -44,12 +46,28 @@ type fakeProc struct {
 
 func (p *fakeProc) Write(b []byte) (int, error) {
 	p.mu.Lock()
+	blocked := p.blocked
+	p.mu.Unlock()
+	if blocked != nil {
+		// A child that has stopped reading its stdin: the write parks, as a
+		// real pipe write does once the kernel buffer is full.
+		<-blocked
+	}
+	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.stdinClosed {
 		return 0, errors.New("stdin closed")
 	}
 	p.stdin = append(p.stdin, b...)
 	return len(b), nil
+}
+
+// blockWrites makes every later stdin write park until the process exits,
+// which is what a child that reads none of its input does to the pipe.
+func (p *fakeProc) blockWrites() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.blocked = p.done
 }
 
 func (p *fakeProc) CloseStdin() error {
@@ -98,6 +116,16 @@ func (p *fakeProc) stdinBytes() ([]byte, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]byte(nil), p.stdin...), p.stdinClosed
+}
+
+// stdinProgress is stdinBytes without the copy, for the tests that poll a
+// large stream: copying megabytes under the same lock the writer takes is
+// itself the bottleneck, and a test that measured that would be measuring
+// nothing about exec.
+func (p *fakeProc) stdinProgress() (int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.stdin), p.stdinClosed
 }
 
 type fakeStarter struct {
@@ -960,5 +988,402 @@ func TestDetachRequiresALogInsideTheWorkspace(t *testing.T) {
 	start.mu.Unlock()
 	if spawned != 0 {
 		t.Fatalf("a refused detach spawned %d processes", spawned)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the shared demux
+// ---------------------------------------------------------------------------
+
+// TestClientNeverBlocksTheSharedDemux is the one rule here that is about the
+// RELAY rather than about this exec: Client runs on the demux every
+// attachment on this session's conn shares — the session's own terminal and
+// the session RPC included — so no path through it may block at all.
+//
+// The case is a child that reads none of its stdin while its caller keeps
+// writing. Blocking would be the textbook answer, and it is the wrong one
+// here: a demux that does not return never reads the FrameClose that would
+// have ended the exec, nor the exec_signal a Ctrl-C sends, so the wedge would
+// have no way out at all. The input is buffered up to a generous bound and
+// the exec is then ended — and ended with a NAMED reason, so its caller
+// learns what happened rather than being told the connection dropped.
+func TestClientNeverBlocksTheSharedDemux(t *testing.T) {
+	for name, write := range map[string]func(a relay.ExecAttachment){
+		// Many tiny writes: fills the queue's SLOTS long before its bytes.
+		"many small writes": func(a relay.ExecAttachment) {
+			for i := 0; i < stdinQueueDepth+64; i++ {
+				a.Client(terminal.ClientMessage{Type: "stdin", Data: []byte("x")})
+			}
+		},
+		// Few large writes: fills the queue's BYTES long before its slots.
+		"few large writes": func(a relay.ExecAttachment) {
+			chunk := make([]byte, 1<<20)
+			for i := 0; i < 16; i++ {
+				a.Client(terminal.ClientMessage{Type: "stdin", Data: chunk})
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			start := newFakeStarter()
+			r, _ := testRunner(t, start.start)
+			spec := withTool(t, r, "tool")
+
+			a := r.OpenExec(spec)
+			p := start.await(t)
+			if m := <-a.Msgs(); m.Type != terminal.TypeExecStarted {
+				t.Fatalf("first message = %q", m.Type)
+			}
+			// The child stops reading: every write to it now parks the pump,
+			// so the queue fills and stays full.
+			p.blockWrites()
+
+			done := make(chan struct{})
+			go func() { defer close(done); write(a) }()
+			select {
+			case <-done:
+			case <-time.After(30 * time.Second):
+				t.Fatal("Client wedged the relay's shared demux; a stalled exec " +
+					"would have frozen the session's terminal with it")
+			}
+
+			// It ended the exec rather than dropping the caller's bytes, and
+			// it said which.
+			var reason string
+			for _, m := range drainAttachment(t, a) {
+				if m.Type == terminal.TypeExecError {
+					reason = m.Reason
+				}
+			}
+			if reason != terminal.ReasonStdinOverrun {
+				t.Fatalf("a stalled stdin ended with reason %q, want %q — a bare "+
+					"disconnect would be misattributed to the connection",
+					reason, terminal.ReasonStdinOverrun)
+			}
+			var sawKill bool
+			for _, s := range p.sentSignals() {
+				if s == syscall.SIGTERM || s == syscall.SIGKILL {
+					sawKill = true
+				}
+			}
+			if !sawKill {
+				t.Fatalf("a stalled stdin neither delivered nor ended the exec: %v",
+					p.sentSignals())
+			}
+		})
+	}
+}
+
+// TestOrdinaryStdinIsNeverRefused is the other half: the bound is generous
+// enough that a command which reads its input normally never approaches it,
+// however much the caller pipes.
+func TestOrdinaryStdinIsNeverRefused(t *testing.T) {
+	start := newFakeStarter()
+	r, _ := testRunner(t, start.start)
+	spec := withTool(t, r, "tool")
+
+	a := r.OpenExec(spec)
+	p := start.await(t)
+	if m := <-a.Msgs(); m.Type != terminal.TypeExecStarted {
+		t.Fatalf("first message = %q", m.Type)
+	}
+
+	// 32 MiB in 32 KiB chunks, the shape the CLI actually sends, into a child
+	// that reads it as fast as it arrives.
+	//
+	// The feed is PACED, and that is the honest model rather than a
+	// concession: in production this loop is the relay demux reading a
+	// socket, so the rate is the network's. A test that fed from a tight
+	// local loop would be measuring whether one goroutine can outrun another
+	// on this machine, which is a question about the Go scheduler and not
+	// about exec.
+	chunk := make([]byte, 32<<10)
+	for i := range chunk {
+		chunk[i] = byte(i)
+	}
+	const chunks = 512 // 16 MiB, four times the sandbox's own stdin bound
+	for i := 0; i < chunks; i++ {
+		a.Client(terminal.ClientMessage{Type: "stdin", Data: chunk})
+		time.Sleep(time.Millisecond) // ≈32 MB/s, faster than most links
+	}
+	a.Client(terminal.ClientMessage{Type: terminal.TypeExecStdinEOF})
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		n, closed := p.stdinProgress()
+		if n == chunks*len(chunk) && closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("delivered %d of %d bytes (closed=%v); an ordinary stream was refused",
+				n, chunks*len(chunk), closed)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	p.exit(Status{})
+	for _, m := range drainAttachment(t, a) {
+		if m.Type == terminal.TypeExecError {
+			t.Fatalf("an ordinary stream was refused: %+v", m)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the session ending underneath an exec
+// ---------------------------------------------------------------------------
+
+// TestKillAllRacingAnOpeningExecDoesNotPanic is the crash this sandbox must
+// never have. The slot is taken before the spawn, so the session's own
+// shutdown can reach an attachment that has no process yet — and the closing
+// it does there used to race the `exec_started` and the refusal that follow,
+// which is a send on a closed channel and takes sessiond down with it. It
+// takes it down BEFORE the shutdown path flushes the agent's last write,
+// which is the part that costs somebody their work.
+//
+// It is a loop rather than one attempt because the window is microseconds
+// wide: a single pass would pass on a build with the bug.
+func TestKillAllRacingAnOpeningExecDoesNotPanic(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		start := newFakeStarter()
+		r, _ := testRunner(t, start.start)
+		spec := withTool(t, r, "tool")
+
+		opened := make(chan relay.ExecAttachment, 1)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); opened <- r.OpenExec(spec) }()
+		go func() { defer wg.Done(); r.KillAll() }()
+		wg.Wait()
+
+		// The race has run. Whether the shutdown reached this exec or missed
+		// it entirely is the whole point — so the attachment is ended here
+		// either way, and the assertion is that nothing panicked and
+		// everything still closes.
+		a := <-opened
+		drained := make(chan struct{})
+		go func() { defer close(drained); drainAttachment(t, a) }()
+		for {
+			select {
+			case <-drained:
+			case <-time.After(2 * time.Millisecond):
+				r.KillAll()
+				continue
+			}
+			break
+		}
+	}
+}
+
+// TestASpawnThatRacesTheSessionsEndIsStillKilled is the other half: the spawn
+// cannot be undone, so a process created in the instant the session was
+// stopped has to be ended rather than left behind. It is what keeps "a
+// detached exec dies with its session" true even at the boundary.
+func TestASpawnThatRacesTheSessionsEndIsStillKilled(t *testing.T) {
+	start := newFakeStarter()
+	r, _ := testRunner(t, start.start)
+	spec := withTool(t, r, "tool")
+	spec.Detach, spec.LogPath = true, "run.log"
+
+	// Hold the spawn until the session has already ended.
+	release := make(chan struct{})
+	r.start = func(req Request, onStdout, onStderr func([]byte) error) (Proc, error) {
+		<-release
+		return start.start(req, onStdout, onStderr)
+	}
+
+	a := r.OpenExec(spec)
+	// Wait until the slot is taken, which is what makes the attachment
+	// reachable by KillAll.
+	deadline := time.Now().Add(5 * time.Second)
+	for r.LiveCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the exec never took its slot")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	r.KillAll()
+	close(release)
+
+	p := start.await(t)
+	drainAttachment(t, a)
+	deadline = time.Now().Add(5 * time.Second)
+	for len(p.sentSignals()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("a process spawned as the session ended was left running")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestDetachedExecsCannotFillEverySlot is the reason the detached cap is
+// lower than the total. A detached process holds its slot for as long as it
+// runs, and the design's only way to stop one is `rainier exec s -- kill
+// <pid>` — which is itself an exec. A session that could fill all eight slots
+// with detached work would have no way left to stop any of it, and no listing
+// and no kill API to fall back on.
+func TestDetachedExecsCannotFillEverySlot(t *testing.T) {
+	start := newFakeStarter()
+	r, root := testRunner(t, start.start)
+	spec := withTool(t, r, "tool")
+	detached := spec
+	detached.Detach, detached.LogPath = true, "run.log"
+
+	for i := 0; i < MaxDetached; i++ {
+		msgs := drainAttachment(t, r.OpenExec(detached))
+		if len(msgs) != 1 || msgs[0].Type != terminal.TypeExecStarted {
+			t.Fatalf("detached exec %d answered %+v", i, msgs)
+		}
+		start.await(t)
+	}
+	// The next DETACHED one is refused...
+	msgs := drainAttachment(t, r.OpenExec(detached))
+	if len(msgs) != 1 || msgs[0].Reason != terminal.ReasonTooManyExecs {
+		t.Fatalf("the %dth detached exec got %+v", MaxDetached+1, msgs)
+	}
+	// ...and an ATTACHED one — the `kill <pid>` that ends them — still runs.
+	a := r.OpenExec(spec)
+	p := start.await(t)
+	if m := <-a.Msgs(); m.Type != terminal.TypeExecStarted {
+		t.Fatalf("the command that stops a detached run was refused: %+v", m)
+	}
+	p.exit(Status{})
+	drainAttachment(t, a)
+	_ = root
+}
+
+// TestALogThatWouldBlockIsRefused. The path is the CALLER's, and a caller who
+// can run one command can create anything on it: `open(2)` O_WRONLY on a FIFO
+// with no reader never returns. This used to run on the relay's shared demux,
+// where that froze the whole session — no terminal input, no session RPC, no
+// FrameClose — until the conn died.
+func TestALogThatWouldBlockIsRefused(t *testing.T) {
+	start := newFakeStarter()
+	r, root := testRunner(t, start.start)
+	spec := withTool(t, r, "tool")
+	spec.Detach, spec.LogPath = true, "wedge.log"
+
+	if err := syscall.Mkfifo(filepath.Join(root, "wedge.log"), 0o644); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+
+	done := make(chan []terminal.ServerMessage, 1)
+	go func() { done <- drainAttachment(t, r.OpenExec(spec)) }()
+	select {
+	case msgs := <-done:
+		if len(msgs) != 1 || msgs[0].Reason != terminal.ReasonLogRefused {
+			t.Fatalf("a FIFO log got %+v, want one exec_error log_refused", msgs)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("opening a FIFO log never returned")
+	}
+	if r.LiveCount() != 0 {
+		t.Fatalf("the refused exec kept its slot: %d live", r.LiveCount())
+	}
+}
+
+// TestTheEnvRuleCoversTheChannelsThatChangeWhatRuns. The list is not a
+// privilege boundary — a caller who may exec may run `sh -c` — but it is what
+// keeps "somebody ran git here" from being the record of somebody running
+// something else through git, and what keeps `-- make` running make.
+func TestTheEnvRuleCoversTheChannelsThatChangeWhatRuns(t *testing.T) {
+	refused := []string{
+		// The loader, as a prefix: LD_AUDIT is LD_PRELOAD by another name.
+		"LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_PROFILE",
+		"LD_DEBUG_OUTPUT", "LD_ORIGIN_PATH", "LD_ANYTHING_AT_ALL",
+		// git's config injection, which reaches core.sshCommand,
+		// credential.helper and core.pager — every one of the named hooks.
+		"GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+		"GIT_CONFIG_KEY_17", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG",
+		"GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_PROXY_COMMAND",
+		"GIT_EDITOR", "GIT_PAGER", "GIT_SEQUENCE_EDITOR", "GIT_ASKPASS",
+		"GIT_DIR", "GIT_WORK_TREE",
+		// Shell startup files and trace hooks.
+		"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "PS4",
+		// Interpreter option channels: --eval under another name.
+		"NODE_OPTIONS", "PYTHONSTARTUP", "PERL5OPT", "RUBYOPT",
+		// The originals.
+		"HOME", "PATH", "SHELL", "IFS", "RAINIER_DIAL", "PAGER", "EDITOR",
+	}
+	for _, name := range refused {
+		t.Run("refused "+name, func(t *testing.T) {
+			start := newFakeStarter()
+			r, _ := testRunner(t, start.start)
+			spec := withTool(t, r, "tool")
+			spec.Env = map[string]string{name: "x"}
+			msgs := drainAttachment(t, r.OpenExec(spec))
+			if len(msgs) != 1 || msgs[0].Reason != terminal.ReasonEnvRefused {
+				t.Fatalf("%s was accepted (%+v); it changes what a named binary runs", name, msgs)
+			}
+		})
+	}
+
+	// And the names an ordinary build actually needs are still allowed: a
+	// prefix rule over GIT_ or PYTHON would have taken these away.
+	allowed := []string{"GIT_AUTHOR_NAME", "GIT_COMMITTER_EMAIL", "PYTHONPATH",
+		"NODE_ENV", "CI", "CARGO_TERM_COLOR", "_private", "MAKEFLAGS"}
+	for _, name := range allowed {
+		t.Run("allowed "+name, func(t *testing.T) {
+			start := newFakeStarter()
+			r, _ := testRunner(t, start.start)
+			spec := withTool(t, r, "tool")
+			spec.Env = map[string]string{name: "x"}
+			a := r.OpenExec(spec)
+			p := start.await(t)
+			if !contains(start.lastRequest(t).Env, name+"=x") {
+				t.Fatalf("%s was refused; an ordinary build needs it", name)
+			}
+			p.exit(Status{})
+			drainAttachment(t, a)
+		})
+	}
+}
+
+// TestAnEnormousEnvIsBounded: a name or a value is not a way to make this
+// process allocate, nor to push an execve over E2BIG in a way that would
+// report as "not executable" rather than as the refusal it is.
+func TestAnEnormousEnvIsBounded(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"a huge name":  {"A" + strings.Repeat("B", maxEnvNameBytes): "x"},
+		"a huge value": {"OK_NAME": strings.Repeat("v", maxEnvValueBytes+1)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			start := newFakeStarter()
+			r, _ := testRunner(t, start.start)
+			spec := withTool(t, r, "tool")
+			spec.Env = env
+			msgs := drainAttachment(t, r.OpenExec(spec))
+			if len(msgs) != 1 || msgs[0].Reason != terminal.ReasonEnvRefused {
+				t.Fatalf("got %+v, want one exec_error env_refused", msgs)
+			}
+		})
+	}
+}
+
+// TestAPtySizeIsClampedRatherThanRefused: the ioctl takes a uint16, so a
+// plain conversion turns 65536 into a nought-column terminal — a size no
+// program draws on, installed as though the caller had asked for it.
+func TestAPtySizeIsClampedRatherThanRefused(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cols, rows, wantCols, wantRows int
+	}{
+		"none at all":   {0, 0, ptyDefaultCols, ptyDefaultRows},
+		"negative":      {-1, -1, ptyDefaultCols, ptyDefaultRows},
+		"past a uint16": {65536, 100000, 65535, 65535},
+		"ordinary":      {100, 40, 100, 40},
+	} {
+		t.Run(name, func(t *testing.T) {
+			start := newFakeStarter()
+			r, _ := testRunner(t, start.start)
+			spec := withTool(t, r, "tool")
+			spec.TTY, spec.Cols, spec.Rows = true, tc.cols, tc.rows
+			a := r.OpenExec(spec)
+			p := start.await(t)
+			req := start.lastRequest(t)
+			if req.Cols != tc.wantCols || req.Rows != tc.wantRows {
+				t.Fatalf("%dx%d became %dx%d, want %dx%d",
+					tc.cols, tc.rows, req.Cols, req.Rows, tc.wantCols, tc.wantRows)
+			}
+			p.exit(Status{})
+			drainAttachment(t, a)
+		})
 	}
 }

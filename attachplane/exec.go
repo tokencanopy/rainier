@@ -54,12 +54,18 @@ var _ ExecBroker = execBroker{}
 
 // The two errors an exec socket can be closed with that an attach cannot.
 var (
-	// errExecUnsupported is the sandbox refusing, or failing to confirm, the
-	// exec — the permanent "old sessiond" case above. The client is also
-	// SENT an exec_error{unsupported} before the close, because a close
+	// errExecUnsupported is the sandbox answering something that is not an
+	// exec_started — the permanent "old sessiond" case above. The client is
+	// also SENT an exec_error{unsupported} before the close, because a close
 	// reason is a string a CLI has to pattern-match and a message is a field
 	// it can switch on.
 	errExecUnsupported = errors.New("controld: the session's sandbox does not support exec")
+	// errExecNoAnswer is the sandbox answering NOTHING in time, which is a
+	// different fact and deliberately a different word. "This session was
+	// created before exec shipped" is permanent and sends a caller to make a
+	// new session; saying it about a sandbox that was merely slow would be a
+	// false statement a caller would act on.
+	errExecNoAnswer = errors.New("controld: the session's sandbox did not answer in time")
 	// errExecEnded is an exec that ran and is over.
 	errExecEnded = errors.New("controld: the exec ended")
 )
@@ -103,6 +109,11 @@ func (b execBroker) Exec(ctx context.Context, target control.AttachTarget,
 		// this entry: take it back and let the caller close the client.
 		p.attaches.claim(attachID)
 		p.logf("controld: exec %s: %v", target.SessionID, err)
+		// Closed here, not left to the caller: this port's contract is that a
+		// broker either splices the stream or ends it, never both and never
+		// neither, and a second host composing this broker is entitled to
+		// rely on that rather than on what today's one happens to do.
+		_ = stream.Close(control.ErrUnavailable)
 		return control.ErrUnavailable
 	}
 
@@ -178,16 +189,20 @@ var ErrExecFirstMessage = errors.New("controld: the first exec message must be a
 // unsupported, having forwarded nothing.
 func execSplice(ctx context.Context, client control.TerminalStream, sandbox runnerConn,
 	ackTimeout time.Duration) {
-	started, err := awaitExecStarted(ctx, sandbox, ackTimeout)
+	started, err := awaitExecStarted(ctx, sandbox, execHandshakeTimeout)
 	if err != nil {
 		// The client is told in its own vocabulary before the socket goes:
 		// a close reason is a string a CLI has to pattern-match, a message
 		// is a field it can switch on.
+		reason := terminal.ReasonUnsupported
+		if errors.Is(err, errExecNoAnswer) {
+			reason = terminal.ReasonNoAnswer
+		}
 		tellCtx, cancel := context.WithTimeout(ctx, ackTimeout)
 		_ = client.Send(tellCtx, terminal.ServerMessage{
-			Type: terminal.TypeExecError, Reason: terminal.ReasonUnsupported})
+			Type: terminal.TypeExecError, Reason: reason})
 		cancel()
-		_ = client.Close(errExecUnsupported)
+		_ = client.Close(err)
 		sandbox.Close()
 		return
 	}
@@ -213,11 +228,7 @@ func execSplice(ctx context.Context, client control.TerminalStream, sandbox runn
 			// exactly as an attach client's `control` is: there is nothing
 			// for it to claim.
 			m.Generation = ""
-			raw, err := json.Marshal(m)
-			if err != nil {
-				return
-			}
-			if sandbox.Write(ctx, raw) != nil {
+			if !forwardExecClient(ctx, sandbox, m) {
 				return
 			}
 		}
@@ -254,14 +265,24 @@ func execSplice(ctx context.Context, client control.TerminalStream, sandbox runn
 	<-done // let the second pump exit before returning
 }
 
-// awaitExecStarted reads the sandbox's first message under the handshake's
-// own budget and requires it to be an `exec_started`.
+// execHandshakeTimeout bounds the sandbox's first message on an exec.
 //
-// The budget is short because this is a single small frame on an
-// already-open socket: the dial-back has happened, the sandbox has the spec,
-// and a sandbox that knows what an exec is answers immediately whether the
-// spawn succeeded or was refused. One that does not know answers a snapshot
-// just as fast, which is the case this exists to catch.
+// It is deliberately NOT the acknowledgement timeout an ownership handoff
+// uses, even though both are "one small frame on an already-open socket".
+// That one acknowledges a binding that is already installed; this one waits
+// for a SPAWN — a path resolution, a symlink-resolving containment check on a
+// caller-named directory, possibly a log file created on a cold filesystem,
+// and a fork. Two seconds is a fine budget for the first and a coin toss for
+// the second on a loaded box, and the cost of being wrong is telling a user
+// their session predates the feature.
+//
+// It is still short enough to be a fence rather than a wait: a sandbox that
+// does not know what an exec is answers its snapshot in microseconds, so the
+// case this exists to catch is never the one that spends the budget.
+const execHandshakeTimeout = 10 * time.Second
+
+// awaitExecStarted reads the sandbox's first message under that budget and
+// requires it to be an `exec_started`.
 //
 // An `exec_error` is a perfectly good first message — a cwd outside the
 // workspace, an env name the rule refuses, one exec too many — and is
@@ -273,7 +294,9 @@ func awaitExecStarted(ctx context.Context, sandbox runnerConn,
 	defer cancel()
 	raw, err := sandbox.Read(ctx)
 	if err != nil {
-		return terminal.ServerMessage{}, errExecUnsupported
+		// Nothing at all, in time: a slow sandbox, or a dead one. Either way
+		// not an old one.
+		return terminal.ServerMessage{}, errExecNoAnswer
 	}
 	var m terminal.ServerMessage
 	if json.Unmarshal(raw, &m) != nil {
@@ -286,6 +309,49 @@ func awaitExecStarted(ctx context.Context, sandbox runnerConn,
 	default:
 		return terminal.ServerMessage{}, errExecUnsupported
 	}
+}
+
+// maxExecStdinChunk bounds one stdin message on its way to the sandbox, and
+// it exists because of an ARITHMETIC the hops do not otherwise notice: the
+// caller's bytes are base64 inside ClientMessage.Data, and the runner then
+// wraps the whole encoded message in relay.Frame.Payload, which is base64
+// AGAIN. Every hop caps a frame at 16 MiB, so about 9 MiB of stdin — well
+// under the limit the caller was checked against — becomes an oversized frame
+// at the sandbox, whose read limit closes the SESSION conn: every viewer
+// dropped, every in-flight exec killed, from one message.
+//
+// So a large stdin message is SPLIT rather than refused. The bytes and their
+// order are what the caller sent; only the framing changes, which is the one
+// thing on this hop that is nobody's contract. Rainier's own CLI already
+// sends 32 KiB pieces and never reaches this.
+const maxExecStdinChunk = 1 << 20
+
+// forwardExecClient writes one client message to the sandbox, splitting a
+// stdin message that is too large for the frame layer to carry. It reports
+// whether the write succeeded.
+func forwardExecClient(ctx context.Context, sandbox runnerConn, m terminal.ClientMessage) bool {
+	if m.Type != "stdin" || len(m.Data) <= maxExecStdinChunk {
+		return writeExecClient(ctx, sandbox, m)
+	}
+	for off := 0; off < len(m.Data); off += maxExecStdinChunk {
+		end := off + maxExecStdinChunk
+		if end > len(m.Data) {
+			end = len(m.Data)
+		}
+		if !writeExecClient(ctx, sandbox, terminal.ClientMessage{
+			Type: "stdin", Data: m.Data[off:end]}) {
+			return false
+		}
+	}
+	return true
+}
+
+func writeExecClient(ctx context.Context, sandbox runnerConn, m terminal.ClientMessage) bool {
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return false
+	}
+	return sandbox.Write(ctx, raw) == nil
 }
 
 // execClientForwardable is the closed set of messages a caller may send into

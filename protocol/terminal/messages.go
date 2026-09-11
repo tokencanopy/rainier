@@ -224,6 +224,16 @@ const (
 //	                   could not be opened
 //	ReasonTooManyExecs this session already has the maximum number of
 //	                   concurrent execs
+//	ReasonNoAnswer     the sandbox did not answer in time. It is kept apart
+//	                   from ReasonUnsupported deliberately: "this session was
+//	                   created before exec shipped" is permanent and sends a
+//	                   caller to make a new session, and saying it about a
+//	                   sandbox that was merely slow would be a false and
+//	                   actionable statement
+//	ReasonStdinOverrun the caller sent more input than the sandbox may hold
+//	                   for a command that is not reading it. It is the one
+//	                   reason that can arrive AFTER exec_started, because it
+//	                   is about the input rather than about the command
 const (
 	ReasonUnsupported   = "unsupported"
 	ReasonNotFound      = "not_found"
@@ -232,6 +242,8 @@ const (
 	ReasonEnvRefused    = "env_refused"
 	ReasonLogRefused    = "log_refused"
 	ReasonTooManyExecs  = "too_many_execs"
+	ReasonNoAnswer      = "no_answer"
+	ReasonStdinOverrun  = "stdin_overrun"
 )
 
 // ---------------------------------------------------------------------------

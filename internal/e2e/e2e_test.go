@@ -670,8 +670,7 @@ func (ss *scriptedSessiond) serve() {
 		}
 		switch f.Type {
 		case relay.FrameOpen:
-			if f.Kind == runner.KindExec {
-				ss.openExec(ctx, f)
+			if f.Kind == runner.KindExec && ss.openExec(ctx, f) {
 				continue
 			}
 			for _, m := range ss.openFrames(f.Since) {
@@ -707,14 +706,16 @@ func (ss *scriptedSessiond) serve() {
 // deliberately indistinguishable from one that predates the Kind field: the
 // caller never receives an exec_started, and the plane refuses on the missing
 // handshake.
-func (ss *scriptedSessiond) openExec(ctx context.Context, f relay.Frame) {
+func (ss *scriptedSessiond) openExec(ctx context.Context, f relay.Frame) bool {
 	execs := ss.execRunner()
 	if execs == nil || f.Exec == nil {
-		raw, err := relay.Encode(relay.Frame{Type: relay.FrameClose, AttachID: f.AttachID})
-		if err == nil {
-			ss.conn.Write(ctx, raw)
-		}
-		return
+		// NOT handled: this sandbox has no exec runner, which is exactly what
+		// a sessiond older than the Kind field is. Such a build reads the
+		// FrameOpen, sees a kind it does not know, and opens a TERMINAL
+		// attachment — so the caller returns false and the snapshot goes out,
+		// which is the case the plane's exec_started handshake exists to
+		// catch.
+		return false
 	}
 	att := execs.OpenExec(*f.Exec)
 	ss.mu.Lock()
@@ -734,6 +735,7 @@ func (ss *scriptedSessiond) openExec(ctx context.Context, f relay.Frame) {
 			ss.conn.Write(ctx, raw)
 		}
 	}()
+	return true
 }
 
 func (ss *scriptedSessiond) execAttachment(id uint64) relay.ExecAttachment {

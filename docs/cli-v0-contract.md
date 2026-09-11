@@ -389,8 +389,8 @@ reaches the session's emulator, event log or any other viewer's screen —
 `rainier attach --since 0` never replays it. It works while another device
 holds the lease, which is the case it is most wanted in.
 
-`--tty` allocates a terminal and **merges stdout into stderr**, because a pty
-has one stream; the local window size is sent at open and on every SIGWINCH,
+`--tty` allocates a terminal and **merges stderr into stdout**, because a pty
+has one stream — everything the command writes arrives on rainier's stdout; the local window size is sent at open and on every SIGWINCH,
 and it resizes *that exec's* pty and nothing else. `--cwd` must resolve inside
 `/workspace`, symlinks included. `--env` sets one variable per flag; names
 must match `^[A-Za-z_][A-Za-z0-9_]*$`, must not be in the `RAINIER_*`
@@ -453,6 +453,7 @@ tell "the command failed" from "rainier failed":
 | accepted, but no exit status ever arrived | **125** |
 | the command could not be executed (`not_executable`, `cwd_refused`, `env_refused`, `log_refused`) | **126** |
 | the command was not found | **127** |
+| Ctrl-C twice: the caller left and the command was killed | 130 (128+SIGINT) |
 
 125/126/127 are `env(1)` and shell convention. The overlap with a command's own
 status is real and unavoidable — a command may itself exit 126 — and it is the
@@ -500,7 +501,10 @@ stdout carries the document after the command exits.
 `queued_ms` is the request-to-start time — the dial-back and the spawn — kept
 apart from `duration_ms` so a slow cell is not read as a slow build.
 `exit_code` and `signal` are both present and exactly one is null. A `--detach`
-document carries `"detached": true` and `"pid"` instead of a status. `--json`
+document carries `"detached": true` and `"pid"` instead of a status, and a
+refusal the sandbox or the plane named carries `"error"` with that reason — a
+caller who asked for machine-readable output should not have to parse a
+sentence off stderr to learn that its `--cwd` was refused. `--json`
 never carries output: bounding it would truncate, and not bounding it would
 put a build log in a JSON string.
 

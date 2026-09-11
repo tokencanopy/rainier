@@ -259,9 +259,16 @@ func tellExecRefusal(ctx context.Context, stream control.TerminalStream, reason 
 // the same words, rather than inventing a second vocabulary for the same
 // answers.
 func ExecRefusal(cmd ExecCommand) string {
+	// The words mean what they say. "Not found" is for a command that was
+	// looked for, so an argv that is merely too big to carry is "could not be
+	// executed" — which is true, and is the 126 a script reads as "Rainier
+	// refused this" rather than the 127 it reads as "you typed a name this
+	// sandbox does not have".
 	switch {
-	case len(cmd.Argv) == 0, cmd.Argv[0] == "", len(cmd.Argv) > maxExecArgv:
+	case len(cmd.Argv) == 0, cmd.Argv[0] == "":
 		return terminal.ReasonNotFound
+	case len(cmd.Argv) > maxExecArgv:
+		return terminal.ReasonNotExecutable
 	}
 	total := 0
 	for _, arg := range cmd.Argv {
@@ -271,7 +278,7 @@ func ExecRefusal(cmd ExecCommand) string {
 		total += len(arg)
 	}
 	if total > maxExecArgvBytes {
-		return terminal.ReasonNotFound
+		return terminal.ReasonNotExecutable
 	}
 	if len(cmd.Env) > maxExecEnv {
 		return terminal.ReasonEnvRefused
@@ -297,11 +304,11 @@ func ExecRefusal(cmd ExecCommand) string {
 			return terminal.ReasonLogRefused
 		}
 	}
-	if cmd.TTY && (cmd.Cols <= 0 || cmd.Rows <= 0) {
-		// A terminal with no size would leave the sandbox opening a pty at
-		// 0x0, which no program draws on.
-		return terminal.ReasonNotExecutable
-	}
+	// A size is deliberately NOT refused here. The sandbox clamps it into
+	// what the pty ioctl can carry, so an absent or absurd one costs a caller
+	// a default-sized terminal rather than a refusal — and refusing would
+	// have meant answering "the command is not executable" for a window
+	// dimension, which is a word about something else.
 	return ""
 }
 

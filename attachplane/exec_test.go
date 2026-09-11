@@ -1,6 +1,7 @@
 package attachplane
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,11 @@ func runExec(t *testing.T, spec runner.ExecSpec, serve func(conn relay.Conn)) (
 			return
 		}
 		defer c.CloseNow()
+		// The same read limit runnerd's own dial-back sets. Without it
+		// coder/websocket's 32 KiB default closes the socket on the first
+		// frame bigger than that, which is every frame this hop is supposed
+		// to carry.
+		c.SetReadLimit(attachReadLimit)
 		serve(relay.WSConn(c))
 		close(served)
 	}
@@ -157,8 +163,14 @@ func TestExecRequiresExecStarted(t *testing.T) {
 	}
 }
 
-// TestExecRefusesASilentSandbox: a sandbox that answers nothing at all is the
-// same refusal, bounded by the acknowledgement timeout rather than left open.
+// TestExecRefusesASilentSandbox: a sandbox that answers nothing at all is
+// refused too, bounded rather than left open — but with a DIFFERENT word.
+//
+// "Unsupported" means "this session was created before exec shipped", which
+// is permanent and sends a caller to make a new session. A sandbox that was
+// merely slow, or that died between the dial-back and its first frame, is
+// none of those things, and saying so would be a false statement a caller
+// would act on.
 func TestExecRefusesASilentSandbox(t *testing.T) {
 	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 150 * time.Millisecond})
 	hold := make(chan struct{})
@@ -178,8 +190,61 @@ func TestExecRefusesASilentSandbox(t *testing.T) {
 			brokerTarget("sess_test", "vm1"), execSpecOf("true"), stream)
 	}()
 	m := stream.nextServerMsg(t)
-	if m.Type != terminal.TypeExecError || m.Reason != terminal.ReasonUnsupported {
-		t.Fatalf("a silent sandbox produced %+v", m)
+	if m.Type != terminal.TypeExecError || m.Reason != terminal.ReasonNoAnswer {
+		t.Fatalf("a silent sandbox produced %+v, want exec_error no_answer", m)
+	}
+	if err := stream.closeReason(t); !errors.Is(err, errExecNoAnswer) {
+		t.Fatalf("closed with %v, want errExecNoAnswer", err)
+	}
+}
+
+// TestExecStdinIsSplitToFitTheFrameLayer. A caller's stdin bytes are base64
+// inside the message, and the runner base64s the whole message again into the
+// frame — so a message well under the plane's own 16 MiB limit becomes an
+// oversized FRAME at the sandbox, whose read limit closes the SESSION conn:
+// every viewer dropped and every in-flight exec killed, from one message.
+//
+// The bytes and their order are the caller's; only the framing changes.
+func TestExecStdinIsSplitToFitTheFrameLayer(t *testing.T) {
+	const total = 3*maxExecStdinChunk + 1234
+	got := make(chan []byte, 1)
+	stream, _, _ := runExec(t, execSpecOf("cat"), func(conn relay.Conn) {
+		sandboxSend(t, conn, terminal.ServerMessage{Type: terminal.TypeExecStarted})
+		var seen []byte
+		for len(seen) < total {
+			m, err := sandboxRead(t, conn)
+			if err != nil {
+				break
+			}
+			if m.Type != "stdin" {
+				continue
+			}
+			if len(m.Data) > maxExecStdinChunk {
+				t.Errorf("a %d-byte stdin frame reached the sandbox; the limit is %d",
+					len(m.Data), maxExecStdinChunk)
+				break
+			}
+			seen = append(seen, m.Data...)
+		}
+		got <- seen
+		sandboxSend(t, conn, terminal.ServerMessage{Type: terminal.TypeExecExit})
+	})
+	stream.nextServerMsg(t) // exec_started
+
+	body := make([]byte, total)
+	for i := range body {
+		body[i] = byte(i)
+	}
+	stream.in <- terminal.ClientMessage{Type: "stdin", Data: body}
+
+	select {
+	case seen := <-got:
+		if !bytes.Equal(seen, body) {
+			t.Fatalf("the sandbox received %d bytes, want the caller's %d, unchanged",
+				len(seen), len(body))
+		}
+	case <-time.After(testDeadline):
+		t.Fatal("the split stdin never arrived")
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -428,5 +429,139 @@ func TestRunReadsTheErrorEnvelopeOffARefusedUpgrade(t *testing.T) {
 					de, tc.status, tc.code, tc.state)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// a sandbox that lies
+// ---------------------------------------------------------------------------
+
+// TestASandboxCannotReportASuccessItDidNotHave is the range check on the one
+// number a sandbox supplies that the CLI turns straight into its own exit
+// status. os.Exit masks to eight bits, so a sandbox reporting 256 would make
+// `rainier exec` exit 0 — telling a script a failing command succeeded, which
+// is the single worst thing this command could get wrong.
+func TestASandboxCannotReportASuccessItDidNotHave(t *testing.T) {
+	for _, reported := range []int{256, 512, 300, -1, -256, 1 << 30} {
+		t.Run(fmt.Sprint(reported), func(t *testing.T) {
+			p := newFakePlane(t, func(p *fakePlane, ctx context.Context, c *websocket.Conn) {
+				send(t, ctx, c, terminal.ServerMessage{Type: terminal.TypeExecStarted})
+				send(t, ctx, c, terminal.ServerMessage{
+					Type: terminal.TypeExecExit, ExitCode: reported})
+			})
+			res, err := Run(context.Background(), p.wsURL(),
+				Options{Spec: runner.ExecSpec{Argv: []string{"x"}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.ExitCode != nil {
+				t.Fatalf("a reported status of %d was accepted as %d", reported, *res.ExitCode)
+			}
+			code, ok := ExitCodeFor(res)
+			if code != ExitNoStatus || !ok {
+				t.Fatalf("exit = (%d, %v), want (125, true) — never 0", code, ok)
+			}
+		})
+	}
+
+	// And the whole legal range still passes through verbatim.
+	for _, reported := range []int{0, 1, 125, 126, 127, 128, 254, 255} {
+		p := newFakePlane(t, func(p *fakePlane, ctx context.Context, c *websocket.Conn) {
+			send(t, ctx, c, terminal.ServerMessage{Type: terminal.TypeExecStarted})
+			send(t, ctx, c, terminal.ServerMessage{
+				Type: terminal.TypeExecExit, ExitCode: reported})
+		})
+		res, err := Run(context.Background(), p.wsURL(),
+			Options{Spec: runner.ExecSpec{Argv: []string{"x"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code, _ := ExitCodeFor(res); code != reported {
+			t.Fatalf("a reported status of %d exited %d", reported, code)
+		}
+	}
+}
+
+// TestASecondExecStartedIsIgnored: a sandbox that says it started twice does
+// not get to move the clock a second time, or to re-arm the input pumps.
+func TestASecondExecStartedIsIgnored(t *testing.T) {
+	p := newFakePlane(t, func(p *fakePlane, ctx context.Context, c *websocket.Conn) {
+		send(t, ctx, c, terminal.ServerMessage{Type: terminal.TypeExecStarted, PID: 1})
+		send(t, ctx, c, terminal.ServerMessage{Type: terminal.TypeExecStarted, PID: 999})
+		send(t, ctx, c, terminal.ServerMessage{Type: terminal.TypeExecExit, ExitCode: 3})
+	})
+	res, err := Run(context.Background(), p.wsURL(),
+		Options{Spec: runner.ExecSpec{Argv: []string{"x"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PID != 1 {
+		t.Fatalf("a second exec_started rewrote the pid to %d", res.PID)
+	}
+	if res.ExitCode == nil || *res.ExitCode != 3 {
+		t.Fatalf("result = %+v", res)
+	}
+}
+
+// TestOutputAfterTheExitIsNotWaitedFor: the exit is the end of the exec, so a
+// sandbox that keeps talking afterwards cannot hold the caller.
+func TestOutputAfterTheExitIsNotWaitedFor(t *testing.T) {
+	p := newFakePlane(t, func(p *fakePlane, ctx context.Context, c *websocket.Conn) {
+		send(t, ctx, c, terminal.ServerMessage{Type: terminal.TypeExecStarted})
+		send(t, ctx, c, terminal.ServerMessage{Type: terminal.TypeExecExit, ExitCode: 0})
+		<-ctx.Done() // and never closes
+	})
+	done := make(chan Result, 1)
+	go func() {
+		res, err := Run(context.Background(), p.wsURL(),
+			Options{Spec: runner.ExecSpec{Argv: []string{"x"}}})
+		if err != nil {
+			t.Error(err)
+		}
+		done <- res
+	}()
+	select {
+	case res := <-done:
+		if res.ExitCode == nil || *res.ExitCode != 0 {
+			t.Fatalf("result = %+v", res)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the caller waited past the exit status it already had")
+	}
+}
+
+// TestADoubleInterruptIsADecidedOutcome pins the Ctrl-C policy's second half.
+// A caller that pressed Ctrl-C twice and left killed the command; 130 is what
+// a shell reports for a command an interrupt ended, and it is the honest
+// answer — the status is missing because this caller stopped waiting for it,
+// not because anything went wrong with the connection.
+func TestADoubleInterruptIsADecidedOutcome(t *testing.T) {
+	code, ok := ExitCodeFor(Result{Started: true, Interrupted: true})
+	if !ok || code != 130 {
+		t.Fatalf("an interrupted exec exits (%d, %v), want (130, true)", code, ok)
+	}
+	// A command that exited on its own before the second press still reports
+	// its own status: the interrupt only decides when nothing else did.
+	seven := 7
+	if got, _ := ExitCodeFor(Result{Started: true, Interrupted: true, ExitCode: &seven}); got != 7 {
+		t.Fatalf("an interrupted exec that DID report exited %d, want 7", got)
+	}
+	if got, _ := ExitCodeFor(Result{Started: true, Interrupted: true, Signal: "KILL"}); got != 137 {
+		t.Fatalf("an interrupted exec that was signalled exited %d, want 137", got)
+	}
+}
+
+// TestRainiersOwnRefusalsNeverDecideTheExitCode: every reason that is
+// Rainier's failure rather than the command's is reported as such, so the
+// caller prints a sentence instead of inventing a status.
+func TestRainiersOwnRefusalsNeverDecideTheExitCode(t *testing.T) {
+	for _, reason := range []string{
+		terminal.ReasonUnsupported, terminal.ReasonTooManyExecs,
+		terminal.ReasonNoAnswer, terminal.ReasonStdinOverrun,
+	} {
+		code, ok := ExitCodeFor(Result{Reason: reason})
+		if ok || code != 1 {
+			t.Fatalf("%s = (%d, %v), want (1, false)", reason, code, ok)
+		}
 	}
 }

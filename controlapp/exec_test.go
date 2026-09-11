@@ -3,6 +3,7 @@ package controlapp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -292,13 +293,15 @@ func TestExecAuditsTheCommandNameAndNothingElse(t *testing.T) {
 		e.Resource.ID != "sess_example" || e.PlacementGeneration != 7 {
 		t.Fatalf("event = %+v", e)
 	}
-	// Nothing else from the request is anywhere in it.
+	// Nothing else from the request is anywhere in it. The event is rendered
+	// WHOLE — every exported field, by reflection — rather than by naming the
+	// fields the test already knows about, which would pass unchanged if a
+	// future field started carrying an argument.
+	rendered := fmt.Sprintf("%+v", e)
 	for _, forbidden := range []string{"push", "--force", "token", "secret-dir",
-		"SECRET_TOKEN", "s3cr3t-value"} {
-		if strings.Contains(strings.Join([]string{
-			string(e.Command), string(e.Action), string(e.Resource.ID),
-			string(e.ActorID), string(e.WorkspaceID)}, " "), forbidden) {
-			t.Fatalf("the audit event carried %q", forbidden)
+		"SECRET_TOKEN", "s3cr3t-value", "/usr/bin"} {
+		if strings.Contains(rendered, forbidden) {
+			t.Fatalf("the audit event carried %q: %s", forbidden, rendered)
 		}
 	}
 }
@@ -387,6 +390,26 @@ func TestExecCommandName(t *testing.T) {
 // shape
 // ---------------------------------------------------------------------------
 
+// TestExecRefusalWordsMeanWhatTheySay: "not found" is for a command that was
+// LOOKED FOR, so an argv that is merely too big to carry is "could not be
+// executed" — 126, which a script reads as "Rainier refused this", rather
+// than 127, which it reads as "you typed a name this sandbox does not have".
+func TestExecRefusalWordsMeanWhatTheySay(t *testing.T) {
+	huge := execTestCommand()
+	huge.Argv = make([]string, maxExecArgv+1)
+	for i := range huge.Argv {
+		huge.Argv[i] = "x"
+	}
+	if got := ExecRefusal(huge); got != terminal.ReasonNotExecutable {
+		t.Fatalf("an over-long argv = %q, want %q", got, terminal.ReasonNotExecutable)
+	}
+	empty := execTestCommand()
+	empty.Argv = nil
+	if got := ExecRefusal(empty); got != terminal.ReasonNotFound {
+		t.Fatalf("an empty argv = %q, want %q", got, terminal.ReasonNotFound)
+	}
+}
+
 // TestValidateExec is the hop-before-the-sandbox check: what can be refused
 // without a filesystem is refused here, early, where it is still a status
 // code. It is deliberately not the whole check — the sandbox re-derives every
@@ -402,7 +425,6 @@ func TestValidateExec(t *testing.T) {
 		"no argv":            ok(func(c *ExecCommand) { c.Argv = nil }),
 		"empty argv0":        ok(func(c *ExecCommand) { c.Argv = []string{""} }),
 		"a NUL in argv":      ok(func(c *ExecCommand) { c.Argv = []string{"sh", "a\x00b"} }),
-		"too many args":      ok(func(c *ExecCommand) { c.Argv = make([]string, maxExecArgv+1) }),
 		"cwd outside":        ok(func(c *ExecCommand) { c.Cwd = "/etc" }),
 		"cwd with dot dot":   ok(func(c *ExecCommand) { c.Cwd = "../secrets" }),
 		"cwd with a NUL":     ok(func(c *ExecCommand) { c.Cwd = "a\x00b" }),
@@ -414,7 +436,6 @@ func TestValidateExec(t *testing.T) {
 		"log outside":        ok(func(c *ExecCommand) { c.Detach, c.Log = true, "/etc/x.log" }),
 		"log with dot dot":   ok(func(c *ExecCommand) { c.Detach, c.Log = true, "../x.log" }),
 		"log without detach": ok(func(c *ExecCommand) { c.Log = "run.log" }),
-		"tty with no size":   ok(func(c *ExecCommand) { c.TTY = true }),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := ValidateExec(cmd); !errors.Is(err, control.ErrInvalid) {
@@ -432,6 +453,13 @@ func TestValidateExec(t *testing.T) {
 		"a detached run":  ok(func(c *ExecCommand) { c.Detach, c.Log = true, "run.log" }),
 		"an empty env":    ok(func(c *ExecCommand) { c.Env = map[string]string{} }),
 		"an absolute log": ok(func(c *ExecCommand) { c.Detach, c.Log = true, "/workspace/run.log" }),
+		// A SIZE is not the plane's to refuse: the sandbox clamps it into
+		// what the pty ioctl carries, so an absent or absurd one costs a
+		// default-sized terminal rather than a refusal — and refusing would
+		// have meant answering "the command is not executable" about a
+		// window dimension.
+		"a tty with no size":        ok(func(c *ExecCommand) { c.TTY = true }),
+		"a tty with an absurd size": ok(func(c *ExecCommand) { c.TTY, c.Cols, c.Rows = true, 1<<20, -4 }),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := ValidateExec(cmd); err != nil {
@@ -485,5 +513,39 @@ func TestExecStartMessage(t *testing.T) {
 				t.Fatalf("got %v, want ErrInvalid", err)
 			}
 		})
+	}
+}
+
+// TestExecAuditIsRenderedWholeAndIsStillClean is the same claim as above,
+// applied to a spec whose every field is a distinctive marker. It exists
+// because the natural way to write that assertion — listing the fields the
+// test already knows about — would keep passing if a NEW field on
+// control.Event ever started carrying one of them.
+func TestExecAuditIsRenderedWholeAndIsStillClean(t *testing.T) {
+	fx := newExecFixture(t)
+	cmd := ExecCommand{
+		SessionID: "sess_example",
+		Argv: []string{"/opt/marker-dir/git", "marker-arg-one", "--marker-flag",
+			"marker-arg-two"},
+		Cwd: "marker-cwd",
+		Env: map[string]string{"MARKER_NAME": "marker-value"},
+		TTY: true, Cols: 4242, Rows: 2424,
+	}
+	if err := fx.svc.ExecCommand(context.Background(), attachmentTestScope(),
+		cmd, &attachmentRecordingTerminalStream{}); err != nil {
+		t.Fatal(err)
+	}
+	got := fx.events.snapshot()
+	if len(got) != 1 || got[0].Command != "git" {
+		t.Fatalf("recorded %+v, want one event naming git", got)
+	}
+	rendered := fmt.Sprintf("%+v", got[0])
+	for _, marker := range []string{
+		"marker-dir", "marker-arg-one", "--marker-flag", "marker-arg-two",
+		"marker-cwd", "MARKER_NAME", "marker-value", "4242", "2424", "/opt",
+	} {
+		if strings.Contains(rendered, marker) {
+			t.Fatalf("the audit event carried %q: %s", marker, rendered)
+		}
 	}
 }

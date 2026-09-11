@@ -247,7 +247,13 @@ func reportExec(cfg cli.Config, id string, spec runner.ExecSpec, res execio.Resu
 		fmt.Fprintln(os.Stdout, res.PID)
 		return nil
 	}
-	if jsonOut && res.Started {
+	// The document is written for a REFUSAL too, which is what its `error`
+	// field is for: a caller that asked for machine-readable output and got a
+	// cwd it could fix should not have to parse a sentence off stderr to
+	// learn that. Only a run that never reached the sandbox at all — a 404, a
+	// 409 — has nothing to describe, and that is reported as an error before
+	// this is ever called.
+	if jsonOut && (res.Started || res.Reason != "") {
 		if err := execJSON(id, spec, res); err != nil {
 			return err
 		}
@@ -279,7 +285,14 @@ func execRefusal(res execio.Result) error {
 			"before exec shipped. A session created now can be exec'd into.")
 	case terminal.ReasonTooManyExecs:
 		return errors.New("this session is already running as many commands as it may; " +
-			"wait for one to finish")
+			"wait for one to finish, or stop a detached one with " +
+			"rainier exec <session> -- kill <pid>")
+	case terminal.ReasonNoAnswer:
+		return errors.New("the session's sandbox did not answer in time; try again")
+	case terminal.ReasonStdinOverrun:
+		return errors.New("the command stopped reading its input while more was still " +
+			"arriving, and the session will not buffer more of it.\n" +
+			"Run it again writing to a file instead: rainier exec <session> -- sh -c 'cat > f'")
 	}
 	if res.Interrupted {
 		return errors.New("interrupted")

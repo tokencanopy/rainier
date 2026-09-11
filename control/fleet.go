@@ -182,6 +182,13 @@ type Event struct {
 	// nothing else: the base name of argv[0], capped at 64 bytes, and "?"
 	// when it is not printable ASCII. Empty on every other action.
 	//
+	// It is what was ASKED FOR rather than what ran. The name is
+	// path.Base(argv[0]) as the caller typed it, settled at the plane; the
+	// sandbox resolves argv[0] a hop later, so `-- ./git` runs a file the
+	// caller planted and is recorded as "git". An audit reader should read
+	// this as "somebody asked to run something called git here", which is
+	// the question the log is being asked.
+	//
 	// The cap and the vocabulary are the point rather than an
 	// implementation detail. "Somebody ran git in this session at this
 	// time" is the whole of what this field may say, which answers the

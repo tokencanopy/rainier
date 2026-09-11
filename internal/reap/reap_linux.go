@@ -20,8 +20,28 @@ var (
 	mu      sync.Mutex
 	cond    = sync.NewCond(&mu)
 	codes   = map[int]Status{} // pid -> outcome, for pids the reaper has reaped
+	order   []int              // insertion order of `codes`, for the bound below
 	started bool
 )
+
+// maxUnclaimed bounds how many reaped outcomes may sit waiting for a caller
+// that is never going to ask.
+//
+// Most of what this process reaps IS claimed: the agent's own child and every
+// exec go through AwaitStatus, which deletes its entry. What is not claimed
+// is the orphans — PR_SET_CHILD_SUBREAPER makes this process the parent of
+// every grandchild whose own parent exited, and `git fetch` spawning
+// git-remote-https is the ordinary shape of that, not a corner. A session
+// outlives everything else in this system (spec §10), so an unbounded map of
+// them is a leak measured in weeks.
+//
+// The oldest are dropped first, which is the safe direction: a waiter is
+// normally already waiting when its child exits, so an entry that has sat
+// through a thousand later exits is one nobody is coming for. A dropped entry
+// that somebody IS waiting for leaves that waiter blocked in AwaitStatus,
+// which is why the bound is far above any real concurrency — the cap is eight
+// execs plus the agent.
+const maxUnclaimed = 4096
 
 // Start installs the SIGCHLD reaper. Safe to call once. After Start, AwaitExit
 // returns the reaped exit code for a given child pid (blocking until reaped).
@@ -51,12 +71,38 @@ func Start() {
 					break
 				} // no more reapable now
 				mu.Lock()
-				codes[pid] = statusOf(ws)
+				record(pid, statusOf(ws))
 				cond.Broadcast()
 				mu.Unlock()
 			}
 		}
 	}()
+}
+
+// record keeps one reaped outcome, dropping the oldest when the table is at
+// its bound. Callers hold mu.
+func record(pid int, st Status) {
+	if _, dup := codes[pid]; !dup {
+		order = append(order, pid)
+	}
+	codes[pid] = st
+	for len(order) > maxUnclaimed {
+		oldest := order[0]
+		order = order[1:]
+		delete(codes, oldest)
+	}
+}
+
+// forget removes a claimed outcome and its place in the order. Callers hold
+// mu.
+func forget(pid int) {
+	delete(codes, pid)
+	for i, p := range order {
+		if p == pid {
+			order = append(order[:i], order[i+1:]...)
+			break
+		}
+	}
 }
 
 // statusOf reads a wait status into the portable outcome. A process killed by
@@ -83,7 +129,7 @@ func AwaitStatus(pid int) (Status, bool) {
 	}
 	for {
 		if st, ok := codes[pid]; ok {
-			delete(codes, pid)
+			forget(pid)
 			return st, true
 		}
 		cond.Wait()

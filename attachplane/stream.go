@@ -85,6 +85,35 @@ const (
 	defaultClientWriteRate = 64 << 10 // bytes per second
 )
 
+// defaultExecWriteBase is the same budget for an EXEC caller, and it is
+// shorter for a reason that is about the SESSION rather than about the exec.
+//
+// Every attachment on one session shares one relay conn and one writer on it,
+// so a peer that has stopped reading eventually backs that writer up — and
+// while it is backed up, the agent's terminal output and the session RPC wait
+// behind it. For a terminal viewer that is the trade the plane already makes,
+// and a minute is the right number: being disconnected mid-scrollback costs a
+// person their session.
+//
+// An exec caller is not a person watching a screen. It is a script, it is the
+// only reader its process will ever have, and there is nothing for it to lose
+// by being disconnected and re-running the command. Twenty seconds of taking
+// NOTHING is generous for one and cheap for everybody else on the session.
+// The per-byte rate is unchanged, so a caller making steady progress on a
+// large frame is not affected at all.
+//
+// It is a mitigation and not a cure: the real fix is a writer per attachment
+// rather than one per conn, which is a change to the relay and not to this
+// plane. Recorded as an open question in the design.
+const defaultExecWriteBase = 20 * time.Second
+
+// ExecClientStream is ClientStream on the exec budget. A host mounting the
+// exec route uses it instead of ClientStream; everything else about the
+// stream is identical.
+func ExecClientStream(c *websocket.Conn) control.TerminalStream {
+	return clientStream(c, defaultExecWriteBase, defaultClientWriteRate)
+}
+
 // ClientStream wraps an accepted client websocket as the control.TerminalStream
 // the application (and this plane's broker) speaks. It also sets the socket's
 // read limit: a snapshot replaying a large scrollback is the biggest frame
@@ -244,6 +273,14 @@ func attachCloseReason(err error) (websocket.StatusCode, string) {
 		return websocket.StatusTryAgainLater, "the attach ended"
 	case errors.Is(err, ErrExecFirstMessage):
 		return websocket.StatusPolicyViolation, "first exec message must be exec_start"
+	case errors.Is(err, control.ErrInvalid):
+		// A request this plane will not carry — a cwd outside the workspace,
+		// a --log without --detach. The client has already been sent the
+		// exec_error it acts on; this is what a packet capture and a proxy
+		// log see, and "runner unreachable" would have been a lie in both.
+		return websocket.StatusPolicyViolation, "invalid request"
+	case errors.Is(err, errExecNoAnswer):
+		return websocket.StatusTryAgainLater, "the sandbox did not answer in time"
 	case errors.Is(err, errExecUnsupported):
 		// A sandbox that cannot exec is not going to start being able to, so
 		// this is a policy violation rather than an invitation to retry. The
