@@ -59,12 +59,24 @@ var (
 // control.TerminalStream over the client socket
 // ---------------------------------------------------------------------------
 
-// clientWriteTimeout bounds one write to a client socket. See Send: it is not
-// a liveness budget for a handoff (Plane.step is that, and it is seconds), it
-// is the point at which a socket that has taken nothing at all is closed
-// rather than held. A variable so a test can drive the wedged-client path
-// without spending a minute on it.
-var clientWriteTimeout = 60 * time.Second
+const (
+	// defaultClientWriteBase is the part of one message's budget that does
+	// not depend on its size. See Send: it is not a liveness budget for a
+	// handoff (Plane.step is that, and it is seconds), it is the point at
+	// which a socket that has taken NOTHING is closed rather than held.
+	defaultClientWriteBase = 60 * time.Second
+	// defaultClientWriteRate is the throughput a client has to sustain on
+	// the payload of a large frame to keep its socket. It buys the rest of
+	// the budget: without it the base would be a whole-write deadline, and
+	// the largest frame attachReadLimit allows would demand ≈273 KB/s of a
+	// client that is making perfectly steady progress — more than a 2 Mbit/s
+	// link has. At this rate that frame gets 60s + 256s instead.
+	//
+	// It is deliberately a floor rather than an estimate of anybody's link.
+	// A client slower than this over sixteen megabytes is not going to
+	// render the scrollback either.
+	defaultClientWriteRate = 64 << 10 // bytes per second
+)
 
 // ClientStream wraps an accepted client websocket as the control.TerminalStream
 // the application (and this plane's broker) speaks. It also sets the socket's
@@ -75,8 +87,17 @@ var clientWriteTimeout = 60 * time.Second
 // The caller keeps the socket's own lifetime — a handler that accepted it
 // still defers its CloseNow — and hands the reason it ends with to Close.
 func ClientStream(c *websocket.Conn) control.TerminalStream {
+	return clientStream(c, defaultClientWriteBase, defaultClientWriteRate)
+}
+
+// clientStream is the same over a write budget the caller picks, which is how
+// a test drives the wedged-client path without spending a minute on it. The
+// two knobs are FIELDS rather than package variables: nothing in the package
+// takes t.Parallel() today, and a package variable three tests write is a
+// race waiting for the first one that does.
+func clientStream(c *websocket.Conn, base time.Duration, rate int) wsTerminalStream {
 	c.SetReadLimit(attachReadLimit)
-	return wsTerminalStream{c: c, once: &sync.Once{}}
+	return wsTerminalStream{c: c, once: &sync.Once{}, base: base, rate: rate}
 }
 
 // wsTerminalStream is the typed adapter between the client's websocket and
@@ -92,6 +113,21 @@ func ClientStream(c *websocket.Conn) control.TerminalStream {
 type wsTerminalStream struct {
 	c    *websocket.Conn
 	once *sync.Once
+	// base and rate are this stream's write budget; see budget and Send.
+	base time.Duration
+	rate int
+}
+
+// budget is how long ONE message carrying payload bytes of terminal data may
+// take. The fixed part is what a socket that has taken nothing gets; the rest
+// is the time that payload needs at the slowest rate this stream will keep a
+// client for. A message with no payload — every ownership message, every
+// acknowledgement — gets exactly the base.
+func (s wsTerminalStream) budget(payload int) time.Duration {
+	if s.rate <= 0 {
+		return s.base
+	}
+	return s.base + time.Duration(payload)*time.Second/time.Duration(s.rate)
 }
 
 var _ control.TerminalStream = wsTerminalStream{}
@@ -120,10 +156,11 @@ func (s wsTerminalStream) Receive(ctx context.Context) (terminal.ClientMessage, 
 //
 // It is deliberately far above any frame a live client could be slow with —
 // the biggest thing this stream ever carries is a snapshot replaying a large
-// scrollback, and a slow link must be able to take one. What it catches is a
-// peer that is not draining at all.
+// scrollback, and a slow link must be able to take one, which is why the
+// budget SCALES with the payload rather than being one number for every
+// frame. What it catches is a peer that is not draining at all.
 func (s wsTerminalStream) Send(ctx context.Context, m terminal.ServerMessage) error {
-	wctx, cancel := context.WithTimeout(ctx, clientWriteTimeout)
+	wctx, cancel := context.WithTimeout(ctx, s.budget(len(m.Data)))
 	defer cancel()
 	if err := wsjson.Write(wctx, s.c, m); err != nil {
 		if wctx.Err() != nil && ctx.Err() == nil {

@@ -2363,3 +2363,96 @@ func ownerOf(t *testing.T, p *Plane, session control.SessionID, f *attachFixture
 	t.Fatal("the plane is not serving this attach")
 	return nil
 }
+
+// holdingStream is a client stream whose FIRST Send parks until the test lets
+// it go. Holding one send open holds this attach's announce mutex open with
+// it, which is how a test arranges something to happen while an announcement
+// is queued behind another.
+type holdingStream struct {
+	hold    atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+	sent    chan terminal.ServerMessage
+}
+
+func newHoldingStream() *holdingStream {
+	s := &holdingStream{entered: make(chan struct{}), release: make(chan struct{}),
+		sent: make(chan terminal.ServerMessage, 4)}
+	s.hold.Store(true)
+	return s
+}
+
+func (s *holdingStream) Receive(ctx context.Context) (terminal.ClientMessage, error) {
+	<-ctx.Done()
+	return terminal.ClientMessage{}, ctx.Err()
+}
+
+func (s *holdingStream) Send(_ context.Context, m terminal.ServerMessage) error {
+	if s.hold.CompareAndSwap(true, false) {
+		close(s.entered)
+		<-s.release
+	}
+	s.sent <- m
+	return nil
+}
+
+func (s *holdingStream) Close(error) error { return nil }
+
+// TestAnAnnouncementReportsTheStateItFoundWhenItGotTheHold pins the announce
+// mutex under the contention it exists for, which no other test creates
+// deliberately — the fifth review's surviving mutant is "read (mode, gen)
+// before acquiring the hold and report that", and it is the literal shape of
+// the defect three rounds of review found on three different paths.
+//
+// The interleaving is the one a busy session produces: one announcement is
+// mid-sentence to a client that is slow to take it, a second is queued behind
+// it, and this attach wins control inside that wait. The queued one must
+// report the state it finds when it GETS the hold. Reporting what it read on
+// the way in tells a client that has just won control that it is a viewer —
+// and nothing corrects that, because a client that believes it is a viewer
+// claims and a client that believes it is a controller does not.
+//
+// The settle below only decides how reliably a wrong implementation is
+// caught: a correct one reads under the hold and cannot fail this test at any
+// timing at all.
+func TestAnAnnouncementReportsTheStateItFoundWhenItGotTheHold(t *testing.T) {
+	p, _, _ := newTestPlane(t, Options{})
+	for i := 0; i < 3; i++ {
+		stream := newHoldingStream()
+		o := &ownership{plane: p, session: "sess_example", negotiated: true, stream: stream,
+			mode: terminal.ModeView, gen: 1, announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
+
+		// (1) an announcement takes the hold and parks inside it.
+		go o.announceAs(context.Background(), terminal.TypeAttached, 0)
+		<-stream.entered
+
+		// (2) a second queues behind it.
+		queued := make(chan struct{})
+		go func() {
+			close(queued)
+			o.announceAs(context.Background(), terminal.TypeControlChanged, 0)
+		}()
+		<-queued
+		time.Sleep(20 * time.Millisecond)
+
+		// (3) and this attach wins control while that one waits.
+		if !o.advance(terminal.ModeControl, 2) {
+			t.Fatal("the claim was refused its own generation")
+		}
+		close(stream.release)
+
+		if m := <-stream.sent; m.Type != terminal.TypeAttached || m.Mode != terminal.ModeView ||
+			m.Generation.Value() != 1 {
+			t.Fatalf("the first announcement said %q %s at %q, want attached view at 1",
+				m.Type, m.Mode, m.Generation)
+		}
+		m := <-stream.sent
+		if m.Type != terminal.TypeControlChanged || m.Mode != terminal.ModeControl ||
+			m.Generation.Value() != 2 {
+			t.Fatalf("an announcement that waited for the hold reported %q %s at %q, but this "+
+				"attach won control at 2 while it waited; it reported what it read on the way "+
+				"IN, and a client told it is a viewer when it has control never claims again",
+				m.Type, m.Mode, m.Generation)
+		}
+	}
+}

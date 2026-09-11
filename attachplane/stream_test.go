@@ -16,8 +16,10 @@ import (
 // clientPair returns a live client stream and the socket on the other end of
 // it, with the peer reading nothing until drain is closed. It is a client that
 // is alive and slow, which is a different thing from one that is wedged — and
-// the difference is what these two tests are about.
-func clientPair(t *testing.T, drain <-chan struct{}) (control.TerminalStream, *websocket.Conn) {
+// the difference is what these two tests are about. base and rate are this
+// stream's write budget, so a test spends milliseconds where production
+// spends a minute without any of them sharing a variable.
+func clientPair(t *testing.T, drain <-chan struct{}, base time.Duration, rate int) (control.TerminalStream, *websocket.Conn) {
 	t.Helper()
 	served := make(chan struct{})
 	accepted := make(chan *websocket.Conn, 1)
@@ -49,7 +51,7 @@ func clientPair(t *testing.T, drain <-chan struct{}) (control.TerminalStream, *w
 		}
 	}()
 	c := <-accepted
-	return ClientStream(c), c
+	return clientStream(c, base, rate), c
 }
 
 // TestACourtesyNoticeNeverClosesAHealthyClient is the other side of the write
@@ -65,7 +67,7 @@ func clientPair(t *testing.T, drain <-chan struct{}) (control.TerminalStream, *w
 func TestACourtesyNoticeNeverClosesAHealthyClient(t *testing.T) {
 	drain := make(chan struct{})
 	defer close(drain)
-	stream, conn := clientPair(t, drain)
+	stream, conn := clientPair(t, drain, defaultClientWriteBase, defaultClientWriteRate)
 
 	// The snapshot, as the splice's output pump has it: a writer that owns
 	// the socket and has not finished. Holding the lock explicitly is what
@@ -102,13 +104,9 @@ func TestACourtesyNoticeNeverClosesAHealthyClient(t *testing.T) {
 // close of our own, a client that has taken nothing for the whole of this
 // stream's budget would be left open with writers parked behind it.
 func TestAClientThatNeverDrainsIsClosedFromBehindTheWriteLock(t *testing.T) {
-	restore := clientWriteTimeout
-	clientWriteTimeout = 300 * time.Millisecond
-	defer func() { clientWriteTimeout = restore }()
-
 	never := make(chan struct{}) // a peer that never reads a byte
 	defer close(never)
-	stream, conn := clientPair(t, never)
+	stream, conn := clientPair(t, never, 300*time.Millisecond, defaultClientWriteRate)
 
 	// Somebody else owns the socket and is not giving it back.
 	if _, err := conn.Writer(context.Background(), websocket.MessageText); err != nil {
@@ -147,13 +145,13 @@ func TestAClientThatNeverDrainsIsClosedFromBehindTheWriteLock(t *testing.T) {
 // Without the deadline this test does not fail, it HANGS: the write never
 // returns at all, which is exactly the production symptom.
 func TestAWedgedClientIsClosedRatherThanHeld(t *testing.T) {
-	restore := clientWriteTimeout
-	clientWriteTimeout = 250 * time.Millisecond
-	t.Cleanup(func() { clientWriteTimeout = restore })
-
+	const base = 250 * time.Millisecond
 	never := make(chan struct{}) // the client that never reads
 	defer close(never)
-	stream, _ := clientPair(t, never)
+	// A rate high enough that the frames below buy milliseconds rather than
+	// minutes: what this test is about is the base, and the frames are big
+	// only because the kernel's own buffers take the first megabytes.
+	stream, _ := clientPair(t, never, base, 64<<20)
 	// Big frames, because the kernel's own buffers take the first megabytes
 	// whatever the peer does. One of these writes blocks with nothing left to
 	// unblock it.
@@ -176,7 +174,71 @@ func TestAWedgedClientIsClosedRatherThanHeld(t *testing.T) {
 	started = time.Now()
 	if err := stream.Send(context.Background(), terminal.ServerMessage{Type: "output", Seq: 2}); err == nil {
 		t.Fatal("the wedged socket was still open after its write deadline expired")
-	} else if elapsed := time.Since(started); elapsed >= clientWriteTimeout {
+	} else if elapsed := time.Since(started); elapsed >= base {
 		t.Fatalf("a write to the wedged socket took %s; it was held, not closed", elapsed)
+	}
+}
+
+// TestTheWriteBudgetScalesWithTheFrame is the arithmetic on its own. A budget
+// that did not scale would be a WHOLE-write deadline, and the largest frame
+// attachReadLimit allows would then demand ≈273 KB/s of a client that is
+// making perfectly steady progress — more than a 2 Mbit/s link has, and the
+// answer to falling short is CloseNow.
+func TestTheWriteBudgetScalesWithTheFrame(t *testing.T) {
+	s := wsTerminalStream{base: defaultClientWriteBase, rate: defaultClientWriteRate}
+	if got := s.budget(0); got != defaultClientWriteBase {
+		t.Fatalf("a message with no payload gets %s, want the base %s", got, defaultClientWriteBase)
+	}
+	// The biggest frame this stream can carry, at the slowest link it keeps.
+	big := s.budget(attachReadLimit)
+	if want := defaultClientWriteBase + 256*time.Second; big != want {
+		t.Fatalf("the largest frame gets %s, want %s", big, want)
+	}
+	if rate := float64(attachReadLimit) / big.Seconds(); rate > defaultClientWriteRate {
+		t.Fatalf("the largest frame demands %.0f B/s sustained, which is more than the "+
+			"%d B/s this stream promises to keep a client for", rate, defaultClientWriteRate)
+	}
+	// A stream with no rate is the base and nothing else, rather than a
+	// division by zero.
+	if got := (wsTerminalStream{base: time.Second}).budget(1 << 20); got != time.Second {
+		t.Fatalf("a stream with no rate gave a 1MiB frame %s, want its base", got)
+	}
+}
+
+// TestALargeFrameIsGivenTimeInProportionToItself is the same property through
+// Send, so that the arithmetic above is the arithmetic the socket actually
+// gets. Holding the conn's write lock is what makes it measurable: the send
+// never reaches the socket at all, so what it spends is exactly its budget.
+func TestALargeFrameIsGivenTimeInProportionToItself(t *testing.T) {
+	const (
+		base    = 100 * time.Millisecond
+		rate    = 4 << 20 // 4 MiB/s
+		payload = 2 << 20 // and so half a second on top of the base
+	)
+	elapsed := func(m terminal.ServerMessage) time.Duration {
+		t.Helper()
+		never := make(chan struct{}) // a peer that never reads a byte
+		defer close(never)
+		stream, conn := clientPair(t, never, base, rate)
+		if _, err := conn.Writer(context.Background(), websocket.MessageText); err != nil {
+			t.Fatalf("taking the write lock: %v", err)
+		}
+		started := time.Now()
+		if err := stream.Send(context.Background(), m); err == nil {
+			t.Fatal("a write that never got the socket reported success")
+		}
+		return time.Since(started)
+	}
+
+	small := elapsed(terminal.ServerMessage{Type: terminal.TypeControlChanged,
+		Mode: terminal.ModeView, Generation: "2"})
+	if small > base+base/2 {
+		t.Fatalf("a message with no payload spent %s, want about its %s base", small, base)
+	}
+	big := elapsed(terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: make([]byte, payload)})
+	if want := base + payload*time.Second/rate; big < want {
+		t.Fatalf("a %dB frame spent %s, want at least %s: a whole-write deadline is what "+
+			"disconnects a client that is making steady progress through a large snapshot",
+			payload, big, want)
 	}
 }
