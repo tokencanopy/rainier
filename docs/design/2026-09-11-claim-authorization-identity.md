@@ -60,9 +60,15 @@ again produces the same answer forever. The session's own creator — an
 `admin`, even — cannot take control of their own terminal from a second
 device.
 
-Hosted Rainier has the same shape and the same outcome:
-`internal/cell/authz.Authorizer.Authorize` reads the current workspace role
-with `scope.RoleFrom(ctx)` and refuses a request that carries none.
+Hosted Rainier has the same policy shape and does not reach it yet. Its
+authorizer reads the current workspace role with `scope.RoleFrom(ctx)` and
+refuses a request that carries none, so it would answer a claim exactly as
+`ownerOrAdmin` does — but its gateway still opens every attach
+**unnegotiated** (`Mode: control.AttachmentController` with no `Negotiated`),
+which `grant` answers with a nil keeper and therefore no claim path at all.
+The defect is latent there rather than live: the day that composer negotiates
+is the day it inherits this, which is a reason to fix it in the core now and
+not a reason to think hosted is unaffected.
 
 Two things kept it from being caught:
 
@@ -234,12 +240,15 @@ on the runner's dial-back context:
 ## Edge cases
 
 - **A claim on a keeper with no identity captured.** `grant` is the only
-  constructor and it always captures, so this is the defensive case: a host
-  that authorizes from the scope alone and puts nothing in the context, or a
-  keeper assembled in a test. A nil authorizing context falls through to the
-  caller's context unchanged, which is exactly the previous behaviour. It is
-  the only nil tolerated — a keeper with no *policy* is a composition error
-  and still panics, as it did before.
+  constructor and it always captures, so in production this cannot happen: a
+  host that authorizes from the scope alone still gets a captured context,
+  just one with no principal in it, and that works because the scope and the
+  resource are the keeper's own fields. The nil case is reachable only from a
+  keeper assembled by hand, which means a test. It falls through to the
+  caller's context — the previous behaviour — rather than refusing, because a
+  guard that turned a test's oversight into `ErrDenied` would be diagnosing
+  it as a policy decision. It is the only nil tolerated: a keeper with no
+  *policy* is a composition error and still panics, as it did before.
 - **The attach's context is cancelled while a claim is in flight.** Only the
   live call's cancellation is honoured; the captured one has none. A claim on
   a cancelled splice fails on the store call or the policy's own context, as
@@ -251,6 +260,16 @@ on the runner's dial-back context:
   context's own values, which on both hosts shipping today means the
   claimant's identity *and their role*: see [Limitations](#limitations),
   because today that is the whole of what either policy reads.
+- **A composer that had solved this the other way.** A host that injected the
+  claimant onto the runner's dial-back context — the shape
+  `agentActorContext` uses for the credential RPC — has working claims before
+  this change and refused ones after it, because the question no longer reads
+  anything the live call carries. It is a composer-visible narrowing and it is
+  deliberate (that is the whole property), but it is worth stating: no such
+  host exists, the only two `AttachTerminal` callers in either repository are
+  self-hosted controld's attach route and the hosted gateway's, and a host
+  doing it that way should capture at the door instead, where the identity is
+  the claimant's rather than the session creator's.
 - **A runner that tries to influence the decision.** It cannot: the runner
   contributes no value to the context the policy sees, and the claim is
   answered against the resource and scope captured at the door, for the

@@ -246,6 +246,7 @@ func withRecordingPolicy(t *testing.T, fx *attachFixture) *recordingPolicy {
 		Authorizer: ownerOrAdmin{}, Policy: policy, Sessions: fx.st.Sessions(),
 		Transport: fx.s.transport, Broker: fx.s.broker, Events: fx.st,
 		Clock: fx.s.clock, IDs: idGenerator{}, UnitOfWork: fx.st,
+		MaxTransferBytes: fx.s.cfg.MaxTransferBytes,
 	})
 	if err != nil {
 		t.Fatalf("composing an attachment service over a recording policy: %v", err)
