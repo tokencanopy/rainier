@@ -343,6 +343,14 @@ worth writing down here because this is the first one whose loss leaves a sessio
   can — restarts the container without clearing the previous child's exit, because the entry
   did not look parked. The safe resolution would need the one thing that is unavailable in
   exactly that situation: an answer from the driver.
+- **An operator cannot tell an auto-stop from their own stop by looking at the session.**
+  Both land the row on `suspended_cold`, and the runner's sentence ("idle for 30m0s") is
+  deliberately dropped by `runnerplane` rather than carried into `Detail`, which is the error
+  column's text and a session that parked exactly as asked has no error. So `rainier info`
+  and `rainier ls` read identically for the two. The audit event does distinguish them — its
+  `ActorID` is the runner's id, where an operator's stop carries the person's — which is what
+  keeps this a legibility gap rather than a hole. Carrying the reason in a non-error field is
+  a change to `control.RunnerEvent` and the session row, and is on the PR's follow-up list.
 - **`cmd/runnerd`'s wiring is not covered by a test** (the package has none, and `main` is not
   factored for one). Deleting the `go s.RunIdleStop(...)` line would leave the suite green.
 

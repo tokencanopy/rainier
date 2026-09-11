@@ -582,9 +582,8 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 			// the container dies, racing ahead of the setState below) sees a
 			// state that means "keep the entry" rather than defaulting to
 			// the crash path and destroying a container we deliberately just
-			// stopped. beginColdSuspend also records that this park is a
-			// STOP and not a pause, which is what a later resume reads to
-			// decide whether the child it knew about survived — see
+			// stopped. Whether a later resume restarted the child is NOT
+			// inferred from this mark — the driver reports it; see
 			// registry.resumed.
 			s.reg.beginColdSuspend(id)
 			return s.coldSuspend(ctx, id, handle)

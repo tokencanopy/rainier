@@ -626,8 +626,9 @@ func (r *registry) idleSessions(idle time.Duration, now time.Time) []string {
 }
 
 // claimIdle re-checks the idle rule for id and, in the SAME critical section,
-// marks the entry "suspending" and cold — the claim. It returns the driver
-// handle to stop and how long the session had been idle when it was claimed.
+// marks the entry "suspending" and records the stop as in flight — the claim.
+// It returns the driver handle to stop and how long the session had been idle
+// when it was claimed.
 //
 // Check and mark cannot be separated. If they were, two sweeps (or a sweep and
 // a stop arriving from controld) could both decide to stop one session, and a
@@ -660,7 +661,7 @@ func (r *registry) claimIdle(id string, idle time.Duration, now time.Time) (hand
 }
 
 // beginColdSuspend marks an entry for the cold suspend Op is about to run:
-// the "suspending" state and the cold flag, in one lock, for the reasons
+// the "suspending" state and the in-flight count, in one lock, for the reasons
 // claimIdle spells out. It is claimIdle's unconditional sibling — an
 // operator's stop asks no questions about idleness.
 // It leaves a "destroying" entry alone, for the same reason releaseColdSuspend
