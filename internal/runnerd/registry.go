@@ -4,6 +4,7 @@ package runnerd
 import (
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/tokencanopy/rainier/internal/relay"
 )
@@ -29,16 +30,159 @@ type sessionEntry struct {
 	// carried none" — an old controld — and fences nothing.
 	placementGen uint64
 	hub          *relay.Hub // set when sessiond registers; nil until then
+	// attachments is the number of attachments currently open over this
+	// session's hub — viewers and controllers alike, since a runner neither
+	// knows nor needs to know which of them holds the controller lease.
+	// Maintained around BOTH attach fronts (the local /attach handler and the
+	// agent's dial_attach dial-back), because a session with a live viewer is
+	// not idle no matter which door that viewer came through.
+	attachments int
+	// childExitedAt is when sessiond reported child_exited for the sandbox
+	// boot this entry is currently on. Zero means "the child is running, as
+	// far as this runner has been told" — which is also what a session
+	// rebuilt by Recover looks like, since the exit was only ever in memory.
+	// Zero is the safe value in both cases: idle auto-stop never stops a
+	// session whose child it has not been told has exited.
+	childExitedAt time.Time
+	// lastDetachAt is when the most recent attachment over this session
+	// ended. It is what makes the idle timer run from the moment the last
+	// viewer left rather than from the child's exit: someone reading a
+	// finished agent's scrollback for an hour resets nothing while attached
+	// and gets the full timeout after detaching.
+	lastDetachAt time.Time
+	// boot identifies the sandbox boot this entry is currently on: a
+	// registry-wide counter minted when the entry is inserted and bumped
+	// again by every cold resume (never by a plain /register, which reads it
+	// — see currentBoot). It exists
+	// because a control frame can outlive the boot that sent it — a hub's
+	// read loop that was stalled writing to a wedged viewer drains its
+	// buffered frames whenever it comes back, which can be after the sandbox
+	// has been stopped, resumed, and re-registered. A child_exited from the
+	// PREVIOUS boot landing on the current one would make this runner believe
+	// a working agent had finished, and stop the session out from under it —
+	// the one thing idle auto-stop must never do. Same guard, same reason, as
+	// hubDied's deadHub parameter.
+	boot uint64
+	// driverOps counts driver operations this runner has dispatched for the
+	// session and not yet finished: a warm suspend, a resume, a snapshot.
+	// A session with one in flight is never idle, because the entry still
+	// reads "running" for the whole of `docker pause` or `docker commit`, and
+	// a sweep that claimed it in that window would stop a container somebody
+	// else is mid-operation on — turning an operator's pause into a stop, or
+	// killing a commit halfway. The cold suspend and Delete don't need this:
+	// each marks the state before its driver call.
+	driverOps int
+	// recovered marks an entry that Recover rebuilt from a labelled container
+	// after a runnerd restart, rather than one this process created and
+	// watched. Such an entry's childExitedAt is zero because the exit fact
+	// lived only in the memory of the process that died — not because this
+	// runner has been told the child is running — so it is carried in NEITHER
+	// capacity count until something tells the runner what the child is
+	// doing. Counting it as "active" is the misleading answer on the one box
+	// the sweep will reclaim nothing on: sixteen finished sessions would
+	// report sixteen working agents. See registry.counts.
+	//
+	// Cleared by the two things that make the runner able to speak for the
+	// child again: a child_exited report for this boot (the session is now
+	// genuinely idle-exited, and an auto-stop candidate), and a resume the
+	// driver says RESTARTED the container (a new process tree this runner did
+	// watch start).
+	recovered bool
+	// stopsInFlight counts cold suspends this runner has claimed for the
+	// session and not yet finished. It is deliberately NOT the same fact as
+	// the "suspending" state: a stop whose outcome the driver could not
+	// report leaves the entry parked on "suspending" indefinitely (see
+	// settleFailedColdSuspend), and a resume is the only thing that brings
+	// such a session back, so refusing every resume of a "suspending" entry
+	// would strand it for the life of the runner. A resume is refused while
+	// this is non-zero and allowed once it falls back to zero.
+	//
+	// A counter rather than a flag because two stops can be claimed against
+	// one session (an operator's, arriving while a Delete owns the entry), and
+	// the first to finish must not clear the second's claim.
+	stopsInFlight int
+	// bootFailed records that this session's boot chain failed (setup, clone
+	// or init). Such a session is deliberately never idle-stopped: the whole
+	// reason the CLI lets you attach to a failed session is to read the log
+	// that says why it failed, and a stopped sandbox has no hub to attach to
+	// and a failed row cannot be resumed. It holds its slot until someone
+	// removes it — the honest trade, and reclaiming those is part of the
+	// resource-aware admission this change's design doc defers to.
+	bootFailed bool
+}
+
+// idleFor reports how long this session has been idle at now, and whether it
+// is idle at all: its container is up, its child has exited, and nothing is
+// attached. Callers must hold the registry lock.
+//
+// The clock is the caller's, and both times come from it, so in production
+// both carry Go's monotonic reading and this subtraction uses it — a wall
+// clock stepped by NTP can neither make a session look idle early nor keep
+// one from ever looking idle.
+//
+// The idle clock starts at the LATER of the child's exit and the last
+// detach, which is the whole reason lastDetachAt is kept.
+func (e *sessionEntry) idleFor(now time.Time) (time.Duration, bool) {
+	if e.state != "running" || e.attachments > 0 || e.childExitedAt.IsZero() {
+		return 0, false
+	}
+	if e.driverOps > 0 || e.bootFailed {
+		return 0, false
+	}
+	since := e.childExitedAt
+	if e.lastDetachAt.After(since) {
+		since = e.lastDetachAt
+	}
+	return now.Sub(since), true
 }
 
 type registry struct {
 	mu    sync.Mutex
 	items map[string]*sessionEntry
+	// nextBoot mints sessionEntry.boot values. Monotonic across the whole
+	// registry rather than per entry so that a value can never be reused by a
+	// session id that was deleted and recreated, which is exactly the case a
+	// stale frame would otherwise be accepted in.
+	//
+	// Minted at INSERTION (put/putIfAbsent) as well as at a cold resume, so
+	// that no live entry is ever on epoch zero. Leaving the zero value in
+	// place would have made every never-resumed entry share one epoch, and a
+	// recreated id would have inherited its predecessor's — the very reuse
+	// this counter is registry-wide to prevent. Zero is now reserved for "no
+	// such session", which is what currentBoot returns for one.
+	nextBoot uint64
 }
 
 func newRegistry() *registry { return &registry{items: map[string]*sessionEntry{}} }
 
-func (r *registry) put(id string, e *sessionEntry) { r.mu.Lock(); r.items[id] = e; r.mu.Unlock() }
+func (r *registry) put(id string, e *sessionEntry) {
+	r.mu.Lock()
+	r.mintBoot(e)
+	r.items[id] = e
+	r.mu.Unlock()
+}
+
+// mintBoot opens a fresh sandbox-boot epoch on an entry being inserted. The
+// caller must hold the registry lock.
+//
+// Every insertion gets one — put (recovery) and putIfAbsent (create) alike —
+// so a session id that was deleted and recreated lands on an epoch strictly
+// greater than the dead entry's, and a control frame the old container's hub
+// read loop is still draining — a child_exited, a stage failure — names an
+// epoch this REGISTRY refuses. Without this both entries carried the zero
+// value, and the guard that exists for exactly this case never fired: a bogus
+// child exit would auto-stop the new session's working agent a timeout later,
+// or a stale stage failure would pin it out of auto-stop for the life of the
+// runner.
+//
+// The fence is the registry's, not the event's: routeControl still announces
+// what it decoded to the control plane, so a stale stage failure can reach a
+// row even when this entry ignored it. That is the shape main had before the
+// epoch existed and is recorded as a known limit rather than closed here.
+func (r *registry) mintBoot(e *sessionEntry) {
+	r.nextBoot++
+	e.boot = r.nextBoot
+}
 
 // putIfAbsent inserts e under id only if no entry exists yet, as a single
 // locked check-and-reserve step. CreateWithID uses this (not a separate
@@ -56,6 +200,7 @@ func (r *registry) putIfAbsent(id string, e *sessionEntry) bool {
 	if _, exists := r.items[id]; exists {
 		return false
 	}
+	r.mintBoot(e)
 	r.items[id] = e
 	return true
 }
@@ -132,6 +277,21 @@ func (r *registry) hub(id string) (*relay.Hub, bool) {
 		return nil, false
 	}
 	return e.hub, true
+}
+
+// restoreAfterFailedDestroy puts an entry back where Delete found it when the
+// driver teardown failed — but only if the entry is still the one Delete
+// marked. The same compare-and-swap discipline as releaseColdSuspend, and for
+// the mirror of its reason: a cold suspend that landed while drv.Destroy was in
+// flight has already moved the entry to "suspended", and stamping the
+// pre-Delete state back over it would claim a container is running that this
+// runner has just stopped.
+func (r *registry) restoreAfterFailedDestroy(id, previousState string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok && e.state == "destroying" {
+		e.state = previousState
+	}
 }
 
 // setState updates an entry's state under the registry lock — sessionOp's
@@ -275,4 +435,373 @@ func (r *registry) setHandle(id, handle string) {
 	if e, ok := r.items[id]; ok {
 		e.handle = handle
 	}
+}
+
+// attachStarted records that an attachment has opened over id's hub. A
+// session with any attachment open is not idle, however long its child has
+// been gone. An unknown id is a no-op: the session was deleted out from under
+// an attach that was already in flight, and there is nothing left to account
+// against.
+func (r *registry) attachStarted(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok {
+		e.attachments++
+	}
+}
+
+// attachEnded records that an attachment over id's hub has closed, at time
+// at. The idle clock starts here, not at the child's exit — see
+// sessionEntry.lastDetachAt.
+//
+// The counter floors at zero rather than going negative: every caller pairs
+// this with attachStarted through a defer, but an entry that was recreated
+// under the same id between the two (a delete and a create of the same
+// controld-supplied id) would otherwise leave a permanently negative count on
+// the new entry, which reads as "fewer than no attachments" and would be
+// indistinguishable from an attached session forever after.
+// pumped says whether this attachment ever became one — whether it got as far
+// as bridging the client to the session. A handshake that failed (the upgrade,
+// or the first client frame that never came) still decrements the count, which
+// is what keeps a dropped dial from pinning a session open, but must NOT move
+// the idle clock: the local /attach surface has no authentication, so a client
+// looping on a failed dial once a minute would otherwise push every deadline on
+// this runner out indefinitely, and nothing would say why.
+func (r *registry) attachEnded(id string, at time.Time, pumped bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.items[id]
+	if !ok {
+		return
+	}
+	if e.attachments > 0 {
+		e.attachments--
+	}
+	if pumped {
+		e.lastDetachAt = at
+	}
+}
+
+// childExited records that sessiond reported this session's child process
+// ended, at time at. It is the ONLY thing that makes a session a candidate for
+// idle auto-stop: a runner never infers that a child is finished, it is told.
+//
+// Recorded once per sandbox boot. A repeat report (sessiond re-delivering an
+// event it was unsure landed) must not move the idle clock forward, or a
+// retried delivery would silently extend the timeout.
+func (r *registry) childExited(id string, boot uint64, at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.items[id]
+	if !ok || e.boot != boot {
+		// Not this sandbox's boot: a frame from a connection the session has
+		// since moved on from. Dropping it is the safe direction in the only
+		// way that matters — the worst case is an auto-stop this runner never
+		// makes, against a worst case of stopping a session whose agent is
+		// working. See sessionEntry.boot.
+		return
+	}
+	// The report is what takes a recovered session out of the count
+	// exemption: this runner has now been told what its child is doing, which
+	// is the only thing Recover could not know. Cleared even on a repeat
+	// delivery, which is idempotent and says the same thing.
+	e.recovered = false
+	if e.childExitedAt.IsZero() {
+		e.childExitedAt = at
+	}
+}
+
+// currentBoot returns the sandbox-boot epoch id is on, which register READS
+// (rather than mints) and every control frame from that connection then
+// carries. Zero ONLY for a session this registry does not hold: every entry is
+// minted an epoch when it is inserted, so a frame carrying zero names no live
+// session rather than every never-resumed one.
+//
+// Reading rather than minting is the whole point, and it took a review round
+// to get right. A new epoch per REGISTRATION would open one on a plain
+// sessiond redial too, where the container never restarted and the child never
+// changed — and sessiond re-sends only events it never delivered, so a
+// child_exited already in flight across that redial would be dropped here and
+// never sent again. That session then holds its slot for the life of the
+// runner, silently: the very incident this feature exists to end. Only a
+// restart of the container can change the child, only a cold resume restarts
+// it, and resumed() is where the epoch therefore moves.
+func (r *registry) currentBoot(id string) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok {
+		return e.boot
+	}
+	return 0
+}
+
+// markBootFailed records that this session's boot chain failed, which takes it
+// out of idle auto-stop until it is cold-resumed — see sessionEntry.bootFailed.
+// Boot-guarded exactly like childExited: a stage failure that outlived its boot
+// describes a sandbox this session has already left, and letting it pin a
+// healthy one out of auto-stop would be the same lost slot by another route.
+func (r *registry) markBootFailed(id string, boot uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok && e.boot == boot {
+		e.bootFailed = true
+	}
+}
+
+// beginOp and endOp bracket a driver operation dispatched for id, so a sweep
+// cannot claim a session that is mid-`docker pause`, mid-`docker start` or
+// mid-`docker commit`. Paired through a defer by every caller; an unknown id
+// is a no-op at both ends, so a session deleted mid-operation leaves nothing
+// behind.
+func (r *registry) beginOp(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok {
+		e.driverOps++
+	}
+}
+
+func (r *registry) endOp(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok && e.driverOps > 0 {
+		e.driverOps--
+	}
+}
+
+// counts returns the two numbers a runner's capacity line needs beyond
+// used/total: how many of its sandboxes are up with a child still running,
+// and how many are up with the child gone. Only "running" entries are counted:
+// a warm-suspended sandbox and one still being created each hold a slot and
+// are in neither count, which is the honest answer rather than a made-up one.
+//
+// A session Recover rebuilt after a runnerd restart is in neither count until
+// it says what its child is doing, for the same reason: its zero
+// childExitedAt is an absence of knowledge, not a running child. Reporting
+// "16 active" about a box of sixteen finished sessions — the one case this
+// feature cannot reclaim anything on — would be a confident lie, where
+// "active 0, idle_exited 0, used 16" is already legible as "this runner is not
+// telling me" (see protocol/runner.FromRunner.Active). The cost is that a
+// recovered session whose agent really is working is not counted either; the
+// runner cannot tell those apart, and only the safe direction is available.
+//
+// So the two normally sum to less than `used`, not more — but not
+// invariably: register's hub-death tail deliberately KEEPS an entry as
+// "running" when the driver cannot say whether its container survived
+// (destroying on that uncertainty is the catastrophic direction), and such an
+// entry is counted here while `docker ps` no longer counts it. A consumer of
+// these numbers must treat them as a split of what this runner believes it
+// holds, not as an arithmetic partition of `used`.
+//
+// idleExited also includes a session whose BOOT failed, which idle auto-stop
+// deliberately never reclaims (see sessionEntry.bootFailed). The count says
+// what is up with no agent in it, which is the truth about the machine; it is
+// not a promise about what the sweep will hand back.
+func (r *registry) counts() (active, idleExited int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range r.items {
+		if e.state != "running" || e.recovered {
+			continue
+		}
+		if e.childExitedAt.IsZero() {
+			active++
+			continue
+		}
+		idleExited++
+	}
+	return active, idleExited
+}
+
+// idleSessions returns the ids that have been idle for at least idle at now,
+// in stable (id) order. It is the sweep's candidate list, not its decision:
+// the decision is claimIdle, which re-checks the same rule under the lock it
+// marks the entry in. Sorted so a sweep that stops several sessions logs them
+// in an order that does not depend on map iteration.
+func (r *registry) idleSessions(idle time.Duration, now time.Time) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for id, e := range r.items {
+		if d, ok := e.idleFor(now); ok && d >= idle {
+			out = append(out, id)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// claimIdle re-checks the idle rule for id and, in the SAME critical section,
+// marks the entry "suspending" and records the stop as in flight — the claim.
+// It returns the driver handle to stop and how long the session had been idle
+// when it was claimed.
+//
+// Check and mark cannot be separated. If they were, two sweeps (or a sweep and
+// a stop arriving from controld) could both decide to stop one session, and a
+// sweep could stop a session that a concurrent Delete had already begun tearing
+// down. One locked call means at most one caller ever gets a handle back.
+//
+// "suspending" is exactly the marker Op's cold suspend sets, and for the same
+// reason: `docker stop` kills the container's sessiond, closing the /register
+// conn, and the register goroutine must read that as a deliberate stop rather
+// than a crash — otherwise it destroys the container this is only trying to
+// park.
+func (r *registry) claimIdle(id string, idle time.Duration, now time.Time) (handle string, idleFor time.Duration, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, exists := r.items[id]
+	if !exists {
+		return "", 0, false
+	}
+	d, isIdle := e.idleFor(now)
+	if !isIdle || d < idle {
+		return "", 0, false
+	}
+	e.state = "suspending"
+	// Taken in the SAME critical section as the claim, so there is no instant
+	// in which this runner is stopping a container without a concurrent resume
+	// being able to see it. Paired by coldSuspend, which stopIdle always calls
+	// on a successful claim. See Op's resume arm.
+	e.stopsInFlight++
+	return e.handle, d, true
+}
+
+// beginColdSuspend marks an entry for the cold suspend Op is about to run:
+// the "suspending" state and the in-flight count, in one lock, for the reasons
+// claimIdle spells out. It is claimIdle's unconditional sibling — an
+// operator's stop asks no questions about idleness.
+// It leaves a "destroying" entry alone, for the same reason releaseColdSuspend
+// does: a Delete that got there first owns the entry, and overwriting its
+// marker is what makes the register goroutine destroy the container a second
+// time and report the session dead instead of destroyed.
+func (r *registry) beginColdSuspend(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.items[id]
+	if !ok {
+		return
+	}
+	if e.state != "destroying" {
+		e.state = "suspending"
+	}
+	// Counted even when the marker is left alone: the stop runs either way
+	// (Op calls coldSuspend straight after this), and a count that skipped
+	// this case would go negative when coldSuspend's defer pairs with it.
+	e.stopsInFlight++
+}
+
+// endStop pairs with the increment claimIdle and beginColdSuspend take, once
+// the stop they claimed has finished — whatever it finished as. Floors at
+// zero, like every other counter here, so an entry recreated under the same id
+// mid-stop cannot be left permanently unresumable.
+func (r *registry) endStop(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok && e.stopsInFlight > 0 {
+		e.stopsInFlight--
+	}
+}
+
+// stopInFlight reports whether a cold suspend this runner claimed is still
+// running against id's container — the question Op's resume must ask, and the
+// one the "suspending" state cannot answer. See sessionEntry.stopsInFlight.
+func (r *registry) stopInFlight(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.items[id]
+	return ok && e.stopsInFlight > 0
+}
+
+// releaseColdSuspend rolls a claimed-but-failed cold suspend back to running:
+// the container was never stopped, so the entry must not be left claiming it
+// was cold-parked. The next sweep (or the operator's retry) will try again.
+//
+// It moves the entry ONLY if it is still the one this stop claimed. A Delete
+// that arrived while `docker stop` was in flight has already marked the entry
+// "destroying" — the marker that makes the register goroutine stand down
+// instead of destroying the container a second time and reporting the session
+// dead — and an unconditional rollback to "running" would wipe it, which is
+// precisely the outcome Delete's marker exists to prevent.
+func (r *registry) releaseColdSuspend(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok && e.state == "suspending" {
+		e.state = "running"
+	}
+}
+
+// finishColdSuspend lands a successful cold suspend on "suspended", with the
+// same compare-and-swap discipline and for the same reason as
+// releaseColdSuspend: a Delete that overtook this stop owns the entry now.
+func (r *registry) finishColdSuspend(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok && e.state == "suspending" {
+		e.state = "suspended"
+	}
+}
+
+// resumed lands an entry back on "running" after a successful driver resume,
+// and clears the idle bookkeeping if — and only if — the driver reports that it
+// RESTARTED the container.
+//
+// That condition is the whole point, and it must come from the driver rather
+// than from what this runner intended. `docker start` gives the container a new
+// process tree, so the child is a new one and the old child's exit says nothing
+// about it; keeping the fact would let the next sweep stop a session whose
+// agent is working, which is the one thing idle auto-stop must never do.
+// `docker unpause` restarts nothing, so a child that had exited is still exited
+// and the fact must survive, or a warm-cycled session would never be
+// auto-stopped again.
+//
+// An earlier version keyed this on a flag set when the runner ASKED for a cold
+// suspend, and the two come apart in both directions. A warm-paused container
+// that the docker daemon restarts underneath a surviving runnerd (a daemon
+// upgrade, an OOM kill) is resumed with `docker start` while the flag reads
+// "paused" — a new agent inheriting the old one's exit, stopped half an hour
+// later. And an entry left marked cold by a stop whose outcome could not be
+// read is resumed by an `unpause` or by nothing at all, while the epoch bump
+// deafens the connection that is still live — its child's exit dropped, its
+// slot never reclaimed. Only the driver knows which call it made; see
+// driver.Driver.Resume.
+func (r *registry) resumed(id string, restarted bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.items[id]
+	if !ok {
+		return
+	}
+	// Read before it is overwritten: only the resume that actually brings a
+	// PARKED entry back can be the one that restarted it. `docker start` on an
+	// an already-started container exits 0, so a second resume reports a
+	// restart just as honestly as the first — and two are a real shape, since
+	// the control plane dispatches the command before it transitions the row,
+	// so two racing clients both send one. Without this, the second bumps the
+	// epoch again; if the restarted sandbox registered in between, that bump
+	// moves the epoch out from under a connection that is already live, and
+	// its child's exit is dropped — the session's slot never comes back, and
+	// nothing says why. Consuming the transition is what the intent flag used
+	// to give for free, and this keeps it while the answer comes from the
+	// driver.
+	wasParked := e.state != "running"
+	e.state = "running"
+	if !restarted || !wasParked {
+		return
+	}
+	e.childExitedAt = time.Time{}
+	e.lastDetachAt = time.Time{}
+	// A restart this runner made is a process tree it watched start, so a
+	// recovered session stops being one the moment it is cold-resumed: its
+	// child is running, and `active` can say so.
+	e.recovered = false
+	// The new boot runs the whole chain again (setup, clone, init), so a
+	// previous boot's failure says nothing about it.
+	e.bootFailed = false
+	// And close the old boot, so a control frame still in flight from the
+	// sandbox that has just been restarted cannot land its child's exit on
+	// the new one. The register that is about to arrive opens the next
+	// epoch; until it does, frames from either side of the restart match
+	// nothing. See sessionEntry.boot.
+	r.nextBoot++
+	e.boot = r.nextBoot
 }

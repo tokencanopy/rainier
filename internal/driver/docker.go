@@ -681,23 +681,34 @@ func (d *Docker) Suspend(ctx context.Context, id string, warm bool) error {
 	return err
 }
 
-func (d *Docker) Resume(ctx context.Context, id string) error {
+func (d *Docker) Resume(ctx context.Context, id string) (bool, error) {
 	// Determine current status to pick unpause vs start.
 	out, err := dockerRun(ctx, "inspect", "-f", "{{.State.Status}}", id)
 	if err != nil {
-		return err
+		return false, err
 	}
+	// restarted is reported per branch rather than derived afterwards,
+	// because it is precisely the distinction this function makes and nothing
+	// above it can: `docker start` gives the container a new process tree —
+	// a new agent — while `unpause` and the already-running case do not.
+	// See Driver.Resume.
 	switch out {
 	case "paused":
 		_, err = dockerRun(ctx, "unpause", id)
+		return false, err
+	case "running":
+		return false, nil // already running
 	case "exited", "created":
 		_, err = dockerRun(ctx, "start", id)
-	case "running":
-		err = nil // already running
+		return err == nil, err
 	default:
+		// An unrecognized status (docker's "restarting", "removing", "dead",
+		// or a word a future daemon invents) is treated as a start, as it
+		// always has been — and a start that returns cleanly restarted the
+		// process tree whatever the status was called.
 		_, err = dockerRun(ctx, "start", id)
+		return err == nil, err
 	}
-	return err
 }
 
 // Snapshot commits the container as an image under ref, or under a

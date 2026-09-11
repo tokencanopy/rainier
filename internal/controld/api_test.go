@@ -2144,6 +2144,65 @@ func TestResumeSession(t *testing.T) {
 		}
 	})
 
+	// The third way a resume is refused, and the one idle auto-stop added:
+	// the runner is already stopping that sandbox. It reaches the handler as
+	// a conflict because the runner said so on its result, which is the whole
+	// of the fix — before it, this was a 500 `internal`, "could not resume
+	// session", about a runner that is healthy, answering, and will accept
+	// the very same command a second later. Reachable from here and not only
+	// from the runner's dev surface: a runner that redials mid-auto-stop
+	// announces the session as suspended_cold, reconciliation moves the row
+	// there, and this is the state a resume is accepted in.
+	t.Run("a runner already stopping the sandbox is 409 conflict", func(t *testing.T) {
+		s, st, ts := newTestControld(t)
+		f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
+			Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
+		waitConnected(t, s, "vm1")
+		awaitReconciled(t, f)
+
+		owner, tok := loginUser(t, st, "alice", "member")
+		seedSession(t, st, control.Session{ID: "sess_res_stopping", CreatorID: control.ActorID(owner.ID), State: control.StateSuspendedCold, RunnerID: "vm1"})
+
+		type result struct{ resp *http.Response }
+		resc := make(chan result, 1)
+		go func() {
+			resc <- result{doRequest(t, ts, http.MethodPost, "/v0/sessions/sess_res_stopping/resume", tok, nil, nil)}
+		}()
+		cmd := f.nextCmd(t)
+		if cmd.Type != "resume" {
+			t.Fatalf("got %+v, want a resume", cmd)
+		}
+		f.replyConflict(t, cmd, "session is being suspended")
+
+		resp := (<-resc).resp
+		raw := readBody(t, resp)
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
+		}
+		e := decodeErrBody(t, raw)
+		if e.Error.Code != "conflict" {
+			t.Errorf("code = %q, want conflict — the CLI keys its bounded retry on this", e.Error.Code)
+		}
+		if e.Error.Message != "session cannot be resumed right now" {
+			t.Errorf("message = %q, want the handler's own sentence", e.Error.Message)
+		}
+		if strings.Contains(raw, "session is being suspended") {
+			t.Errorf("the runner's own words reached the client: %s", raw)
+		}
+
+		// And the row is left exactly where it was: the refusal moves
+		// nothing, so the session is not left claiming to run on a container
+		// that is stopping.
+		after := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_res_stopping", tok, nil, nil)
+		var body v0wire.SessionEnvelope
+		if err := json.Unmarshal([]byte(readBody(t, after)), &body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if body.Session.State != string(control.StateSuspendedCold) {
+			t.Errorf("state after the refused resume = %q, want suspended_cold", body.Session.State)
+		}
+	})
+
 	t.Run("runner disconnected is 502 runner_unreachable", func(t *testing.T) {
 		_, st, ts := newTestControld(t)
 		owner, tok := loginUser(t, st, "alice", "member")
@@ -4406,5 +4465,62 @@ func TestControllerHeldIsMeasuredOnTheServersClock(t *testing.T) {
 	now = now.Add(control.ControllerLeaseTTL + time.Second)
 	if view := s.renderer(context.Background()).view(row); view.Controller.Held {
 		t.Fatal("an expired lease still reads as held; expiry is passive and must be derived on the read")
+	}
+}
+
+// TestARunnerConflictDoesNotBorrowTheRowsSentence. A runner's "not yet" and a
+// row in the wrong state are both 409 `conflict` — deliberately, so a client
+// keying on the status or the code sees one retryable refusal — but they are
+// not the same statement, and the handlers' Conflict sentences NAME A STATE.
+// `stop` is the clearest case: its row conflict is "session is not running",
+// and a runner refusing a stop is refusing a session that very much is. A
+// handler that reused that sentence would tell a person something the row
+// they just read disproves.
+//
+// Unreachable from today's runnerd for stop and snapshot (only Op's resume
+// arm returns errSuspendInFlight), and pinned anyway: the conflict set is one
+// shared list read by every result arm, so the first sentinel added to it
+// arrives in three commands that never had one.
+func TestARunnerConflictDoesNotBorrowTheRowsSentence(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, state, want string
+	}{
+		{"suspend", http.MethodPost, "/suspend?warm=true", string(control.StateRunning), "session cannot be stopped right now"},
+		{"snapshot", http.MethodPost, "/snapshot", string(control.StateRunning), "session cannot be snapshotted right now"},
+		{"delete", http.MethodDelete, "", string(control.StateRunning), "session cannot be deleted right now"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, st, ts := newTestControld(t)
+			f := startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4,
+				Sessions: []runner.SessionInfo{{ID: ghostSession, State: "running"}}})
+			waitConnected(t, s, "vm1")
+			awaitReconciled(t, f)
+
+			owner, tok := loginUser(t, st, "alice", "member")
+			id := "sess_rc_" + tc.name
+			seedSession(t, st, control.Session{ID: control.SessionID(id), CreatorID: control.ActorID(owner.ID),
+				State: control.SessionState(tc.state), RunnerID: "vm1"})
+
+			type result struct{ resp *http.Response }
+			resc := make(chan result, 1)
+			go func() {
+				resc <- result{doRequest(t, ts, tc.method, "/v0/sessions/"+id+tc.path, tok, nil, nil)}
+			}()
+			f.replyConflict(t, f.nextCmd(t), "session is being suspended")
+
+			resp := (<-resc).resp
+			raw := readBody(t, resp)
+			if resp.StatusCode != http.StatusConflict {
+				t.Fatalf("status = %d, want 409; body=%s", resp.StatusCode, raw)
+			}
+			e := decodeErrBody(t, raw)
+			if e.Error.Code != "conflict" {
+				t.Errorf("code = %q, want conflict", e.Error.Code)
+			}
+			if e.Error.Message != tc.want {
+				t.Errorf("message = %q, want %q — the row's own conflict sentence names a state "+
+					"the runner's refusal does not claim", e.Error.Message, tc.want)
+			}
+		})
 	}
 }

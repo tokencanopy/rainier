@@ -102,6 +102,21 @@ func (p *Plane) applyRunnerEvent(ctx context.Context, rc *runnerConn, m runner.F
 		ev.State = control.StateRunning
 	case "dead":
 		ev.State = control.StateDead
+	case "suspended_cold":
+		// A park the RUNNER decided on: today only idle auto-stop, which
+		// stops a sandbox whose child has exited and that nobody has attached
+		// to for its configured timeout — the same cold suspend, on the same
+		// runner, that an operator's stop dispatches, just without a command
+		// to answer. The service's own transition table already accepts this
+		// state from a runner (running or suspended_cold → suspended_cold),
+		// so the session's row follows the sandbox instead of claiming to be
+		// running on a container that is stopped.
+		//
+		// The runner's sentence (how long it had been idle) is deliberately
+		// dropped here rather than carried into Detail: Detail is the error
+		// column's text, and a session that parked exactly as asked has no
+		// error. The runner logs the duration on its own side.
+		ev.State = control.StateSuspendedCold
 	case "setup_failed":
 		// The original name for what is now one stage among three, and one
 		// that stays accepted forever: sessiond ships INSIDE the session image

@@ -183,7 +183,19 @@ type Listed struct {
 type Driver interface {
 	Create(ctx context.Context, spec Spec) (Handle, error)
 	Suspend(ctx context.Context, id string, warm bool) error // warm=pause, cold=stop
-	Resume(ctx context.Context, id string) error
+	// Resume brings a suspended session back and reports whether doing so
+	// RESTARTED the container — `docker start` (a new process tree, and
+	// therefore a new agent process) rather than `docker unpause` (the same
+	// processes, unfrozen) or nothing at all (it was already running).
+	//
+	// The caller cannot work that out for itself, and that is the whole reason
+	// this is in the signature rather than inferred above the driver: Inspect
+	// folds paused, exited and created into the single StateSuspended, so
+	// nothing outside a driver can tell a pause from a stop. runnerd needs the
+	// answer to know whether the child it was told had exited is the child
+	// that is running now — and getting it wrong in the "restarted" direction
+	// means idle auto-stop kills a working agent.
+	Resume(ctx context.Context, id string) (restarted bool, err error)
 	// Snapshot commits a session's current filesystem as an image.
 	//
 	// ref, when non-empty, is the exact tag to commit to, and comes back in

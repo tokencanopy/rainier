@@ -423,7 +423,15 @@ func (f *fleet) addRunner(name string, slots int) *runnerNode {
 // startRunner starts a runnerd over drv. Reusing a driver that already holds
 // containers is how the restart scenes simulate a process death that the
 // containers outlived: Recover rebuilds the registry from exactly that.
-func (f *fleet) startRunner(name string, drv *driver.Fake) *runnerNode {
+//
+// wrap, when given, is what the Server actually runs on: a scene that needs to
+// hold a driver call open — a cold suspend that does not return until the test
+// says so, which is the only way to stand inside the window where a runner is
+// stopping a sandbox — passes a decorator around the same fake. Everything
+// that reads the box back (containers, volumes, the last dispatched spec) goes
+// on reading the fake itself, so only the scene that asks for a decorator pays
+// for one.
+func (f *fleet) startRunner(name string, drv *driver.Fake, wrap ...func(*driver.Fake) driver.Driver) *runnerNode {
 	f.t.Helper()
 
 	// The local surface's address has to be known before runnerd.New (it is
@@ -431,7 +439,14 @@ func (f *fleet) startRunner(name string, drv *driver.Fake) *runnerNode {
 	// unstarted and its handler installed once the Server exists.
 	ts := httptest.NewUnstartedServer(nil)
 	wsBase := "ws://" + ts.Listener.Addr().String()
-	rd := runnerd.New(drv, wsBase, "", "")
+	if len(wrap) > 1 {
+		f.t.Fatalf("startRunner(%s): %d decorators, want at most one", name, len(wrap))
+	}
+	var d driver.Driver = drv
+	if len(wrap) == 1 && wrap[0] != nil {
+		d = wrap[0](drv)
+	}
+	rd := runnerd.New(d, wsBase, "", "")
 	ts.Config.Handler = rd.Handler()
 	ts.Start()
 
