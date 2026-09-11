@@ -122,15 +122,25 @@ frozen. Rejected for the same reason the exec broker was made optional rather
 than required: this struct is composed by Rainier Cloud as well as by
 self-hosted controld.
 
-**Have each host inject the identity onto the runner's dial-back context.**
+**Have each host RE-RESOLVE the claimant from its store on every claim.**
 This is what the sandbox's upward credential request already does
-(`internal/controld/srpc.go`'s `agentActorContext` looks the session's creator
-up and calls `withUser`). It works, and it is wrong here: the dial-back
-carries an attach id and nothing else, so a host would have to *re-derive* who
-the claimant is from the session row — which is not the same person as the
-claimant, and would authorize a viewer's claim as the session's creator. The
-credential path can do it because the principal it wants genuinely is the
-session's creator.
+(`internal/controld/srpc.go`'s `agentActorContext` reads the session's creator
+out of the store and calls `withUser`), and it is the only shape that keeps a
+claim's authorization *live* in the identity as well as in the question: a
+host would resolve the keeper's own `scope.Actor.ID` — the claimant, not the
+session's creator — to whatever that account is now, so a role revoked or an
+account deleted mid-attach would be seen at the next press.
+
+It is not what this change does, and the reason is scope rather than
+correctness. Every host would need a principal lookup on the claim path
+(`ownerOrAdmin` is a zero-size struct today and would need the store),
+attach-time authorization would grow a store read, and "the store cannot
+answer" would become a new authorization outcome with its own semantics.
+Rainier Cloud would need the matching change against its directory, in its own
+repository, on its own review. The captured identity is what makes
+`--take` work at all; re-resolution is what would make it honour a
+revocation, and it is written down as the follow-up under
+[Limitations](#limitations) rather than smuggled in here.
 
 **Let the plane carry the client's context into the splice.** The plane would
 have to hold the client's request context alongside the runner's and hand the
@@ -155,29 +165,50 @@ two: the **values** of the authorizing context, and the **deadline and
 cancellation** of the call being made now.
 
 ```go
-type policyContext struct {
-	context.Context          // the live call: deadline, cancellation, Err
-	identity context.Context // the attach that was authorized: values only
+func (k controllerKeeper) authorizing(ctx context.Context) (context.Context, func()) {
+	if k.identity == nil {
+		return ctx, func() {}          // ask as a composer got before this existed
+	}
+	base, stopTimer := k.identity, context.CancelFunc(func() {})
+	if deadline, ok := ctx.Deadline(); ok {
+		base, stopTimer = context.WithDeadline(base, deadline)
+	}
+	out, cancel := context.WithCancelCause(base)
+	stop := context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
+	if ctx.Err() != nil {
+		cancel(context.Cause(ctx))     // already over: answer synchronously
+	}
+	return out, func() { stop(); cancel(context.Canceled); stopTimer() }
 }
-
-func (c policyContext) Value(key any) any { return c.identity.Value(key) }
 ```
 
 Values from the authorizing context **only**, never merged with the live
-call's: the live call is the runner's, and a runner must not be able to
-contribute a value to an authorization decision about a user. Deadline and
-cancellation from the live call **only**: a policy that is a network call must
-die with the claim that asked it, and the captured context must not be able
-to keep a store or a policy call alive after the attach is gone — which is
-also why the capture is `WithoutCancel`ed, so the stored field carries no
-`Done` channel for anything to wait on and no `Err` for anything to read.
+call's — not even as a fallback for a key the authorizing context does not
+carry. The live call is the runner's, and a runner must not be able to
+contribute a value to an authorization decision about a user; the capture's
+`context.WithoutCancel` severs the chain, so nothing on the runner's side is
+reachable from the question at all. Deadline and cancellation from the live
+call **only**: a policy that is a network call must die with the claim that
+asked it, and the captured context must not be able to keep a policy call
+alive after the attach is gone.
+
+The two are grafted together with the context package's own machinery rather
+than by overriding `Value` on a wrapper around the live call. The override is
+three lines shorter and it hides the key `context.WithCancel` looks a
+cancellation parent up by, so every cancelable context a host's policy derived
+— which is every policy that makes a bounded network call — would spawn a
+goroutine to watch its parent instead of registering as a child. A test pins
+the cost at derivation, not the implementation.
 
 The store calls the keeper makes — the generation CAS, the lease renew, the
 row read — keep running on the caller's context exactly as they do today.
 They are not authorization decisions, they are already fenced by the
 generation, and a host repository that reads a request-scoped value (a
 transaction handle, say) must see the context of the call it is actually
-serving.
+serving. The symmetric case on the policy side is the opposite by
+construction: a policy that reads the store sees the captured attach's values,
+so it cannot join a transaction the claim opened — which is correct, because
+the claim opens none.
 
 `Claim` is the only keeper method that asks the policy. `Renew`, `Release` and
 `State` ask nothing, which is what makes the heartbeat survive on a runner's
@@ -202,39 +233,74 @@ on the runner's dial-back context:
 
 ## Edge cases
 
-- **A claim on a context with no identity captured.** A composer that built a
-  keeper before this change cannot exist (the field is set in the only
-  constructor), but a zero-value keeper — or a host that authorizes from the
-  scope alone and puts nothing in the context — must not break. A nil
-  authorizing context falls through to the caller's context unchanged, which
-  is exactly today's behaviour.
+- **A claim on a keeper with no identity captured.** `grant` is the only
+  constructor and it always captures, so this is the defensive case: a host
+  that authorizes from the scope alone and puts nothing in the context, or a
+  keeper assembled in a test. A nil authorizing context falls through to the
+  caller's context unchanged, which is exactly the previous behaviour. It is
+  the only nil tolerated — a keeper with no *policy* is a composition error
+  and still panics, as it did before.
 - **The attach's context is cancelled while a claim is in flight.** Only the
   live call's cancellation is honoured; the captured one has none. A claim on
   a cancelled splice fails on the store call or the policy's own context, as
   it does today.
-- **A grant revoked mid-attach.** Still honoured: the policy is asked live,
-  per claim, and it is asked about a stored grant. What is frozen is *who the
-  claimant is*, not *what they may do* — and the claimant cannot change
-  mid-attach, because the socket is the one the principal authenticated.
-- **A role revoked mid-attach, on a host that resolves the role at the
-  edge.** The captured context holds the role the attach was admitted with,
-  so a claim after a revocation is authorized against it. That is a real
-  narrowing of liveness relative to a question asked on a fresh request, and
-  it is the only answer available: the claim does not arrive on a request the
-  edge could bind a current role to. The mechanism for a revoked membership
-  is closing the live connection, which hosted Rainier already does; a policy
-  that reads stored state rather than a context-bound role is honoured live.
-  This is written down in `docs/terminal-controller-ownership.md` rather than
-  left implicit.
+- **A grant revoked mid-attach.** The *question* is still asked live, per
+  claim, so a policy whose answer depends on state it reads at that moment —
+  Cloud's planned session collaboration grants are the case this seam exists
+  for — is honoured at the next press. What is frozen is the captured
+  context's own values, which on both hosts shipping today means the
+  claimant's identity *and their role*: see [Limitations](#limitations),
+  because today that is the whole of what either policy reads.
 - **A runner that tries to influence the decision.** It cannot: the runner
   contributes no value to the context the policy sees, and the claim is
   answered against the resource and scope captured at the door, for the
   session the attach was authorized for.
 - **The identity outliving the attach.** The captured context is a field on a
   keeper held by one `ownership`, which the plane drops when the attach
-  finishes. It carries no goroutine, no timer and no `Done` channel.
+  finishes. It carries no goroutine, no timer and no `Done` channel of its
+  own. What it does retain is the value chain of the attach request — for
+  self-hosted, a cursor, the `User`, and the standard library's own server
+  and local-address values; no request body and no socket. Each context
+  `authorizing` derives from it is released before `Claim` returns.
 - **An unnegotiated (legacy) attach.** It gets no keeper at all, so it has no
   claim path and nothing here applies to it.
+
+## Limitations
+
+Named rather than implied, because the adversarial review of this change
+demonstrated each one and an operator would otherwise have to.
+
+**A revoked role still authorizes a claim on a socket that was already
+open.** Both shipped policies read everything they need from frozen inputs —
+`ownerOrAdmin` from the captured `User` (including its `Role`) and the
+keeper's `resource.CreatorID`, hosted Rainier from the role the edge bound and
+`scope.Actor.ID` — so a claim's answer today is a function of state captured
+at attach time. Concretely: an admin who attached to another person's session
+as a viewer, and was then demoted, is refused a *new* attach with 403 and can
+still take control on the attach they already hold. Self-hosted controld has
+no mechanism that ends that window: no attach lease, no server idle timeout,
+and no token-revocation or role-change endpoint at all, so it is the lifetime
+of the connection.
+
+This is a narrowing of authority-over-time compared to asking on a fresh
+request, and it is a widening compared to the broken behaviour it replaces,
+where every claim was refused. It is consistent with the rest of an attach
+rather than an exception to it: a controller who is demoted mid-attach keeps
+typing under the same rule, because the plane's own `claim` path short-circuits
+for the attach that already holds control and the heartbeat's `Renew` asks
+nothing. Nothing about a live attach is re-authenticated today; this change
+does not make that better and does not make it worse for anybody who already
+had control.
+
+The follow-ups that would close it, in order of cost: re-resolve the claimant
+from the host's store on each claim (see [Alternatives](#alternatives)), and
+close live attach sockets when a membership, role or token changes — which is
+the mechanism a hosted cell has and a self-hosted installation does not.
+
+**A claim from the attach that already holds control asks nothing.** It is
+answered from a lease read (`attachplane/ownership.go`), by design and by the
+shipped doc, so "the take-control key asks the policy" is true of a viewer's
+press and not of a controller's. The tests here say which they cover.
 
 ## Verification
 
@@ -245,11 +311,17 @@ on the runner's dial-back context:
   advanced generation; before the fix it is answered `stale`. Plus the same
   path for a principal the policy genuinely refuses the controller (still
   `stale`), so the fix is not a weakening.
-- `internal/controld`: `rainier attach --take`'s exact sequence, and the
-  in-session take-control key's, driven through the client library against
-  the real server with a policy that **records the identity it was asked
-  about** — the assertion being that it was asked about the attaching user
-  and not about nobody.
+- `internal/controld`: the exact frame sequence `rainier attach --take` and
+  the in-session take-control key produce, against the real server — both
+  halves of `--take`, the query-string claim that was never broken and the
+  mid-attach claim that was. The frames are written out in the test rather
+  than driven through `internal/attachio`, whose decision to send them is
+  unexported and pinned by that package's own tests
+  (`TestTheTakeKeyClaimsFromTheGenerationItWasTold`,
+  `TestALostClaimSaysSoAndDoesNotRetry`); the two halves meet at one frame
+  shape. One of these tests runs under a policy that **records the identity
+  it was asked about**, and asserts it was the attaching user rather than
+  nobody.
 - `controlapp`: unit tests over a keeper with an identity-inspecting fake
   policy — `Claim` on a bare context succeeds and the policy sees the
   authorizing user; `Renew`, `Release` and `State` on a bare context succeed
@@ -257,6 +329,13 @@ on the runner's dial-back context:
   before.
 - The controller-ownership suites — `attachplane`, `controlapp`,
   `internal/controld`, `internal/attachio`, `cmd/rainier` — at
-  `-race -count=3`.
+  `-race -count=3`. `controlapp` needs `-timeout` raised above the default ten
+  minutes at that count, for a pre-existing reason that has nothing to do with
+  ownership: `TestPullWorkspaceExactlyMaxBytes` and `TestPullWorkspaceOverflow`
+  each stream `workspace.MaxBytes` through a fake transport, which costs five
+  minutes a round under the race detector.
+- Mutation checks, because a test that cannot fail is not verification: the
+  capture removed, the values merged with the live call's, and the live call's
+  cancellation ignored each fail a named test and nothing else.
 - `make verify`, and `repotest` on both store adapters with
   `RAINIER_TEST_PG_DSN` set at PostgreSQL 17.

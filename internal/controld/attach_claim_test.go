@@ -229,6 +229,16 @@ func (p *recordingPolicy) refuseController(deny bool) {
 // leaving every other adapter — the store, the transport, the broker, the
 // events — exactly as compose built them. It is the seam a hosted policy
 // occupies, stood up in the one place a self-hosted test can reach it.
+//
+// Two honest limits. It replaces the SERVICE's policy only: the pre-upgrade
+// check in mayAttach is ownerOrAdmin either way, so a refuseController
+// fixture models a host whose door admits the attach and whose service then
+// grants viewing — the hosted shape — and not a host whose two halves
+// disagree. And it writes the field after the fixture's server is already
+// serving, which is safe here for a mechanical reason rather than a lucky
+// one: it runs before this test dials any attach, and nothing else in the
+// fixture reads that field (the runner's control connection and the credential
+// RPC go through other services).
 func withRecordingPolicy(t *testing.T, fx *attachFixture) *recordingPolicy {
 	t.Helper()
 	policy := &recordingPolicy{}
@@ -286,11 +296,14 @@ func TestAMidAttachClaimIsAuthorizedAgainstTheAttachingUser(t *testing.T) {
 	}
 }
 
-// TestAViewOnlyPrincipalsClaimIsStillRefused is the other half of the fix: it
-// must carry the identity through without weakening what the policy is then
-// allowed to say about it. A host that grants viewing and not driving admits
-// the attach as a viewer, and its claim is refused — with the store never
-// touched, because the service already carried that answer down to the plane.
+// TestAViewOnlyPrincipalsClaimIsStillRefused is a no-weakening test rather
+// than a regression test, and it is worth being exact about which: a claim
+// from a principal the policy refused the controller at the door never reaches
+// the keeper at all — the service carried that answer down to the plane as
+// MayClaim=false — so this path is refused with or without the fix. What it
+// pins is that carrying the identity did not open it: the refusal still
+// happens, the store is still never touched, and the policy is still not asked
+// a second time for an answer this attach already has.
 func TestAViewOnlyPrincipalsClaimIsStillRefused(t *testing.T) {
 	fx := newAttachFixture(t)
 	policy := withRecordingPolicy(t, fx)
@@ -302,9 +315,13 @@ func TestAViewOnlyPrincipalsClaimIsStillRefused(t *testing.T) {
 	}
 	fx.sd.nextOpen(t)
 
+	before := len(policy.questions())
 	takeControl(t, phone, opening.Generation.Value())
 	if m := readOwnership(t, phone); m.Type != terminal.TypeStale {
 		t.Fatalf("a view-only principal's claim was answered %+v, want stale", m)
+	}
+	if asked := policy.questions()[before:]; len(asked) != 0 {
+		t.Fatalf("the claim asked the policy %v; the service already had that answer", asked)
 	}
 	row, err := fx.st.Sessions().GetSession(context.Background(), installWorkspace, control.SessionID(fx.id))
 	if err != nil {
@@ -312,6 +329,12 @@ func TestAViewOnlyPrincipalsClaimIsStillRefused(t *testing.T) {
 	}
 	if row.ControllerGeneration != 0 {
 		t.Fatalf("the row's generation = %d; a refused claim must move nothing", row.ControllerGeneration)
+	}
+	// And the door's own questions were about the attaching user, which is
+	// what makes "the policy refused THIS principal the controller" the
+	// reason for everything above.
+	if asked := policy.questions()[:before]; len(asked) == 0 || asked[0].user != "alice" {
+		t.Fatalf("the attach's policy questions were %v, want them about alice", asked)
 	}
 }
 
@@ -338,9 +361,20 @@ func TestAGrantRevokedMidAttachIsRefusedAtTheNextPress(t *testing.T) {
 	// The host withdraws the grant this attach was admitted under.
 	policy.refuseController(true)
 
+	before := len(policy.questions())
 	takeControl(t, phone, second.Generation.Value())
 	if m := readOwnership(t, phone); m.Type != terminal.TypeStale {
 		t.Fatalf("a claim under a withdrawn grant was answered %+v, want stale", m)
+	}
+	// Refused because the POLICY said no about this person — not because the
+	// question was asked about nobody, which is the bug and which produces
+	// the same `stale` on the wire. The assertion is what tells them apart.
+	asked := policy.questions()[before:]
+	if len(asked) != 1 || asked[0].mode != control.AttachmentController {
+		t.Fatalf("the claim asked the policy %v, want one controller question", asked)
+	}
+	if asked[0].user != "alice" {
+		t.Fatalf("the withdrawn grant was evaluated against %q, want alice", asked[0].user)
 	}
 	row, err := fx.st.Sessions().GetSession(context.Background(), installWorkspace, control.SessionID(fx.id))
 	if err != nil {

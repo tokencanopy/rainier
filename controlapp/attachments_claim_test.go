@@ -3,8 +3,10 @@ package controlapp
 import (
 	"context"
 	"errors"
+	"runtime"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/tokencanopy/rainier/control"
 )
@@ -117,29 +119,118 @@ func TestACallersContextCannotSupplyTheIdentity(t *testing.T) {
 	}
 }
 
-// TestAClaimHonoursTheLiveCallsCancellation is the other half of that split:
-// the values come from the attach, and the deadline and cancellation come
-// from the call being made now. A captured context must not be able to keep a
-// policy's network call alive after the claim that asked it is gone.
-func TestAClaimHonoursTheLiveCallsCancellation(t *testing.T) {
+// TestARunnersValueCannotFillAGapInTheIdentity is the sharp edge of "values
+// from the authorizing context ALONE". A merge that fell back to the live call
+// for a key the identity did not carry would look harmless and would hand the
+// runner's dial-back context the casting vote on every question the attach
+// itself left unanswered.
+func TestARunnersValueCannotFillAGapInTheIdentity(t *testing.T) {
 	fx := newAttachmentFixture(t)
-	var seen error
-	policy := policyFunc(func(ctx context.Context, mode control.AttachmentMode) error {
-		seen = ctx.Err()
-		return ctx.Err()
-	})
-	k := claimKeeper(fx, policy, withTestPrincipal(context.Background(), "usr_example"))
+	policy := &identityPolicy{allow: "usr_example"}
+	// An authorizing context that names nobody — a host that authorizes from
+	// the scope alone — and a live call that names the principal the policy
+	// would allow.
+	k := claimKeeper(fx, policy, context.WithValue(context.Background(), struct{ unrelated int }{}, 1))
 
+	if _, err := k.Claim(withTestPrincipal(context.Background(), "usr_example"),
+		fx.sessions.row.ControllerGeneration); !errors.Is(err, control.ErrDenied) {
+		t.Fatalf("Claim whose identity carries nobody: err = %v, want ErrDenied", err)
+	}
+	if !slices.Equal(policy.asked, []string{""}) {
+		t.Fatalf("the policy was asked about %v, want one question about nobody", policy.asked)
+	}
+}
+
+// TestAClaimIsCancelledWithTheCallThatAskedIt pins the other half of the
+// split: a policy that is a network call must not outlive the claim. Both the
+// already-over case and the cancelled-while-asking case, because they take
+// different paths — one is answered synchronously and one arrives through the
+// context package's own callback.
+func TestAClaimIsCancelledWithTheCallThatAskedIt(t *testing.T) {
+	fx := newAttachmentFixture(t)
+
+	t.Run("already over", func(t *testing.T) {
+		var seen error
+		k := claimKeeper(fx, policyFunc(func(ctx context.Context, _ control.AttachmentMode) error {
+			seen = ctx.Err()
+			return ctx.Err()
+		}), withTestPrincipal(context.Background(), "usr_example"))
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := k.Claim(ctx, fx.sessions.row.ControllerGeneration); !errors.Is(err, control.ErrDenied) {
+			t.Fatalf("Claim on a cancelled call: err = %v, want ErrDenied", err)
+		}
+		if !errors.Is(seen, context.Canceled) {
+			t.Fatalf("the policy saw ctx.Err() = %v, want context.Canceled", seen)
+		}
+	})
+
+	t.Run("cancelled while asking", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		k := claimKeeper(fx, policyFunc(func(asked context.Context, _ control.AttachmentMode) error {
+			// The claim is abandoned mid-question, which is what a client
+			// hanging up looks like from in here.
+			cancel()
+			select {
+			case <-asked.Done():
+				return asked.Err()
+			case <-time.After(5 * time.Second):
+				return errors.New("the authorizing context never followed the live call")
+			}
+		}), withTestPrincipal(context.Background(), "usr_example"))
+		if _, err := k.Claim(ctx, fx.sessions.row.ControllerGeneration); !errors.Is(err, control.ErrDenied) {
+			t.Fatalf("Claim abandoned mid-question: err = %v, want ErrDenied", err)
+		}
+	})
+
+	t.Run("deadline", func(t *testing.T) {
+		var got time.Time
+		k := claimKeeper(fx, policyFunc(func(asked context.Context, _ control.AttachmentMode) error {
+			got, _ = asked.Deadline()
+			return nil
+		}), withTestPrincipal(context.Background(), "usr_example"))
+		want := time.Now().Add(time.Hour)
+		ctx, cancel := context.WithDeadline(context.Background(), want)
+		defer cancel()
+		if _, err := k.Claim(ctx, fx.sessions.row.ControllerGeneration); err != nil {
+			t.Fatalf("Claim under a deadline: %v", err)
+		}
+		if !got.Equal(want) {
+			t.Fatalf("the policy saw deadline %v, want the live call's %v", got, want)
+		}
+	})
+}
+
+// TestAnAuthorizingContextCostsNoGoroutinePerDerivation is the cost of the
+// shape, pinned. A host's policy derives its own cancelable context — every
+// one that makes a network call does — and an authorizing context that hid
+// the cancellation parent would make each of those spawn a goroutine to watch
+// it instead of registering as a child.
+func TestAnAuthorizingContextCostsNoGoroutinePerDerivation(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	k := claimKeeper(fx, &identityPolicy{allow: "usr_example"},
+		withTestPrincipal(context.Background(), "usr_example"))
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if _, err := k.Claim(ctx, fx.sessions.row.ControllerGeneration); !errors.Is(err, control.ErrDenied) {
-		t.Fatalf("Claim on a cancelled call: err = %v, want ErrDenied", err)
+	defer cancel()
+	authCtx, release := k.authorizing(ctx)
+	defer release()
+
+	const derivations = 1000
+	before := runtime.NumGoroutine()
+	cancels := make([]context.CancelFunc, 0, derivations)
+	for range derivations {
+		_, c := context.WithCancel(authCtx)
+		cancels = append(cancels, c)
 	}
-	if !errors.Is(seen, context.Canceled) {
-		t.Fatalf("the policy saw ctx.Err() = %v, want context.Canceled from the live call", seen)
+	grew := runtime.NumGoroutine() - before
+	for _, c := range cancels {
+		c()
 	}
-	if _, ok := k.authorizing(ctx).Deadline(); ok {
-		t.Fatal("an authorizing context reported a deadline the live call did not have")
+	// Generous: what this is looking for is one goroutine PER derivation, and
+	// the noise from other tests in this binary is two orders smaller.
+	if grew > derivations/5 {
+		t.Fatalf("%d cancelable contexts derived from an authorizing context grew %d goroutines; "+
+			"they must register as children rather than each watch a parent", derivations, grew)
 	}
 }
 

@@ -164,12 +164,15 @@ func startFakeSessiond(t *testing.T, ctx context.Context, wsBase, id string) *fa
 	c.SetReadLimit(16 << 20)
 	t.Cleanup(func() { c.CloseNow() })
 	fs := &fakeSessiond{
-		raw:      c,
-		conn:     relay.WSConn(c),
-		opens:    make(chan relay.Frame, 8),
-		resizes:  make(chan terminal.ClientMessage, 8),
-		closes:   make(chan uint64, 8),
-		controls: make(chan terminal.ClientMessage, 8),
+		raw:     c,
+		conn:    relay.WSConn(c),
+		opens:   make(chan relay.Frame, 8),
+		resizes: make(chan terminal.ClientMessage, 8),
+		closes:  make(chan uint64, 8),
+		// Deep enough that no test stalls the fake's single serve loop on an
+		// undrained handoff: the send below is blocking, because a test that
+		// asserts on a binding must not have it dropped.
+		controls: make(chan terminal.ClientMessage, 64),
 	}
 	go fs.serve(ctx)
 	return fs

@@ -189,40 +189,58 @@ type controllerKeeper struct {
 	holder   string
 }
 
-// policyContext is the context one of this keeper's policy questions is asked
-// on: the VALUES of the context that authorized the attach, and the deadline
-// and cancellation of the call being made now.
+// authorizing returns the context one of this keeper's policy questions is
+// asked on, and the release its caller must run. It carries the VALUES of the
+// context that authorized the attach, and the deadline and cancellation of
+// the call being made now.
 //
-// Both halves are deliberate. The values are the authorizing context's alone
-// and are never merged with the live call's, because the live call is the
-// runner's dial-back — a runner must not be able to contribute a value to an
-// authorization decision about a user. The deadline and cancellation are the
-// live call's alone, because a policy that is a network call must die with
-// the claim that asked it, and a captured context must not be able to keep
-// one alive after the attach is gone.
+// Both halves are deliberate. The values are the authorizing context's alone:
+// the live call is the runner's dial-back, and a runner must not be able to
+// contribute a value to an authorization decision about a user — not even by
+// filling a gap the authorizing context leaves. context.WithoutCancel is what
+// severs the chain at capture, so nothing on the runner's side is reachable
+// from here at all. The deadline and cancellation are the live call's, because
+// a policy that is a network call must die with the claim that asked it, and a
+// captured context must not be able to keep one alive after the attach is
+// gone.
+//
+// They are grafted on with the context package's own machinery — a deadline
+// and an AfterFunc — rather than by overriding Value on a wrapper around the
+// live call. The override is three lines shorter and it hides the cancellation
+// key the package looks a parent up by, so every cancelable context a host's
+// policy derived would cost a goroutine instead of a registration.
 //
 // The keeper's STORE calls are not routed through this. They are not
 // authorization decisions, they are already fenced by the generation, and a
 // host repository that reads a request-scoped value (a transaction handle,
 // say) must see the context of the call it is actually serving.
-type policyContext struct {
-	context.Context                 // the live call: deadline, cancellation, Err
-	identity        context.Context // the attach that was authorized: values only
-}
-
-func (c policyContext) Value(key any) any { return c.identity.Value(key) }
-
-// authorizing returns the context this keeper's policy questions are asked
-// on. A keeper with no captured identity asks on the caller's own context,
-// which is what every composer got before this existed.
-func (k controllerKeeper) authorizing(ctx context.Context) context.Context {
+//
+// A keeper with no captured identity asks on the caller's own context, which
+// is what a composer got before this existed. It is the only nil this
+// tolerates: a keeper with no policy is a composition error, not a case.
+func (k controllerKeeper) authorizing(ctx context.Context) (context.Context, func()) {
 	if k.identity == nil {
-		return ctx
+		return ctx, func() {}
 	}
-	return policyContext{Context: ctx, identity: k.identity}
+	base, stopTimer := k.identity, context.CancelFunc(func() {})
+	if deadline, ok := ctx.Deadline(); ok {
+		base, stopTimer = context.WithDeadline(base, deadline)
+	}
+	out, cancel := context.WithCancelCause(base)
+	stop := context.AfterFunc(ctx, func() { cancel(context.Cause(ctx)) })
+	// A call that is ALREADY over is cancelled here rather than left to that
+	// callback, which the context package runs on a goroutine of its own: a
+	// policy asked microseconds later would otherwise see a context that is
+	// not cancelled yet, on behalf of a claim nobody is waiting for.
+	if ctx.Err() != nil {
+		cancel(context.Cause(ctx))
+	}
+	return out, func() {
+		stop()
+		cancel(context.Canceled)
+		stopTimer()
+	}
 }
-
-var _ control.ControllerLeaseKeeper = controllerKeeper{}
 
 // Claim advances the generation from expected and takes the lease. The two
 // statements are safe in this order because the generation is the authority
@@ -238,8 +256,10 @@ var _ control.ControllerLeaseKeeper = controllerKeeper{}
 // attach's: the generation is the authority and the lease is only the hint,
 // so the claim stands and the heartbeat installs the lease on its next pass.
 func (k controllerKeeper) Claim(ctx context.Context, expected uint64) (uint64, error) {
-	if err := k.policy.AuthorizeAttachment(k.authorizing(ctx),
-		k.scope, k.resource, control.AttachmentController); err != nil {
+	authCtx, release := k.authorizing(ctx)
+	err := k.policy.AuthorizeAttachment(authCtx, k.scope, k.resource, control.AttachmentController)
+	release()
+	if err != nil {
 		return 0, control.ErrDenied
 	}
 	return k.claimAuthorized(ctx, expected)

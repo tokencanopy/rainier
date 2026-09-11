@@ -169,12 +169,21 @@ else.
   identity that **opened the attach**, captured when the attach was
   authorized. It has to be: a claim arrives on the socket the runner dialed
   back, which is authenticated as a runner and carries no person at all, so
-  there is nobody on that call to ask about. A grant read out of stored state
-  — a collaboration grant, a session's creator — is therefore honoured at the
-  next press, while a **role** a host resolves per request is the one the
-  attach was admitted with for as long as the attach lives. The mechanism for
-  a membership that is revoked mid-attach is closing the connection, not
-  refusing its next claim.
+  there is nobody on that call to ask about. So a policy whose answer depends
+  on stored state — a collaboration grant — is honoured at the next press,
+  and a policy whose answer depends on the **role** the request was
+  authenticated with is answered from the role this attach was admitted with,
+  for as long as the attach lives.
+
+  Operationally that means one thing worth knowing: **an attach that is
+  already open keeps the authority it opened with.** A person whose role is
+  revoked is refused a new attach at once, and on a socket they already hold
+  they can still watch, and can still take control if their old role allowed
+  it. It is the same rule that already lets a demoted controller keep typing
+  — nothing about a live attach is re-authenticated, and this is the whole of
+  what the take-control key adds to it. To end such an attach today, end the
+  connection: stop it at the proxy or restart the control plane. Nothing in
+  self-hosted Rainier expires a live attach on its own.
 
   There is **one message for both refusals**, and the CLI renders it
   `[somebody else got there first; press Ctrl-\ to try again]`. For a
