@@ -87,6 +87,21 @@ type Server struct {
 	// never registered" would otherwise take ten seconds each — and it is only
 	// ever written immediately after New, before this server serves anything.
 	hubWait time.Duration
+	// now is the clock every idle-stop decision reads: time.Now in
+	// production, a test's own function in tests, so the thirty minutes a
+	// session has to sit idle can be a table row rather than a sleep. A field
+	// written only immediately after New, like hubWait, and never again.
+	//
+	// Both sides of every duration this server computes come from here, so in
+	// production both carry Go's monotonic reading and the subtraction uses
+	// it — an NTP step cannot make a session look idle early. Nothing on this
+	// path calls UTC/Round/Truncate or marshals these times, which is what
+	// would strip that reading.
+	now func() time.Time
+	// idleSweep is how often RunIdleStop looks for idle sessions. Zero — the
+	// value New leaves — means "derive it from the timeout" (see
+	// idleSweepInterval); a test sets it directly to keep its loop short.
+	idleSweep time.Duration
 }
 
 // SetOnEvent installs f as the session-event callback (nil clears it).
@@ -164,7 +179,7 @@ func (e *egressError) Unwrap() error { return e.err }
 
 func New(drv driver.Driver, dialBase, egressAdmin, proxyURL string) *Server {
 	return &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin,
-		proxyURL: proxyURL, hubWait: defaultHubWait}
+		proxyURL: proxyURL, hubWait: defaultHubWait, now: time.Now}
 }
 
 // Recover rebuilds the in-memory registry from the driver's labeled
@@ -531,13 +546,14 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 			// the container dies, racing ahead of the setState below) sees a
 			// state that means "keep the entry" rather than defaulting to
 			// the crash path and destroying a container we deliberately just
-			// stopped.
-			s.reg.setState(id, "suspending")
+			// stopped. beginColdSuspend also records that this park is a
+			// STOP and not a pause, which is what a later resume reads to
+			// decide whether the child it knew about survived — see
+			// registry.resumed.
+			s.reg.beginColdSuspend(id)
+			return s.coldSuspend(ctx, id, handle)
 		}
 		if err := s.drv.Suspend(ctx, handle, warm); err != nil {
-			if !warm {
-				s.reg.setState(id, "running") // stop failed: we're still running
-			}
 			return err
 		}
 		// e.state is mutated here from a concurrent request goroutine, so it
@@ -551,11 +567,30 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 		if err := s.drv.Resume(ctx, handle); err != nil {
 			return err
 		}
-		s.reg.setState(id, "running")
+		// Lands on "running" and, for a sandbox that was STOPPED rather than
+		// paused, starts a fresh idle epoch: `docker start` restarts the
+		// process tree, so the child this runner was told had exited is not
+		// the child that is running now. See registry.resumed.
+		s.reg.resumed(id)
 		return nil
 	default:
 		return errUnknownOp
 	}
+}
+
+// coldSuspend stops a session's container and lands its state, on the
+// assumption the caller has ALREADY claimed the entry with beginColdSuspend or
+// claimIdle. Both stops — an operator's `rainier stop` through Op and the
+// runner's own idle auto-stop — go through this one function, so the two can
+// never drift into meaning different things: the same driver call, the same
+// landing state, and the same rollback when the daemon refuses.
+func (s *Server) coldSuspend(ctx context.Context, id, handle string) error {
+	if err := s.drv.Suspend(ctx, handle, false); err != nil {
+		s.reg.releaseIdle(id) // stop failed: we're still running
+		return err
+	}
+	s.reg.setState(id, "suspended")
+	return nil
 }
 
 // Delete tears down a session: close its hub (if it ever registered) before
@@ -863,6 +898,11 @@ func (s *Server) routeControl(id string, payload []byte) {
 		// travels as "0"; relay.ControlEvent's RC is `omitempty`, so a clean
 		// exit puts no rc on the wire at all and decodes back to the same 0.
 		log.Printf("session %s: agent exited with code %d", id, ev.RC)
+		// Recorded as well as reported: a child that has exited is the ONE
+		// thing that makes this session a candidate for idle auto-stop, and
+		// nothing else in this runner would remember it. It still changes no
+		// state here — see RunIdleStop for the timeout that does.
+		s.reg.childExited(id, s.now())
 		s.fireEventDetail(id, "child_exited", strconv.Itoa(ev.RC))
 	case "resp":
 		// The sandbox's answer to a request controld sent down. Forwarded
@@ -1028,6 +1068,13 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 		c.CloseNow()
 		return
 	}
+	// An attached session is not idle, however long ago its child exited, and
+	// the timer starts again when this viewer leaves. Counted around the pump
+	// rather than inside the hub because the runner is where the idle
+	// decision is made, and because both attach fronts — this one and the
+	// agent's dial_attach — have to be counted the same way.
+	s.reg.attachStarted(id)
+	defer s.reg.attachEnded(id, s.now())
 	// The runner's own local attach endpoint is a single-box debugging tool
 	// with no control plane above it: it grants no binding, so the attachment
 	// is unconditional exactly as it has always been.

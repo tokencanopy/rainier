@@ -122,11 +122,29 @@ type FromRunner struct {
 	Sessions []SessionInfo `json:"sessions,omitempty"` // announce
 	Used     int           `json:"used"`
 	Total    int           `json:"total"`
-	ReqID    uint64        `json:"req_id,omitempty"`  // result: correlates ToRunner.ReqID
-	OK       bool          `json:"ok,omitempty"`      // result
-	Detail   string        `json:"detail,omitempty"`  // result: error text or snapshot ref; event: setup_failed tail
-	Session  string        `json:"session,omitempty"` // event, session_req
-	State    string        `json:"state,omitempty"`   // event: "running" | "dead" | "setup_done" | "setup_failed" | "child_exited"
+	// Active and IdleExited split Used by what the sandbox is actually doing:
+	// Active counts sandboxes that are up with their child process still
+	// running, IdleExited those that are up with the child gone. Both are
+	// additive to Used/Total and ride every message beside them, so a control
+	// plane can say "16 slots, 3 active, 13 idle" rather than "no free
+	// capacity"; a runner that predates them sends neither and reads as zero,
+	// which is the same "unknown" a control plane has today.
+	//
+	// Active+IdleExited is at most Used and usually less: a warm-suspended
+	// sandbox and one still being created each hold a slot and are in neither
+	// count, because neither has a child this runner can speak for.
+	Active     int    `json:"active"`
+	IdleExited int    `json:"idle_exited"`
+	ReqID      uint64 `json:"req_id,omitempty"`  // result: correlates ToRunner.ReqID
+	OK         bool   `json:"ok,omitempty"`      // result
+	Detail     string `json:"detail,omitempty"`  // result: error text or snapshot ref; event: setup_failed tail
+	Session    string `json:"session,omitempty"` // event, session_req
+	// State is the event's subject. "suspended_cold" is the runner reporting
+	// a park it decided on itself — today only idle auto-stop, which stops a
+	// sandbox whose child has exited and that nobody has attached to for the
+	// configured timeout, exactly as an operator's stop would. It is the same
+	// word the announce vocabulary uses for the same condition.
+	State string `json:"state,omitempty"` // event: "running" | "dead" | "setup_done" | "setup_failed" | "child_exited" | "suspended_cold"
 	// RPC carries a session-RPC message the sandbox originated ("session_req")
 	// — a credential mint, say — which controld answers with a "session_rpc"
 	// back down. Session names which sandbox it came from; without it a

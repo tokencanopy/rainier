@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/runnerd"
@@ -19,7 +20,9 @@ func main() {
 	image := flag.String("image", "rainier-session:latest", "default session image")
 	network := flag.String("network", "rainier-internal", "internal docker network for sessions")
 	egressAdmin := flag.String("egress-admin", "http://egressd:3129", "egressd admin URL")
-	slots := flag.Int("slots", 16, "capacity")
+	slots := flag.Int("slots", 16, "how many sandboxes this runner may hold at once, running or warm-suspended; a cold-stopped session keeps its files but no slot")
+	idleStop := flag.Duration("idle-stop", 30*time.Minute,
+		"stop a session whose agent process has exited and that has had no attachment for this `duration`, exactly as rainier stop does: the container stops, the files are kept, the slot comes back, and an attach resumes it. A session whose agent is still running is never stopped, however long nobody has watched it. 0 disables it")
 	controld := flag.String("controld", "", "controld URL to dial (ws://host:port); enables agent (dial) mode when set")
 	runnerToken := flag.String("runner-token", envDefault("RAINIER_RUNNER_TOKEN", ""),
 		"bearer token for the controld dial (required when --controld is set; or set RAINIER_RUNNER_TOKEN, which keeps it out of the process list)")
@@ -58,6 +61,14 @@ func main() {
 	if err := s.Recover(context.Background()); err != nil {
 		log.Fatalf("recover: %v", err)
 	}
+
+	// Started after Recover, so the first sweep sees the sessions that
+	// outlived a restart, and before either serving mode takes the
+	// foreground. Recovered sessions are never auto-stopped until they report
+	// a child exit, because the exit that would make them candidates lived
+	// only in the memory of the process that just died — the safe direction,
+	// and a durable activity record is #85's job.
+	go s.RunIdleStop(context.Background(), *idleStop)
 
 	log.Printf("runnerd on %s (dial-base %s)", *listen, *dialBase)
 	if *controld == "" {

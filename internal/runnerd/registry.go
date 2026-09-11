@@ -4,6 +4,7 @@ package runnerd
 import (
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/tokencanopy/rainier/internal/relay"
 )
@@ -29,6 +30,57 @@ type sessionEntry struct {
 	// carried none" — an old controld — and fences nothing.
 	placementGen uint64
 	hub          *relay.Hub // set when sessiond registers; nil until then
+	// attachments is the number of attachments currently open over this
+	// session's hub — viewers and controllers alike, since a runner neither
+	// knows nor needs to know which of them holds the controller lease.
+	// Maintained around BOTH attach fronts (the local /attach handler and the
+	// agent's dial_attach dial-back), because a session with a live viewer is
+	// not idle no matter which door that viewer came through.
+	attachments int
+	// childExitedAt is when sessiond reported child_exited for the sandbox
+	// boot this entry is currently on. Zero means "the child is running, as
+	// far as this runner has been told" — which is also what a session
+	// rebuilt by Recover looks like, since the exit was only ever in memory.
+	// Zero is the safe value in both cases: idle auto-stop never stops a
+	// session whose child it has not been told has exited.
+	childExitedAt time.Time
+	// lastDetachAt is when the most recent attachment over this session
+	// ended. It is what makes the idle timer run from the moment the last
+	// viewer left rather than from the child's exit: someone reading a
+	// finished agent's scrollback for an hour resets nothing while attached
+	// and gets the full timeout after detaching.
+	lastDetachAt time.Time
+	// coldSuspended records that this entry's container was stopped (`docker
+	// stop`), not paused, and is therefore going to restart its whole process
+	// tree — a NEW child — when it resumes. It is set at the START of the
+	// cold suspend, together with the "suspending" marker, and cleared if the
+	// stop fails, so it cannot be missed by a hub death that races ahead of
+	// the stop's completion. resumed() reads it to decide whether the
+	// child-exit fact survives the resume: after a stop it must not (the
+	// child is new), after a pause it must (the child is whatever it was).
+	coldSuspended bool
+}
+
+// idleFor reports how long this session has been idle at now, and whether it
+// is idle at all: its container is up, its child has exited, and nothing is
+// attached. Callers must hold the registry lock.
+//
+// The clock is the caller's, and both times come from it, so in production
+// both carry Go's monotonic reading and this subtraction uses it — a wall
+// clock stepped by NTP can neither make a session look idle early nor keep
+// one from ever looking idle.
+//
+// The idle clock starts at the LATER of the child's exit and the last
+// detach, which is the whole reason lastDetachAt is kept.
+func (e *sessionEntry) idleFor(now time.Time) (time.Duration, bool) {
+	if e.state != "running" || e.attachments > 0 || e.childExitedAt.IsZero() {
+		return 0, false
+	}
+	since := e.childExitedAt
+	if e.lastDetachAt.After(since) {
+		since = e.lastDetachAt
+	}
+	return now.Sub(since), true
 }
 
 type registry struct {
@@ -274,5 +326,179 @@ func (r *registry) setHandle(id, handle string) {
 	defer r.mu.Unlock()
 	if e, ok := r.items[id]; ok {
 		e.handle = handle
+	}
+}
+
+// attachStarted records that an attachment has opened over id's hub. A
+// session with any attachment open is not idle, however long its child has
+// been gone. An unknown id is a no-op: the session was deleted out from under
+// an attach that was already in flight, and there is nothing left to account
+// against.
+func (r *registry) attachStarted(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok {
+		e.attachments++
+	}
+}
+
+// attachEnded records that an attachment over id's hub has closed, at time
+// at. The idle clock starts here, not at the child's exit — see
+// sessionEntry.lastDetachAt.
+//
+// The counter floors at zero rather than going negative: every caller pairs
+// this with attachStarted through a defer, but an entry that was recreated
+// under the same id between the two (a delete and a create of the same
+// controld-supplied id) would otherwise leave a permanently negative count on
+// the new entry, which reads as "fewer than no attachments" and would be
+// indistinguishable from an attached session forever after.
+func (r *registry) attachEnded(id string, at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.items[id]
+	if !ok {
+		return
+	}
+	if e.attachments > 0 {
+		e.attachments--
+	}
+	e.lastDetachAt = at
+}
+
+// childExited records that sessiond reported this session's child process
+// ended, at time at. It is the ONLY thing that makes a session a candidate for
+// idle auto-stop: a runner never infers that a child is finished, it is told.
+//
+// Recorded once per sandbox boot. A repeat report (sessiond re-delivering an
+// event it was unsure landed) must not move the idle clock forward, or a
+// retried delivery would silently extend the timeout.
+func (r *registry) childExited(id string, at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok && e.childExitedAt.IsZero() {
+		e.childExitedAt = at
+	}
+}
+
+// counts returns the two numbers a runner's capacity line needs beyond
+// used/total: how many of its sandboxes are up with a child still running,
+// and how many are up with the child gone. Only "running" entries are counted,
+// so active+idleExited is at most `used` — a warm-suspended sandbox and one
+// still being created each hold a slot and are in neither count, which is the
+// honest answer rather than a made-up one.
+func (r *registry) counts() (active, idleExited int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range r.items {
+		if e.state != "running" {
+			continue
+		}
+		if e.childExitedAt.IsZero() {
+			active++
+			continue
+		}
+		idleExited++
+	}
+	return active, idleExited
+}
+
+// idleSessions returns the ids that have been idle for at least idle at now,
+// in stable (id) order. It is the sweep's candidate list, not its decision:
+// the decision is claimIdle, which re-checks the same rule under the lock it
+// marks the entry in. Sorted so a sweep that stops several sessions logs them
+// in an order that does not depend on map iteration.
+func (r *registry) idleSessions(idle time.Duration, now time.Time) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for id, e := range r.items {
+		if d, ok := e.idleFor(now); ok && d >= idle {
+			out = append(out, id)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// claimIdle re-checks the idle rule for id and, in the SAME critical section,
+// marks the entry "suspending" and cold — the claim. It returns the driver
+// handle to stop and how long the session had been idle when it was claimed.
+//
+// Check and mark cannot be separated. If they were, two sweeps (or a sweep and
+// a stop arriving from controld) could both decide to stop one session, and a
+// sweep could stop a session that a concurrent Delete had already begun tearing
+// down. One locked call means at most one caller ever gets a handle back.
+//
+// "suspending" is exactly the marker Op's cold suspend sets, and for the same
+// reason: `docker stop` kills the container's sessiond, closing the /register
+// conn, and the register goroutine must read that as a deliberate stop rather
+// than a crash — otherwise it destroys the container this is only trying to
+// park. coldSuspended is set here, before the stop rather than after it, so
+// that a hub death racing ahead of the stop's completion cannot leave the
+// entry looking pause-suspended; releaseIdle clears both if the stop fails.
+func (r *registry) claimIdle(id string, idle time.Duration, now time.Time) (handle string, idleFor time.Duration, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, exists := r.items[id]
+	if !exists {
+		return "", 0, false
+	}
+	d, isIdle := e.idleFor(now)
+	if !isIdle || d < idle {
+		return "", 0, false
+	}
+	e.state = "suspending"
+	e.coldSuspended = true
+	return e.handle, d, true
+}
+
+// beginColdSuspend marks an entry for the cold suspend Op is about to run:
+// the "suspending" state and the cold flag, in one lock, for the reasons
+// claimIdle spells out. It is claimIdle's unconditional sibling — an
+// operator's stop asks no questions about idleness.
+func (r *registry) beginColdSuspend(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok {
+		e.state = "suspending"
+		e.coldSuspended = true
+	}
+}
+
+// releaseIdle rolls a claimed-but-failed cold suspend back to running: the
+// container was never stopped, so the entry must not be left claiming it was
+// cold-parked. The next sweep will try again.
+func (r *registry) releaseIdle(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok {
+		e.state = "running"
+		e.coldSuspended = false
+	}
+}
+
+// resumed lands an entry back on "running" after a successful driver resume,
+// and clears the idle bookkeeping if — and only if — the sandbox had been
+// COLD suspended.
+//
+// That condition is the whole point. `docker start` restarts the container's
+// whole process tree, so the child is a new one and the old child's exit says
+// nothing about it; keeping the fact would let the next sweep stop a session
+// whose agent is working, which is the one thing idle auto-stop must never do.
+// `docker unpause` restarts nothing, so a child that had exited is still
+// exited and the fact must survive, or a warm-cycled session would never be
+// auto-stopped again.
+func (r *registry) resumed(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.items[id]
+	if !ok {
+		return
+	}
+	e.state = "running"
+	if e.coldSuspended {
+		e.coldSuspended = false
+		e.childExitedAt = time.Time{}
+		e.lastDetachAt = time.Time{}
 	}
 }

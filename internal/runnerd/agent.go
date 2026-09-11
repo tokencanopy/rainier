@@ -261,6 +261,13 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 		cctx, ccancel := context.WithTimeout(ctx, 5*time.Second)
 		m.Used, m.Total, _ = s.drv.Capacity(cctx) // best-effort; piggybacked on every message
 		ccancel()
+		// The two counts that turn "no free capacity" into something a person
+		// can act on: how much of `used` is a working agent and how much is a
+		// sandbox whose agent has finished. They ride the same message the
+		// used/total pair already does, from the registry rather than the
+		// driver — docker cannot say whether a container's child is still
+		// running; only sessiond's report can, and this runner keeps it.
+		m.Active, m.IdleExited = s.reg.counts()
 		// The two generations every report carries (D19), stamped in the one
 		// place every report passes through. The runner's own is whatever
 		// controld granted this connection; the session's is the one its
@@ -299,8 +306,10 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 	defer s.SetOnSessionRPC(nil)
 
 	used, total, _ := s.drv.Capacity(ctx)
+	active, idleExited := s.reg.counts()
 	ann := runner.FromRunner{Type: "announce", Proto: runner.ProtocolVersion, Runner: cfg.RunnerName,
-		Sessions: s.Announce(), Used: used, Total: total, Capabilities: cfg.Capabilities}
+		Sessions: s.Announce(), Used: used, Total: total, Active: active, IdleExited: idleExited,
+		Capabilities: cfg.Capabilities}
 	if err := wsjson.Write(connCtx, c, ann); err != nil {
 		return false, err // nothing can have been accepted before the announce
 	}
@@ -645,6 +654,11 @@ func (s *Server) dialAttachBack(ctx context.Context, m runner.ToRunner, cfg Agen
 		c.CloseNow()
 		return
 	}
+	// The same idle accounting the local /attach front keeps, for the same
+	// reason: a session with a viewer on it is not idle whichever door that
+	// viewer came through, and the idle timer restarts when they leave.
+	s.reg.attachStarted(m.Session)
+	defer s.reg.attachEnded(m.Session, s.now())
 	// Blocks for the life of the attach; the hub owns the conn's teardown on
 	// either side dying (its readLoop closes clients when the session conn
 	// dies, AttachClient closes the attachment when the client does).
