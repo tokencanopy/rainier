@@ -242,6 +242,13 @@ failure. Both are fixed here, and the fixes are worth writing down because
 they are the same mistake in opposite directions: **a deadline belongs to the
 caller that can afford it.**
 
+- **A deadline that is already there is not written twice.** The install step
+  inside the fan-out carried a wrapper of its own, which capped at one
+  acknowledgement timeout what `install` and `installAndWait` already cap at
+  one between them — a write that fails takes its wait with it. It is gone;
+  what is left is one deadline per step, in the step. The notice's deadline is
+  the one that has to be at the loop, because the write it bounds is the one
+  that reaches a client.
 - **A courtesy notice must not close a healthy client.** Bounding every
   ownership message by the acknowledgement timeout, and closing the socket
   whenever any context expired, meant a websocket serialises its writes so a

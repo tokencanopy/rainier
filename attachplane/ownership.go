@@ -727,14 +727,17 @@ func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wai
 			defer wg.Done()
 			if was == terminal.ModeControl {
 				// It believed it was typing, so its sandbox has to be told
-				// before anybody is told anything else.
-				sctx, cancel := p.step(ctx)
+				// before anybody is told anything else. The deadline for
+				// this step lives inside it — install bounds its own write,
+				// installAndWait bounds its own wait — so wrapping another
+				// one around the pair here would cap at one timeout what is
+				// already at most one timeout: a write that fails takes the
+				// wait with it.
 				if wait {
-					_ = other.installAndWait(sctx, terminal.ModeView, gen)
+					_ = other.installAndWait(ctx, terminal.ModeView, gen)
 				} else {
-					_ = other.install(sctx, terminal.ModeView, gen)
+					_ = other.install(ctx, terminal.ModeView, gen)
 				}
-				cancel()
 			}
 			// A viewer stays a viewer; only the number it would claim from
 			// changes, and its client reads that silently. What the notice
