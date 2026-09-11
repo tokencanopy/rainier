@@ -83,7 +83,10 @@ func (s *Server) handleClientExec(w http.ResponseWriter, r *http.Request, u User
 	// authoritative; the pre-upgrade checks above only refuse what it would
 	// refuse too.
 	if err := s.attachments.ExecCommand(ctx, userScope(u), cmd, stream); err != nil {
-		_ = stream.Close(err)
+		// Tagged as an EXEC's refusal, so the close mapping — which is shared
+		// with the terminal attach's — can answer it in exec's words without
+		// changing what the same error means on the older path.
+		_ = stream.Close(attachplane.ExecFailure(err))
 	}
 }
 
@@ -116,7 +119,7 @@ func (s *Server) mayExec(w http.ResponseWriter, r *http.Request, u User, id stri
 		return false
 	}
 	connected := row.RunnerID != "" && s.runnerConnected(string(row.RunnerID))
-	if refusal, refused := execReadiness(row, connected,
+	if refusal, refused := execReadiness(row, s.attachments.ExecSupported(), connected,
 		func() bool { return s.runnerSupportsExec(r.Context(), row.RunnerID) }); refused {
 		refusal.write(w)
 		return false
@@ -155,7 +158,20 @@ func (e execRefusal) write(w http.ResponseWriter) {
 //
 // supportsExec is a function rather than a boolean because it is a store
 // read, and a caller refused earlier must not pay for one.
-func execReadiness(row control.Session, connected bool, supportsExec func() bool) (execRefusal, bool) {
+//
+// hostExec is whether this host composed an exec plane at all. It is answered
+// HERE, pre-upgrade, because controlapp's own ErrUnsupported for a nil exec
+// broker is reached only after the socket is a websocket — so on such a host
+// the promised 501 became a 1008 close, which is a different thing to a
+// caller and breaks the table's own rule that every status is answered before
+// the upgrade. Self-hosted controld always composes one; the host that does
+// not is the stated extension point.
+func execReadiness(row control.Session, hostExec, connected bool,
+	supportsExec func() bool) (execRefusal, bool) {
+	if !hostExec {
+		return execRefusal{status: http.StatusNotImplemented, code: "exec_unsupported",
+			message: "this server cannot run commands in sessions"}, true
+	}
 	// Not running: a conflict with the resource's current state, with the
 	// state named. A suspended session is deliberately NOT resumed — resuming
 	// costs minutes, can fail, and changes what the caller is billed for, so

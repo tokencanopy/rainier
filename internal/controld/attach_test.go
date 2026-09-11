@@ -157,6 +157,17 @@ type fakeSessiond struct {
 	execReply func(f relay.Frame) []terminal.ServerMessage
 	// execClient records the client messages that reached an exec.
 	execClient chan terminal.ClientMessage
+	// allClient records EVERY client message this sandbox received, whatever
+	// kind of attachment it arrived on.
+	//
+	// It exists because execClient alone made a whole class of assertion
+	// structurally dead: execIDs is populated only when a test scripts an
+	// exec reply, so a test standing in for an OLD sandbox (execReply nil)
+	// routes a leaked frame into the terminal branch, where nothing on
+	// execClient can ever see it. Mutating the plane to forward before the
+	// handshake left "no stdin before exec_started" green while a
+	// {stdin "rm -rf /\n"} reached this sandbox.
+	allClient chan terminal.ClientMessage
 	// execIDs is which attachment ids are execs, so a client frame is routed
 	// the way the real serveSession routes it.
 	execIDs sync.Map
@@ -178,6 +189,7 @@ func startFakeSessiond(t *testing.T, ctx context.Context, wsBase, id string) *fa
 		closes:     make(chan uint64, 8),
 		execs:      make(chan relay.Frame, 8),
 		execClient: make(chan terminal.ClientMessage, 16),
+		allClient:  make(chan terminal.ClientMessage, 64),
 	}
 	go fs.serve(ctx)
 	return fs
@@ -222,6 +234,10 @@ func (fs *fakeSessiond) serve(ctx context.Context) {
 			var m terminal.ClientMessage
 			if json.Unmarshal(f.Payload, &m) != nil {
 				continue
+			}
+			select {
+			case fs.allClient <- m:
+			default: // a test that is not watching; never block the reader
 			}
 			if _, ok := fs.execIDs.Load(f.AttachID); ok {
 				fs.execClient <- m

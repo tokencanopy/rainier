@@ -86,6 +86,17 @@ const (
 	maxExecEnv       = 256
 )
 
+// ExecSupported reports whether this host composed an exec plane at all.
+//
+// It exists so a route can answer 501 BEFORE the upgrade. ExecCommand's own
+// control.ErrUnsupported is reached only after the socket is a websocket, so
+// on a host with no exec plane the promised 501 became a 1008 close — which is
+// a different thing to a caller and contradicts the rule that every status in
+// the table is answered pre-upgrade. Self-hosted controld always composes one;
+// the host that does not is the stated extension point, which is exactly the
+// one nothing here can otherwise test.
+func (s *AttachmentService) ExecSupported() bool { return s.execBroker != nil }
+
 // ExecCommand authorizes and shape-checks one exec, then hands the stream to
 // the exec broker and records that it happened.
 //

@@ -173,28 +173,36 @@ func TestExecReadinessStatusTable(t *testing.T) {
 
 	for name, tc := range map[string]struct {
 		row        control.Session
+		hostExec   bool
 		connected  bool
 		supports   func() bool
 		wantStatus int
 		wantCode   string
 		wantState  control.SessionState
 	}{
-		"running, connected, capable": {running, true, yes, 0, "", ""},
+		"running, connected, capable": {running, true, true, yes, 0, "", ""},
 		"suspended": {control.Session{State: control.StateSuspendedWarm, RunnerID: "vm1"},
-			true, yes, http.StatusConflict, "session_not_running", control.StateSuspendedWarm},
+			true, true, yes, http.StatusConflict, "session_not_running", control.StateSuspendedWarm},
 		"queued": {control.Session{State: control.StateQueued},
-			true, yes, http.StatusConflict, "session_not_running", control.StateQueued},
+			true, true, yes, http.StatusConflict, "session_not_running", control.StateQueued},
 		"failed": {control.Session{State: control.StateFailed, RunnerID: "vm1"},
-			true, yes, http.StatusConflict, "session_not_running", control.StateFailed},
+			true, true, yes, http.StatusConflict, "session_not_running", control.StateFailed},
 		"destroyed": {control.Session{State: control.StateDestroyed},
-			true, yes, http.StatusConflict, "session_not_running", control.StateDestroyed},
-		"runner gone": {running, false, yes,
+			true, true, yes, http.StatusConflict, "session_not_running", control.StateDestroyed},
+		"runner gone": {running, true, false, yes,
 			http.StatusServiceUnavailable, "runner_unreachable", ""},
-		"runner cannot exec": {running, true, no,
+		"runner cannot exec": {running, true, true, no,
 			http.StatusNotImplemented, "exec_unsupported", ""},
+		// A host that composed no exec plane at all. It answers 501 whatever
+		// the session's state, because the refusal is about this server.
+		"this host has no exec plane": {running, false, true, yes,
+			http.StatusNotImplemented, "exec_unsupported", ""},
+		"no exec plane, and the session is stopped too": {
+			control.Session{State: control.StateSuspendedWarm, RunnerID: "vm1"},
+			false, true, yes, http.StatusNotImplemented, "exec_unsupported", ""},
 	} {
 		t.Run(name, func(t *testing.T) {
-			got, refused := execReadiness(tc.row, tc.connected, tc.supports)
+			got, refused := execReadiness(tc.row, tc.hostExec, tc.connected, tc.supports)
 			if tc.wantStatus == 0 {
 				if refused {
 					t.Fatalf("a ready session was refused %+v", got)
@@ -237,12 +245,13 @@ func TestExecReadinessStatusTable(t *testing.T) {
 func TestExecReadinessAsksTheStoreOnlyWhenItHasTo(t *testing.T) {
 	asked := 0
 	count := func() bool { asked++; return true }
-	execReadiness(control.Session{State: control.StateSuspendedWarm}, true, count)
-	execReadiness(control.Session{State: control.StateRunning, RunnerID: "vm1"}, false, count)
+	execReadiness(control.Session{State: control.StateSuspendedWarm}, true, true, count)
+	execReadiness(control.Session{State: control.StateRunning, RunnerID: "vm1"}, true, false, count)
+	execReadiness(control.Session{State: control.StateRunning, RunnerID: "vm1"}, false, true, count)
 	if asked != 0 {
 		t.Fatalf("the capability read ran %d times for callers refused before it", asked)
 	}
-	execReadiness(control.Session{State: control.StateRunning, RunnerID: "vm1"}, true, count)
+	execReadiness(control.Session{State: control.StateRunning, RunnerID: "vm1"}, true, true, count)
 	if asked != 1 {
 		t.Fatalf("the capability read ran %d times, want once", asked)
 	}
@@ -364,10 +373,14 @@ func TestExecAgainstAnOldSandboxIsRefusedCleanly(t *testing.T) {
 	if _, _, err := cli.Read(ctx); err == nil {
 		t.Fatal("the exec socket stayed open after exec_unsupported")
 	}
+	// allClient, not execClient, and the difference is the whole assertion.
+	// This test is the OLD sandbox, so it scripts no exec reply — which means
+	// execIDs is never populated and a leaked frame routes into the fake's
+	// TERMINAL branch, where nothing on execClient could ever see it.
 	select {
-	case got := <-fx.sd.execClient:
-		t.Fatalf("stdin reached a sandbox that never said exec_started: %+v", got)
-	case <-time.After(200 * time.Millisecond):
+	case got := <-fx.sd.allClient:
+		t.Fatalf("a client frame reached a sandbox that never said exec_started: %+v", got)
+	case <-time.After(500 * time.Millisecond):
 	}
 }
 
@@ -591,4 +604,51 @@ func TestRunnerSupportsExecIsAPreCheckThatFailsOpen(t *testing.T) {
 			t.Fatalf("runnerSupportsExec(%s) = %v, want %v", id, got, want)
 		}
 	}
+}
+
+// TestExecOnARunnerWithoutTheCapabilityIs501 pins the last row of the status
+// table ON THE ROUTE.
+//
+// It was pinned only as a pure decision, and the comment above that table said
+// why: a runnerd built from this tree always announces exec.v1, so the
+// in-process fixture cannot be put into the state. A fake runner can — it is
+// what an operator's older runnerd is — and with it, mutating
+// runnerSupportsExec to `return true` stops leaving the suite green.
+func TestExecOnARunnerWithoutTheCapabilityIs501(t *testing.T) {
+	_, st, ts := newAttachControld(t)
+	owner, tok := loginUser(t, st, "alice", "member")
+	// A connected runner that announces everything EXCEPT exec.v1 — an
+	// operator's runnerd from before the roll.
+	startFakeRunner(t, ts, runnerScript{Name: "vm1", Total: 4, Capabilities: []string{"gpu"}})
+	waitRunnerRow(t, st, "vm1", func(r control.Runner) bool { return r.Connected })
+	seedSession(t, st, control.Session{ID: "sess_x", CreatorID: control.ActorID(owner.ID),
+		State: control.StateRunning, RunnerID: "vm1"})
+
+	c, resp, err := dialExec(t, ts, "sess_x", tok)
+	if err == nil {
+		c.CloseNow()
+		t.Fatal("exec on a runner that cannot forward one was upgraded")
+	}
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501", resp.StatusCode)
+	}
+	assertErrCode(t, resp, "exec_unsupported")
+}
+
+// waitRunnerRow polls the fleet until the named runner's row satisfies cond.
+func waitRunnerRow(t *testing.T, st MemStore, name string, cond func(control.Runner) bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		rows, err := st.Fleet().ListRunners(context.Background(), installPool)
+		if err == nil {
+			for _, r := range rows {
+				if string(r.ID) == name && cond(r) {
+					return
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("runner %s never reached the expected row state", name)
 }

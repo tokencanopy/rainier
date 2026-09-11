@@ -3,6 +3,7 @@ package attachplane
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -53,7 +54,32 @@ var (
 	// errAttachEnded is an attach that ran and is over — one side of the
 	// splice stopped, and the other is being closed after it.
 	errAttachEnded = errors.New("controld: the attach ended")
+	// errExecRefused marks an error as having come from an EXEC rather than
+	// from an attach, so the close mapping the two share can answer it
+	// differently without changing what the same error means on the older
+	// path. See ExecFailure.
+	errExecRefused = errors.New("controld: the exec was refused")
 )
+
+// ExecFailure tags a service error as an exec's, for the close a route makes
+// when controlapp refuses the command.
+//
+// It exists because attachCloseReason is shared with the pre-existing terminal
+// attach close: mapping a bare control.ErrInvalid to 1008 "invalid request"
+// would silently change an attach that closes 1013 "runner unreachable" today,
+// in a change whose whole compatibility claim is that every existing path is
+// byte-identical. Unwrapping still reaches the original error, so a caller
+// that checks errors.Is(err, control.ErrDenied) is unaffected.
+//
+// Exported because every host's exec route makes this close, and a host that
+// passed the service's error through unwrapped would get the attach mapping
+// for an exec's refusal.
+func ExecFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", errExecRefused, err)
+}
 
 // ---------------------------------------------------------------------------
 // control.TerminalStream over the client socket
@@ -273,12 +299,21 @@ func attachCloseReason(err error) (websocket.StatusCode, string) {
 		return websocket.StatusTryAgainLater, "the attach ended"
 	case errors.Is(err, ErrExecFirstMessage):
 		return websocket.StatusPolicyViolation, "first exec message must be exec_start"
-	case errors.Is(err, control.ErrInvalid):
+	case errors.Is(err, errExecRefused) && errors.Is(err, control.ErrInvalid):
 		// A request this plane will not carry — a cwd outside the workspace,
 		// a --log without --detach. The client has already been sent the
 		// exec_error it acts on; this is what a packet capture and a proxy
 		// log see, and "runner unreachable" would have been a lie in both.
+		//
+		// Scoped to an exec by ExecFailure, deliberately. This mapping is
+		// SHARED with the pre-existing terminal attach close, so an unscoped
+		// control.ErrInvalid case would have turned an attach that closes
+		// 1013 "runner unreachable" today into 1008 "invalid request" — a
+		// change to an existing path, in a change whose whole claim is that
+		// every existing path is byte-identical.
 		return websocket.StatusPolicyViolation, "invalid request"
+	case errors.Is(err, errExecRefused) && errors.Is(err, control.ErrUnsupported):
+		return websocket.StatusPolicyViolation, "exec unsupported by this server"
 	case errors.Is(err, errExecNoAnswer):
 		return websocket.StatusTryAgainLater, "the sandbox did not answer in time"
 	case errors.Is(err, errExecUnsupported):
@@ -290,8 +325,6 @@ func attachCloseReason(err error) (websocket.StatusCode, string) {
 		return websocket.StatusPolicyViolation, "exec unsupported by this sandbox"
 	case errors.Is(err, errExecEnded):
 		return websocket.StatusNormalClosure, "the exec ended"
-	case errors.Is(err, control.ErrUnsupported):
-		return websocket.StatusPolicyViolation, "exec unsupported by this server"
 	default:
 		return websocket.StatusTryAgainLater, "runner unreachable"
 	}
