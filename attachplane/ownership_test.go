@@ -89,6 +89,11 @@ func (k fakeKeeper) State(context.Context) (uint64, bool, error) {
 // protocol and never answers.
 type fakeSandbox struct {
 	acks bool
+	// ackGate, when non-nil, holds every acknowledgement until the test
+	// closes it. A real sandbox answers whenever it answers; a test that
+	// needs something else to happen INSIDE a handoff's wait has to decide
+	// when that is, and this is how it says so.
+	ackGate chan struct{}
 
 	mu  sync.Mutex
 	got []terminal.ClientMessage
@@ -127,6 +132,9 @@ func (s *fakeSandbox) serve(t *testing.T, ts *httptest.Server, at *runner.Attach
 		s.got = append(s.got, m)
 		s.mu.Unlock()
 		if m.Type == terminal.TypeControl && s.acks {
+			if s.ackGate != nil {
+				<-s.ackGate
+			}
 			ack, _ := json.Marshal(terminal.ServerMessage{
 				Type: terminal.TypeControlAck, Mode: m.Mode, Generation: m.Generation})
 			if conn.Write(context.Background(), ack) != nil {
@@ -202,7 +210,17 @@ func startAttachOn(t *testing.T, p *Plane, h *fakeHost, ts *httptest.Server,
 	mode control.AttachmentMode, gen uint64, keeper control.ControllerLeaseKeeper,
 	acks, negotiated, mayClaim bool) *attachFixture {
 	t.Helper()
-	sandbox := newFakeSandbox(acks)
+	return startAttachWith(t, p, h, ts, mode, gen, keeper, newFakeSandbox(acks), negotiated, mayClaim)
+}
+
+// startAttachWith is the same over a sandbox the test built itself, for the
+// tests that need to decide WHEN that sandbox acknowledges a binding. The
+// sandbox must be fully configured before this is called: it is served on a
+// goroutine of the plane's making from here on.
+func startAttachWith(t *testing.T, p *Plane, h *fakeHost, ts *httptest.Server,
+	mode control.AttachmentMode, gen uint64, keeper control.ControllerLeaseKeeper,
+	sandbox *fakeSandbox, negotiated, mayClaim bool) *attachFixture {
+	t.Helper()
 	h.dialBack = func(at *runner.Attach) { sandbox.serve(t, ts, at) }
 
 	stream := newScriptedStream()
@@ -1325,14 +1343,21 @@ func TestAdvanceAcceptsTheGenerationThisAttachAlreadyHolds(t *testing.T) {
 	}
 }
 
-// TestDisplaceAtGenerationZeroTouchesNobody pins the guard at the top of
-// displace. Zero is not a generation any row is ever at, so an announcement
-// carrying it says nothing — and acting on it would demote every attach on
-// the session to a generation none of them could ever claim from.
+// TestDisplaceAtGenerationZeroTouchesNobody pins the guard displaceTo is.
+// Zero is not a generation any row is ever at — it is what `finish` passes
+// when its store read failed — so it must demote nobody and leave every
+// attach on the session at the generation it holds.
+//
+// Every peer is still ANNOUNCED to, because the fan-out no longer decides
+// what a client hears from whether its state moved. What the announcement
+// says is read under the announce hold, so a peer at control@2 is told
+// control@2: its own state, never the zero that reached displace.
 func TestDisplaceAtGenerationZeroTouchesNobody(t *testing.T) {
 	p, _, _ := newTestPlane(t, Options{})
+	stream := newScriptedStream()
 	winner := &ownership{plane: p, session: "sess_example", announce: make(chan struct{}, 1)}
-	peer := &ownership{plane: p, session: "sess_example", mode: terminal.ModeControl, gen: 2, announce: make(chan struct{}, 1)}
+	peer := &ownership{plane: p, session: "sess_example", negotiated: true, stream: stream,
+		mode: terminal.ModeControl, gen: 2, announce: make(chan struct{}, 1)}
 	p.owners.add(winner)
 	p.owners.add(peer)
 
@@ -1340,6 +1365,13 @@ func TestDisplaceAtGenerationZeroTouchesNobody(t *testing.T) {
 
 	if mode, gen := peer.get(); mode != terminal.ModeControl || gen != 2 {
 		t.Fatalf("a displacement at generation zero moved a peer to %s at %d, want control at 2", mode, gen)
+	}
+	m := stream.nextServerMsg(t)
+	if m.Type != terminal.TypeControlChanged || m.Mode != terminal.ModeControl ||
+		m.Generation.Value() != 2 {
+		t.Fatalf("the peer was sent %q %s at %q; a notice out of a displacement at generation "+
+			"zero must still name what that attach IS, which is control at 2",
+			m.Type, m.Mode, m.Generation)
 	}
 }
 
@@ -2094,5 +2126,94 @@ func TestABindingWriteThatNeverLandsDoesNotHoldTheHandoff(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("the handoff waited %s on a runner socket that had stopped draining", elapsed)
+	}
+}
+
+// TestAPeerAlreadyAtTheNewGenerationIsStillToldAboutIt is the fifth review's
+// finding, and the last instance of the class the fourth round named: a path
+// that decides what an attach is instead of reading it. The fourth round made
+// every announcement read the state it reports; the decision whether to
+// announce AT ALL was left asserting that a peer whose state is already at
+// the new generation has already been told about it.
+//
+// It has not. Two paths move an attach's own state and then spend real time
+// before announcing it, and a take-over landing in that gap skipped the peer
+// entirely:
+//
+//  1. B claims: the store goes 1→2 and B waits on its own sandbox's
+//     acknowledgement, which this test holds.
+//  2. A's heartbeat renews generation 1, is refused, and A demotes itself: it
+//     reads 2 from the store, moves its OWN state to view@2, and then blocks
+//     in installAndWait against a sandbox that never answers — an older
+//     sessiond, which this PR supports.
+//  3. B's acknowledgement lands, B advances, and the fan-out reaches A —
+//     already at generation 2, and so skipped.
+//
+// B is then told it has control while A has been told nothing at all, and A
+// finds out only when its own wait times out: one full ControlAckTimeout in
+// which two screens both say "you have control". Nothing corrects it in the
+// meantime, because a client that believes it is the controller sends no
+// claim and this attach's heartbeat renews nothing.
+func TestAPeerAlreadyAtTheNewGenerationIsStillToldAboutIt(t *testing.T) {
+	const ackTimeout = 2 * time.Second
+	p, h, ts := newTestPlane(t, Options{
+		HeartbeatInterval: 20 * time.Millisecond, ControlAckTimeout: ackTimeout})
+	lease := &fakeLease{gen: 1, holder: "att_aaaa"}
+
+	// A holds control, and its sandbox predates the protocol: every binding
+	// it is sent costs the whole acknowledgement timeout.
+	a := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_aaaa"}, false)
+	awaitType(t, a.stream, terminal.TypeAttached)
+	awaitSpliced(t, a)
+
+	// B watches, and its sandbox answers only when this test says so.
+	gate := make(chan struct{})
+	sandbox := newFakeSandbox(true)
+	sandbox.ackGate = gate
+	b := startAttachWith(t, p, h, ts, control.AttachmentViewer, 1,
+		fakeKeeper{lease, "att_bbbb"}, sandbox, true, true)
+	awaitType(t, b.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, b)
+
+	// (1) B claims. The store moves, and B parks on the gated acknowledgement.
+	b.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
+	awaitGeneration(t, lease, 2)
+
+	// (2) A's renewal at generation 1 is refused, so A demotes itself to
+	//     view@2 and then blocks installing that binding. The binding
+	//     reaching A's sandbox is the signal that A's own state has already
+	//     moved — which is the whole precondition of this bug.
+	awaitSandbox(t, a.sandbox, func(got []terminal.ClientMessage) bool {
+		for _, m := range got {
+			if m.Type == terminal.TypeControl && m.Mode == terminal.ModeView &&
+				m.Generation.Value() == 2 {
+				return true
+			}
+		}
+		return false
+	}, "the demoted controller's viewer binding")
+
+	// (3) B's sandbox acknowledges, so B advances and displaces its peers.
+	close(gate)
+
+	if m, _ := awaitType(t, b.stream, terminal.TypeAttached); m.Mode != terminal.ModeControl ||
+		m.Generation.Value() != 2 {
+		t.Fatalf("B's claim was answered %s at %q, want control at 2", m.Mode, m.Generation)
+	}
+	// A must already have been told. The taker is not answered until the
+	// fan-out is done, so by the time B's `attached` is readable A's notice
+	// is in A's queue — and a peer that is skipped has nothing in it until
+	// its own wait times out, a whole acknowledgement timeout later.
+	select {
+	case m := <-a.stream.out:
+		if m.Type != terminal.TypeControlChanged || m.Mode != terminal.ModeView ||
+			m.Generation.Value() != 2 {
+			t.Fatalf("the displaced controller was sent %q %s at %q, want control_changed view at 2",
+				m.Type, m.Mode, m.Generation)
+		}
+	default:
+		t.Fatalf("B was told it has control while A, which still believed it had control, was told "+
+			"nothing: A was skipped because its own demotion had already moved it to generation 2, "+
+			"and it finds out only when its binding wait times out %s from now", ackTimeout)
 	}
 }

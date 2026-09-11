@@ -172,8 +172,10 @@ func (o *ownership) demoteTo(from, gen uint64) (uint64, bool) {
 // It returns the mode this attach WAS in — a controller has to be fenced in
 // its sandbox before anybody is told anything, a viewer only carries a new
 // number — and whether it moved at all. An attach already at or past gen is
-// left alone: naming it a generation it has passed would walk its client
-// backwards.
+// left alone: writing a generation it has passed over its state would walk it
+// backwards. Being left alone is a statement about its STATE and not about
+// what its client has heard; the two were conflated once, and displace says
+// what that cost.
 func (o *ownership) displaceTo(gen uint64) (was string, moved bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -687,6 +689,13 @@ func (t *ownerTable) peers(o *ownership) []*ownership {
 // controller simply leaving — is answered "somebody else got there first"
 // about a session nobody is using.
 //
+// EVERY peer is told, including one whose state is already at gen. The notice
+// reports what that attach is, read under its own announce hold, so telling a
+// peer something it already knows costs one small frame and says nothing
+// untrue — while not telling it, on the theory that its state moving and its
+// client being told are the same event, is how a displaced controller ended
+// up watching a screen that said it had control.
+//
 // wait says whether to hold until each demoted peer's sandbox has confirmed
 // the new binding. A take-over waits, because the taker must not be told it
 // has control while a keystroke the previous controller has already sent
@@ -718,14 +727,23 @@ func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wai
 		// the displacement it has just lost to. It stays on this goroutine,
 		// ahead of the fan-out: every displaced peer stops being forwarded
 		// for at once, whatever its socket is doing.
+		//
+		// What it decides is whether this peer's SANDBOX needs a new binding,
+		// and nothing else. It used to decide whether the peer's CLIENT heard
+		// anything either — `moved == false` was read as "already at gen,
+		// therefore already told" — and those are not the same fact. Two
+		// paths move an attach's own state and then spend real time before
+		// announcing it: `demote`, which holds `installAndWait` for up to one
+		// acknowledgement timeout against a sandbox that never answers, and
+		// `sendStale`, which can wait out a client's whole write budget. A
+		// take-over landing in either gap skipped that peer entirely and
+		// answered the taker, so two screens said "you have control" until
+		// the skipped peer's own wait timed out.
 		was, moved := other.displaceTo(gen)
-		if !moved {
-			continue
-		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if was == terminal.ModeControl {
+			if moved && was == terminal.ModeControl {
 				// It believed it was typing, so its sandbox has to be told
 				// before anybody is told anything else. The deadline for
 				// this step lives inside it — install bounds its own write,
@@ -744,6 +762,12 @@ func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wai
 			// SAYS is read at send time, not asserted here: a peer that won
 			// its own claim inside this loop is told it has control, rather
 			// than being told it is a viewer and then corrected.
+			//
+			// That is also what makes it safe to send this to a peer already
+			// at gen. announceAs reads the mode and the number under the
+			// announce hold and reports what it read, so the notice names
+			// that peer's real state and cannot walk its client backwards;
+			// a client that is already there folds it to no notice at all.
 			//
 			// Under its own deadline, like every other step: this notice is
 			// the one thing in a handoff that goes to a client, and a client
