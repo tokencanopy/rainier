@@ -338,5 +338,11 @@ window the `driverOps` interlock already closes for the sweep.
   an `internal/e2e` scene drives the whole thing — a real runnerd whose cold suspend is
   held open, a real controld restarted underneath it so the announce moves the row, the
   real REST client refused, and the same resume succeeding once the stop lands.
+- The two `cmd/rainier` tests are CHARACTERIZATION, said plainly in the file: this round
+  changes no CLI production code, so they pass on either side of it. They record what the
+  far end does with each answer — exit 1 and `conflict: session cannot be resumed right
+  now` for the 409, the bounded convergence loop entered for a conflict and skipped for a
+  500 — which is the reason the class is worth getting right, not a regression pin on it.
+  The pins are the four seams above.
 - `make verify`, `go test ./internal/runnerd/ ./internal/driver/ ./protocol/... ./runnerplane/
   -race -count=3`, and the new tests at `-race -count=20`.

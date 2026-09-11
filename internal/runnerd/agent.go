@@ -542,7 +542,7 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 		// simply arrived after some other path already had.
 		ok := err == nil || errors.Is(err, errNoSuchSession)
 		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: ok,
-			Conflict: !ok && opConflict(err), Detail: errTextUnless(err, errNoSuchSession)})
+			Conflict: opConflict(err), Detail: errTextUnless(err, errNoSuchSession)})
 	case "remove_workspace":
 		// The reclaim controld sends after a session it holds is explicitly
 		// removed — including a crash-dead one, whose container went long ago

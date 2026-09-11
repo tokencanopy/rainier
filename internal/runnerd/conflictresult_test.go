@@ -31,9 +31,14 @@ func nextResult(t *testing.T, conn *fakeConn, reqID uint64) runner.FromRunner {
 // and a plain not-ok on the control connection, which the control plane could
 // only report as an internal error.
 //
-// So the rule is stated once, over every sentinel the op surfaces can return:
+// So the rule is stated once, over every sentinel the OP surfaces can return:
 // mapOpErr answers 409 for exactly the errors opConflict calls conflicts. Add
 // a sentinel to one side only and this fails, whichever side you forgot.
+//
+// errSessionExists is not in the table because it never reaches mapOpErr —
+// it is the CREATE route's, which writes its own 409 — and feeding it through
+// here would assert 500-is-not-a-conflict about a path neither surface uses.
+// Its exemption is asserted directly, below, with its reason.
 func TestTheTwoSurfacesAgreeOnWhichRefusalsAreConflicts(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -43,7 +48,6 @@ func TestTheTwoSurfacesAgreeOnWhichRefusalsAreConflicts(t *testing.T) {
 		{"still starting", errSessionStarting},
 		{"unknown op", errUnknownOp},
 		{"suspend in flight", errSuspendInFlight},
-		{"session exists", errSessionExists},
 		{"wrapped suspend in flight", fmt.Errorf("resume: %w", errSuspendInFlight)},
 		{"an unclassified driver failure", errors.New("docker daemon is not running")},
 	} {
