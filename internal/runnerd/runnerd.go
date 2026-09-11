@@ -1074,7 +1074,12 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 	// decision is made, and because both attach fronts — this one and the
 	// agent's dial_attach — have to be counted the same way.
 	s.reg.attachStarted(id)
-	defer s.reg.attachEnded(id, s.now())
+	// The closure is load-bearing: a deferred call's ARGUMENTS are evaluated
+	// where the defer is written, so `defer s.reg.attachEnded(id, s.now())`
+	// would stamp the detach with the time of the ATTACH — which reads as an
+	// attachment that ended the moment it began, and idle-stops a session
+	// somebody is watching.
+	defer func() { s.reg.attachEnded(id, s.now()) }()
 	// The runner's own local attach endpoint is a single-box debugging tool
 	// with no control plane above it: it grants no binding, so the attachment
 	// is unconditional exactly as it has always been.

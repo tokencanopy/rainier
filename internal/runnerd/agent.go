@@ -658,7 +658,9 @@ func (s *Server) dialAttachBack(ctx context.Context, m runner.ToRunner, cfg Agen
 	// reason: a session with a viewer on it is not idle whichever door that
 	// viewer came through, and the idle timer restarts when they leave.
 	s.reg.attachStarted(m.Session)
-	defer s.reg.attachEnded(m.Session, s.now())
+	// In a closure, not as a deferred call's argument: see the local /attach
+	// front for what that difference costs.
+	defer func() { s.reg.attachEnded(m.Session, s.now()) }()
 	// Blocks for the life of the attach; the hub owns the conn's teardown on
 	// either side dying (its readLoop closes clients when the session conn
 	// dies, AttachClient closes the attachment when the client does).
