@@ -586,6 +586,13 @@ func TestViewNeverClaimsWhateverTheUserPresses(t *testing.T) {
 		terminal.ServerMessage{Type: terminal.TypeAttached, Mode: terminal.ModeView, Generation: terminal.GenOf(7)},
 		terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
 	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeView, NeverClaim: true})
+	// Wait for the snapshot behind the opening answer, because Ctrl-\ is not
+	// this client's key until a plane has proved it speaks conditional
+	// ownership: pressed before the `attached` is observed, it is forwarded
+	// as an ordinary byte and this test would pass on a press that never
+	// reached the key handler at all. A --view attach prints nothing when it
+	// opens, so the snapshot is what says the answer has landed.
+	run.awaitPrinted(t, "screen")
 
 	if _, err := run.stdin.Write([]byte{takeKey}); err != nil {
 		t.Fatal(err)
@@ -626,6 +633,9 @@ func TestAReconnectedViewerKeepsItsTakeControlKey(t *testing.T) {
 	// Exactly what reconnectOwnership builds after an attach that ended in
 	// view mode: the mode is view and the flag is not set.
 	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeView})
+	// The snapshot behind the opening answer, for the reason above: the key
+	// is not a key until an answer has arrived.
+	run.awaitPrinted(t, "screen")
 
 	if _, err := run.stdin.Write([]byte{takeKey}); err != nil {
 		t.Fatal(err)
