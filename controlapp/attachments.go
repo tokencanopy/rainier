@@ -374,6 +374,42 @@ func newHolderID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// admit resolves the mode this attach is actually authorized to open in, or
+// refuses it. The policy is asked about the mode the client asked for, exactly
+// as before; what is new is what happens when it says no to a NEGOTIATED
+// controller.
+//
+// A plain `rainier attach` asks for control — it is zero-click on one laptop,
+// which is the case that has always worked — so a principal a host grants
+// viewing and not driving was refused outright at the door, and had to know to
+// type `--view`. That is the exact principal mayClaim exists for, and
+// `grant`'s own rule is that every refusal lands the attach in
+// AttachmentViewer and never in an error: "somebody else is typing" is an
+// answer, and so is "you may watch this". The client is told `attached, view`
+// before it paints a screen, prints the viewing notice, and its take-control
+// key is answered "you are still a viewer" without the store being touched,
+// because mayClaim asks the controller question separately and gets the same
+// no.
+//
+// An UNNEGOTIATED attach is still refused: it cannot be told it is a viewer,
+// so admitting it as one would leave a terminal that silently does not type.
+// Hosts whose policy answers both questions the same way — self-hosted
+// Rainier, where a caller who may attach may drive — never reach the second
+// call at all.
+func (s *AttachmentService) admit(ctx context.Context, scope control.Scope,
+	resource control.Resource, cmd control.AttachTerminal) (control.AttachmentMode, error) {
+	if err := s.policy.AuthorizeAttachment(ctx, scope, resource, cmd.Mode); err == nil {
+		return cmd.Mode, nil
+	}
+	if !cmd.Negotiated || cmd.Mode != control.AttachmentController {
+		return "", control.ErrDenied
+	}
+	if err := s.policy.AuthorizeAttachment(ctx, scope, resource, control.AttachmentViewer); err != nil {
+		return "", control.ErrDenied
+	}
+	return control.AttachmentViewer, nil
+}
+
 // mayClaim reports whether this attach may take control mid-attach, which is
 // a second question from whether it may attach at all. An attach is
 // authorized for the mode it OPENS in — a view-only principal is a principal
@@ -384,7 +420,9 @@ func newHolderID() (string, error) {
 //
 // A negotiated controller attach was admitted on this very mode a moment ago,
 // so it is not asked again here, and neither is the claim the grant below
-// makes on its behalf. An unnegotiated attach has no way to send a claim at
+// makes on its behalf. One that ASKED for control and was admitted as a
+// viewer instead (see admit) arrives here as the viewer it is, so it is asked
+// — and refused — exactly as an attach that asked to watch would be. An unnegotiated attach has no way to send a claim at
 // all. What every negotiated attach does cost is one policy call per claim it
 // makes afterwards — worth knowing for a host whose policy is a network call
 // or an audited decision, and deliberate: a cached answer cannot honour a
@@ -420,9 +458,13 @@ func (s *AttachmentService) AttachTerminal(ctx context.Context, scope control.Sc
 	}
 	resource := control.Resource{Kind: control.ResourceSession, WorkspaceID: row.WorkspaceID,
 		ID: string(row.ID), CreatorID: row.CreatorID}
-	if err := s.policy.AuthorizeAttachment(ctx, scope, resource, cmd.Mode); err != nil {
-		return control.ErrDenied
+	mode, err := s.admit(ctx, scope, resource, cmd)
+	if err != nil {
+		return err
 	}
+	// Everything below asks about the mode this attach was ADMITTED in, which
+	// is not always the mode it asked for.
+	cmd.Mode = mode
 	if !s.attachable(row) {
 		return control.ErrConflict
 	}

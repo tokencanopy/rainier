@@ -3,6 +3,7 @@ package controlapp
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -1232,12 +1233,44 @@ func TestAViewOnlyPrincipalWatchesAndMayNotClaim(t *testing.T) {
 		t.Fatalf("a refused claim still advanced the generation %d time(s)", got-before)
 	}
 
-	// A negotiated CONTROLLER attach under the same policy is still refused
-	// at the door, which is where `mode=control` is answered.
+	// A negotiated CONTROLLER attach under the same policy is admitted as a
+	// VIEWER. It used to be refused at the door, and that refusal is what
+	// made this whole seam unreachable from the first-party CLI: a plain
+	// `rainier attach` asks for control, so a view-only principal got
+	// "not authorized to attach to this session" for a session it may
+	// perfectly well watch, and had to know to type `--view`. It is answered
+	// the way `grant` answers every other refusal — as a viewer, at the
+	// current generation, never an error.
+	asked := len(fx.policy.modes())
 	if err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
 		SessionID: "sess_example", Mode: control.AttachmentController, Negotiated: true,
+	}, &attachmentRecordingTerminalStream{}); err != nil {
+		t.Fatalf("a negotiated control attach under a controller-denying policy: %v", err)
+	}
+	switch tg := fx.broker.target(); {
+	case tg.Mode != control.AttachmentViewer:
+		t.Fatalf("a refused controller was granted %q, want viewer", tg.Mode)
+	case !tg.Negotiated:
+		t.Fatal("the downgraded attach was not marked negotiated; its client would never be told it is watching")
+	case tg.MayClaim:
+		t.Fatal("a principal the policy refuses the controller was handed the right to claim")
+	case tg.Controller == nil:
+		t.Fatal("the downgraded attach got no keeper, so it cannot read its own generation")
+	}
+	// The controller it asked for, the viewer it was admitted as, and then
+	// the separate question of whether it may ever take control.
+	want := []control.AttachmentMode{control.AttachmentController, control.AttachmentViewer, control.AttachmentController}
+	if got := fx.policy.modes()[asked:]; !slices.Equal(got, want) {
+		t.Fatalf("the policy was asked %v; want %v", got, want)
+	}
+
+	// An UNNEGOTIATED controller attach under the same policy is still
+	// refused. It cannot be told it is a viewer, so admitting it as one would
+	// leave a terminal that silently does not type.
+	if err := fx.svc.AttachTerminal(context.Background(), attachmentTestScope(), control.AttachTerminal{
+		SessionID: "sess_example", Mode: control.AttachmentController,
 	}, &attachmentRecordingTerminalStream{}); !errors.Is(err, control.ErrDenied) {
-		t.Fatalf("a negotiated control attach under a controller-denying policy: err = %v, want ErrDenied", err)
+		t.Fatalf("an unnegotiated control attach under a controller-denying policy: err = %v, want ErrDenied", err)
 	}
 
 	// An UNNEGOTIATED viewer is authorized as what it is and may not claim:

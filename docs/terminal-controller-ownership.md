@@ -150,7 +150,14 @@ else.
   later is authorized separately, on the claim itself. A host whose policy
   grants viewing without granting driving therefore admits `--view` normally,
   and that client's take-control key is answered `stale` — refused on this
-  replica, without a generation moving anywhere. The claim asks the policy
+  replica, without a generation moving anywhere. A **plain attach** from such
+  a principal asks for control, because that is what zero-click on one laptop
+  means; it is **admitted as a viewer** rather than refused, told `attached,
+  view` before it paints a screen, and prints the viewing notice. Refusing it
+  would mean a person who may watch a session being told they may not attach
+  to it, and having to know to type `--view`. An **unnegotiated** client
+  asking for control is still refused: it cannot be told it is a viewer, so
+  admitting it as one would leave a terminal that silently does not type. The claim asks the policy
   live rather than reading an answer cached at attach time, so a grant revoked
   mid-attach is honoured at the next press. Self-hosted Rainier answers both
   questions the same way (a caller who may attach may drive), so none of this
@@ -173,13 +180,28 @@ else.
   generation, so one press of the take-control key takes it back. Reversing
   the order is not available, because until the runner dials back there is no
   socket to install a binding on.
-- Nothing bounds how often a client may claim. A client that already has
-  control can loop `claim` and `release` on its own stream; each claim
-  advances the generation and waits, serially and up to the acknowledgement
-  timeout per peer, for every other attach's sandbox. It is an authorized
-  user's nuisance against their own session — no escalation, and nothing
-  another account can do — and it is deliberately not rate limited, because a
-  limiter would also refuse the legitimate rapid hand-back after a mis-press.
+- Nothing bounds how often a client may claim, and nothing needs to. A claim
+  from the attach that already **holds** control is answered with what it
+  holds and goes no further: it never reaches the store, never advances the
+  generation, and never fences the keystrokes that client has already sent. A
+  client can still loop `claim` and `release` on its own stream; each pair
+  advances the generation twice and waits, up to one acknowledgement timeout
+  in total, for the other attaches' sandboxes. It is an authorized user's
+  nuisance against their own session — no escalation, and nothing another
+  account can do — and it is deliberately not rate limited, because a limiter
+  would also refuse the legitimate rapid hand-back after a mis-press.
+
+- A handoff is **bounded and parallel**. Every peer a take-over displaces is
+  reached on its own path, and every step of it — the binding written to that
+  peer's sandbox, the acknowledgement waited for, the notice written to that
+  peer's client — carries the acknowledgement timeout. A device that has
+  stopped reading its socket (a closed lid, a paused browser tab) therefore
+  costs a handoff one timeout and delays nobody else: it is fenced at its pty
+  the moment the generation moves, the plane stops carrying what it types
+  before any of this runs, and its own heartbeat demotes it within one
+  interval. What it loses is the immediate notice. Client sockets carry a
+  write deadline for the same reason, so one that has stopped reading
+  altogether is eventually closed rather than held open.
 - Nothing about ownership is logged, and no message, byte, or length of one is.
   The holder is an opaque per-attach identity, never a user, device, account or
   browser-session identifier, and never leaves the control plane.

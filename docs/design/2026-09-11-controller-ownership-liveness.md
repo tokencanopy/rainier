@@ -231,15 +231,15 @@ Every fix lands with a regression test that fails without it:
 
 | Fix | Test | Fails without the fix because |
 |---|---|---|
-| 1 | `TestAStuckPeerDoesNotStallAClaim` | the claim is never answered |
+| 1 | `TestAStuckPeerDoesNotStallAClaim`, `TestAStalledExControllerIsFencedEvenThoughItsNoticeCouldNotBeDelivered` | the claim is never answered |
 | 1 | `TestAStuckPeerDoesNotStallANewControllerAttach` | the attach never reaches its runner |
-| 1 | `TestOnePeersStallDoesNotHideAnothersDisplacement` | the peer behind the stalled one is never told |
+| 1 | `TestOneStalledPeerDoesNotHideAnothersDisplacement` | the peer behind the stalled one is never told |
 | 1 | `TestAWedgedClientIsClosedRatherThanHeld` | the write never returns |
-| 2 | `TestAControllerIsNeverToldItIsAViewer` | the controller is told `stale` and stops typing |
-| 2 | `TestADisplacementReportsTheModeItReadsAtSendTime` | the notice says `view` for a live controller |
-| 3 | `TestADemotionThatWasSupersededDoesNotDemote` | the plane demotes an attach that won a newer generation |
-| 4 | `TestAViewOnlyPrincipalsPlainAttachIsAdmittedAsAViewer` | the attach is `ErrDenied` |
-| 5 | `TestAClaimFromTheControllerChangesNothing` | the generation advances and peers are re-displaced |
+| 2 | `TestAControllerThatClaimsFromAStaleGenerationKeepsControl`, `TestAStaleAnswerNeverTellsALiveControllerItIsAViewer` | the controller is told `stale` and stops typing |
+| 2 | `TestADisplacementNoticeReportsTheModeItReads` | the notice says `view` for a live controller |
+| 3 | `TestADemotionThatWasSupersededDoesNotDemote`, `TestDemoteToRefusesAGenerationThisAttachHasLeft` | the plane demotes an attach that won a newer generation |
+| 4 | `TestAViewOnlyPrincipalWatchesAndMayNotClaim` (the plain-attach case) | the attach is `ErrDenied` |
+| 5 | `TestAClaimFromTheCurrentControllerNeverAdvancesTheGeneration` | the generation advances and peers are re-displaced |
 | 7 | `TestAStaleAcknowledgementNeverCostsTheNextHandoffItsWait` | the second handoff burns the whole timeout |
 
 Plus: the existing `attachplane` and `controlapp` suites, `-race -count=10` on
