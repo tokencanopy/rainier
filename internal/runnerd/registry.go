@@ -78,15 +78,6 @@ type sessionEntry struct {
 	// removes it — the honest trade, and reclaiming those is part of the
 	// resource-aware admission this change's design doc defers to.
 	bootFailed bool
-	// coldSuspended records that this entry's container was stopped (`docker
-	// stop`), not paused, and is therefore going to restart its whole process
-	// tree — a NEW child — when it resumes. It is set at the START of the
-	// cold suspend, together with the "suspending" marker, and cleared if the
-	// stop fails, so it cannot be missed by a hub death that races ahead of
-	// the stop's completion. resumed() reads it to decide whether the
-	// child-exit fact survives the resume: after a stop it must not (the
-	// child is new), after a pause it must (the child is whatever it was).
-	coldSuspended bool
 }
 
 // idleFor reports how long this session has been idle at now, and whether it
@@ -220,6 +211,21 @@ func (r *registry) hub(id string) (*relay.Hub, bool) {
 		return nil, false
 	}
 	return e.hub, true
+}
+
+// restoreAfterFailedDestroy puts an entry back where Delete found it when the
+// driver teardown failed — but only if the entry is still the one Delete
+// marked. The same compare-and-swap discipline as releaseColdSuspend, and for
+// the mirror of its reason: a cold suspend that landed while drv.Destroy was in
+// flight has already moved the entry to "suspended", and stamping the
+// pre-Delete state back over it would claim a container is running that this
+// runner has just stopped.
+func (r *registry) restoreAfterFailedDestroy(id, previousState string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok && e.state == "destroying" {
+		e.state = previousState
+	}
 }
 
 // setState updates an entry's state under the registry lock — sessionOp's
@@ -559,7 +565,7 @@ func (r *registry) idleSessions(idle time.Duration, now time.Time) []string {
 // than a crash — otherwise it destroys the container this is only trying to
 // park. coldSuspended is set here, before the stop rather than after it, so
 // that a hub death racing ahead of the stop's completion cannot leave the
-// entry looking pause-suspended; releaseIdle clears both if the stop fails.
+// entry looking pause-suspended.
 func (r *registry) claimIdle(id string, idle time.Duration, now time.Time) (handle string, idleFor time.Duration, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -572,7 +578,6 @@ func (r *registry) claimIdle(id string, idle time.Duration, now time.Time) (hand
 		return "", 0, false
 	}
 	e.state = "suspending"
-	e.coldSuspended = true
 	return e.handle, d, true
 }
 
@@ -589,7 +594,6 @@ func (r *registry) beginColdSuspend(id string) {
 	defer r.mu.Unlock()
 	if e, ok := r.items[id]; ok && e.state != "destroying" {
 		e.state = "suspending"
-		e.coldSuspended = true
 	}
 }
 
@@ -608,7 +612,6 @@ func (r *registry) releaseColdSuspend(id string) {
 	defer r.mu.Unlock()
 	if e, ok := r.items[id]; ok && e.state == "suspending" {
 		e.state = "running"
-		e.coldSuspended = false
 	}
 }
 
@@ -624,17 +627,29 @@ func (r *registry) finishColdSuspend(id string) {
 }
 
 // resumed lands an entry back on "running" after a successful driver resume,
-// and clears the idle bookkeeping if — and only if — the sandbox had been
-// COLD suspended.
+// and clears the idle bookkeeping if — and only if — the driver reports that it
+// RESTARTED the container.
 //
-// That condition is the whole point. `docker start` restarts the container's
-// whole process tree, so the child is a new one and the old child's exit says
-// nothing about it; keeping the fact would let the next sweep stop a session
-// whose agent is working, which is the one thing idle auto-stop must never do.
-// `docker unpause` restarts nothing, so a child that had exited is still
-// exited and the fact must survive, or a warm-cycled session would never be
+// That condition is the whole point, and it must come from the driver rather
+// than from what this runner intended. `docker start` gives the container a new
+// process tree, so the child is a new one and the old child's exit says nothing
+// about it; keeping the fact would let the next sweep stop a session whose
+// agent is working, which is the one thing idle auto-stop must never do.
+// `docker unpause` restarts nothing, so a child that had exited is still exited
+// and the fact must survive, or a warm-cycled session would never be
 // auto-stopped again.
-func (r *registry) resumed(id string) {
+//
+// An earlier version keyed this on a flag set when the runner ASKED for a cold
+// suspend, and the two come apart in both directions. A warm-paused container
+// that the docker daemon restarts underneath a surviving runnerd (a daemon
+// upgrade, an OOM kill) is resumed with `docker start` while the flag reads
+// "paused" — a new agent inheriting the old one's exit, stopped half an hour
+// later. And an entry left marked cold by a stop whose outcome could not be
+// read is resumed by an `unpause` or by nothing at all, while the epoch bump
+// deafens the connection that is still live — its child's exit dropped, its
+// slot never reclaimed. Only the driver knows which call it made; see
+// driver.Driver.Resume.
+func (r *registry) resumed(id string, restarted bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.items[id]
@@ -642,19 +657,19 @@ func (r *registry) resumed(id string) {
 		return
 	}
 	e.state = "running"
-	if e.coldSuspended {
-		e.coldSuspended = false
-		e.childExitedAt = time.Time{}
-		e.lastDetachAt = time.Time{}
-		// The new boot runs the whole chain again (setup, clone, init), so a
-		// previous boot's failure says nothing about it.
-		e.bootFailed = false
-		// And close the old boot, so a control frame still in flight from the
-		// sandbox that has just been restarted cannot land its child's exit on
-		// the new one. The register that is about to arrive opens the next
-		// epoch; until it does, frames from either side of the restart match
-		// nothing. See sessionEntry.boot.
-		r.nextBoot++
-		e.boot = r.nextBoot
+	if !restarted {
+		return
 	}
+	e.childExitedAt = time.Time{}
+	e.lastDetachAt = time.Time{}
+	// The new boot runs the whole chain again (setup, clone, init), so a
+	// previous boot's failure says nothing about it.
+	e.bootFailed = false
+	// And close the old boot, so a control frame still in flight from the
+	// sandbox that has just been restarted cannot land its child's exit on
+	// the new one. The register that is about to arrive opens the next
+	// epoch; until it does, frames from either side of the restart match
+	// nothing. See sessionEntry.boot.
+	r.nextBoot++
+	e.boot = r.nextBoot
 }

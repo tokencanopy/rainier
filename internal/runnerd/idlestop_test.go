@@ -707,9 +707,6 @@ func TestColdResumeForgetsThePreviousChild(t *testing.T) {
 	if !e.childExitedAt.IsZero() || !e.lastDetachAt.IsZero() {
 		t.Fatalf("after a cold resume: childExitedAt=%v lastDetachAt=%v, want both zero", e.childExitedAt, e.lastDetachAt)
 	}
-	if e.coldSuspended {
-		t.Fatal("after a cold resume the entry still reads as cold-suspended")
-	}
 	h.clk.set(1000 * time.Hour)
 	if stops := h.rd.sweepIdle(context.Background(), 30*time.Minute); len(stops) != 0 {
 		t.Fatalf("stopped %v — a resumed session's new agent is running", stops)
@@ -1103,5 +1100,124 @@ func TestAnOperatorStopDoesNotClobberAConcurrentDelete(t *testing.T) {
 	h.rd.reg.beginColdSuspend(h.id)
 	if _, state, _ := h.rd.reg.opTarget(h.id); state != "destroying" {
 		t.Fatalf("state = %q, want %q — a stop must not overwrite a teardown in flight", state, "destroying")
+	}
+}
+
+// TestADaemonRestartUnderAWarmSuspendIsTreatedAsANewChild is the third review
+// round's finding, and the last door into the invariant. The runner's INTENT
+// (it asked for a pause, so the child is the same one) and what the container
+// actually did can come apart: a docker daemon upgrade, or an OOM kill, stops
+// every session container while runnerd — which runs on the host — survives.
+// The entry still reads warm-suspended, but the resume that follows is a
+// `docker start`: a new process tree, a new agent. Keying the reset on the
+// intent left the new agent holding the old one's exit, and the sweep stopped
+// it half an hour later.
+func TestADaemonRestartUnderAWarmSuspendIsTreatedAsANewChild(t *testing.T) {
+	h := newIdleHarness(t)
+	ctx := context.Background()
+	h.run(30*time.Minute, idleStep{at: 0, act: childExits})
+	h.run(30*time.Minute, idleStep{at: 1 * time.Minute, act: warmSuspends})
+
+	// The daemon restarts underneath the pause: the container is stopped, not
+	// paused, and nothing told the runner.
+	if err := h.fd.Suspend(ctx, h.handle(), false); err != nil {
+		t.Fatalf("stop the container out from under the runner: %v", err)
+	}
+
+	h.clk.set(2 * time.Minute)
+	if err := h.rd.Op(ctx, h.id, "resume", false); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	h.register(h.id)
+	if e := h.entry(h.id); !e.childExitedAt.IsZero() {
+		t.Fatal("a resume that restarted the container kept the previous child's exit")
+	}
+	h.clk.set(1000 * time.Hour)
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 0 {
+		t.Fatalf("stopped %v — the restarted container's agent is a new one, and it is running", stops)
+	}
+}
+
+// unreadableStopDriver reports a failure from Suspend and cannot answer
+// Inspect either — the shape a wedged daemon leaves, where the runner has to
+// decide without knowing anything.
+type unreadableStopDriver struct {
+	*driver.Fake
+	fail bool
+}
+
+func (d *unreadableStopDriver) Suspend(ctx context.Context, id string, warm bool) error {
+	if d.fail && !warm {
+		return errors.New("signal: killed")
+	}
+	return d.Fake.Suspend(ctx, id, warm)
+}
+
+func (d *unreadableStopDriver) Inspect(ctx context.Context, id string) (driver.Handle, error) {
+	if d.fail {
+		return driver.Handle{}, errors.New("daemon not responding")
+	}
+	return d.Fake.Inspect(ctx, id)
+}
+
+// TestAResumeThatRestartedNothingKeepsTheConnectionsBootEpoch is the other
+// half of the same finding, on the write side. A stop whose outcome could not
+// be read leaves the entry parked with its container and its connection both
+// alive. The resume that follows restarts nothing — and if it moved the boot
+// epoch anyway, the live connection's captured token would go stale, its
+// child's exit would be dropped, and the session would hold its slot for the
+// life of the runner with nothing in the log to say why.
+func TestAResumeThatRestartedNothingKeepsTheConnectionsBootEpoch(t *testing.T) {
+	clk := newFakeClock()
+	ud := &unreadableStopDriver{Fake: driver.NewFake(4), fail: true}
+	rd := New(ud, "", "", "")
+	rd.now = clk.now
+	h := &idleHarness{t: t, clk: clk, rd: rd, fd: ud.Fake, id: "sess-idle-1", boot: map[string]uint64{}}
+	h.create(h.id)
+	liveBoot := h.boot[h.id]
+	ctx := context.Background()
+
+	// A stop that fails with no answer from the driver leaves the entry
+	// parked rather than guessing.
+	h.run(30*time.Minute, idleStep{at: 0, act: childExits})
+	h.clk.set(time.Hour)
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 0 {
+		t.Fatalf("sweep reported %v stopped; the stop failed", stops)
+	}
+	if _, state, _ := h.rd.reg.opTarget(h.id); state != "suspending" {
+		t.Fatalf("state after an unreadable stop = %q, want %q", state, "suspending")
+	}
+
+	// The daemon comes back and the session is resumed. Its container never
+	// stopped, so this restarts nothing.
+	ud.fail = false
+	if err := h.rd.Op(ctx, h.id, "resume", false); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if got := h.rd.reg.currentBoot(h.id); got != liveBoot {
+		t.Fatalf("boot epoch moved to %d without a restart; the live connection is now deaf", got)
+	}
+
+	// So the exit reported by the sandbox that was there all along still counts.
+	h.clk.set(2 * time.Hour)
+	h.rd.routeControl(h.id, liveBoot, []byte(`{"kind":"child_exited","rc":0}`))
+	h.clk.set(2*time.Hour + 31*time.Minute)
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 1 {
+		t.Fatalf("sweep stopped %v, want the session", stops)
+	}
+}
+
+// TestADeleteThatFailsDoesNotUnstopAStoppedContainer: Delete restores the
+// state it found when the driver teardown fails, and must not stamp "running"
+// over a cold suspend that landed while its Destroy was in flight.
+func TestADeleteThatFailsDoesNotUnstopAStoppedContainer(t *testing.T) {
+	h := newIdleHarness(t)
+	h.rd.reg.setState(h.id, "destroying")
+	h.rd.reg.beginColdSuspend(h.id) // refused: the teardown owns the entry
+	h.rd.reg.setState(h.id, "suspended")
+
+	h.rd.reg.restoreAfterFailedDestroy(h.id, "running")
+	if _, state, _ := h.rd.reg.opTarget(h.id); state != "suspended" {
+		t.Fatalf("state = %q, want %q — the container really is stopped", state, "suspended")
 	}
 }

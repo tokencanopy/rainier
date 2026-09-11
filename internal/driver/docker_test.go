@@ -669,8 +669,10 @@ func TestDockerWorkspaceSurvivesColdPark(t *testing.T) {
 	if err := d.Suspend(ctx, h.ID, false); err != nil { // cold park: docker stop
 		t.Fatal(err)
 	}
-	if err := d.Resume(ctx, h.ID); err != nil {
+	if restarted, err := d.Resume(ctx, h.ID); err != nil {
 		t.Fatal(err)
+	} else if !restarted {
+		t.Fatal("a cold resume reported no restart")
 	}
 	// Two ticks: the second start appended to the file the first one wrote.
 	waitTicks(2)

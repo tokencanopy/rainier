@@ -155,16 +155,24 @@ func (f *Fake) Suspend(_ context.Context, id string, warm bool) error {
 	it.cold = !warm
 	return nil
 }
-func (f *Fake) Resume(_ context.Context, id string) error {
+
+// Resume mirrors the docker driver's branch, including what it reports: only a
+// COLD-parked item is restarted (the fake's `docker start`), because only that
+// one gets a new process tree. A warm-paused item is unfrozen and an already
+// running one is untouched, and neither is a restart. Modelling this in the
+// fake is what lets runnerd's tests cover the rule that decides whether a
+// child it was told had exited is the child running now.
+func (f *Fake) Resume(_ context.Context, id string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	it, ok := f.items[id]
 	if !ok {
-		return fmt.Errorf("no such id %s", id)
+		return false, fmt.Errorf("no such id %s", id)
 	}
+	restarted := it.state == StateSuspended && it.cold
 	it.state = StateRunning
 	it.cold = false
-	return nil
+	return restarted, nil
 }
 func (f *Fake) Snapshot(_ context.Context, id, ref string, stripEnv []string) (Snapshot, error) {
 	f.mu.Lock()

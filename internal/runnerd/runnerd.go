@@ -593,14 +593,17 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 		s.reg.setState(id, "suspended")
 		return nil
 	case "resume":
-		if err := s.drv.Resume(ctx, handle); err != nil {
+		restarted, err := s.drv.Resume(ctx, handle)
+		if err != nil {
 			return err
 		}
-		// Lands on "running" and, for a sandbox that was STOPPED rather than
-		// paused, starts a fresh idle epoch: `docker start` restarts the
-		// process tree, so the child this runner was told had exited is not
-		// the child that is running now. See registry.resumed.
-		s.reg.resumed(id)
+		// Lands on "running" and, for a sandbox the driver actually RESTARTED,
+		// starts a fresh idle epoch: `docker start` gives the container a new
+		// process tree, so the child this runner was told had exited is not the
+		// child that is running now. Only the driver can tell that from an
+		// unpause — Inspect folds paused and exited into one state — which is
+		// why it says so. See registry.resumed.
+		s.reg.resumed(id, restarted)
 		return nil
 	default:
 		return errUnknownOp
@@ -635,8 +638,12 @@ func (s *Server) coldSuspend(ctx context.Context, id, handle string) error {
 //
 //   - container still running: the stop really did fail. Roll back; the next
 //     sweep, or the operator's retry, tries again.
-//   - container stopped, paused or created: the stop landed after all. Land the
-//     entry where a successful stop would have.
+//   - container not running: the stop landed after all, or near enough. Land
+//     the entry where a successful stop would have. This arm is coarse and
+//     knowingly so — Inspect folds paused, exited, created and every status a
+//     driver does not recognize into one StateSuspended — so a container docker
+//     happens to be removing reads as "stopped" here too. Harmless: the landing
+//     is a compare-and-swap that a Delete's marker already refuses.
 //   - container gone: not this function's business. Roll back so the
 //     hub-death tail can do what it does for any container that vanished —
 //     confirm it with its own Inspect, reclaim the entry, keep the workspace,
@@ -699,7 +706,7 @@ func (s *Server) Delete(ctx context.Context, id string) error {
 		// entry so Announce/reconciliation and an explicit retry can still
 		// find it. Restore the prior state: sessiond redials after hub.Close,
 		// and a successful redial can then install a fresh hub normally.
-		s.reg.setState(id, previousState)
+		s.reg.restoreAfterFailedDestroy(id, previousState)
 		return err
 	}
 	s.reg.remove(id)

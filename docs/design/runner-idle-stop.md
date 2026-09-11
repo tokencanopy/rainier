@@ -186,12 +186,28 @@ On a successful stop:
 
 ### Where the fact is reset
 
-`childExitedAt` describes *the current sandbox boot*. A cold suspend and resume restarts the
-container, so the child is new; a warm pause and unpause does not, so the child is still
-whatever it was. The registry therefore records `coldSuspended` when a cold suspend
-succeeds, and a successful resume clears the idle bookkeeping **only** for a sandbox that was
-cold-suspended. A session that is resumed, works, and finishes again is a candidate again —
-by its new child's exit.
+`childExitedAt` describes *the current sandbox boot*. `docker start` gives the container a new
+process tree — a new agent — so the fact must go; `docker unpause` does not, so it must stay,
+or a warm-cycled session would never be auto-stopped again. A session that is resumed, works
+and finishes again is a candidate again, by its new child's exit.
+
+**Which of the two happened is the driver's answer, not the runner's.** `Driver.Resume` now
+reports `restarted bool`, true only where it ran a start, and `resumed()` clears the
+bookkeeping (and closes the boot epoch) on exactly that. Nothing above the driver can work it
+out: `Inspect` folds paused, exited and created into one `StateSuspended`.
+
+An earlier version keyed this on a flag the runner set when it *asked* for a cold suspend, and
+the two come apart in both directions — each breaking one half of the design:
+
+- A warm-paused container that the **docker daemon** restarts underneath a surviving `runnerd`
+  (a daemon upgrade, an OOM kill; the runner is a host process, not a container) is resumed
+  with a start while the flag still says "paused". The new agent inherits the old one's exit
+  and is stopped half an hour into its work.
+- An entry left marked cold by a stop whose outcome could not be read is resumed by an unpause,
+  or by nothing at all — and the epoch bump would then move under a connection that is still
+  alive, whose captured token goes stale. That sandbox's child exit is dropped, `sessiond`
+  re-sends only what it never delivered, and the session holds its slot for the life of the
+  runner with nothing in the log to say why.
 
 ## Alternatives considered
 
@@ -234,6 +250,7 @@ timeout measured in tens of minutes.
 | a `Delete` overtakes an in-flight stop | the stop's claim, its rollback and its landing state are all conditional on the entry still being the one it claimed, so none of them can wipe `Delete`'s `"destroying"` marker — the marker that stops the register goroutine from destroying the container a second time and reporting the session dead. That conditionality has one cost, worth naming: if a stop fails *and* the hub died first (so `hubDied` already normalized `"suspending"` to `"suspended"`), the rollback is skipped and the entry reads `"suspended"` over a container the stop did not stop. A dead sessiond almost always means the container really did go, `Docker.Resume` is status-aware, and the next announce corrects it either way. |
 | a stop reports failure but the container stopped anyway | `docker stop` killed at its bound leaves the *daemon* still stopping the container. So a failed stop does not assume: it asks the driver what the container is doing, and lands the entry where the answer says. Believing the error would roll the entry back to `"running"`, the container would die seconds later, and the register goroutine would read that as a crash — destroying the container and reporting a merely idle session dead. If the driver cannot answer either, the entry is left `"suspending"`, the conservative marker, and the next sweep re-checks. |
 | a session that failed to boot | never stopped; see `bootFailed` above. |
+| the docker daemon restarts under a warm-paused session | its container is stopped, not paused, and the resume that follows is a start. The driver says so, the fact is cleared, and the new agent is treated as new. |
 | `drv.Suspend` fails | the entry rolls back to `"running"`, exactly as `Op` does; no event, no log line, and the next sweep tries again |
 | the container dies on its own first | the crash path removes the entry; a claim on a removed entry fails |
 | runnerd restarts | `Recover` rebuilds entries from labelled containers with no `childExitedAt` — the exit was only ever in memory. Recovered sessions are treated as "child running" and are not auto-stopped until they report a new exit (they won't). Safe direction, and a durable activity record is #85's. |

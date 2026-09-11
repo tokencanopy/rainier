@@ -47,7 +47,7 @@ func TestFakeRecordsWorkspaceVolumeAndEnv(t *testing.T) {
 	if !f.hasVolume("rainier-ws-sess-a") {
 		t.Error("cold park dropped the workspace volume")
 	}
-	if err := f.Resume(ctx, h.ID); err != nil {
+	if _, err := f.Resume(ctx, h.ID); err != nil {
 		t.Fatal(err)
 	}
 	if !f.hasVolume("rainier-ws-sess-a") {
