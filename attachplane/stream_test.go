@@ -189,13 +189,22 @@ func TestTheWriteBudgetScalesWithTheFrame(t *testing.T) {
 	if got := s.budget(0); got != defaultClientWriteBase {
 		t.Fatalf("a message with no payload gets %s, want the base %s", got, defaultClientWriteBase)
 	}
-	// The biggest frame this stream can carry, at the slowest link it keeps.
-	big := s.budget(attachReadLimit)
-	if want := defaultClientWriteBase + 256*time.Second; big != want {
-		t.Fatalf("the largest frame gets %s, want %s", big, want)
+	// The biggest payload this stream can carry: the read limit bounds the
+	// WIRE frame, and Data travels base64, so the payload inside it is three
+	// quarters of that.
+	const biggest = attachReadLimit / 4 * 3
+	got := s.budget(biggest)
+	if want := defaultClientWriteBase +
+		time.Duration(wireSize(biggest))*time.Second/defaultClientWriteRate; got != want {
+		t.Fatalf("the largest frame gets %s, want %s", got, want)
 	}
-	if rate := float64(attachReadLimit) / big.Seconds(); rate > defaultClientWriteRate {
-		t.Fatalf("the largest frame demands %.0f B/s sustained, which is more than the "+
+	// And the rate it demands is the rate this stream promises, measured
+	// against the bytes that actually reach the socket. Budgeting the
+	// payload instead would ask a third more of the client than the comment
+	// and the doc say.
+	if rate := float64(wireSize(biggest)) / (got - defaultClientWriteBase).Seconds(); rate >
+		defaultClientWriteRate+1 {
+		t.Fatalf("the largest frame demands %.0f B/s on the wire, which is more than the "+
 			"%d B/s this stream promises to keep a client for", rate, defaultClientWriteRate)
 	}
 	// A stream with no rate is the base and nothing else, rather than a
@@ -209,11 +218,18 @@ func TestTheWriteBudgetScalesWithTheFrame(t *testing.T) {
 // Send, so that the arithmetic above is the arithmetic the socket actually
 // gets. Holding the conn's write lock is what makes it measurable: the send
 // never reaches the socket at all, so what it spends is exactly its budget.
+//
+// The rate is absurdly slow and the payload correspondingly tiny on purpose.
+// A test that bought its extra budget with a megabyte would measure
+// json.Marshal under -race instead — which is most of a second for 2MiB, and
+// enough to make this test pass with the scaling removed, at exactly the
+// -count and the -race the gates run it under.
 func TestALargeFrameIsGivenTimeInProportionToItself(t *testing.T) {
 	const (
 		base    = 100 * time.Millisecond
-		rate    = 4 << 20 // 4 MiB/s
-		payload = 2 << 20 // and so half a second on top of the base
+		rate    = 1024 // B/s: slow enough that half a kilobyte is half a second
+		payload = 384  // and so 512 wire bytes, and so 500ms on top of the base
+		scaled  = base + payload*4/3*time.Second/rate
 	)
 	elapsed := func(m terminal.ServerMessage) time.Duration {
 		t.Helper()
@@ -232,13 +248,20 @@ func TestALargeFrameIsGivenTimeInProportionToItself(t *testing.T) {
 
 	small := elapsed(terminal.ServerMessage{Type: terminal.TypeControlChanged,
 		Mode: terminal.ModeView, Generation: "2"})
-	if small > base+base/2 {
+	if small < base || small > base*3 {
 		t.Fatalf("a message with no payload spent %s, want about its %s base", small, base)
 	}
 	big := elapsed(terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: make([]byte, payload)})
-	if want := base + payload*time.Second/rate; big < want {
+	if big < scaled {
 		t.Fatalf("a %dB frame spent %s, want at least %s: a whole-write deadline is what "+
 			"disconnects a client that is making steady progress through a large snapshot",
-			payload, big, want)
+			payload, big, scaled)
+	}
+	// And an UPPER bound, because the lower one alone is satisfied by
+	// anything slow — including the marshalling this test deliberately keeps
+	// negligible.
+	if big > scaled+base*3 {
+		t.Fatalf("a %dB frame spent %s, want about %s; the budget is not what bounded it",
+			payload, big, scaled)
 	}
 }

@@ -228,7 +228,11 @@ then refused for the life of the attach.
   the number down while still moving the mode.
 - `displaceTo` refusing (`o.gen >= gen`) must not send anything: the peer is
   already at or past that generation and a `control_changed` naming an older
-  number would walk its client backwards.
+  number would walk its client backwards. *(Wrong from the moment `announceAs`
+  began reading the number under the announce hold — a notice cannot name an
+  older number if it does not carry a caller's number at all. Corrected in
+  [`2026-09-11-controller-ownership-fifth-review.md`](2026-09-11-controller-ownership-fifth-review.md),
+  which is where the cost of leaving it standing is written down.)*
 - A negotiated view-only attach still gets a keeper, because it needs `State`
   for its own generation reads and `finish` is a no-op for a non-controller.
 - An unnegotiated attach is unaffected by all three: it carries no keeper, is

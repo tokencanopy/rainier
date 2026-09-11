@@ -18,6 +18,12 @@ Nothing here changes the wire, the message set, or the compatibility matrix.
 One observable client behaviour changes, deliberately, and is written down in
 [Scope](#scope): under `--view` the take-control key stops sending a claim.
 
+Two further reviews of *this* change — one independent, one adversarial —
+found four defects it had introduced and several documentation sentences it
+had falsified. Their dispositions are in
+[What the reviews of this round found](#what-the-reviews-of-this-round-found);
+everything below already describes the fixed version.
+
 ## Problem
 
 ### 1. A displaced controller can be skipped and never told, while the taker *is* told it has control
@@ -206,9 +212,17 @@ under its own `Plane.step` deadline, on its own goroutine.
 
 `sendStale` already reads the current generation from the store and records it
 on this attach; it now returns it, and the give-back path fans it out with
-`displace(ctx, o, current, false)`. `false` because there is nobody to race:
-the generation has already moved twice and this attach is not becoming the
-controller.
+`displace(ctx, o, current, true)`.
+
+It WAITS, like a take-over and unlike a release. This is the only fan-out in
+the module that can demote a peer which genuinely holds control — `release`
+and `finish` both demote the caller first, so their peers are already viewers
+— and `displaceTo` flips that peer to `view` in the plane before its sandbox
+has the matching binding. A fire-and-forget install there disarms the NEXT
+taker: `displaceTo` hands it `was == view`, it skips `installAndWait`, and it
+is answered while the old binding is still on the wire. The pty's own
+generation fence still holds either way, so nothing executes twice; what would
+not hold is the ordering this module promises.
 
 ### F3 — the runner pump drops what the plane owns
 
@@ -223,15 +237,35 @@ callers — the take-control key and `--take`'s single claim — so `--view`
 cannot claim by any route, including the flag combination the CLI already
 refuses at parse time.
 
+What it reads is a new `Options.NeverClaim`, set only by the flag, and NOT the
+existing `askedView`. `askedView` means "this attach is requesting view mode",
+which is what `cmd/rainier`'s `reconnectOwnership` asks for on every reconnect
+whose previous attach ended as a viewer — so a device superseded while its
+network was out does not take control back on a blip. Those `Options` are
+otherwise byte-identical to `--view`'s, and that device must keep its
+take-control key: the plane promotes an attach only in answer to a claim, so
+losing the key would pin it a viewer for the rest of the process with no way
+back but detaching.
+
 ### F5 and F7 — a budget that scales, on the stream rather than in a package var
 
 `wsTerminalStream` carries a base budget and a minimum sustained rate, and one
-message's deadline is `base + len(payload)/rate`. At the defaults (60 s,
-64 KiB/s) the largest frame the read limit allows gets 60 s + 256 s, so a
-client progressing at 64 KiB/s can take a full 16 MiB snapshot; a client that
-has taken NOTHING is still closed, which is the property the budget is for.
-Both knobs are fields set by `ClientStream`, so a test constructs a stream with
-its own and nothing shared is mutated.
+message's deadline is `base + wire(payload)/rate`. The rate is measured against
+the bytes that reach the SOCKET rather than the payload: `Data` is a `[]byte`,
+which JSON carries base64-encoded, so four wire bytes leave for every three of
+payload, and budgeting the payload would quietly ask a third more throughput
+than the rate promises. At the defaults (60 s, 64 KiB/s) the largest frame the
+16 MiB read limit allows gets 60 s + 256 s, so a client progressing at
+64 KiB/s can take a full snapshot; a client that has taken NOTHING is still
+closed, which is the property the budget is for. Both knobs are fields set by
+`ClientStream`, so a test constructs a stream with its own and nothing shared
+is mutated.
+
+The trade is explicit: a wedged client carrying the largest frame is held for
+about five minutes rather than one, and a new attach's first byte can wait one
+`Plane.step` behind a wedged peer's courtesy notice whether or not that peer
+moved. Each costs one goroutine, one file descriptor and one table entry;
+being disconnected mid-scrollback costs a person their session.
 
 ### F6 — a test that holds the announce hold while the state moves under it
 
@@ -239,6 +273,42 @@ Not a code change: the coverage gap is closed with a test that takes one
 attach's announce hold, queues a second announcement behind it, moves the
 attach's state, and then releases — so the queued announcement must report the
 state as of when it acquired the hold, not as of when it was called.
+
+## What the reviews of this round found
+
+Two Opus reviews of this change — one independent, one adversarial, both with
+a mutation battery — found four defects it had introduced. All four are fixed
+above, each with a regression test that fails without its fix.
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | **HIGH** — F4 read `askedView`, which `reconnectOwnership` also sets, so a plain attach that came back a viewer after a disconnect lost Ctrl-\ for the rest of the process, silently and with no way back | **Fixed.** `Options.NeverClaim` is a separate fact from the mode being requested. `TestAReconnectedViewerKeepsItsTakeControlKey` |
+| 2 | **HIGH** — F2's give-back fan-out did not wait, so a peer was flipped to `view` in the plane with its binding still in flight, and the next taker skipped its own `installAndWait` | **Fixed.** `wait=true`, and the test asserts the binding has landed when the claim returns rather than polling for it. `TestAClaimThatGivesItsGenerationBackTellsThePeersToo` |
+| 3 | **MEDIUM-HIGH** — F1's unconditional announce reached attaches that are registered but have not been told what they are yet (up to `attachFirstMsgTimeout`), making a courtesy notice their OPENING answer: two `[another device took control]` lines for a plain viewer, and one for a `--view` attach that should hear nothing | **Fixed.** A peer whose state did not move AND which has been told nothing is left to its own opening answer, which says the same thing. A peer that moved is still told. `TestAPeerThatHasNotBeenToldWhatItIsIsNotToldAboutSomebodyElseFirst` |
+| 4 | **MEDIUM** — the Send-level budget test passed with the scaling reverted, because `json.Marshal` of a 2 MiB payload under `-race` costs most of a second — vacuous at exactly the `-race -count=30` the gates run | **Fixed.** A 384-byte payload at 1 KiB/s buys the same half second with negligible marshalling, and the test now has an upper bound as well as a lower one. |
+| 5 | **MEDIUM-LOW** — the budget scaled on the payload, not the base64 the socket actually carries: ≈8% more throughput demanded than promised | **Fixed.** `wireSize` rounds the payload up to its base64 length. |
+| 6 | **MEDIUM/LOW (docs)** — `docs/cli-v0-contract.md` said Ctrl-\ still works under `--view`; `docs/terminal-controller-ownership.md` said the flag's key is answered `stale`; the help text did not mention the key at all; two prior design-doc sentences the change falsifies were left standing | **Fixed.** All four updated, the two prior sentences annotated in place with what superseded them. |
+| 7 | **LOW** — the F1 test could pass on the wrong producer if a run stalled past `ControlAckTimeout`, and a comment attributed generation zero to `finish`, which never passes it | **Fixed.** Five seconds of margin plus an explicit guard that fails the run rather than concluding from it; the attribution corrected here and in the test. |
+| 8 | **LOW** — `budget`'s largest-frame assertion was a tautology (`P/(base+P/rate) < rate` for any base) | **Fixed.** It now checks the wire rate against the promised floor with the base subtracted. |
+
+Findings deliberately NOT taken:
+
+- **A wedged client is now held ~5 minutes rather than 1 for the largest
+  frame, and a new attach's first byte can wait one `Plane.step` behind a
+  wedged peer.** Accepted and written into the comment: both are the price of
+  not disconnecting a client that is making steady progress, and both cost
+  resources rather than correctness.
+- **A `control_changed` can still precede a peer's opening `attached` when
+  that peer's state DID move, and the client then prints its notice twice.**
+  Pre-existing (`TestAnAttachStillReadingItsFirstMessageIsDisplacedLikeAnyOther`
+  pins the plane's half), unchanged by this round, and the notice is true
+  there — that attach really was granted control and really lost it. Folding
+  the duplicate is a change to client notice policy and belongs with its own
+  design note.
+- **The give-back tells the previous controller `control_changed view` while
+  the lease is vacant**, which reads as "another device took control" when
+  nobody did. It is the closest word the vocabulary has and the state it
+  reports is correct; a new message type for "nobody has it" is a wire change.
 
 ## Alternatives considered
 
@@ -273,11 +343,14 @@ state as of when it acquired the hold, not as of when it was called.
 - A peer whose client has stopped reading. The extra notice is under
   `Plane.step`, so it expires in one acknowledgement timeout and the taker is
   not held. `announceAs` gives up on a contended hold the same way.
-- A peer at generation 0 — `displace(…, 0, …)` from `finish` when the store
-  read failed. Every attach is already at or past 0, so `moved` is false for
-  all of them; each now gets one `control_changed` naming the generation it
-  already holds, which `attachio.observe` folds to nothing. No peer is
-  demoted and no binding is written.
+- A peer at generation 0 — what a composer that never set
+  `ControllerGeneration` hands `broker.Attach`, and what `release` falls back
+  to when the store read fails and the attach is itself at zero. (`finish`
+  displaces only when its read succeeded, so it never passes zero.) Every
+  attach is already at or past 0, so `moved` is false for all of them; each
+  peer that has already been told what it is gets one `control_changed` naming
+  the generation it already holds, which `attachio.observe` folds to nothing.
+  No peer is demoted and no binding is written.
 - The give-back fan-out runs after `sendStale` has already answered the
   claimer, so the claimer is never in its own peer list and never sees its own
   notice.
@@ -287,6 +360,12 @@ state as of when it acquired the hold, not as of when it was called.
   the plane says, which is the only authority for those three.
 - `--view` with `--take` is refused at parse time, so the `claim()` guard is
   belt and braces there; it is the whole fix for Ctrl-\.
+- A plain attach reconnecting as a viewer asks for view mode and is NOT
+  `--view`. It keeps its take-control key; see F4.
+- A peer that has been registered but not yet told what it is. Its opening
+  answer is still coming and reads the same state, so a courtesy notice that
+  arrived first would only change which sentence its client printed. It is
+  skipped when its state did not move, and told when it did.
 - A zero-payload message under the scaled budget gets exactly the base, which
   is what every ownership message and every `control_ack` is.
 
@@ -303,9 +382,12 @@ state as of when it acquired the hold, not as of when it was called.
   reaches the client, and the splice survives it.
 - `attachplane`: the announce hold under contention — the M10′ mutant dies.
 - `attachplane/stream`: a large payload gets proportionally more budget than a
-  small one, and a client that has taken nothing is still closed.
+  small one — measured through `Send`, with a payload small enough that
+  marshalling is not what the clock reads — and a client that has taken
+  nothing is still closed.
 - `internal/attachio`: `--view` + Ctrl-\ sends no claim, and the attach ends a
-  viewer.
+  viewer; the same `Options` WITHOUT the flag — which is what a reconnect
+  builds — claims and takes control.
 - Gates: `make verify`; `controlapp/repotest` on memstore and pgstore with
   zero skips; `go test ./internal/e2e/ -race`; `go test ./attachplane/ -race
   -count=20`; the new tests at `-race -count=30`.

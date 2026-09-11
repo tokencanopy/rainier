@@ -272,10 +272,18 @@ func TestRunNoRaceOnFloodedOutputDuringDetach(t *testing.T) {
 	// backlog of already-buffered frames in the socket (and the reader
 	// goroutine actively mid read-decode-write) at the moment of detach, not
 	// a cold start that races nothing.
-	deadline := time.Now().Add(5 * time.Second)
+	//
+	// The budget here is generous on purpose, and is not part of what the
+	// test asserts: it is waiting for the flood to have STARTED, and under
+	// -race on a loaded machine eight kilobytes through a websocket, a
+	// decoder and a pipe takes whatever it takes. Five seconds was tight
+	// enough to fail about one run in four on an idle machine, which made a
+	// -count gate on this package unusable.
+	const started = 30 * time.Second
+	deadline := time.Now().Add(started)
 	for drained.Load() < 8192 {
 		if !time.Now().Before(deadline) {
-			t.Fatal("flood never produced 8KiB of output within 5s")
+			t.Fatalf("flood never produced 8KiB of output within %s", started)
 		}
 		time.Sleep(time.Millisecond)
 	}

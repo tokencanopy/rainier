@@ -148,9 +148,11 @@ else.
   gone.
 - An attach is authorized for the mode it **opens in**, and taking control
   later is authorized separately, on the claim itself. A host whose policy
-  grants viewing without granting driving therefore admits `--view` normally,
-  and that client's take-control key is answered `stale` — refused on this
-  replica, without a generation moving anywhere. A **plain attach** from such
+  grants viewing without granting driving therefore admits a view-mode attach
+  normally, and a claim from one is answered `stale` — refused on this
+  replica, without a generation moving anywhere. (The first-party `--view`
+  client sends no claim at all, so nothing reaches that check; it is what
+  answers a third-party client, and a plain attach reconnecting as a viewer.) A **plain attach** from such
   a principal asks for control, because that is what zero-click on one laptop
   means; it is **admitted as a viewer** rather than refused, told `attached,
   view` before it paints a screen, and prints the viewing notice. Refusing it

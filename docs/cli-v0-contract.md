@@ -291,8 +291,12 @@ point on a laptop and a phone.
 - `--view` never claims, and never types: it is held on the client from the
   first byte rather than from the server's answer, so it means the same thing
   against a server that does not implement conditional ownership — where a
-  plain attach would take control unconditionally. Ctrl-\ still works; the
-  flag is about what happens without one.
+  plain attach would take control unconditionally. Ctrl-\ is inert for the
+  life of the attach, and silently so, the way it already is on a device that
+  has control. "Never claims" is the whole of the flag; a person who wants
+  the key back attaches without it. A plain attach that comes back a **viewer**
+  after a disconnect asks for view mode too and keeps its key — the flag is a
+  separate fact from the mode being requested.
 - `--take` takes control on attach, once, even from a live holder, and its one
   claim is spent by the first answer whatever that answer said: an attach that
   opened holding control does not take it back later, on its own, when

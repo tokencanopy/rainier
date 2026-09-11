@@ -65,16 +65,23 @@ const (
 	// handoff (Plane.step is that, and it is seconds), it is the point at
 	// which a socket that has taken NOTHING is closed rather than held.
 	defaultClientWriteBase = 60 * time.Second
-	// defaultClientWriteRate is the throughput a client has to sustain on
-	// the payload of a large frame to keep its socket. It buys the rest of
-	// the budget: without it the base would be a whole-write deadline, and
-	// the largest frame attachReadLimit allows would demand ≈273 KB/s of a
-	// client that is making perfectly steady progress — more than a 2 Mbit/s
-	// link has. At this rate that frame gets 60s + 256s instead.
+	// defaultClientWriteRate is the throughput a client has to sustain on a
+	// large frame to keep its socket. It buys the rest of the budget:
+	// without it the base would be a whole-write deadline, and the largest
+	// frame attachReadLimit allows would demand ≈273 KB/s of a client that
+	// is making perfectly steady progress — more than a 2 Mbit/s link has.
+	// At this rate that frame gets 60s + 256s instead.
 	//
 	// It is deliberately a floor rather than an estimate of anybody's link.
 	// A client slower than this over sixteen megabytes is not going to
 	// render the scrollback either.
+	//
+	// The trade it makes is explicit: a socket that takes NOTHING is still
+	// closed, but a wedged client carrying the largest frame is now held for
+	// five minutes rather than one, and a new attach's first byte waits up
+	// to one Plane.step behind a wedged peer's courtesy notice whether or
+	// not that peer moved. Both cost one goroutine, one fd and one table
+	// entry; being disconnected mid-scrollback costs a person their session.
 	defaultClientWriteRate = 64 << 10 // bytes per second
 )
 
@@ -120,15 +127,26 @@ type wsTerminalStream struct {
 
 // budget is how long ONE message carrying payload bytes of terminal data may
 // take. The fixed part is what a socket that has taken nothing gets; the rest
-// is the time that payload needs at the slowest rate this stream will keep a
-// client for. A message with no payload — every ownership message, every
-// acknowledgement — gets exactly the base.
+// is the time that message needs on the wire at the slowest rate this stream
+// will keep a client for. A message with no payload — every ownership
+// message, every acknowledgement — gets exactly the base.
+//
+// The rate is against the bytes that reach the SOCKET, not the payload:
+// terminal.ServerMessage.Data is a []byte, which JSON carries base64-encoded,
+// so four wire bytes leave for every three of payload. Budgeting the payload
+// instead would quietly demand a third more throughput than the rate
+// promises.
 func (s wsTerminalStream) budget(payload int) time.Duration {
 	if s.rate <= 0 {
 		return s.base
 	}
-	return s.base + time.Duration(payload)*time.Second/time.Duration(s.rate)
+	return s.base + time.Duration(wireSize(payload))*time.Second/time.Duration(s.rate)
 }
+
+// wireSize is payload bytes as base64, rounded up to the 4-byte group the
+// encoding emits. The rest of a terminal message is a few dozen bytes of
+// field names and is not worth counting.
+func wireSize(payload int) int { return (payload + 2) / 3 * 4 }
 
 var _ control.TerminalStream = wsTerminalStream{}
 

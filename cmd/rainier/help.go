@@ -213,7 +213,7 @@ otherwise attaches as a viewer and says so. Ctrl-\ takes control, and tells
 the device that had it. Ctrl-] releases control as it detaches, so the next
 attach needs no key at all.
 
-  --view    watch without ever claiming control
+  --view    watch without ever claiming control; Ctrl-\ does nothing
   --take    take control on attach, even if another device has it
 
 Reconnecting after a disconnect resumes control only if nobody took it in

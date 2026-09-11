@@ -228,7 +228,12 @@ smaller change.
   deadline is deliberately far above any legitimate frame time on a slow link;
   it exists to close a socket that is not draining at all.
 - **`displace` at generation zero.** Unchanged: no row is ever at zero, so
-  every `displaceTo` refuses and no goroutine does any I/O.
+  every `displaceTo` refuses and no goroutine does any I/O. *(Superseded by
+  [`2026-09-11-controller-ownership-fifth-review.md`](2026-09-11-controller-ownership-fifth-review.md):
+  every peer is now announced to whether or not its state moved, so a
+  generation-zero fan-out does one client write per peer that has already
+  been told what it is. It still demotes nobody, and what each notice says is
+  that peer's own mode and number.)*
 - **A view-only principal on an unnegotiated attach.** Still refused. A legacy
   client cannot be told it is a viewer, so admitting it as one would leave a
   terminal that silently does not type.
