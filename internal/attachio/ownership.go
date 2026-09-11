@@ -158,10 +158,24 @@ func (o *ownership) takeOnce() bool {
 // take-control key, and whether to send one at all. A client that already has
 // control sends nothing: re-claiming from yourself would advance the
 // generation and fence your own keystrokes for no reason anybody asked for.
+//
+// Neither does a --view attach, which is what makes "watch without ever
+// claiming control" true rather than aspirational. The plane would honour the
+// claim — a view-mode attach whose principal may drive is authorized to take
+// control mid-attach, which is what a reconnecting controller admitted as a
+// viewer depends on, so the service cannot tell the two apart — and --view is
+// this user's instruction to their own client, so it is held here, in the one
+// place that decides what this client claims. It covers the take-control key
+// and --take's single claim alike.
+//
+// Ctrl-\ is therefore swallowed under --view rather than forwarded: a --view
+// attach sends no input at all, so forwarding it would reach the same nowhere
+// with more moving parts. Nothing is printed, which is what the key already
+// does on a device that has control.
 func (o *ownership) claim() (terminal.ClientMessage, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if !o.settled || o.mode == terminal.ModeControl {
+	if o.askedView || !o.settled || o.mode == terminal.ModeControl {
 		return terminal.ClientMessage{}, false
 	}
 	return terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(o.gen)}, true

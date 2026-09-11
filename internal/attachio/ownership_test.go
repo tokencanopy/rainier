@@ -570,3 +570,41 @@ func TestGainingControlSaysHowBigThisTerminalIs(t *testing.T) {
 		t.Fatal("taking control sent no size, so the pty keeps whatever this attachment had when it was watching")
 	}
 }
+
+// TestViewNeverClaimsWhateverTheUserPresses is the flag's other half. --view
+// is documented as "watch without ever claiming control", and the attach is
+// genuinely admitted a viewer and genuinely types nothing — but Ctrl-\ still
+// sent a claim, and the plane honours it: a view-mode attach whose principal
+// may drive IS authorized to take control mid-attach, because that is what a
+// reconnecting controller admitted as a viewer depends on, so the service
+// cannot tell the two requests apart.
+//
+// So the flag has to hold here, where the user's instruction lives. One press
+// sends nothing, and the attach ends the viewer it asked to be.
+func TestViewNeverClaimsWhateverTheUserPresses(t *testing.T) {
+	p := newFakePlane(
+		terminal.ServerMessage{Type: terminal.TypeAttached, Mode: terminal.ModeView, Generation: terminal.GenOf(7)},
+		terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
+	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeView})
+
+	if _, err := run.stdin.Write([]byte{takeKey}); err != nil {
+		t.Fatal(err)
+	}
+	// Give the claim every chance to arrive before concluding it did not.
+	// The detach below cannot be the proof on its own: scanKeys stops at the
+	// first key in a chunk and discards the rest, so the two presses have to
+	// be two reads.
+	time.Sleep(200 * time.Millisecond)
+	for _, m := range p.received() {
+		if m.Type == terminal.TypeClaim {
+			t.Fatalf("--view claimed control from generation %q; the flag says it never will",
+				m.Expected)
+		}
+	}
+	if s := run.printed(); strings.Contains(s, NoticeHaveControl) || strings.Contains(s, NoticeStale) {
+		t.Fatalf("a --view attach printed an ownership line for a claim it never sent: %q", s)
+	}
+	if out := run.detach(t); out.Mode != terminal.ModeView || out.Generation != 7 {
+		t.Fatalf("a --view attach ended %s at %d, want view at 7", out.Mode, out.Generation)
+	}
+}
