@@ -165,14 +165,20 @@ func (r *registry) put(id string, e *sessionEntry) {
 // mintBoot opens a fresh sandbox-boot epoch on an entry being inserted. The
 // caller must hold the registry lock.
 //
-// Every insertion gets one, so a session id that was deleted and recreated
-// lands on an epoch strictly greater than the dead entry's and a control frame
-// the old container's hub read loop is still draining — a child_exited, a
-// stage failure — names an epoch that matches nothing. Without this both
-// entries carried the zero value, and the guard that exists for exactly this
-// case never fired: a bogus child exit would auto-stop the new session's
-// working agent a timeout later, or a stale stage failure would pin it out of
-// auto-stop for the life of the runner.
+// Every insertion gets one — put (recovery) and putIfAbsent (create) alike —
+// so a session id that was deleted and recreated lands on an epoch strictly
+// greater than the dead entry's, and a control frame the old container's hub
+// read loop is still draining — a child_exited, a stage failure — names an
+// epoch this REGISTRY refuses. Without this both entries carried the zero
+// value, and the guard that exists for exactly this case never fired: a bogus
+// child exit would auto-stop the new session's working agent a timeout later,
+// or a stale stage failure would pin it out of auto-stop for the life of the
+// runner.
+//
+// The fence is the registry's, not the event's: routeControl still announces
+// what it decoded to the control plane, so a stale stage failure can reach a
+// row even when this entry ignored it. That is the shape main had before the
+// epoch existed and is recorded as a known limit rather than closed here.
 func (r *registry) mintBoot(e *sessionEntry) {
 	r.nextBoot++
 	e.boot = r.nextBoot
