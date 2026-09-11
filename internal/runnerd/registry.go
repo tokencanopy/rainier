@@ -88,6 +88,19 @@ type sessionEntry struct {
 	// driver says RESTARTED the container (a new process tree this runner did
 	// watch start).
 	recovered bool
+	// stopsInFlight counts cold suspends this runner has claimed for the
+	// session and not yet finished. It is deliberately NOT the same fact as
+	// the "suspending" state: a stop whose outcome the driver could not
+	// report leaves the entry parked on "suspending" indefinitely (see
+	// settleFailedColdSuspend), and a resume is the only thing that brings
+	// such a session back, so refusing every resume of a "suspending" entry
+	// would strand it for the life of the runner. A resume is refused while
+	// this is non-zero and allowed once it falls back to zero.
+	//
+	// A counter rather than a flag because two stops can be claimed against
+	// one session (an operator's, arriving while a Delete owns the entry), and
+	// the first to finish must not clear the second's claim.
+	stopsInFlight int
 	// bootFailed records that this session's boot chain failed (setup, clone
 	// or init). Such a session is deliberately never idle-stopped: the whole
 	// reason the CLI lets you attach to a failed session is to read the log
@@ -638,6 +651,11 @@ func (r *registry) claimIdle(id string, idle time.Duration, now time.Time) (hand
 		return "", 0, false
 	}
 	e.state = "suspending"
+	// Taken in the SAME critical section as the claim, so there is no instant
+	// in which this runner is stopping a container without a concurrent resume
+	// being able to see it. Paired by coldSuspend, which stopIdle always calls
+	// on a successful claim. See Op's resume arm.
+	e.stopsInFlight++
 	return e.handle, d, true
 }
 
@@ -652,9 +670,39 @@ func (r *registry) claimIdle(id string, idle time.Duration, now time.Time) (hand
 func (r *registry) beginColdSuspend(id string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.items[id]; ok && e.state != "destroying" {
+	e, ok := r.items[id]
+	if !ok {
+		return
+	}
+	if e.state != "destroying" {
 		e.state = "suspending"
 	}
+	// Counted even when the marker is left alone: the stop runs either way
+	// (Op calls coldSuspend straight after this), and a count that skipped
+	// this case would go negative when coldSuspend's defer pairs with it.
+	e.stopsInFlight++
+}
+
+// endStop pairs with the increment claimIdle and beginColdSuspend take, once
+// the stop they claimed has finished — whatever it finished as. Floors at
+// zero, like every other counter here, so an entry recreated under the same id
+// mid-stop cannot be left permanently unresumable.
+func (r *registry) endStop(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.items[id]; ok && e.stopsInFlight > 0 {
+		e.stopsInFlight--
+	}
+}
+
+// stopInFlight reports whether a cold suspend this runner claimed is still
+// running against id's container — the question Op's resume must ask, and the
+// one the "suspending" state cannot answer. See sessionEntry.stopsInFlight.
+func (r *registry) stopInFlight(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.items[id]
+	return ok && e.stopsInFlight > 0
 }
 
 // releaseColdSuspend rolls a claimed-but-failed cold suspend back to running:

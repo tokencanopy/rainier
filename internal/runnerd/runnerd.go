@@ -163,6 +163,11 @@ var (
 	errNoSuchSession   = errors.New("no such session")
 	errSessionStarting = errors.New("session still starting")
 	errUnknownOp       = errors.New("unknown op")
+	// errSuspendInFlight is a resume's answer when the entry is already
+	// claimed by a stop that has not landed yet. Resuming through it would
+	// leave the entry claiming "running" over a container the stop is about
+	// to take down — see Op's resume arm.
+	errSuspendInFlight = errors.New("session is being suspended")
 	// errSessionExists is CreateWithID's answer when its putIfAbsent finds
 	// the id already claimed — see CreateWithID's doc comment for the race
 	// this closes.
@@ -419,6 +424,8 @@ func mapOpErr(w http.ResponseWriter, err error, onOK func()) {
 		http.Error(w, "no such session", http.StatusNotFound)
 	case errors.Is(err, errSessionStarting):
 		http.Error(w, "session still starting", http.StatusConflict)
+	case errors.Is(err, errSuspendInFlight):
+		http.Error(w, "session is being suspended", http.StatusConflict)
 	case errors.Is(err, errUnknownOp):
 		http.Error(w, "unknown op", http.StatusBadRequest)
 	default:
@@ -598,6 +605,38 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 		s.reg.setState(id, "suspended")
 		return nil
 	case "resume":
+		if s.reg.stopInFlight(id) {
+			// A cold suspend this runner already claimed is still running
+			// against the container. Resuming through it is the one ordering
+			// that leaves an entry claiming "running" over a stopped
+			// container: `resumed` would see a non-running state, take the
+			// entry for parked, clear the child's exit and bump the boot
+			// epoch; the stop would then land, finishColdSuspend's
+			// compare-and-swap would find the state moved and do nothing, and
+			// the register goroutine would read the hub death that follows as
+			// a crash — destroying the container and reporting a session dead
+			// because somebody resumed it.
+			//
+			// The question is "is a stop RUNNING", not "is the state
+			// suspending": a stop whose outcome could not be read deliberately
+			// leaves the entry parked on "suspending" (see
+			// settleFailedColdSuspend), and a resume is the only thing that
+			// brings such a session back — refusing that one would strand it
+			// for the life of the runner.
+			//
+			// Against the SWEEP's stop the guard is total rather than a
+			// narrowing, and the bracket at the top of this function is why:
+			// claimIdle takes the claim and this counter in one critical
+			// section and refuses an entry with driverOps > 0, and beginOp
+			// takes the same lock. Either beginOp won it, and the sweep never
+			// claimed the session at all, or claimIdle won it, and the counter
+			// this reads is already up. Against an operator's own stop it is a
+			// narrowing only — a `rainier stop` and a `rainier resume` issued
+			// at the same instant can still have the resume get past this
+			// before beginColdSuspend marks — which the design doc's
+			// edge-case table names.
+			return errSuspendInFlight
+		}
 		restarted, err := s.drv.Resume(ctx, handle)
 		if err != nil {
 			return err
@@ -622,6 +661,11 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 // never drift into meaning different things: the same driver call, the same
 // landing state, and the same rollback when the daemon refuses.
 func (s *Server) coldSuspend(ctx context.Context, id, handle string) error {
+	// Pairs with the increment both claims take (claimIdle's and
+	// beginColdSuspend's), which is what makes "a stop is running against this
+	// container" a fact a concurrent resume can read — as opposed to the state
+	// marker, which a stop that could not be read deliberately leaves behind.
+	defer s.reg.endStop(id)
 	if err := s.drv.Suspend(ctx, handle, false); err != nil {
 		s.settleFailedColdSuspend(id, handle)
 		return err

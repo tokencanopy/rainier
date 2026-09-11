@@ -45,7 +45,7 @@ In, one commit each, every code fix with a test that fails without it:
 | 2 | `boot == 0` shared by every never-resumed entry | Mint the epoch in `put`/`putIfAbsent`, so zero is never a live entry's epoch |
 | 3 | Recovered entries counted as `active` | Carry them in neither count until they report an exit |
 | 4 | Two comments describe a deleted mechanism | Delete the stale clauses |
-| 5 | Resume overtakes an in-flight stop | `Op`'s resume refuses `state == "suspending"` (409), and the design-doc table gains the row |
+| 5 | Resume overtakes an in-flight stop | `Op`'s resume refuses while a claimed stop is still running (409), and the design-doc table gains the row |
 | 6 | An auto-stop is indistinguishable from an operator's stop | Recorded as a follow-up (PR body + "Other known limits") |
 | 7 | No idle-stop knob on `fleet-up.sh` | `--idle-stop "${IDLE_STOP:-30m}"` |
 | 8 | PR body's follow-up 2 contradicts the code | PR text only |
@@ -111,14 +111,27 @@ parked as asked has no error, so distinguishing the two stops on `rainier info` 
 non-error field — a change to `control.RunnerEvent` and the session row, which is not this
 PR's.
 
-5 is the only one with a race in it. `Op` takes the `driverOps` bracket as its very first
-action, and `claimIdle` refuses an entry with `driverOps > 0`; both take the registry lock.
-So for the sweep the guard is total, not merely a narrowing: if `beginOp` won the lock, the
-sweep never claimed the session, and if `claimIdle` won it, the state `Op` then reads is
-already `"suspending"` and the resume is refused. What remains is operator-versus-operator —
-a `rainier stop` and a `rainier resume` issued at the same moment, where the resume can read
-`"running"` before `beginColdSuspend` marks — which this change narrows but does not close,
-and which the edge-case table now names.
+5 is the only one with a race in it, and the finding's own wording ("refuse
+`state == "suspending"`") would have introduced a worse bug than it fixes. `"suspending"` is
+not only a transient: a stop whose outcome the driver could not report deliberately *parks*
+the entry there (`settleFailedColdSuspend`'s last arm), no sweep re-claims it because the
+idle rule requires `"running"`, and a resume is the only way back. Refusing that resume
+strands the session for the life of the runner — the same lost slot this feature exists to
+end.
+
+So the fact the resume asks for is "is a cold suspend RUNNING against this container": a
+`stopsInFlight` counter on the entry, incremented inside `claimIdle`'s and
+`beginColdSuspend`'s critical sections and paired by `coldSuspend`'s defer. A counter and not
+a flag because two stops can be claimed against one session (an operator's, arriving while a
+`Delete` owns the entry) and the first to finish must not clear the second's claim.
+
+For the sweep the guard is then total, not merely a narrowing. `Op` takes the `driverOps`
+bracket as its very first action, `claimIdle` refuses an entry with `driverOps > 0`, and both
+take the registry lock: if `beginOp` won it, the sweep never claimed the session; if
+`claimIdle` won it, the count `Op` then reads is already up. What remains is
+operator-versus-operator — a `rainier stop` and a `rainier resume` issued at the same moment,
+where the resume can get past the check before `beginColdSuspend` marks — which this change
+narrows but does not close, and which the edge-case table now names.
 
 ## Alternatives considered
 
@@ -138,6 +151,11 @@ operational fact; the knob is there for the transition.
 **Document the `Recover` count skew instead of fixing it (finding 3's stated alternative).**
 Rejected as above: a doc comment does not reach the operator reading `rainier status`.
 
+**Refusing a resume whenever the state reads `"suspending"`**, which is finding 5's own
+wording. Rejected: that state is also where a stop whose outcome could not be read parks the
+entry, permanently, and the resume it would refuse is the only thing that unparks it. The
+fix would have converted a narrow race into a guaranteed lost slot.
+
 **A `resuming` state for finding 5**, claimed under the lock like `claimIdle` does. Rejected
 for this slice: it adds a fourth transient state that every other path (`hubDied`,
 `Delete`'s marker, `Recover`, the `GET /sessions` rendering) would have to learn, to close a
@@ -154,14 +172,16 @@ window the `driverOps` interlock already closes for the sweep.
 | a recovered session reports a child exit | it leaves the exemption: counted in `idle_exited`, and an auto-stop candidate from that exit |
 | a recovered session is cold-resumed | the driver reports a restart, the entry is one this runner watched start, and it counts as `active` |
 | a resume arrives while a stop is in flight | 409 `session is being suspended`. For the sweep's stop this is airtight (the `driverOps` interlock); for an operator's stop it is a narrowing |
+| a resume arrives for an entry parked on `"suspending"` by a stop that could not be read | allowed, and it is the only way back for that session: the guard is on a running stop, not on the state marker |
 | `IDLE_STOP=0` on the launcher | `RunIdleStop` returns immediately and logs that auto-stop is disabled — the documented off switch, now reachable without editing the script |
 
 ## Verification
 
 - `internal/runnerd`: a test per code fix, each pinned by mutating the fix back out and
   watching it fail — a recreated id refusing the dead container's `child_exited`; `Recover`'s
-  entries in neither count, and both ways out of the exemption; a resume against a
-  `"suspending"` entry refused with 409 and the driver never called.
+  entries in neither count, and both ways out of the exemption; a resume during an in-flight
+  stop refused with 409 and the driver never called, and a resume of an entry parked by a
+  stop that could not be read still allowed.
 - A test that `scripts/fleet-up.sh` passes `--idle-stop` with the `IDLE_STOP` override, in
   the package that owns the flag's meaning.
 - `make verify`, `go test ./internal/runnerd/ ./internal/driver/ ./protocol/... ./runnerplane/
