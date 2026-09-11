@@ -163,21 +163,31 @@ var _ control.AttachmentBroker = broker{}
 // broker either splices the stream or ends it, never both and never neither.
 func (b broker) Attach(ctx context.Context, target control.AttachTarget, stream control.TerminalStream) error {
 	p := b.p
+	// Everything this attach holds, and everything it can do about it —
+	// registered BEFORE the first message is read. The application has
+	// already advanced the generation for a controller attach by the time
+	// this is called, so between here and that registration this attach is a
+	// controller no peer can see: a claim on another attach takes its peer
+	// list without it, never displaces it, and both clients are then told
+	// they have control. The read below is bounded by
+	// attachFirstMsgTimeout — fifteen seconds of that window, on a client
+	// that need only be slow.
+	own := newOwnership(p, target)
+	own.stream = stream
+	p.owners.add(own)
+	defer own.finish()
+
 	first, err := attachFirstResize(ctx, stream)
 	if err != nil {
 		_ = stream.Close(err)
 		return err
 	}
 
-	// Everything this attach holds, and everything it can do about it. A
-	// negotiated client is told its mode and generation HERE — before the
+	// A negotiated client is told its mode and generation HERE — before the
 	// pairing, and therefore before the first snapshot or output byte can
-	// possibly reach it.
-	own := newOwnership(p, target)
-	own.stream = stream
+	// possibly reach it. What it is told is read now, not above: a peer may
+	// have displaced this attach while it was still opening.
 	mode, generation := own.get()
-	p.owners.add(own)
-	defer own.finish()
 	if mode == terminal.ModeControl {
 		// Whoever held control before this attach no longer does: the
 		// application already advanced the generation. Tell them, and — for

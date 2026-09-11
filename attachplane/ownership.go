@@ -523,7 +523,7 @@ func (o *ownership) release(ctx context.Context) {
 		return
 	}
 	_ = o.keeper.Release(ctx, gen)
-	o.plane.displace(ctx, o, o.demote(ctx), false)
+	o.plane.displace(ctx, o, o.demote(ctx, gen), false)
 }
 
 // demote turns this attach into a viewer and says so: the plane stops
@@ -531,8 +531,12 @@ func (o *ownership) release(ctx context.Context) {
 // attachment is not the controller under it, and then the client is told what
 // this attach now IS. It returns the generation it demoted to.
 //
-// It is a decision about the generation this attach holds when it starts, and
-// it does nothing to an attach that has since moved past it — see demoteTo.
+// from is the generation the demotion was DECIDED at — the one the heartbeat's
+// renewal was refused for, or the one a release gave up — and not a generation
+// read here. The window this guard exists for opens the moment that decision
+// is made, and reading it again at the top of this function would leave the
+// first part of it uncovered. It does nothing to an attach that has since
+// moved past from; see demoteTo.
 //
 // A demotion whose current generation cannot be read still demotes — being
 // wrong about the number is survivable, believing you still have control is
@@ -540,11 +544,7 @@ func (o *ownership) release(ctx context.Context) {
 // than to zero. A claim from a stale-but-real generation is refused exactly
 // as a claim from zero would be, while the common case, where the read merely
 // timed out, still leaves the client able to take control in one press.
-func (o *ownership) demote(ctx context.Context) uint64 {
-	// The generation this demotion is ABOUT, read before the store call that
-	// can outlive its own answer. demoteTo refuses a demotion this attach has
-	// moved past, and this is what it compares against.
-	_, from := o.get()
+func (o *ownership) demote(ctx context.Context, from uint64) uint64 {
 	current := from
 	if o.keeper != nil {
 		if gen, _, err := o.keeper.State(ctx); err == nil {
@@ -584,7 +584,11 @@ func (o *ownership) heartbeat(ctx context.Context) {
 			}
 			err := o.keeper.Renew(ctx, gen)
 			if errors.Is(err, control.ErrStale) {
-				o.demote(ctx)
+				// Demote from the generation the renewal was refused FOR. A
+				// claim of this attach's own can land while the refusal is
+				// still in flight, and a demotion that re-read the generation
+				// here would be about the one it just won.
+				o.demote(ctx, gen)
 				continue
 			}
 			// Any other failure is the store being briefly unusable. The

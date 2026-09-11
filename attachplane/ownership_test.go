@@ -1789,10 +1789,10 @@ func TestAStalledExControllerIsFencedEvenThoughItsNoticeCouldNotBeDelivered(t *t
 	}
 }
 
-// gatedKeeper holds a demotion still, in the one place a demotion spends real
-// time: the store read that asks what generation exists now. The test opens
-// the gate when it has arranged the interleaving it wants to see, so the
-// window under test is deterministic rather than raced.
+// gatedKeeper holds a demotion still at the moment it is DECIDED: the renewal
+// that is about to be refused. The test opens the gate once it has arranged
+// the interleaving it wants to see, so the whole window — from the refusal to
+// the write that acts on it — is deterministic rather than raced.
 type gatedKeeper struct {
 	fakeKeeper
 	stale   atomic.Bool // renewals are refused while this is armed
@@ -1802,25 +1802,22 @@ type gatedKeeper struct {
 }
 
 func (k *gatedKeeper) Renew(ctx context.Context, generation uint64) error {
-	if k.stale.Load() {
-		return control.ErrStale
+	if !k.stale.Load() {
+		return k.fakeKeeper.Renew(ctx, generation)
 	}
-	return k.fakeKeeper.Renew(ctx, generation)
-}
-
-func (k *gatedKeeper) State(ctx context.Context) (uint64, bool, error) {
 	k.once.Do(func() { close(k.entered) })
 	<-k.gate
-	return k.fakeKeeper.State(ctx)
+	return control.ErrStale
 }
 
 // TestADemotionThatWasSupersededDoesNotDemote is the fourth review's third
 // finding, driven through the real plane. The interleaving is the one the
 // heartbeat makes possible and nothing else corrects:
 //
-//  1. the laptop holds control at generation 1, and a renewal is refused —
-//     something on another replica took over — so it starts demoting itself;
-//  2. that demotion blocks in the store read that asks what generation exists;
+//  1. the laptop holds control at generation 1, and its renewal at that
+//     generation is about to be refused — something on another replica took
+//     over — which is the moment the demotion is decided;
+//  2. that refusal is held in flight;
 //  3. the phone claims and takes generation 2, displacing the laptop;
 //  4. the laptop's own client takes it back at generation 3;
 //  5. the demotion decided at generation 1 wakes up.
@@ -1872,6 +1869,22 @@ func TestADemotionThatWasSupersededDoesNotDemote(t *testing.T) {
 	if m.Mode != terminal.ModeControl || m.Generation.Value() != 3 {
 		t.Fatalf("a superseded demotion told the session's controller it is %s at %q; "+
 			"the store says it holds generation 3", m.Mode, m.Generation)
+	}
+	// And it installed NOTHING in the sandbox. A viewer binding written for
+	// an attach that has since won a newer generation fences the controller
+	// it just became: session.mayWriteLocked refuses every keystroke, and the
+	// heartbeat renews happily because the lease really is this attach's. The
+	// notice above is the demotion's last step, so by now any binding it was
+	// going to write has been written.
+	last := ""
+	for _, got := range laptop.sandbox.received() {
+		if got.Type == terminal.TypeControl {
+			last = got.Mode + "@" + string(got.Generation)
+		}
+	}
+	if last != terminal.ModeControl+"@3" {
+		t.Fatalf("the laptop's sandbox was last told %s; it holds control at generation 3, "+
+			"so the pty would refuse every keystroke it sends", last)
 	}
 	// And it is still typing, under the generation it won.
 	laptop.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("ls\r")}
@@ -1934,5 +1947,84 @@ func TestAStaleAcknowledgementNeverCostsTheNextHandoffItsWait(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > p.ackTimeout/4 {
 		t.Fatalf("a handoff whose sandbox answered at once took %s: it spent the wait on the "+
 			"PREVIOUS handoff's acknowledgement", elapsed)
+	}
+}
+
+// awaitOwners blocks until the plane is serving n attaches for session, read
+// under the owner table's own lock. It is how a test says "this attach is
+// registered" without reaching for a sleep — and what it proves is the point
+// of the test below: registration does not wait for the client to speak.
+func awaitOwners(t *testing.T, p *Plane, session control.SessionID, n int) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		p.owners.mu.Lock()
+		got := len(p.owners.m[session])
+		p.owners.mu.Unlock()
+		if got >= n {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("the plane is serving %d attaches for %s, want %d: an attach that has not "+
+				"spoken yet is invisible to every peer", got, session, n)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// TestAnAttachStillReadingItsFirstMessageIsDisplacedLikeAnyOther closes the
+// last window in which two devices are each told they have control.
+//
+// A controller attach is granted before the broker is called — the
+// application advanced the generation already — and the client then has up to
+// attachFirstMsgTimeout to send the resize the protocol opens with. An attach
+// registered only after that read is, for the whole of it, a controller no
+// peer can see: a claim on another attach takes its peer list without it, so
+// nothing displaces it, and its own opening announcement then tells it it has
+// control at a generation somebody else has passed. Both clients print
+// [you have control]; nothing corrects the loser until its next heartbeat.
+func TestAnAttachStillReadingItsFirstMessageIsDisplacedLikeAnyOther(t *testing.T) {
+	// No heartbeat: the plane's own notice is what is under test, not the
+	// fallback that eventually repairs it.
+	p, h, ts := newTestPlane(t, Options{HeartbeatInterval: time.Hour})
+	lease := &fakeLease{gen: 1}
+	phone := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_phone"}, true)
+	awaitType(t, phone.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, phone)
+
+	// The application admits the laptop as a controller: generation 2 is
+	// already its own when the broker is called.
+	if gen, err := (fakeKeeper{lease, "att_laptop"}).Claim(context.Background(), 1); err != nil || gen != 2 {
+		t.Fatalf("the application's own claim = %d, %v; want 2, nil", gen, err)
+	}
+	sandbox := newFakeSandbox(true)
+	h.dialBack = func(at *runner.Attach) { sandbox.serve(t, ts, at) }
+	// A client that has not sent its opening resize yet. Nothing is wrong
+	// with it; it is one round trip slower than the phone.
+	stream := newScriptedStream()
+	t.Cleanup(func() { stream.Close(errAttachEnded) })
+	target := brokerTarget("sess_example", "vm1")
+	target.Mode, target.ControllerGeneration = control.AttachmentController, 2
+	target.Negotiated, target.MayClaim = true, true
+	target.Controller = fakeKeeper{lease, "att_laptop"}
+	go func() { _ = p.Broker().Attach(context.Background(), target, stream) }()
+
+	// It is registered before it has said anything, so the phone can see it.
+	awaitOwners(t, p, "sess_example", 2)
+	phone.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(2)}
+	if m, _ := awaitType(t, phone.stream, terminal.TypeAttached); m.Generation.Value() != 3 {
+		t.Fatalf("the phone's claim landed at %q, want 3", m.Generation)
+	}
+
+	// Only now does the laptop finish opening — and it is told what it IS.
+	stream.in <- terminal.ClientMessage{Type: "resize", Cols: 80, Rows: 24}
+	m, _ := awaitType(t, stream, terminal.TypeAttached)
+	if m.Mode == terminal.ModeControl {
+		t.Fatalf("an attach displaced while it was still opening was told it has control at %q; "+
+			"two devices are now printing [you have control]", m.Generation)
+	}
+	if m.Generation.Value() != 3 {
+		t.Fatalf("it opened at generation %q, want the 3 that exists", m.Generation)
 	}
 }
