@@ -880,12 +880,16 @@ func TestExecLookupFailures(t *testing.T) {
 		argv []string
 		want string
 	}{
-		"missing":                            {[]string{"definitely-not-here"}, terminal.ReasonNotFound},
-		"not executable":                     {[]string{"notexec"}, terminal.ReasonNotExecutable},
-		"a directory":                        {[]string{"adir"}, terminal.ReasonNotExecutable},
-		"empty argv":                         {nil, terminal.ReasonNotFound},
-		"empty name":                         {[]string{""}, terminal.ReasonNotFound},
-		"a NUL in argv":                      {[]string{"tool", "a\x00b"}, terminal.ReasonNotFound},
+		"missing":        {[]string{"definitely-not-here"}, terminal.ReasonNotFound},
+		"not executable": {[]string{"notexec"}, terminal.ReasonNotExecutable},
+		"a directory":    {[]string{"adir"}, terminal.ReasonNotExecutable},
+		"empty argv":     {nil, terminal.ReasonNotFound},
+		"empty name":     {[]string{""}, terminal.ReasonNotFound},
+		// "Could not be executed", not "not found": nothing was looked for.
+		// A NUL cannot cross execve at all, so this is Rainier refusing the
+		// request — 126 — rather than the 127 a script reads as "you typed a
+		// name this sandbox does not have".
+		"a NUL in argv":                      {[]string{"tool", "a\x00b"}, terminal.ReasonNotExecutable},
 		"an absolute path that is not there": {[]string{"/nope/nope"}, terminal.ReasonNotFound},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1311,10 +1315,14 @@ func TestDetachedExecsCannotFillEverySlot(t *testing.T) {
 		}
 		start.await(t)
 	}
-	// The next DETACHED one is refused...
+	// The next DETACHED one is refused, with its OWN word. Reusing
+	// too_many_execs made the CLI print "this session is already running as
+	// many commands as it may" with half the slots free — a false sentence,
+	// and a different remedy: stop a detached run, do not wait for one.
 	msgs := drainAttachment(t, r.OpenExec(detached))
-	if len(msgs) != 1 || msgs[0].Reason != terminal.ReasonTooManyExecs {
-		t.Fatalf("the %dth detached exec got %+v", MaxDetached+1, msgs)
+	if len(msgs) != 1 || msgs[0].Reason != terminal.ReasonTooManyDetached {
+		t.Fatalf("the %dth detached exec got %+v, want %q",
+			MaxDetached+1, msgs, terminal.ReasonTooManyDetached)
 	}
 	// ...and an ATTACHED one — the `kill <pid>` that ends them — still runs.
 	a := r.OpenExec(spec)
@@ -1694,4 +1702,69 @@ func TestStdinJustUnderTheBoundIsNeverRefused(t *testing.T) {
 			t.Fatalf("a caller inside the bound was refused: %q", m.Reason)
 		}
 	}
+}
+
+// TestTheTwoExhaustionsAreDifferentWords: a full session and a full detached
+// pool are different facts with different remedies, and the sentence for one
+// is false for the other.
+func TestTheTwoExhaustionsAreDifferentWords(t *testing.T) {
+	start := newFakeStarter()
+	r, _ := testRunner(t, start.start)
+	spec := withTool(t, r, "tool")
+
+	// Fill every slot with ATTACHED execs; the next one is too_many_execs.
+	for i := 0; i < MaxConcurrent; i++ {
+		a := r.OpenExec(spec)
+		start.await(t)
+		if m := <-a.Msgs(); m.Type != terminal.TypeExecStarted {
+			t.Fatalf("exec %d opened with %q", i, m.Type)
+		}
+	}
+	msgs := drainAttachment(t, r.OpenExec(spec))
+	if len(msgs) != 1 || msgs[0].Reason != terminal.ReasonTooManyExecs {
+		t.Fatalf("a full session refused with %+v, want %q", msgs, terminal.ReasonTooManyExecs)
+	}
+	if terminal.ReasonTooManyExecs == terminal.ReasonTooManyDetached {
+		t.Fatal("the two exhaustions are the same word again")
+	}
+}
+
+// TestAPanicInThePlumbingCostsOneExecAndNotTheSession. sessiond has no
+// recover around the relay's demux and this process by design outlives its
+// agent, its connection and every viewer — a panic on one of this package's
+// own goroutines would take the session's whole scrollback with it, and take
+// it down BEFORE the shutdown path flushes the agent's last write.
+//
+// The caller is answered the way any connection that ended without a status
+// answers: the attachment closes, which is exit 125 and a sentence.
+func TestAPanicInThePlumbingCostsOneExecAndNotTheSession(t *testing.T) {
+	boom := func(req Request, onStdout, onStderr func([]byte) error) (Proc, error) {
+		panic("a bug in the spawn")
+	}
+	r, _ := testRunner(t, boom)
+	spec := withTool(t, r, "tool")
+
+	a := r.OpenExec(spec)
+	// It closes rather than taking the process down with it.
+	drainAttachment(t, a)
+
+	// And the runner is still usable: the slot came back and the next command
+	// runs, which is what "one exec and not the session" means.
+	deadline := time.Now().Add(5 * time.Second)
+	for r.LiveCount() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("a panicking spawn left %d slot(s) held", r.LiveCount())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	start := newFakeStarter()
+	r2, _ := testRunner(t, start.start)
+	spec2 := withTool(t, r2, "tool")
+	b := r2.OpenExec(spec2)
+	p := start.await(t)
+	if m := <-b.Msgs(); m.Type != terminal.TypeExecStarted {
+		t.Fatalf("the next exec opened with %q", m.Type)
+	}
+	p.exit(Status{})
+	drainAttachment(t, b)
 }

@@ -284,7 +284,11 @@ func ExecRefusal(cmd ExecCommand) string {
 	total := 0
 	for _, arg := range cmd.Argv {
 		if strings.ContainsRune(arg, 0) {
-			return terminal.ReasonNotFound
+			// "Could not be executed", not "not found": nothing was looked
+			// for, and a NUL cannot cross execve at all. Same word the
+			// sandbox uses for the same argv, so the CLI's exit code does not
+			// depend on which hop noticed.
+			return terminal.ReasonNotExecutable
 		}
 		total += len(arg)
 	}

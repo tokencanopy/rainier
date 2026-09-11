@@ -146,22 +146,66 @@ func TestExecVocabularyIsClosed(t *testing.T) {
 		terminal.TypeExecStarted, terminal.TypeExecStdout, terminal.TypeExecStderr,
 		terminal.TypeExecExit, terminal.TypeExecError,
 		terminal.SignalTERM, terminal.SignalINT,
-		terminal.ReasonUnsupported, terminal.ReasonNotFound, terminal.ReasonNotExecutable,
-		terminal.ReasonCwdRefused, terminal.ReasonEnvRefused, terminal.ReasonLogRefused,
-		terminal.ReasonTooManyExecs,
 	}
 	want := []string{
 		"exec_start", "exec_stdin_eof", "exec_signal",
 		"exec_started", "exec_stdout", "exec_stderr",
 		"exec_exit", "exec_error",
 		"TERM", "INT",
-		"unsupported", "not_found", "not_executable",
-		"cwd_refused", "env_refused", "log_refused",
-		"too_many_execs",
 	}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("vocabulary word %d = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+// TestExecReasonsAreClosedBothWays iterates the CODE's table rather than the
+// test's own list.
+//
+// Iterating `want` meant a NEW reason word was never noticed, which is how
+// no_answer and stdin_overrun drifted out of the design's published
+// vocabulary — the doc lists seven and the code has ten. Checking both
+// directions means a word added here fails until it is written down.
+func TestExecReasonsAreClosedBothWays(t *testing.T) {
+	want := map[string]bool{
+		"unsupported":       true,
+		"not_found":         true,
+		"not_executable":    true,
+		"cwd_refused":       true,
+		"env_refused":       true,
+		"log_refused":       true,
+		"too_many_execs":    true,
+		"too_many_detached": true,
+		"no_answer":         true,
+		"stdin_overrun":     true,
+	}
+	got := map[string]bool{}
+	for _, r := range terminal.ExecReasons() {
+		if got[r] {
+			t.Fatalf("reason %q appears twice in the vocabulary", r)
+		}
+		got[r] = true
+		if !want[r] {
+			t.Fatalf("the code has a reason word %q this test does not know. "+
+				"Add it HERE, to docs/design/rainier-exec.md's vocabulary list and to "+
+				"docs/cli-v0-contract.md §3.9 — a word a caller can receive and no "+
+				"document names is a word nobody can act on.", r)
+		}
+	}
+	for r := range want {
+		if !got[r] {
+			t.Fatalf("reason %q is documented and no longer in the vocabulary", r)
+		}
+	}
+}
+
+// TestExecReasonsIsACopy: the vocabulary is a fact about this protocol, not a
+// variable a consumer may edit out from under every other consumer.
+func TestExecReasonsIsACopy(t *testing.T) {
+	first := terminal.ExecReasons()
+	first[0] = "tampered"
+	if terminal.ExecReasons()[0] == "tampered" {
+		t.Fatal("ExecReasons hands out the same backing array every time")
 	}
 }

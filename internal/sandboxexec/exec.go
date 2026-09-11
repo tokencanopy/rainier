@@ -33,6 +33,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -63,6 +64,12 @@ const (
 	// MaxConcurrent on purpose: a detached process holds its slot for as long
 	// as it runs, and the only way to stop one is `rainier exec s -- kill
 	// <pid>`, which needs a slot of its own. See Runner.reserve.
+	//
+	// It is published — the design and §3.9 both name it — and its refusal has
+	// its OWN reason word, `too_many_detached`. Reusing `too_many_execs` told
+	// the fifth detached caller "this session is already running as many
+	// commands as it may" with four of eight slots free, which is a false
+	// sentence and a different remedy.
 	MaxDetached = 4
 	// killGrace is how long a killed exec's process GROUP has between
 	// SIGTERM and SIGKILL. The group matters for the reason files.go already
@@ -229,13 +236,16 @@ func (r *Runner) OpenExec(spec runner.ExecSpec) relay.ExecAttachment {
 	// Nothing about the message ORDER depends on this being synchronous:
 	// every message an exec will ever send goes through the same channel,
 	// and `exec_started` is put on it before the output callbacks are armed.
-	go r.open(a, spec)
+	go func() {
+		defer a.guard("opening an exec")
+		r.open(a, spec)
+	}()
 	return a
 }
 
 func (r *Runner) open(a *attachment, spec runner.ExecSpec) {
-	if !r.reserve(a, spec.Detach) {
-		a.refuse(terminal.ReasonTooManyExecs)
+	if reason := r.reserve(a, spec.Detach); reason != "" {
+		a.refuse(reason)
 		return
 	}
 
@@ -303,7 +313,40 @@ func (r *Runner) open(a *attachment, spec runner.ExecSpec) {
 
 	a.emit(terminal.ServerMessage{Type: terminal.TypeExecStarted})
 	close(ready)
-	go a.run()
+	go func() {
+		defer a.guard("running an exec")
+		a.run()
+	}()
+}
+
+// guard turns a panic on one of this package's own goroutines into an ended
+// exec rather than a dead session.
+//
+// sessiond has no recover around the relay's demux, and this process by design
+// outlives its agent, its connection and every viewer — a panic here would
+// take the session's whole terminal scrollback with it, and take it down
+// BEFORE the shutdown path flushes the agent's last write. A bug in one
+// command's plumbing must cost that command its answer and nothing else.
+//
+// No reason word is emitted: the command may well have run, so the honest
+// answer is the one a caller already gets when a connection ends without a
+// status — exit 125, with a sentence. The log line is for the operator.
+//
+// Nothing about the request is logged, per this package's hygiene rule: not
+// argv beyond what a panic value happens to carry, not the cwd, not the
+// environment, not a byte or a length of input or output.
+func (a *attachment) guard(what string) {
+	if r := recover(); r != nil {
+		log.Printf("sandboxexec: %s panicked: %v", what, r)
+		// The SLOT comes back too. Without this a panicking spawn would hold
+		// one of the session's eight for as long as the session lived, and
+		// eight of them would end exec for that session entirely — a bug in
+		// one command costing every later one, which is exactly what this
+		// guard exists to prevent. release is a map delete and is safe to
+		// call for an attachment that already gave its slot back.
+		a.runner.release(a)
+		a.kill()
+	}
 }
 
 // KillAll ends every exec this session is running, detached ones included.
@@ -351,9 +394,16 @@ func (r *Runner) KillAllAndWait(budget time.Duration) int {
 // invisible next to a stop, long enough not to spin.
 const killPollInterval = 20 * time.Millisecond
 
-// reserve takes one of the session's exec slots, reporting false when they
-// are all taken. The count is checked and taken in one locked step, so eight
-// callers racing produce eight execs and not nine.
+// reserve takes one of the session's exec slots, naming the reason it could
+// not when they are all taken (and the empty string when it did). The count is
+// checked and taken in one locked step, so eight callers racing produce eight
+// execs and not nine.
+//
+// The two exhaustions are DIFFERENT WORDS, because the sentence a caller is
+// shown and the thing it should do about it are different: "this session is
+// already running as many commands as it may" is false with four of eight
+// slots free, and the answer to a full detached pool is to stop a detached
+// run rather than to wait for one to finish.
 //
 // A DETACHED exec takes a slot from a smaller pool as well, and that second
 // bound is what keeps the feature usable rather than being belt and braces.
@@ -363,11 +413,11 @@ const killPollInterval = 20 * time.Millisecond
 // detached work would have no way left to stop any of it, and no listing and
 // no kill API to fall back on. Capping detached work below the total leaves
 // room for the command that ends it.
-func (r *Runner) reserve(a *attachment, detached bool) bool {
+func (r *Runner) reserve(a *attachment, detached bool) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.live) >= r.max {
-		return false
+		return terminal.ReasonTooManyExecs
 	}
 	if detached {
 		n := 0
@@ -377,12 +427,12 @@ func (r *Runner) reserve(a *attachment, detached bool) bool {
 			}
 		}
 		if n >= r.maxDetached {
-			return false
+			return terminal.ReasonTooManyDetached
 		}
 	}
 	r.live[a] = struct{}{}
 	a.setDetached(detached)
-	return true
+	return ""
 }
 
 func (r *Runner) release(a *attachment) {
@@ -509,7 +559,11 @@ func (r *Runner) validate(spec runner.ExecSpec) (Request, string) {
 	}
 	for _, arg := range spec.Argv {
 		if strings.ContainsRune(arg, 0) {
-			return Request{}, terminal.ReasonNotFound
+			// "Could not be executed" rather than "not found": nothing was
+			// looked for. A NUL cannot cross execve at all, so this is
+			// Rainier refusing the request — 126 — and not the 127 a script
+			// reads as "you typed a name this sandbox does not have".
+			return Request{}, terminal.ReasonNotExecutable
 		}
 	}
 
@@ -1215,9 +1269,15 @@ func (a *attachment) killProc(p Proc) {
 	_ = p.Signal(syscall.SIGTERM)
 	done := make(chan struct{})
 	go func() { p.Wait(); close(done) }()
+	// NewTimer and Stop rather than time.After: this runs once per exec and
+	// per KillAll, and a time.After that nobody stops holds its runtime timer
+	// (and the closure behind it) for the whole grace period after the
+	// process has already gone.
+	grace := time.NewTimer(a.runner.grace)
+	defer grace.Stop()
 	select {
 	case <-done:
-	case <-time.After(a.runner.grace):
+	case <-grace.C:
 		_ = p.Signal(syscall.SIGKILL)
 	}
 }
@@ -1623,9 +1683,13 @@ func (d *drain) watch() {
 		d.mu.Lock()
 		last = d.reads
 		d.mu.Unlock()
+		// Stopped on the way out: this loop runs per exec and can turn many
+		// times, and an unstopped time.After holds a runtime timer each time.
+		tick := time.NewTimer(d.grace)
 		select {
-		case <-time.After(d.grace):
+		case <-tick.C:
 		case <-d.finished:
+			tick.Stop()
 			return
 		}
 		d.mu.Lock()

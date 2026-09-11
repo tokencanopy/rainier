@@ -63,6 +63,7 @@ func (e *execEnvFlag) String() string { return strings.Join(*e, ",") }
 
 func (e *execEnvFlag) Set(v string) error {
 	if !strings.Contains(v, "=") {
+		// Safe to quote: there is no '=' in it, so there is no value in it.
 		return fmt.Errorf("--env must be K=V, got %q", safeField(v))
 	}
 	*e = append(*e, v)
@@ -191,7 +192,11 @@ func execEnvMap(flags execEnvFlag) (map[string]string, error) {
 	for _, kv := range flags {
 		name, value, _ := strings.Cut(kv, "=")
 		if name == "" {
-			return nil, usagef("--env needs a name: %q", safeField(kv))
+			// The name, never the assignment. `--env =secret` would have
+			// echoed the secret to this caller's stderr, which contradicts
+			// "values are never quoted in an error" — and the name is the
+			// whole of what is wrong, so it is the whole of what is said.
+			return nil, usagef("--env needs a name before the =")
 		}
 		if _, dup := out[name]; dup {
 			return nil, usagef("--env %s was given twice", safeField(name))
@@ -299,6 +304,13 @@ func execRefusal(res execio.Result) error {
 		return errors.New("this session is already running as many commands as it may; " +
 			"wait for one to finish, or stop a detached one with " +
 			"rainier exec <session> -- kill <pid>")
+	case terminal.ReasonTooManyDetached:
+		// Its own sentence, because the other one is FALSE here: the session
+		// has slots free, and what this caller has to do is stop a detached
+		// run rather than wait for anything to finish.
+		return errors.New("this session is already running as many DETACHED commands " +
+			"as it may; stop one with rainier exec <session> -- kill <pid>, or run " +
+			"this command without --detach")
 	case terminal.ReasonNoAnswer:
 		return errors.New("the session's sandbox did not answer in time; try again")
 	case terminal.ReasonStdinOverrun:

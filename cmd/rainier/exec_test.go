@@ -352,3 +352,40 @@ func TestExecJSONMovesTheCommandsOwnOutputOffStdout(t *testing.T) {
 		t.Fatal("--json changed where the command's input comes from")
 	}
 }
+
+// TestTheEnvUsageErrorNeverQuotesAValue: an --env value is a secret as often
+// as not, and "values are never quoted in an error" is a rule this CLI states.
+// `--env =secret` echoed the whole assignment to stderr.
+func TestTheEnvUsageErrorNeverQuotesAValue(t *testing.T) {
+	const secret = "s3cr3t-value"
+	_, err := execEnvMap(execEnvFlag{"=" + secret})
+	if err == nil {
+		t.Fatal("--env with no name was accepted")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("the usage error quoted the value: %q", err)
+	}
+}
+
+// TestTooManyDetachedHasItsOwnSentence: the other sentence — "this session is
+// already running as many commands as it may" — is FALSE when half the slots
+// are free, and the remedy is different too.
+func TestTooManyDetachedHasItsOwnSentence(t *testing.T) {
+	full := execRefusal(execio.Result{Reason: terminal.ReasonTooManyExecs})
+	detached := execRefusal(execio.Result{Reason: terminal.ReasonTooManyDetached})
+	if full == nil || detached == nil {
+		t.Fatal("a refusal produced no sentence")
+	}
+	if full.Error() == detached.Error() {
+		t.Fatalf("both exhaustions print the same sentence: %q", full)
+	}
+	if !strings.Contains(detached.Error(), "DETACHED") {
+		t.Fatalf("the detached refusal does not say which cap it is: %q", detached)
+	}
+	// And it is Rainier's own failure rather than the command's, so it is 1
+	// with a sentence and never a status a script would read as the
+	// command's.
+	if code, ok := execio.ExitCodeFor(execio.Result{Reason: terminal.ReasonTooManyDetached}); ok || code != 1 {
+		t.Fatalf("too_many_detached exits (%d, %v), want (1, false)", code, ok)
+	}
+}

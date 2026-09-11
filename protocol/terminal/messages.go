@@ -224,6 +224,13 @@ const (
 //	                   could not be opened
 //	ReasonTooManyExecs this session already has the maximum number of
 //	                   concurrent execs
+//	ReasonTooManyDetached this session already has the maximum number of
+//	                   DETACHED execs, which is a smaller number than the
+//	                   concurrent one. It is its own word because the sentence
+//	                   for the other — "this session is already running as
+//	                   many commands as it may" — would be false with half the
+//	                   slots free, and because what a caller does about it is
+//	                   different: stop a detached run, rather than wait
 //	ReasonNoAnswer     the sandbox did not answer in time. It is kept apart
 //	                   from ReasonUnsupported deliberately: "this session was
 //	                   created before exec shipped" is permanent and sends a
@@ -244,7 +251,28 @@ const (
 	ReasonTooManyExecs  = "too_many_execs"
 	ReasonNoAnswer      = "no_answer"
 	ReasonStdinOverrun  = "stdin_overrun"
+
+	ReasonTooManyDetached = "too_many_detached"
 )
+
+// ExecReasons is that closed vocabulary, as a value.
+//
+// It exists so a consumer — and the test that pins the words — iterates what
+// the CODE has rather than a list somebody has to remember to update.
+// Iterating a hand-written `want` is exactly how no_answer and stdin_overrun
+// drifted out of the design's published list without anything noticing, and a
+// new word is the case a vocabulary test is for.
+//
+// A copy per call, because the vocabulary is a fact about this protocol and
+// not a variable a consumer may edit.
+func ExecReasons() []string {
+	return []string{
+		ReasonUnsupported, ReasonNotFound, ReasonNotExecutable,
+		ReasonCwdRefused, ReasonEnvRefused, ReasonLogRefused,
+		ReasonTooManyExecs, ReasonTooManyDetached,
+		ReasonNoAnswer, ReasonStdinOverrun,
+	}
+}
 
 // ---------------------------------------------------------------------------
 // conditional controller ownership
