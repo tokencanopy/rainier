@@ -216,6 +216,14 @@ smaller change.
   within one interval, and its pty fence was already in force the moment the
   store advanced. The notice is a courtesy; the mechanism is the heartbeat and
   the fence. This is written down in `docs/terminal-controller-ownership.md`.
+- **A displaced peer's binding that does not land inside its deadline.** The
+  peer is fenced anyway, and not by luck: `internal/session.observeLocked`
+  walks the session's controller generation up from *any* binding it is told
+  about, and the taker's own binding — installed on its own socket before the
+  fan-out on a claim, riding the `dial_attach` on an attach — is one of them.
+  The displaced peer's binding only re-points its own attachment so the
+  sandbox's copy agrees with the plane's. Installing it is therefore
+  best-effort by design, which is what lets it carry a deadline at all.
 - **A slow but live client during a large snapshot replay.** The write
   deadline is deliberately far above any legitimate frame time on a slow link;
   it exists to close a socket that is not draining at all.
@@ -225,6 +233,48 @@ smaller change.
   client cannot be told it is a viewer, so admitting it as one would leave a
   terminal that silently does not type.
 
+## What the review of this change found, and what it changed again
+
+Two independent reviews of the first version of these fixes (one adversarial,
+with a 21-mutant battery) found that the bound in finding 1 had been applied
+one level too wide, and that two of the other fixes composed into a new
+failure. Both are fixed here, and the fixes are worth writing down because
+they are the same mistake in opposite directions: **a deadline belongs to the
+caller that can afford it.**
+
+- **A courtesy notice must not close a healthy client.** Bounding every
+  ownership message by the acknowledgement timeout, and closing the socket
+  whenever any context expired, meant a websocket serialises its writes so a
+  handoff's `control_changed` queued behind a snapshot being replayed to that
+  same client expired on the write lock — and killed the attach. One take-over
+  anywhere on the session disconnected a client that was reading a scrollback
+  over a slow link. The caller's context now decides: a message this attach is
+  owed carries the socket's write deadline, a message about somebody else's
+  handoff carries one acknowledgement timeout, and `ClientStream` closes on
+  its own budget and nobody else's. The `announce` hold became a channel so
+  that *acquiring* it is bounded too.
+- **A claim whose binding never landed is not a claim.** `install` is bounded
+  now, and a claim discarded its error: the store CAS had already succeeded,
+  so the plane took control, told the client so, and the pty then discarded
+  every keystroke — with nothing able to repair it, because the lease really
+  was this attach's and the heartbeat renewed it happily. The generation is
+  given back instead and the client is told what exists now.
+- **The idempotency guard checks its belief before answering from it.** A
+  controller displaced from another replica reads `control` here until its own
+  heartbeat is refused, and the take-control press is its user's only way out.
+  One store read, which advances nothing, keeps that door open.
+- **A demotion is decided at the renewal that was refused**, not at a
+  generation read later, and a superseded one installs nothing at the sandbox.
+- **An attach is registered before its first message is read.** A controller
+  attach whose generation the application has already advanced used to be
+  invisible to the owner table for the length of that read — up to fifteen
+  seconds — so a claim elsewhere never displaced it and both clients were told
+  they had control. This one predates this round; it is the last window in
+  which the rule this PR exists for could be broken, so it is closed here.
+- The client prints `[you have control]` when it learns it from a
+  `control_changed` rather than from the answer to its own claim, which is
+  what happens when a peer's handoff announces to it first.
+
 ## Verification
 
 Every fix lands with a regression test that fails without it:
@@ -233,7 +283,15 @@ Every fix lands with a regression test that fails without it:
 |---|---|---|
 | 1 | `TestAStuckPeerDoesNotStallAClaim`, `TestAStalledExControllerIsFencedEvenThoughItsNoticeCouldNotBeDelivered` | the claim is never answered |
 | 1 | `TestAStuckPeerDoesNotStallANewControllerAttach` | the attach never reaches its runner |
-| 1 | `TestOneStalledPeerDoesNotHideAnothersDisplacement` | the peer behind the stalled one is never told |
+| 1 | `TestOneStalledPeerDoesNotHideAnothersDisplacement` | the peer behind the stalled one is never told (with the writes unbounded; bounded-but-serial, it is `TestTheFanOutReachesEveryPeerAtOnce` that fails) |
+| 1 | `TestTheFanOutReachesEveryPeerAtOnce` | six peers that stopped reading cost six deadlines instead of one |
+| 1 | `TestABindingWriteThatNeverLandsDoesNotHoldTheHandoff` | the handoff waits on a runner socket that stopped draining |
+| 1 | `TestACourtesyNoticeNeverClosesAHealthyClient` | a handoff's notice closes a client that is mid-snapshot |
+| 1 | `TestAClientThatNeverDrainsIsClosedFromBehindTheWriteLock` | a socket that has taken nothing is held open |
+| 2 | `TestAClaimWhoseBindingNeverLandedGivesTheGenerationBack` | the plane takes control its sandbox cannot honour |
+| 2 | `TestAControllerDisplacedElsewhereRecoversOnOnePress` | the press is answered from a belief the store contradicts |
+| 2 | `TestAnAttachStillReadingItsFirstMessageIsDisplacedLikeAnyOther` | two attaches are each told they have control |
+| 2 | `internal/attachio: TestControlWonInsideSomebodyElsesHandoffIsStillAnnounced` | the person takes control and is told nothing |
 | 1 | `TestAWedgedClientIsClosedRatherThanHeld` | the write never returns |
 | 2 | `TestAControllerThatClaimsFromAStaleGenerationKeepsControl`, `TestAStaleAnswerNeverTellsALiveControllerItIsAViewer` | the controller is told `stale` and stops typing |
 | 2 | `TestADisplacementNoticeReportsTheModeItReads` | the notice says `view` for a live controller |

@@ -331,6 +331,36 @@ func TestJourney4TheDisplacedControllerIsToldAndStopsTyping(t *testing.T) {
 	run.detach(t)
 }
 
+// TestControlWonInsideSomebodyElsesHandoffIsStillAnnounced covers the one
+// path on which [you have control] would otherwise never be printed. A claim
+// this client won can be answered by a peer's displacement first: the plane
+// reads what this attach IS at send time, so that `control_changed` says
+// `control`, and the `attached` that answers the claim then arrives at a
+// client already holding control and says nothing. The person took control
+// and was told nothing at all.
+func TestControlWonInsideSomebodyElsesHandoffIsStillAnnounced(t *testing.T) {
+	p := newFakePlane(
+		terminal.ServerMessage{Type: terminal.TypeAttached, Mode: terminal.ModeView, Generation: terminal.GenOf(1)},
+		terminal.ServerMessage{Type: "snapshot", Seq: 1, Data: []byte("screen")})
+	run := runAgainst(t, p, Options{Control: true, Mode: terminal.ModeControl})
+	run.awaitPrinted(t, NoticeViewing)
+
+	p.extra <- terminal.ServerMessage{
+		Type: terminal.TypeControlChanged, Mode: terminal.ModeControl, Generation: terminal.GenOf(2)}
+	run.awaitPrinted(t, NoticeHaveControl)
+
+	// And the claim's own answer, arriving behind it, says it once and not
+	// twice: this client already knows.
+	p.extra <- terminal.ServerMessage{
+		Type: terminal.TypeAttached, Mode: terminal.ModeControl, Generation: terminal.GenOf(2)}
+	p.extra <- terminal.ServerMessage{Type: "output", Seq: 2, Data: []byte("typing now")}
+	run.awaitPrinted(t, "typing now")
+	if n := strings.Count(run.printed(), NoticeHaveControl); n != 1 {
+		t.Fatalf("[you have control] was printed %d times, want exactly 1", n)
+	}
+	run.detach(t)
+}
+
 // TestALostClaimSaysSoAndDoesNotRetry pins the absence of the loop. The
 // client is told it lost, it says so once, and it sends nothing further
 // unless a person presses the key again.

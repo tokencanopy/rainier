@@ -396,18 +396,22 @@ func newHolderID() (string, error) {
 // Hosts whose policy answers both questions the same way — self-hosted
 // Rainier, where a caller who may attach may drive — never reach the second
 // call at all.
+// It also reports whether it ASKED the policy about the controller and was
+// refused, so that the separate privilege question below is not paid for a
+// second time: a host's policy can be a network call or an audited decision,
+// and an answer this attach already has is not worth asking for twice.
 func (s *AttachmentService) admit(ctx context.Context, scope control.Scope,
-	resource control.Resource, cmd control.AttachTerminal) (control.AttachmentMode, error) {
+	resource control.Resource, cmd control.AttachTerminal) (control.AttachmentMode, bool, error) {
 	if err := s.policy.AuthorizeAttachment(ctx, scope, resource, cmd.Mode); err == nil {
-		return cmd.Mode, nil
+		return cmd.Mode, false, nil
 	}
 	if !cmd.Negotiated || cmd.Mode != control.AttachmentController {
-		return "", control.ErrDenied
+		return "", true, control.ErrDenied
 	}
 	if err := s.policy.AuthorizeAttachment(ctx, scope, resource, control.AttachmentViewer); err != nil {
-		return "", control.ErrDenied
+		return "", true, control.ErrDenied
 	}
-	return control.AttachmentViewer, nil
+	return control.AttachmentViewer, true, nil
 }
 
 // mayClaim reports whether this attach may take control mid-attach, which is
@@ -421,9 +425,9 @@ func (s *AttachmentService) admit(ctx context.Context, scope control.Scope,
 // A negotiated controller attach was admitted on this very mode a moment ago,
 // so it is not asked again here, and neither is the claim the grant below
 // makes on its behalf. One that ASKED for control and was admitted as a
-// viewer instead (see admit) arrives here as the viewer it is, so it is asked
-// — and refused — exactly as an attach that asked to watch would be. An unnegotiated attach has no way to send a claim at
-// all. What every negotiated attach does cost is one policy call per claim it
+// viewer instead (see admit) is not asked again either: the policy refused it
+// the controller a moment ago, and that answer is carried down rather than
+// paid for twice. An unnegotiated attach has no way to send a claim at all. What every negotiated attach does cost is one policy call per claim it
 // makes afterwards — worth knowing for a host whose policy is a network call
 // or an audited decision, and deliberate: a cached answer cannot honour a
 // grant revoked mid-attach.
@@ -458,7 +462,7 @@ func (s *AttachmentService) AttachTerminal(ctx context.Context, scope control.Sc
 	}
 	resource := control.Resource{Kind: control.ResourceSession, WorkspaceID: row.WorkspaceID,
 		ID: string(row.ID), CreatorID: row.CreatorID}
-	mode, err := s.admit(ctx, scope, resource, cmd)
+	mode, refusedControl, err := s.admit(ctx, scope, resource, cmd)
 	if err != nil {
 		return err
 	}
@@ -472,7 +476,7 @@ func (s *AttachmentService) AttachTerminal(ctx context.Context, scope control.Sc
 	if err != nil {
 		return err
 	}
-	mayClaim := s.mayClaim(ctx, scope, resource, cmd)
+	mayClaim := !refusedControl && s.mayClaim(ctx, scope, resource, cmd)
 	mode, generation, keeper, err := s.grant(ctx, scope, resource, row, cmd)
 	if err != nil {
 		return err

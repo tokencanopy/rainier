@@ -164,14 +164,15 @@ var _ control.AttachmentBroker = broker{}
 func (b broker) Attach(ctx context.Context, target control.AttachTarget, stream control.TerminalStream) error {
 	p := b.p
 	// Everything this attach holds, and everything it can do about it —
-	// registered BEFORE the first message is read. The application has
-	// already advanced the generation for a controller attach by the time
-	// this is called, so between here and that registration this attach is a
-	// controller no peer can see: a claim on another attach takes its peer
-	// list without it, never displaces it, and both clients are then told
-	// they have control. The read below is bounded by
-	// attachFirstMsgTimeout — fifteen seconds of that window, on a client
-	// that need only be slow.
+	// registered BEFORE the first message is read, which is the whole reason
+	// it is up here. The application has already advanced the generation for
+	// a controller attach by the time this is called, so an attach that
+	// joined the table only after that read would be a controller no peer
+	// could see for the length of it: a claim on another attach takes its
+	// peer list without this one, never displaces it, and both clients are
+	// then told they have control. That read is bounded by
+	// attachFirstMsgTimeout — fifteen seconds, on a client that need only be
+	// slow.
 	own := newOwnership(p, target)
 	own.stream = stream
 	p.owners.add(own)

@@ -1257,9 +1257,11 @@ func TestAViewOnlyPrincipalWatchesAndMayNotClaim(t *testing.T) {
 	case tg.Controller == nil:
 		t.Fatal("the downgraded attach got no keeper, so it cannot read its own generation")
 	}
-	// The controller it asked for, the viewer it was admitted as, and then
-	// the separate question of whether it may ever take control.
-	want := []control.AttachmentMode{control.AttachmentController, control.AttachmentViewer, control.AttachmentController}
+	// The controller it asked for and the viewer it was admitted as, and
+	// nothing more: the separate question of whether it may ever take control
+	// was answered by the first of those two, and a host's policy can be a
+	// network call.
+	want := []control.AttachmentMode{control.AttachmentController, control.AttachmentViewer}
 	if got := fx.policy.modes()[asked:]; !slices.Equal(got, want) {
 		t.Fatalf("the policy was asked %v; want %v", got, want)
 	}

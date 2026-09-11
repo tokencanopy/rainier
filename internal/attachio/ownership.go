@@ -120,8 +120,16 @@ func (o *ownership) observe(m terminal.ServerMessage) string {
 	case terminal.TypeControlChanged:
 		o.mode = m.Mode
 		o.gen = m.Generation.Value()
-		if m.Mode == terminal.ModeView && was != terminal.ModeView {
+		switch {
+		case m.Mode == terminal.ModeView && was != terminal.ModeView:
 			return NoticeTaken
+		case m.Mode == terminal.ModeControl && was == terminal.ModeView:
+			// The generation moved and this attach came out of it holding
+			// control: a claim of its own won while somebody else's handoff
+			// was announcing to it. The `attached` that answers that claim
+			// arrives after this and will find the mode already `control`, so
+			// this is the only place the person can be told.
+			return NoticeHaveControl
 		}
 		return ""
 	}

@@ -16,6 +16,13 @@ import (
 	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
+// testDeadline is how long any of the helpers below waits for something the
+// plane should do in milliseconds. It is generous on purpose: every one of
+// them fails the test when it expires, so the only thing a tight bound buys
+// is a suite that reports a busy machine as a bug. The handoff timings these
+// tests actually measure carry bounds of their own.
+const testDeadline = 15 * time.Second
+
 // ---------------------------------------------------------------------------
 // a session's controller lease, as the application would keep it
 // ---------------------------------------------------------------------------
@@ -219,7 +226,7 @@ func startAttachOn(t *testing.T, p *Plane, h *fakeHost, ts *httptest.Server,
 func awaitType(t *testing.T, s *scriptedStream, kind string) (terminal.ServerMessage, []string) {
 	t.Helper()
 	var before []string
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(testDeadline)
 	for {
 		select {
 		case m := <-s.out:
@@ -307,7 +314,7 @@ func TestAnUnnegotiatedAttachGetsTodaysMessageSetAndStampedFrames(t *testing.T) 
 		t.Fatalf("a legacy client's snapshot carried ownership fields: %+v", m)
 	}
 
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(testDeadline)
 	for {
 		var stamped bool
 		for _, got := range f.sandbox.received() {
@@ -361,7 +368,7 @@ func TestJourney3And4AClaimIsAnsweredOnlyAfterTheSandboxHasTheFence(t *testing.T
 
 	// And what it types now goes out under the generation it holds.
 	f.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("ls\r")}
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(testDeadline)
 	for {
 		for _, got := range f.sandbox.received() {
 			if got.Type == "stdin" {
@@ -523,7 +530,7 @@ func TestDetachingReleasesControl(t *testing.T) {
 	f.close()
 	select {
 	case <-f.done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testDeadline):
 		t.Fatal("the attach never ended")
 	}
 	lease.mu.Lock()
@@ -631,7 +638,7 @@ func TestAClientsControlVerbNeverReachesTheSandbox(t *testing.T) {
 // say "everything up to here has arrived" without sleeping for a fixed time.
 func awaitSandbox(t *testing.T, s *fakeSandbox, want func([]terminal.ClientMessage) bool, what string) {
 	t.Helper()
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(testDeadline)
 	for {
 		if want(s.received()) {
 			return
@@ -820,7 +827,7 @@ func awaitViewerSpliced(t *testing.T, f *attachFixture) {
 // sequence one claim behind another's store write without sleeping for it.
 func awaitGeneration(t *testing.T, l *fakeLease, want uint64) {
 	t.Helper()
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(testDeadline)
 	for {
 		l.mu.Lock()
 		got := l.gen
@@ -854,7 +861,7 @@ func awaitGeneration(t *testing.T, l *fakeLease, want uint64) {
 // waits out the whole timeout, while the second attach's sandbox answers at
 // once.
 func TestAClaimSupersededWhileItWaitedIsNeverToldItHasControl(t *testing.T) {
-	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 500 * time.Millisecond})
+	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 1500 * time.Millisecond})
 	lease := &fakeLease{gen: 1}
 
 	a := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_aaaa"}, false)
@@ -870,7 +877,7 @@ func TestAClaimSupersededWhileItWaitedIsNeverToldItHasControl(t *testing.T) {
 	awaitGeneration(t, lease, 2)
 	b.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(2)}
 
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(testDeadline)
 	for done := false; !done; {
 		select {
 		case m := <-a.stream.out:
@@ -947,7 +954,7 @@ func TestAViewOnlyAttachIsToldEverythingAndClaimsNothing(t *testing.T) {
 	awaitViewerSpliced(t, f)
 
 	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(4)}
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(testDeadline)
 	for done := false; !done; {
 		select {
 		case m := <-f.stream.out:
@@ -986,7 +993,7 @@ func TestAViewOnlyAttachIsToldEverythingAndClaimsNothing(t *testing.T) {
 // that believes it is the controller sends no claim of its own, and this
 // attach's heartbeat renews nothing because the plane knows it is a viewer.
 func TestAClaimSupersededWhileItDisplacedIsNeverToldItHasControl(t *testing.T) {
-	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 700 * time.Millisecond})
+	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 1500 * time.Millisecond})
 	lease := &fakeLease{gen: 1, holder: "att_aaaa"}
 
 	// The incumbent's sandbox predates the protocol, so displacing it costs
@@ -1015,7 +1022,7 @@ func TestAClaimSupersededWhileItDisplacedIsNeverToldItHasControl(t *testing.T) {
 	}, "the displaced incumbent's new binding")
 	tablet.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(2)}
 
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(testDeadline)
 	for done := false; !done; {
 		select {
 		case m := <-phone.stream.out:
@@ -1045,7 +1052,7 @@ func TestAClaimSupersededWhileItDisplacedIsNeverToldItHasControl(t *testing.T) {
 // has to be what this attach holds when the message is written, not what the
 // application granted before the loop began.
 func TestATakeOverAtAttachTimeIsToldWhatItIsAfterItDisplaced(t *testing.T) {
-	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 700 * time.Millisecond})
+	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 1500 * time.Millisecond})
 	lease := &fakeLease{gen: 1, holder: "att_aaaa"}
 
 	laptop := startAttach(t, p, h, ts, control.AttachmentController, 1, fakeKeeper{lease, "att_aaaa"}, false)
@@ -1365,7 +1372,7 @@ func TestAControllerThatClaimsFromAStaleGenerationKeepsControl(t *testing.T) {
 	// The generation it presents is one this session left long ago.
 	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
 
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(testDeadline)
 	for answered := false; !answered; {
 		select {
 		case m := <-f.stream.out:
@@ -1956,7 +1963,7 @@ func TestAStaleAcknowledgementNeverCostsTheNextHandoffItsWait(t *testing.T) {
 // of the test below: registration does not wait for the client to speak.
 func awaitOwners(t *testing.T, p *Plane, session control.SessionID, n int) {
 	t.Helper()
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(testDeadline)
 	for {
 		p.owners.mu.Lock()
 		got := len(p.owners.m[session])
@@ -2026,5 +2033,66 @@ func TestAnAttachStillReadingItsFirstMessageIsDisplacedLikeAnyOther(t *testing.T
 	}
 	if m.Generation.Value() != 3 {
 		t.Fatalf("it opened at generation %q, want the 3 that exists", m.Generation)
+	}
+}
+
+// TestTheFanOutReachesEveryPeerAtOnce is the parallelism itself, which the
+// per-step deadlines alone do not give. Bounded but serial, a take-over on a
+// session with several devices that have stopped reading pays one deadline per
+// device before it answers anybody — and a session with several such devices
+// is exactly the session this feature ships for. Reached at once, it pays one.
+func TestTheFanOutReachesEveryPeerAtOnce(t *testing.T) {
+	// Six, not more: the fake host queues the dial_attach commands it is
+	// handed and this test reads none of them, so the peers and the taker
+	// have to fit inside that queue.
+	const (
+		peers = 6
+		ack   = 250 * time.Millisecond
+	)
+	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: ack, HeartbeatInterval: time.Hour})
+	lease := &fakeLease{gen: 1}
+	for i := range peers {
+		stuck := stalledPeer(t, p, h, ts, 1, fakeKeeper{lease, "att_stuck_" + string(rune('a'+i))})
+		t.Cleanup(stuck.stream.drain)
+	}
+	taker := startAttach(t, p, h, ts, control.AttachmentViewer, 1, fakeKeeper{lease, "att_taker"}, true)
+	awaitType(t, taker.stream, terminal.TypeAttached)
+	awaitViewerSpliced(t, taker)
+
+	started := time.Now()
+	taker.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(1)}
+	if m, _ := awaitType(t, taker.stream, terminal.TypeAttached); m.Generation.Value() != 2 {
+		t.Fatalf("the claim was answered %s at %q, want control at 2", m.Mode, m.Generation)
+	}
+	// Serial, this is peers × ack — two full seconds of a person waiting for
+	// a key press to do anything. In parallel it is one ack, plus whatever
+	// the machine is busy with.
+	if elapsed := time.Since(started); elapsed > peers*ack/2 {
+		t.Fatalf("a claim behind %d peers that had stopped reading took %s: they were walked "+
+			"one after another, not at once", peers, elapsed)
+	}
+}
+
+// TestABindingWriteThatNeverLandsDoesNotHoldTheHandoff is the deadline on the
+// SANDBOX-facing half. A runner socket that has stopped draining is rarer than
+// a client that has, and it holds exactly as much: the handoff waits on a
+// write that will never complete, while the generation it is fencing moved in
+// the store long ago.
+func TestABindingWriteThatNeverLandsDoesNotHoldTheHandoff(t *testing.T) {
+	p, _, _ := newTestPlane(t, Options{ControlAckTimeout: 200 * time.Millisecond})
+	o := &ownership{plane: p, session: "sess_example", mode: terminal.ModeControl, gen: 2,
+		announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
+	o.bindRunner(blockedConn{})
+
+	// A generous outer bound, so an unbounded write fails this as an
+	// assertion rather than as a hung test.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	started := time.Now()
+	if err := o.installAndWait(ctx, terminal.ModeView, 3); err == nil {
+		t.Fatal("a binding write that never landed was reported as installed")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("the handoff waited %s on a runner socket that had stopped draining", elapsed)
 	}
 }

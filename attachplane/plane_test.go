@@ -87,7 +87,7 @@ func (h *fakeHost) nextCmd(t *testing.T) runner.ToRunner {
 	select {
 	case m := <-h.cmds:
 		return m
-	case <-time.After(5 * time.Second):
+	case <-time.After(testDeadline):
 		t.Fatal("no command reached the runner within 5s")
 		return runner.ToRunner{}
 	}
@@ -269,7 +269,7 @@ func (s *scriptedStream) closeReason(t *testing.T) error {
 	select {
 	case err := <-s.closed:
 		return err
-	case <-time.After(5 * time.Second):
+	case <-time.After(testDeadline):
 		t.Fatal("the broker never closed the stream")
 		return nil
 	}
@@ -280,7 +280,7 @@ func (s *scriptedStream) nextServerMsg(t *testing.T) terminal.ServerMessage {
 	select {
 	case m := <-s.out:
 		return m
-	case <-time.After(5 * time.Second):
+	case <-time.After(testDeadline):
 		t.Fatal("no server message reached the client stream within 5s")
 		return terminal.ServerMessage{}
 	}
@@ -362,7 +362,7 @@ func TestUnpairedAttachTimesOutAtThePairTTL(t *testing.T) {
 		if !errors.Is(err, control.ErrUnavailable) {
 			t.Fatalf("Attach after the pairing TTL = %v, want ErrUnavailable", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testDeadline):
 		t.Fatal("Attach never returned after the pairing TTL")
 	}
 	if got := stream.closeReason(t); !errors.Is(got, errAttachNoDialBack) {
@@ -508,7 +508,7 @@ func TestBrokerAsksTheRunnerToDialBack(t *testing.T) {
 		if !errors.Is(err, control.ErrUnavailable) {
 			t.Fatalf("Attach after the pairing TTL = %v, want ErrUnavailable", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testDeadline):
 		t.Fatal("Attach never returned after the pairing TTL")
 	}
 	if got := stream.closeReason(t); !errors.Is(got, errAttachNoDialBack) {
@@ -585,7 +585,7 @@ func TestBrokerSplicesBothDirections(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Attach after a spliced attach ended = %v, want nil", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(testDeadline):
 		t.Fatal("Attach never returned after the runner half closed")
 	}
 	if n := pendingAttaches(p); n != 0 {

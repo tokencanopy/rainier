@@ -181,9 +181,13 @@ else.
   the order is not available, because until the runner dials back there is no
   socket to install a binding on.
 - Nothing bounds how often a client may claim, and nothing needs to. A claim
-  from the attach that already **holds** control is answered with what it
-  holds and goes no further: it never reaches the store, never advances the
-  generation, and never fences the keystrokes that client has already sent. A
+  from the attach that already **holds** control costs one lease read and
+  nothing else: it never advances the generation and never fences the
+  keystrokes that client has already sent. (The read is not ceremony. A
+  controller displaced by an attach on another replica still reads as the
+  controller here until its own heartbeat is refused, and that press is how
+  its user finds out; answering it from memory would confirm control that has
+  already gone elsewhere.) A
   client can still loop `claim` and `release` on its own stream; each pair
   advances the generation twice and waits, up to one acknowledgement timeout
   in total, for the other attaches' sandboxes. It is an authorized user's
@@ -201,7 +205,18 @@ else.
   before any of this runs, and its own heartbeat demotes it within one
   interval. What it loses is the immediate notice. Client sockets carry a
   write deadline for the same reason, so one that has stopped reading
-  altogether is eventually closed rather than held open.
+  altogether is eventually closed rather than held open — a deadline far
+  longer than a handoff's, because a client that is merely slow must be able
+  to take a large snapshot, and because a handoff never waits on it anyway.
+
+- A take-over that cannot be **installed** in the taker's own sandbox is not
+  granted. The generation it won is given back at once, and the client is told
+  the number that exists now, so one more press takes control. Granting it
+  would produce a controller nothing can repair: the pty would discard every
+  keystroke, and the lease would be renewed happily by a plane that believed
+  the handoff had happened. A sandbox that simply never **acknowledges** is a
+  different thing — that is an older `sessiond`, and the handoff proceeds
+  fenced at the plane alone, as the compatibility matrix says.
 - Nothing about ownership is logged, and no message, byte, or length of one is.
   The holder is an opaque per-attach identity, never a user, device, account or
   browser-session identifier, and never leaves the control plane.
