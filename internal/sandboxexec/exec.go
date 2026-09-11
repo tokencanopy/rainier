@@ -821,6 +821,16 @@ type attachment struct {
 	// keeps a dead consumer from parking a reader goroutine forever.
 	closing   chan struct{}
 	closeOnce sync.Once
+	// killOnce makes ending the PROCESS happen once however many paths reach
+	// it. closeOnce guards only `close(closing)`; without this the signal and
+	// its five-second escalation timer are armed once per caller, and
+	// offerStdin spawns one endWith per over-bound message — two thousand
+	// messages after an overrun measured two thousand SIGTERMs to the same
+	// process group and two thousand live timers.
+	killOnce sync.Once
+	// endOnce is the same rule for the reason that precedes the kill: a
+	// caller learns WHY once, not once per message it had already sent.
+	endOnce sync.Once
 
 	// out guards the OUTBOX against the one race that can crash a sandbox:
 	// closing msgs while a sender is mid-send is a "send on closed channel"
@@ -842,7 +852,8 @@ type attachment struct {
 	mu       sync.Mutex
 	proc     Proc
 	detached bool
-	queued   int // bytes of stdin waiting
+	queued   int  // bytes of stdin waiting
+	stdinEOF bool // the caller said it was done; pumpStdin has gone
 }
 
 func (a *attachment) setDetached(v bool) {
@@ -890,10 +901,7 @@ func (a *attachment) arm(p Proc, detached bool) bool {
 	a.mu.Unlock()
 	select {
 	case <-a.closing:
-		go func() {
-			a.killProc(p)
-			a.finish()
-		}()
+		a.endProcess(p)
 		return false
 	default:
 	}
@@ -1056,6 +1064,19 @@ func signalNamed(name string) (syscall.Signal, bool) {
 // rather than dropping bytes.
 func (a *attachment) offerStdin(in stdinPiece) {
 	a.mu.Lock()
+	if a.stdinEOF {
+		// The caller already said it was done, so pumpStdin has returned and
+		// NOTHING drains this queue any more. Anything arriving now would
+		// accumulate until it crossed the bound and then end a command that
+		// may well have finished — reported as stdin_overrun, which would be
+		// a refusal for input the child was never going to read. A closed
+		// pipe drops what is written to it, and so does this.
+		a.mu.Unlock()
+		return
+	}
+	if in.eof {
+		a.stdinEOF = true
+	}
 	over := a.queued > 0 && a.queued+len(in.data) > stdinQueueBytes
 	if !over {
 		a.queued += len(in.data)
@@ -1088,8 +1109,10 @@ func (a *attachment) offerStdin(in stdinPiece) {
 // something Rainier did on purpose — which would be a misattribution, and the
 // kind a script cannot act on.
 func (a *attachment) endWith(reason string) {
-	_ = a.emit(terminal.ServerMessage{Type: terminal.TypeExecError, Reason: reason})
-	a.kill()
+	a.endOnce.Do(func() {
+		_ = a.emit(terminal.ServerMessage{Type: terminal.TypeExecError, Reason: reason})
+		a.kill()
+	})
 }
 
 // pumpStdin is the one goroutine that writes the child's stdin. A write that
@@ -1149,18 +1172,35 @@ func (a *attachment) kill() {
 	if p == nil {
 		// Nothing has been spawned (yet). Ending the attachment is the whole
 		// of what there is to do; a spawn still in flight finds `closing`
-		// closed in arm and ends the process it just made.
+		// closed in arm and ends the process it just made. killOnce is
+		// deliberately NOT consumed here, so that spawn can still use it.
 		a.finish()
 		return
 	}
-	// The attachment is finished when the process is GONE, whichever path
-	// ended it — a caller disconnect, the session's own shutdown, a spawn
-	// that raced it. finish is idempotent, so the ordinary exit path calling
-	// it too is not a second closing, it is whichever got there first.
-	go func() {
-		a.killProc(p)
-		a.finish()
-	}()
+	a.endProcess(p)
+}
+
+// endProcess signals and reaps p exactly once, whichever of the paths that can
+// reach it got here first: a caller disconnect, an explicit close, a stalled
+// stdin, the session's own shutdown, or a spawn that lost the race with one of
+// them in arm.
+//
+// The once is what makes kill()'s documented idempotence true. Without it each
+// caller armed its own SIGTERM and its own five-second SIGKILL timer against
+// the same process group, and offerStdin's one endWith per over-bound message
+// turned a single overrun into thousands of both.
+//
+// The attachment is finished when the process is GONE rather than when the
+// signal is sent, which is what keeps an exec_exit from overtaking the output
+// that preceded it. finish is idempotent, so the ordinary exit path calling it
+// too is not a second closing — it is whichever got there first.
+func (a *attachment) endProcess(p Proc) {
+	a.killOnce.Do(func() {
+		go func() {
+			a.killProc(p)
+			a.finish()
+		}()
+	})
 }
 
 // killProc is the signal half on its own: SIGTERM to the process GROUP, a

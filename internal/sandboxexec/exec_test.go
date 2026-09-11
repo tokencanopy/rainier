@@ -1395,3 +1395,138 @@ func TestAPtySizeIsClampedRatherThanRefused(t *testing.T) {
 		})
 	}
 }
+
+// TestKillIsIdempotentUnderAnOverrunFlood is finding 9 as a count.
+//
+// kill() is documented idempotent and was not: closeOnce guarded only
+// close(closing), so every caller armed its own SIGTERM and its own five
+// second SIGKILL timer against the same process group — and offerStdin spawns
+// one endWith per over-bound message, so two thousand messages after an
+// overrun measured two thousand signals and two thousand live timers.
+func TestKillIsIdempotentUnderAnOverrunFlood(t *testing.T) {
+	start := newFakeStarter()
+	r, _ := testRunner(t, start.start)
+	spec := withTool(t, r, "tool")
+
+	a := r.OpenExec(spec)
+	p := start.await(t)
+	if m := <-a.Msgs(); m.Type != terminal.TypeExecStarted {
+		t.Fatalf("first message = %q", m.Type)
+	}
+	p.blockWrites()
+
+	// Fill the queue past its bound, then keep going — which is exactly what
+	// a caller piping into a command that has stopped reading does.
+	chunk := make([]byte, 64<<10)
+	for i := 0; i < (stdinQueueBytes/len(chunk))+16; i++ {
+		a.Client(terminal.ClientMessage{Type: "stdin", Data: chunk})
+	}
+	for i := 0; i < 2000; i++ {
+		a.Client(terminal.ClientMessage{Type: "stdin", Data: []byte("x")})
+	}
+	drainAttachment(t, a)
+
+	// The fake's SIGTERM ends the process, so the escalation never runs and
+	// every signal counted here is a separate caller reaching kill().
+	sigs := p.sentSignals()
+	if len(sigs) != 1 {
+		t.Fatalf("an overrun delivered %d signals to the process group, want exactly 1 — "+
+			"each one also arms a %s SIGKILL timer", len(sigs), killGrace)
+	}
+	if sigs[0] != syscall.SIGTERM {
+		t.Fatalf("the one signal was %v, want SIGTERM", sigs[0])
+	}
+}
+
+// TestOnlyOneReasonReachesACallerAfterAnOverrun: a caller learns WHY once, not
+// once per message it had already sent. Two thousand exec_errors would be two
+// thousand sentences for one fact.
+func TestOnlyOneReasonReachesACallerAfterAnOverrun(t *testing.T) {
+	start := newFakeStarter()
+	r, _ := testRunner(t, start.start)
+	spec := withTool(t, r, "tool")
+
+	a := r.OpenExec(spec)
+	p := start.await(t)
+	if m := <-a.Msgs(); m.Type != terminal.TypeExecStarted {
+		t.Fatalf("first message = %q", m.Type)
+	}
+	p.blockWrites()
+
+	chunk := make([]byte, 64<<10)
+	for i := 0; i < (stdinQueueBytes/len(chunk))+512; i++ {
+		a.Client(terminal.ClientMessage{Type: "stdin", Data: chunk})
+	}
+	n := 0
+	for _, m := range drainAttachment(t, a) {
+		if m.Type == terminal.TypeExecError {
+			n++
+			if m.Reason != terminal.ReasonStdinOverrun {
+				t.Fatalf("reason = %q, want %q", m.Reason, terminal.ReasonStdinOverrun)
+			}
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%d exec_errors reached the caller for one overrun, want 1", n)
+	}
+}
+
+// TestPostEOFStdinCannotKillAHealthyCommand is finding 10. pumpStdin returns
+// on the EOF, so nothing drains the queue afterwards; later stdin accumulated
+// until it crossed the bound and then ended a command that had already been
+// told its input was complete — reported as stdin_overrun, for input the child
+// was never going to read. A closed pipe drops what is written to it.
+func TestPostEOFStdinCannotKillAHealthyCommand(t *testing.T) {
+	start := newFakeStarter()
+	r, _ := testRunner(t, start.start)
+	spec := withTool(t, r, "tool")
+
+	a := r.OpenExec(spec)
+	p := start.await(t)
+	if m := <-a.Msgs(); m.Type != terminal.TypeExecStarted {
+		t.Fatalf("first message = %q", m.Type)
+	}
+	a.Client(terminal.ClientMessage{Type: "stdin", Data: []byte("hello")})
+	a.Client(terminal.ClientMessage{Type: terminal.TypeExecStdinEOF})
+
+	// The stdin the caller's own pipe drained after it sent the EOF — well
+	// past the bound, and none of it the command's business.
+	chunk := make([]byte, 64<<10)
+	for i := 0; i < (stdinQueueBytes/len(chunk))+64; i++ {
+		a.Client(terminal.ClientMessage{Type: "stdin", Data: chunk})
+	}
+
+	// The command finishes normally, on its own terms.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, closed := p.stdinProgress(); closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the EOF never reached the child")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	p.exit(Status{Code: 0})
+
+	var reason string
+	var exit *terminal.ServerMessage
+	for _, m := range drainAttachment(t, a) {
+		switch m.Type {
+		case terminal.TypeExecError:
+			reason = m.Reason
+		case terminal.TypeExecExit:
+			mm := m
+			exit = &mm
+		}
+	}
+	if reason != "" {
+		t.Fatalf("stdin sent after the EOF ended a healthy command as %q", reason)
+	}
+	if exit == nil || exit.ExitCode != 0 || exit.Signal != "" {
+		t.Fatalf("the command reported %+v, want a clean exit 0", exit)
+	}
+	if got, _ := p.stdinBytes(); string(got) != "hello" {
+		t.Fatalf("the child received %q, want only the bytes sent before the EOF", got)
+	}
+}
