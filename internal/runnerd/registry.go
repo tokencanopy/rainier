@@ -50,8 +50,10 @@ type sessionEntry struct {
 	// finished agent's scrollback for an hour resets nothing while attached
 	// and gets the full timeout after detaching.
 	lastDetachAt time.Time
-	// boot identifies the sandbox boot this entry is currently on: a counter
-	// bumped by every fresh /register and by every cold resume. It exists
+	// boot identifies the sandbox boot this entry is currently on: a
+	// registry-wide counter minted when the entry is inserted and bumped
+	// again by every cold resume (never by a plain /register, which reads it
+	// — see currentBoot). It exists
 	// because a control frame can outlive the boot that sent it — a hub's
 	// read loop that was stalled writing to a wedged viewer drains its
 	// buffered frames whenever it comes back, which can be after the sandbox
@@ -112,12 +114,40 @@ type registry struct {
 	// registry rather than per entry so that a value can never be reused by a
 	// session id that was deleted and recreated, which is exactly the case a
 	// stale frame would otherwise be accepted in.
+	//
+	// Minted at INSERTION (put/putIfAbsent) as well as at a cold resume, so
+	// that no live entry is ever on epoch zero. Leaving the zero value in
+	// place would have made every never-resumed entry share one epoch, and a
+	// recreated id would have inherited its predecessor's — the very reuse
+	// this counter is registry-wide to prevent. Zero is now reserved for "no
+	// such session", which is what currentBoot returns for one.
 	nextBoot uint64
 }
 
 func newRegistry() *registry { return &registry{items: map[string]*sessionEntry{}} }
 
-func (r *registry) put(id string, e *sessionEntry) { r.mu.Lock(); r.items[id] = e; r.mu.Unlock() }
+func (r *registry) put(id string, e *sessionEntry) {
+	r.mu.Lock()
+	r.mintBoot(e)
+	r.items[id] = e
+	r.mu.Unlock()
+}
+
+// mintBoot opens a fresh sandbox-boot epoch on an entry being inserted. The
+// caller must hold the registry lock.
+//
+// Every insertion gets one, so a session id that was deleted and recreated
+// lands on an epoch strictly greater than the dead entry's and a control frame
+// the old container's hub read loop is still draining — a child_exited, a
+// stage failure — names an epoch that matches nothing. Without this both
+// entries carried the zero value, and the guard that exists for exactly this
+// case never fired: a bogus child exit would auto-stop the new session's
+// working agent a timeout later, or a stale stage failure would pin it out of
+// auto-stop for the life of the runner.
+func (r *registry) mintBoot(e *sessionEntry) {
+	r.nextBoot++
+	e.boot = r.nextBoot
+}
 
 // putIfAbsent inserts e under id only if no entry exists yet, as a single
 // locked check-and-reserve step. CreateWithID uses this (not a separate
@@ -135,6 +165,7 @@ func (r *registry) putIfAbsent(id string, e *sessionEntry) bool {
 	if _, exists := r.items[id]; exists {
 		return false
 	}
+	r.mintBoot(e)
 	r.items[id] = e
 	return true
 }
@@ -442,9 +473,9 @@ func (r *registry) childExited(id string, boot uint64, at time.Time) {
 
 // currentBoot returns the sandbox-boot epoch id is on, which register READS
 // (rather than mints) and every control frame from that connection then
-// carries. Zero for a session that has never been cold-resumed, and for one
-// this registry does not hold — a frame for a session that has been deleted
-// matches nothing either way.
+// carries. Zero ONLY for a session this registry does not hold: every entry is
+// minted an epoch when it is inserted, so a frame carrying zero names no live
+// session rather than every never-resumed one.
 //
 // Reading rather than minting is the whole point, and it took a review round
 // to get right. A new epoch per REGISTRATION would open one on a plain

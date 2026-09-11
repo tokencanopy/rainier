@@ -1276,3 +1276,60 @@ func TestASecondResumeDoesNotMoveTheEpochAgain(t *testing.T) {
 		t.Fatalf("sweep stopped %v, want the session", stops)
 	}
 }
+
+// TestARecreatedSessionIdRefusesTheDeadSandboxsChildExit is the other half of
+// the stale-frame guard, and the half that used to be missing: the boot epoch
+// is registry-wide precisely so that a value "can never be reused by a session
+// id that was deleted and recreated" — but while the counter was only ever
+// minted from by a cold resume, both the dead entry and its replacement sat on
+// the zero value, and a frame from the old container matched the new entry
+// exactly.
+//
+// Id reuse is not something controld does (it mints ids), but runnerctl and
+// the local dev surface take the id from the caller, and the two outcomes are
+// the pair this feature exists to prevent: a bogus child exit auto-stops a
+// working agent a timeout later, and a bogus stage failure pins a healthy
+// session out of auto-stop for the life of the runner.
+func TestARecreatedSessionIdRefusesTheDeadSandboxsChildExit(t *testing.T) {
+	h := newIdleHarness(t)
+	ctx := context.Background()
+	deadBoot := h.boot[h.id]
+
+	if err := h.rd.Delete(ctx, h.id); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	// The same id, created again: a different sandbox, a different agent.
+	h.create(h.id)
+
+	// The dead container's hub read loop finally drains what it was holding.
+	// Asserted on the consequences first, and on the epoch afterwards, so a
+	// regression fails on the harm rather than on the mechanism.
+	h.clk.set(time.Minute)
+	h.rd.routeControl(h.id, deadBoot, []byte(`{"kind":"child_exited","rc":0}`))
+	if e := h.entry(h.id); !e.childExitedAt.IsZero() {
+		t.Error("a child_exited from the deleted session's sandbox was recorded against the new one")
+	}
+	h.rd.routeControl(h.id, deadBoot, []byte(`{"kind":"setup_failed","rc":1}`))
+	if e := h.entry(h.id); e.bootFailed {
+		t.Error("a stage failure from the deleted session's sandbox pinned the new one out of auto-stop")
+	}
+	if got := h.boot[h.id]; got == deadBoot {
+		t.Fatalf("the recreated session is on boot %d, the same epoch the deleted one carried", got)
+	}
+
+	// So the new agent works for as long as it likes and is never stopped.
+	h.clk.set(100 * time.Hour)
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 0 {
+		t.Fatalf("stopped %v — the new session's agent is running", stops)
+	}
+	if got := h.state(); got != driver.StateRunning {
+		t.Fatalf("container state = %v, want %v", got, driver.StateRunning)
+	}
+
+	// And its own exit, on its own boot, still counts.
+	h.run(30*time.Minute, idleStep{at: 100 * time.Hour, act: childExits})
+	h.clk.set(100*time.Hour + 30*time.Minute)
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 1 {
+		t.Fatalf("stopped %v after the new child exited, want the session", stops)
+	}
+}
