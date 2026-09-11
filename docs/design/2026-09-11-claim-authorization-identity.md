@@ -356,5 +356,11 @@ press and not of a controller's. The tests here say which they cover.
 - Mutation checks, because a test that cannot fail is not verification: the
   capture removed, the values merged with the live call's, and the live call's
   cancellation ignored each fail a named test and nothing else.
+- Two `internal/controld` tests flake at `-count` above one, and both flake on
+  `origin/main` the same way: `TestPlacementPinQueuesWhenTheRunnerHasNoRoom`
+  (scheduler, untouched here) and `TestAttachToFailedSession` (3 failures in 20
+  repeats on `origin/main`, 1 in 20 on this branch). Neither is introduced
+  here, and the `control_ack` this branch teaches the fake sessiond is not on
+  either test's path — an unnegotiated attach installs no binding.
 - `make verify`, and `repotest` on both store adapters with
   `RAINIER_TEST_PG_DSN` set at PostgreSQL 17.
