@@ -18,11 +18,11 @@ import (
 // exactly as it did before — type unconditionally, forward Ctrl-\ as an
 // ordinary byte, stamp nothing — which is what settled=false means here.
 type ownership struct {
-	asked     bool // this attach advertised the capability
-	askedView bool // this attach asked to attach in view mode
-	// neverClaim is --view, which is NOT the same fact as askedView: a plain
-	// attach reconnecting after it was superseded also asks for view mode,
-	// and that device must keep its take-control key. See Options.NeverClaim.
+	asked bool // this attach advertised the capability
+	// neverClaim is --view, which is NOT the same fact as asking for view
+	// mode: a plain attach reconnecting after it was superseded also asks for
+	// view mode, and that device must keep its take-control key and be told
+	// it is viewing. See Options.NeverClaim.
 	neverClaim bool
 	take       bool // --take: claim once if it comes back a viewer
 
@@ -46,7 +46,6 @@ func newOwnership(o Options) *ownership {
 		// true before any answer arrives, and true at all against a plane
 		// that never answers — which is the plane that would otherwise
 		// admit this attach as an unconditional controller and let it type.
-		own.askedView = true
 		own.mode = terminal.ModeView
 	}
 	return own
@@ -109,9 +108,9 @@ func (o *ownership) observe(m terminal.ServerMessage) string {
 				// --view asked to watch. Being told it is watching is not
 				// news, and "another device has control" might not even be
 				// true. A plain attach that RECONNECTED as a viewer also asked
-				// for view — that is what askedView records — but it was
-				// superseded while its network was out, and the contract says
-				// it comes back as a viewer and says so.
+				// for view mode, but it was superseded while its network was
+				// out, and the contract says it comes back as a viewer and
+				// says so.
 				return ""
 			}
 			return NoticeViewing // the opening answer: somebody else is typing
@@ -176,7 +175,7 @@ func (o *ownership) takeOnce() bool {
 // place that decides what this client claims. It covers the take-control key
 // and --take's single claim alike.
 //
-// It reads neverClaim and NOT askedView. A plain attach that came back a
+// It reads neverClaim, not the requested mode. A plain attach that came back a
 // viewer after a disconnect asks for view mode too, and taking its
 // take-control key away for the rest of the process — silently, with no way
 // back but detaching — is not what "reconnect is conditional" means.

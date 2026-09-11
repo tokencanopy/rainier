@@ -471,8 +471,8 @@ func (o *ownership) claim(ctx context.Context, expected uint64) {
 	_ = o.install(ctx, mode, current)
 }
 
-// announceAs sends ONE ownership message, and it is the only place any of
-// them is sent. It takes the announce hold, reads the mode and the generation
+// announceAs is the only place an ownership message is sent. It takes the
+// announce hold, reads the mode and the generation
 // under it, and reports what it READ — no caller can assert a mode it did not
 // read, because no caller supplies one. Three rounds of review found that
 // defect on three different paths; this is the version of the fix that cannot
@@ -529,8 +529,11 @@ func (o *ownership) announceAs(ctx context.Context, typ string, won uint64) (str
 	// the plane, and a client that believes it controls sends no claim. So
 	// the correction is made here, by whoever holds the announce hold when
 	// the write ends: re-read, and if the state moved under the write, say
-	// so, until it has stopped moving. Bounded, because every turn needs the
-	// state to have moved again, and it only moves forward.
+	// so, until it has stopped moving. Bounded because every turn needs the
+	// state to have moved again and the store's Claim hands out strictly
+	// increasing generations, so the state cannot flap: the one mode change
+	// at a fixed generation (a demotion after an unreadable store) happens
+	// once per generation.
 	for ctx.Err() == nil {
 		now, at := o.get()
 		if now == mode && at == gen {

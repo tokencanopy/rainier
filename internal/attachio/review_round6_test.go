@@ -98,27 +98,33 @@ func TestFix1AReconnectedViewerIsNotToldItIsAViewer(t *testing.T) {
 	}
 }
 
-// TestFix3ClientSideFirstWordIsADisplacement is the client half of the
-// attachplane probe: when the plane's first word to an attach is a
-// control_changed (the moved-but-never-told case), what does the person see?
-func TestFix3ClientSideFirstWordIsADisplacement(t *testing.T) {
+// TestFix3ClientSideFirstWordIsAnOpeningAnswer is the client half of the
+// attachplane fix: a peer moved by a handoff before it was told anything now
+// receives its opening `attached` as its first word, never a `control_changed`
+// about control its person never heard it had. A plain attach is told it is
+// viewing, once; a --view attach is told nothing.
+func TestFix3ClientSideFirstWordIsAnOpeningAnswer(t *testing.T) {
 	t.Run("plain attach", func(t *testing.T) {
 		own := newOwnership(Options{Control: true, Mode: terminal.ModeControl})
-		first := own.observe(msg(terminal.TypeControlChanged, terminal.ModeView, 2))
-		second := own.observe(msg(terminal.TypeAttached, terminal.ModeView, 2))
-		t.Logf("plain attach displaced before its opening answer: %q then %q", first, second)
-		if first != "" && second != "" && first == second {
-			t.Logf("FIX3/client: the same notice %q is printed twice", first)
+		if got := own.observe(msg(terminal.TypeAttached, terminal.ModeView, 2)); got != NoticeViewing {
+			t.Fatalf("first word to a plain attach opened as a viewer printed %q, want %q", got, NoticeViewing)
 		}
 	})
 	t.Run("--view attach", func(t *testing.T) {
 		own := newOwnership(Options{Control: true, Mode: terminal.ModeView, NeverClaim: true})
+		if got := own.observe(msg(terminal.TypeAttached, terminal.ModeView, 2)); got != "" {
+			t.Fatalf("a --view attach opened as the viewer it asked to be printed %q, want nothing", got)
+		}
+	})
+	t.Run("the old first word was a lie", func(t *testing.T) {
+		// What the previous head sent first, kept so the reason for the fix
+		// stays visible: the client prints "took control from you" about
+		// control it never had, and then prints the opening answer too.
+		own := newOwnership(Options{Control: true, Mode: terminal.ModeControl})
 		first := own.observe(msg(terminal.TypeControlChanged, terminal.ModeView, 2))
 		second := own.observe(msg(terminal.TypeAttached, terminal.ModeView, 2))
-		t.Logf("--view attach displaced before its opening answer: %q then %q", first, second)
-		if second == NoticeTaken {
-			t.Logf("FIX3/client: a --view attach is told %q — askedView's suppression only "+
-				"covers the FIRST answer, and the courtesy notice consumed it", second)
+		if first != NoticeTaken || second != NoticeTaken {
+			t.Fatalf("the documented symptom changed shape: %q then %q", first, second)
 		}
 	})
 }
