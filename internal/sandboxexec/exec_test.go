@@ -549,8 +549,16 @@ func TestExecKillsTheProcessWhenItsCallerGoes(t *testing.T) {
 	if !sawTERM {
 		t.Fatalf("signals after a caller disconnect = %v, want SIGTERM", p.sentSignals())
 	}
-	if r.LiveCount() != 0 {
-		t.Fatalf("the exec slot was not released: %d still live", r.LiveCount())
+	// Polled rather than read once: the attachment is finished by whichever
+	// of the kill and the exit gets there first, and the slot comes back on
+	// the exit's own path. A single read here would be asserting an ordering
+	// between two goroutines that deliberately do not have one.
+	deadline := time.Now().Add(5 * time.Second)
+	for r.LiveCount() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the exec slot was not released: %d still live", r.LiveCount())
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
