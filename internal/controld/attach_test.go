@@ -146,6 +146,13 @@ type fakeSessiond struct {
 	opens   chan relay.Frame
 	resizes chan terminal.ClientMessage
 	closes  chan uint64
+	// controls is every mid-attach binding the plane installed, and the fake
+	// acknowledges each one exactly as internal/relay's session side does.
+	// Without the acknowledgement a handoff still completes — that is the
+	// old-sandbox pairing — but it spends the whole acknowledgement timeout
+	// doing it, and the ordering the plane promises (the sandbox has the new
+	// binding before the taker is told it has control) is never exercised.
+	controls chan terminal.ClientMessage
 }
 
 func startFakeSessiond(t *testing.T, ctx context.Context, wsBase, id string) *fakeSessiond {
@@ -157,11 +164,12 @@ func startFakeSessiond(t *testing.T, ctx context.Context, wsBase, id string) *fa
 	c.SetReadLimit(16 << 20)
 	t.Cleanup(func() { c.CloseNow() })
 	fs := &fakeSessiond{
-		raw:     c,
-		conn:    relay.WSConn(c),
-		opens:   make(chan relay.Frame, 8),
-		resizes: make(chan terminal.ClientMessage, 8),
-		closes:  make(chan uint64, 8),
+		raw:      c,
+		conn:     relay.WSConn(c),
+		opens:    make(chan relay.Frame, 8),
+		resizes:  make(chan terminal.ClientMessage, 8),
+		closes:   make(chan uint64, 8),
+		controls: make(chan terminal.ClientMessage, 8),
 	}
 	go fs.serve(ctx)
 	return fs
@@ -199,6 +207,13 @@ func (fs *fakeSessiond) serve(ctx context.Context) {
 				fs.send(ctx, f.AttachID, terminal.ServerMessage{Type: "output", Data: m.Data})
 			case "resize":
 				fs.resizes <- m
+			case terminal.TypeControl:
+				// Install, then say so, in that order and on this one
+				// socket — the acknowledgement is what the plane waits for
+				// before it tells a taker it has control.
+				fs.controls <- m
+				fs.send(ctx, f.AttachID, terminal.ServerMessage{
+					Type: terminal.TypeControlAck, Mode: m.Mode, Generation: m.Generation})
 			}
 		case relay.FrameClose:
 			fs.closes <- f.AttachID
@@ -226,6 +241,18 @@ func (fs *fakeSessiond) nextOpen(t *testing.T) relay.Frame {
 	case <-time.After(5 * time.Second):
 		t.Fatal("no FrameOpen reached the session within 5s")
 		return relay.Frame{}
+	}
+}
+
+// nextControl waits for the next binding the plane installed in this fake.
+func (fs *fakeSessiond) nextControl(t *testing.T) terminal.ClientMessage {
+	t.Helper()
+	select {
+	case m := <-fs.controls:
+		return m
+	case <-time.After(5 * time.Second):
+		t.Fatal("no control binding reached the session within 5s")
+		return terminal.ClientMessage{}
 	}
 }
 
