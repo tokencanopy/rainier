@@ -83,9 +83,8 @@ func (k fakeKeeper) State(context.Context) (uint64, bool, error) {
 type fakeSandbox struct {
 	acks bool
 
-	mu    sync.Mutex
-	got   []terminal.ClientMessage
-	order []string
+	mu  sync.Mutex
+	got []terminal.ClientMessage
 
 	ready chan struct{}
 	conn  relay.Conn
@@ -119,7 +118,6 @@ func (s *fakeSandbox) serve(t *testing.T, ts *httptest.Server, at *runner.Attach
 		}
 		s.mu.Lock()
 		s.got = append(s.got, m)
-		s.order = append(s.order, m.Type)
 		s.mu.Unlock()
 		if m.Type == terminal.TypeControl && s.acks {
 			ack, _ := json.Marshal(terminal.ServerMessage{
@@ -438,12 +436,27 @@ func TestADisplacedControllerIsToldAtOnce(t *testing.T) {
 
 	// And it is fenced at the plane too: what it types now is not carried.
 	laptop.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("y\r")}
-	time.Sleep(100 * time.Millisecond)
+	awaitPumpCaughtUp(t, laptop)
 	for _, got := range laptop.sandbox.received() {
 		if got.Type == "stdin" {
 			t.Fatal("a displaced controller's keystroke was still carried")
 		}
 	}
+}
+
+// awaitPumpCaughtUp blocks until this attach's client pump has processed
+// everything queued before it, by sending one message the pump must ANSWER
+// and waiting for the answer: a claim from generation zero, which no row is
+// ever at, so the store refuses it, no generation moves anywhere and nothing
+// about the attach changes.
+//
+// It is what makes "nothing I typed was carried" an assertion about what
+// happened rather than about how long the test waited. A sleep in its place
+// leaves a forwarding regression failing only probabilistically.
+func awaitPumpCaughtUp(t *testing.T, f *attachFixture) {
+	t.Helper()
+	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(0)}
+	awaitType(t, f.stream, terminal.TypeStale)
 }
 
 // TestAStaleHeartbeatDemotesAControllerFromAnotherReplica is the durable
@@ -489,7 +502,7 @@ func TestReleasingAdvancesTheGenerationAndDemotes(t *testing.T) {
 		t.Fatalf("after a release the lease is generation %d held by %q, want 2 and vacant", gen, holder)
 	}
 	f.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("y\r")}
-	time.Sleep(100 * time.Millisecond)
+	awaitPumpCaughtUp(t, f)
 	for _, got := range f.sandbox.received() {
 		if got.Type == "stdin" {
 			t.Fatal("a released controller's keystroke was still carried")
@@ -1772,4 +1785,53 @@ func TestADemotionThatWasSupersededDoesNotDemote(t *testing.T) {
 		}
 		return false
 	}, "the controller's keystroke")
+}
+
+// ackingConn is a sandbox that answers a binding the INSTANT the plane writes
+// it — before the plane has parked on the acknowledgement channel at all,
+// which is what a fast socket does and what makes the drain in installAndWait
+// load-bearing rather than tidy.
+type ackingConn struct{ o *ownership }
+
+func (c ackingConn) Read(ctx context.Context) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (c ackingConn) Write(_ context.Context, b []byte) error {
+	var m terminal.ClientMessage
+	if json.Unmarshal(b, &m) == nil && m.Type == terminal.TypeControl {
+		c.o.acked(m.Generation.Value())
+	}
+	return nil
+}
+
+func (c ackingConn) Close() error { return nil }
+
+// TestAStaleAcknowledgementNeverCostsTheNextHandoffItsWait covers the drain at
+// the top of installAndWait, which had no test at all and survived deletion.
+//
+// A handoff that gave up on an acknowledgement leaves the sandbox's answer to
+// arrive afterwards, into a channel that holds exactly one. The NEXT handoff
+// installs its binding and the sandbox answers at once — and that answer is
+// dropped, because the previous handoff's is still sitting in the channel. The
+// handoff then waits out the entire acknowledgement timeout for an answer it
+// has already been given, which on a take-over is time the person pressing the
+// key spends looking at a terminal that will not type.
+func TestAStaleAcknowledgementNeverCostsTheNextHandoffItsWait(t *testing.T) {
+	p, _, _ := newTestPlane(t, Options{ControlAckTimeout: 2 * time.Second})
+	o := &ownership{plane: p, session: "sess_example", mode: terminal.ModeControl, gen: 2,
+		ack: make(chan uint64, 1)}
+	o.bindRunner(ackingConn{o})
+	// The previous handoff's acknowledgement, arriving after it gave up.
+	o.acked(2)
+
+	started := time.Now()
+	if err := o.installAndWait(context.Background(), terminal.ModeView, 3); err != nil {
+		t.Fatalf("installAndWait: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > p.ackTimeout/4 {
+		t.Fatalf("a handoff whose sandbox answered at once took %s: it spent the wait on the "+
+			"PREVIOUS handoff's acknowledgement", elapsed)
+	}
 }
