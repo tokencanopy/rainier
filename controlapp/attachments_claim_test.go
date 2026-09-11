@@ -167,19 +167,27 @@ func TestAClaimIsCancelledWithTheCallThatAskedIt(t *testing.T) {
 
 	t.Run("cancelled while asking", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
+		var seen error
 		k := claimKeeper(fx, policyFunc(func(asked context.Context, _ control.AttachmentMode) error {
 			// The claim is abandoned mid-question, which is what a client
 			// hanging up looks like from in here.
 			cancel()
 			select {
 			case <-asked.Done():
-				return asked.Err()
+				seen = asked.Err()
 			case <-time.After(5 * time.Second):
-				return errors.New("the authorizing context never followed the live call")
+				seen = errors.New("the authorizing context never followed the live call")
 			}
+			return seen
 		}), withTestPrincipal(context.Background(), "usr_example"))
 		if _, err := k.Claim(ctx, fx.sessions.row.ControllerGeneration); !errors.Is(err, control.ErrDenied) {
 			t.Fatalf("Claim abandoned mid-question: err = %v, want ErrDenied", err)
+		}
+		// ErrDenied alone would also be the answer to a policy that timed out
+		// on its own; what this pins is that the live call's cancellation
+		// reached the question.
+		if !errors.Is(seen, context.Canceled) {
+			t.Fatalf("the policy saw %v, want context.Canceled from the live call", seen)
 		}
 	})
 
@@ -341,4 +349,40 @@ type policyFunc func(context.Context, control.AttachmentMode) error
 func (f policyFunc) AuthorizeAttachment(ctx context.Context, _ control.Scope,
 	_ control.Resource, mode control.AttachmentMode) error {
 	return f(ctx, mode)
+}
+
+// storeCallKey marks the live call's context so a test can tell which context
+// a store call was made on.
+type storeCallKey struct{}
+
+// TestAClaimsStoreCallRunsOnTheCallThatMadeIt pins the half of authorizing
+// that the mutants did not reach: the policy question carries the captured
+// identity's values, but the STORE call carries the live call's context. A
+// host repository that reads a request-scoped value (a transaction handle, a
+// trace id) must see the call it is serving, not the attach that opened the
+// keeper hours ago.
+func TestAClaimsStoreCallRunsOnTheCallThatMadeIt(t *testing.T) {
+	fx := newAttachmentFixture(t)
+	var askedOn context.Context
+	k := claimKeeper(fx, policyFunc(func(asked context.Context, _ control.AttachmentMode) error {
+		askedOn = asked
+		return nil
+	}), withTestPrincipal(context.Background(), "usr_example"))
+
+	live := context.WithValue(context.Background(), storeCallKey{}, "this call")
+	if _, err := k.Claim(live, fx.sessions.row.ControllerGeneration); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	fx.sessions.mu.Lock()
+	storeSaw := fx.sessions.casCtx
+	fx.sessions.mu.Unlock()
+	if storeSaw == nil || storeSaw.Value(storeCallKey{}) != "this call" {
+		t.Fatal("the store's conditional claim did not run on the live call's context")
+	}
+	if askedOn == nil || askedOn.Value(storeCallKey{}) != nil {
+		t.Fatal("the policy question carried the live call's value; it must carry the captured identity's alone")
+	}
+	if askedOn.Value(testPrincipalKey{}) != "usr_example" {
+		t.Fatalf("the policy was asked about %v, want the captured usr_example", askedOn.Value(testPrincipalKey{}))
+	}
 }

@@ -46,6 +46,16 @@ type AttachmentOptions struct {
 // service asks this policy whether the validated mode is also permitted for
 // the same authoritative resource. Self-hosted maps it to creator/installation
 // policy; Cloud maps it to current session collaboration grants.
+//
+// The context an implementation receives differs by question. For the attach
+// itself (admit, and the may-claim question) it is the attaching request's
+// context. For a mid-attach CLAIM it carries the VALUES of the context that
+// authorized the attach — the attaching user, never the runner whose dial-back
+// call is executing the claim — grafted onto the live call's deadline and
+// cancellation. An implementation that resolves its caller from the context
+// therefore answers about the same principal for every question on one
+// attachment; one that logs a request id from the context will see the
+// attach's id on a claim, not the claim's.
 type AttachmentPolicy interface {
 	AuthorizeAttachment(context.Context, control.Scope, control.Resource, control.AttachmentMode) error
 }
@@ -180,7 +190,7 @@ type controllerKeeper struct {
 	// at all, so a policy that resolves its caller from the context would
 	// refuse the session's own creator.
 	//
-	// Values only, and never the runner's — see policyContext. A nil
+	// Values only, and never the runner's — see authorizing. A nil
 	// identity is a keeper built without one, which asks exactly as it did
 	// before.
 	identity context.Context

@@ -605,6 +605,7 @@ func (f *attachmentFakePolicy) modes() []control.AttachmentMode {
 
 type attachmentFakeSessions struct {
 	mu         sync.Mutex
+	casCtx     context.Context // the context the last conditional claim reached the store on
 	found      bool
 	row        control.Session
 	err        error
@@ -827,11 +828,12 @@ func (r *attachmentRecordingTerminalStream) Close(err error) error {
 // CompareAndAdvanceControllerGeneration is the conditional grant: it advances
 // the row only from the exact generation the caller expected, so an attach
 // test can stage the race the contract is about.
-func (f *attachmentFakeSessions) CompareAndAdvanceControllerGeneration(_ context.Context, ws control.WorkspaceID,
+func (f *attachmentFakeSessions) CompareAndAdvanceControllerGeneration(ctx context.Context, ws control.WorkspaceID,
 	id control.SessionID, expected uint64) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.casCalls++
+	f.casCtx = ctx
 	if !f.found || f.row.ControllerGeneration != expected {
 		return 0, control.ErrStale
 	}
