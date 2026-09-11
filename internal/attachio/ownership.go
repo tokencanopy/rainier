@@ -105,9 +105,13 @@ func (o *ownership) observe(m terminal.ServerMessage) string {
 		o.gen = m.Generation.Value()
 		switch {
 		case m.Mode == terminal.ModeView && first:
-			if o.askedView {
-				// It asked to watch. Being told it is watching is not news,
-				// and "another device has control" might not even be true.
+			if o.neverClaim {
+				// --view asked to watch. Being told it is watching is not
+				// news, and "another device has control" might not even be
+				// true. A plain attach that RECONNECTED as a viewer also asked
+				// for view — that is what askedView records — but it was
+				// superseded while its network was out, and the contract says
+				// it comes back as a viewer and says so.
 				return ""
 			}
 			return NoticeViewing // the opening answer: somebody else is typing
