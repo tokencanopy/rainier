@@ -146,10 +146,28 @@ type FromRunner struct {
 	// where every one of them may have finished hours ago.
 	Active     int    `json:"active"`
 	IdleExited int    `json:"idle_exited"`
-	ReqID      uint64 `json:"req_id,omitempty"`  // result: correlates ToRunner.ReqID
-	OK         bool   `json:"ok,omitempty"`      // result
-	Detail     string `json:"detail,omitempty"`  // result: error text or snapshot ref; event: setup_failed tail
-	Session    string `json:"session,omitempty"` // event, session_req
+	ReqID      uint64 `json:"req_id,omitempty"` // result: correlates ToRunner.ReqID
+	OK         bool   `json:"ok,omitempty"`     // result
+	// Conflict qualifies a result that is NOT ok: the runner received the
+	// command and understood it, and refused it because it conflicts with
+	// work the runner is already doing — a resume that overtook a cold
+	// suspend the runner had already claimed, a command for a sandbox that
+	// is still being created. It is the runner's "not yet", where a bare
+	// OK:false is its "this failed", and only the first is worth retrying.
+	//
+	// The same distinction the runner's own HTTP front has always drawn
+	// (409 rather than 500) reaching the control connection, which could not
+	// see it before: a control plane that cannot tell the two apart reports
+	// a healthy runner mid-stop as an internal error, and a client's
+	// retry-on-conflict logic never runs.
+	//
+	// Additive both ways, like every other field added here: an old control
+	// plane ignores it, and a new one reading false from an old runner —
+	// which never sets it — gets exactly the behaviour it has today.
+	// Meaningless on anything but a result, and omitted when false.
+	Conflict bool   `json:"conflict,omitempty"` // result
+	Detail   string `json:"detail,omitempty"`   // result: error text or snapshot ref; event: setup_failed tail
+	Session  string `json:"session,omitempty"`  // event, session_req
 	// State is the event's subject. "suspended_cold" is the runner reporting
 	// a park it decided on itself — today only idle auto-stop, which stops a
 	// sandbox whose child has exited and that nobody has attached to for the

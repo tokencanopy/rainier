@@ -396,3 +396,46 @@ func TestCapacityCountsOnTheWire(t *testing.T) {
 		t.Fatalf("round trip mangled the counts: %+v", out)
 	}
 }
+
+// TestConflictRefusalOnTheWire pins the tag of the bit that tells a refusal
+// the runner chose ("not yet — I am already stopping this sandbox") from one
+// it suffered ("this failed"). Both ends read it off the wire by name, and a
+// control plane that cannot see it can only report the first as the second:
+// a 500 internal error for a healthy runner mid-stop.
+//
+// omitempty, deliberately and unlike the capacity counts: `false` is the
+// answer every result that is not a conflict has always given, so a result
+// that omits the key and one that sends false mean the same thing, and
+// omitting it keeps an ordinary result byte-for-byte what it was.
+func TestConflictRefusalOnTheWire(t *testing.T) {
+	b, err := json.Marshal(runner.FromRunner{Type: "result", ReqID: 7, Detail: "session is being suspended", Conflict: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"conflict":true`) {
+		t.Fatalf("conflict tag wrong on the wire: %s", b)
+	}
+	plain, err := json.Marshal(runner.FromRunner{Type: "result", ReqID: 7, Detail: "no such session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), `"conflict"`) {
+		t.Fatalf("an ordinary refusal grew a conflict key: %s", plain)
+	}
+	var out runner.FromRunner
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Conflict {
+		t.Fatalf("round trip lost the conflict bit: %+v", out)
+	}
+	// An old runner sends no key at all, which must decode as "not a
+	// conflict" — today's behaviour, which is what makes the field additive.
+	var old runner.FromRunner
+	if err := json.Unmarshal([]byte(`{"type":"result","req_id":7,"detail":"boom"}`), &old); err != nil {
+		t.Fatal(err)
+	}
+	if old.Conflict {
+		t.Fatal("a result from a runner that predates the field decoded as a conflict")
+	}
+}

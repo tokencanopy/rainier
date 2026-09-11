@@ -413,9 +413,36 @@ func (s *Server) sessionOp(w http.ResponseWriter, r *http.Request) {
 	mapOpErr(w, s.Op(ctx, id, op, warm), func() { w.WriteHeader(http.StatusNoContent) })
 }
 
+// opConflicts are the refusals that mean "not yet" rather than "this failed":
+// the command is well formed and the session exists, but the runner is in the
+// middle of something the command cannot be interleaved with. Both of this
+// runner's surfaces answer them as a conflict — 409 on the local HTTP front
+// (mapOpErr, which gives each its own sentence), and FromRunner.Conflict on
+// the control connection (the agent's result arms) — and both read this one
+// list, because two lists is exactly how the control path came to report a
+// 409 as a 500 in the first place.
+var opConflicts = []error{errSessionStarting, errSuspendInFlight}
+
+// opConflict reports whether err is one of them. Nil is not a conflict, and
+// neither is any error the list does not name: a refusal this runner has not
+// classified is reported as a plain failure, which is the safe direction —
+// "this failed" invites no retry, where a wrong "not yet" invites one forever.
+func opConflict(err error) bool {
+	for _, c := range opConflicts {
+		if errors.Is(err, c) {
+			return true
+		}
+	}
+	return false
+}
+
 // mapOpErr maps Op/OpSnapshot/Delete's sentinel errors to the status codes the
 // HTTP surface has always returned, or calls onOK to write the success response
 // (which varies: 204 for delete/suspend/resume, a JSON ref for snapshot).
+//
+// Every 409 arm here is a member of opConflicts, and a test pins that: the two
+// must stay the same set, or a refusal is a conflict to a person holding a
+// terminal and an internal error to the control plane.
 func mapOpErr(w http.ResponseWriter, err error, onOK func()) {
 	switch {
 	case err == nil:

@@ -478,7 +478,14 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 		}
 	case "suspend", "resume":
 		err := s.Op(ctx, m.Session, m.Type, m.Warm)
-		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: errText(err)})
+		// Conflict is what tells controld apart the two ways this can be
+		// not-ok: a command that failed, and one the runner refused because
+		// it is already stopping (or still creating) this sandbox. Without
+		// it the control plane reports a healthy runner mid-stop as an
+		// internal error, and the CLI's retry-on-conflict never runs. See
+		// opConflicts and runner.FromRunner.Conflict.
+		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil,
+			Conflict: opConflict(err), Detail: errText(err)})
 	case "snapshot":
 		// m.Ref is controld's content-addressed environment ref
 		// (rainier-env:<envID>-<setupHash>), passed through untouched — see
@@ -494,7 +501,8 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 		if err != nil {
 			detail = err.Error()
 		}
-		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: detail})
+		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil,
+			Conflict: opConflict(err), Detail: detail})
 	case "prepull":
 		// Advisory and session-less: controld dispatches a prepull without a
 		// pending entry to correlate against (design §4.3 — it is warming an
@@ -533,7 +541,8 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 		// is already reached, whether we just deleted it or this destroy
 		// simply arrived after some other path already had.
 		ok := err == nil || errors.Is(err, errNoSuchSession)
-		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: ok, Detail: errTextUnless(err, errNoSuchSession)})
+		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: ok,
+			Conflict: !ok && opConflict(err), Detail: errTextUnless(err, errNoSuchSession)})
 	case "remove_workspace":
 		// The reclaim controld sends after a session it holds is explicitly
 		// removed — including a crash-dead one, whose container went long ago
