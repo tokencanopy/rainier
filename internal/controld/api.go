@@ -320,6 +320,15 @@ type sessionErrText struct {
 // runner, and unavailableStatus says which way (no connection, or no answer)
 // off a re-read of the row. A re-read that fails leaves the fixed 500, the
 // honest answer when we cannot even say whose runner it was.
+//
+// A runner that received the command and refused it as a CONFLICT
+// (controlapp.ErrRunnerConflict — it is already stopping that sandbox, or
+// still creating it) needs no arm of its own and deliberately does not get
+// one: it wraps control.ErrConflict, so the first arm already gives it this
+// handler's own sentence and a 409. That is the whole point of the sentinel
+// wrapping the conflict rather than the unavailable — "the runner said not
+// yet" is the same answer to a person as "the row is in the wrong state",
+// and both are things to try again rather than things that broke.
 func (s *Server) writeSessionErr(w http.ResponseWriter, ctx context.Context, id string, err error, text sessionErrText) {
 	status, code, msg := v0wire.StatusFor(err)
 	if status == 0 {

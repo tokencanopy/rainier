@@ -22,6 +22,26 @@ import (
 // sandbox's words, and this sentinel is the whole answer.
 var ErrRunnerRefused = fmt.Errorf("controlapp: runner refused the command: %w", control.ErrUnavailable)
 
+// ErrRunnerConflict is the other way a runner can answer no, and it means the
+// opposite thing to a caller: the runner received the command, understood it,
+// and refused it because it CONFLICTS with work it is already doing — a resume
+// that overtook a cold suspend the runner had already claimed, a command for a
+// sandbox that is still being created. Nothing is broken, the runner is
+// healthy and answering, and the same command succeeds once that work lands.
+//
+// So it wraps control.ErrConflict where ErrRunnerRefused wraps
+// control.ErrUnavailable, and every caller that knows only the closed sentinel
+// set gets the right answer with no new branch: the session handlers already
+// write their own sentence for ErrConflict, and the CLI's bounded
+// retry-on-conflict already keys on the code that produces. Reported by the
+// runner as an additive bit on its result (runner.FromRunner.Conflict); a
+// runner that predates it sends nothing, which is ErrRunnerRefused exactly as
+// before.
+//
+// It carries no detail of its own, for the same reason ErrRunnerRefused does
+// not: the runner's words stay inside the transport.
+var ErrRunnerConflict = fmt.Errorf("controlapp: runner refused the command as a conflict: %w", control.ErrConflict)
+
 // SessionOptions carries the host-supplied dependencies of SessionService.
 // Every field is required; NewSessionService refuses a missing dependency with
 // control.ErrInvalid. Wake is called only after a queued session is durably
@@ -373,11 +393,19 @@ func cloneRepos(in []control.RepoRef) []control.RepoRef {
 	return slices.Clone(in)
 }
 
-// dispatch sends msg to the runner that holds row. Every failure is
-// control.ErrUnavailable: an absent pool, an absent runner, a missing
-// connection, and a transport failure return it bare, while a runner that
-// answered and reported failure returns ErrRunnerRefused, which wraps it. The
-// runner's own detail text never leaves this method in either case.
+// dispatch sends msg to the runner that holds row. An absent pool, an absent
+// runner, a missing connection and a transport failure are control.ErrUnavailable
+// bare. A runner that ANSWERED no is one of two things, and which one is the
+// runner's to say: a refusal it suffered is ErrRunnerRefused (ErrUnavailable),
+// and one it chose because the command conflicts with work already in flight
+// on that sandbox is ErrRunnerConflict (ErrConflict). The runner's own detail
+// text never leaves this method in any case.
+//
+// The split matters because the two reach a person as different sentences and
+// different advice: "this failed" versus "not right now". Collapsing them —
+// which is what this did before the runner could say which — reported a
+// healthy runner stopping an idle sandbox as an internal server error, for a
+// condition that clears itself in the time it takes `docker stop` to return.
 func (s *SessionService) dispatch(ctx context.Context, row control.Session, msg runner.ToRunner) (runner.FromRunner, error) {
 	if row.PoolID == "" || row.RunnerID == "" || !s.transport.Connected(row.PoolID, row.RunnerID) {
 		return runner.FromRunner{}, control.ErrUnavailable
@@ -387,6 +415,9 @@ func (s *SessionService) dispatch(ctx context.Context, row control.Session, msg 
 		return runner.FromRunner{}, control.ErrUnavailable
 	}
 	if !res.OK {
+		if res.Conflict {
+			return runner.FromRunner{}, ErrRunnerConflict
+		}
 		return runner.FromRunner{}, ErrRunnerRefused
 	}
 	return res, nil
