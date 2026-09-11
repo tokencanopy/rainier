@@ -389,3 +389,250 @@ func TestAClientCloseClosesItsExec(t *testing.T) {
 		t.Fatal("the caller hung up and the exec was never closed")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// the shared writer
+// ---------------------------------------------------------------------------
+
+// wedgingConn blocks its FIRST write until released and passes every one
+// after it, which is the shape of a conn backed up behind one slow consumer:
+// the frame in flight cannot move, and everything queued behind it is fine the
+// instant it does. Reads come off a channel the test feeds.
+type wedgingConn struct {
+	entered chan struct{}
+	release chan struct{}
+	in      chan []byte
+	once    sync.Once
+
+	mu      sync.Mutex
+	written [][]byte
+}
+
+func newWedgingConn() *wedgingConn {
+	return &wedgingConn{entered: make(chan struct{}), release: make(chan struct{}),
+		in: make(chan []byte, 8)}
+}
+
+func (c *wedgingConn) Read(ctx context.Context) ([]byte, error) {
+	select {
+	case b := <-c.in:
+		return b, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (c *wedgingConn) Write(ctx context.Context, b []byte) error {
+	first := false
+	c.once.Do(func() { first = true })
+	if first {
+		close(c.entered)
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	c.mu.Lock()
+	c.written = append(c.written, append([]byte(nil), b...))
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *wedgingConn) Close() error { return nil }
+
+func (c *wedgingConn) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.written)
+}
+
+// TestAWedgedExecWriteDoesNotHoldTheSessionsWriter is finding 8, as a
+// measurement rather than a claim.
+//
+// Every attachment on one session shares one relay conn and one writer on it.
+// An exec forwarder's write took that writer and used the ServeSession
+// context, which lives as long as the session — so a caller draining at a
+// couple of kilobytes a second never tripped the plane's twenty-second budget
+// and held the writer indefinitely, and behind it a viewer's snapshot and the
+// session RPC waited. This asserts they get out.
+func TestAWedgedExecWriteDoesNotHoldTheSessionsWriter(t *testing.T) {
+	c := newWedgingConn()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newConnWriter(ctx, c)
+
+	execErr := make(chan error, 1)
+	go func() {
+		execErr <- w.writeWithin(Frame{Type: FrameServer, AttachID: 1,
+			Payload: []byte(`{"type":"exec_stdout"}`)}, 150*time.Millisecond)
+	}()
+	<-c.entered // the exec's frame is in the conn and not coming out
+
+	// The session's own writer — a viewer's screen, or a ControlSender — asks
+	// for its turn while the exec is wedged.
+	termErr := make(chan error, 1)
+	go func() {
+		termErr <- (&ControlSender{w: w}).Send([]byte(`{"kind":"setup_done"}`))
+	}()
+
+	if err := <-execErr; err == nil {
+		t.Fatal("a wedged exec write reported success")
+	}
+	select {
+	case err := <-termErr:
+		if err != nil {
+			t.Fatalf("the session's own control event failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a wedged exec caller still holds the session's writer; " +
+			"every viewer and the session RPC are behind it")
+	}
+	if c.count() != 1 {
+		t.Fatalf("%d frames reached the wire, want only the control event — "+
+			"the abandoned exec frame must not be written after its budget", c.count())
+	}
+}
+
+// TestWriteWithinDoesNotWaitOutAnotherWritersStall is the other half of the
+// bound: an exec that cannot even get the writer inside its budget is dropped
+// with the conn untouched, because nothing of its frame was ever written.
+func TestWriteWithinDoesNotWaitOutAnotherWritersStall(t *testing.T) {
+	c := newWedgingConn()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newConnWriter(ctx, c)
+
+	go func() { _ = w.write(Frame{Type: FrameControl, Payload: []byte(`{"kind":"x"}`)}) }()
+	<-c.entered
+
+	start := time.Now()
+	err := w.writeWithin(Frame{Type: FrameServer, AttachID: 1, Payload: []byte(`{}`)},
+		100*time.Millisecond)
+	if err == nil {
+		t.Fatal("writeWithin reported success while another writer held the conn")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("writeWithin waited %s for a writer it was given 100ms to get", elapsed)
+	}
+	close(c.release)
+}
+
+// TestASlowExecConsumerIsDroppedAndClosed is the wiring the budget exists for.
+// A frame that misses it means this exec's only reader is gone, so the exec
+// leaves the table and its process group is killed rather than being left
+// holding one of the session's eight slots with nobody to stream to.
+func TestASlowExecConsumerIsDroppedAndClosed(t *testing.T) {
+	proc := newSilentProc()
+	s, err := session.New(
+		session.Config{Argv: []string{"agent"}, Cols: 80, Rows: 24,
+			LogPath: filepath.Join(t.TempDir(), "s.log")},
+		func(argv []string, cols, rows int, onOutput func([]byte)) (session.Proc, error) {
+			return proc, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newWedgingConn()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ex := newFakeExecer()
+	w := newConnWriterBudget(ctx, c, 150*time.Millisecond)
+	go serveSession(ctx, c, s, w, nil, ex)
+
+	open, err := Encode(Frame{Type: FrameOpen, AttachID: 1, Kind: runner.KindExec,
+		Exec: &runner.ExecSpec{Argv: []string{"true"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.in <- open
+
+	var a *fakeExecAttachment
+	select {
+	case a = <-ex.open:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no exec was opened")
+	}
+	// One frame, which wedges in the conn and never comes out.
+	a.msgs <- terminal.ServerMessage{Type: terminal.TypeExecStdout, Data: []byte("x")}
+
+	select {
+	case <-a.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("an exec whose frame missed its write budget was left running")
+	}
+	close(c.release)
+}
+
+// TestAnUnknownAttachmentKindIsRefused is the nit with teeth: `if Kind ==
+// KindExec` was correct for the two kinds that exist, and the next one added
+// would have fallen into the terminal branch and opened the AGENT's pty with
+// no handshake to save it — a take-over nobody asked for, which is the one
+// outcome this whole design is built to make impossible.
+func TestAnUnknownAttachmentKindIsRefused(t *testing.T) {
+	rig := newExecTestRig(t)
+	ctx := context.Background()
+	client, hubClient := newPipe()
+	defer client.Close()
+	go rig.hub.AttachClient(ctx, hubClient, Open{Cols: 80, Rows: 24, Kind: "kind.v2"})
+
+	// The client socket is closed rather than answered with a snapshot.
+	readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if b, err := client.Read(readCtx); err == nil {
+		// The bytes are deliberately not printed: a snapshot is the whole
+		// screen, and a failing test that scrolls a terminal for a page is a
+		// failing test nobody reads.
+		var m terminal.ServerMessage
+		_ = json.Unmarshal(b, &m)
+		t.Fatalf("an unknown kind was answered with a %q (%d bytes), want a close",
+			m.Type, len(b))
+	}
+	if got := rig.proc.bytes(); len(got) != 0 {
+		t.Fatalf("an unknown kind reached the agent's pty: %q", got)
+	}
+}
+
+// TestASecondOpenOnALiveExecIdIsRefused: serveSession is the sandbox's trust
+// boundary. Overwriting the table entry would leave the previous process
+// unkilled and its slot held for the life of the session.
+func TestASecondOpenOnALiveExecIdIsRefused(t *testing.T) {
+	proc := newSilentProc()
+	s, err := session.New(
+		session.Config{Argv: []string{"agent"}, Cols: 80, Rows: 24,
+			LogPath: filepath.Join(t.TempDir(), "s.log")},
+		func(argv []string, cols, rows int, onOutput func([]byte)) (session.Proc, error) {
+			return proc, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessConn, peer := newPipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ex := newFakeExecer()
+	ServeSessionWithExec(ctx, sessConn, s, nil, ex)
+
+	open, err := Encode(Frame{Type: FrameOpen, AttachID: 9, Kind: runner.KindExec,
+		Exec: &runner.ExecSpec{Argv: []string{"true"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.Write(ctx, open); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ex.open:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first exec was never opened")
+	}
+	if err := peer.Write(ctx, open); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ex.open:
+		t.Fatal("a second FrameOpen on a live exec id opened a SECOND process, " +
+			"orphaning the first and its slot")
+	case <-time.After(500 * time.Millisecond):
+	}
+}

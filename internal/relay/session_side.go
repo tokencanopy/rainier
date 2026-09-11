@@ -4,7 +4,9 @@ package relay
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
+	"time"
 
 	"github.com/tokencanopy/rainier/internal/session"
 	"github.com/tokencanopy/rainier/protocol/runner"
@@ -20,13 +22,25 @@ import (
 // channel existed the discipline was implicit (only ServeSession wrote);
 // this type makes it explicit so a second writer can be added safely.
 type connWriter struct {
-	mu   sync.Mutex
+	// sem is that discipline, as a one-slot semaphore rather than a Mutex: a
+	// Mutex cannot be acquired with a deadline, and writeWithin's whole job is
+	// to bound the wait for this writer.
+	sem  chan struct{}
 	conn Conn
 	ctx  context.Context
+	// execBudget is what an exec frame gets (see execWriteBudget). It is a
+	// field rather than a constant read at the call site so a test can drive
+	// the dropped-consumer path in milliseconds instead of in five seconds,
+	// and so it cannot become a package variable two tests write.
+	execBudget time.Duration
 }
 
 func newConnWriter(ctx context.Context, conn Conn) *connWriter {
-	return &connWriter{conn: conn, ctx: ctx}
+	return newConnWriterBudget(ctx, conn, execWriteBudget)
+}
+
+func newConnWriterBudget(ctx context.Context, conn Conn, exec time.Duration) *connWriter {
+	return &connWriter{conn: conn, ctx: ctx, sem: make(chan struct{}, 1), execBudget: exec}
 }
 
 func (w *connWriter) write(f Frame) error {
@@ -34,9 +48,75 @@ func (w *connWriter) write(f Frame) error {
 	if err != nil {
 		return err
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	select {
+	case w.sem <- struct{}{}:
+	case <-w.ctx.Done():
+		return w.ctx.Err()
+	}
+	defer func() { <-w.sem }()
 	return w.conn.Write(w.ctx, b)
+}
+
+// execWriteBudget bounds ONE exec frame's trip onto this conn.
+//
+// Without it an exec forwarder's write takes the shared writer and uses the
+// ServeSession context, which lives as long as the session: a caller draining
+// at a couple of kilobytes a second never trips the plane's own twenty-second
+// budget (each individual write completes inside it) and holds this writer
+// indefinitely, and behind it the agent's terminal output and the session RPC
+// wait. The plane's budget is a bound on a caller that takes NOTHING; this is
+// the bound on one that takes almost nothing, which is the case that actually
+// stalls a session.
+//
+// Five seconds, against the largest frame this path produces — a 32 KiB
+// readChunk is 43,692 wire bytes after two base64 hops — is a floor of about
+// 8.7 KB/s. That is far below any link a person runs `rainier exec` over and
+// far above the rate a stall is measured at. A caller under it loses its exec
+// with a clean "no exit status" (125) and a sentence, never a truncated
+// stream, and can run the command again.
+const execWriteBudget = 5 * time.Second
+
+// errExecWriteBudget is an exec frame that could not be put on the wire inside
+// that budget. It is this exec's consumer being gone in every way that matters.
+var errExecWriteBudget = errors.New("relay: the exec's frame missed its write budget")
+
+// writeWithin is write with a deadline of its own, for the one caller that
+// must not be able to hold this conn's writer indefinitely.
+//
+// Two things are bounded and their outcomes differ, which is worth stating
+// because only one of them is free:
+//
+//   - ACQUIRING the writer. Somebody else is mid-write and has been for longer
+//     than this budget. Nothing has been written, so the conn is untouched and
+//     only this exec is dropped.
+//   - The write ITSELF. A WebSocket frame cannot be abandoned half-written, so
+//     the transport's answer to an expired write deadline is to close the conn
+//     (coder/websocket's setupWriteTimeout). That is the honest bound: the
+//     alternative is an unbounded freeze of everything else on the session,
+//     and sessiond's dial loop redials within its one-second backoff.
+func (w *connWriter) writeWithin(f Frame, d time.Duration) error {
+	b, err := Encode(f)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(w.ctx, d)
+	defer cancel()
+	select {
+	case w.sem <- struct{}{}:
+	case <-ctx.Done():
+		if w.ctx.Err() != nil {
+			return w.ctx.Err()
+		}
+		return errExecWriteBudget
+	}
+	defer func() { <-w.sem }()
+	if err := w.conn.Write(ctx, b); err != nil {
+		if ctx.Err() != nil && w.ctx.Err() == nil {
+			return errExecWriteBudget
+		}
+		return err
+	}
+	return nil
 }
 
 // ControlSender emits sessiond-originated control frames upstream over the
@@ -164,13 +244,32 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 		}
 		switch f.Type {
 		case FrameOpen:
-			if f.Kind == runner.KindExec {
+			// An explicit switch over the KINDS, with a default that refuses.
+			// `if Kind == KindExec` was correct for the two kinds that exist,
+			// and the next one added would silently open the AGENT's pty with
+			// no handshake to save it — which is the one mistake this whole
+			// design is built to make impossible.
+			switch f.Kind {
+			case runner.KindExec:
 				// Its own branch, and it never touches session.Session: an
 				// exec's output must never reach the emulator, the event log
 				// or another viewer's screen, and the cheapest way to
 				// guarantee that is for the code path not to have the session
 				// in its hands at all.
 				if ex == nil || f.Exec == nil {
+					write(Frame{Type: FrameClose, AttachID: f.AttachID})
+					continue
+				}
+				mu.Lock()
+				_, liveExec := execs[f.AttachID]
+				_, liveTerm := atts[f.AttachID]
+				mu.Unlock()
+				if liveExec || liveTerm {
+					// A second open on a live id. Unreachable from this
+					// runnerd (Hub.next is monotonic), but serveSession is the
+					// sandbox's trust boundary: overwriting the entry would
+					// leave the previous process unkilled and its slot held
+					// for the life of the session.
 					write(Frame{Type: FrameClose, AttachID: f.AttachID})
 					continue
 				}
@@ -188,7 +287,14 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 						// stops the sandbox reading the process's pipes while
 						// this conn is not draining, so the process blocks on
 						// write(2) and no byte of its output is dropped.
-						if write(Frame{Type: FrameServer, AttachID: id, Payload: p}) != nil {
+						//
+						// Blocking, but not forever: this writer is shared
+						// with every other attachment on this conn and with
+						// the session RPC, so an exec caller that has stopped
+						// draining would otherwise stall a person's terminal
+						// behind it. See execWriteBudget.
+						if w.writeWithin(Frame{Type: FrameServer, AttachID: id, Payload: p},
+							w.execBudget) != nil {
 							mu.Lock()
 							delete(execs, id)
 							mu.Unlock()
@@ -201,6 +307,17 @@ func serveSession(ctx context.Context, conn Conn, s *session.Session, w *connWri
 					delete(execs, id)
 					mu.Unlock()
 				}(f.AttachID, att)
+				continue
+			case runner.KindTerminal:
+				// The terminal branch, below. Named rather than defaulted: an
+				// older plane sends no kind at all, which is the same thing
+				// and is why the empty string is this case too.
+			default:
+				// A kind this sessiond has never heard of. Refused rather than
+				// opened as a terminal, because the plane's own handshake is
+				// what turns "refused" into an actionable answer and there is
+				// no handshake for a kind nobody here can name.
+				write(Frame{Type: FrameClose, AttachID: f.AttachID})
 				continue
 			}
 			// The binding rides the frame that opens the attachment, so it is
