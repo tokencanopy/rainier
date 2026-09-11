@@ -282,6 +282,16 @@ not idle, and the timer starts again when the last one leaves. A session whose
 **boot** failed is kept too, however idle: attaching to it to read the log that
 says why is the only thing left to do with it.
 
+**Roll `controld` before the runners.** The auto-stop reports itself to the
+control plane with a `suspended_cold` event, which is additive — a control
+plane that predates it logs an unknown state and drops it, and the session row
+then reads `running` over a container that is stopped: `rainier attach` will
+not resume a `running` row and cannot reach a stopped sandbox, and the row is
+only corrected when that runner next reconnects. A fleet whose control plane
+has not been rolled yet must pass `--idle-stop 0` until it has;
+`scripts/fleet-up.sh` takes that as `IDLE_STOP=0`. Nothing in a runner can
+detect an old control plane, so this is an operational order, not a check.
+
 Resource-aware admission — memory and disk headroom instead of a fixed count,
 queueing instead of refusing, and one shared idleness signal — is
 [issue #85](https://github.com/tokencanopy/rainier/issues/85), which

@@ -296,6 +296,31 @@ fix — carry the generation on `resume` and have the runner adopt it, which rep
 `child_exited` for cold-resumed sessions too — is a separate change across the protocol and
 the control plane, and is recorded as a follow-up on the PR.
 
+## Deploy order
+
+**controld is rolled before its runners**, and until it has been, a runner must run with
+`--idle-stop 0`.
+
+`ProtocolVersion` stays 1 and the new event state is additive, which is what makes a
+mixed-version fleet work at all — but `runnerplane`'s translation drops an unknown state on
+its default arm, so a **new runnerd against an old controld** has its `suspended_cold`
+dropped. The row then reads `running` over a stopped container, and that is the same end
+state "the cold-resume fence" above spends a whole section making impossible: `rainier
+attach` does not resume a `running` row and finds no hub when it dials, and `ResumeSession`
+refuses it too. The user has no way back into their session until that runner happens to
+reconnect, because reconciliation runs once per runner connection and not periodically.
+
+There is no in-band answer. Bumping `ProtocolVersion` would have the old controld refuse the
+connection outright — losing the fleet rather than an event — and the control plane tells a
+runner nothing about which event states it understands. So the answer is operational, and it
+has two halves: the order above, and a knob. `scripts/fleet-up.sh` passes
+`--idle-stop "${IDLE_STOP:-30m}"`, so `IDLE_STOP=0` stands the feature down on an un-rolled
+fleet without editing the script, and the README's "Runner capacity" says both.
+
+This is true of every additive runner event and has simply never been written down. It is
+worth writing down here because this is the first one whose loss leaves a session
+*unreachable* rather than merely unreported.
+
 ## Other known limits
 
 - **A half-open viewer conn holds a session open.** `internal/relay` has no keepalive and
