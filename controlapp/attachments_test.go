@@ -562,18 +562,35 @@ type attachmentFakePolicy struct {
 	calls    int
 	lastMode control.AttachmentMode
 	asked    []control.AttachmentMode
+	// principals is the identity each question's CONTEXT carried, in the
+	// same order as asked. A host policy resolves its caller from the
+	// context — that is what ownerOrAdmin and every hosted authorizer do —
+	// so a fake that ignored the context could not tell a question about the
+	// attaching user from a question about nobody, which is exactly the
+	// defect it failed to see.
+	principals []string
 }
 
-func (f *attachmentFakePolicy) AuthorizeAttachment(_ context.Context, _ control.Scope, _ control.Resource, mode control.AttachmentMode) error {
+func (f *attachmentFakePolicy) AuthorizeAttachment(ctx context.Context, _ control.Scope, _ control.Resource, mode control.AttachmentMode) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	f.lastMode = mode
 	f.asked = append(f.asked, mode)
+	who, _ := testPrincipalFrom(ctx)
+	f.principals = append(f.principals, who)
 	if f.deny != nil && f.deny[mode] {
 		return control.ErrDenied
 	}
 	return f.err
+}
+
+// principalsAsked is the identity every question this policy was asked
+// carried, in order, with "" for a question about nobody.
+func (f *attachmentFakePolicy) principalsAsked() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.principals...)
 }
 
 // modes is every mode this policy was asked about, in order. The FIRST is the
@@ -588,6 +605,7 @@ func (f *attachmentFakePolicy) modes() []control.AttachmentMode {
 
 type attachmentFakeSessions struct {
 	mu         sync.Mutex
+	casCtx     context.Context // the context the last conditional claim reached the store on
 	found      bool
 	row        control.Session
 	err        error
@@ -810,11 +828,12 @@ func (r *attachmentRecordingTerminalStream) Close(err error) error {
 // CompareAndAdvanceControllerGeneration is the conditional grant: it advances
 // the row only from the exact generation the caller expected, so an attach
 // test can stage the race the contract is about.
-func (f *attachmentFakeSessions) CompareAndAdvanceControllerGeneration(_ context.Context, ws control.WorkspaceID,
+func (f *attachmentFakeSessions) CompareAndAdvanceControllerGeneration(ctx context.Context, ws control.WorkspaceID,
 	id control.SessionID, expected uint64) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.casCalls++
+	f.casCtx = ctx
 	if !f.found || f.row.ControllerGeneration != expected {
 		return 0, control.ErrStale
 	}
