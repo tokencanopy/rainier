@@ -254,12 +254,22 @@ Failure presence is included with fixed diagnostic guidance. Raw failure prose
 is omitted because it can contain secrets unknown to the local credential store. Raw provider errors, terminal contents,
 credentials, and internal database details are never shown.
 
-A `Controller:` line reports who may type: `this device`, `another device`, or
-`none`. It has three answers and no fourth. The API says whether somebody
-holds control, never who — that is a fact about another person's session — so
-"this device" is derived locally, from the generation this CLI was last
-granted: nobody else can hold a generation without advancing past it, so a
-live lease still at that number is this device's.
+One line reports who may type, and which line it is depends on the server's
+**attachment policy** (§3.6):
+
+- under a **shared** policy, `Input:  shared (N attached)` — the rule, and how
+  many attached terminals may type under it. There is no controller to name;
+  `N` is what the answering replica can see, and on a multi-replica host a
+  terminal attached elsewhere is not counted.
+- under an **exclusive** policy, `Controller:` reports `this device`, `another
+  device`, or `none`. It has three answers and no fourth. The API says whether
+  somebody holds control, never who — that is a fact about another person's
+  session — so "this device" is derived locally, from the generation this CLI
+  was last granted: nobody else can hold a generation without advancing past
+  it, so a live lease still at that number is this device's.
+
+A server that reports no policy at all is read as exclusive, which is what
+every build of this CLI assumed before the policy existed.
 
 ### 3.6 `rainier attach <session>`
 
@@ -280,10 +290,34 @@ states and a display word groups states the endpoint treats differently.
   control as it goes, so the next attach claims it with no key press.
 - `--since` remains the diagnostic replay and overrides every refusal above.
 
-**Who may type.** At most one attached device controls a session at any
-moment; every other attach is a viewer that receives the screen and the output
-and whose input is discarded. This is invisible on one laptop and is the whole
-point on a laptop and a phone.
+**Who may type.** The **server** decides, by its attachment policy, and the CLI
+reports what it is told. The policy is not negotiated: a client reads what the
+session view says about the session and what `attached` says about its own
+attach. Both policies admit `--view`, and under both a viewer receives the
+screen and the output and everything it sends is discarded.
+
+**Shared input** (the default on the hosted plane and in `controld`): every
+attach that asked to type may type, at the session's current generation.
+Nothing is claimed, no generation is advanced by an attach, a claim or a
+release, and no attach is ever displaced by another one. A laptop terminal and
+a browser terminal on one session both type, and their input executes in the
+order the pty receives it.
+
+- The first typer attaches in **silence**. A typer joining others prints ONE
+  line: `[2 other terminals attached; everyone may type. Ctrl-] detaches.]`
+- `--take` is accepted and does nothing beyond attaching as a typer. It is kept
+  rather than refused because an installed CLI passes it.
+- Ctrl-\ is still intercepted, and answered "you are still a viewer" for an
+  attach that may not type. The take-over copy — "another device has control",
+  "another device took control", "somebody else got there first" — is never
+  printed, because none of it is true: an attach that may not type was refused
+  by the host's policy, not beaten to it, and it is told so.
+- A `release` is accepted and stops THAT terminal typing. It is a no-op for
+  every other terminal.
+
+**Exclusive input**: at most one attached device controls a session at any
+moment; every other attach is a viewer. This is invisible on one laptop and is
+the whole point on a laptop and a phone.
 
 - A plain `attach` claims control when nobody holds it — which is every
   single-device attach — and attaches as a viewer when somebody does, printing
@@ -310,8 +344,17 @@ point on a laptop and a phone.
   server that does not implement conditional ownership it is forwarded to the
   remote application as an ordinary byte, and the attach behaves exactly as it
   did before this existed.
-- A viewer's resize is ignored. The terminal size follows the controller, so a
-  phone watching does not squeeze a laptop's terminal to phone width.
+- **Resize follows the latest client.** The pty is sized by the most recent
+  resize from any terminal that may type. A viewer's resize is remembered and
+  never applied, so a phone watching does not squeeze a laptop's terminal to
+  phone width. Under an exclusive policy exactly one terminal may type at a
+  time, so that is the controller's size; under a shared policy the terminal
+  that resized last owns the size, and the other typers render a screen that is
+  not their own until one of them resizes. Both rules are the same sentence,
+  and this is the one the pty implements.
+- The bullets from here to the end of this section are the **exclusive**
+  policy's. Under a shared policy nothing is claimed, no lease is taken, and a
+  reconnect comes back a typer.
 - **Reconnect is conditional.** A controller that reconnects within its lease
   presents the generation it held and resumes control only while nobody took
   it; if somebody did, it comes back as a viewer and says so. A connection
@@ -860,20 +903,32 @@ key always present so a consumer cannot mistake "absent" for "older server". A
 client that wants exactly what the control plane said reads those three and
 ignores the rest.
 
-The API's session view carries one further object, additively — nothing else
+The API's session view carries two further objects, additively — nothing else
 in it changed:
 
 ```json
 "controller": {"generation": "3", "held": true}
+"input": {"policy": "shared", "attached": 2}
 ```
 
-`generation` is the controller generation currently in force, as a DECIMAL
-STRING because it is a `uint64` and a JSON number past 2^53 is silently wrong
-in a browser. `held` is whether anybody holds it right now. It names nobody: a
-client learns that somebody has control, never who or on what device. Both
-keys are always present; a server that predates them sends neither, which
+`controller.generation` is the controller generation currently in force, as a
+DECIMAL STRING because it is a `uint64` and a JSON number past 2^53 is silently
+wrong in a browser. `held` is whether anybody holds it right now. It names
+nobody: a client learns that somebody has control, never who or on what device.
+Both keys are always present; a server that predates them sends neither, which
 reads as "nobody has control" and is the truth there, because nothing was ever
-conditional.
+conditional. **Neither key changed meaning when the shared policy shipped** —
+the generation still exists and is still what input is fenced against.
+
+`input.policy` is the server's attachment policy, `"shared"` or `"exclusive"`,
+and `input.attached` is how many attached terminals may currently type. The
+count is a status fact and never an authorization input: it is what the replica
+answering the request can see, so on a multi-replica host a terminal attached
+elsewhere is not counted, and it can change the instant after it is read. It
+names nobody — a count is not an identity. An **empty** policy is a meaningful
+answer and not a gap: it is what a server that predates this object says by
+omitting it, and a client reads an empty or unrecognised policy as exclusive,
+which is the behaviour every earlier client already had.
 
 The derived fields are **additive and separately named** — `lifecycle`,
 `process`, `connection`, and an `actions` object — so nothing overwrites a fact
