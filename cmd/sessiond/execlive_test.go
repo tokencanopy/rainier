@@ -80,7 +80,7 @@ func TestALiveExecIsReportedUpstream(t *testing.T) {
 func TestTheMailboxKeepsTheNEWESTReport(t *testing.T) {
 	m := newExecCountMailbox()
 	for seq := uint64(1); seq <= 5; seq++ {
-		m.offer(execCountPayload(int(seq), seq))
+		m.offer(execCountPayload(int(seq), seq), seq)
 	}
 	var ev relay.ControlEvent
 	select {
@@ -101,8 +101,8 @@ func TestTheMailboxKeepsTheNEWESTReport(t *testing.T) {
 	}
 	// And a nil payload — what execCountPayload returns when encoding failed —
 	// does not clear it.
-	m.offer(execCountPayload(9, 9))
-	m.offer(nil)
+	m.offer(execCountPayload(9, 9), 9)
+	m.offer(nil, 0)
 	select {
 	case <-m.c():
 	default:
@@ -123,7 +123,7 @@ func TestConcurrentOffersLeaveTheNewestReport(t *testing.T) {
 			wg.Add(1)
 			go func(seq uint64) {
 				defer wg.Done()
-				m.offer(execCountPayload(int(seq), seq))
+				m.offer(execCountPayload(int(seq), seq), seq)
 			}(uint64(i))
 		}
 		wg.Wait()
@@ -133,8 +133,8 @@ func TestConcurrentOffersLeaveTheNewestReport(t *testing.T) {
 			if err := json.Unmarshal(p, &ev); err != nil {
 				t.Fatal(err)
 			}
-			if ev.Seq == 0 {
-				t.Fatalf("the mailbox held a report with no sequence: %s", p)
+			if ev.Seq != n {
+				t.Fatalf("the mailbox held sequence %d, want the newest, %d: a later arrival evicted a newer report", ev.Seq, n)
 			}
 		default:
 			t.Fatal("every concurrent offer was lost")

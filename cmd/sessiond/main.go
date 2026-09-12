@@ -506,6 +506,15 @@ func reportExecs(sender controlSender, execs execReporter) {
 type execCountMailbox struct {
 	mu sync.Mutex
 	ch chan []byte
+	// seq is the sequence number of the report the slot holds, if any. The
+	// producer assigns sequence numbers under its own lock and hands the
+	// report over AFTER the unlock, so two reports can arrive here out of
+	// order; the number is what lets this slot keep the newer one rather
+	// than the later one. Without it the last of four teardown reports to
+	// arrive — say live=1, seq=8 — could evict the terminal live=0, seq=9,
+	// and the far end would believe a finished session still working until
+	// the next transition, which for a finished session never comes.
+	seq uint64
 }
 
 func newExecCountMailbox() *execCountMailbox {
@@ -519,7 +528,7 @@ func newExecCountMailbox() *execCountMailbox {
 func watchExecs(execs *sandboxexec.Runner) *execCountMailbox {
 	m := newExecCountMailbox()
 	execs.ObserveLive(func(live int, seq uint64) {
-		m.offer(execCountPayload(live, seq))
+		m.offer(execCountPayload(live, seq), seq)
 	})
 	return m
 }
@@ -529,16 +538,22 @@ func watchExecs(execs *sandboxexec.Runner) *execCountMailbox {
 // back at once — so two offers cannot both find the slot empty and leave the
 // older one in it. The consumer only ever makes room, so the second send
 // cannot fail.
-func (m *execCountMailbox) offer(p []byte) {
+func (m *execCountMailbox) offer(p []byte, seq uint64) {
 	if p == nil {
 		return
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	select {
-	case <-m.ch:
+	case held := <-m.ch:
+		if m.seq > seq {
+			// The slot held a NEWER report than the one arriving. Keep it.
+			m.ch <- held
+			return
+		}
 	default:
 	}
+	m.seq = seq
 	select {
 	case m.ch <- p:
 	default:

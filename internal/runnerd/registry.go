@@ -963,9 +963,11 @@ func (r *registry) resumed(id string, restarted bool) {
 	e.childExitedAt = time.Time{}
 	e.lastDetachAt = time.Time{}
 	// The restarted container's commands are gone with its process tree, and
-	// its sessiond is a NEW process whose sequence numbers start again at 1 —
-	// so the fence has to be cleared with the count, or every report from the
-	// new sandbox would look stale and be refused for the life of the entry.
+	// its sessiond is a NEW process whose sequence numbers start again at 1.
+	// The registration that process makes mints a higher execReg, and the
+	// adopt branch in execCount resets the sequence fence with it, so nothing
+	// depends on clearing it here; it is cleared with the count for the same
+	// belt-and-braces reason as execReg below.
 	// A warm resume clears none of this and must not: nothing restarted, the
 	// same sessiond keeps counting, and the suspend handshake has already
 	// killed its execs and reported zero.
