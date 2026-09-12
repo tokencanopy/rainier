@@ -92,25 +92,38 @@ type Frame struct {
 // ControlSender.Send, Hub.SendControl, and both control handlers alike — but
 // owning the shape is what keeps a field rename from silently becoming a
 // dropped event.
-// The two kinds of the suspend handshake. They are constants rather than
-// literals because both ends of the hop are in different repositories'
-// worth of build lineage — runnerd runs on the host and sessiond ships inside
-// the session image, so a typo on one side would be a silently ignored frame
-// rather than a compile error.
+// The three kinds of the suspend handshake. They are constants rather than
+// literals because both ends of the hop come from different build lineages —
+// runnerd runs on the host and sessiond ships inside the session image — so a
+// typo on one side would be a silently ignored frame rather than a compile
+// error.
+//
+// All three carry a NONCE in ControlEvent.ID, which is the one place an event
+// uses that field. Without it a late answer to a suspend that already gave up
+// satisfies the NEXT one: runnerd would freeze a container while its sandbox
+// was still mid-kill, leaving a signal pending in the freezer cgroup — the
+// exact failure this handshake exists to prevent, reintroduced by its own
+// acknowledgement.
 const (
 	// KindSuspending is runnerd telling a sandbox it is about to be FROZEN.
 	// It is sent before `docker pause`, which sessiond never sees as a signal:
 	// a paused sessiond receives no SIGTERM, so without this the exec runner's
 	// KillAll — the one bound on a detached exec's life — would never run on
 	// the default `rainier stop`.
-	//
-	// A sessiond that predates it logs an unknown kind and drops it, and
-	// runnerd's acknowledgement wait expires and pauses anyway, which is
-	// exactly the behaviour the fleet has today.
 	KindSuspending = "suspending"
-	// KindSuspendReady is the sandbox saying its execs are gone (or that it
-	// gave up waiting for one). It carries nothing: runnerd is waiting for the
-	// FACT, and a count would be a number nobody acts on.
+	// KindSuspendAck is the sandbox saying it HEARD, immediately, before it
+	// starts killing anything.
+	//
+	// It exists so that the two waits can be different lengths. A sessiond
+	// that predates this vocabulary answers nothing at all, and a session
+	// keeps the sessiond it booted with for life — so every session created
+	// before exec shipped would otherwise pay the full "are they gone yet"
+	// budget on every warm stop, forever. Hearing an ack is what tells runnerd
+	// it is worth waiting for the rest; hearing none is what tells it not to.
+	KindSuspendAck = "suspend_ack"
+	// KindSuspendReady is the sandbox saying its execs are GONE (or that it
+	// gave up waiting for one). Beyond the nonce it carries nothing: runnerd
+	// is waiting for the fact, and a count would be a number nobody acts on.
 	KindSuspendReady = "suspend_ready"
 )
 
@@ -122,6 +135,12 @@ type ControlEvent struct {
 	// response only against the requests it sent. Zero means "not an RPC" —
 	// the fire-and-forget event shape — which is why it is omitempty rather
 	// than a pointer: an event has no id to omit ambiguously.
+	//
+	// The suspend handshake is the one EVENT that uses it, as a nonce rather
+	// than as a request id, so that a late answer cannot satisfy the next
+	// suspend. It shares no space with the RPC ids: those travel on kinds
+	// "req:"/"resp", which every reader matches before it reaches a suspend
+	// kind, and neither end looks one up in the other's table.
 	ID uint64 `json:"id,omitempty"`
 	// OK is a response's verdict, meaningful only on Kind "resp". False is the
 	// zero value and therefore absent from the wire, which is the safe

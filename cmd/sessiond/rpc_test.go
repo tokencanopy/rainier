@@ -458,7 +458,7 @@ func suspendWired(execs execKiller) (*rpcDispatcher, *recordingSender) {
 	sender := &recordingSender{}
 	d.online(sender)
 	d.RegisterEventHandler(relay.KindSuspending, func(relay.ControlEvent) {
-		quiesceExecs(execs, d)
+		quiesceExecs(execs, d, 77)
 	})
 	return d, sender
 }
@@ -494,12 +494,61 @@ func TestASuspendNoticeEndsEveryExec(t *testing.T) {
 		t.Fatalf("the kill was given %s, want the quiesce budget %s", budget, execQuiesceBudget)
 	}
 	got := sender.events()
-	if len(got) != 1 || got[0].Kind != relay.KindSuspendReady {
-		t.Fatalf("the sandbox answered %+v, want one %s", got, relay.KindSuspendReady)
+	if len(got) != 2 {
+		t.Fatalf("the sandbox answered %+v, want an ack and then a ready", got)
 	}
-	if got[0].ID != 0 {
-		t.Fatalf("the acknowledgement carries id %d; it is an event, not a response", got[0].ID)
+	if got[0].Kind != relay.KindSuspendAck || got[1].Kind != relay.KindSuspendReady {
+		t.Fatalf("the sandbox answered %s then %s, want %s then %s",
+			got[0].Kind, got[1].Kind, relay.KindSuspendAck, relay.KindSuspendReady)
 	}
+	for _, ev := range got {
+		if ev.ID != 77 {
+			t.Fatalf("a %s answered nonce %d, want the notice's own 77 — without the "+
+				"echo a late answer satisfies the NEXT suspend", ev.Kind, ev.ID)
+		}
+	}
+}
+
+// TestTheSandboxSaysItHeardBeforeItStartsKilling is why there are two answers.
+// runnerd cannot tell a sandbox that is working from one that predates this
+// notice, and a session keeps the sessiond it booted with for life — so
+// without an early "heard you" every session created before exec shipped would
+// make every warm stop wait out the long budget, forever.
+func TestTheSandboxSaysItHeardBeforeItStartsKilling(t *testing.T) {
+	killing := make(chan struct{})
+	execs := &blockingExecs{enter: killing, release: make(chan struct{})}
+	d, sender := suspendWired(execs)
+
+	done := make(chan struct{})
+	go func() { defer close(done); d.OnControl(suspendFrame(t)) }()
+
+	<-killing // the kill is under way and has not returned
+	got := sender.events()
+	if len(got) != 1 || got[0].Kind != relay.KindSuspendAck {
+		t.Fatalf("before the kill finished the sandbox had said %+v, want the ack — "+
+			"an old sandbox is indistinguishable from a working one without it", got)
+	}
+	close(execs.release)
+	<-done
+	if got := sender.events(); len(got) != 2 || got[1].Kind != relay.KindSuspendReady {
+		t.Fatalf("after the kill the sandbox had said %+v", got)
+	}
+}
+
+// blockingExecs parks inside the kill so a test can look at what has been said
+// while it is still running.
+type blockingExecs struct {
+	enter   chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingExecs) KillAll() {}
+
+func (b *blockingExecs) KillAllAndWait(time.Duration) int {
+	b.once.Do(func() { close(b.enter) })
+	<-b.release
+	return 0
 }
 
 // TestASuspendNoticeIsAcknowledgedEvenWhenAnExecWillNotDie: runnerd freezes the
@@ -512,9 +561,9 @@ func TestASuspendNoticeIsAcknowledgedEvenWhenAnExecWillNotDie(t *testing.T) {
 	d.OnControl(suspendFrame(t))
 
 	got := sender.events()
-	if len(got) != 1 || got[0].Kind != relay.KindSuspendReady {
-		t.Fatalf("a sandbox with a stubborn exec answered %+v, want one %s",
-			got, relay.KindSuspendReady)
+	if len(got) != 2 || got[1].Kind != relay.KindSuspendReady {
+		t.Fatalf("a sandbox with a stubborn exec answered %+v, want an ack and a ready",
+			got)
 	}
 }
 
@@ -537,6 +586,7 @@ func TestAnUnknownControlKindIsStillDropped(t *testing.T) {
 	if got := sender.events(); len(got) != 0 {
 		t.Fatalf("an unknown control kind produced %+v", got)
 	}
+
 }
 
 // TestAPanickingEventHandlerDoesNotTakeTheSessionDown: event handlers run on

@@ -222,11 +222,42 @@ needed:
   `rainier stop` is a warm suspend — `docker pause` — which delivers nothing at
   all: the freezer cgroup stops the process where it stands, so a detached run
   would be frozen and resumed rather than reaped, and an in-flight exec's
-  caller would block until somebody resumed the session. So runnerd sends the
-  sandbox a `suspending` control event before it pauses the container and waits
-  (bounded) for the `suspend_ready` that says the execs are gone. A sessiond
-  that predates the event logs an unknown kind and drops it, and the wait
-  expires and the pause proceeds — which is the behaviour a fleet has today.
+  caller would block until somebody resumed the session.
+
+  So runnerd sends the sandbox a `suspending` control event before it pauses the
+  container, and the sandbox answers **twice**: `suspend_ack` at once, and
+  `suspend_ready` when the processes are actually gone. Three properties fall
+  out of that shape, and each of them is the answer to a way the one-answer
+  version was wrong:
+
+  - **Two answers, so the two waits can be different lengths.** runnerd cannot
+    tell a sandbox that is working from one that predates the notice entirely,
+    and a session keeps the `sessiond` it booted with for life — so with one
+    answer, every session created before exec shipped would make every warm
+    stop wait out the whole "are they gone" budget, forever. The ack is cheap
+    and immediate; hearing none means "this sandbox is old, carry on" after two
+    seconds rather than twelve.
+  - **A nonce on all three, echoed by the sandbox.** Sessiond's answer can
+    legitimately outlast runnerd's budget, so without one, a straggler from a
+    suspend that already gave up releases the NEXT suspend — freezing a
+    container while its sandbox is mid-kill and leaving a signal pending in the
+    freezer cgroup, which is the exact failure this handshake exists to prevent.
+  - **The wait is for the PROCESSES, not the signals.** `KillAll` signals on a
+    goroutine per exec, so answering as soon as it returns would report a
+    suspend ready with the SIGTERMs still in flight. `KillAllAndWait` waits for
+    the slots to come back, and the sandbox's budget is longer than its own kill
+    grace so the SIGTERM→SIGKILL escalation completes before the clocks stop.
+
+  A sessiond that predates the notice logs an unknown kind and drops it; the ack
+  wait expires and the pause proceeds, which is the behaviour a fleet has today.
+  A conn that has died and a dispatch whose context is already cancelled both
+  end the wait at once rather than spending it on an answer that cannot come.
+
+  One thing the sandbox does NOT do is keep accepting commands while it is
+  quiescing. The relay conn stays up for the whole of that budget, so an exec
+  arriving mid-sweep would be spawned into a container that is about to be
+  frozen and then frozen alive — so the runner refuses new execs once the sweep
+  has begun, with `exec_error{session_ending}`.
 - **A way to be listed** — not needed in v1, and deliberately not built. The
   caller has the pid, the sandbox has `ps`, and a listing API would be a
   second source of truth about processes the sandbox already knows about.

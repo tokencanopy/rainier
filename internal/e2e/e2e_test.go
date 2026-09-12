@@ -582,11 +582,19 @@ func (ss *scriptedSessiond) execRunner() *sandboxexec.Runner {
 // runnerd is told when they are gone so the container can be frozen without a
 // half-delivered signal pending inside it. It is the same pair of steps
 // cmd/sessiond's quiesceExecs takes, over the same real runner.
-func (ss *scriptedSessiond) quiesce(ctx context.Context) {
+func (ss *scriptedSessiond) quiesce(ctx context.Context, nonce uint64) {
+	// Heard, then gone — two answers with the notice's own nonce, because
+	// runnerd cannot otherwise tell a sandbox that is working from one that
+	// predates the notice entirely.
+	ss.answerSuspend(ctx, relay.KindSuspendAck, nonce)
 	if execs := ss.execRunner(); execs != nil {
-		execs.KillAllAndWait(6 * time.Second)
+		execs.KillAllAndWait(10 * time.Second)
 	}
-	b, err := json.Marshal(relay.ControlEvent{Kind: relay.KindSuspendReady})
+	ss.answerSuspend(ctx, relay.KindSuspendReady, nonce)
+}
+
+func (ss *scriptedSessiond) answerSuspend(ctx context.Context, kind string, nonce uint64) {
+	b, err := json.Marshal(relay.ControlEvent{Kind: kind, ID: nonce})
 	if err != nil {
 		return
 	}
@@ -842,15 +850,15 @@ func (ss *scriptedSessiond) onControl(ctx context.Context, payload []byte) {
 		return
 	}
 	switch {
-	case ev.Kind == relay.KindSuspendReady:
-		// Upward only; a sandbox never receives its own acknowledgement.
+	case ev.Kind == relay.KindSuspendAck, ev.Kind == relay.KindSuspendReady:
+		// Upward only; a sandbox never receives its own answers.
 		return
 	case ev.Kind == relay.KindSuspending:
-		// The two lines a real sessiond runs, and for the same reason: the
+		// The steps a real sessiond takes, and for the same reason: the
 		// container is about to be FROZEN, which delivers no signal, so this
-		// is the only chance every exec — detached ones included — gets to
-		// end before the freezer cgroup stops the clock on it.
-		go ss.quiesce(ctx)
+		// is the only chance every exec — detached ones included — gets to end
+		// before the freezer cgroup stops the clock on it.
+		go ss.quiesce(ctx, ev.ID)
 	case ev.Kind == "resp":
 		if ev.ID == 0 {
 			return
@@ -3530,7 +3538,7 @@ func TestStoppingASessionEndsAnInFlightExec(t *testing.T) {
 	}
 }
 
-// TestExecRefusalsEndToEnd is the design's status table, from the client's// TestExecRefusalsEndToEnd is the design's status table, from the client's
+// TestExecRefusalsEndToEnd is the design's status table, from the client's
 // side: each refusal is a status code the CLI can act on, answered before the
 // socket is upgraded.
 func TestExecRefusalsEndToEnd(t *testing.T) {

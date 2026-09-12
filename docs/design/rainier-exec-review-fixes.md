@@ -75,15 +75,39 @@ Two options, and the first is taken:
   would mean a `claude --continue` resuming hours later inside a session
   somebody stopped on purpose.
 
-Mechanism: runnerd sends a **suspend control frame** down the session's relay
-conn immediately before `drv.Suspend(ctx, handle, warm)` and waits a short,
-bounded time for the sandbox's acknowledgement before pausing it. sessiond
-answers by calling `Runner.KillAll`, which closes every exec attachment; the
-relay's forwarder then sends the `FrameClose` that ends each in-flight exec's
-stream, so the caller sees the connection end with no exit status — exit 125 —
-and `execEndedSentence` re-reads the session and says *"the session was
-stopped before the command reported an exit status"*, which is the branch the
-amendment intended and which was unreachable on the default path.
+Mechanism: runnerd sends a **`suspending` control event** down the session's
+relay conn immediately before `drv.Suspend(ctx, handle, warm)`, and the sandbox
+answers **twice** — `suspend_ack` at once, `suspend_ready` when the processes
+are gone. sessiond answers by calling `Runner.KillAllAndWait`, which closes
+every exec attachment; the relay's forwarder then sends the `FrameClose` that
+ends each in-flight exec's stream, so the caller sees the connection end with no
+exit status — exit 125 — and `execEndedSentence` re-reads the session and says
+*"the session was stopped before the command reported an exit status"*, which is
+the branch the amendment intended and which was unreachable on the default path.
+
+Three things about that shape are answers to ways a simpler version was wrong,
+and each was found by executing it rather than reading it:
+
+- **Two answers rather than one**, so the two waits can be different lengths.
+  runnerd cannot tell a sandbox that is working from one that predates the
+  notice, and a session keeps the `sessiond` it booted with for life — so a
+  single answer made every session created before exec shipped pay the full
+  budget on every warm stop, forever. The ack is immediate; hearing none means
+  "old sandbox, carry on" after two seconds instead of twelve.
+- **A nonce on all three, echoed back.** sessiond's answer can outlast
+  runnerd's budget (its own quiesce waits out a kill grace, and the send behind
+  it queues on a conn writer an exec may be holding), so a straggler from a
+  suspend that already gave up released the NEXT one — freezing a container
+  mid-kill and leaving a signal pending in the freezer cgroup, which is the
+  failure the handshake exists to prevent.
+- **A latch on the runner**, not just a sweep. The relay conn stays up for the
+  whole budget, so an exec opened mid-quiesce was spawned, never signalled, and
+  frozen alive. `reserve` refuses once the sweep has begun, with
+  `exec_error{session_ending}`.
+
+Everything that can go wrong ends in "pause anyway": no hub, an old sandbox, a
+conn that died, a cancelled dispatch. The last two end the wait at once rather
+than spending it.
 
 Compatibility, both directions, is why this is an event and not a new required
 handshake:
@@ -228,7 +252,7 @@ obvious:
 |---|---|
 | 1 | The subprocess target sleeps rather than parking every goroutine, and a new `grandchild` case (`sh -c 'sleep 300 & sleep 300'`) gives the **minus sign** a witness: signalling the leader alone leaves the grandchild alive, which the test polls `rec.calls()` for. |
 | 2 | `TestAgentAnnouncesItsCapabilities` gains the 32-capability boundary case. |
-| 3 | Through the real path: a sessiond fixture receives the suspend frame and its exec runner's processes are gone afterwards; a second test drives runnerd's warm `Op` and asserts the frame is sent before the driver's `Suspend`. |
+| 3 | Through the real path: a sessiond fixture receives the suspend frame and answers both times with the right nonce; runnerd's tests pin the ORDER against the driver, that an ack alone does not release the pause, that an old sandbox pays only the short budget, that a stale answer cannot release the next suspend, and that a dead conn or a cancelled dispatch ends the wait at once. e2e drives the real stop route. |
 | 4 | An fd census across 50 exec cycles, which is what makes a one-socket-per-command leak visible at all. |
 | 5 | One assertion per surviving mutant: the `--json` stream swap, the `KillAll` wiring, the detached slot release, and `ExecClientStream`'s budget. |
 | 7 | Linux-only, executed here: an eviction with a waiter parked on the evicted pid, and a stale unclaimed record a later mark must ignore. |

@@ -88,17 +88,32 @@ type Server struct {
 	// never registered" would otherwise take ten seconds each — and it is only
 	// ever written immediately after New, before this server serves anything.
 	hubWait time.Duration
-	// suspendAcks is the one waiter per session for a sandbox's
-	// `suspend_ready`. It is keyed by session and holds at most one entry,
-	// because two concurrent suspends of one session are already a caller
-	// bug and neither could be told apart by an acknowledgement that carries
-	// nothing. A `suspend_ready` arriving with no waiter is dropped.
-	suspendMu   sync.Mutex
-	suspendAcks map[string]chan struct{}
-	// suspendWait is how long a warm suspend gives the sandbox to say its
-	// execs are gone. A field rather than a constant so a test does not spend
-	// the production budget; only ever written immediately after New.
-	suspendWait time.Duration
+	// suspends is the one waiter per session for a sandbox's answers to a
+	// suspend notice. It holds at most one entry per session: two concurrent
+	// warm suspends of one session are already a caller bug, and the second
+	// simply waits out its own budget rather than being mis-served by the
+	// first's answer — see deliverSuspend, which matches the NONCE.
+	suspendMu sync.Mutex
+	suspends  map[string]*suspendWaiter
+	// suspendNonce is this runner's source of those nonces. Monotonic per
+	// process, which is all that is needed: a nonce only has to distinguish a
+	// suspend from the ones before it on the same conn.
+	suspendNonce atomic.Uint64
+	// suspendAckWait and suspendReadyWait are the two budgets a warm suspend
+	// gives a sandbox: "did you hear me" and "are they gone". Fields rather
+	// than constants so a test does not spend the production ones; only ever
+	// written immediately after New.
+	suspendAckWait   time.Duration
+	suspendReadyWait time.Duration
+}
+
+// suspendWaiter is one in-flight suspend's two answers, matched by nonce.
+type suspendWaiter struct {
+	nonce     uint64
+	ack       chan struct{}
+	ready     chan struct{}
+	ackOnce   sync.Once
+	readyOnce sync.Once
 }
 
 // SetOnEvent installs f as the session-event callback (nil clears it).
@@ -176,8 +191,9 @@ func (e *egressError) Unwrap() error { return e.err }
 
 func New(drv driver.Driver, dialBase, egressAdmin, proxyURL string) *Server {
 	return &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin,
-		proxyURL: proxyURL, hubWait: defaultHubWait, suspendWait: defaultSuspendWait,
-		suspendAcks: map[string]chan struct{}{}}
+		proxyURL: proxyURL, hubWait: defaultHubWait,
+		suspendAckWait: defaultSuspendAckWait, suspendReadyWait: defaultSuspendReadyWait,
+		suspends: map[string]*suspendWaiter{}}
 }
 
 // Recover rebuilds the in-memory registry from the driver's labeled
@@ -545,7 +561,7 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 		// design's lifetime rule. Sent only for the warm case, so the cold
 		// path keeps exactly the shape it has today.
 		if warm {
-			s.quiesceExecs(id)
+			s.quiesceExecs(ctx, id)
 		}
 		if !warm {
 			// Cold suspend (docker stop) kills the container's sessiond,
@@ -864,11 +880,14 @@ func (s *Server) routeControl(id string, payload []byte) {
 			return
 		}
 		s.fireEventDetail(id, "stage_failed", stageFailedDetail(stage, ev.RC, ev.Tail))
+	case relay.KindSuspendAck:
+		// The sandbox heard the notice. It stays between this process and that
+		// sandbox: controld asked for a suspend and is waiting for THAT
+		// answer, not for a step of it.
+		s.deliverSuspend(id, ev.ID, false)
 	case relay.KindSuspendReady:
-		// The sandbox's execs are gone and the container may be frozen. It
-		// stays between this process and that sandbox: controld asked for a
-		// suspend and is waiting for THAT answer, not for this step of it.
-		s.deliverSuspendAck(id)
+		// And its execs are gone, so the container may be frozen.
+		s.deliverSuspend(id, ev.ID, true)
 	case "credential_rejected":
 		// A git operation in the sandbox was refused by GitHub. The vault mints
 		// optimistically (no GitHub round-trip per mint, design §4.2), so an
@@ -931,83 +950,128 @@ func (s *Server) routeControl(id string, payload []byte) {
 	}
 }
 
-// defaultSuspendWait is how long a warm suspend gives a sandbox to say its
-// execs are gone.
+// The two budgets a warm suspend gives a sandbox, and they are different
+// lengths because they answer different questions.
 //
-// It is a little longer than the sandbox's own quiesce budget, so the ordinary
-// answer is the acknowledgement rather than this timeout; a sandbox that
-// predates the notice never answers at all and spends the whole of it, which
-// is the one case where a `rainier stop` gets slower than it is today. That is
-// bounded, it happens only for sessions created before exec shipped, and the
-// alternative is a lifetime rule that is false.
-const defaultSuspendWait = 7 * time.Second
+// suspendAckWait is "did you hear me". A sessiond that predates this
+// vocabulary answers nothing, and a session keeps the sessiond it booted with
+// for life — so every session created before exec shipped reaches this path,
+// forever, and must pay as little as possible for it. Two seconds is a
+// round-trip on an already-open socket inside one container.
+//
+// suspendReadyWait is "are they gone", and it starts only once an ack has
+// arrived — so only a sandbox that actually speaks the vocabulary can spend
+// it. It is comfortably longer than the sandbox's own quiesce budget, so the
+// ordinary answer is the acknowledgement rather than this timeout.
+const (
+	defaultSuspendAckWait   = 2 * time.Second
+	defaultSuspendReadyWait = 12 * time.Second
+)
 
 // quiesceExecs tells the sandbox it is about to be frozen and waits for it to
 // say its execs are gone.
 //
 // Best effort by construction, and every way it can fail ends in "pause
 // anyway": a session that never registered a hub has no sandbox to tell, a
-// sessiond that predates the notice logs an unknown kind and drops it, and a
-// conn that has died takes the whole question with it. None of those is worse
-// than today, where the notice is not sent at all.
-func (s *Server) quiesceExecs(id string) {
+// sessiond that predates the notice drops it, a conn that has died takes the
+// whole question with it, and a cancelled dispatch is one whose suspend is
+// about to fail on its own. None of those is worse than not sending it at all.
+func (s *Server) quiesceExecs(ctx context.Context, id string) {
 	hub, ok := s.reg.hub(id)
 	if !ok {
 		return
 	}
-	b, err := json.Marshal(relay.ControlEvent{Kind: relay.KindSuspending})
+	nonce := s.suspendNonce.Add(1)
+	w := s.armSuspendWaiter(id, nonce)
+	defer s.disarmSuspendWaiter(id, w)
+
+	b, err := json.Marshal(relay.ControlEvent{Kind: relay.KindSuspending, ID: nonce})
 	if err != nil {
 		log.Printf("session %s: encoding the suspend notice: %v", id, err)
 		return
 	}
-	ack := s.armSuspendAck(id)
-	defer s.disarmSuspendAck(id)
 	if err := hub.SendControl(b); err != nil {
 		log.Printf("session %s: sending the suspend notice: %v; suspending anyway", id, err)
 		return
 	}
+
+	// "Did you hear me." A sandbox that predates the notice never will, and
+	// paying the long budget for every one of them on every stop is what this
+	// first, short wait exists to avoid.
+	ackTimer := time.NewTimer(s.suspendAckWait)
+	defer ackTimer.Stop()
 	select {
-	case <-ack:
-	case <-time.After(s.suspendWait):
+	case <-w.ack:
+	case <-hub.Done():
+		return
+	case <-ctx.Done():
+		return
+	case <-ackTimer.C:
 		log.Printf("session %s: the sandbox did not acknowledge the suspend within %s "+
 			"(a sandbox created before exec shipped never will); suspending anyway",
-			id, s.suspendWait)
+			id, s.suspendAckWait)
+		return
+	}
+
+	// "Are they gone." Only a sandbox that answered above can spend this.
+	readyTimer := time.NewTimer(s.suspendReadyWait)
+	defer readyTimer.Stop()
+	select {
+	case <-w.ready:
+	case <-hub.Done():
+	case <-ctx.Done():
+	case <-readyTimer.C:
+		log.Printf("session %s: the sandbox heard the suspend but had not finished "+
+			"ending its commands within %s; suspending anyway", id, s.suspendReadyWait)
 	}
 }
 
-// armSuspendAck registers this session's one waiter, replacing any stale
-// entry: a previous suspend that timed out left one behind, and a
-// `suspend_ready` for it would otherwise satisfy this one.
-func (s *Server) armSuspendAck(id string) chan struct{} {
-	ch := make(chan struct{})
+// armSuspendWaiter registers this suspend's waiter, replacing any stale entry:
+// a previous suspend that timed out left one behind, and its answers must not
+// find it. The nonce is what keeps those answers from finding THIS one.
+func (s *Server) armSuspendWaiter(id string, nonce uint64) *suspendWaiter {
+	w := &suspendWaiter{nonce: nonce, ack: make(chan struct{}), ready: make(chan struct{})}
 	s.suspendMu.Lock()
-	s.suspendAcks[id] = ch
+	s.suspends[id] = w
 	s.suspendMu.Unlock()
-	return ch
+	return w
 }
 
-func (s *Server) disarmSuspendAck(id string) {
+// disarmSuspendWaiter removes this suspend's waiter and only this one.
+// Deleting by key alone would let a suspend that finished first unregister a
+// concurrent second suspend's waiter, which then waits out its whole budget
+// with the answer already in hand.
+func (s *Server) disarmSuspendWaiter(id string, w *suspendWaiter) {
 	s.suspendMu.Lock()
-	delete(s.suspendAcks, id)
-	s.suspendMu.Unlock()
-}
-
-// deliverSuspendAck wakes this session's waiter, once. A `suspend_ready` with
-// no waiter is a late answer to a suspend that already gave up, and dropping
-// it is the whole of what there is to do.
-func (s *Server) deliverSuspendAck(id string) {
-	s.suspendMu.Lock()
-	ch, ok := s.suspendAcks[id]
-	if ok {
-		delete(s.suspendAcks, id)
+	if s.suspends[id] == w {
+		delete(s.suspends, id)
 	}
 	s.suspendMu.Unlock()
-	if ok {
-		close(ch)
+}
+
+// deliverSuspend wakes this session's waiter, once per answer, and only when
+// the NONCE matches the suspend that is actually in flight. A mismatch is a
+// late answer to a suspend that already gave up and froze the container;
+// letting it release the next one would freeze a sandbox mid-kill.
+func (s *Server) deliverSuspend(id string, nonce uint64, ready bool) {
+	s.suspendMu.Lock()
+	w := s.suspends[id]
+	s.suspendMu.Unlock()
+	switch {
+	case w == nil:
+		return // no suspend in flight; nothing to answer
+	case w.nonce != nonce:
+		log.Printf("session %s: a suspend answer for %d arrived while %d is in flight; "+
+			"dropping it", id, nonce, w.nonce)
+		return
+	case ready:
+		w.readyOnce.Do(func() { close(w.ready) })
+	default:
+		w.ackOnce.Do(func() { close(w.ack) })
 	}
 }
 
-// sendSessionRPC delivers one envelope into a sandbox as a control frame: a
+// sendSessionRPC delivers one envelope into a sandbox as a control frame:// sendSessionRPC delivers one envelope into a sandbox as a control frame: a
 // request controld originated, or the response to one the sandbox originated.
 // It is the mirror of routeControl's forwarding, and the one place the
 // envelope/ControlEvent translation happens in this direction.

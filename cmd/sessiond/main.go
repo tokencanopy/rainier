@@ -207,8 +207,8 @@ func main() {
 	// CLI's help says and what the design's lifetime rule states — true on
 	// the path users actually take.
 	if rpc != nil {
-		rpc.RegisterEventHandler(relay.KindSuspending, func(relay.ControlEvent) {
-			quiesceExecs(execs, rpc)
+		rpc.RegisterEventHandler(relay.KindSuspending, func(ev relay.ControlEvent) {
+			quiesceExecs(execs, rpc, ev.ID)
 		})
 	}
 
@@ -378,7 +378,18 @@ func onShutdownSignal(stopWatching func(), stop func(), execs execKiller, closeA
 	}
 }
 
-const execQuiesceBudget = 6 * time.Second
+// execQuiesceBudget bounds how long the sandbox waits for its execs to be
+// GONE before saying so.
+//
+// Longer than sandboxexec's own kill grace on purpose: that grace is what
+// separates the SIGTERM from the SIGKILL, and answering in between would
+// freeze the container with the escalation still on a timer the freezer cgroup
+// then stops. By the time it expires every exec has had both signals, so what
+// can still be outstanding is a drain waiting for EOF on a pipe some process
+// outside the group is holding — not a live command. Every session running no
+// exec at all, which is nearly every stop, answers immediately and pays none
+// of it.
+const execQuiesceBudget = 10 * time.Second
 
 // execKiller is the exec runner as the suspend path needs it, named as an
 // interface so the wiring below is testable without a sandbox to have
@@ -390,34 +401,47 @@ type execKiller interface {
 	KillAllAndWait(budget time.Duration) int
 }
 
-// eventNotifier is the one method the acknowledgement needs.
+// eventNotifier is the one method the suspend answers need.
 type eventNotifier interface {
 	Notify(relay.ControlEvent) error
 }
 
 // quiesceExecs ends every exec this session is running — DETACHED ones
 // included, because their lifetime is the session's — and tells runnerd when
-// they are gone so the container can be frozen without a half-delivered
-// signal pending inside it.
+// they are gone so the container can be frozen without a half-delivered signal
+// pending inside it.
 //
-// It waits for the processes rather than for the signals: KillAll signals on a
-// goroutine per exec by design, so returning as soon as it does would
-// acknowledge a suspend while the SIGTERMs were still in flight. Each exec's
+// It answers TWICE, and the first answer is immediate. runnerd cannot tell a
+// sandbox that is working from one that predates this notice entirely, and a
+// session keeps the sessiond it booted with for life — so without an early
+// "heard you" every session created before exec shipped would make every warm
+// stop wait out the long budget, forever. Saying so at once is what lets
+// runnerd give a sandbox that IS working the time it needs.
+//
+// The wait is for the processes rather than for the signals: KillAll signals
+// on a goroutine per exec by design, so answering as soon as it returns would
+// report a suspend ready while the SIGTERMs were still in flight. Each exec's
 // attachment closes as its process goes, which is what ends the caller's
 // stream — the caller reads a connection that ended with no exit status, exits
 // 125, and is told "the session was stopped before the command reported an
 // exit status".
 //
-// The acknowledgement is sent even when the budget expires. runnerd pauses
-// anyway when it hears nothing, so staying silent would only make the stop
-// slower; saying so is what puts the reason in this session's log.
-func quiesceExecs(execs execKiller, notifier eventNotifier) {
+// The final answer goes out even when the budget expires. runnerd freezes the
+// container anyway when it hears nothing, so staying silent would only make
+// the stop slower; saying so is what puts the reason in this session's log.
+func quiesceExecs(execs execKiller, notifier eventNotifier, nonce uint64) {
+	if err := notifier.Notify(relay.ControlEvent{
+		Kind: relay.KindSuspendAck, ID: nonce}); err != nil {
+		log.Printf("acknowledging the suspend notice: %v", err)
+	}
 	if n := execs.KillAllAndWait(execQuiesceBudget); n > 0 {
 		log.Printf("%d exec(s) had not ended %s after the suspend notice; "+
-			"acknowledging anyway", n, execQuiesceBudget)
+			"answering anyway (every one of them has had SIGTERM and SIGKILL by now; "+
+			"what is outstanding is a drain, not a command)", n, execQuiesceBudget)
 	}
-	if err := notifier.Notify(relay.ControlEvent{Kind: relay.KindSuspendReady}); err != nil {
-		log.Printf("acknowledging the suspend: %v", err)
+	if err := notifier.Notify(relay.ControlEvent{
+		Kind: relay.KindSuspendReady, ID: nonce}); err != nil {
+		log.Printf("reporting the suspend ready: %v", err)
 	}
 }
 
