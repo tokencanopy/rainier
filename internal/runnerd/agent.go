@@ -262,6 +262,13 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 		cctx, ccancel := context.WithTimeout(ctx, 5*time.Second)
 		m.Used, m.Total, _ = s.drv.Capacity(cctx) // best-effort; piggybacked on every message
 		ccancel()
+		// The two counts that turn "no free capacity" into something a person
+		// can act on: how much of `used` is a working agent and how much is a
+		// sandbox whose agent has finished. They ride the same message the
+		// used/total pair already does, from the registry rather than the
+		// driver — docker cannot say whether a container's child is still
+		// running; only sessiond's report can, and this runner keeps it.
+		m.Active, m.IdleExited = s.reg.counts()
 		// The two generations every report carries (D19), stamped in the one
 		// place every report passes through. The runner's own is whatever
 		// controld granted this connection; the session's is the one its
@@ -270,7 +277,29 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 		switch m.Type {
 		case "event":
 			m.Generation = ag.generation.Load()
-			if m.Session != "" {
+			// Every event about a session echoes the placement generation its
+			// create carried — except the runner's own idle auto-stop, which
+			// must carry NONE. A cold resume opens a new placement generation
+			// on the control plane's row but sends the runner no new value, so
+			// this entry's is stale by construction from the first resume on;
+			// stamping it would guarantee the report is fenced as stale, and a
+			// fenced auto-stop leaves the row reading "running" over a
+			// container that is stopped — a session `rainier attach` then
+			// refuses to resume and cannot reach, until the runner happens to
+			// reconnect. Zero means "not carried" and fences nothing, which is
+			// safe here specifically because the report is about the sandbox
+			// this runner holds right now, and a session re-placed onto a
+			// DIFFERENT runner is still fenced by the runner identity the
+			// service checks first. Carrying the generation on `resume` is the
+			// real fix and is a separate change (protocol + control plane).
+			//
+			// The test is on the state rather than on which call site
+			// produced it, and that is right for both producers: reannounce
+			// renders the same word for the same registry state, and it is
+			// equally a report about the sandbox this runner holds right
+			// now, whose generation is equally unknowable to it. Anything
+			// NEW that fires this state would have to be one too.
+			if m.Session != "" && m.State != "suspended_cold" {
 				m.PlacementGeneration = s.reg.placementGeneration(m.Session)
 			}
 		case "result":
@@ -300,8 +329,10 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 	defer s.SetOnSessionRPC(nil)
 
 	used, total, _ := s.drv.Capacity(ctx)
+	active, idleExited := s.reg.counts()
 	ann := runner.FromRunner{Type: "announce", Proto: runner.ProtocolVersion, Runner: cfg.RunnerName,
-		Sessions: s.Announce(), Used: used, Total: total, Capabilities: buildCapabilities(cfg.Capabilities)}
+		Sessions: s.Announce(), Used: used, Total: total, Active: active, IdleExited: idleExited,
+		Capabilities: buildCapabilities(cfg.Capabilities)}
 	if err := wsjson.Write(connCtx, c, ann); err != nil {
 		return false, err // nothing can have been accepted before the announce
 	}
@@ -448,7 +479,14 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 		}
 	case "suspend", "resume":
 		err := s.Op(ctx, m.Session, m.Type, m.Warm)
-		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: errText(err)})
+		// Conflict is what tells controld apart the two ways this can be
+		// not-ok: a command that failed, and one the runner refused because
+		// it is already stopping (or still creating) this sandbox. Without
+		// it the control plane reports a healthy runner mid-stop as an
+		// internal error, and the CLI's retry-on-conflict never runs. See
+		// opConflicts and runner.FromRunner.Conflict.
+		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil,
+			Conflict: opConflict(err), Detail: errText(err)})
 	case "snapshot":
 		// m.Ref is controld's content-addressed environment ref
 		// (rainier-env:<envID>-<setupHash>), passed through untouched — see
@@ -464,7 +502,8 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 		if err != nil {
 			detail = err.Error()
 		}
-		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil, Detail: detail})
+		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: err == nil,
+			Conflict: opConflict(err), Detail: detail})
 	case "prepull":
 		// Advisory and session-less: controld dispatches a prepull without a
 		// pending entry to correlate against (design §4.3 — it is warming an
@@ -503,7 +542,8 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 		// is already reached, whether we just deleted it or this destroy
 		// simply arrived after some other path already had.
 		ok := err == nil || errors.Is(err, errNoSuchSession)
-		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: ok, Detail: errTextUnless(err, errNoSuchSession)})
+		send(runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: ok,
+			Conflict: opConflict(err), Detail: errTextUnless(err, errNoSuchSession)})
 	case "remove_workspace":
 		// The reclaim controld sends after a session it holds is explicitly
 		// removed — including a crash-dead one, whose container went long ago
@@ -623,6 +663,20 @@ func (s *Server) dialAttachBack(ctx context.Context, m runner.ToRunner, cfg Agen
 		return
 	}
 
+	// Counted from here — before the dial, not after it and the hub wait —
+	// because this is the front that carries viewers in fleet mode, and
+	// controld has already paired a client to this attachment by the time the
+	// command arrives. Fifteen seconds of dial and hub wait during which the
+	// session looked idle is fifteen seconds in which the sweep could stop it
+	// under a viewer who is already on their way in.
+	s.reg.attachStarted(m.Session)
+	// pumped, and the closure, for the two reasons the local /attach front
+	// spells out: a dial that never became an attachment must release the
+	// count without moving the idle clock, and a deferred call's arguments
+	// would be evaluated here rather than at the detach.
+	pumped := false
+	defer func() { s.reg.attachEnded(m.Session, s.now(), pumped) }()
+
 	hdr := http.Header{"Authorization": {"Bearer " + cfg.Token}}
 	// The timeout covers the handshake only, and deliberately sits under
 	// controld's pairing TTL: a blackholed target must not park this
@@ -646,6 +700,10 @@ func (s *Server) dialAttachBack(ctx context.Context, m runner.ToRunner, cfg Agen
 		c.CloseNow()
 		return
 	}
+	// The same idle accounting the local /attach front keeps, for the same
+	// reason: a session with a viewer on it is not idle whichever door that
+	// viewer came through, and the idle timer restarts when they leave.
+	pumped = true
 	// Blocks for the life of the attach; the hub owns the conn's teardown on
 	// either side dying (its readLoop closes clients when the session conn
 	// dies, AttachClient closes the attachment when the client does).

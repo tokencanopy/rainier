@@ -1655,3 +1655,86 @@ func (r *sessionStubSessionRepo) RenewControllerLease(_ context.Context, ws cont
 	r.rows[id] = s
 	return nil
 }
+
+// TestARunnerSConflictIsAConflictNotAnOutage is the other half of D12, and
+// the half the idle auto-stop needed. A runner can now answer no in two
+// distinguishable ways, and the difference is the difference between "this
+// failed" and "not right now": a resume dispatched into the window where the
+// runner is already stopping that sandbox — reachable whenever the runner
+// redials mid-auto-stop, because it announces a stopping session as
+// suspended_cold and reconciliation moves the row there — is refused with the
+// conflict bit, and the person retries rather than reading an internal error
+// about a runner that is perfectly healthy.
+//
+// Fails without dispatch's conflict branch: the refusal satisfies
+// ErrUnavailable, the host writes 500 internal, and the CLI's bounded
+// retry-on-conflict (which keys on the code that produces) never runs.
+func TestARunnerSConflictIsAConflictNotAnOutage(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a conflict-flagged refusal is ErrConflict", func(t *testing.T) {
+		f := newSessionFixtureFull(t)
+		f.transport.res = runner.FromRunner{OK: false, Conflict: true, Detail: "session is being suspended"}
+		f.fleet.runners = coldResumeCapacity()
+		f.repo.put(sessionInState(control.StateSuspendedCold))
+
+		_, err := f.svc.ResumeSession(ctx, sessionTestScope(), control.ResumeSession{ID: "sess_example"})
+		if !errors.Is(err, control.ErrConflict) {
+			t.Fatalf("got %v, want it to satisfy control.ErrConflict", err)
+		}
+		if !errors.Is(err, ErrRunnerConflict) {
+			t.Fatalf("got %v, want it to satisfy ErrRunnerConflict", err)
+		}
+		if errors.Is(err, control.ErrUnavailable) {
+			t.Fatalf("a runner that answered a conflict was reported as an unavailable dependency: %v", err)
+		}
+		if strings.Contains(err.Error(), "session is being suspended") {
+			t.Fatalf("runner detail leaked: %v", err)
+		}
+	})
+
+	t.Run("the row is left exactly where it was", func(t *testing.T) {
+		f := newSessionFixtureFull(t)
+		f.transport.res = runner.FromRunner{OK: false, Conflict: true}
+		f.fleet.runners = coldResumeCapacity()
+		f.repo.put(sessionInState(control.StateSuspendedCold))
+
+		if _, err := f.svc.ResumeSession(ctx, sessionTestScope(), control.ResumeSession{ID: "sess_example"}); err == nil {
+			t.Fatal("the refused resume succeeded")
+		}
+		row, err := f.repo.GetSession(ctx, sessionTestScope().WorkspaceID, "sess_example")
+		if err != nil {
+			t.Fatalf("re-read: %v", err)
+		}
+		if row.State != control.StateSuspendedCold {
+			t.Fatalf("state after a refused resume = %q, want suspended_cold — the refusal must not "+
+				"move the row, or the session is left claiming to run on a container that is stopping", row.State)
+		}
+		if f.log.hasPrefix("sessions:transition") {
+			t.Fatal("a refused resume transitioned the row")
+		}
+	})
+
+	t.Run("an unflagged refusal is still an outage", func(t *testing.T) {
+		f := newSessionFixtureFull(t)
+		f.transport.res = runner.FromRunner{OK: false}
+		f.fleet.runners = coldResumeCapacity()
+		f.repo.put(sessionInState(control.StateSuspendedCold))
+
+		_, err := f.svc.ResumeSession(ctx, sessionTestScope(), control.ResumeSession{ID: "sess_example"})
+		if !errors.Is(err, ErrRunnerRefused) {
+			t.Fatalf("got %v, want ErrRunnerRefused — a runner that predates the bit sends no bit", err)
+		}
+		if errors.Is(err, ErrRunnerConflict) {
+			t.Fatalf("an unflagged refusal was read as a conflict: %v", err)
+		}
+	})
+}
+
+// coldResumeCapacity is the runner row a cold resume's fit check needs: the
+// session's own runner, with a free slot for the sandbox it is about to
+// restart. Without it ResumeSession refuses before it ever dispatches, and a
+// test about what the RUNNER answered would never reach the runner.
+func coldResumeCapacity() []control.Runner {
+	return []control.Runner{{ID: "runner_a", PoolID: "pool_a", CapacityTotal: 4, CapacityUsed: 1, Connected: true}}
+}

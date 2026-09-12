@@ -208,6 +208,15 @@ func (f *fakeRunner) reply(t *testing.T, cmd runner.ToRunner, ok bool, detail st
 	f.write(t, runner.FromRunner{Type: "result", ReqID: cmd.ReqID, OK: ok, Detail: detail})
 }
 
+// replyConflict is the other way a runner answers no: it received the command
+// and refused it because the command conflicts with work already in flight on
+// that sandbox — a resume that overtook the cold suspend idle auto-stop had
+// already claimed. See runner.FromRunner.Conflict.
+func (f *fakeRunner) replyConflict(t *testing.T, cmd runner.ToRunner, detail string) {
+	t.Helper()
+	f.write(t, runner.FromRunner{Type: "result", ReqID: cmd.ReqID, OK: false, Conflict: true, Detail: detail})
+}
+
 func (f *fakeRunner) event(t *testing.T, session, state string) {
 	t.Helper()
 	f.write(t, runner.FromRunner{Type: "event", Session: session, State: state})

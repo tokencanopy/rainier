@@ -1061,6 +1061,11 @@ func TestEventTranslation(t *testing.T) {
 			control.RunnerEvent{State: control.StateFailed, Detail: "boot failed: unparseable"}},
 		{"child_exited", runner.FromRunner{Session: "s1", State: "child_exited", Detail: "0"},
 			control.RunnerEvent{State: control.StateRunning, ChildExitCode: &code}},
+		// The runner parking a session it decided was idle. The duration it
+		// reports is for its own log, not for the session's error column, so
+		// the detail is dropped on the way through.
+		{"suspended_cold", runner.FromRunner{Session: "s1", State: "suspended_cold", Detail: "idle for 30m0s"},
+			control.RunnerEvent{State: control.StateSuspendedCold}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			before := len(h.fleet.applied())

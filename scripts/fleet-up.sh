@@ -171,13 +171,26 @@ echo "internal network bridge gateway: $BRIDGE_GW; host reachable via: $GW"
 # passed through because a capacity you can set from the outside is what makes
 # the burst/queue behavior (design success criterion 5) reproducible on a real
 # fleet: SLOTS=4 gives you the four-free-slot fleet that criterion describes.
+# IDLE_STOP is how long a session whose agent has exited and that nobody is
+# attached to may hold its slot before runnerd stops it (the container stops,
+# the files stay, an attach resumes it). runnerd's own default is 30m and this
+# passes it through so the behavior can be changed — or stood down — without
+# editing this script.
+#
+# IDLE_STOP=0 disables it, and there is one case that REQUIRES that: a fleet
+# whose controld has not been rolled yet. The auto-stop reports itself with a
+# suspended_cold event, which a control plane that predates it drops as an
+# unknown state — leaving the session row reading `running` over a container
+# that is stopped, which `rainier attach` will not resume and cannot reach,
+# until this runner next reconnects. Roll controld first, or pass IDLE_STOP=0
+# until you have. See the README's "Runner capacity".
 # RUNNERD_PORT: parameterized for hosts where 8080 is taken by something
 # unrelated (a dev box running another server). Default unchanged.
 RUNNERD_PORT="${RUNNERD_PORT:-8080}"
 RUNNERD_ARGS=(--listen "0.0.0.0:$RUNNERD_PORT" --dial-base "ws://$GW:$RUNNERD_PORT"
   --image rainier-session:latest --network rainier-internal
   --egress-admin http://127.0.0.1:3129 --proxy-url "http://$GW:3128"
-  --slots "${SLOTS:-16}")
+  --slots "${SLOTS:-16}" --idle-stop "${IDLE_STOP:-30m}")
 
 # Dial (agent) mode, opt-in via CONTROLD_URL: this runnerd also dials a
 # control plane and takes its placements from there (Plan 3). Unset — the

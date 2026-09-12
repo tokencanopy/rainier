@@ -125,17 +125,33 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 		if g, _ := d.Inspect(ctx, h.ID); g.State != StateSuspended {
 			t.Fatalf("warm state = %s", g.State)
 		}
-		if err := d.Resume(ctx, h.ID); err != nil {
+		// A warm resume is an unpause: the same processes, unfrozen, so it
+		// reports no restart. Every driver must agree on this — runnerd
+		// decides whether a session's agent is a NEW one from this bit, and a
+		// driver that always said true would have it stop working agents.
+		if restarted, err := d.Resume(ctx, h.ID); err != nil {
 			t.Fatal(err)
+		} else if restarted {
+			t.Fatal("a warm resume reported a restart; unpause does not replace the process tree")
 		}
 		if g, _ := d.Inspect(ctx, h.ID); g.State != StateRunning {
 			t.Fatalf("resumed state = %s", g.State)
 		}
+		// And a resume of an already-running container restarts nothing
+		// either.
+		if restarted, err := d.Resume(ctx, h.ID); err != nil {
+			t.Fatal(err)
+		} else if restarted {
+			t.Fatal("resuming an already-running container reported a restart")
+		}
 		if err := d.Suspend(ctx, h.ID, false); err != nil {
 			t.Fatal(err)
 		} // cold
-		if err := d.Resume(ctx, h.ID); err != nil {
+		// A cold resume IS a start: a new process tree, and a new agent.
+		if restarted, err := d.Resume(ctx, h.ID); err != nil {
 			t.Fatal(err)
+		} else if !restarted {
+			t.Fatal("a cold resume reported no restart; `docker start` replaces the process tree")
 		}
 	})
 
@@ -396,7 +412,7 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 		if err := d.Suspend(ctx, h.ID, false); err != nil {
 			t.Fatal(err)
 		} // cold
-		if err := d.Resume(ctx, h.ID); err != nil {
+		if _, err := d.Resume(ctx, h.ID); err != nil {
 			t.Fatal(err)
 		}
 		if g, err := d.Inspect(ctx, h.ID); err != nil || g.State != StateRunning {

@@ -296,17 +296,28 @@ func (s *Server) unavailableStatus(row control.Session) (int, string, string) {
 	return http.StatusBadGateway, "runner_unreachable", "runner did not respond"
 }
 
-// sessionErrText is the pair of sentences a session handler owns, because the
-// service reports both situations as one sentinel and cannot know which
+// sessionErrText is the set of sentences a session handler owns, because the
+// service reports each situation as one sentinel and cannot know which
 // operation was being asked for.
 //
 // Conflict replaces the generic "conflict" where today's handler had a
 // specific refusal. Refused is the "could not <verb> session" a runner that
 // answered NO gets — the operation genuinely failed here, not at an
 // unreachable dependency, so it is 500 rather than 502.
+//
+// RunnerConflict is the runner's "not yet" and needs its own sentence rather
+// than borrowing Conflict's, because the two conflicts are about different
+// things: Conflict describes the ROW ("session is not running"), which the
+// runner's refusal does not contradict — it is refusing a session that IS
+// running, because it is busy with it. Reusing Conflict there would answer a
+// `rainier stop` of a running session with "session is not running", a
+// sentence the client can disprove by re-reading the row it just read.
+// Empty falls back to Conflict, which is right for the handlers whose
+// Conflict sentence already says "not right now" rather than naming a state.
 type sessionErrText struct {
-	Conflict string
-	Refused  string
+	Conflict       string
+	RunnerConflict string
+	Refused        string
 }
 
 // writeSessionErr answers a session-service error with v0wire.StatusFor's
@@ -320,12 +331,34 @@ type sessionErrText struct {
 // runner, and unavailableStatus says which way (no connection, or no answer)
 // off a re-read of the row. A re-read that fails leaves the fixed 500, the
 // honest answer when we cannot even say whose runner it was.
+//
+// A runner that received the command and refused it as a CONFLICT
+// (controlapp.ErrRunnerConflict — it is already stopping that sandbox, or
+// still creating it) shares the status and the code with the row's own
+// conflict, which is the whole point of the sentinel wrapping
+// control.ErrConflict: a client keying on either sees one retryable refusal.
+// It takes the FIRST arm rather than the row's, because the sentences are
+// not interchangeable — the row's names a state ("session is not running")
+// that the runner's refusal does not claim, and a handler that borrowed it
+// would tell a person their running session is not running.
 func (s *Server) writeSessionErr(w http.ResponseWriter, ctx context.Context, id string, err error, text sessionErrText) {
 	status, code, msg := v0wire.StatusFor(err)
 	if status == 0 {
 		return // the caller went away; there is nobody to answer
 	}
 	switch {
+	case errors.Is(err, controlapp.ErrRunnerConflict):
+		// Checked before the plain ErrConflict arm, which it also satisfies:
+		// the runner's "not yet" and the row's "wrong state" are both 409
+		// conflicts, but only the second is about the row, and answering the
+		// first with the second's sentence tells the client something it can
+		// disprove. Same status and code either way — a client keying on
+		// those sees one conflict, which is the point.
+		if text.RunnerConflict != "" {
+			msg = text.RunnerConflict
+		} else if text.Conflict != "" {
+			msg = text.Conflict
+		}
 	case errors.Is(err, control.ErrConflict) && text.Conflict != "":
 		msg = text.Conflict
 	case errors.Is(err, controlapp.ErrRunnerRefused):
@@ -630,8 +663,9 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request, u U
 	ctx := withUser(r.Context(), u)
 	if err := s.sessions.DeleteSession(ctx, userScope(u), control.DeleteSession{ID: control.SessionID(id)}); err != nil {
 		s.writeSessionErr(w, ctx, id, err, sessionErrText{
-			Conflict: "session is still creating",
-			Refused:  "could not delete session",
+			Conflict:       "session is still creating",
+			RunnerConflict: "session cannot be deleted right now",
+			Refused:        "could not delete session",
 		})
 		return
 	}
@@ -658,8 +692,9 @@ func (s *Server) handleSuspendSession(w http.ResponseWriter, r *http.Request, u 
 	})
 	if err != nil {
 		s.writeSessionErr(w, ctx, id, err, sessionErrText{
-			Conflict: "session is not running",
-			Refused:  "could not suspend session",
+			Conflict:       "session is not running",
+			RunnerConflict: "session cannot be stopped right now",
+			Refused:        "could not suspend session",
 		})
 		return
 	}
@@ -700,8 +735,9 @@ func (s *Server) handleSnapshotSession(w http.ResponseWriter, r *http.Request, u
 	ck, err := s.sessions.SnapshotSession(ctx, userScope(u), control.SnapshotSession{ID: control.SessionID(id)})
 	if err != nil {
 		s.writeSessionErr(w, ctx, id, err, sessionErrText{
-			Conflict: "session is not running or suspended",
-			Refused:  "could not snapshot session",
+			Conflict:       "session is not running or suspended",
+			RunnerConflict: "session cannot be snapshotted right now",
+			Refused:        "could not snapshot session",
 		})
 		return
 	}

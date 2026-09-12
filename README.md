@@ -261,6 +261,43 @@ Reachability is outbound-only in one direction (spec rule 3): sessiond →
 runnerd → controld, and clients talk only to controld. Nothing dials into a
 runner.
 
+### Runner capacity
+
+A runner holds at most `--slots` sandboxes at once (default 16; the hosted
+runner passes its own). Running and warm-suspended sandboxes hold a slot; a
+cold-stopped one keeps its files and holds none.
+
+A sandbox used to hold its slot from creation until somebody stopped or
+deleted the session, even when its agent had finished hours earlier. It no
+longer does: `--idle-stop` (default `30m`, `0` disables) makes `runnerd` stop
+a session whose **agent process has exited** and that has had **no attachment**
+for that long — the container stops, the workspace is kept, the slot comes
+back, the session reads `stopped`, and `rainier attach` resumes it. It is the
+same stop `rainier stop` performs, decided by the runner instead of by a
+person.
+
+Two rules it never breaks: a session whose agent is still running is never
+stopped, however long nobody has been watching it (a long unattended build is
+the point), and nothing is ever deleted. A session with any viewer attached is
+not idle, and the timer starts again when the last one leaves. A session whose
+**boot** failed is kept too, however idle: attaching to it to read the log that
+says why is the only thing left to do with it.
+
+**Roll `controld` before the runners.** The auto-stop reports itself to the
+control plane with a `suspended_cold` event, which is additive — a control
+plane that predates it logs an unknown state and drops it, and the session row
+then reads `running` over a container that is stopped: `rainier attach` will
+not resume a `running` row and cannot reach a stopped sandbox, and the row is
+only corrected when that runner next reconnects. A fleet whose control plane
+has not been rolled yet must pass `--idle-stop 0` until it has;
+`scripts/fleet-up.sh` takes that as `IDLE_STOP=0`. Nothing in a runner can
+detect an old control plane, so this is an operational order, not a check.
+
+Resource-aware admission — memory and disk headroom instead of a fixed count,
+queueing instead of refusing, and one shared idleness signal — is
+[issue #85](https://github.com/tokencanopy/rainier/issues/85), which
+supersedes this.
+
 `runnerctl` and `rattach` are **dev tools**, not the product surface: they
 drive one runnerd's local HTTP API directly, bypassing the control plane
 (no identity, no placement, no durable state). They stay in-tree for

@@ -105,6 +105,22 @@ type Server struct {
 	// written immediately after New.
 	suspendAckWait   time.Duration
 	suspendReadyWait time.Duration
+	// now is the clock every idle-stop decision reads: time.Now in
+	// production, a test's own function in tests, so the thirty minutes a
+	// session has to sit idle can be a table row rather than a sleep. A field
+	// written only immediately after New, like hubWait, and never again.
+	//
+	// Both sides of every duration the IDLE path computes come from here (the
+	// unrelated waits — waitHub's deadline, the agent's backoff — still read
+	// time.Now directly), so in production both carry Go's monotonic reading
+	// and the subtraction uses it: an NTP step cannot make a session look idle
+	// early. Nothing on this path calls UTC/Round/Truncate or marshals these
+	// times, which is what would strip that reading.
+	now func() time.Time
+	// idleSweep is how often RunIdleStop looks for idle sessions. Zero — the
+	// value New leaves — means "derive it from the timeout" (see
+	// idleSweepInterval); a test sets it directly to keep its loop short.
+	idleSweep time.Duration
 }
 
 // suspendWaiter is one in-flight suspend's two answers, matched by nonce.
@@ -174,6 +190,11 @@ var (
 	errNoSuchSession   = errors.New("no such session")
 	errSessionStarting = errors.New("session still starting")
 	errUnknownOp       = errors.New("unknown op")
+	// errSuspendInFlight is a resume's answer when the entry is already
+	// claimed by a stop that has not landed yet. Resuming through it would
+	// leave the entry claiming "running" over a container the stop is about
+	// to take down — see Op's resume arm.
+	errSuspendInFlight = errors.New("session is being suspended")
 	// errSessionExists is CreateWithID's answer when its putIfAbsent finds
 	// the id already claimed — see CreateWithID's doc comment for the race
 	// this closes.
@@ -191,7 +212,7 @@ func (e *egressError) Unwrap() error { return e.err }
 
 func New(drv driver.Driver, dialBase, egressAdmin, proxyURL string) *Server {
 	return &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin,
-		proxyURL: proxyURL, hubWait: defaultHubWait,
+		proxyURL: proxyURL, hubWait: defaultHubWait, now: time.Now,
 		suspendAckWait: defaultSuspendAckWait, suspendReadyWait: defaultSuspendReadyWait,
 		suspends: map[string]*suspendWaiter{}}
 }
@@ -218,8 +239,24 @@ func (s *Server) Recover(ctx context.Context) error {
 		if l.Handle.State == driver.StateSuspended {
 			state = "suspended"
 		}
-		e := &sessionEntry{id: l.SessionID, handle: l.Handle.ID, state: state}
+		// recovered: the exit fact lived only in the memory of the process
+		// that just died, so this runner knows neither that the child is
+		// running nor that it has finished. It says so — the entry is in
+		// neither capacity count — until a child_exited or a cold resume
+		// tells it. See sessionEntry.recovered.
+		e := &sessionEntry{id: l.SessionID, handle: l.Handle.ID, state: state, recovered: true}
 		s.reg.put(l.SessionID, e)
+	}
+	// The exemption is worth saying out loud where an operator will see it: a
+	// recovered session is never an idle auto-stop candidate until it reports a
+	// child exit, because the exit that would make it one lived only in the
+	// memory of the process that just died. A redeploy onto a box full of
+	// finished sessions reclaims none of them, and the alternative — assuming
+	// the child of a session this process never watched has finished — is the
+	// direction that stops working agents.
+	if len(listed) > 0 {
+		log.Printf("runnerd: recovered %d session(s) from labeled containers; none is an idle auto-stop candidate until it reports a child exit", len(listed))
+		return nil
 	}
 	log.Printf("runnerd: recovered %d session(s) from labeled containers", len(listed))
 	return nil
@@ -405,9 +442,47 @@ func (s *Server) sessionOp(w http.ResponseWriter, r *http.Request) {
 	mapOpErr(w, s.Op(ctx, id, op, warm), func() { w.WriteHeader(http.StatusNoContent) })
 }
 
+// opConflicts are the refusals of an OP (suspend, resume, snapshot, destroy)
+// that mean "not yet" rather than "this failed": the command is well formed
+// and the session exists, but the runner is in the middle of something the
+// command cannot be interleaved with. Both of this runner's surfaces answer
+// them as a conflict — 409 on the local HTTP front (mapOpErr, which gives
+// each its own sentence), and FromRunner.Conflict on the control connection
+// (the agent's result arms) — and both read this one list, because two lists
+// is exactly how the control path came to report a 409 as a 500 in the first
+// place.
+//
+// errSessionExists is NOT here, though the create handler answers it 409 too
+// (see the create route). It is the one refusal whose two surfaces disagree
+// on purpose: on the control path the agent's create arm reports an id that
+// already exists as OK, because the desired state — a session under this id —
+// is reached, and a result that said `ok: true, conflict: true` would be two
+// answers to one question. The anti-drift test states that exemption rather
+// than leaving it to be rediscovered.
+var opConflicts = []error{errSessionStarting, errSuspendInFlight}
+
+// opConflict reports whether err is one of them. Nil is not a conflict, and
+// neither is any error the list does not name: a refusal this runner has not
+// classified is reported as a plain failure, which is the safe direction —
+// "this failed" invites no retry, where a wrong "not yet" invites one forever.
+func opConflict(err error) bool {
+	for _, c := range opConflicts {
+		if errors.Is(err, c) {
+			return true
+		}
+	}
+	return false
+}
+
 // mapOpErr maps Op/OpSnapshot/Delete's sentinel errors to the status codes the
 // HTTP surface has always returned, or calls onOK to write the success response
 // (which varies: 204 for delete/suspend/resume, a JSON ref for snapshot).
+//
+// Every 409 arm HERE is a member of opConflicts, and a test pins that in both
+// directions: the two must stay the same set, or a refusal is a conflict to a
+// person holding a terminal and an internal error to the control plane. The
+// create route writes its own 409 without passing through here, which is the
+// one deliberate exemption — see opConflicts.
 func mapOpErr(w http.ResponseWriter, err error, onOK func()) {
 	switch {
 	case err == nil:
@@ -416,6 +491,8 @@ func mapOpErr(w http.ResponseWriter, err error, onOK func()) {
 		http.Error(w, "no such session", http.StatusNotFound)
 	case errors.Is(err, errSessionStarting):
 		http.Error(w, "session still starting", http.StatusConflict)
+	case errors.Is(err, errSuspendInFlight):
+		http.Error(w, "session is being suspended", http.StatusConflict)
 	case errors.Is(err, errUnknownOp):
 		http.Error(w, "unknown op", http.StatusBadRequest)
 	default:
@@ -467,6 +544,12 @@ func (s *Server) opTarget(id string) (handle, state string, err error) {
 // with an empty ref (it has no environment to name, so the driver mints the
 // tag) and the agent with controld's content-addressed rainier-env: ref.
 func (s *Server) OpSnapshot(ctx context.Context, id, ref string) (string, error) {
+	// Before the guard, like Op's: `docker commit` runs against a LIVE
+	// container and takes minutes on a large image, and a sweep that stopped
+	// the session underneath it would break both the commit and the
+	// environment cache built on it.
+	s.reg.beginOp(id)
+	defer s.reg.endOp(id)
 	handle, err := s.opHandle(id)
 	if err != nil {
 		return "", err
@@ -546,6 +629,12 @@ func envKeys(env map[string]string) []string {
 // this function has no business knowing about. Snapshot has its own entry
 // point — see OpSnapshot.
 func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
+	// Marked before the handle is even read, so there is no gap between the
+	// guard and the mark for a sweep to land in: from here on this session is
+	// not idle, whatever this op turns out to be. An unknown or still-starting
+	// id makes both calls no-ops.
+	s.reg.beginOp(id)
+	defer s.reg.endOp(id)
 	handle, err := s.opHandle(id)
 	if err != nil {
 		return err
@@ -571,13 +660,23 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 			// the container dies, racing ahead of the setState below) sees a
 			// state that means "keep the entry" rather than defaulting to
 			// the crash path and destroying a container we deliberately just
-			// stopped.
-			s.reg.setState(id, "suspending")
+			// stopped. Whether a later resume restarted the child is NOT
+			// inferred from this mark — the driver reports it; see
+			// registry.resumed.
+			s.reg.beginColdSuspend(id)
+			// Pairs with beginColdSuspend's increment. An operator's stop has
+			// nothing to report after the driver call — controld already
+			// knows about a stop it dispatched — so the claim ends with this
+			// function, unlike the sweep's, which holds it across its event.
+			defer s.reg.endStop(id)
+			return s.coldSuspend(ctx, id, handle)
 		}
+		// The bracket at the top of this function is what covers this branch:
+		// a warm suspend has no state marker of its own, so the entry reads
+		// "running" for the whole of `docker pause`, and a sweep that claimed
+		// it in that window would turn an operator's pause — which
+		// deliberately KEEPS the slot — into a stop that releases it.
 		if err := s.drv.Suspend(ctx, handle, warm); err != nil {
-			if !warm {
-				s.reg.setState(id, "running") // stop failed: we're still running
-			}
 			return err
 		}
 		// e.state is mutated here from a concurrent request goroutine, so it
@@ -588,15 +687,126 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 		s.reg.setState(id, "suspended")
 		return nil
 	case "resume":
-		if err := s.drv.Resume(ctx, handle); err != nil {
+		if s.reg.stopInFlight(id) {
+			// A cold suspend this runner already claimed is still running
+			// against the container. Resuming through it is the one ordering
+			// that leaves an entry claiming "running" over a stopped
+			// container: `resumed` would see a non-running state, take the
+			// entry for parked, clear the child's exit and bump the boot
+			// epoch; the stop would then land, finishColdSuspend's
+			// compare-and-swap would find the state moved and do nothing, and
+			// the register goroutine would read the hub death that follows as
+			// a crash — destroying the container and reporting a session dead
+			// because somebody resumed it.
+			//
+			// The question is "is a stop RUNNING", not "is the state
+			// suspending": a stop whose outcome could not be read deliberately
+			// leaves the entry parked on "suspending" (see
+			// settleFailedColdSuspend), and a resume is the only thing that
+			// brings such a session back — refusing that one would strand it
+			// for the life of the runner.
+			//
+			// Against the SWEEP's stop the guard is total rather than a
+			// narrowing, and the bracket at the top of this function is why:
+			// claimIdle takes the claim and this counter in one critical
+			// section and refuses an entry with driverOps > 0, and beginOp
+			// takes the same lock. Either beginOp won it, and the sweep never
+			// claimed the session at all, or claimIdle won it, and the counter
+			// this reads is already up. Against an operator's own stop it is a
+			// narrowing only — a `rainier stop` and a `rainier resume` issued
+			// at the same instant can still have the resume get past this
+			// before beginColdSuspend marks — which the design doc's
+			// edge-case table names.
+			return errSuspendInFlight
+		}
+		restarted, err := s.drv.Resume(ctx, handle)
+		if err != nil {
 			return err
 		}
-		s.reg.setState(id, "running")
+		// Lands on "running" and, for a sandbox the driver actually RESTARTED,
+		// starts a fresh idle epoch: `docker start` gives the container a new
+		// process tree, so the child this runner was told had exited is not the
+		// child that is running now. Only the driver can tell that from an
+		// unpause — Inspect folds paused and exited into one state — which is
+		// why it says so. See registry.resumed.
+		s.reg.resumed(id, restarted)
 		return nil
 	default:
 		return errUnknownOp
 	}
 }
+
+// coldSuspend stops a session's container and lands its state, on the
+// assumption the caller has ALREADY claimed the entry with beginColdSuspend or
+// claimIdle. Both stops — an operator's `rainier stop` through Op and the
+// runner's own idle auto-stop — go through this one function, so the two can
+// never drift into meaning different things: the same driver call, the same
+// landing state, and the same rollback when the daemon refuses.
+// It does NOT release the in-flight claim its caller took. That is
+// deliberate and it is load-bearing for the sweep: a stop is not finished
+// when the container is stopped, it is finished when the runner has REPORTED
+// it, and a resume accepted between those two points is accepted against a
+// row the auto-stop event is about to park. Each caller therefore pairs its
+// own claim — Op with a defer, stopIdle after its event is out. See
+// registry.endStop and stopIdle.
+func (s *Server) coldSuspend(ctx context.Context, id, handle string) error {
+	if err := s.drv.Suspend(ctx, handle, false); err != nil {
+		s.settleFailedColdSuspend(id, handle)
+		return err
+	}
+	s.reg.finishColdSuspend(id)
+	return nil
+}
+
+// settleFailedColdSuspend decides where a stop that REPORTED failure leaves the
+// entry, by asking the driver what the container is actually doing rather than
+// assuming it is still running.
+//
+// The assumption is not safe, and bounding the stop is what made it unsafe: a
+// `docker stop` killed at its deadline leaves the DAEMON still stopping the
+// container. Rolling the entry back to "running" there is a lie that costs the
+// session — the container dies seconds later, the register goroutine reads a
+// "running" entry, takes it for a crash, destroys the container and reports the
+// session dead. A merely idle session, gone, for a stop that worked.
+//
+//   - container still running: the stop really did fail. Roll back; the next
+//     sweep, or the operator's retry, tries again.
+//   - container not running: the stop landed after all, or near enough. Land
+//     the entry where a successful stop would have. This arm is coarse and
+//     knowingly so — Inspect folds paused, exited, created and every status a
+//     driver does not recognize into one StateSuspended — so a container docker
+//     happens to be removing reads as "stopped" here too. Harmless: the landing
+//     is a compare-and-swap that a Delete's marker already refuses.
+//   - container gone: not this function's business. Roll back so the
+//     hub-death tail can do what it does for any container that vanished —
+//     confirm it with its own Inspect, reclaim the entry, keep the workspace,
+//     and report the session dead, which is what it is.
+//   - no answer at all: change nothing. "suspending" is the conservative
+//     marker — it keeps the register goroutine from destroying a container this
+//     runner cannot speak for, and hubDied normalizes it to "suspended" if the
+//     container really did die.
+//
+// Its own context, not the caller's: the caller's is very likely the one that
+// just expired, and an Inspect on a dead context answers nothing.
+func (s *Server) settleFailedColdSuspend(id, handle string) {
+	ctx, cancel := context.WithTimeout(context.Background(), coldSuspendSettleTimeout)
+	h, err := s.drv.Inspect(ctx, handle)
+	cancel()
+	if err != nil {
+		log.Printf("session %s: a stop reported failure and the driver cannot say what the container is doing (%v); leaving the entry parked rather than guessing", id, err)
+		return
+	}
+	if h.State == driver.StateRunning || h.State == driver.StateGone {
+		s.reg.releaseColdSuspend(id)
+		return
+	}
+	log.Printf("session %s: the stop reported failure but the container is %v; landing it as stopped", id, h.State)
+	s.reg.finishColdSuspend(id)
+}
+
+// coldSuspendSettleTimeout bounds that Inspect. Same bound as the one
+// register's hub-death tail uses for the same question.
+const coldSuspendSettleTimeout = 30 * time.Second
 
 // Delete tears down a session: close its hub (if it ever registered) before
 // removing the registry entry and destroying the driver resource, then
@@ -629,7 +839,7 @@ func (s *Server) Delete(ctx context.Context, id string) error {
 		// entry so Announce/reconciliation and an explicit retry can still
 		// find it. Restore the prior state: sessiond redials after hub.Close,
 		// and a successful redial can then install a fresh hub normally.
-		s.reg.setState(id, previousState)
+		s.reg.restoreAfterFailedDestroy(id, previousState)
 		return err
 	}
 	s.reg.remove(id)
@@ -720,6 +930,12 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.SetReadLimit(16 << 20)
+	// Read BEFORE the hub, because NewHubWithControl starts the read loop.
+	// Every control frame from this conn carries it, and the registry drops
+	// the ones that name a boot the session has moved past. Note READ, not
+	// minted: a redial is not a new boot — only a cold resume restarts the
+	// container, and that is where the epoch moves. See registry.currentBoot.
+	boot := s.reg.currentBoot(id)
 	hub := relay.NewHubWithControl(r.Context(), relay.WSConn(c), func(payload []byte) {
 		// On its own goroutine, deliberately: this runs on the hub's read
 		// loop, the single goroutine demultiplexing every attachment
@@ -737,7 +953,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		// belongs to — both ends match on that id, never on arrival order
 		// (which is exactly why the id is on the wire). A control channel
 		// that grows ORDERED events needs a queue here instead.
-		go s.routeControl(id, payload)
+		go s.routeControl(id, boot, payload)
 	})
 	if !s.reg.setHub(id, hub) {
 		// The entry vanished between our existence check above and now — a
@@ -847,7 +1063,7 @@ func (s *Server) RemoveWorkspace(ctx context.Context, id string) error {
 // escalated: this arrives from inside a container over a conn that also
 // carries every viewer's terminal traffic, and the one thing that must not
 // happen is a malformed frame taking the session down with it.
-func (s *Server) routeControl(id string, payload []byte) {
+func (s *Server) routeControl(id string, boot uint64, payload []byte) {
 	var ev relay.ControlEvent
 	if err := json.Unmarshal(payload, &ev); err != nil {
 		log.Printf("session %s: undecodable control payload (%d bytes): %v", id, len(payload), err)
@@ -875,6 +1091,14 @@ func (s *Server) routeControl(id string, payload []byte) {
 			stage = "setup"
 		}
 		log.Printf("session %s: the %s stage failed (rc %d)", id, stage, ev.RC)
+		// A session that never finished booting is kept out of idle
+		// auto-stop for good. Its child exits with the failing stage, so it
+		// would otherwise look like a finished agent half an hour later — and
+		// stopping it takes away the only thing left to do with it: the CLI
+		// lets you attach to a failed session precisely to read the log that
+		// says why, and neither a stopped sandbox (no hub) nor a failed row
+		// (not resumable) can serve that. See sessionEntry.bootFailed.
+		s.reg.markBootFailed(id, boot)
 		if stage == "setup" {
 			s.fireEventDetail(id, "setup_failed", setupFailedDetail(ev.RC, ev.Tail))
 			return
@@ -911,6 +1135,11 @@ func (s *Server) routeControl(id string, payload []byte) {
 		// travels as "0"; relay.ControlEvent's RC is `omitempty`, so a clean
 		// exit puts no rc on the wire at all and decodes back to the same 0.
 		log.Printf("session %s: agent exited with code %d", id, ev.RC)
+		// Recorded as well as reported: a child that has exited is the ONE
+		// thing that makes this session a candidate for idle auto-stop, and
+		// nothing else in this runner would remember it. It still changes no
+		// state here — see RunIdleStop for the timeout that does.
+		s.reg.childExited(id, boot, s.now())
 		s.fireEventDetail(id, "child_exited", strconv.Itoa(ev.RC))
 	case "resp":
 		// The sandbox's answer to a request controld sent down. Forwarded
@@ -1183,6 +1412,24 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Counted here — before the upgrade and before the first client frame —
+	// rather than just before the pump. An attachment that has been paired and
+	// is mid-handshake is a viewer arriving, and readFirstResize below waits
+	// on a frame that crosses the client's network: counting after it would
+	// leave a real viewer invisible to a sweep for as long as their round trip
+	// takes, and stop the session under them.
+	s.reg.attachStarted(id)
+	// pumped stays false unless this dial gets as far as bridging the client
+	// to the session, so a handshake that never completed releases the count
+	// without moving the idle clock — see registry.attachEnded.
+	//
+	// The closure is load-bearing for a second reason: a deferred call's
+	// ARGUMENTS are evaluated where the defer is written, so
+	// `defer s.reg.attachEnded(id, s.now(), true)` would stamp the detach with
+	// the time of the ATTACH — an attachment that ended the moment it began,
+	// which idle-stops a session somebody is watching.
+	pumped := false
+	defer func() { s.reg.attachEnded(id, s.now(), pumped) }()
 	c, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
@@ -1197,6 +1444,7 @@ func (s *Server) attach(w http.ResponseWriter, r *http.Request) {
 		c.CloseNow()
 		return
 	}
+	pumped = true
 	// The runner's own local attach endpoint is a single-box debugging tool
 	// with no control plane above it: it grants no binding, so the attachment
 	// is unconditional exactly as it has always been.
