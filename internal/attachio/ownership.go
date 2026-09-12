@@ -19,6 +19,14 @@ import (
 // ordinary byte, stamp nothing — which is what settled=false means here.
 type ownership struct {
 	asked bool // this attach advertised the capability
+	// shared is what the server said its attachment policy is, read off the
+	// session view before this attach dialed. It changes the COPY and nothing
+	// else: under a shared policy no peer holds anything, so "another device
+	// has control" is false and the key it offers cannot succeed.
+	shared bool
+	// others is how many other terminals could already type when this attach
+	// was prepared, for the one line it opens with. Zero is silence.
+	others int
 	// neverClaim is --view, which is NOT the same fact as asking for view
 	// mode: a plain attach reconnecting after it was superseded also asks for
 	// view mode, and that device must keep its take-control key and be told
@@ -39,7 +47,8 @@ type ownership struct {
 }
 
 func newOwnership(o Options) *ownership {
-	own := &ownership{asked: o.Control, neverClaim: o.NeverClaim, take: o.Take, gen: o.Expected}
+	own := &ownership{asked: o.Control, shared: o.Shared, others: o.OtherTypers,
+		neverClaim: o.NeverClaim, take: o.Take, gen: o.Expected}
 	if o.Control && o.Mode == terminal.ModeView {
 		// --view is the user's instruction, not a request the server may
 		// ignore. Holding it locally from the first byte is what makes it
@@ -102,6 +111,24 @@ func (o *ownership) observe(m terminal.ServerMessage) string {
 	case terminal.TypeAttached:
 		o.mode = m.Mode
 		o.gen = m.Generation.Value()
+	case terminal.TypeStale:
+		o.mode = terminal.ModeView
+		o.gen = m.Generation.Value()
+	case terminal.TypeControlChanged:
+		o.mode = m.Mode
+		o.gen = m.Generation.Value()
+	default:
+		return ""
+	}
+	if o.shared {
+		// The take-over copy is wrong under a shared policy in every one of
+		// its clauses — no other device holds anything, nothing was taken, and
+		// the key it offers cannot succeed — so that policy's copy is decided
+		// on its own, out of the same three facts.
+		return o.sharedNotice(m, was, first)
+	}
+	switch m.Type {
+	case terminal.TypeAttached:
 		switch {
 		case m.Mode == terminal.ModeView && first:
 			if o.neverClaim {
@@ -121,12 +148,8 @@ func (o *ownership) observe(m terminal.ServerMessage) string {
 		}
 		return "" // the ordinary case: control, first thing, silently
 	case terminal.TypeStale:
-		o.mode = terminal.ModeView
-		o.gen = m.Generation.Value()
 		return NoticeStale
 	case terminal.TypeControlChanged:
-		o.mode = m.Mode
-		o.gen = m.Generation.Value()
 		switch {
 		case m.Mode == terminal.ModeView && was != terminal.ModeView:
 			return NoticeTaken
@@ -139,6 +162,40 @@ func (o *ownership) observe(m terminal.ServerMessage) string {
 			return NoticeHaveControl
 		}
 		return ""
+	}
+	return ""
+}
+
+// sharedNotice is the client's copy under control.PolicyShared. Callers hold
+// o.mu and have already folded m into the state; was and first are what it was
+// before.
+//
+// Four answers, and no fifth:
+//
+//   - the opening answer as a typer is SILENCE, or the one line naming the
+//     other terminals that may type;
+//   - the opening answer as a viewer is "this terminal may not type", which is
+//     a host policy's answer about this person rather than a race — so it
+//     offers no key. --view asked for it and is told nothing;
+//   - becoming a typer again says so, which is the answer to a release this
+//     client made or a revocation that ended;
+//   - losing the ability to type says so without offering a key that cannot
+//     take it back: under this policy no peer can do that to this attach, only
+//     its own release and a plane-side revocation.
+func (o *ownership) sharedNotice(m terminal.ServerMessage, was string, first bool) string {
+	typing := o.mode != terminal.ModeView
+	switch {
+	case first && typing:
+		return SharedNotice(o.others)
+	case first:
+		if o.neverClaim {
+			return ""
+		}
+		return NoticeViewOnly
+	case typing && was == terminal.ModeView:
+		return NoticeHaveControl
+	case !typing && was != terminal.ModeView:
+		return NoticeViewOnly
 	}
 	return ""
 }

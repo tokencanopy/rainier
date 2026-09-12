@@ -334,6 +334,11 @@ type session struct {
 	// "nobody has control", and is the truth there: nothing was ever
 	// conditional.
 	Controller controllerView `json:"controller"`
+	// Input is the RULE the server decides who may type by, and how many
+	// terminals currently may. It is where this CLI learns the attachment
+	// policy: the terminal protocol carries none, and an attach reads what it
+	// is told about itself.
+	Input inputView `json:"input"`
 }
 
 // controllerView is the session view's additive controller object. The
@@ -343,6 +348,24 @@ type controllerView struct {
 	Generation string `json:"generation"`
 	Held       bool   `json:"held"`
 }
+
+// inputView is the session view's additive input object: the server's
+// attachment policy and how many attached terminals may type under it.
+//
+// An absent or unrecognised policy is EXCLUSIVE as far as this CLI is
+// concerned, which is what an older server means by omitting the object and
+// what every build of this CLI has always assumed. A word this build does not
+// know is treated the same way, because the copy that assumes exclusivity is
+// the copy that offers a key — and offering a key that does nothing is a
+// smaller wrong than withholding the one that works.
+type inputView struct {
+	Policy   string `json:"policy"`
+	Attached int    `json:"attached"`
+}
+
+// sharedInput reports whether the server told us every attached terminal may
+// type.
+func (v inputView) sharedInput() bool { return v.Policy == "shared" }
 
 type sessionEnvelope struct {
 	Session session `json:"session"`
@@ -1666,6 +1689,24 @@ func defaultOwnership() attachio.Options {
 	return attachio.Options{Control: true, Mode: terminal.ModeControl}
 }
 
+// withServerPolicy folds what the session view said about the server's
+// attachment policy into what this attach asks for. It changes only the COPY a
+// person sees — the notices, and whether a take-control key is offered — never
+// what the client sends, so an attach whose view read stale, or whose server
+// reported nothing, behaves identically and merely says less.
+//
+// The count excludes this attach, which has not happened yet: "2 other
+// terminals attached" is exactly what the view was reporting a moment before
+// this one arrived.
+func withServerPolicy(own attachio.Options, s session) attachio.Options {
+	if !s.Input.sharedInput() {
+		return own
+	}
+	own.Shared = true
+	own.OtherTypers = s.Input.Attached
+	return own
+}
+
 // reconnectOwnership is what the NEXT attempt asks for, and it is the whole
 // of "reconnect is conditional". A device that had control presents the
 // generation it held, so it resumes only while nobody took it — and comes
@@ -1993,9 +2034,14 @@ func runAttach(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := prepareAttach(c, id, replay); err != nil {
+	row, err := prepareAttach(c, id, replay)
+	if err != nil {
 		return err
 	}
+	// What the server said about who may type, folded into the copy this attach
+	// will print. It is the view prepareAttach already read; asking again would
+	// be a second round trip for a courtesy line.
+	own = withServerPolicy(own, row)
 	if err := attachWithRetryOwned(cfg, id, cursor, own, nil, 60*time.Second); err != nil {
 		return err
 	}
@@ -2018,10 +2064,14 @@ func runAttach(args []string) error {
 // replay is the one override. `--since` is the diagnostic path: the whole
 // reason to attach to a session that failed its setup is to read the log that
 // says why, and refusing that would take away the only tool for the case.
-func prepareAttach(c *cli.Client, id string, replay bool) error {
+//
+// It returns the row it read, because the caller needs it too: the session view
+// is where the server's attachment policy and its current typer count come
+// from, and reading it twice would be two round trips for one question.
+func prepareAttach(c *cli.Client, id string, replay bool) (session, error) {
 	row, err := getSession(c, id)
 	if err != nil {
-		return err
+		return session{}, err
 	}
 	// Dispatch on the SERVER's state, not on the display word. The endpoint's
 	// rules are stated in raw states (controlapp/attachments.go attachable,
@@ -2035,29 +2085,29 @@ func prepareAttach(c *cli.Client, id string, replay bool) error {
 		// not yet, and attachWithRetry waits for them exactly as `new` does.
 		// A running session whose child has exited is still attachable — the
 		// screen and the sandbox are both still there.
-		return nil
+		return row, nil
 	case "suspended_warm", "suspended_cold":
-		return resumeForAttach(c, id)
+		return row, resumeForAttach(c, id)
 	case "failed":
 		// AttachTerminal admits a failed session only while its runner is
 		// still connected, which is what preserves setup-failure diagnosis.
 		if row.Reachable || replay {
-			return nil
+			return row, nil
 		}
-		return unreachableFailedSession(row)
+		return session{}, unreachableFailedSession(row)
 	case "dead", "canceled", "destroyed":
 		if replay {
 			// --since is the documented diagnostic override. The endpoint
 			// will refuse if there is nothing behind it, and that refusal is
 			// more informative than one this CLI invents.
-			return nil
+			return row, nil
 		}
-		return goneSessionResult(row)
+		return session{}, goneSessionResult(row)
 	default:
 		// A state this build has never heard of. Conservative means making no
 		// claim about it, not inventing one: the attach is attempted and the
 		// server decides.
-		return nil
+		return row, nil
 	}
 }
 
@@ -2159,7 +2209,8 @@ func attachFlags(args []string) (ref string, cursor uint64, replay bool, own att
 	fs := flag.NewFlagSet("attach", flag.ExitOnError)
 	since := fs.Uint64("since", 0, "resume from sequence number; 0 replays the whole event log (omit for the current screen)")
 	view := fs.Bool("view", false, "watch without ever claiming control")
-	take := fs.Bool("take", false, "take control on attach, even if another device has it")
+	take := fs.Bool("take", false,
+		"take control on attach, even if another device has it (no effect where every attached terminal may already type)")
 	fs.Parse(reorderArgs(fs, args))
 	passed := passedFlags(fs)["since"]
 	selector, err := requireSelector(fs, "attach")
@@ -3796,6 +3847,20 @@ func rememberControl(cfg cli.Config, id string, out attachio.Outcome) {
 		latest.UpdateContext(name, ctx)
 		return nil
 	})
+}
+
+// inputRow renders `info`'s row about who may type: its label and its value.
+//
+// Under a shared attachment policy the question "who is the controller" has no
+// answer, because there is no controller — so the row says what the rule is and
+// how many terminals are attached under it. Under an exclusive policy it is
+// today's row, word for word, and that is also what an older server (which
+// reports no policy at all) gets.
+func inputRow(cfg cli.Config, s session) (label, value string) {
+	if s.Input.sharedInput() {
+		return "Input", fmt.Sprintf("shared (%d attached)", s.Input.Attached)
+	}
+	return "Controller", controllerLine(cfg, s)
 }
 
 // controllerLine renders `info`'s Controller row from what the server says

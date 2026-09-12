@@ -207,17 +207,25 @@ facts — state, reachable, child_exit_code — beside the derived ones.`
 Open the session's current terminal screen. Ctrl-] detaches and leaves the
 session running. A stopped session is resumed first and waited for.
 
-One device at a time may type; everyone else watches. Attaching takes
-control when nobody has it, which is every single-device attach, and
-otherwise attaches as a viewer and says so. Ctrl-\ takes control, and tells
-the device that had it. Ctrl-] releases control as it detaches, so the next
-attach needs no key at all.
+Who may type is the server's rule, and rainier info reports it. Where input
+is SHARED — the default — every attached terminal may type, nothing has to
+be claimed, and attaching says how many other terminals are already there.
+Where it is EXCLUSIVE, one device at a time may type and everyone else
+watches: attaching takes control when nobody has it, otherwise it attaches
+as a viewer and says so; Ctrl-\ takes control and tells the device that had
+it; and Ctrl-] releases control as it detaches, so the next attach needs no
+key at all.
+
+The pty follows the most recent resize from any terminal that may type. A
+viewer's size is ignored.
 
   --view    watch without ever claiming control; Ctrl-\ does nothing
-  --take    take control on attach, even if another device has it
+  --take    take control on attach, even if another device has it; no effect
+            where every attached terminal may already type
 
-Reconnecting after a disconnect resumes control only if nobody took it in
-the meantime; if somebody did, it comes back as a viewer and says so.
+Reconnecting after a disconnect comes back as whatever it actually is. Under
+an exclusive policy that means resuming control only if nobody took it in the
+meantime, and coming back a viewer — and saying so — if somebody did.
 
 A running sandbox stays attachable after its child exits. A failed session
 is attachable while its runner is reachable. --since requests diagnostic
