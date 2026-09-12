@@ -46,7 +46,7 @@ func TestControlEventWireShape(t *testing.T) {
 	if string(ev) != `{"kind":"setup_done"}` {
 		t.Fatalf("plain event on the wire = %s, want {\"kind\":\"setup_done\"}", ev)
 	}
-	for _, tag := range []string{"id", "ok", "payload", "stage", "rc", "tail"} {
+	for _, tag := range []string{"id", "ok", "payload", "stage", "rc", "tail", "live", "seq"} {
 		if strings.Contains(string(ev), `"`+tag+`"`) {
 			t.Fatalf("empty event leaked %q: %s", tag, ev)
 		}
@@ -76,6 +76,33 @@ func TestControlEventWireShape(t *testing.T) {
 	}
 	if string(fail) != `{"kind":"stage_failed","stage":"clone","rc":128,"tail":"fatal: repo not found"}` {
 		t.Fatalf("stage failure on the wire = %s", fail)
+	}
+
+	// The live-exec count, whose ZERO is its most important value: it is what
+	// starts the idle clock when the last command ends. `live` is omitempty,
+	// so that report puts no `live` on the wire at all and decodes back to the
+	// 0 that was meant — the same trick, and the same one-line justification,
+	// as a clean child exit's rc.
+	busy, err := json.Marshal(ControlEvent{Kind: KindExecCount, Live: 2, Seq: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(busy) != `{"kind":"exec_count","live":2,"seq":7}` {
+		t.Fatalf("exec count on the wire = %s", busy)
+	}
+	idle, err := json.Marshal(ControlEvent{Kind: KindExecCount, Live: 0, Seq: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(idle) != `{"kind":"exec_count","seq":8}` {
+		t.Fatalf("an empty exec count on the wire = %s", idle)
+	}
+	var lastOne ControlEvent
+	if err := json.Unmarshal(idle, &lastOne); err != nil {
+		t.Fatal(err)
+	}
+	if lastOne.Kind != KindExecCount || lastOne.Live != 0 || lastOne.Seq != 8 {
+		t.Fatalf("the last exec ending round-tripped to %+v", lastOne)
 	}
 
 	var back ControlEvent

@@ -197,6 +197,23 @@ func main() {
 		sandboxexec.SessionEnv(os.Environ(), envAssignments(chainVars)),
 		sandboxexec.NewSpawner().Start)
 
+	// What the RUNNER needs to know about those commands, and the only thing
+	// it needs: how many are running. runnerd's idle auto-stop stops a session
+	// whose agent child has exited and that has had no attachment for the
+	// timeout — and an attached exec holds an attachment, while a DETACHED one
+	// holds nothing at all. Without this report the 30m default cold-stops the
+	// session, and `docker stop`'s SIGTERM reaches the handler below and kills
+	// `rainier exec s --detach -- claude --continue`: the case the flag exists
+	// for. Installed here, before the relay can accept a FrameOpen, so the
+	// first exec of the session's life is counted.
+	//
+	// It never blocks: offerControl is the same never-blocking queue the
+	// agent's exit uses, so a report costs the goroutine that released a slot
+	// nothing at all.
+	execs.ObserveLive(func(live int, seq uint64) {
+		offerControl(events, execCountPayload(live, seq))
+	})
+
 	// The OTHER end of an exec's lifetime, and the one a signal cannot reach.
 	// The default `rainier stop` is a WARM suspend — `docker pause` — which
 	// freezes this process without ever delivering it a SIGTERM, so the
@@ -321,6 +338,23 @@ func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, e
 			// later one — see rpc.go.
 			sender, errc := relay.ServeSessionWithExec(ctx, relay.WSConn(c), s, rpc.OnControl, execs)
 			rpc.online(sender)
+			// This connection's first exec count, restated rather than waited
+			// for. The report queue drops when it is full and drops the oldest
+			// when it is at its cap — both deliberately — so a transition that
+			// happened while there was no connection can be lost, and an
+			// absolute count is only self-correcting if something restates it.
+			// A reconnection is the moment to: it costs one small frame per
+			// dial and it is the only point at which the runner's view and
+			// this sandbox's can have drifted with no further command coming
+			// to repair it.
+			//
+			// Straight down the sender rather than onto the queue, which is
+			// the one place in this file that is right to bypass it: a
+			// restatement is only ever about the connection in hand, and the
+			// next dial makes its own. It carries the highest sequence number
+			// issued so far, so whatever serveConn is about to drain from the
+			// queue behind it cannot overwrite it at the far end.
+			reportExecs(sender, execs)
 			var relayErr error
 			pending, relayErr = serveConn(sender, errc, events, pending)
 			rpc.offline()
@@ -437,6 +471,18 @@ func quiesceExecs(execs execKiller, notifier eventNotifier, nonce uint64) {
 	}
 }
 
+// reportExecs states this sandbox's live exec count over one connection. A
+// failure is logged and dropped: the conn is already dying (serveConn is about
+// to say so), the next dial restates the count, and there is nothing a
+// sandbox can usefully do about a runner it cannot reach.
+func reportExecs(sender controlSender, execs *sandboxexec.Runner) {
+	if p := execCountPayload(execs.LiveReport()); p != nil {
+		if err := sender.Send(p); err != nil {
+			log.Printf("reporting the live exec count: %v; the next connection restates it", err)
+		}
+	}
+}
+
 // controlSender is the one method serveConn needs from
 // relay.ControlSender — named as an interface so the delivery rules below
 // can be tested without standing up a conn to have a sender for.
@@ -546,6 +592,20 @@ func offerControl(out chan<- []byte, p []byte) {
 // same number, and it decodes back to the 0 that means "exited cleanly".
 func childExitedPayload(code int) []byte {
 	return controlPayload(relay.ControlEvent{Kind: "child_exited", RC: code})
+}
+
+// execCountPayload encodes the event that tells runnerd how many commands this
+// session is running, so idle auto-stop can count a live exec as activity.
+//
+// An EVENT like the child's exit: ID stays 0 and nobody answers it. Live is
+// `omitempty` and a live count of ZERO is the report that matters most — the
+// last command finished, start the idle clock — which is safe here for
+// precisely the reason it is safe on a clean child exit and no other: the
+// field's zero value and the number being carried are the same, so the absent
+// `live` decodes back to the 0 that was meant. Seq is never zero on a real
+// report, so it always travels.
+func execCountPayload(live int, seq uint64) []byte {
+	return controlPayload(relay.ControlEvent{Kind: relay.KindExecCount, Live: live, Seq: seq})
 }
 
 // nextBackoff doubles d and clamps to the 30s cap. Extracted as a pure step

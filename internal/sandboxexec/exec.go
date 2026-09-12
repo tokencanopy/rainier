@@ -207,6 +207,21 @@ type Runner struct {
 
 	mu   sync.Mutex
 	live map[*attachment]struct{}
+	// onLive is told, after every change to `live`, how many execs this
+	// session is running — which is what lets runnerd's idle auto-stop treat a
+	// live exec as activity instead of cold-stopping the session out from
+	// under a detached `claude --continue`. Nil until ObserveLive is called,
+	// and nil for good in every caller that has no relay to report over.
+	onLive func(live int, seq uint64)
+	// liveSeq numbers those reports. It is assigned under the SAME hold of
+	// mu that changes the count, while the observer is called after the
+	// unlock — so two transitions can reach the wire out of order, and the
+	// number is what lets the far end refuse the stale one rather than
+	// believe a session is running a command that has already finished.
+	// Calling the observer under the lock would order them for free and is
+	// not worth the deadlock it invites: it is a caller's function, and this
+	// package would be holding the mutex every one of its own methods takes.
+	liveSeq uint64
 	// quiescing is set once this session is on its way out and never cleared.
 	// KillAll sweeps what is live at the instant it runs; without a latch, an
 	// exec opened during the sweep — the relay conn is still up and still
@@ -430,14 +445,15 @@ const killPollInterval = 20 * time.Millisecond
 // room for the command that ends it.
 func (r *Runner) reserve(a *attachment, detached bool) string {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.quiescing {
 		// This session is ending. Refused rather than spawned into a sandbox
 		// that is about to be frozen or torn down, where the process would
 		// outlive the rule that says it cannot.
+		r.mu.Unlock()
 		return terminal.ReasonSessionEnding
 	}
 	if len(r.live) >= r.max {
+		r.mu.Unlock()
 		return terminal.ReasonTooManyExecs
 	}
 	if detached {
@@ -448,18 +464,72 @@ func (r *Runner) reserve(a *attachment, detached bool) string {
 			}
 		}
 		if n >= r.maxDetached {
+			r.mu.Unlock()
 			return terminal.ReasonTooManyDetached
 		}
 	}
 	r.live[a] = struct{}{}
+	// setDetached takes the ATTACHMENT's lock, not this one, so it cannot
+	// deadlock against the hold above — and it stays inside it because the
+	// detached-cap walk just above reads the same flag on every other
+	// attachment.
 	a.setDetached(detached)
+	report := r.noteLive()
+	r.mu.Unlock()
+	report()
 	return ""
 }
 
+// release gives one exec's slot back. It is idempotent — guard() calls it for
+// an attachment that may already have given its slot up — and a call that
+// changes nothing reports nothing, so a panicking spawn does not put a
+// duplicate count on the wire.
 func (r *Runner) release(a *attachment) {
 	r.mu.Lock()
-	delete(r.live, a)
+	report := func() {}
+	if _, held := r.live[a]; held {
+		delete(r.live, a)
+		report = r.noteLive()
+	}
 	r.mu.Unlock()
+	report()
+}
+
+// ObserveLive installs the observer described on Runner.onLive. It is called
+// once, before the runner is handed to anything that can open an exec — the
+// same discipline relay's onControl has, and for the same reason: a
+// registration racing a live reader is a data race whatever the mutex says.
+// Taking the lock here is belt and braces for the one caller that does it in
+// the right order and insurance for one that does not.
+func (r *Runner) ObserveLive(f func(live int, seq uint64)) {
+	r.mu.Lock()
+	r.onLive = f
+	r.mu.Unlock()
+}
+
+// LiveReport states the current count again under a fresh sequence number,
+// without waiting for a transition. sessiond sends one on every connection it
+// makes to runnerd, which is what repairs a report that was dropped while
+// there was no connection to carry it: this channel may drop, and a count that
+// is merely restated is self-correcting where a delta would not be.
+func (r *Runner) LiveReport() (live int, seq uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.liveSeq++
+	return len(r.live), r.liveSeq
+}
+
+// noteLive captures the report for the change the caller has just made and
+// returns it as a thunk to be called AFTER the lock is released. The caller
+// must hold r.mu. It is always safe to call the returned function; with no
+// observer installed it does nothing.
+func (r *Runner) noteLive() func() {
+	if r.onLive == nil {
+		return func() {}
+	}
+	r.liveSeq++
+	f, live, seq := r.onLive, len(r.live), r.liveSeq
+	return func() { f(live, seq) }
 }
 
 // LiveCount is how many execs this session is running right now, detached

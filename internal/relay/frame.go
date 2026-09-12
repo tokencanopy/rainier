@@ -71,7 +71,8 @@ type Frame struct {
 // shapes, distinguished by Kind and ID:
 //
 //   - An EVENT — "setup_done", "setup_failed"/"stage_failed", "child_exited",
-//     "suspending"/"suspend_ready" — is fire-and-forget and carries ID 0. Most
+//     "exec_count", "suspending"/"suspend_ready" — is fire-and-forget and
+//     carries ID 0. Most
 //     travel upward only (sessiond → runnerd), where runnerd turns them into
 //     rwire events for controld; the suspend pair is the one that travels both
 //     ways and stays between runnerd and the sandbox.
@@ -125,6 +126,23 @@ const (
 	// gave up waiting for one). Beyond the nonce it carries nothing: runnerd
 	// is waiting for the fact, and a count would be a number nobody acts on.
 	KindSuspendReady = "suspend_ready"
+	// KindExecCount is the sandbox telling runnerd how many commands it is
+	// running right now — detached ones included — so that idle auto-stop can
+	// treat a live exec exactly as it treats an attachment. It travels upward
+	// only, carries Live and Seq, and is answered by nothing.
+	//
+	// It is an ABSOLUTE count rather than a start/end pair because this
+	// channel is allowed to drop: a sessiond with no connection queues its
+	// events and drops the oldest at a cap, by design (an unbounded queue in
+	// a process that outlives everything else is the worse failure). A lost
+	// DELTA is wrong forever — the runner either pins a finished session out
+	// of auto-stop for its life or, worse, under-counts and stops a session
+	// with a live command in it. A lost COUNT is corrected by the next
+	// transition or by the next connection, both of which state the truth
+	// again.
+	//
+	// See docs/design/exec-idle-stop.md.
+	KindExecCount = "exec_count"
 )
 
 type ControlEvent struct {
@@ -169,6 +187,18 @@ type ControlEvent struct {
 	// came up, so it travels with the event rather than being left in a log
 	// inside a container that is about to go away.
 	Tail string `json:"tail,omitempty"`
+	// Live and Seq are KindExecCount's whole payload: how many commands the
+	// sandbox is running right now, and the report's place in the sequence.
+	//
+	// Live is `omitempty` and zero is its most important value — "the last one
+	// ended" — which is safe for the same reason, and only the same reason, as
+	// RC's on a clean child exit: the field's zero value and the number being
+	// carried are the same, so an absent `live` decodes back to the 0 that was
+	// meant. Seq is 1 on a sandbox's first report and never zero afterwards,
+	// so it is never omitted on a real one; a decoded zero names a peer that
+	// does not speak this event.
+	Live int    `json:"live,omitempty"`
+	Seq  uint64 `json:"seq,omitempty"`
 }
 
 func Encode(f Frame) ([]byte, error) { return json.Marshal(f) }
