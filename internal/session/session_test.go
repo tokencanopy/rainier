@@ -170,7 +170,11 @@ func TestStdinForwarded(t *testing.T) {
 	}
 }
 
-func TestSmallestViewerResizesProc(t *testing.T) {
+// TestTheLatestAttachSizesProc: two unbound attachments may both type (an
+// older plane, or a direct-to-sandbox attach), and the pty follows the size
+// reported most recently — whole, not axis-by-axis. This is the rule that
+// replaced smallest-per-axis; see LatestSize.
+func TestTheLatestAttachSizesProc(t *testing.T) {
 	s, fp := newFakeSession(t)
 	a, _ := s.Attach(0, Size{120, 40}, Binding{})
 	recv(t, a.Msgs)
@@ -178,8 +182,8 @@ func TestSmallestViewerResizesProc(t *testing.T) {
 	b, _ := s.Attach(0, Size{80, 50}, Binding{})
 	recv(t, b.Msgs)
 	got := <-fp.resizes
-	if got != (Size{80, 40}) {
-		t.Fatalf("resize = %+v, want {80 40}", got)
+	if got != (Size{80, 50}) {
+		t.Fatalf("resize = %+v, want the latest attach's {80 50}", got)
 	}
 	_ = b
 }
