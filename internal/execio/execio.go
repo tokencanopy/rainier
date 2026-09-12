@@ -465,10 +465,11 @@ func ExitCodeFor(r Result) (code int, ok bool) {
 		terminal.ReasonTooManyDetached, terminal.ReasonSessionEnding,
 		terminal.ReasonNoAnswer, terminal.ReasonStdinOverrun:
 		// None of these is the command failing: a sandbox that cannot run
-		// commands at all, one that did not answer in time, a session already
-		// running as many as it may, or input this caller sent faster than
-		// its command would take it. All four are Rainier's own failure,
-		// which is 1, with a sentence that says which.
+		// commands at all, one that is on its way out, one that did not answer
+		// in time, a session already running as many commands as it may or as
+		// many DETACHED ones as it may, or input this caller sent faster than
+		// its command would take it. All six are Rainier's own failure, which
+		// is 1, with a sentence that says which.
 		return 1, false
 	}
 	if !r.Started {

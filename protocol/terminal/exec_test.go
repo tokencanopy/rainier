@@ -2,6 +2,8 @@ package terminal_test
 
 import (
 	"encoding/json"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/tokencanopy/rainier/protocol/runner"
@@ -208,5 +210,34 @@ func TestExecReasonsIsACopy(t *testing.T) {
 	first[0] = "tampered"
 	if terminal.ExecReasons()[0] == "tampered" {
 		t.Fatal("ExecReasons hands out the same backing array every time")
+	}
+}
+
+// TestEveryExecReasonReachesTheContract closes the loop the failure message
+// above opens. It told a reader to add a new word to two documents and then
+// checked neither, which is how `session_ending`, `too_many_execs`,
+// `too_many_detached` and `stdin_overrun` reached §3.9 as prose — described
+// accurately, spelled nowhere — while `no_answer` and four others were
+// spelled. A word a caller can receive and cannot search the contract for is a
+// word nobody can act on, which is the whole reason that message exists.
+//
+// It looks for the word in BACKTICKS, because that is how the section spells
+// every other one and because prose that merely contains "not found" is not
+// the same promise as `not_found`.
+func TestEveryExecReasonReachesTheContract(t *testing.T) {
+	const doc = "../../docs/cli-v0-contract.md"
+	b, err := os.ReadFile(doc)
+	if err != nil {
+		// Not a failure: this package is consumed as a module, where the
+		// repository's documents are not on disk beside it.
+		t.Skipf("the contract document is not in this tree: %v", err)
+	}
+	text := string(b)
+	for _, r := range terminal.ExecReasons() {
+		if !strings.Contains(text, "`"+r+"`") {
+			t.Errorf("the reason word %q is not in %s. Add it to §3.9 as the literal "+
+				"word, in backticks, beside the sentence that describes it — a caller "+
+				"who receives it has to be able to find it there.", r, doc)
+		}
 	}
 }

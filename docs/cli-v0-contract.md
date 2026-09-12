@@ -427,15 +427,25 @@ frozen, so a detached run does not survive a stop-and-resume. A non-detached
 command **is** killed when its caller disconnects (`SIGTERM` to its process
 group, five seconds, `SIGKILL`).
 
-At most **four** of the eight concurrent commands may be detached, refused
-with its own reason rather than the eight-command one: a detached process
-holds its slot for as long as it runs, and the command that stops one is
-itself a command that needs a slot.
+At most **four** of the eight concurrent commands may be detached, refused with
+its own reason (`too_many_detached`) rather than the eight-command one
+(`too_many_execs`): a detached process holds its slot for as long as it runs,
+and the command that stops one is itself a command that needs a slot.
+
+Input this caller sends faster than its command will take it is refused too
+(`stdin_overrun`), which ends the command rather than silently dropping bytes
+it would have read.
+
+A detached command also keeps its session out of the runner's **idle
+auto-stop**: a session running any command — attached or detached — is not idle,
+and the idle timer starts again when the last one ends, exactly as it does when
+the last viewer detaches. See the README's "Runner capacity".
 
 A command that arrives while the session is being stopped or deleted is refused
-rather than started, and exits 1 with a sentence saying so — the sandbox stops
-accepting commands the moment it is told it is going away, because one accepted
-in that window would be frozen alive by the pause that follows.
+rather than started (`session_ending`), and exits 1 with a sentence saying so —
+the sandbox stops accepting commands the moment it is told it is going away,
+because one accepted in that window would be frozen alive by the pause that
+follows.
 
 Ctrl-C forwards `SIGINT` to the command; a second press leaves, which kills
 it. There is no server-imposed timeout: a build legitimately runs for an hour
