@@ -508,7 +508,24 @@ type attachmentFixture struct {
 	ids       *attachmentFakeIDs
 }
 
+// newAttachmentFixture composes the service under control.PolicyExclusive —
+// the conditional-controller model — so that every generation and lease
+// assertion in this package keeps testing what it was written for after shared
+// input became the DEFAULT policy. The shared rule has its own fixture below;
+// the two are one line apart on purpose.
 func newAttachmentFixture(t *testing.T) *attachmentFixture {
+	t.Helper()
+	return newAttachmentFixturePolicy(t, control.PolicyExclusive)
+}
+
+// newSharedAttachmentFixture composes the same service under
+// control.PolicyShared, which is what a host that names no policy gets.
+func newSharedAttachmentFixture(t *testing.T) *attachmentFixture {
+	t.Helper()
+	return newAttachmentFixturePolicy(t, control.PolicyShared)
+}
+
+func newAttachmentFixturePolicy(t *testing.T, policy control.InputPolicy) *attachmentFixture {
 	t.Helper()
 	fx := &attachmentFixture{
 		now:       time.Unix(1_700_000_000, 0).UTC(),
@@ -521,15 +538,16 @@ func newAttachmentFixture(t *testing.T) *attachmentFixture {
 		ids:       &attachmentFakeIDs{eventID: "evt_example"},
 	}
 	svc, err := NewAttachmentService(AttachmentOptions{
-		Authorizer: fx.auth,
-		Policy:     fx.policy,
-		Sessions:   fx.sessions,
-		Transport:  fx.transport,
-		Broker:     fx.broker,
-		Events:     fx.events,
-		Clock:      attachmentFakeClock(func() time.Time { return fx.now }),
-		IDs:        fx.ids,
-		UnitOfWork: directUOW{},
+		Authorizer:  fx.auth,
+		Policy:      fx.policy,
+		Sessions:    fx.sessions,
+		Transport:   fx.transport,
+		Broker:      fx.broker,
+		Events:      fx.events,
+		Clock:       attachmentFakeClock(func() time.Time { return fx.now }),
+		IDs:         fx.ids,
+		UnitOfWork:  directUOW{},
+		InputPolicy: policy,
 	})
 	if err != nil {
 		t.Fatalf("NewAttachmentService: %v", err)
