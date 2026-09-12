@@ -110,6 +110,35 @@ other mutable field:
   not failed ones, and a time-boxed diagnosis window is a better answer than either extreme
   once #85's admission work has somewhere to put it.
 - `lastDetachAt time.Time` — when the most recent attachment ended.
+- `liveExecs int`, `lastExecEndedAt time.Time`, `execSeq`/`execStampedSeq`/`execReg uint64` —
+  how many `rainier exec` commands the sandbox says it is running, when the count last fell
+  to zero, and the three counters that decide which reports to believe: a sequence the
+  sandbox assigns, the one stamp that sequence is allowed to make from a refusal, and the
+  `/register` epoch the stream belongs to. That last one is **minted** where `boot` is read,
+  because a live-exec report is only ever about the connection in hand — the sandbox restates
+  its count as every connection's first message — and because a sandbox process replaced
+  without a cold resume numbers from 1 again on an unchanged `boot`. See
+  [`exec-idle-stop.md`](exec-idle-stop.md), and below.
+
+#### `rainier exec`, which landed beside this
+
+`rainier exec` runs a command inside the same live sandbox. **A session running one is not
+idle**, on exactly the terms a session with a viewer attached is not idle, and the timer
+starts again when the last command ends exactly as it starts again at the last detach.
+
+That has to be *told*, not inferred. An **attached** exec happens to hold an `attachments`
+count, because it shares the `dial_attach` dial-back — but a **detached** one holds nothing at
+all, and outliving its caller is the entire meaning of the flag. Before the two features were
+introduced to each other, `idleFor` read five facts and none of them was an exec, so the 30m
+default cold-stopped a session whose agent had finished and `docker stop`'s SIGTERM killed
+`rainier exec s --detach -- claude --continue` — the case `rainier exec` exists for, and a
+direct contradiction of this file's own rule that a long unattended run is the product.
+
+So `sessiond` reports its live count as an `exec_count` control event on every transition and
+on every connection, behind the same boot epoch every other control event carries, and the
+runner keeps it on the entry. An old `sessiond` sends nothing, leaves `liveExecs` at zero and
+behaves exactly as described above — with the attached-exec case still covered by its
+attachment.
 
 ### The rule
 
@@ -121,12 +150,16 @@ A session is idle at time `now`, for a timeout `d > 0`, when all of:
   container for minutes, so a session somebody else is mid-operation on is not one to stop,
 - its boot chain did not fail (`bootFailed == false`) — see below,
 - `attachments == 0`,
+- `liveExecs == 0` — the session is running no `rainier exec` command, detached ones
+  included,
 - `childExitedAt` is non-zero,
-- `now.Sub(max(childExitedAt, lastDetachAt)) >= d`.
+- `now.Sub(max(childExitedAt, lastDetachAt, lastExecEndedAt)) >= d`.
 
-`max(childExitedAt, lastDetachAt)` is what makes the timer start when the **last viewer
-leaves**, not when the child exited: someone reading the scrollback of a finished agent for
-an hour resets nothing while attached, and gets the full `d` after detaching.
+`max(childExitedAt, lastDetachAt, lastExecEndedAt)` is what makes the timer start when the
+**last viewer leaves or the last command ends**, not when the child exited: someone reading
+the scrollback of a finished agent for an hour resets nothing while attached, and gets the
+full `d` after detaching, and the same is true of a script that runs `rainier exec` against
+the session every twenty minutes.
 
 ### The sweep
 
@@ -257,6 +290,8 @@ timeout measured in tens of minutes.
 | child running, nobody attached for hours | never stopped |
 | child exited, one viewer attached | never stopped, however long |
 | that viewer detaches | the timer runs from the detach, not from the exit |
+| child exited, a detached `rainier exec` running | never stopped, however long |
+| that command ends | the timer runs from its end, not from the exit |
 | `--idle-stop 0` | the loop never starts; nothing is ever stopped |
 | already stopped by the operator | state is not `"running"`; never claimed, never stopped twice |
 | resumed, works, child exits again | eligible again, `d` after that exit |
@@ -327,6 +362,10 @@ worth writing down here because this is the first one whose loss leaves a sessio
   `AttachClient` sets no read deadline, so a viewer whose laptop lid closed counts as attached
   until TCP gives up. Safe direction (never stops a watched session) but it is the one input
   this feature trusts absolutely, and a liveness signal on attachments would be worth having.
+- **A sandbox whose conn dies while it is running a command holds its session open.** The
+  last `exec_count` the runner applied stands until something contradicts it, so a session
+  whose sessiond went away mid-command is never auto-stopped. Same shape as the line above,
+  same safe direction, and an operator's stop and a delete are unaffected.
 - **`active + idle_exited` is not an arithmetic partition of `used`.** It is usually less
   (a warm-suspended sandbox, one still being created, and one `Recover` rebuilt are in
   neither), but it can also exceed what the driver counts: `register`'s hub-death tail

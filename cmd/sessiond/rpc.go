@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -61,12 +62,19 @@ type rpcDispatcher struct {
 	// inbound frame afterwards. Under the same lock as pending because both
 	// are small map touches and one lock is one fewer thing to reason about.
 	handlers map[string]RPCHandler
-	pending  map[uint64]chan relay.ControlEvent
+	// events is the third shape this channel carries: a fire-and-forget
+	// control kind that is neither a request nor a response and therefore has
+	// no id to correlate and no reply to send. The suspend notice is the one
+	// that travels DOWN, which is why this exists at all — everything else in
+	// the event vocabulary goes up.
+	events  map[string]func(relay.ControlEvent)
+	pending map[uint64]chan relay.ControlEvent
 }
 
 func newRPCDispatcher() *rpcDispatcher {
 	return &rpcDispatcher{
 		handlers: map[string]RPCHandler{},
+		events:   map[string]func(relay.ControlEvent){},
 		pending:  map[uint64]chan relay.ControlEvent{},
 	}
 }
@@ -79,6 +87,40 @@ func (d *rpcDispatcher) RegisterRPCHandler(method string, fn RPCHandler) {
 	defer d.mu.Unlock()
 	d.handlers[method] = fn
 }
+
+// RegisterEventHandler installs fn as the handler for one fire-and-forget
+// control kind. Registered at boot for the same reason RegisterRPCHandler is:
+// a frame arriving on a connection's first read must find its handler already
+// installed.
+//
+// fn runs on the per-frame goroutine relay hands the payload to, so it may
+// block for as long as its meaning needs — the suspend notice deliberately
+// does, because the whole point is that runnerd is waiting for it. It must not
+// panic; invokeEvent turns one into a log line rather than into a dead session.
+func (d *rpcDispatcher) RegisterEventHandler(kind string, fn func(relay.ControlEvent)) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.events[kind] = fn
+}
+
+// Notify sends one fire-and-forget control event over the live connection.
+// Unlike a response it has no connection it must go back on, because there is
+// no id whose meaning a different connection could change — but a nil conn is
+// still an error rather than a silent drop, because the one caller (the
+// suspend acknowledgement) has somebody waiting on the other end.
+func (d *rpcDispatcher) Notify(ev relay.ControlEvent) error {
+	conn := d.conn.Load()
+	if conn == nil {
+		return errNoRPCConn
+	}
+	b, err := json.Marshal(ev)
+	if err != nil {
+		return fmt.Errorf("encoding a %s event: %w", ev.Kind, err)
+	}
+	return conn.sender.Send(b)
+}
+
+var errNoRPCConn = errors.New("sessiond: no connection to runnerd")
 
 // online installs the sender for a freshly established connection. Any
 // connection it replaces is marked done first, which is what fails the calls
@@ -161,8 +203,28 @@ func (d *rpcDispatcher) OnControl(payload []byte) {
 		}
 		d.serve(method, ev)
 	default:
-		log.Printf("control frame of unknown kind %q; ignoring", ev.Kind)
+		d.mu.Lock()
+		fn := d.events[ev.Kind]
+		d.mu.Unlock()
+		if fn == nil {
+			log.Printf("control frame of unknown kind %q; ignoring", ev.Kind)
+			return
+		}
+		d.invokeEvent(ev, fn)
 	}
+}
+
+// invokeEvent runs one event handler, turning a panic into a log line for the
+// same reason invoke does: these run on relay's per-frame goroutines, and an
+// unrecovered panic on one of those takes down a process that by design
+// outlives its agent, its connection and every viewer.
+func (d *rpcDispatcher) invokeEvent(ev relay.ControlEvent, fn func(relay.ControlEvent)) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("the %s event handler panicked: %v", ev.Kind, r)
+		}
+	}()
+	fn(ev)
 }
 
 // serve runs one inbound request and sends its response back over the

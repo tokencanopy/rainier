@@ -19,6 +19,7 @@ import (
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/runnerplane"
 )
 
 // AgentConfig configures RunAgent's outbound dial to controld.
@@ -331,7 +332,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 	active, idleExited := s.reg.counts()
 	ann := runner.FromRunner{Type: "announce", Proto: runner.ProtocolVersion, Runner: cfg.RunnerName,
 		Sessions: s.Announce(), Used: used, Total: total, Active: active, IdleExited: idleExited,
-		Capabilities: cfg.Capabilities}
+		Capabilities: buildCapabilities(cfg.Capabilities)}
 	if err := wsjson.Write(connCtx, c, ann); err != nil {
 		return false, err // nothing can have been accepted before the announce
 	}
@@ -709,7 +710,47 @@ func (s *Server) dialAttachBack(ctx context.Context, m runner.ToRunner, cfg Agen
 	hub.AttachClient(ctx, relay.WSConn(c), relay.Open{
 		Since: at.Since, Cols: at.Cols, Rows: at.Rows,
 		Mode: at.Mode, Generation: at.Generation,
+		// The kind and the command are forwarded verbatim and interpreted
+		// nowhere in this process: what an exec IS belongs to the sandbox,
+		// which is the only party that can resolve a path, read an
+		// environment or spawn anything. A runner that forwards them is the
+		// whole of what `exec.v1` claims.
+		Kind: at.Kind, Exec: at.Exec,
 	})
+}
+
+// buildCapabilities is what this runner announces: the operator's own
+// --capability claims, plus the ones that are facts about the BUILD rather
+// than claims about the machine.
+//
+// `exec.v1` is such a fact. Whether this runnerd can forward an exec
+// dial-back is decided by the code it was compiled from, not by a flag an
+// operator remembered to pass, and an operator who had to remember would
+// produce a fleet where `rainier exec` works on some runners and 501s on
+// others for no reason a user could see. The operator's list is left exactly
+// as given otherwise — a capability is a claim controld decides whether to
+// schedule on, and this adds one it can always trust.
+//
+// It is appended only when there is ROOM for it. runnerplane refuses a whole
+// registration whose claim carries more than MaxCapabilities, so an operator
+// already passing the maximum would announce one too many after this rolls and
+// never reconnect — a working runner out of the fleet permanently, which is a
+// far worse failure than the 501 this append exists to avoid for what is a
+// cheap pre-check and not the fence. The sandbox's own `exec_started` is the
+// fence, so the only cost of dropping the claim is one wasted round trip.
+func buildCapabilities(declared []string) []string {
+	for _, c := range declared {
+		if c == runner.CapabilityExecV1 {
+			return declared
+		}
+	}
+	if len(declared) >= runnerplane.MaxCapabilities {
+		log.Printf("agent: %d capabilities declared, which is runnerplane's maximum; "+
+			"announcing without %s (exec is still fenced by the sandbox's own handshake)",
+			len(declared), runner.CapabilityExecV1)
+		return declared
+	}
+	return append(append([]string(nil), declared...), runner.CapabilityExecV1)
 }
 
 // attachDialTimeout bounds one attach-back handshake. It sits below

@@ -236,6 +236,18 @@ func chainProgram(env []envVar, stages []bootStage) string {
 	return b.String()
 }
 
+// envAssignments renders the boot chain's exports as the KEY=VALUE strings an
+// environment is actually made of. The exec runner takes them in that shape
+// rather than in this package's own envVar, so that nothing about how the
+// boot chain happens to hold its variables reaches across the seam.
+func envAssignments(vars []envVar) []string {
+	out := make([]string, 0, len(vars))
+	for _, v := range vars {
+		out = append(out, v.Name+"="+v.Value)
+	}
+	return out
+}
+
 // chainArgv composes the child argv: the chain program, a $0 placeholder, and
 // then the real argv verbatim as "$@". With no stages the agent IS the child,
 // which is what keeps a session that asked for nothing free of a shell it does

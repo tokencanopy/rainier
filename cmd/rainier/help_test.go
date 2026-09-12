@@ -279,7 +279,7 @@ func TestMakeBuildVersionFromWorktree(t *testing.T) {
 	write(filepath.Join(repo, ".gitignore"), "bin/\n.worktrees/\n")
 	write(filepath.Join(repo, "cmd/rainier/main.go"), `package main
 import "fmt"
-const envUsage, agentUsage, secretUsage, connectionUsage = "", "", "", ""
+const envUsage, agentUsage, secretUsage, connectionUsage, execUsage = "", "", "", "", ""
 var connectionProviders []string
 func agentProviderNames() []string { return nil }
 func printManual() {}

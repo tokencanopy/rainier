@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/tokencanopy/rainier/internal/eventlog"
 	"github.com/tokencanopy/rainier/internal/reap"
 	"github.com/tokencanopy/rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/sandboxexec"
 	"github.com/tokencanopy/rainier/internal/server"
 	"github.com/tokencanopy/rainier/internal/session"
 	"github.com/tokencanopy/rainier/protocol/runner"
@@ -120,6 +122,12 @@ func main() {
 	// the unix socket is how a process inside the container (the git credential
 	// helper) reaches it. Handler registration happens here, at boot, for the
 	// same reason.
+	// chainVars is what the boot chain exports to the AGENT — GIT_CONFIG_GLOBAL
+	// and the no-prompting rules. It is hoisted out of the relay-mode block
+	// below because the exec runner needs it too: an exec that could not find
+	// the credential helper or the session's git identity would be a `git
+	// status` that works for the agent and not for a script.
+	var chainVars []envVar
 	var rpc *rpcDispatcher
 	// agents keeps this session's agent homes equal to the control plane's
 	// custody for as long as the session lives. It stays nil when the create
@@ -146,6 +154,7 @@ func main() {
 			// session failed.
 			log.Fatalf("boot chain: %v", err)
 		}
+		chainVars = chainEnv
 		argv = chainArgv(chainEnv, stages, argv)
 
 		// The agent homes. The fetch that fills them runs on its own goroutine,
@@ -176,6 +185,59 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// The exec runner: `rainier exec`'s end in the sandbox. It is built BESIDE
+	// the session and is handed to the relay rather than to it, because an
+	// exec's output must never reach the emulator, the event log or any
+	// viewer's screen. It starts nothing until a caller asks.
+	//
+	// Its environment is the one the agent got — this process's own, which is
+	// the container's, plus the boot chain's exports — which is what makes
+	// `claude --continue` and `git status` work inside an exec and what
+	// argv[0] is looked up on.
+	execs := sandboxexec.NewRunner(workspaceRoot,
+		sandboxexec.SessionEnv(os.Environ(), envAssignments(chainVars)),
+		sandboxexec.NewSpawner().Start)
+
+	// What the RUNNER needs to know about those commands, and the only thing
+	// it needs: how many are running. runnerd's idle auto-stop stops a session
+	// whose agent child has exited and that has had no attachment for the
+	// timeout — and an attached exec holds an attachment, while a DETACHED one
+	// holds nothing at all. Without this report the 30m default cold-stops the
+	// session, and `docker stop`'s SIGTERM reaches the handler below and kills
+	// `rainier exec s --detach -- claude --continue`: the case the flag exists
+	// for. Installed here, before the relay can accept a FrameOpen, so the
+	// first exec of the session's life is counted.
+	//
+	// It never blocks: offerControl is the same never-blocking queue the
+	// agent's exit uses, so a report costs the goroutine that released a slot
+	// nothing at all.
+	//
+	// It goes to a mailbox of its own rather than onto `events`, and that is
+	// the difference between a count that is self-correcting and one that only
+	// looks it. `events` drops the NEWEST payload when it is full and the
+	// pending queue behind it drops the OLDEST when it is at its cap; for an
+	// absolute count the newest is the only one that matters, and a dropped
+	// "one live" with no further transition coming is exactly the cold stop
+	// this whole change exists to prevent. The mailbox holds one report and
+	// replaces it, so the newest always wins, and it never displaces the
+	// child's exit out of a queue they would otherwise share.
+	execCounts := watchExecs(execs)
+
+	// The OTHER end of an exec's lifetime, and the one a signal cannot reach.
+	// The default `rainier stop` is a WARM suspend — `docker pause` — which
+	// freezes this process without ever delivering it a SIGTERM, so the
+	// handler below never runs and a detached `claude --continue` would be
+	// frozen and resumed rather than reaped. runnerd sends this notice just
+	// before it pauses the container and waits for the acknowledgement, which
+	// is what makes "it dies with its session when it is stopped" — what the
+	// CLI's help says and what the design's lifetime rule states — true on
+	// the path users actually take.
+	if rpc != nil {
+		rpc.RegisterEventHandler(relay.KindSuspending, func(ev relay.ControlEvent) {
+			quiesceExecs(execs, rpc, ev.ID)
+		})
+	}
+
 	go func() {
 		<-s.Exited()
 		code := s.ExitCode()
@@ -204,19 +266,11 @@ func main() {
 	signal.Notify(term, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-term
-		stopWatching()
-		// Graceful: ask the agent to exit; the exit path closes viewers and the
-		// process ends when the child is reaped. Give it a moment, then hard-exit.
-		s.Stop()
-		// The last thing an agent wrote is usually the thing worth keeping — a
-		// login completed seconds before the session was torn down — and the
-		// sync's two-second tick must not be what decides whether it survives.
-		// Placed after Stop so the child already has its signal while this
-		// runs, and bounded by the RPC's own timeout so a control plane that
-		// has gone away cannot hold the shutdown open.
+		var closeAgents func()
 		if agents != nil {
-			agents.close()
+			closeAgents = agents.close
 		}
+		onShutdownSignal(stopWatching, s.Stop, execs, closeAgents)
 		select {
 		case <-s.Exited():
 		case <-time.After(5 * time.Second):
@@ -228,7 +282,7 @@ func main() {
 		if len(stages) > 0 {
 			startStageWatcher(stageCtx, s.Stop, stages, *logPath, events)
 		}
-		dialLoop(context.Background(), *dial, *sessionID, s, events, rpc)
+		dialLoop(context.Background(), *dial, *sessionID, s, events, execCounts, rpc, execs)
 		return
 	}
 
@@ -253,12 +307,18 @@ func main() {
 // this loop's, and there may not be one at the moment they land — see
 // serveConn.
 //
+// execs is the exec runner the relay hands exec attachments to. It is
+// threaded through here rather than reached for globally because an exec is
+// per-SESSION — its concurrency cap, its environment and the processes it has
+// to kill at shutdown all belong to this sandbox and to no other.
+//
 // rpc is the session-RPC dispatcher, which this loop owns the connection half
 // of: it handles the control frames arriving on each conn, and holds that
 // conn's sender for as long as it lives. The asymmetry with events is
 // deliberate — an event queues across a reconnect, a request does not (see
 // rpcConn).
-func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, events <-chan []byte, rpc *rpcDispatcher) {
+func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, events <-chan []byte,
+	execCounts *execCountMailbox, rpc *rpcDispatcher, execs *sandboxexec.Runner) {
 	backoff := time.Second
 	var pending [][]byte // control payloads no connection has accepted yet
 	for {
@@ -285,10 +345,10 @@ func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, e
 			// cannot arrive, and a handler that outlives the conn answers over
 			// the (now dead) conn its request came in on rather than over a
 			// later one — see rpc.go.
-			sender, errc := relay.ServeSessionWithControl(ctx, relay.WSConn(c), s, rpc.OnControl)
+			sender, errc := relay.ServeSessionWithExec(ctx, relay.WSConn(c), s, rpc.OnControl, execs)
 			rpc.online(sender)
 			var relayErr error
-			pending, relayErr = serveConn(sender, errc, events, pending)
+			pending, relayErr = serveConn(sender, errc, events, execCounts.c(), execs, pending)
 			rpc.offline()
 			log.Printf("relay ended: %v; redialing", relayErr)
 		} else {
@@ -306,6 +366,202 @@ func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, e
 		backoff = nextBackoff(backoff)
 	}
 }
+
+// onShutdownSignal is what a SIGTERM means to this sessiond, on its own so
+// that what it does is checkable rather than only readable.
+//
+// Graceful: ask the agent to exit — the exit path closes viewers and the
+// process ends when the child is reaped — and end every exec with it,
+// DETACHED ones included. That is the bound on a detached exec's life: it
+// outlives its caller, never its session. A cold stop and a destroy both
+// arrive here; the WARM stop, which delivers no signal at all, arrives at
+// quiesceExecs instead.
+//
+// KillAll rather than KillAllAndWait: the caller below already bounds the
+// whole shutdown at five seconds, and a container being stopped has a SIGKILL
+// coming for anything still running. The warm path is the one that has to
+// wait, because a frozen container's processes are not going anywhere.
+//
+// The agent sync closes last. The last thing an agent wrote is usually the
+// thing worth keeping — a login completed seconds before the session was torn
+// down — and the sync's two-second tick must not be what decides whether it
+// survives; placing it after Stop means the child already has its signal
+// while this runs.
+func onShutdownSignal(stopWatching func(), stop func(), execs execKiller, closeAgents func()) {
+	stopWatching()
+	stop()
+	execs.KillAll()
+	if closeAgents != nil {
+		closeAgents()
+	}
+}
+
+// execQuiesceBudget bounds how long the sandbox waits for its execs to be
+// GONE before saying so.
+//
+// Longer than sandboxexec's own kill grace on purpose: that grace is what
+// separates the SIGTERM from the SIGKILL, and answering in between would
+// freeze the container with the escalation still on a timer the freezer cgroup
+// then stops. By the time it expires every exec has had both signals, so what
+// can still be outstanding is a drain waiting for EOF on a pipe some process
+// outside the group is holding — not a live command. Every session running no
+// exec at all, which is nearly every stop, answers immediately and pays none
+// of it.
+const execQuiesceBudget = 10 * time.Second
+
+// execKiller is the exec runner as the suspend path needs it, named as an
+// interface so the wiring below is testable without a sandbox to have
+// processes in.
+type execKiller interface {
+	// KillAll ends every exec and returns as soon as each has been signalled.
+	KillAll()
+	// KillAllAndWait is KillAll plus the wait for the processes to be GONE.
+	KillAllAndWait(budget time.Duration) int
+}
+
+// eventNotifier is the one method the suspend answers need.
+type eventNotifier interface {
+	Notify(relay.ControlEvent) error
+}
+
+// quiesceExecs ends every exec this session is running — DETACHED ones
+// included, because their lifetime is the session's — and tells runnerd when
+// they are gone so the container can be frozen without a half-delivered signal
+// pending inside it.
+//
+// It answers TWICE, and the first answer is immediate. runnerd cannot tell a
+// sandbox that is working from one that predates this notice entirely, and a
+// session keeps the sessiond it booted with for life — so without an early
+// "heard you" every session created before exec shipped would make every warm
+// stop wait out the long budget, forever. Saying so at once is what lets
+// runnerd give a sandbox that IS working the time it needs.
+//
+// The wait is for the processes rather than for the signals: KillAll signals
+// on a goroutine per exec by design, so answering as soon as it returns would
+// report a suspend ready while the SIGTERMs were still in flight. Each exec's
+// attachment closes as its process goes, which is what ends the caller's
+// stream — the caller reads a connection that ended with no exit status, exits
+// 125, and is told "the session was stopped before the command reported an
+// exit status".
+//
+// The final answer goes out even when the budget expires. runnerd freezes the
+// container anyway when it hears nothing, so staying silent would only make
+// the stop slower; saying so is what puts the reason in this session's log.
+func quiesceExecs(execs execKiller, notifier eventNotifier, nonce uint64) {
+	if err := notifier.Notify(relay.ControlEvent{
+		Kind: relay.KindSuspendAck, ID: nonce}); err != nil {
+		log.Printf("acknowledging the suspend notice: %v", err)
+	}
+	if n := execs.KillAllAndWait(execQuiesceBudget); n > 0 {
+		log.Printf("%d exec(s) had not ended %s after the suspend notice; "+
+			"answering anyway (every one of them has had SIGTERM and SIGKILL by now; "+
+			"what is outstanding is a drain, not a command)", n, execQuiesceBudget)
+	}
+	if err := notifier.Notify(relay.ControlEvent{
+		Kind: relay.KindSuspendReady, ID: nonce}); err != nil {
+		log.Printf("reporting the suspend ready: %v", err)
+	}
+}
+
+// execReporter is the one method serveConn needs from the exec runner, named
+// as an interface so the delivery rules can be tested without a sandbox to
+// have processes in.
+type execReporter interface {
+	// LiveReport states the current live-exec count under a fresh sequence
+	// number.
+	LiveReport() (live int, seq uint64)
+}
+
+// reportExecs states this sandbox's live exec count over one connection. A
+// failure is logged and dropped: the conn is already dying (serveConn is about
+// to say so), the next dial restates the count, and there is nothing a
+// sandbox can usefully do about a runner it cannot reach.
+//
+// A nil reporter is the dev-mode and test shape — no exec runner to speak for
+// — and says nothing at all.
+func reportExecs(sender controlSender, execs execReporter) {
+	if execs == nil {
+		return
+	}
+	if p := execCountPayload(execs.LiveReport()); p != nil {
+		if err := sender.Send(p); err != nil {
+			log.Printf("reporting the live exec count: %v; the next connection restates it", err)
+		}
+	}
+}
+
+// execCountMailbox is the one-slot queue this sandbox's live-exec reports wait
+// in, and REPLACING is the whole of what makes it different from `events`.
+//
+// A live-exec count is absolute, so the newest report is the only one worth
+// delivering and every older one is noise. offerControl's overflow rule is the
+// opposite — it drops the arriving payload, which for a count means dropping
+// the truth and keeping the history — and appendPending's is the opposite of
+// that again. Neither is wrong for the events they were written for; both are
+// wrong for this one, and a count that was dropped with no further transition
+// coming is the cold stop this feature exists to prevent.
+//
+// It holds ONE report. Offering never blocks, so the goroutine that just gave
+// an exec slot back is not made to wait on a connection that may not exist.
+type execCountMailbox struct {
+	mu sync.Mutex
+	ch chan []byte
+	// seq is the sequence number of the report the slot holds, if any. The
+	// producer assigns sequence numbers under its own lock and hands the
+	// report over AFTER the unlock, so two reports can arrive here out of
+	// order; the number is what lets this slot keep the newer one rather
+	// than the later one. Without it the last of four teardown reports to
+	// arrive — say live=1, seq=8 — could evict the terminal live=0, seq=9,
+	// and the far end would believe a finished session still working until
+	// the next transition, which for a finished session never comes.
+	seq uint64
+}
+
+func newExecCountMailbox() *execCountMailbox {
+	return &execCountMailbox{ch: make(chan []byte, 1)}
+}
+
+// watchExecs is the whole wiring between the exec runner and the mailbox, in
+// one place so that it is a function a test can call rather than three lines
+// inside main that a test can only re-type. It is called before the relay can
+// accept a FrameOpen, so the first exec of the session's life is counted.
+func watchExecs(execs *sandboxexec.Runner) *execCountMailbox {
+	m := newExecCountMailbox()
+	execs.ObserveLive(func(live int, seq uint64) {
+		m.offer(execCountPayload(live, seq), seq)
+	})
+	return m
+}
+
+// offer replaces whatever report is still waiting. The lock makes the discard
+// and the fill one step against other producers — several exec slots can come
+// back at once — so two offers cannot both find the slot empty and leave the
+// older one in it. The consumer only ever makes room, so the second send
+// cannot fail.
+func (m *execCountMailbox) offer(p []byte, seq uint64) {
+	if p == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	select {
+	case held := <-m.ch:
+		if m.seq > seq {
+			// The slot held a NEWER report than the one arriving. Keep it.
+			m.ch <- held
+			return
+		}
+	default:
+	}
+	m.seq = seq
+	select {
+	case m.ch <- p:
+	default:
+	}
+}
+
+// c is the receive end, for serveConn's select.
+func (m *execCountMailbox) c() <-chan []byte { return m.ch }
 
 // controlSender is the one method serveConn needs from
 // relay.ControlSender — named as an interface so the delivery rules below
@@ -351,7 +607,9 @@ const pendingCap = 8
 // few now that setup and child_exited can both be waiting: a failing setup
 // produces BOTH (the wrapper writes its rc and then exits with it), so the
 // pair is the normal case, not a corner.
-func serveConn(sender controlSender, errc <-chan error, events <-chan []byte, pending [][]byte) ([][]byte, error) {
+func serveConn(sender controlSender, errc <-chan error, events, execCounts <-chan []byte,
+	execs execReporter, pending [][]byte) ([][]byte, error) {
+	restated := false
 	for {
 		for len(pending) > 0 {
 			if err := sender.Send(pending[0]); err != nil {
@@ -364,11 +622,45 @@ func serveConn(sender controlSender, errc <-chan error, events <-chan []byte, pe
 			}
 			pending = pending[1:]
 		}
+		if !restated {
+			// This connection's exec count, restated rather than waited for.
+			// A transition that happened while there was no connection is
+			// gone — the mailbox holds one report and only a live conn drains
+			// it — so a dial is the one moment at which the runner's view and
+			// this sandbox's can have drifted with no further command coming
+			// to repair it. It costs one small frame per dial and it is what
+			// makes "an absolute count is self-correcting" true rather than
+			// merely likely.
+			//
+			// AFTER the queue above, not before it, and the order is the
+			// priority: what is in that queue has no second chance, while
+			// this is the one message in the whole vocabulary that is repeated
+			// on every connection by design. A wedged conn's first write
+			// should be the child's exit.
+			//
+			// It carries the highest sequence number issued so far, so a
+			// report the mailbox is still holding from before this conn —
+			// which the loop below may deliver a moment later — cannot
+			// overwrite it at the far end.
+			reportExecs(sender, execs)
+			restated = true
+		}
 		select {
 		case err := <-errc:
 			return pending, err
 		case p := <-events:
 			pending = appendPending(pending, p)
+		case p := <-execCounts:
+			// Sent, never queued. A live-exec count is only ever about the
+			// connection in hand: if this one dies with the report
+			// undelivered, the next dial's restatement above says what is true
+			// THEN, which is a better answer than replaying what was true
+			// before. Queueing it would also put it in competition with the
+			// child's exit for the pending cap, and that exit has no second
+			// chance at all.
+			if err := sender.Send(p); err != nil {
+				log.Printf("live exec count not delivered (%v); the next connection restates it", err)
+			}
 		}
 	}
 }
@@ -416,6 +708,20 @@ func offerControl(out chan<- []byte, p []byte) {
 // same number, and it decodes back to the 0 that means "exited cleanly".
 func childExitedPayload(code int) []byte {
 	return controlPayload(relay.ControlEvent{Kind: "child_exited", RC: code})
+}
+
+// execCountPayload encodes the event that tells runnerd how many commands this
+// session is running, so idle auto-stop can count a live exec as activity.
+//
+// An EVENT like the child's exit: ID stays 0 and nobody answers it. Live is
+// `omitempty` and a live count of ZERO is the report that matters most — the
+// last command finished, start the idle clock — which is safe here for
+// precisely the reason it is safe on a clean child exit and no other: the
+// field's zero value and the number being carried are the same, so the absent
+// `live` decodes back to the 0 that was meant. Seq is never zero on a real
+// report, so it always travels.
+func execCountPayload(live int, seq uint64) []byte {
+	return controlPayload(relay.ControlEvent{Kind: relay.KindExecCount, Live: live, Seq: seq})
 }
 
 // nextBackoff doubles d and clamps to the 30s cap. Extracted as a pure step

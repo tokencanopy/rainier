@@ -51,7 +51,7 @@ func clientPair(t *testing.T, drain <-chan struct{}, base time.Duration, rate in
 		}
 	}()
 	c := <-accepted
-	return clientStream(c, base, rate), c
+	return clientStream(c, base, rate, false), c
 }
 
 // TestACourtesyNoticeNeverClosesAHealthyClient is the other side of the write
@@ -263,5 +263,88 @@ func TestALargeFrameIsGivenTimeInProportionToItself(t *testing.T) {
 	if big > scaled+base*3 {
 		t.Fatalf("a %dB frame spent %s, want about %s; the budget is not what bounded it",
 			payload, big, scaled)
+	}
+}
+
+// TestExecClientStreamIsOnTheExecBudget is the mitigation finding 8's plane
+// half rests on, and until now `grep -rn 'ExecClientStream|defaultExecWriteBase'`
+// found zero test references: swapping ExecClientStream for ClientStream
+// survived the whole tree.
+//
+// The budgets differ for a reason about the SESSION rather than about the
+// exec. Every attachment on one session shares one relay conn and one writer,
+// so a peer that has stopped reading backs that writer up and the agent's
+// terminal waits behind it. A minute is right for a person watching a screen —
+// being disconnected mid-scrollback costs them their session — and twenty
+// seconds is right for a script that can simply run the command again.
+func TestExecClientStreamIsOnTheExecBudget(t *testing.T) {
+	drain := make(chan struct{})
+	defer close(drain)
+	_, conn := clientPair(t, drain, defaultClientWriteBase, defaultClientWriteRate)
+
+	es, ok := ExecClientStream(conn).(wsTerminalStream)
+	if !ok {
+		t.Fatal("ExecClientStream did not return this package's own stream")
+	}
+	as, ok := ClientStream(conn).(wsTerminalStream)
+	if !ok {
+		t.Fatal("ClientStream did not return this package's own stream")
+	}
+	if es.base != defaultExecWriteBase {
+		t.Fatalf("an exec caller's write base is %s, want %s", es.base, defaultExecWriteBase)
+	}
+	if as.base != defaultClientWriteBase {
+		t.Fatalf("an attach client's write base is %s, want %s", as.base, defaultClientWriteBase)
+	}
+	if es.base == as.base {
+		t.Fatal("an exec caller and a terminal viewer are on the same write budget; " +
+			"the whole point of the exec stream is that they are not")
+	}
+	if es.rate != as.rate {
+		t.Fatalf("the per-byte rate differs (%d vs %d); only the BASE is shorter, so a "+
+			"caller making steady progress on a large frame is unaffected", es.rate, as.rate)
+	}
+}
+
+// TestAnExecStreamTagsItsOwnCloses is the guard for the seam a host can
+// forget. attachCloseReason is shared with the terminal attach's close, so the
+// exec rows are scoped by a tag — and a route that handed the service's error
+// through untagged got the DEFAULT arm, "runner unreachable" (1013), for what
+// is really a policy refusal. The stream tags it, so forgetting is not
+// possible.
+func TestAnExecStreamTagsItsOwnCloses(t *testing.T) {
+	drain := make(chan struct{})
+	defer close(drain)
+	_, conn := clientPair(t, drain, defaultClientWriteBase, defaultClientWriteRate)
+
+	es, ok := ExecClientStream(conn).(wsTerminalStream)
+	if !ok {
+		t.Fatal("ExecClientStream did not return this package's own stream")
+	}
+	if !es.exec {
+		t.Fatal("an exec stream is not marked as one, so its Close cannot scope the " +
+			"close codes it shares with a terminal attach")
+	}
+	as, ok := ClientStream(conn).(wsTerminalStream)
+	if !ok {
+		t.Fatal("ClientStream did not return this package's own stream")
+	}
+	if as.exec {
+		t.Fatal("a terminal attach stream is marked as an exec's; its closes would " +
+			"move to the exec codes")
+	}
+
+	// And the mapping an exec stream's Close actually reaches, for the two
+	// errors that differ. Untagged, both fall through to "runner unreachable".
+	for _, err := range []error{control.ErrInvalid, control.ErrUnsupported} {
+		code, _ := attachCloseReason(ExecFailure(err))
+		if code != websocket.StatusPolicyViolation {
+			t.Fatalf("an exec's %v closes %v, want a policy violation", err, code)
+		}
+		plain, _ := attachCloseReason(err)
+		if plain != websocket.StatusTryAgainLater {
+			t.Fatalf("a bare %v on an ATTACH closes %v, want the unchanged "+
+				"try-again-later", err, plain)
+		}
 	}
 }

@@ -35,6 +35,7 @@ Rainier is currently at **v0 (terminal happy path)**. One `controld` (Postgres-b
 - **Deployment Guide:** [`docs/deploy-gce.md`](docs/deploy-gce.md)
 - **Terminal Ownership:** [`docs/terminal-controller-ownership.md`](docs/terminal-controller-ownership.md) — who may type when several devices are attached to one session, and how the three parties that implement it interoperate across releases
 - **Session Image:** [`docs/session-image.md`](docs/session-image.md) — the default coding environment every session runs, what is in it, and how it is pinned and smoke tested
+- **Running a command in a session:** [`docs/design/rainier-exec.md`](docs/design/rainier-exec.md) — `rainier exec` runs one command inside a live session's sandbox non-interactively and exits with its status: transport, protocol, exit codes, and how it stays out of the terminal's controller lease. The command contract is [`docs/cli-v0-contract.md`](docs/cli-v0-contract.md) §3.9.
 - **Architecture Specs:**
   - [Rainier Overview](docs/superpowers/specs/2026-08-27-rainier-design.md)
   - [Control Plane (`controld`)](docs/superpowers/specs/2026-08-28-plan3-controld-design.md)
@@ -278,9 +279,16 @@ person.
 Two rules it never breaks: a session whose agent is still running is never
 stopped, however long nobody has been watching it (a long unattended build is
 the point), and nothing is ever deleted. A session with any viewer attached is
-not idle, and the timer starts again when the last one leaves. A session whose
-**boot** failed is kept too, however idle: attaching to it to read the log that
-says why is the only thing left to do with it.
+not idle, and the timer starts again when the last one leaves. The same is true
+of a session running a `rainier exec` command — including a `--detach`ed one,
+which holds no viewer at all — and the timer starts again when the last command
+ends. A session whose **boot** failed is kept too, however idle: attaching to it
+to read the log that says why is the only thing left to do with it.
+
+**Roll the runners before the session image.** A runner that predates `exec`'s live-count
+report logs an unknown control kind and drops it, which means idle auto-stop on that runner
+can still stop a session running a detached command. Same shape, same reason, as the order
+below.
 
 **Roll `controld` before the runners.** The auto-stop reports itself to the
 control plane with a `suspended_cold` event, which is additive — a control

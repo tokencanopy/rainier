@@ -2,3 +2,18 @@
 bin/
 .superpowers/
 *.log
+
+# `go build ./...` writes one executable per main package into the CURRENT
+# directory rather than into bin/, so running it at the repo root leaves
+# multi-megabyte unstripped binaries sitting beside the source, where
+# `git add -A` will take them. `make build` (scripts/build.sh) is the supported
+# way and writes to bin/, which is already ignored above.
+/controld
+/egressd
+/rainier
+/rainier-latency
+/rattach
+/runnerctl
+/runnerd
+/sessiond
+/vtcap

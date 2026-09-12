@@ -3,6 +3,7 @@ package attachplane
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -53,7 +54,32 @@ var (
 	// errAttachEnded is an attach that ran and is over — one side of the
 	// splice stopped, and the other is being closed after it.
 	errAttachEnded = errors.New("controld: the attach ended")
+	// errExecRefused marks an error as having come from an EXEC rather than
+	// from an attach, so the close mapping the two share can answer it
+	// differently without changing what the same error means on the older
+	// path. See ExecFailure.
+	errExecRefused = errors.New("controld: the exec was refused")
 )
+
+// ExecFailure tags a service error as an exec's, for the close a route makes
+// when controlapp refuses the command.
+//
+// It exists because attachCloseReason is shared with the pre-existing terminal
+// attach close: mapping a bare control.ErrInvalid to 1008 "invalid request"
+// would silently change an attach that closes 1013 "runner unreachable" today,
+// in a change whose whole compatibility claim is that every existing path is
+// byte-identical. Unwrapping still reaches the original error, so a caller
+// that checks errors.Is(err, control.ErrDenied) is unaffected.
+//
+// Exported because every host's exec route makes this close, and a host that
+// passed the service's error through unwrapped would get the attach mapping
+// for an exec's refusal.
+func ExecFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", errExecRefused, err)
+}
 
 // ---------------------------------------------------------------------------
 // control.TerminalStream over the client socket
@@ -85,6 +111,35 @@ const (
 	defaultClientWriteRate = 64 << 10 // bytes per second
 )
 
+// defaultExecWriteBase is the same budget for an EXEC caller, and it is
+// shorter for a reason that is about the SESSION rather than about the exec.
+//
+// Every attachment on one session shares one relay conn and one writer on it,
+// so a peer that has stopped reading eventually backs that writer up — and
+// while it is backed up, the agent's terminal output and the session RPC wait
+// behind it. For a terminal viewer that is the trade the plane already makes,
+// and a minute is the right number: being disconnected mid-scrollback costs a
+// person their session.
+//
+// An exec caller is not a person watching a screen. It is a script, it is the
+// only reader its process will ever have, and there is nothing for it to lose
+// by being disconnected and re-running the command. Twenty seconds of taking
+// NOTHING is generous for one and cheap for everybody else on the session.
+// The per-byte rate is unchanged, so a caller making steady progress on a
+// large frame is not affected at all.
+//
+// It is a mitigation and not a cure: the real fix is a writer per attachment
+// rather than one per conn, which is a change to the relay and not to this
+// plane. Recorded as an open question in the design.
+const defaultExecWriteBase = 20 * time.Second
+
+// ExecClientStream is ClientStream on the exec budget. A host mounting the
+// exec route uses it instead of ClientStream; everything else about the
+// stream is identical.
+func ExecClientStream(c *websocket.Conn) control.TerminalStream {
+	return clientStream(c, defaultExecWriteBase, defaultClientWriteRate, true)
+}
+
 // ClientStream wraps an accepted client websocket as the control.TerminalStream
 // the application (and this plane's broker) speaks. It also sets the socket's
 // read limit: a snapshot replaying a large scrollback is the biggest frame
@@ -94,7 +149,7 @@ const (
 // The caller keeps the socket's own lifetime — a handler that accepted it
 // still defers its CloseNow — and hands the reason it ends with to Close.
 func ClientStream(c *websocket.Conn) control.TerminalStream {
-	return clientStream(c, defaultClientWriteBase, defaultClientWriteRate)
+	return clientStream(c, defaultClientWriteBase, defaultClientWriteRate, false)
 }
 
 // clientStream is the same over a write budget the caller picks, which is how
@@ -102,9 +157,9 @@ func ClientStream(c *websocket.Conn) control.TerminalStream {
 // two knobs are FIELDS rather than package variables: nothing in the package
 // takes t.Parallel() today, and a package variable three tests write is a
 // race waiting for the first one that does.
-func clientStream(c *websocket.Conn, base time.Duration, rate int) wsTerminalStream {
+func clientStream(c *websocket.Conn, base time.Duration, rate int, exec bool) wsTerminalStream {
 	c.SetReadLimit(attachReadLimit)
-	return wsTerminalStream{c: c, once: &sync.Once{}, base: base, rate: rate}
+	return wsTerminalStream{c: c, once: &sync.Once{}, base: base, rate: rate, exec: exec}
 }
 
 // wsTerminalStream is the typed adapter between the client's websocket and
@@ -123,6 +178,11 @@ type wsTerminalStream struct {
 	// base and rate are this stream's write budget; see budget and Send.
 	base time.Duration
 	rate int
+	// exec is whether this is an EXEC caller's socket. It decides two things:
+	// the write budget above, and that Close tags the error it is given as an
+	// exec's — because attachCloseReason is shared with the terminal attach's
+	// close, and the exec rows must not change what the same error means there.
+	exec bool
 }
 
 // budget is how long ONE message carrying payload bytes of terminal data may
@@ -220,6 +280,15 @@ func (s wsTerminalStream) Send(ctx context.Context, m terminal.ServerMessage) er
 // is the remedy, and the reason says which dependency to blame without
 // quoting anybody.
 func (s wsTerminalStream) Close(err error) error {
+	if s.exec {
+		// Tagged HERE rather than at the route, so a host cannot forget. The
+		// mapping below is shared with the terminal attach's, and an untagged
+		// service error would fall through to its default — "runner
+		// unreachable" — for what is really a policy refusal or an unsupported
+		// server. ExecFailure is idempotent, so a route that tags it too is no
+		// worse off.
+		err = ExecFailure(err)
+	}
 	code, reason := attachCloseReason(err)
 	s.once.Do(func() { closeAttach(s.c, code, reason) })
 	return nil
@@ -242,6 +311,34 @@ func attachCloseReason(err error) (websocket.StatusCode, string) {
 		return websocket.StatusTryAgainLater, "session not ready"
 	case errors.Is(err, errAttachEnded):
 		return websocket.StatusTryAgainLater, "the attach ended"
+	case errors.Is(err, ErrExecFirstMessage):
+		return websocket.StatusPolicyViolation, "first exec message must be exec_start"
+	case errors.Is(err, errExecRefused) && errors.Is(err, control.ErrInvalid):
+		// A request this plane will not carry — a cwd outside the workspace,
+		// a --log without --detach. The client has already been sent the
+		// exec_error it acts on; this is what a packet capture and a proxy
+		// log see, and "runner unreachable" would have been a lie in both.
+		//
+		// Scoped to an exec by ExecFailure, deliberately. This mapping is
+		// SHARED with the pre-existing terminal attach close, so an unscoped
+		// control.ErrInvalid case would have turned an attach that closes
+		// 1013 "runner unreachable" today into 1008 "invalid request" — a
+		// change to an existing path, in a change whose whole claim is that
+		// every existing path is byte-identical.
+		return websocket.StatusPolicyViolation, "invalid request"
+	case errors.Is(err, errExecRefused) && errors.Is(err, control.ErrUnsupported):
+		return websocket.StatusPolicyViolation, "exec unsupported by this server"
+	case errors.Is(err, errExecNoAnswer):
+		return websocket.StatusTryAgainLater, "the sandbox did not answer in time"
+	case errors.Is(err, errExecUnsupported):
+		// A sandbox that cannot exec is not going to start being able to, so
+		// this is a policy violation rather than an invitation to retry. The
+		// client has already been sent an exec_error{unsupported}, which is
+		// the field it actually switches on; this is what a packet capture
+		// and a proxy log see.
+		return websocket.StatusPolicyViolation, "exec unsupported by this sandbox"
+	case errors.Is(err, errExecEnded):
+		return websocket.StatusNormalClosure, "the exec ended"
 	default:
 		return websocket.StatusTryAgainLater, "runner unreachable"
 	}

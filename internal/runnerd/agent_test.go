@@ -4,6 +4,7 @@ package runnerd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/runnerplane"
 )
 
 const testToken = "testtoken"
@@ -882,9 +884,16 @@ func TestAgentCreateWithoutSetupLeavesTheSpecEmpty(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestAgentAnnouncesItsCapabilities pins the operator's configured
-// capabilities onto the announce verbatim and in order. They are claims about
-// this runner and nothing else, so the agent neither invents nor reorders
-// them; controld is where they are validated.
+// capabilities onto the announce verbatim and in order, with the BUILD's own
+// appended after them. They are claims about this runner and nothing else, so
+// the agent neither invents nor reorders the operator's; controld is where
+// they are validated.
+//
+// `exec.v1` is the exception that proves the rule: whether this runnerd can
+// forward an exec dial-back is decided by the code it was compiled from, not
+// by a flag somebody remembered to pass, and an operator who had to remember
+// would produce a fleet where `rainier exec` works on some runners and 501s
+// on others for no reason a user could see.
 func TestAgentAnnouncesItsCapabilities(t *testing.T) {
 	rd := New(driver.NewFake(4), "", "", "")
 
@@ -896,8 +905,68 @@ func TestAgentAnnouncesItsCapabilities(t *testing.T) {
 		Capabilities: caps})
 
 	ann := fc.nextConn(t).readAnnounce(t)
-	if !slices.Equal(ann.Capabilities, caps) {
-		t.Fatalf("announce Capabilities = %v, want %v", ann.Capabilities, caps)
+	want := append(append([]string(nil), caps...), runner.CapabilityExecV1)
+	if !slices.Equal(ann.Capabilities, want) {
+		t.Fatalf("announce Capabilities = %v, want %v", ann.Capabilities, want)
+	}
+}
+
+// TestAgentNeverAnnouncesOverTheCapabilityCap is the boundary the append can
+// cross and must not. runnerplane refuses the WHOLE registration when a claim
+// carries more than MaxCapabilities, so an operator already passing the
+// maximum would announce one too many after this rolls and never reconnect —
+// a working runner out of the fleet permanently, for a pre-check whose only
+// job is to save one round trip on a fence that lives in the sandbox.
+//
+// Table over the boundary itself, because one-below and exactly-at are the
+// two answers that differ and off-by-one is the only way to get this wrong.
+func TestAgentNeverAnnouncesOverTheCapabilityCap(t *testing.T) {
+	caps := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("cap.%d", i)
+		}
+		return out
+	}
+	for _, n := range []int{runnerplane.MaxCapabilities - 1, runnerplane.MaxCapabilities} {
+		declared := caps(n)
+		got := buildCapabilities(declared)
+		if len(got) > runnerplane.MaxCapabilities {
+			t.Fatalf("%d declared capabilities announced %d, which runnerplane refuses outright",
+				n, len(got))
+		}
+		wantExec := n < runnerplane.MaxCapabilities
+		if slices.Contains(got, runner.CapabilityExecV1) != wantExec {
+			t.Fatalf("%d declared: exec.v1 present = %v, want %v",
+				n, !wantExec, wantExec)
+		}
+		if !slices.Equal(got[:n], declared) {
+			t.Fatalf("%d declared: the operator's own list was not left verbatim: %v", n, got)
+		}
+	}
+}
+
+// TestAgentAnnouncesExecOnceAndOnlyOnce: the build token is appended, not
+// duplicated, and an operator who spells it out by hand is left alone rather
+// than corrected.
+func TestAgentAnnouncesExecOnceAndOnlyOnce(t *testing.T) {
+	for _, declared := range [][]string{nil, {}, {"gpu"}, {runner.CapabilityExecV1},
+		{"gpu", runner.CapabilityExecV1}} {
+		got := buildCapabilities(declared)
+		seen := 0
+		for _, c := range got {
+			if c == runner.CapabilityExecV1 {
+				seen++
+			}
+		}
+		if seen != 1 {
+			t.Fatalf("buildCapabilities(%v) = %v, want exec.v1 exactly once", declared, got)
+		}
+		for i, c := range declared {
+			if got[i] != c {
+				t.Fatalf("buildCapabilities(%v) = %v; it reordered the operator's list", declared, got)
+			}
+		}
 	}
 }
 

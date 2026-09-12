@@ -43,6 +43,13 @@ func usagef(format string, args ...any) error {
 }
 
 // exitCodeFor is main's whole exit-code policy.
+//
+// `rainier exec` is the one command whose exit code is not Rainier's own: the
+// command it ran decides it, verbatim, and the codes Rainier reserves for
+// itself (125/126/127) are the ones the shell vocabulary already reserves for
+// a wrapper. Everything else is unchanged — 2 for an invalid invocation, 1
+// for everything else — so a script can still tell "the command failed" from
+// "rainier failed".
 func exitCodeFor(err error) int {
 	if err == nil {
 		return 0
@@ -51,7 +58,20 @@ func exitCodeFor(err error) int {
 	if errors.As(err, &u) {
 		return 2
 	}
+	var ex execExitError
+	if errors.As(err, &ex) {
+		return ex.code
+	}
 	return 1
+}
+
+// silentError reports that an error has already said everything it is going
+// to. Only a command `rainier exec` ran qualifies: it printed whatever it
+// printed on its own streams, and Rainier adding a line would corrupt the
+// output of a caller who is redirecting it.
+func silentError(err error) bool {
+	var ex execExitError
+	return errors.As(err, &ex) && ex.silent()
 }
 
 // ---------------------------------------------------------------------------

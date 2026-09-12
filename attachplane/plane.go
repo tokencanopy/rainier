@@ -78,18 +78,30 @@ type Options struct {
 	// ControlAckTimeout bounds a handoff's wait for the sandbox to confirm
 	// the new generation. Zero means two seconds.
 	ControlAckTimeout time.Duration
+	// ExecHandshakeTimeout bounds an exec's wait for the sandbox's
+	// `exec_started`. Zero means defaultExecHandshakeTimeout.
+	//
+	// It is deliberately NOT ControlAckTimeout, even though both are "one
+	// small frame on an already-open socket": that one acknowledges a binding
+	// already installed, and this one waits for a SPAWN. It is a knob rather
+	// than a constant because the test that looks like it configures the
+	// budget did not — it passed ControlAckTimeout, which only bounded the
+	// exec_error send — and so burned the full production ten seconds of wall
+	// clock, ten times the next slowest test in the package.
+	ExecHandshakeTimeout time.Duration
 }
 
 // Plane is one replica's attach plane: the pairings it is waiting on, the
 // dial-back endpoint they are claimed through, and the broker that mints
 // them. Its zero value is not usable — construct it with New.
 type Plane struct {
-	host       Host
-	ttl        time.Duration
-	heartbeat  time.Duration
-	ackTimeout time.Duration
-	logf       func(string, ...any)
-	attaches   *attachTable
+	host          Host
+	ttl           time.Duration
+	heartbeat     time.Duration
+	ackTimeout    time.Duration
+	execHandshake time.Duration
+	logf          func(string, ...any)
+	attaches      *attachTable
 	// owners is the live attaches this replica is serving, by session, so a
 	// take-over can tell the device it displaced at once rather than leaving
 	// it to notice at its next heartbeat. The state is replica-local for the
@@ -117,8 +129,12 @@ func New(h Host, o Options) *Plane {
 	if o.ControlAckTimeout <= 0 {
 		o.ControlAckTimeout = defaultControlAckTimeout
 	}
+	if o.ExecHandshakeTimeout <= 0 {
+		o.ExecHandshakeTimeout = defaultExecHandshakeTimeout
+	}
 	return &Plane{host: h, ttl: o.PairTTL, heartbeat: o.HeartbeatInterval, ackTimeout: o.ControlAckTimeout,
-		logf: o.Logf, attaches: newAttachTable(), owners: newOwnerTable()}
+		execHandshake: o.ExecHandshakeTimeout,
+		logf:          o.Logf, attaches: newAttachTable(), owners: newOwnerTable()}
 }
 
 // step bounds ONE peer-facing step of a handoff: a binding written to a
@@ -340,6 +356,13 @@ func (p *Plane) handleAttachBack(w http.ResponseWriter, r *http.Request) {
 	// Release the client handler once the splice is over, whatever ends it.
 	defer close(pa.done)
 
+	// Which splice claims the socket is decided by what was PARKED, never by
+	// anything the runner says: the runner was told which kind to open and is
+	// not asked what it opened.
+	if pa.exec {
+		execSplice(r.Context(), pa.stream, wsRunnerConn{c}, p.ackTimeout, p.execHandshake)
+		return
+	}
 	splice(r.Context(), pa.stream, wsRunnerConn{c}, pa.own)
 }
 

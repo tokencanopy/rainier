@@ -16,17 +16,22 @@ import (
 // The columns are the event's fixed fields and nothing else. Nothing here
 // takes a terminal byte, a session's content, a secret, a raw error, a price,
 // or a provider resource id, because control.Event has none of them to give.
+// The one field that comes from a caller's own input, Command, is the NAME of
+// an exec'd command — bounded and sanitised by the application before it gets
+// here (see control.Event.Command), and never an argument.
 func (s *Store) Record(ctx context.Context, e control.Event) error {
 	_, err := s.q(ctx).Exec(ctx, `
 		INSERT INTO events (id, workspace_id, actor_id, action, resource_kind, resource_id,
 			resource_workspace_id, resource_creator_id, at, placement_generation,
-			cpu_time_seconds, memory_byte_seconds, storage_bytes, network_bytes, agent_token_count)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+			cpu_time_seconds, memory_byte_seconds, storage_bytes, network_bytes, agent_token_count,
+			command)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
 		string(e.ID), string(e.WorkspaceID), string(e.ActorID), string(e.Action),
 		string(e.Resource.Kind), e.Resource.ID, string(e.Resource.WorkspaceID), string(e.Resource.CreatorID),
 		e.At, int64(e.PlacementGeneration),
 		e.Usage.CPUTimeSeconds, e.Usage.MemoryByteSeconds, e.Usage.StorageBytes,
-		e.Usage.NetworkBytes, e.Usage.AgentTokenCount)
+		e.Usage.NetworkBytes, e.Usage.AgentTokenCount,
+		e.Command)
 	if err != nil {
 		switch code, _ := constraintViolation(err); code {
 		case sqlstateUniqueViolation:

@@ -122,12 +122,14 @@ type FromRunner struct {
 	Sessions []SessionInfo `json:"sessions,omitempty"` // announce
 	Used     int           `json:"used"`
 	Total    int           `json:"total"`
-	// Active and IdleExited split Used by what the sandbox is actually doing:
+	// Active and IdleExited split Used by whether the sandbox has WORK in it:
 	// Active counts sandboxes that are up with their child process still
-	// running, IdleExited those that are up with the child gone. Both are
-	// additive to Used/Total and ride every message beside them, so a control
-	// plane can say "16 slots, 3 active, 13 idle" rather than "no free
-	// capacity".
+	// running OR with a `rainier exec` command running (a detached run on a
+	// session whose agent has finished is work, and is exactly what the
+	// runner's idle auto-stop refuses to reclaim), IdleExited those that are
+	// up with neither. Both are additive to Used/Total and ride every message
+	// beside them, so a control plane can say "16 slots, 3 active, 13 idle"
+	// rather than "no free capacity".
 	//
 	// A runner that predates them sends neither, and they read as zero — which
 	// a consumer cannot tell apart from a current runner that is simply
@@ -353,4 +355,69 @@ type Attach struct {
 	// client could be sending.
 	Mode       string `json:"mode,omitempty"`
 	Generation uint64 `json:"controller_generation,omitempty"`
+	// Kind is which sort of attachment this dial-back opens: KindTerminal
+	// (absent) is the session's pty, KindExec is a process this attachment
+	// creates and owns. Absent is the terminal, which is what every control
+	// plane older than this field sends and what a sandbox older than it
+	// reads any dial_attach as.
+	Kind string `json:"kind,omitempty"`
+	// Exec is the command a KindExec attachment runs. It travels here, on
+	// the command that opens the attachment, and never on a URL: a URL is
+	// written to the access log of every proxy between the caller and the
+	// cell, and an argv in a URL is an argument in a log file.
+	Exec *ExecSpec `json:"exec,omitempty"`
+}
+
+// The two kinds of attachment a dial_attach can open. KindTerminal is the
+// session's one pty, shared by every viewer; KindExec is a process the
+// attachment itself creates and owns. The terminal kind is spelled as the
+// EMPTY string because that is what every control plane older than this
+// field sends, and because a runner that has never heard of the field
+// forwards an absent value exactly as it forwards today's dial_attach.
+const (
+	KindTerminal = ""
+	KindExec     = "exec"
+)
+
+// CapabilityExecV1 is the capability token a runnerd announces when its build
+// can forward an exec attachment. It is a fact about the BUILD, not a claim
+// an operator makes, so runnerd appends it to whatever --capability it was
+// given rather than waiting to be told.
+//
+// It is a pre-check and not the fence. A runner forwards the dial_attach, but
+// the sandbox is what actually runs the command, and a session keeps the
+// sessiond it booted with for as long as it lives — so a new runner can be
+// holding a session whose sandbox has never heard of exec. The authoritative
+// fence is the sandbox's own `exec_started`; this token only saves the round
+// trip when the answer is already known.
+const CapabilityExecV1 = "exec.v1"
+
+// ExecSpec is one command to run inside the sandbox. It is composed by the
+// CALLER and validated by the sandbox; the control plane carries it and
+// checks only its shape, because the filesystem the cwd and the log path
+// name is the sandbox's and nobody else can ask it anything.
+//
+// Argv is never empty and argv[0] is exec'd directly: no shell, no glob, no
+// $VAR, no `&&`. A caller who wants a shell names one.
+//
+// Env values are secrets as often as not and are never logged verbatim — the
+// same sentence Spec.Env already carries, for the same reason.
+type ExecSpec struct {
+	Argv []string          `json:"argv"`          // never empty; argv[0] is exec'd directly
+	Cwd  string            `json:"cwd,omitempty"` // absent means workspace.WorkspaceRoot
+	Env  map[string]string `json:"env,omitempty"` // caller additions; see the env rule
+	TTY  bool              `json:"tty,omitempty"`
+	Cols int               `json:"cols,omitempty"` // TTY only
+	Rows int               `json:"rows,omitempty"` // TTY only
+	// Detach asks the sandbox to spawn the process in its own process group
+	// with its output redirected to LogPath, answer `exec_started` with the
+	// pid, and close the attachment. A detached process outlives its caller
+	// and is bounded only by the session: it is killed when the session is
+	// suspended, stopped or destroyed, never by a caller disconnecting.
+	Detach bool `json:"detach,omitempty"`
+	// LogPath is where a detached process's stdout and stderr go. It is
+	// required with Detach and refused without it, and it is resolved inside
+	// the workspace exactly as Cwd is — a detached process may not write its
+	// output outside the tree its session owns.
+	LogPath string `json:"log_path,omitempty"`
 }

@@ -119,6 +119,27 @@ sessions before accepting agent login/logout traffic. The credential-sync
 protocol rejects old custody RPCs, but an old session can still read a home it
 already mounted; do not run mixed session-image versions through this upgrade.
 
+Migration 0014 adds `events.command`, the one field `rainier exec` writes
+beyond what every event already carries: the NAME of the command that ran —
+`path.Base(argv[0])`, capped and refused to the record unless it is printable
+ASCII — and never an argument, an environment variable, a working directory,
+or a byte of input or output. It is **additive and safe in both directions**:
+one nullable-by-default column, `NOT NULL DEFAULT ''`, so an older controld
+keeps writing and reading rows through it and no rehearsal or stop-the-world
+step is needed. It applies with 0013 (the controller lease) on controld start.
+
+Order it against the rest of the exec roll, which is the one thing here that
+is not free-form: **the session image first**, then the plane (controld, which
+is what applies 0014), then the CLI. The image first because a session keeps
+the `sessiond` it booted with for as long as it lives, so only sessions
+created after that roll can be exec'd into — every older one answers
+`exec_unsupported` forever, which is what the sandbox handshake exists to make
+honest. The CLI last because a client that can ask for something no deployed
+plane can answer produces support traffic and one that ships after the plane
+produces none. Each step is separately revertable and no step requires the one
+after it; the full rationale is in
+[`docs/design/rainier-exec.md`](design/rainier-exec.md#rollout).
+
 ## 4. controld
 
 The fleet token is the shared secret every runnerd presents. Generate it

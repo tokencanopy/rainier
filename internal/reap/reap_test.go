@@ -16,7 +16,7 @@ func TestReapOnNonLinuxIsNoop(t *testing.T) {
 		t.Skip("linux has real reaping")
 	}
 	Start()
-	if code, ok := AwaitExit(1234); ok || code != 0 {
+	if code, ok := AwaitExit(1234, 0); ok || code != 0 {
 		t.Fatalf("AwaitExit on non-linux = (%d, %v), want (0, false)", code, ok)
 	}
 }
@@ -27,10 +27,11 @@ func TestReaperDeliversChildCode(t *testing.T) {
 	}
 	Start()
 	cmd := exec.Command("sh", "-c", "exit 7")
+	mark := Mark()
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	code, ok := AwaitExit(cmd.Process.Pid)
+	code, ok := AwaitExit(cmd.Process.Pid, mark)
 	if !ok || code != 7 {
 		t.Fatalf("AwaitExit = (%d, %v), want (7, true)", code, ok)
 	}
@@ -44,10 +45,11 @@ func TestReapCollectsOrphan(t *testing.T) {
 	// to the subreaper. `sh -c '(sleep 0.2 &) ; exit 0'` leaves a grandchild.
 	Start()
 	cmd := exec.Command("sh", "-c", "(sleep 0.2 &) ; exit 0")
+	mark := Mark()
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := AwaitExit(cmd.Process.Pid); !ok {
+	if _, ok := AwaitExit(cmd.Process.Pid, mark); !ok {
 		t.Fatal("AwaitExit did not report the direct child's exit")
 	}
 	time.Sleep(400 * time.Millisecond)

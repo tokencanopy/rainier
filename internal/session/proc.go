@@ -37,6 +37,10 @@ type Proc interface {
 func StartProc(argv []string, cols, rows int, onOutput func([]byte)) (Proc, error) {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	// The mark is taken IMMEDIATELY before the fork: an outcome the reaper
+	// recorded before this instant belongs to some earlier holder of whatever
+	// pid this child gets, and pids wrap.
+	mark := reap.Mark()
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
 	if err != nil { return nil, err }
 	p := &proc{cmd: cmd, ptmx: ptmx, done: make(chan struct{})}
@@ -54,7 +58,7 @@ func StartProc(argv []string, cols, rows int, onOutput func([]byte)) (Proc, erro
 				break
 			}
 		}
-		if code, ok := reap.AwaitExit(p.cmd.Process.Pid); ok {
+		if code, ok := reap.AwaitExit(p.cmd.Process.Pid, mark); ok {
 			p.code = code
 			// Release Go-side resources; the child is already reaped, so Wait
 			// returns ECHILD — ignore it, we already have the authoritative code.

@@ -306,6 +306,19 @@ resumes a stopped session on its own.`
 		help = `usage: rainier snapshot <session>
 
 Advanced. Create a checkpoint of the session and print its reference.`
+	case "exec":
+		help = execUsage + `
+
+Advanced. The command's exit status is this command's exit status, so a
+script can test it directly. Rainier's own failures use 125 (accepted, but
+the connection ended before a status arrived), 126 (the command could not be
+executed) and 127 (not found) — the codes env(1) and the shell already
+reserve for a wrapper — and everything Rainier says goes to stderr, so
+rainier exec s -- cat f > out produces exactly f.
+
+An exec does not take the terminal's controller lease and its output never
+reaches the session's scrollback: somebody attached to the session sees
+nothing, and rainier attach --since 0 never replays it.`
 	case "push", "pull":
 		help = "usage: rainier push <local-dir> <session>:<path>"
 		if command == "pull" {

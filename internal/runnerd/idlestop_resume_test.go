@@ -60,7 +60,7 @@ func TestAResumeDuringAnInFlightStopIsRefused(t *testing.T) {
 	sd := newStallingStopDriver()
 	rd := New(sd, "", "", "")
 	rd.now = clk.now
-	h := &idleHarness{t: t, clk: clk, rd: rd, fd: sd.Fake, id: "sess-idle-1", boot: map[string]uint64{}}
+	h := &idleHarness{t: t, clk: clk, rd: rd, fd: sd.Fake, id: "sess-idle-1", boot: map[string]uint64{}, reg: map[string]uint64{}}
 	h.create(h.id)
 	h.run(30*time.Minute, idleStep{at: 0, act: childExits})
 	h.clk.set(30 * time.Minute)
@@ -133,7 +133,7 @@ func TestAParkedStopThatCouldNotBeReadIsStillResumable(t *testing.T) {
 	ud := &unreadableStopDriver{Fake: driver.NewFake(4), fail: true}
 	rd := New(ud, "", "", "")
 	rd.now = clk.now
-	h := &idleHarness{t: t, clk: clk, rd: rd, fd: ud.Fake, id: "sess-idle-1", boot: map[string]uint64{}}
+	h := &idleHarness{t: t, clk: clk, rd: rd, fd: ud.Fake, id: "sess-idle-1", boot: map[string]uint64{}, reg: map[string]uint64{}}
 	h.create(h.id)
 
 	h.run(30*time.Minute, idleStep{at: 0, act: childExits})
@@ -222,7 +222,7 @@ func TestAResumeIsRefusedUntilTheAutoStopHasBeenReported(t *testing.T) {
 		}
 	}
 
-	h := &idleHarness{t: t, clk: clk, rd: rd, fd: sd.Fake, id: "sess-idle-1", boot: map[string]uint64{}}
+	h := &idleHarness{t: t, clk: clk, rd: rd, fd: sd.Fake, id: "sess-idle-1", boot: map[string]uint64{}, reg: map[string]uint64{}}
 	h.create(h.id)
 	h.run(30*time.Minute, idleStep{at: 0, act: childExits})
 	h.clk.set(30 * time.Minute)

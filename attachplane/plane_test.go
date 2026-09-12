@@ -610,6 +610,24 @@ func TestAttachCloseReasons(t *testing.T) {
 		{"not attachable", control.ErrConflict, websocket.StatusTryAgainLater},
 		{"the attach ended", errAttachEnded, websocket.StatusTryAgainLater},
 		{"unavailable", control.ErrUnavailable, websocket.StatusTryAgainLater},
+		// The exec vocabulary. Every one of these is SCOPED to an exec, which
+		// is what keeps the two rows below it true.
+		{"first exec message", ErrExecFirstMessage, websocket.StatusPolicyViolation},
+		{"an exec this plane will not carry", ExecFailure(control.ErrInvalid),
+			websocket.StatusPolicyViolation},
+		{"a host with no exec plane", ExecFailure(control.ErrUnsupported),
+			websocket.StatusPolicyViolation},
+		{"the sandbox did not answer", errExecNoAnswer, websocket.StatusTryAgainLater},
+		{"the sandbox cannot exec", errExecUnsupported, websocket.StatusPolicyViolation},
+		{"the exec ended", errExecEnded, websocket.StatusNormalClosure},
+		// And the two that must NOT have moved. attachCloseReason is shared
+		// with the pre-existing terminal attach close, so an UNSCOPED
+		// control.ErrInvalid case would turn an attach that closes 1013
+		// "runner unreachable" today into 1008 "invalid request" — a change
+		// to an existing path, in a change whose whole claim is that every
+		// existing path is byte-identical.
+		{"a bare invalid on an ATTACH", control.ErrInvalid, websocket.StatusTryAgainLater},
+		{"a bare unsupported on an ATTACH", control.ErrUnsupported, websocket.StatusTryAgainLater},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -624,6 +642,21 @@ func TestAttachCloseReasons(t *testing.T) {
 				t.Fatalf("reason = %q, want a sentence for the client, not the sentinel's own text", reason)
 			}
 		})
+	}
+}
+
+// TestExecFailureStillUnwraps: tagging a refusal as an exec's must not hide
+// what it was. A host that checks errors.Is(err, control.ErrDenied) on what
+// its route got back has to keep getting the same answer.
+func TestExecFailureStillUnwraps(t *testing.T) {
+	for _, err := range []error{control.ErrDenied, control.ErrInvalid,
+		control.ErrConflict, control.ErrUnsupported, control.ErrUnavailable} {
+		if !errors.Is(ExecFailure(err), err) {
+			t.Fatalf("ExecFailure(%v) no longer unwraps to it", err)
+		}
+	}
+	if ExecFailure(nil) != nil {
+		t.Fatal("ExecFailure(nil) is not nil; a route would close a healthy stream")
 	}
 }
 

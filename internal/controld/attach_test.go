@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -146,6 +147,30 @@ type fakeSessiond struct {
 	opens   chan relay.Frame
 	resizes chan terminal.ClientMessage
 	closes  chan uint64
+	// execs, when set, is what this sandbox answers an exec FrameOpen with.
+	// Leaving it nil is not a gap: a sandbox that does not know the exec kind
+	// answers a SNAPSHOT, because the open falls into the terminal branch it
+	// has always had — which is exactly the permanent "new plane, old
+	// sandbox" case, and what the plane's exec_started handshake fences.
+	execs chan relay.Frame
+	// execReply is the scripted sandbox side of one exec.
+	execReply func(f relay.Frame) []terminal.ServerMessage
+	// execClient records the client messages that reached an exec.
+	execClient chan terminal.ClientMessage
+	// allClient records EVERY client message this sandbox received, whatever
+	// kind of attachment it arrived on.
+	//
+	// It exists because execClient alone made a whole class of assertion
+	// structurally dead: execIDs is populated only when a test scripts an
+	// exec reply, so a test standing in for an OLD sandbox (execReply nil)
+	// routes a leaked frame into the terminal branch, where nothing on
+	// execClient can ever see it. Mutating the plane to forward before the
+	// handshake left "no stdin before exec_started" green while a
+	// {stdin "rm -rf /\n"} reached this sandbox.
+	allClient chan terminal.ClientMessage
+	// execIDs is which attachment ids are execs, so a client frame is routed
+	// the way the real serveSession routes it.
+	execIDs sync.Map
 	// controls is every mid-attach binding the plane installed, and the fake
 	// acknowledges each one exactly as internal/relay's session side does.
 	// Without the acknowledgement a handoff still completes — that is the
@@ -164,11 +189,14 @@ func startFakeSessiond(t *testing.T, ctx context.Context, wsBase, id string) *fa
 	c.SetReadLimit(16 << 20)
 	t.Cleanup(func() { c.CloseNow() })
 	fs := &fakeSessiond{
-		raw:     c,
-		conn:    relay.WSConn(c),
-		opens:   make(chan relay.Frame, 8),
-		resizes: make(chan terminal.ClientMessage, 8),
-		closes:  make(chan uint64, 8),
+		raw:        c,
+		conn:       relay.WSConn(c),
+		opens:      make(chan relay.Frame, 8),
+		resizes:    make(chan terminal.ClientMessage, 8),
+		closes:     make(chan uint64, 8),
+		execs:      make(chan relay.Frame, 8),
+		execClient: make(chan terminal.ClientMessage, 16),
+		allClient:  make(chan terminal.ClientMessage, 64),
 		// Deep enough that no test stalls the fake's single serve loop on an
 		// undrained handoff: the send below is blocking, because a test that
 		// asserts on a binding must not have it dropped.
@@ -197,12 +225,33 @@ func (fs *fakeSessiond) serve(ctx context.Context) {
 		switch f.Type {
 		case relay.FrameOpen:
 			fs.opens <- f
+			if f.Kind == runner.KindExec {
+				fs.execs <- f
+				if fs.execReply != nil {
+					fs.execIDs.Store(f.AttachID, true)
+					for _, m := range fs.execReply(f) {
+						fs.send(ctx, f.AttachID, m)
+					}
+					continue
+				}
+				// No exec reply scripted: answer the snapshot an OLD
+				// sessiond answers, which is the case the handshake exists
+				// to catch.
+			}
 			fs.send(ctx, f.AttachID, terminal.ServerMessage{
 				Type: "snapshot", Seq: 1, Cols: f.Cols, Rows: f.Rows, Data: []byte(snapshotText),
 			})
 		case relay.FrameClient:
 			var m terminal.ClientMessage
 			if json.Unmarshal(f.Payload, &m) != nil {
+				continue
+			}
+			select {
+			case fs.allClient <- m:
+			default: // a test that is not watching; never block the reader
+			}
+			if _, ok := fs.execIDs.Load(f.AttachID); ok {
+				fs.execClient <- m
 				continue
 			}
 			switch m.Type {

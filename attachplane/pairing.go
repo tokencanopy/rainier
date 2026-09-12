@@ -15,6 +15,15 @@ import (
 // runs its deferred close on a socket the splice is still using.
 type pendingAttach struct {
 	stream control.TerminalStream
+	// exec marks the second KIND of attachment. The dial-back endpoint is
+	// shared — one pairing table, one target_url shape, one claim — and this
+	// is what decides which splice claims the socket. It is a field on the
+	// PARKED entry rather than something read off the dial-back, because the
+	// runner is told what to open and is not asked what it opened.
+	//
+	// An exec entry carries no ownership: own is nil, and every part of the
+	// exec path that would have read it does not exist.
+	exec bool
 	// own is what this attach holds — its mode, its generation, and the
 	// keeper it hands control over through. It is parked with the socket
 	// because the splice that claims the socket is where ownership becomes

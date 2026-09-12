@@ -40,7 +40,7 @@ func TestRecoveredSessionsAreMintedABootEpochToo(t *testing.T) {
 
 	// A frame on the epoch nothing lives on is refused by the registry: the
 	// recovered session is not marked exited, and so is never auto-stopped.
-	rd.routeControl("sess-recovered-a", 0, []byte(`{"kind":"child_exited","rc":0}`))
+	rd.routeControl("sess-recovered-a", 0, 1, []byte(`{"kind":"child_exited","rc":0}`))
 	if e, ok := rd.reg.get("sess-recovered-a"); !ok || !e.childExitedAt.IsZero() {
 		t.Fatal("a child_exited carrying epoch zero was recorded against a recovered session")
 	}
@@ -51,7 +51,7 @@ func TestRecoveredSessionsAreMintedABootEpochToo(t *testing.T) {
 
 	// Its own epoch still works, so recovery has not fenced the session off
 	// from the exit its real child will report.
-	rd.routeControl("sess-recovered-a", a, []byte(`{"kind":"child_exited","rc":0}`))
+	rd.routeControl("sess-recovered-a", a, 1, []byte(`{"kind":"child_exited","rc":0}`))
 	if e, ok := rd.reg.get("sess-recovered-a"); !ok || e.childExitedAt.IsZero() {
 		t.Fatal("a child_exited on the recovered session's own epoch was not recorded")
 	}

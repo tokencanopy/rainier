@@ -359,6 +359,92 @@ func TestAnUnboundDialAttachIsTheBytesItAlwaysWas(t *testing.T) {
 	}
 }
 
+// TestExecIsAdditiveOnTheDialAttach is the exec half of the promise above:
+// the two fields exec adds to a dial_attach are omitempty, so a TERMINAL
+// dial_attach — the only one every already-deployed runner knows how to read
+// — is byte-identical to the one asserted above.
+func TestExecIsAdditiveOnTheDialAttach(t *testing.T) {
+	raw, err := json.Marshal(runner.Attach{
+		AttachID: "att_example", Since: 3, Cols: 80, Rows: 24,
+		TargetURL: "wss://rainier.example.invalid/v0/attach-back/att_example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), `"kind"`) || strings.Contains(string(raw), `"exec"`) {
+		t.Fatalf("a terminal dial_attach leaked an exec field: %s", raw)
+	}
+	if runner.KindTerminal != "" {
+		t.Fatalf("the terminal kind must be the empty string, got %q", runner.KindTerminal)
+	}
+}
+
+// TestExecDialAttachWireShape pins the bytes a plane sends a runner to open
+// an exec, and TestExecSpecWireShape the spec inside it. Both are the
+// contract between separately released binaries.
+func TestExecDialAttachWireShape(t *testing.T) {
+	raw, err := json.Marshal(runner.Attach{
+		AttachID:  "att_example",
+		TargetURL: "wss://rainier.example.invalid/v0/attach-back/att_example",
+		Kind:      runner.KindExec,
+		Exec:      &runner.ExecSpec{Argv: []string{"git", "status"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"attach_id":"att_example","since":0,"cols":0,"rows":0,` +
+		`"target_url":"wss://rainier.example.invalid/v0/attach-back/att_example",` +
+		`"kind":"exec","exec":{"argv":["git","status"]}}`
+	if string(raw) != want {
+		t.Fatalf("an exec dial_attach = %s\nwant %s", raw, want)
+	}
+}
+
+// TestExecSpecWireShape pins the spec's own JSON, including the rule that a
+// plain command carries nothing but its argv: cwd, env, tty, the sizes, the
+// detach flag and the log path are all omitempty, so the common case is the
+// smallest message and an added field can never change an existing one.
+func TestExecSpecWireShape(t *testing.T) {
+	plain, err := json.Marshal(runner.ExecSpec{Argv: []string{"true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(plain) != `{"argv":["true"]}` {
+		t.Fatalf("a plain exec spec = %s", plain)
+	}
+
+	full, err := json.Marshal(runner.ExecSpec{
+		Argv: []string{"make", "test"}, Cwd: "/workspace/repo",
+		Env: map[string]string{"CI": "1"}, TTY: true, Cols: 80, Rows: 24,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantFull = `{"argv":["make","test"],"cwd":"/workspace/repo","env":{"CI":"1"},` +
+		`"tty":true,"cols":80,"rows":24}`
+	if string(full) != wantFull {
+		t.Fatalf("a full exec spec = %s\nwant %s", full, wantFull)
+	}
+
+	detached, err := json.Marshal(runner.ExecSpec{
+		Argv: []string{"claude", "--continue"}, Detach: true, LogPath: "/workspace/run.log"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantDetached = `{"argv":["claude","--continue"],"detach":true,"log_path":"/workspace/run.log"}`
+	if string(detached) != wantDetached {
+		t.Fatalf("a detached exec spec = %s\nwant %s", detached, wantDetached)
+	}
+}
+
+// TestExecCapabilityToken pins the announced token. A runner advertises it,
+// a plane pre-checks it, and the two are separately released — so the string
+// is contract, not a constant either end may rename.
+func TestExecCapabilityToken(t *testing.T) {
+	if runner.CapabilityExecV1 != "exec.v1" {
+		t.Fatalf("the exec capability token moved: %q", runner.CapabilityExecV1)
+	}
+}
+
 // TestCapacityCountsOnTheWire pins the tag names of the two counts that split
 // Used by what a sandbox is doing. Both ends read them off the wire by name,
 // and a Go-side test that goes through the struct would go green against a

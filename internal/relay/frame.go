@@ -3,7 +3,11 @@
 // for one attachment, tagged by AttachID.
 package relay
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/tokencanopy/rainier/protocol/runner"
+)
 
 type FrameType uint8
 
@@ -45,18 +49,33 @@ type Frame struct {
 	// attachment is unbound, which the session reads as today's
 	// unconditional attachment. Both are omitempty for that reason: a peer
 	// that sets neither writes the bytes it has always written.
-	Mode    string `json:"m,omitempty"`
-	Gen     uint64 `json:"g,omitempty"`
-	Payload []byte `json:"p,omitempty"`
+	Mode string `json:"m,omitempty"`
+	Gen  uint64 `json:"g,omitempty"`
+	// Kind and Exec are a FrameOpen's attachment KIND: absent (runner.KindTerminal)
+	// opens the session's pty exactly as it always has, runner.KindExec opens a
+	// process this attachment creates and owns, with Exec naming it.
+	//
+	// Both are omitempty, so a terminal FrameOpen is byte-identical to the one
+	// this hop has always written (pinned by TestTerminalFrameWireShape). A
+	// FrameOpen carrying KindExec on a sessiond that predates the field falls
+	// into today's terminal branch and answers a snapshot — which is exactly
+	// why the plane requires a positive `exec_started` before it forwards
+	// anything, and why that handshake, not this field, is the fence.
+	Kind    string           `json:"k,omitempty"`
+	Exec    *runner.ExecSpec `json:"x,omitempty"`
+	Payload []byte           `json:"p,omitempty"`
 }
 
 // ControlEvent is the JSON payload a FrameControl carries: a message about
 // the session as a whole rather than about any one viewer. It has three
 // shapes, distinguished by Kind and ID:
 //
-//   - An EVENT — "setup_done", "setup_failed"/"stage_failed", "child_exited" —
-//     is fire-and-forget, carries ID 0, and travels upward only (sessiond →
-//     runnerd), where runnerd turns it into an rwire event for controld.
+//   - An EVENT — "setup_done", "setup_failed"/"stage_failed", "child_exited",
+//     "exec_count", "suspending"/"suspend_ready" — is fire-and-forget and
+//     carries ID 0. Most travel upward only (sessiond → runnerd), where
+//     runnerd turns them into rwire events for controld; the suspend pair is
+//     the one that travels both ways and stays between runnerd and the
+//     sandbox, and "exec_count" is the one runnerd keeps for itself.
 //   - A REQUEST is Kind "req:<method>" with an ID greater than zero. Either
 //     end may originate one: the sandbox asking controld to mint a git
 //     credential goes up, a diff or a push/pull goes down.
@@ -74,6 +93,58 @@ type Frame struct {
 // ControlSender.Send, Hub.SendControl, and both control handlers alike — but
 // owning the shape is what keeps a field rename from silently becoming a
 // dropped event.
+// The three kinds of the suspend handshake. They are constants rather than
+// literals because both ends of the hop come from different build lineages —
+// runnerd runs on the host and sessiond ships inside the session image — so a
+// typo on one side would be a silently ignored frame rather than a compile
+// error.
+//
+// All three carry a NONCE in ControlEvent.ID, which is the one place an event
+// uses that field. Without it a late answer to a suspend that already gave up
+// satisfies the NEXT one: runnerd would freeze a container while its sandbox
+// was still mid-kill, leaving a signal pending in the freezer cgroup — the
+// exact failure this handshake exists to prevent, reintroduced by its own
+// acknowledgement.
+const (
+	// KindSuspending is runnerd telling a sandbox it is about to be FROZEN.
+	// It is sent before `docker pause`, which sessiond never sees as a signal:
+	// a paused sessiond receives no SIGTERM, so without this the exec runner's
+	// KillAll — the one bound on a detached exec's life — would never run on
+	// the default `rainier stop`.
+	KindSuspending = "suspending"
+	// KindSuspendAck is the sandbox saying it HEARD, immediately, before it
+	// starts killing anything.
+	//
+	// It exists so that the two waits can be different lengths. A sessiond
+	// that predates this vocabulary answers nothing at all, and a session
+	// keeps the sessiond it booted with for life — so every session created
+	// before exec shipped would otherwise pay the full "are they gone yet"
+	// budget on every warm stop, forever. Hearing an ack is what tells runnerd
+	// it is worth waiting for the rest; hearing none is what tells it not to.
+	KindSuspendAck = "suspend_ack"
+	// KindSuspendReady is the sandbox saying its execs are GONE (or that it
+	// gave up waiting for one). Beyond the nonce it carries nothing: runnerd
+	// is waiting for the fact, and a count would be a number nobody acts on.
+	KindSuspendReady = "suspend_ready"
+	// KindExecCount is the sandbox telling runnerd how many commands it is
+	// running right now — detached ones included — so that idle auto-stop can
+	// treat a live exec exactly as it treats an attachment. It travels upward
+	// only, carries Live and Seq, and is answered by nothing.
+	//
+	// It is an ABSOLUTE count rather than a start/end pair because this
+	// channel is allowed to drop: a sessiond with no connection queues its
+	// events and drops the oldest at a cap, by design (an unbounded queue in
+	// a process that outlives everything else is the worse failure). A lost
+	// DELTA is wrong forever — the runner either pins a finished session out
+	// of auto-stop for its life or, worse, under-counts and stops a session
+	// with a live command in it. A lost COUNT is corrected by the next
+	// transition or by the next connection, both of which state the truth
+	// again.
+	//
+	// See docs/design/exec-idle-stop.md.
+	KindExecCount = "exec_count"
+)
+
 type ControlEvent struct {
 	Kind string `json:"kind"`
 	// ID correlates a request with its one response. It is per-direction and
@@ -82,6 +153,12 @@ type ControlEvent struct {
 	// response only against the requests it sent. Zero means "not an RPC" —
 	// the fire-and-forget event shape — which is why it is omitempty rather
 	// than a pointer: an event has no id to omit ambiguously.
+	//
+	// The suspend handshake is the one EVENT that uses it, as a nonce rather
+	// than as a request id, so that a late answer cannot satisfy the next
+	// suspend. It shares no space with the RPC ids: those travel on kinds
+	// "req:"/"resp", which every reader matches before it reaches a suspend
+	// kind, and neither end looks one up in the other's table.
 	ID uint64 `json:"id,omitempty"`
 	// OK is a response's verdict, meaningful only on Kind "resp". False is the
 	// zero value and therefore absent from the wire, which is the safe
@@ -110,6 +187,18 @@ type ControlEvent struct {
 	// came up, so it travels with the event rather than being left in a log
 	// inside a container that is about to go away.
 	Tail string `json:"tail,omitempty"`
+	// Live and Seq are KindExecCount's whole payload: how many commands the
+	// sandbox is running right now, and the report's place in the sequence.
+	//
+	// Live is `omitempty` and zero is its most important value — "the last one
+	// ended" — which is safe for the same reason, and only the same reason, as
+	// RC's on a clean child exit: the field's zero value and the number being
+	// carried are the same, so an absent `live` decodes back to the 0 that was
+	// meant. Seq is 1 on a sandbox's first report and never zero afterwards,
+	// so it is never omitted on a real one; a decoded zero names a peer that
+	// does not speak this event.
+	Live int    `json:"live,omitempty"`
+	Seq  uint64 `json:"seq,omitempty"`
 }
 
 func Encode(f Frame) ([]byte, error) { return json.Marshal(f) }

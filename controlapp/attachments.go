@@ -32,6 +32,17 @@ type AttachmentOptions struct {
 	// — the unit holds every store write the operation makes, which here is
 	// the event alone.
 	UnitOfWork control.UnitOfWork
+	// ExecBroker is the plane an exec attachment is handed to. It is
+	// OPTIONAL, and nil is a host that has composed no exec plane rather
+	// than a misconfiguration: an exec against such a host answers
+	// control.ErrUnsupported, which its route renders as 501, and every
+	// other operation on this service is unaffected.
+	//
+	// Optional rather than required for a reason that outlives this release:
+	// this struct is composed by Rainier Cloud as well as by self-hosted
+	// controld, and making a new dependency mandatory would break a host's
+	// build the moment it took the update, for a capability it may not want.
+	ExecBroker ExecBroker
 	// MaxTransferBytes bounds one push or pull's compressed bytes. Zero means
 	// workspace.MaxBytes; a negative value is control.ErrInvalid. Hosts lower
 	// it in tests so the overrun path is exercised without streaming the full
@@ -60,8 +71,9 @@ type AttachmentPolicy interface {
 	AuthorizeAttachment(context.Context, control.Scope, control.Resource, control.AttachmentMode) error
 }
 
-// AttachmentService implements control.Attachments: AttachTerminal and the
-// three bounded workspace operations. It owns the correlation counter, the
+// AttachmentService implements control.Attachments — AttachTerminal and the
+// three bounded workspace operations — and, when a host composed an exec
+// plane, controlapp.Execs beside it. It owns the correlation counter, the
 // controller-generation fence, and every authorization/readiness/bound check
 // before a byte crosses the broker, runner, reader, or writer seam.
 type AttachmentService struct {
@@ -74,6 +86,7 @@ type AttachmentService struct {
 	clock       control.Clock
 	ids         control.IDGenerator
 	uow         control.UnitOfWork
+	execBroker  ExecBroker
 	maxTransfer int64
 	rpcSeq      atomic.Uint64
 }
@@ -110,6 +123,7 @@ func NewAttachmentService(opts AttachmentOptions) (*AttachmentService, error) {
 		clock:       opts.Clock,
 		ids:         opts.IDs,
 		uow:         opts.UnitOfWork,
+		execBroker:  opts.ExecBroker,
 		maxTransfer: maxTransfer,
 	}, nil
 }

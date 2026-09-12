@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -382,5 +383,266 @@ func TestRPCRepliesGoBackOnTheArrivingConnection(t *testing.T) {
 	}
 	if n := second.tries(); n != 0 {
 		t.Fatalf("%d frames written to the connection that replaced it, want 0", n)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the suspend notice
+// ---------------------------------------------------------------------------
+
+// recordingExecs is the exec runner as the suspend path sees it.
+type recordingExecs struct {
+	mu       sync.Mutex
+	budget   time.Duration
+	calls    int
+	killAlls int
+	left     int
+}
+
+func (r *recordingExecs) KillAll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.killAlls++
+}
+
+func (r *recordingExecs) KillAllAndWait(budget time.Duration) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	r.budget = budget
+	return r.left
+}
+
+func (r *recordingExecs) state() (int, time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls, r.budget
+}
+
+// recordingSender records the payloads a dispatcher sends upstream.
+type recordingSender struct {
+	mu   sync.Mutex
+	sent [][]byte
+	err  error
+}
+
+func (s *recordingSender) Send(p []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	s.sent = append(s.sent, append([]byte(nil), p...))
+	return nil
+}
+
+func (s *recordingSender) events() []relay.ControlEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]relay.ControlEvent, 0, len(s.sent))
+	for _, p := range s.sent {
+		var ev relay.ControlEvent
+		if json.Unmarshal(p, &ev) == nil {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// suspendWired is the dispatcher wired the way main wires it, so these tests
+// exercise the frame's whole journey through sessiond — OnControl's kind
+// dispatch, the event handler, the kill, and the acknowledgement — rather than
+// calling quiesceExecs directly.
+func suspendWired(execs execKiller) (*rpcDispatcher, *recordingSender) {
+	d := newRPCDispatcher()
+	sender := &recordingSender{}
+	d.online(sender)
+	d.RegisterEventHandler(relay.KindSuspending, func(relay.ControlEvent) {
+		quiesceExecs(execs, d, 77)
+	})
+	return d, sender
+}
+
+func suspendFrame(t *testing.T) []byte {
+	t.Helper()
+	b, err := json.Marshal(relay.ControlEvent{Kind: relay.KindSuspending})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestASuspendNoticeEndsEveryExec is the fix for the lifetime rule the CLI's
+// help text states and the code did not have.
+//
+// The default `rainier stop` is a WARM suspend — docker pause — which freezes
+// this process without ever delivering it a SIGTERM, so the shutdown handler
+// that calls KillAll never runs. A detached `claude --continue` was therefore
+// frozen and resumed rather than reaped. runnerd now sends this notice first,
+// and the sandbox answers it.
+func TestASuspendNoticeEndsEveryExec(t *testing.T) {
+	execs := &recordingExecs{}
+	d, sender := suspendWired(execs)
+
+	d.OnControl(suspendFrame(t))
+
+	calls, budget := execs.state()
+	if calls != 1 {
+		t.Fatalf("a suspend notice killed the execs %d times, want exactly once", calls)
+	}
+	if budget != execQuiesceBudget {
+		t.Fatalf("the kill was given %s, want the quiesce budget %s", budget, execQuiesceBudget)
+	}
+	got := sender.events()
+	if len(got) != 2 {
+		t.Fatalf("the sandbox answered %+v, want an ack and then a ready", got)
+	}
+	if got[0].Kind != relay.KindSuspendAck || got[1].Kind != relay.KindSuspendReady {
+		t.Fatalf("the sandbox answered %s then %s, want %s then %s",
+			got[0].Kind, got[1].Kind, relay.KindSuspendAck, relay.KindSuspendReady)
+	}
+	for _, ev := range got {
+		if ev.ID != 77 {
+			t.Fatalf("a %s answered nonce %d, want the notice's own 77 — without the "+
+				"echo a late answer satisfies the NEXT suspend", ev.Kind, ev.ID)
+		}
+	}
+}
+
+// TestTheSandboxSaysItHeardBeforeItStartsKilling is why there are two answers.
+// runnerd cannot tell a sandbox that is working from one that predates this
+// notice, and a session keeps the sessiond it booted with for life — so
+// without an early "heard you" every session created before exec shipped would
+// make every warm stop wait out the long budget, forever.
+func TestTheSandboxSaysItHeardBeforeItStartsKilling(t *testing.T) {
+	killing := make(chan struct{})
+	execs := &blockingExecs{enter: killing, release: make(chan struct{})}
+	d, sender := suspendWired(execs)
+
+	done := make(chan struct{})
+	go func() { defer close(done); d.OnControl(suspendFrame(t)) }()
+
+	<-killing // the kill is under way and has not returned
+	got := sender.events()
+	if len(got) != 1 || got[0].Kind != relay.KindSuspendAck {
+		t.Fatalf("before the kill finished the sandbox had said %+v, want the ack — "+
+			"an old sandbox is indistinguishable from a working one without it", got)
+	}
+	close(execs.release)
+	<-done
+	if got := sender.events(); len(got) != 2 || got[1].Kind != relay.KindSuspendReady {
+		t.Fatalf("after the kill the sandbox had said %+v", got)
+	}
+}
+
+// blockingExecs parks inside the kill so a test can look at what has been said
+// while it is still running.
+type blockingExecs struct {
+	enter   chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingExecs) KillAll() {}
+
+func (b *blockingExecs) KillAllAndWait(time.Duration) int {
+	b.once.Do(func() { close(b.enter) })
+	<-b.release
+	return 0
+}
+
+// TestASuspendNoticeIsAcknowledgedEvenWhenAnExecWillNotDie: runnerd freezes the
+// container when it hears nothing, so a sandbox that gave up waiting has every
+// reason to say so and none to stay silent.
+func TestASuspendNoticeIsAcknowledgedEvenWhenAnExecWillNotDie(t *testing.T) {
+	execs := &recordingExecs{left: 2}
+	d, sender := suspendWired(execs)
+
+	d.OnControl(suspendFrame(t))
+
+	got := sender.events()
+	if len(got) != 2 || got[1].Kind != relay.KindSuspendReady {
+		t.Fatalf("a sandbox with a stubborn exec answered %+v, want an ack and a ready",
+			got)
+	}
+}
+
+// TestAnUnknownControlKindIsStillDropped: the event registry must not turn
+// every unrecognised kind into something that runs. A sandbox is the far end
+// of a channel that also carries a session's terminal traffic.
+func TestAnUnknownControlKindIsStillDropped(t *testing.T) {
+	execs := &recordingExecs{}
+	d, sender := suspendWired(execs)
+
+	b, err := json.Marshal(relay.ControlEvent{Kind: "not_a_kind_this_build_knows"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.OnControl(b)
+
+	if calls, _ := execs.state(); calls != 0 {
+		t.Fatalf("an unknown control kind ran the suspend handler %d times", calls)
+	}
+	if got := sender.events(); len(got) != 0 {
+		t.Fatalf("an unknown control kind produced %+v", got)
+	}
+
+}
+
+// TestAPanickingEventHandlerDoesNotTakeTheSessionDown: event handlers run on
+// relay's per-frame goroutines, and this process by design outlives its agent,
+// its connection and every viewer.
+func TestAPanickingEventHandlerDoesNotTakeTheSessionDown(t *testing.T) {
+	d := newRPCDispatcher()
+	d.online(&recordingSender{})
+	d.RegisterEventHandler("boom", func(relay.ControlEvent) { panic("handler bug") })
+	b, err := json.Marshal(relay.ControlEvent{Kind: "boom"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.OnControl(b) // must return rather than unwind the process
+}
+
+// TestAShutdownSignalEndsEveryExec is the OTHER half of the lifetime rule, and
+// the half nothing was checking: a cold stop and a destroy both arrive as a
+// SIGTERM, and deleting execs.KillAll() from that handler left the whole tree
+// green — the end-to-end test reached into the runner's KillAll directly and
+// never exercised the wiring.
+func TestAShutdownSignalEndsEveryExec(t *testing.T) {
+	execs := &recordingExecs{}
+	var order []string
+	onShutdownSignal(
+		func() { order = append(order, "stop-watching") },
+		func() { order = append(order, "stop-agent") },
+		execs,
+		func() { order = append(order, "close-agents") },
+	)
+	execs.mu.Lock()
+	killAlls := execs.killAlls
+	execs.mu.Unlock()
+	if killAlls != 1 {
+		t.Fatalf("a shutdown signal killed the execs %d times, want exactly once — "+
+			"a detached exec outlives its caller, never its session", killAlls)
+	}
+	want := []string{"stop-watching", "stop-agent", "close-agents"}
+	if len(order) != len(want) {
+		t.Fatalf("shutdown ran %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("shutdown ran %v, want %v", order, want)
+		}
+	}
+}
+
+// TestAShutdownSignalWithNoAgentSyncIsStillAShutdown: a session created with
+// no agent manifest has no sync at all, and its execs still have to go.
+func TestAShutdownSignalWithNoAgentSyncIsStillAShutdown(t *testing.T) {
+	execs := &recordingExecs{}
+	onShutdownSignal(func() {}, func() {}, execs, nil)
+	execs.mu.Lock()
+	defer execs.mu.Unlock()
+	if execs.killAlls != 1 {
+		t.Fatalf("killAlls = %d, want 1", execs.killAlls)
 	}
 }
