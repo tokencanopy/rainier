@@ -356,7 +356,7 @@ type would mean a third decode at every hop. New type words only.
 
 `exec_error`'s vocabulary is `unsupported`, `not_found`, `not_executable`,
 `cwd_refused`, `env_refused`, `log_refused`, `too_many_execs`,
-`too_many_detached`, `no_answer` and `stdin_overrun`. It is closed because the
+`too_many_detached`, `session_ending`, `no_answer` and `stdin_overrun`. It is closed because the
 CLI maps it to an exit code and a sentence, and because a free-form string from
 inside a sandbox is a string a user's terminal renders — and it is published
 here as `terminal.ExecReasons()` rather than as prose, so
@@ -366,6 +366,12 @@ out of it for exactly that reason:
 
 - `too_many_detached` — the DETACHED sub-cap below, which is a smaller number
   than the eight, and therefore a different sentence and a different remedy.
+- `session_ending` — the sandbox is quiescing: it has been told it is about to
+  be suspended, stopped or destroyed and is no longer accepting commands. The
+  relay conn stays up for the whole of that window, so without this word an exec
+  arriving in it would be spawned into a container that is about to be frozen
+  and then frozen alive. The remedy is a `rainier resume` or a new session
+  rather than a retry, and the command never ran.
 - `no_answer` — the sandbox said nothing in time. Kept apart from
   `unsupported`, which means "this session was created before exec shipped" and
   is permanent.

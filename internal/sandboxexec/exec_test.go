@@ -1211,14 +1211,21 @@ func TestOrdinaryStdinIsNeverRefused(t *testing.T) {
 	}
 	a.Client(terminal.ClientMessage{Type: terminal.TypeExecStdinEOF})
 
-	deadline := time.Now().Add(30 * time.Second)
+	// PROGRESS, not wall clock. The claim is that an ordinary stream is never
+	// REFUSED; a fixed deadline on a paced 16 MiB feed measures this machine's
+	// throughput under -race instead, which is how this failed at -count=10 on
+	// a loaded box while passing on its own.
+	last, moved := -1, time.Now()
 	for {
 		n, closed := p.stdinProgress()
 		if n == chunks*len(chunk) && closed {
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("delivered %d of %d bytes (closed=%v); an ordinary stream was refused",
+		if n != last {
+			last, moved = n, time.Now()
+		}
+		if time.Since(moved) > 30*time.Second {
+			t.Fatalf("stalled at %d of %d bytes (closed=%v); an ordinary stream was refused",
 				n, chunks*len(chunk), closed)
 		}
 		time.Sleep(5 * time.Millisecond)

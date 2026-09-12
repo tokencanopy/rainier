@@ -432,6 +432,11 @@ with its own reason rather than the eight-command one: a detached process
 holds its slot for as long as it runs, and the command that stops one is
 itself a command that needs a slot.
 
+A command that arrives while the session is being stopped or deleted is refused
+rather than started, and exits 1 with a sentence saying so — the sandbox stops
+accepting commands the moment it is told it is going away, because one accepted
+in that window would be frozen alive by the pause that follows.
+
 Ctrl-C forwards `SIGINT` to the command; a second press leaves, which kills
 it. There is no server-imposed timeout: a build legitimately runs for an hour
 and a wrong number is worse than none. A caller bounds it with
