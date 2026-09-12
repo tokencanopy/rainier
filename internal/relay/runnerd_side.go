@@ -3,7 +3,9 @@ package relay
 
 import (
 	"context"
+	"log"
 	"sync"
+	"time"
 
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
@@ -31,7 +33,37 @@ type Hub struct {
 	// onControl is wired by the constructor and never written again — see
 	// NewHubWithControl for why it isn't a settable field.
 	onControl func(payload []byte)
+	// clientWrite bounds ONE write to ONE client in readLoop. Set by the
+	// constructor and never written again, for the same reason onControl is:
+	// readLoop is already running by the time a caller could assign it.
+	clientWrite time.Duration
 }
+
+// clientWriteBudget is how long readLoop will wait for one client to take one
+// frame before treating it as gone.
+//
+// readLoop demultiplexes every frame for every attachment on this session's
+// conn — terminal input, exec output and the session RPC alike — on ONE
+// goroutine. A write with no bound of its own therefore makes any single stuck
+// client a stall on all of them, for as long as whatever is below is willing
+// to wait.
+//
+// That was survivable while a client was always a terminal viewer, because
+// attachplane force-detaches one that exceeds its write budget. `rainier exec`
+// is what makes it reachable: an exec stream blocks BY DESIGN — that is its
+// flow control, the thing that keeps a command from outrunning the caller
+// reading it — and downstream it is bounded only by attachplane's per-frame
+// exec budget, twenty seconds. So one slow exec caller buys twenty seconds of
+// stalled viewers and stalled session RPC per frame, with nothing in this
+// package enforcing anything.
+//
+// Five seconds is chosen to sit inside that twenty: this hop gives up before
+// the hop below it does, so the drop is decided here, where the cost of
+// waiting is actually paid, rather than downstream where it is only one
+// client's problem. It is also far outside any healthy write — the client conn
+// is a websocket to a process on this machine or to the control plane, not to
+// the human's laptop.
+const clientWriteBudget = 5 * time.Second
 
 func NewHub(ctx context.Context, sessionConn Conn) *Hub {
 	return NewHubWithControl(ctx, sessionConn, nil)
@@ -57,8 +89,18 @@ func NewHub(ctx context.Context, sessionConn Conn) *Hub {
 // every attachment multiplexed over this conn, not just the control channel.
 // nil means control frames are read and dropped.
 func NewHubWithControl(ctx context.Context, sessionConn Conn, onControl func(payload []byte)) *Hub {
+	return newHub(ctx, sessionConn, onControl, clientWriteBudget)
+}
+
+// newHub is NewHubWithControl with the per-client write budget named, so a
+// test can drive the drop in milliseconds instead of in five seconds. It is
+// unexported because the budget is not a host's choice: it is a property of
+// what this hop owes the OTHER attachments on the same conn.
+func newHub(ctx context.Context, sessionConn Conn, onControl func(payload []byte),
+	clientWrite time.Duration) *Hub {
 	hctx, cancel := context.WithCancel(ctx)
-	h := &Hub{conn: sessionConn, ctx: hctx, cancel: cancel, clients: map[uint64]Conn{}, onControl: onControl}
+	h := &Hub{conn: sessionConn, ctx: hctx, cancel: cancel, clients: map[uint64]Conn{},
+		onControl: onControl, clientWrite: clientWrite}
 	go h.readLoop()
 	return h
 }
@@ -106,8 +148,14 @@ func (h *Hub) readLoop() {
 		}
 		switch f.Type {
 		case FrameServer:
-			// Forward the terminal.ServerMessage payload verbatim to the client.
-			if client.Write(h.ctx, f.Payload) != nil {
+			// Forward the terminal.ServerMessage payload verbatim to the
+			// client, under a bound of its own: a client that cannot take a
+			// frame in clientWriteBudget is treated exactly as one whose write
+			// FAILED, because from this loop's point of view — the one
+			// goroutine every other attachment on this conn is also waiting on
+			// — there is no useful difference between the two.
+			if err := h.writeClient(client, f.Payload); err != nil {
+				log.Printf("relay: dropping attachment %d: %v", f.AttachID, err)
 				h.mu.Lock()
 				delete(h.clients, f.AttachID)
 				h.mu.Unlock()
@@ -120,6 +168,22 @@ func (h *Hub) readLoop() {
 			h.mu.Unlock()
 		}
 	}
+}
+
+// writeClient is one bounded write to one client. The deadline is derived from
+// h.ctx, so a hub whose session conn has died fails immediately rather than
+// spending the budget on a write that cannot land.
+//
+// A budget of zero or less means "no bound of its own", which is what this
+// wrote before the bound existed; no production path sets it, and it is here
+// so the shape is explicit rather than accidental.
+func (h *Hub) writeClient(client Conn, payload []byte) error {
+	if h.clientWrite <= 0 {
+		return client.Write(h.ctx, payload)
+	}
+	ctx, cancel := context.WithTimeout(h.ctx, h.clientWrite)
+	defer cancel()
+	return client.Write(ctx, payload)
 }
 
 // SendControl writes payload to the session as a FrameControl on AttachID 0:
