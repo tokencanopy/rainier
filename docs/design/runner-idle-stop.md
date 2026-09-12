@@ -110,9 +110,14 @@ other mutable field:
   not failed ones, and a time-boxed diagnosis window is a better answer than either extreme
   once #85's admission work has somewhere to put it.
 - `lastDetachAt time.Time` — when the most recent attachment ended.
-- `liveExecs int`, `lastExecEndedAt time.Time`, `execSeq uint64` — how many `rainier exec`
-  commands the sandbox says it is running, when the count last fell to zero, and the fence
-  that refuses a report which arrived out of order. See
+- `liveExecs int`, `lastExecEndedAt time.Time`, `execSeq`/`execStampedSeq`/`execReg uint64` —
+  how many `rainier exec` commands the sandbox says it is running, when the count last fell
+  to zero, and the three counters that decide which reports to believe: a sequence the
+  sandbox assigns, the one stamp that sequence is allowed to make from a refusal, and the
+  `/register` epoch the stream belongs to. That last one is **minted** where `boot` is read,
+  because a live-exec report is only ever about the connection in hand — the sandbox restates
+  its count as every connection's first message — and because a sandbox process replaced
+  without a cold resume numbers from 1 again on an unchanged `boot`. See
   [`exec-idle-stop.md`](exec-idle-stop.md), and below.
 
 #### `rainier exec`, which landed beside this

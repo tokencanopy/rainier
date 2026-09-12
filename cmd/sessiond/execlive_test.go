@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"sync"
@@ -189,6 +190,65 @@ func TestServeConnRestatesTheExecCountAndNeverQueuesOne(t *testing.T) {
 			t.Fatalf("serveConn queued %d exec count(s) for the next connection; a count "+
 				"is only ever about the connection in hand, and it would compete with the "+
 				"child's exit for the cap", len(pending))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveConn did not return")
+	}
+}
+
+// TestAnUndeliverableExecCountNeverDisplacesTheChildsExit is the same rule
+// stated where it actually bites, and the reason the test above is not enough
+// on its own: with a WORKING sender the drain at the top of serveConn's loop
+// empties the queue before anything can be observed in it, so queueing an exec
+// count would look identical to sending one. It is only when sends are failing
+// — which is exactly when the queue matters — that the difference shows.
+//
+// The queue drops its OLDEST at pendingCap. The child's exit has no second
+// chance at all: if it is dropped, runnerd never learns the child exited,
+// childExitedAt stays zero, and the session holds its slot for the life of the
+// runner with nothing in the log to say why. A live-exec count, which every
+// connection restates by design, must never be the thing that pushes it out.
+func TestAnUndeliverableExecCountNeverDisplacesTheChildsExit(t *testing.T) {
+	dead := &stubSender{err: errors.New("write: broken pipe")}
+	errc := make(chan error, 1)
+	events := make(chan []byte, pendingCap)
+	execCounts := make(chan []byte, 1)
+
+	// The one event that cannot be repeated, queued first.
+	events <- childExitedPayload(0)
+
+	done := make(chan [][]byte, 1)
+	go func() {
+		p, _ := serveConn(dead, errc, events, execCounts, &stubReporter{live: 1, seq: 1}, nil)
+		done <- p
+	}()
+
+	// Then more exec counts than the queue can hold, one at a time so each is
+	// taken before the next is offered.
+	for seq := uint64(2); seq <= uint64(pendingCap)+4; seq++ {
+		execCounts <- execCountPayload(1, seq)
+		deadline := time.Now().Add(5 * time.Second)
+		for len(execCounts) > 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("serveConn stopped taking exec counts")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	errc <- io.EOF
+	select {
+	case pending := <-done:
+		if len(pending) != 1 {
+			t.Fatalf("the queue holds %d payload(s), want only the child's exit", len(pending))
+		}
+		var ev relay.ControlEvent
+		if err := json.Unmarshal(pending[0], &ev); err != nil {
+			t.Fatal(err)
+		}
+		if ev.Kind != "child_exited" {
+			t.Fatalf("the queue holds %q; the child's exit was pushed out by exec counts, "+
+				"and runnerd will never learn the child exited", ev.Kind)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("serveConn did not return")

@@ -93,7 +93,7 @@ func TestARefusedResumeReachesControldAsAConflict(t *testing.T) {
 	sd := newStallingStopDriver()
 	rd := New(sd, "", "", "")
 	rd.now = clk.now // before anything serves
-	h := &idleHarness{t: t, clk: clk, rd: rd, fd: sd.Fake, id: "sess-idle-1", boot: map[string]uint64{}}
+	h := &idleHarness{t: t, clk: clk, rd: rd, fd: sd.Fake, id: "sess-idle-1", boot: map[string]uint64{}, reg: map[string]uint64{}}
 	h.create(h.id)
 	h.run(30*time.Minute, idleStep{at: 0, act: childExits})
 	h.clk.set(30 * time.Minute)

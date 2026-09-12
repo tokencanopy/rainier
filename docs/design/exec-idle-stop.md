@@ -112,6 +112,32 @@ reports applied end-first — and the end, applied against a count of zero, woul
 nothing. The idle clock therefore starts at the refusal: late, never early, which is the
 direction every other decision on this path takes.
 
+**Once per applied report**, which is the difference between a repair and a new way to pin a
+session open. A frame is not consumed by being refused: a sandbox re-sending one, or a hub
+draining the same buffered frame after every redial, delivers it again and again, and an
+unbounded stamp would push the deadline out every time — a session with *nothing* running in
+it kept alive forever, which is the leak this whole feature exists to end, reintroduced by
+its own correction. `execStampedSeq` records the applied sequence already stamped for; a
+genuinely new reorder arrives after `execSeq` has moved, a replay does not.
+
+**A second fence, on the REGISTRATION, is what makes the first one safe.** `Seq` is a
+per-*process* counter and the boot epoch is not: it moves only on a cold resume,
+deliberately, so that a `child_exited` in flight across a plain redial is not dropped. So a
+sandbox process replaced *without* a cold resume — an operator's `docker start` on an entry
+`register`'s hub-death tail kept as running, a container the daemon restarted underneath a
+surviving `runnerd` — starts numbering at 1 again against an `execSeq` of 9, and every report
+it ever sends would be refused: the runner would believe a session running a detached command
+was running nothing, and cold-stop it. The catastrophic direction, reached by the fence that
+exists to prevent a lesser version of it.
+
+`runnerd` therefore mints a **registration epoch** at every `/register` — minted, where the
+boot epoch is read, and that asymmetry is the point. A live-exec report is only ever about
+the connection in hand, because the sandbox restates its count as that connection's first
+message; nothing has to survive the gap. A higher registration epoch **adopts** and resets
+`execSeq`; a lower one is refused, which also closes the case the boot epoch could not — a
+frame from the previous registration, drained late by a hub read loop that had been stalled
+on a wedged viewer. None of it is on the wire.
+
 **The boot-epoch fence is the one every other control event carries.** `routeControl` already
 receives the epoch the `/register` conn *read*, and the registry refuses any event naming a
 different one. A buffered `exec_count` drained by a stalled hub read loop after the sandbox
@@ -207,7 +233,9 @@ exactly the cost of an accidental coupling; another one is not the fix.
 | two execs, one ends | still not idle; the clock starts when the **second** ends |
 | a viewer detaches at T1, the last exec ends at T2 > T1 | the clock starts at T2 |
 | `exec_count` naming a previous boot epoch | refused; the current count is untouched |
-| an `exec_count` that arrives out of order (lower `Seq`) | refused |
+| `exec_count` from a previous /register epoch | refused, for the same reason and where the boot epoch cannot help |
+| the sandbox process is replaced without a cold resume | the new registration epoch adopts and resets `Seq`, so its reports are heard from 1 |
+| an `exec_count` that arrives out of order (lower `Seq`) | refused as a *count*. If it reports work at an entry that believes there is none, it starts the idle clock once — the end-first repair — and a replay of the same frame does not repeat it |
 | an old `sessiond` that never sends `exec_count` | exactly today's behaviour |
 | `exec_count{live:1}` then the sandbox conn dies for good | the entry keeps `liveExecs = 1` and is never auto-stopped; an operator's stop and a delete are unaffected. Safe direction, and the same shape as the existing "a half-open viewer conn holds a session open" limit |
 | a cold resume | all three fields cleared; the new sandbox's `Seq` starts at 1 |
@@ -233,7 +261,9 @@ layer above.
   It fails on `9c20a8e` (the session is suspended) and passes after.
 - Table rows in `internal/runnerd/idlestop_test.go` for each decision row above, on the fake
   clock.
-- The boot fence and the `Seq` fence, as registry-level tests.
+- The boot fence, the registration fence and the `Seq` fence, as registry-level tests —
+  including a sandbox process replaced without a cold resume, and a refused report replayed
+  hourly for twelve hours.
 - The old-sessiond row: a session that sends no `exec_count` is stopped exactly when it is
   today, and an attached exec still holds it open through its attachment.
 - `counts()` reports a session running a detached exec as `active`.
@@ -286,6 +316,13 @@ What the bound buys, then, is not a tighter decision but a decision at all: the 
 `/attach` front has no plane below it and was unbounded; a wedged plane, or a host that
 mounts a stream without those budgets, can no longer park this runner's demux for the life of
 the session; and the number is now stated in the package that pays for the wait.
+
+**Be precise about what that is worth.** The stall one wedged terminal client can impose on
+every other attachment on the conn goes from *unbounded* to `70s + bytes/64 KiB`, i.e. up to
+about **five and a half minutes** on the largest frame `attachReadLimit` permits. That is a
+bound and not a small number, and no test exercises the production magnitude — the ones here
+inject millisecond budgets. Shortening it is not available without overruling the plane; what
+is available is the cure below.
 
 It remains a **mitigation, not a cure**, exactly as `attachplane/stream.go`'s own comment
 says: the cure is a writer per attachment rather than one per conn. That is a change to the

@@ -62,9 +62,21 @@ type idleHarness struct {
 	// the one a real /register mints. Control frames carry it, and the
 	// registry drops the ones that name a boot the session has moved past.
 	boot map[string]uint64
+	// reg is the /register epoch the harness's current connection is on, the
+	// one a real /register MINTS (where boot is read). Control frames carry
+	// both, and the registry refuses an exec count from an earlier one.
+	reg map[string]uint64
 	// seq numbers the live-exec reports this harness sends, the way a
 	// sandbox's own exec runner numbers them.
 	seq uint64
+}
+
+// control delivers one control frame the way a registered sandbox's conn does:
+// on the boot epoch and the registration epoch this session's current
+// connection is on.
+func (h *idleHarness) control(payload string) {
+	h.t.Helper()
+	h.rd.routeControl(h.id, h.boot[h.id], h.reg[h.id], []byte(payload))
 }
 
 // newIdleHarness creates a runner with one running session whose sandbox the
@@ -75,7 +87,8 @@ func newIdleHarness(t *testing.T) *idleHarness {
 	fd := driver.NewFake(4)
 	rd := New(fd, "", "", "")
 	rd.now = clk.now // before anything serves: no goroutine of this server's exists yet
-	h := &idleHarness{t: t, clk: clk, rd: rd, fd: fd, id: "sess-idle-1", boot: map[string]uint64{}}
+	h := &idleHarness{t: t, clk: clk, rd: rd, fd: fd, id: "sess-idle-1",
+		boot: map[string]uint64{}, reg: map[string]uint64{}}
 	h.create(h.id)
 	return h
 }
@@ -87,6 +100,9 @@ func newIdleHarness(t *testing.T) *idleHarness {
 func (h *idleHarness) register(id string) {
 	h.t.Helper()
 	h.boot[id] = h.rd.reg.currentBoot(id)
+	// Minted, not read — the asymmetry production has, for the reason
+	// sessionEntry.execReg gives.
+	h.reg[id] = h.rd.reg.registration()
 }
 
 // create adds a session and registers a sandbox boot for it, which is what a
@@ -178,8 +194,7 @@ func (h *idleHarness) nextExecSeq() uint64 {
 // way sessiond's observer does.
 func (h *idleHarness) execCount(live int) {
 	h.t.Helper()
-	h.rd.routeControl(h.id, h.boot[h.id],
-		[]byte(fmt.Sprintf(`{"kind":"exec_count","live":%d,"seq":%d}`, live, h.nextExecSeq())))
+	h.control(fmt.Sprintf(`{"kind":"exec_count","live":%d,"seq":%d}`, live, h.nextExecSeq()))
 }
 
 // run plays one step.
@@ -191,7 +206,7 @@ func (h *idleHarness) run(idle time.Duration, s idleStep) {
 	case childExits:
 		// Through the real control-frame path, not the registry accessor: the
 		// fact has to survive routeControl to be worth anything.
-		h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"child_exited","rc":0}`))
+		h.control(`{"kind":"child_exited","rc":0}`)
 	case viewerAttaches:
 		h.rd.reg.attachStarted(h.id)
 	case viewerDetaches:
@@ -781,7 +796,7 @@ func TestIdleStopIdsAreSweptInAStableOrder(t *testing.T) {
 	for _, id := range []string{"sess-idle-9", "sess-idle-3", "sess-idle-5"} {
 		h.create(id)
 		h.register(id)
-		h.rd.routeControl(id, h.boot[id], []byte(`{"kind":"child_exited","rc":0}`))
+		h.rd.routeControl(id, h.boot[id], h.reg[id], []byte(`{"kind":"child_exited","rc":0}`))
 	}
 	h.run(time.Hour, idleStep{at: 0, act: childExits})
 	h.clk.set(time.Hour)
@@ -827,7 +842,7 @@ func TestStaleChildExitFromAPreviousBootIsIgnored(t *testing.T) {
 
 	// The previous boot's buffered frame finally arrives.
 	h.clk.set(32 * time.Minute)
-	h.rd.routeControl(h.id, staleBoot, []byte(`{"kind":"child_exited","rc":0}`))
+	h.rd.routeControl(h.id, staleBoot, h.reg[h.id], []byte(`{"kind":"child_exited","rc":0}`))
 	if e := h.entry(h.id); !e.childExitedAt.IsZero() {
 		t.Fatal("a child_exited from the previous boot was recorded against the new one")
 	}
@@ -929,7 +944,7 @@ func newBlockedHarness(t *testing.T, warm bool) (*idleHarness, *blockingDriver) 
 	bd := newBlockingDriver(warm)
 	rd := New(bd, "", "", "")
 	rd.now = clk.now
-	h := &idleHarness{t: t, clk: clk, rd: rd, fd: bd.Fake, id: "sess-idle-1", boot: map[string]uint64{}}
+	h := &idleHarness{t: t, clk: clk, rd: rd, fd: bd.Fake, id: "sess-idle-1", boot: map[string]uint64{}, reg: map[string]uint64{}}
 	h.create(h.id)
 	h.run(30*time.Minute, idleStep{at: 0, act: childExits})
 	h.clk.set(10 * time.Hour)
@@ -1023,7 +1038,7 @@ func TestFailedBootIsNeverIdleStopped(t *testing.T) {
 	} {
 		t.Run(kind, func(t *testing.T) {
 			h := newIdleHarness(t)
-			h.rd.routeControl(h.id, h.boot[h.id], []byte(kind))
+			h.rd.routeControl(h.id, h.boot[h.id], h.reg[h.id], []byte(kind))
 			h.run(30*time.Minute, idleStep{at: 0, act: childExits})
 
 			h.clk.set(1000 * time.Hour)
@@ -1082,7 +1097,7 @@ func TestAChildExitSurvivesAPlainRedial(t *testing.T) {
 
 	// The frame that was already in flight when it dropped now lands.
 	h.clk.set(time.Minute)
-	h.rd.routeControl(h.id, inFlight, []byte(`{"kind":"child_exited","rc":0}`))
+	h.rd.routeControl(h.id, inFlight, h.reg[h.id], []byte(`{"kind":"child_exited","rc":0}`))
 	if e := h.entry(h.id); e.childExitedAt.IsZero() {
 		t.Fatal("a child exit in flight across a redial was dropped; that session would hold its slot forever")
 	}
@@ -1111,7 +1126,7 @@ func TestAChildExitInTheResumeWindowIsIgnored(t *testing.T) {
 		t.Fatalf("resume: %v", err)
 	}
 	// Deliberately BEFORE the restarted sandbox registers.
-	h.rd.routeControl(h.id, staleBoot, []byte(`{"kind":"child_exited","rc":0}`))
+	h.rd.routeControl(h.id, staleBoot, h.reg[h.id], []byte(`{"kind":"child_exited","rc":0}`))
 	if e := h.entry(h.id); !e.childExitedAt.IsZero() {
 		t.Fatal("a frame from before the restart landed on the new boot")
 	}
@@ -1137,7 +1152,7 @@ func TestAStaleStageFailureDoesNotPinAHealthySession(t *testing.T) {
 	h.run(30*time.Minute, idleStep{at: 31 * time.Minute, act: sessionResumes})
 
 	// The previous boot's failure report arrives late.
-	h.rd.routeControl(h.id, staleBoot, []byte(`{"kind":"stage_failed","stage":"clone","rc":128}`))
+	h.rd.routeControl(h.id, staleBoot, h.reg[h.id], []byte(`{"kind":"stage_failed","stage":"clone","rc":128}`))
 	if e := h.entry(h.id); e.bootFailed {
 		t.Fatal("a stage failure from the previous boot pinned the current one out of idle auto-stop")
 	}
@@ -1155,7 +1170,7 @@ func TestAStaleStageFailureDoesNotPinAHealthySession(t *testing.T) {
 // not keep the session exempt for ever.
 func TestAResumedSessionForgetsAFailedBoot(t *testing.T) {
 	h := newIdleHarness(t)
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"setup_failed","rc":1}`))
+	h.rd.routeControl(h.id, h.boot[h.id], h.reg[h.id], []byte(`{"kind":"setup_failed","rc":1}`))
 	h.run(30*time.Minute, idleStep{at: 0, act: childExits})
 	h.run(30*time.Minute, idleStep{at: 1 * time.Minute, act: operatorStops})
 	h.run(30*time.Minute, idleStep{at: 2 * time.Minute, act: sessionResumes})
@@ -1209,7 +1224,7 @@ func TestAStopThatFailedButLandedIsNotRolledBackToRunning(t *testing.T) {
 			sd := &stopOutcomeDriver{Fake: driver.NewFake(4), reallyStopped: tc.reallyStopped}
 			rd := New(sd, "", "", "")
 			rd.now = clk.now
-			h := &idleHarness{t: t, clk: clk, rd: rd, fd: sd.Fake, id: "sess-idle-1", boot: map[string]uint64{}}
+			h := &idleHarness{t: t, clk: clk, rd: rd, fd: sd.Fake, id: "sess-idle-1", boot: map[string]uint64{}, reg: map[string]uint64{}}
 			h.create(h.id)
 			h.run(30*time.Minute, idleStep{at: 0, act: childExits})
 
@@ -1328,7 +1343,7 @@ func TestAResumeThatRestartedNothingKeepsTheConnectionsBootEpoch(t *testing.T) {
 	ud := &unreadableStopDriver{Fake: driver.NewFake(4), fail: true}
 	rd := New(ud, "", "", "")
 	rd.now = clk.now
-	h := &idleHarness{t: t, clk: clk, rd: rd, fd: ud.Fake, id: "sess-idle-1", boot: map[string]uint64{}}
+	h := &idleHarness{t: t, clk: clk, rd: rd, fd: ud.Fake, id: "sess-idle-1", boot: map[string]uint64{}, reg: map[string]uint64{}}
 	h.create(h.id)
 	liveBoot := h.boot[h.id]
 	ctx := context.Background()
@@ -1356,7 +1371,7 @@ func TestAResumeThatRestartedNothingKeepsTheConnectionsBootEpoch(t *testing.T) {
 
 	// So the exit reported by the sandbox that was there all along still counts.
 	h.clk.set(2 * time.Hour)
-	h.rd.routeControl(h.id, liveBoot, []byte(`{"kind":"child_exited","rc":0}`))
+	h.rd.routeControl(h.id, liveBoot, h.reg[h.id], []byte(`{"kind":"child_exited","rc":0}`))
 	h.clk.set(2*time.Hour + 31*time.Minute)
 	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 1 {
 		t.Fatalf("sweep stopped %v, want the session", stops)
@@ -1400,7 +1415,7 @@ func TestASecondResumeDoesNotMoveTheEpochAgain(t *testing.T) {
 	ar := &alwaysRestartedDriver{Fake: driver.NewFake(4)}
 	rd := New(ar, "", "", "")
 	rd.now = clk.now
-	h := &idleHarness{t: t, clk: clk, rd: rd, fd: ar.Fake, id: "sess-idle-1", boot: map[string]uint64{}}
+	h := &idleHarness{t: t, clk: clk, rd: rd, fd: ar.Fake, id: "sess-idle-1", boot: map[string]uint64{}, reg: map[string]uint64{}}
 	h.create(h.id)
 	ctx := context.Background()
 
@@ -1426,7 +1441,7 @@ func TestASecondResumeDoesNotMoveTheEpochAgain(t *testing.T) {
 
 	// So this sandbox's own child exit still counts, and its slot comes back.
 	h.clk.set(2 * time.Hour)
-	h.rd.routeControl(h.id, live, []byte(`{"kind":"child_exited","rc":0}`))
+	h.rd.routeControl(h.id, live, h.reg[h.id], []byte(`{"kind":"child_exited","rc":0}`))
 	h.clk.set(2*time.Hour + 31*time.Minute)
 	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 1 {
 		t.Fatalf("sweep stopped %v, want the session", stops)
@@ -1461,11 +1476,11 @@ func TestARecreatedSessionIdRefusesTheDeadSandboxsChildExit(t *testing.T) {
 	// Asserted on the consequences first, and on the epoch afterwards, so a
 	// regression fails on the harm rather than on the mechanism.
 	h.clk.set(time.Minute)
-	h.rd.routeControl(h.id, deadBoot, []byte(`{"kind":"child_exited","rc":0}`))
+	h.rd.routeControl(h.id, deadBoot, h.reg[h.id], []byte(`{"kind":"child_exited","rc":0}`))
 	if e := h.entry(h.id); !e.childExitedAt.IsZero() {
 		t.Error("a child_exited from the deleted session's sandbox was recorded against the new one")
 	}
-	h.rd.routeControl(h.id, deadBoot, []byte(`{"kind":"setup_failed","rc":1}`))
+	h.rd.routeControl(h.id, deadBoot, h.reg[h.id], []byte(`{"kind":"setup_failed","rc":1}`))
 	if e := h.entry(h.id); e.bootFailed {
 		t.Error("a stage failure from the deleted session's sandbox pinned the new one out of auto-stop")
 	}
@@ -1522,7 +1537,7 @@ func TestRecoveredSessionsAreInNeitherCount(t *testing.T) {
 	// One of them reports its child's exit: the runner now knows, so that
 	// session leaves the exemption and is an auto-stop candidate from here.
 	boot := rd.reg.currentBoot("sess-recovered-1")
-	rd.routeControl("sess-recovered-1", boot, []byte(`{"kind":"child_exited","rc":0}`))
+	rd.routeControl("sess-recovered-1", boot, 1, []byte(`{"kind":"child_exited","rc":0}`))
 	if active, idleExited := rd.reg.counts(); active != 0 || idleExited != 1 {
 		t.Fatalf("counts after one exit = active %d, idle_exited %d; want 0 and 1", active, idleExited)
 	}

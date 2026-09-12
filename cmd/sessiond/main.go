@@ -594,18 +594,7 @@ const pendingCap = 8
 // pair is the normal case, not a corner.
 func serveConn(sender controlSender, errc <-chan error, events, execCounts <-chan []byte,
 	execs execReporter, pending [][]byte) ([][]byte, error) {
-	// This connection's exec count, restated rather than waited for, and
-	// FIRST. A transition that happened while there was no connection is gone
-	// — the mailbox holds one report and only a live conn drains it — so a
-	// dial is the one moment at which the runner's view and this sandbox's can
-	// have drifted with no further command coming to repair it. It costs one
-	// small frame per dial and it is what makes "an absolute count is
-	// self-correcting" true rather than merely likely.
-	//
-	// It carries the highest sequence number issued so far, so a report the
-	// mailbox is still holding from before this conn — which the loop below
-	// may deliver a moment later — cannot overwrite it at the far end.
-	reportExecs(sender, execs)
+	restated := false
 	for {
 		for len(pending) > 0 {
 			if err := sender.Send(pending[0]); err != nil {
@@ -617,6 +606,29 @@ func serveConn(sender controlSender, errc <-chan error, events, execCounts <-cha
 				break
 			}
 			pending = pending[1:]
+		}
+		if !restated {
+			// This connection's exec count, restated rather than waited for.
+			// A transition that happened while there was no connection is
+			// gone — the mailbox holds one report and only a live conn drains
+			// it — so a dial is the one moment at which the runner's view and
+			// this sandbox's can have drifted with no further command coming
+			// to repair it. It costs one small frame per dial and it is what
+			// makes "an absolute count is self-correcting" true rather than
+			// merely likely.
+			//
+			// AFTER the queue above, not before it, and the order is the
+			// priority: what is in that queue has no second chance, while
+			// this is the one message in the whole vocabulary that is repeated
+			// on every connection by design. A wedged conn's first write
+			// should be the child's exit.
+			//
+			// It carries the highest sequence number issued so far, so a
+			// report the mailbox is still holding from before this conn —
+			// which the loop below may deliver a moment later — cannot
+			// overwrite it at the far end.
+			reportExecs(sender, execs)
+			restated = true
 		}
 		select {
 		case err := <-errc:

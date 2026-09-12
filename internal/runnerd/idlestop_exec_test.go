@@ -136,7 +136,7 @@ func TestARunningCommandCountsAsActive(t *testing.T) {
 // runner, with nothing in the log to say why.
 func TestAnExecCountFromAnOldBootIsRefused(t *testing.T) {
 	h := newIdleHarness(t)
-	stale := h.boot[h.id]
+	stale, staleReg := h.boot[h.id], h.reg[h.id]
 
 	// A cold stop and a resume: the container restarts, so the epoch moves and
 	// the new sandbox registers on it.
@@ -152,7 +152,7 @@ func TestAnExecCountFromAnOldBootIsRefused(t *testing.T) {
 	}
 
 	// The previous boot's buffered report finally drains.
-	h.rd.routeControl(h.id, stale, []byte(`{"kind":"exec_count","live":1,"seq":9}`))
+	h.rd.routeControl(h.id, stale, staleReg, []byte(`{"kind":"exec_count","live":1,"seq":9}`))
 	if got := liveExecsOn(h.rd, h.id); got != 0 {
 		t.Fatalf("a report from a boot the session has left set live=%d, want 0", got)
 	}
@@ -160,7 +160,7 @@ func TestAnExecCountFromAnOldBootIsRefused(t *testing.T) {
 	// And the new boot's own reports are not refused behind it: a resume
 	// clears the sequence fence with the count, so the new sessiond — a new
 	// process, numbering from 1 — is heard.
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","live":1,"seq":1}`))
+	h.control(`{"kind":"exec_count","live":1,"seq":1}`)
 	if got := liveExecsOn(h.rd, h.id); got != 1 {
 		t.Fatalf("the new sandbox's first report set live=%d, want 1; "+
 			"a stale sequence fence would refuse every report it ever sends", got)
@@ -174,14 +174,14 @@ func TestAnExecCountFromAnOldBootIsRefused(t *testing.T) {
 // holding a slot forever with nothing running in it.
 func TestAReorderedExecCountIsRefused(t *testing.T) {
 	h := newIdleHarness(t)
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","live":1,"seq":1}`))
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","seq":2}`))
+	h.control(`{"kind":"exec_count","live":1,"seq":1}`)
+	h.control(`{"kind":"exec_count","seq":2}`)
 	if got := liveExecsOn(h.rd, h.id); got != 0 {
 		t.Fatalf("live=%d after the command ended, want 0", got)
 	}
 
 	// The start report, overtaken on its way here, arrives late.
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","live":1,"seq":1}`))
+	h.control(`{"kind":"exec_count","live":1,"seq":1}`)
 	if got := liveExecsOn(h.rd, h.id); got != 0 {
 		t.Fatalf("a report that did not advance the sequence set live=%d, want 0", got)
 	}
@@ -190,7 +190,7 @@ func TestAReorderedExecCountIsRefused(t *testing.T) {
 	// re-delivered "none live" from pushing the idle deadline out — the same
 	// rule childExited applies to its own repeats.
 	h.clk.set(time.Hour)
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","seq":2}`))
+	h.control(`{"kind":"exec_count","seq":2}`)
 	e := h.entry(h.id)
 	if !e.lastExecEndedAt.Equal(idleEpoch) {
 		t.Fatalf("a re-delivered report moved the idle clock to %s, want it left at %s",
@@ -198,11 +198,97 @@ func TestAReorderedExecCountIsRefused(t *testing.T) {
 	}
 }
 
+// TestAReplayedStaleReportStartsTheClockOnlyOnce. A refused report is not
+// consumed by being refused: a sandbox that re-sends one, or a hub that drains
+// the same buffered frame after every redial, would deliver it again and
+// again. The repair for an end-first pair (see execCount) must therefore be
+// bounded, or the fence's own refusals become a new way to keep a session with
+// NOTHING running in it alive forever — the leak this whole feature exists to
+// end, reintroduced by its own correction.
+func TestAReplayedStaleReportStartsTheClockOnlyOnce(t *testing.T) {
+	h := newIdleHarness(t)
+	ctx := context.Background()
+	h.control(`{"kind":"child_exited","rc":0}`)
+	// A command's pair, applied end-first, which is the case the repair is for.
+	h.control(`{"kind":"exec_count","seq":2}`)
+	h.control(`{"kind":"exec_count","live":1,"seq":1}`)
+	stamped := h.entry(h.id).lastExecEndedAt
+	if stamped.IsZero() {
+		t.Fatal("the end-first pair did not start the idle clock at all")
+	}
+
+	// The same stale frame, over and over, for twelve hours.
+	for i := 1; i <= 12; i++ {
+		h.clk.set(time.Duration(i) * time.Hour)
+		h.control(`{"kind":"exec_count","live":1,"seq":1}`)
+	}
+	if got := h.entry(h.id).lastExecEndedAt; !got.Equal(stamped) {
+		t.Fatalf("twelve replays of ONE refused report moved the idle clock from %s to %s",
+			stamped, got)
+	}
+	h.clk.set(12 * time.Hour)
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 1 || stops[0] != h.id {
+		t.Fatalf("sweep stopped %v, want [%s]: a session running nothing was kept alive by "+
+			"a report the fence refused", stops, h.id)
+	}
+}
+
+// TestASandboxProcessReplacedWithoutAColdResumeIsStillHeard is the sequence
+// fence's own catastrophic direction, and the reason it is scoped to a
+// REGISTRATION rather than to the entry.
+//
+// A sandbox numbers its reports from 1, per process. The boot epoch cannot
+// separate two of those: it moves only on a cold resume, deliberately, so that
+// a child_exited in flight across a plain redial is not dropped. So a sandbox
+// process replaced without one — an operator's `docker start` on an entry the
+// hub-death tail kept as running, a container the daemon restarted underneath
+// a surviving runnerd — would start again at 1 against an execSeq of 9, every
+// report it ever sent would be refused, and the runner would cold-stop a
+// session running a detached command believing it was running nothing.
+func TestASandboxProcessReplacedWithoutAColdResumeIsStillHeard(t *testing.T) {
+	h := newIdleHarness(t)
+	ctx := context.Background()
+	// A busy first process: nine reports, ending with "nothing running".
+	for seq := 1; seq <= 9; seq++ {
+		live := seq % 2
+		h.control(fmt.Sprintf(`{"kind":"exec_count","live":%d,"seq":%d}`, live, seq))
+	}
+	h.control(`{"kind":"child_exited","rc":0}`)
+
+	// Its process is replaced. No cold resume, so the boot epoch does not
+	// move; the new sessiond dials /register and numbers from 1 again.
+	beforeBoot := h.boot[h.id]
+	h.register(h.id)
+	if h.boot[h.id] != beforeBoot {
+		t.Fatal("a plain re-registration moved the boot epoch; this test is no longer its case")
+	}
+	h.control(`{"kind":"exec_count","live":1,"seq":1}`)
+	if got := liveExecsOn(h.rd, h.id); got != 1 {
+		t.Fatalf("the replaced sandbox's first report set live=%d, want 1 — every report it "+
+			"ever sends is refused behind the previous process's sequence", got)
+	}
+
+	// Which is the difference between keeping the command and killing it.
+	h.clk.set(10 * time.Hour)
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 0 {
+		t.Fatalf("stopped %v while the sandbox was reporting a live command", stops)
+	}
+
+	// And the previous registration's frames, drained late, are refused on
+	// their own account rather than on the sequence's: the boot epoch cannot
+	// tell them apart, and the registration can.
+	h.rd.routeControl(h.id, h.boot[h.id], h.reg[h.id]-1,
+		[]byte(`{"kind":"exec_count","seq":99}`))
+	if got := liveExecsOn(h.rd, h.id); got != 1 {
+		t.Fatalf("a frame from the previous registration set live=%d, want 1", got)
+	}
+}
+
 // TestANegativeExecCountReadsAsNone: nothing sends one, and "fewer than no
 // commands" would be a count that can never fall back to zero.
 func TestANegativeExecCountReadsAsNone(t *testing.T) {
 	h := newIdleHarness(t)
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","live":-3,"seq":1}`))
+	h.control(`{"kind":"exec_count","live":-3,"seq":1}`)
 	if got := liveExecsOn(h.rd, h.id); got != 0 {
 		t.Fatalf("a negative report set live=%d, want 0", got)
 	}
@@ -218,8 +304,8 @@ func TestANegativeExecCountReadsAsNone(t *testing.T) {
 func TestACommandAcrossASweepIsNotStoppedAndThenIs(t *testing.T) {
 	h := newIdleHarness(t)
 	ctx := context.Background()
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"child_exited","rc":0}`))
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","live":1,"seq":1}`))
+	h.control(`{"kind":"child_exited","rc":0}`)
+	h.control(`{"kind":"exec_count","live":1,"seq":1}`)
 
 	for _, at := range []time.Duration{time.Hour, 6 * time.Hour, 24 * time.Hour} {
 		h.clk.set(at)
@@ -229,7 +315,7 @@ func TestACommandAcrossASweepIsNotStoppedAndThenIs(t *testing.T) {
 	}
 
 	h.clk.set(24 * time.Hour)
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","seq":2}`))
+	h.control(`{"kind":"exec_count","seq":2}`)
 	h.clk.set(24*time.Hour + 29*time.Minute)
 	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 0 {
 		t.Fatalf("stopped %v 29 minutes after the command ended", stops)
@@ -250,7 +336,7 @@ func TestACommandAcrossASweepIsNotStoppedAndThenIs(t *testing.T) {
 func TestAColdResumeClearsTheExecBookkeeping(t *testing.T) {
 	h := newIdleHarness(t)
 	ctx := context.Background()
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","live":1,"seq":5}`))
+	h.control(`{"kind":"exec_count","live":1,"seq":5}`)
 	if got := liveExecsOn(h.rd, h.id); got != 1 {
 		t.Fatalf("live=%d before the stop, want 1", got)
 	}
@@ -268,7 +354,7 @@ func TestAColdResumeClearsTheExecBookkeeping(t *testing.T) {
 			e.liveExecs, e.lastExecEndedAt)
 	}
 	// The new sessiond's FIRST report, numbered 1 as every sandbox's is.
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","live":1,"seq":1}`))
+	h.control(`{"kind":"exec_count","live":1,"seq":1}`)
 	if got := liveExecsOn(h.rd, h.id); got != 1 {
 		t.Fatalf("the restarted sandbox's first report set live=%d, want 1; "+
 			"a sequence fence left over from the previous boot refuses every one of them", got)
@@ -286,9 +372,9 @@ func TestAWarmResumeKeepsTheExecBookkeeping(t *testing.T) {
 	// The warm-suspend handshake kills every exec before the freeze, so the
 	// count the sandbox last reported is zero — stamped at the moment the last
 	// one ended.
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","live":1,"seq":1}`))
+	h.control(`{"kind":"exec_count","live":1,"seq":1}`)
 	h.clk.set(10 * time.Minute)
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","seq":2}`))
+	h.control(`{"kind":"exec_count","seq":2}`)
 	stamped := h.entry(h.id).lastExecEndedAt
 
 	if err := h.rd.Op(ctx, h.id, "suspend", true); err != nil {
@@ -302,7 +388,7 @@ func TestAWarmResumeKeepsTheExecBookkeeping(t *testing.T) {
 	}
 	// And the fence survived with it: a report numbered behind the last one is
 	// still refused.
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","live":1,"seq":1}`))
+	h.control(`{"kind":"exec_count","live":1,"seq":1}`)
 	if got := liveExecsOn(h.rd, h.id); got != 0 {
 		t.Fatalf("a stale report set live=%d across an unpause, want 0", got)
 	}
@@ -319,12 +405,12 @@ func TestAWarmResumeKeepsTheExecBookkeeping(t *testing.T) {
 func TestAShortCommandWhoseReportsArriveBackwardsStillStartsTheClock(t *testing.T) {
 	h := newIdleHarness(t)
 	ctx := context.Background()
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"child_exited","rc":0}`))
+	h.control(`{"kind":"child_exited","rc":0}`)
 
 	// A command runs at 29 minutes, and its two reports land backwards.
 	h.clk.set(29 * time.Minute)
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","seq":2}`))
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","live":1,"seq":1}`))
+	h.control(`{"kind":"exec_count","seq":2}`)
+	h.control(`{"kind":"exec_count","live":1,"seq":1}`)
 
 	h.clk.set(30 * time.Minute)
 	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 0 {
@@ -347,13 +433,12 @@ func TestAShortCommandWhoseReportsArriveBackwardsStillStartsTheClock(t *testing.
 func TestRestatingNoneLiveDoesNotPushTheDeadlineOut(t *testing.T) {
 	h := newIdleHarness(t)
 	ctx := context.Background()
-	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"child_exited","rc":0}`))
+	h.control(`{"kind":"child_exited","rc":0}`)
 
 	// A dial a minute for half an hour, each restating "nothing is running".
 	for i := 1; i <= 30; i++ {
 		h.clk.set(time.Duration(i) * time.Minute)
-		h.rd.routeControl(h.id, h.boot[h.id],
-			[]byte(fmt.Sprintf(`{"kind":"exec_count","seq":%d}`, i)))
+		h.control(fmt.Sprintf(`{"kind":"exec_count","seq":%d}`, i))
 	}
 	if e := h.entry(h.id); !e.lastExecEndedAt.IsZero() {
 		t.Fatalf("restating an already-zero count stamped the clock at %s", e.lastExecEndedAt)

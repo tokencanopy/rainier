@@ -936,6 +936,14 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	// minted: a redial is not a new boot — only a cold resume restarts the
 	// container, and that is where the epoch moves. See registry.currentBoot.
 	boot := s.reg.currentBoot(id)
+	// And a fresh REGISTRATION epoch, minted rather than read, which is the
+	// opposite of the line above and deliberately so. The boot epoch must
+	// survive a redial (a child_exited in flight across one would otherwise be
+	// dropped and never re-sent); the live-exec count must NOT, because the
+	// sandbox restates it as the first message of every connection and the
+	// process on the other end may not be the one that numbered the last
+	// report. See sessionEntry.execReg.
+	reg := s.reg.registration()
 	hub := relay.NewHubWithControl(r.Context(), relay.WSConn(c), func(payload []byte) {
 		// On its own goroutine, deliberately: this runs on the hub's read
 		// loop, the single goroutine demultiplexing every attachment
@@ -952,8 +960,10 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		// either, and every session-RPC message names the request it
 		// belongs to — both ends match on that id, never on arrival order
 		// (which is exactly why the id is on the wire). A control channel
-		// that grows ORDERED events needs a queue here instead.
-		go s.routeControl(id, boot, payload)
+		// that grows ORDERED events needs a queue here instead — and
+		// "exec_count" is one, which is why it carries a sequence number of
+		// its own and this hop stayed as it is.
+		go s.routeControl(id, boot, reg, payload)
 	})
 	if !s.reg.setHub(id, hub) {
 		// The entry vanished between our existence check above and now — a
@@ -1063,7 +1073,7 @@ func (s *Server) RemoveWorkspace(ctx context.Context, id string) error {
 // escalated: this arrives from inside a container over a conn that also
 // carries every viewer's terminal traffic, and the one thing that must not
 // happen is a malformed frame taking the session down with it.
-func (s *Server) routeControl(id string, boot uint64, payload []byte) {
+func (s *Server) routeControl(id string, boot, reg uint64, payload []byte) {
 	var ev relay.ControlEvent
 	if err := json.Unmarshal(payload, &ev); err != nil {
 		log.Printf("session %s: undecodable control payload (%d bytes): %v", id, len(payload), err)
@@ -1151,7 +1161,7 @@ func (s *Server) routeControl(id string, boot uint64, payload []byte) {
 		// per transition would be the noisiest thing in a runner's log and
 		// would say nothing an operator can act on; the capacity counts are
 		// where this becomes visible.
-		s.reg.execCount(id, boot, ev.Live, ev.Seq, s.now())
+		s.reg.execCount(id, boot, reg, ev.Live, ev.Seq, s.now())
 	case "resp":
 		// The sandbox's answer to a request controld sent down. Forwarded
 		// verbatim, id included: an id assigned by one end and echoed by the

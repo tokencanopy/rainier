@@ -122,13 +122,45 @@ type sessionEntry struct {
 	// what lastDetachAt is to a viewer: the idle clock starts when the LAST
 	// exec ends, not when the agent's child exited an hour earlier.
 	lastExecEndedAt time.Time
-	// execSeq is the highest sequence number this entry has applied. The
-	// sandbox assigns them under the lock that changes its own count and
-	// reports outside it, so two reports can arrive in the wrong order; a
+	// execSeq is the highest sequence number this entry has applied WITHIN
+	// execReg. The sandbox assigns them under the lock that changes its own
+	// count and reports outside it — and runnerd routes each control frame on
+	// a goroutine of its own — so two reports can arrive in the wrong order; a
 	// report that does not advance this is refused rather than believed.
 	// Without it a "one live" landing after a "none live" would pin the
 	// session out of auto-stop for the life of the runner.
 	execSeq uint64
+	// execStampedSeq is the execSeq this entry last started the idle clock
+	// from on a REFUSED report; see execCount. It bounds that repair at one
+	// stamp per applied report, so a replayed stale frame cannot keep a
+	// finished session alive forever.
+	execStampedSeq uint64
+	// execReg is the /register epoch the reports this entry is applying came
+	// in on, and it is what makes execSeq safe to keep at all.
+	//
+	// A sandbox numbers its reports from 1, per PROCESS. The boot epoch cannot
+	// separate two of those, because it deliberately moves only on a cold
+	// resume — a plain redial reads it, so that a child_exited in flight
+	// across the redial is not dropped. So a sandbox process that is replaced
+	// WITHOUT a cold resume (an operator's `docker start` on an entry the
+	// hub-death tail kept as running, a container the daemon restarted
+	// underneath a surviving runnerd) would start again at 1 against an
+	// execSeq of 9 — and every report it ever sent would be refused, leaving
+	// the runner believing a session running a detached command is running
+	// nothing, and cold-stopping it. The catastrophic direction, reached by
+	// the fence that exists to prevent a lesser version of it.
+	//
+	// A registration epoch is the right scope because a report is only ever
+	// about the connection in hand: sessiond restates its count as the FIRST
+	// message of every connection, so a new conn needs nothing carried over
+	// from the old one. A higher epoch therefore ADOPTS (and resets execSeq),
+	// a lower one is refused — which also closes the case the boot epoch could
+	// not: a frame from the previous registration, drained late by a hub read
+	// loop that had been stalled on a wedged viewer.
+	//
+	// Minted by /register, never by the sandbox, so nothing about it is on the
+	// wire. Zero is "no report has arrived yet", which every epoch exceeds.
+	execReg uint64
 	// bootFailed records that this session's boot chain failed (setup, clone
 	// or init). Such a session is deliberately never idle-stopped: the whole
 	// reason the CLI lets you attach to a failed session is to read the log
@@ -191,9 +223,25 @@ type registry struct {
 	// this counter is registry-wide to prevent. Zero is now reserved for "no
 	// such session", which is what currentBoot returns for one.
 	nextBoot uint64
+	// nextReg mints sessionEntry.execReg values: one per /register, across the
+	// whole registry, so that two connections for one session — or for a
+	// session id that was deleted and recreated — can never share an epoch.
+	nextReg uint64
 }
 
 func newRegistry() *registry { return &registry{items: map[string]*sessionEntry{}} }
+
+// registration opens a fresh /register epoch. It is minted rather than read —
+// the opposite of currentBoot — because a redial genuinely IS a new stream of
+// exec counts: the sandbox restates its count as the connection's first
+// message, so nothing has to survive the gap, and the process on the other end
+// may not even be the same one. See sessionEntry.execReg.
+func (r *registry) registration() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.nextReg++
+	return r.nextReg
+}
 
 func (r *registry) put(id string, e *sessionEntry) {
 	r.mu.Lock()
@@ -574,12 +622,21 @@ func (r *registry) childExited(id string, boot uint64, at time.Time) {
 // keeps the restatement sessiond sends on every connection from pushing the
 // deadline out: a sandbox whose conn flaps once a minute would otherwise never
 // be auto-stopped at all.
-func (r *registry) execCount(id string, boot uint64, live int, seq uint64, at time.Time) {
+func (r *registry) execCount(id string, boot, reg uint64, live int, seq uint64, at time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.items[id]
-	if !ok || e.boot != boot {
+	if !ok || e.boot != boot || reg < e.execReg {
 		return
+	}
+	if reg > e.execReg {
+		// A newer connection, so a possibly newer sandbox PROCESS, numbering
+		// its reports from 1 again. Its stream starts here and owes the
+		// previous one nothing: the first message of every connection is a
+		// restatement of the current count. See sessionEntry.execReg.
+		e.execReg = reg
+		e.execSeq = 0
+		e.execStampedSeq = 0
 	}
 	if seq <= e.execSeq {
 		// Overtaken on its way here. runnerd routes every control frame on a
@@ -595,7 +652,17 @@ func (r *registry) execCount(id string, boot uint64, live int, seq uint64, at ti
 		// every other decision on this path takes. Only when the entry
 		// believes nothing is running: while a command is live the ordinary
 		// path will stamp the clock when the last one ends.
-		if live > 0 && e.liveExecs == 0 {
+		//
+		// ONCE per applied report, which is the difference between a repair
+		// and a new way to pin a session open. A frame is not consumed by
+		// being refused — a sandbox re-sending one, or a hub draining the same
+		// buffered frame after each redial, would otherwise push the deadline
+		// out every time it arrived, and a session with nothing running in it
+		// would never be auto-stopped again. execStampedSeq records the
+		// applied sequence this entry has already stamped for; a genuinely new
+		// reorder arrives after execSeq has moved, a replay does not.
+		if live > 0 && e.liveExecs == 0 && e.execStampedSeq != e.execSeq {
+			e.execStampedSeq = e.execSeq
 			e.lastExecEndedAt = at
 		}
 		return
@@ -905,6 +972,11 @@ func (r *registry) resumed(id string, restarted bool) {
 	e.liveExecs = 0
 	e.lastExecEndedAt = time.Time{}
 	e.execSeq = 0
+	e.execStampedSeq = 0
+	// execReg is registry-wide and monotonic, so the registration the restarted
+	// sandbox is about to make exceeds whatever is here; it is cleared for the
+	// same reason as the rest, not because anything depends on it.
+	e.execReg = 0
 	// A restart this runner made is a process tree it watched start, so a
 	// recovered session stops being one the moment it is cold-resumed: its
 	// child is running, and `active` can say so.
