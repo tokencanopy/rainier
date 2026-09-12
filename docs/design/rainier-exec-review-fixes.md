@@ -253,7 +253,7 @@ obvious:
 | 1 | The subprocess target sleeps rather than parking every goroutine, and a new `grandchild` case (`sh -c 'sleep 300 & sleep 300'`) gives the **minus sign** a witness: signalling the leader alone leaves the grandchild alive, which the test polls `rec.calls()` for. |
 | 2 | `TestAgentAnnouncesItsCapabilities` gains the 32-capability boundary case. |
 | 3 | Through the real path: a sessiond fixture receives the suspend frame and answers both times with the right nonce; runnerd's tests pin the ORDER against the driver, that an ack alone does not release the pause, that an old sandbox pays only the short budget, that a stale answer cannot release the next suspend, and that a dead conn or a cancelled dispatch ends the wait at once. e2e drives the real stop route. |
-| 4 | An fd census across 50 exec cycles, which is what makes a one-socket-per-command leak visible at all. |
+| 4 | `internal/e2e`'s `TestExecLeaksNoDescriptorsOrGoroutines`: fifty cycles of each shape that ends an exec differently — the sandbox closing it, and the CALLER hanging up, which is the exit that leaked. Reverting the line reports **+50 descriptors**; with it, +0. A unit test with a fake catches the missing call; only a census catches "and it really is fd-for-fd clean end to end". |
 | 5 | One assertion per surviving mutant: the `--json` stream swap, the `KillAll` wiring, the detached slot release, and `ExecClientStream`'s budget. |
 | 7 | Linux-only, executed here: an eviction with a waiter parked on the evicted pid, and a stale unclaimed record a later mark must ignore. |
 | 8 | A wedged exec frame with a viewer and a `ControlSender` behind it, asserting both get out. |
@@ -264,5 +264,8 @@ obvious:
 | 20 | The import guard itself. |
 
 Gates: `make verify`, repotest on both adapters with zero skips,
-`go test ./internal/e2e/ -race`, the exec packages at `-race -count=10`, and a
-goroutine-and-fd census across 50 exec cycles.
+`go test ./internal/e2e/ -race`, the exec packages at `-race -count=10`, and
+`GOOS=darwin go vet ./...` — because the reap tests reach into
+`reap_linux.go`'s own table and belong in a linux-tagged file, which is the
+kind of break a Linux-only gate cannot see. The census is no longer a gate
+somebody has to remember to run; it is a test.

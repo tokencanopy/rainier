@@ -137,7 +137,7 @@ const defaultExecWriteBase = 20 * time.Second
 // exec route uses it instead of ClientStream; everything else about the
 // stream is identical.
 func ExecClientStream(c *websocket.Conn) control.TerminalStream {
-	return clientStream(c, defaultExecWriteBase, defaultClientWriteRate)
+	return clientStream(c, defaultExecWriteBase, defaultClientWriteRate, true)
 }
 
 // ClientStream wraps an accepted client websocket as the control.TerminalStream
@@ -149,7 +149,7 @@ func ExecClientStream(c *websocket.Conn) control.TerminalStream {
 // The caller keeps the socket's own lifetime — a handler that accepted it
 // still defers its CloseNow — and hands the reason it ends with to Close.
 func ClientStream(c *websocket.Conn) control.TerminalStream {
-	return clientStream(c, defaultClientWriteBase, defaultClientWriteRate)
+	return clientStream(c, defaultClientWriteBase, defaultClientWriteRate, false)
 }
 
 // clientStream is the same over a write budget the caller picks, which is how
@@ -157,9 +157,9 @@ func ClientStream(c *websocket.Conn) control.TerminalStream {
 // two knobs are FIELDS rather than package variables: nothing in the package
 // takes t.Parallel() today, and a package variable three tests write is a
 // race waiting for the first one that does.
-func clientStream(c *websocket.Conn, base time.Duration, rate int) wsTerminalStream {
+func clientStream(c *websocket.Conn, base time.Duration, rate int, exec bool) wsTerminalStream {
 	c.SetReadLimit(attachReadLimit)
-	return wsTerminalStream{c: c, once: &sync.Once{}, base: base, rate: rate}
+	return wsTerminalStream{c: c, once: &sync.Once{}, base: base, rate: rate, exec: exec}
 }
 
 // wsTerminalStream is the typed adapter between the client's websocket and
@@ -178,6 +178,11 @@ type wsTerminalStream struct {
 	// base and rate are this stream's write budget; see budget and Send.
 	base time.Duration
 	rate int
+	// exec is whether this is an EXEC caller's socket. It decides two things:
+	// the write budget above, and that Close tags the error it is given as an
+	// exec's — because attachCloseReason is shared with the terminal attach's
+	// close, and the exec rows must not change what the same error means there.
+	exec bool
 }
 
 // budget is how long ONE message carrying payload bytes of terminal data may
@@ -275,6 +280,15 @@ func (s wsTerminalStream) Send(ctx context.Context, m terminal.ServerMessage) er
 // is the remedy, and the reason says which dependency to blame without
 // quoting anybody.
 func (s wsTerminalStream) Close(err error) error {
+	if s.exec {
+		// Tagged HERE rather than at the route, so a host cannot forget. The
+		// mapping below is shared with the terminal attach's, and an untagged
+		// service error would fall through to its default — "runner
+		// unreachable" — for what is really a policy refusal or an unsupported
+		// server. ExecFailure is idempotent, so a route that tags it too is no
+		// worse off.
+		err = ExecFailure(err)
+	}
 	code, reason := attachCloseReason(err)
 	s.once.Do(func() { closeAttach(s.c, code, reason) })
 	return nil

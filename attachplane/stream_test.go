@@ -51,7 +51,7 @@ func clientPair(t *testing.T, drain <-chan struct{}, base time.Duration, rate in
 		}
 	}()
 	c := <-accepted
-	return clientStream(c, base, rate), c
+	return clientStream(c, base, rate, false), c
 }
 
 // TestACourtesyNoticeNeverClosesAHealthyClient is the other side of the write
@@ -303,5 +303,48 @@ func TestExecClientStreamIsOnTheExecBudget(t *testing.T) {
 	if es.rate != as.rate {
 		t.Fatalf("the per-byte rate differs (%d vs %d); only the BASE is shorter, so a "+
 			"caller making steady progress on a large frame is unaffected", es.rate, as.rate)
+	}
+}
+
+// TestAnExecStreamTagsItsOwnCloses is the guard for the seam a host can
+// forget. attachCloseReason is shared with the terminal attach's close, so the
+// exec rows are scoped by a tag — and a route that handed the service's error
+// through untagged got the DEFAULT arm, "runner unreachable" (1013), for what
+// is really a policy refusal. The stream tags it, so forgetting is not
+// possible.
+func TestAnExecStreamTagsItsOwnCloses(t *testing.T) {
+	drain := make(chan struct{})
+	defer close(drain)
+	_, conn := clientPair(t, drain, defaultClientWriteBase, defaultClientWriteRate)
+
+	es, ok := ExecClientStream(conn).(wsTerminalStream)
+	if !ok {
+		t.Fatal("ExecClientStream did not return this package's own stream")
+	}
+	if !es.exec {
+		t.Fatal("an exec stream is not marked as one, so its Close cannot scope the " +
+			"close codes it shares with a terminal attach")
+	}
+	as, ok := ClientStream(conn).(wsTerminalStream)
+	if !ok {
+		t.Fatal("ClientStream did not return this package's own stream")
+	}
+	if as.exec {
+		t.Fatal("a terminal attach stream is marked as an exec's; its closes would " +
+			"move to the exec codes")
+	}
+
+	// And the mapping an exec stream's Close actually reaches, for the two
+	// errors that differ. Untagged, both fall through to "runner unreachable".
+	for _, err := range []error{control.ErrInvalid, control.ErrUnsupported} {
+		code, _ := attachCloseReason(ExecFailure(err))
+		if code != websocket.StatusPolicyViolation {
+			t.Fatalf("an exec's %v closes %v, want a policy violation", err, code)
+		}
+		plain, _ := attachCloseReason(err)
+		if plain != websocket.StatusTryAgainLater {
+			t.Fatalf("a bare %v on an ATTACH closes %v, want the unchanged "+
+				"try-again-later", err, plain)
+		}
 	}
 }

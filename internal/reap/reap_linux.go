@@ -59,10 +59,18 @@ type record struct {
 // normally already waiting when its child exits, so an entry that has sat
 // through a thousand later exits is one nobody is coming for. A dropped entry
 // that somebody IS waiting for leaves a TOMBSTONE, so that waiter is told "no
-// status here" and falls back to its own cmd.Wait rather than parking
-// forever; the bound is still far above any real concurrency — the cap is
-// eight execs plus the agent — so the tombstone is the safety net and not the
-// mechanism.
+// status here" and falls back to its own cmd.Wait rather than parking forever;
+// the bound is still far above any real concurrency — the cap is eight execs
+// plus the agent — so the tombstone is the safety net and not the mechanism.
+//
+// The tombstone table is bounded by the same constant, so the guarantee is
+// precise rather than absolute: a waiter parks forever only if its child's
+// TOMBSTONE is itself evicted, which takes another maxUnclaimed reaps between
+// the child exiting and the waiter looking. In practice the waiter is already
+// parked before the child exits and is woken by record's own Broadcast, so it
+// finds the entry or the tombstone on the first pass. A pid that is never
+// reaped at all still parks, and always did — that is a caller waiting on
+// something that is not its child.
 const maxUnclaimed = 4096
 
 // Start installs the SIGCHLD reaper. Safe to call once. After Start, AwaitExit
@@ -187,7 +195,10 @@ func statusOf(ws syscall.WaitStatus) Status {
 // cheapest way to say so.
 //
 // Zero is a legal mark and means "anything": it is what a caller that cannot
-// take one passes, and it restores the old behaviour exactly.
+// take one passes, and it restores the old behaviour exactly. The counter is a
+// uint64 incremented once per reaped child, so a wraparound — after which a
+// mark would be larger than every later sequence — is 1.8e19 reaps away, which
+// is several hundred thousand years at a million a second.
 func Mark() uint64 {
 	mu.Lock()
 	defer mu.Unlock()
@@ -222,9 +233,12 @@ func AwaitStatus(pid int, since uint64) (Status, bool) {
 			// for the outcome this caller is actually waiting for.
 			continue
 		}
-		if seq, ok := tombs[pid]; ok {
+		if tombSeq, ok := tombs[pid]; ok {
+			// Named tombSeq, not seq: the package-level counter is called that,
+			// and shadowing it inside the function that is ABOUT the sequence
+			// is a rename waiting to bite.
 			forgetTomb(pid)
-			if seq > since {
+			if tombSeq > since {
 				// This child's outcome existed and was evicted. Saying so is
 				// what lets cmd.Wait take over instead of this parking
 				// forever — which held one of the eight exec slots for the

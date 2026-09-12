@@ -341,14 +341,6 @@ func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, e
 	}
 }
 
-// execQuiesceBudget bounds how long the sandbox waits for its execs to be
-// GONE before acknowledging a suspend.
-//
-// It is longer than sandboxexec's own kill grace on purpose: that grace is
-// what separates the SIGTERM from the SIGKILL, and acknowledging in between
-// would freeze the container with the escalation still on a timer that the
-// freezer cgroup then stops. Every session that is running no exec at all —
-// which is nearly every stop — acknowledges immediately and pays none of it.
 // onShutdownSignal is what a SIGTERM means to this sessiond, on its own so
 // that what it does is checkable rather than only readable.
 //
