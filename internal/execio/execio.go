@@ -462,7 +462,7 @@ func ExitCodeFor(r Result) (code int, ok bool) {
 		terminal.ReasonEnvRefused, terminal.ReasonLogRefused:
 		return ExitNotExecutable, true
 	case terminal.ReasonUnsupported, terminal.ReasonTooManyExecs,
-		terminal.ReasonTooManyDetached,
+		terminal.ReasonTooManyDetached, terminal.ReasonSessionEnding,
 		terminal.ReasonNoAnswer, terminal.ReasonStdinOverrun:
 		// None of these is the command failing: a sandbox that cannot run
 		// commands at all, one that did not answer in time, a session already

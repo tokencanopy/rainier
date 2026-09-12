@@ -237,6 +237,11 @@ const (
 //	                   caller to make a new session, and saying it about a
 //	                   sandbox that was merely slow would be a false and
 //	                   actionable statement
+//	ReasonSessionEnding the session is on its way out — suspended, stopped or
+//	                   destroyed — and is no longer accepting commands. It is
+//	                   its own word because the remedy is a `rainier resume`
+//	                   or a new session rather than a retry, and because a
+//	                   command refused here never ran at all
 //	ReasonStdinOverrun the caller sent more input than the sandbox may hold
 //	                   for a command that is not reading it. It is the one
 //	                   reason that can arrive AFTER exec_started, because it
@@ -253,6 +258,7 @@ const (
 	ReasonStdinOverrun  = "stdin_overrun"
 
 	ReasonTooManyDetached = "too_many_detached"
+	ReasonSessionEnding   = "session_ending"
 )
 
 // ExecReasons is that closed vocabulary, as a value.
@@ -269,7 +275,7 @@ func ExecReasons() []string {
 	return []string{
 		ReasonUnsupported, ReasonNotFound, ReasonNotExecutable,
 		ReasonCwdRefused, ReasonEnvRefused, ReasonLogRefused,
-		ReasonTooManyExecs, ReasonTooManyDetached,
+		ReasonTooManyExecs, ReasonTooManyDetached, ReasonSessionEnding,
 		ReasonNoAnswer, ReasonStdinOverrun,
 	}
 }

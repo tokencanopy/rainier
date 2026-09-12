@@ -177,6 +177,7 @@ func TestExecReasonsAreClosedBothWays(t *testing.T) {
 		"log_refused":       true,
 		"too_many_execs":    true,
 		"too_many_detached": true,
+		"session_ending":    true,
 		"no_answer":         true,
 		"stdin_overrun":     true,
 	}

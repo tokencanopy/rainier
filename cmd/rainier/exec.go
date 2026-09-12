@@ -311,6 +311,9 @@ func execRefusal(res execio.Result) error {
 		return errors.New("this session is already running as many DETACHED commands " +
 			"as it may; stop one with rainier exec <session> -- kill <pid>, or run " +
 			"this command without --detach")
+	case terminal.ReasonSessionEnding:
+		return errors.New("this session is being stopped or deleted and is no longer " +
+			"accepting commands; the command never ran")
 	case terminal.ReasonNoAnswer:
 		return errors.New("the session's sandbox did not answer in time; try again")
 	case terminal.ReasonStdinOverrun:

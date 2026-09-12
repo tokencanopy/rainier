@@ -41,6 +41,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -206,6 +207,14 @@ type Runner struct {
 
 	mu   sync.Mutex
 	live map[*attachment]struct{}
+	// quiescing is set once this session is on its way out and never cleared.
+	// KillAll sweeps what is live at the instant it runs; without a latch, an
+	// exec opened during the sweep — the relay conn is still up and still
+	// accepting FrameOpens for the whole of it — is never signalled at all,
+	// and on a warm suspend it is then FROZEN alive and resumes hours later.
+	// That is precisely the lifetime rule the suspend path exists to make
+	// true, so the door closes before the sweep rather than after it.
+	quiescing bool
 }
 
 var _ relay.Execer = (*Runner)(nil)
@@ -355,6 +364,7 @@ func (a *attachment) guard(what string) {
 // bound on a detached exec's life: it outlives its caller, never its session.
 func (r *Runner) KillAll() {
 	r.mu.Lock()
+	r.quiescing = true
 	all := make([]*attachment, 0, len(r.live))
 	for a := range r.live {
 		all = append(all, a)
@@ -384,6 +394,11 @@ func (r *Runner) KillAll() {
 func (r *Runner) KillAllAndWait(budget time.Duration) int {
 	r.KillAll()
 	deadline := time.Now().Add(budget)
+	// One sweep is enough, and that is a property of the latch rather than an
+	// assumption. `quiescing` is set and `live` is snapshotted under ONE hold
+	// of the lock reserve also takes, so a reserve either got in before the
+	// sweep (and is in the snapshot) or finds the latch closed and is refused.
+	// There is no third case for a second sweep to catch.
 	for r.LiveCount() > 0 && time.Now().Before(deadline) {
 		time.Sleep(killPollInterval)
 	}
@@ -416,6 +431,12 @@ const killPollInterval = 20 * time.Millisecond
 func (r *Runner) reserve(a *attachment, detached bool) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.quiescing {
+		// This session is ending. Refused rather than spawned into a sandbox
+		// that is about to be frozen or torn down, where the process would
+		// outlive the rule that says it cannot.
+		return terminal.ReasonSessionEnding
+	}
 	if len(r.live) >= r.max {
 		return terminal.ReasonTooManyExecs
 	}
@@ -888,9 +909,10 @@ type attachment struct {
 	// messages after an overrun measured two thousand SIGTERMs to the same
 	// process group and two thousand live timers.
 	killOnce sync.Once
-	// endOnce is the same rule for the reason that precedes the kill: a
-	// caller learns WHY once, not once per message it had already sent.
-	endOnce sync.Once
+	// ending is the same rule for the reason that precedes the kill: a caller
+	// learns WHY once, not once per message it had already sent. It gates the
+	// goroutine too, so an overrun costs one rather than one per message.
+	ending atomic.Bool
 
 	// out guards the OUTBOX against the one race that can crash a sandbox:
 	// closing msgs while a sender is mid-send is a "send on closed channel"
@@ -912,8 +934,13 @@ type attachment struct {
 	mu       sync.Mutex
 	proc     Proc
 	detached bool
-	queued   int  // bytes of stdin waiting
-	stdinEOF bool // the caller said it was done; pumpStdin has gone
+	queued   int // bytes of stdin waiting
+	// stdinDone means the pump has returned and nothing drains a.stdin any
+	// more. The caller's EOF is the ordinary way there, and it is NOT the only
+	// way: the pump also returns when the child closed its own stdin (`head
+	// -1`) and when the attachment is closing, and stdin arriving after either
+	// of those accumulates just the same. Set wherever the pump ends.
+	stdinDone bool
 }
 
 func (a *attachment) setDetached(v bool) {
@@ -955,16 +982,27 @@ func (a *attachment) Msgs() <-chan terminal.ServerMessage { return a.msgs }
 // what keeps "a detached exec dies with its session" true even for one
 // started in the same instant the session was stopped.
 func (a *attachment) arm(p Proc, detached bool) bool {
+	// Installing the process and checking `closing` happen under ONE hold of
+	// the lock, and kill() closes `closing` under the same lock before it
+	// reads a.proc. Without that pairing there is an interleaving in which
+	// nothing ever signals the child: kill reads a nil a.proc and releases,
+	// arm installs it and finds `closing` still open, and only then does kill
+	// close it. The process is armed, the attachment is closing, and no path
+	// reaches the process again — it runs until the container does. That was
+	// true before this package grew a suspend path; what changed is the
+	// consequence, because a warm suspend FREEZES the escapee rather than
+	// taking its container away.
 	a.mu.Lock()
 	a.proc = p
 	a.detached = detached
-	a.mu.Unlock()
 	select {
 	case <-a.closing:
+		a.mu.Unlock()
 		a.endProcess(p)
 		return false
 	default:
 	}
+	a.mu.Unlock()
 	if !detached {
 		go a.pumpStdin()
 	}
@@ -1124,18 +1162,18 @@ func signalNamed(name string) (syscall.Signal, bool) {
 // rather than dropping bytes.
 func (a *attachment) offerStdin(in stdinPiece) {
 	a.mu.Lock()
-	if a.stdinEOF {
-		// The caller already said it was done, so pumpStdin has returned and
-		// NOTHING drains this queue any more. Anything arriving now would
-		// accumulate until it crossed the bound and then end a command that
-		// may well have finished — reported as stdin_overrun, which would be
-		// a refusal for input the child was never going to read. A closed
-		// pipe drops what is written to it, and so does this.
+	if a.stdinDone {
+		// The pump has gone, so NOTHING drains this queue any more. Anything
+		// arriving now would accumulate until it crossed the bound and then
+		// end a command that may well have finished — reported as
+		// stdin_overrun, which would be a refusal for input the child was
+		// never going to read. A closed pipe drops what is written to it, and
+		// so does this.
 		a.mu.Unlock()
 		return
 	}
 	if in.eof {
-		a.stdinEOF = true
+		a.stdinDone = true
 	}
 	over := a.queued > 0 && a.queued+len(in.data) > stdinQueueBytes
 	if !over {
@@ -1143,7 +1181,7 @@ func (a *attachment) offerStdin(in stdinPiece) {
 	}
 	a.mu.Unlock()
 	if over {
-		go a.endWith(terminal.ReasonStdinOverrun)
+		a.endWith(terminal.ReasonStdinOverrun)
 		return
 	}
 	select {
@@ -1159,7 +1197,7 @@ func (a *attachment) offerStdin(in stdinPiece) {
 		a.mu.Lock()
 		a.queued -= len(in.data)
 		a.mu.Unlock()
-		go a.endWith(terminal.ReasonStdinOverrun)
+		a.endWith(terminal.ReasonStdinOverrun)
 	}
 }
 
@@ -1169,10 +1207,19 @@ func (a *attachment) offerStdin(in stdinPiece) {
 // something Rainier did on purpose — which would be a misattribution, and the
 // kind a script cannot act on.
 func (a *attachment) endWith(reason string) {
-	a.endOnce.Do(func() {
+	// The GOROUTINE is inside the gate, not outside it. offerStdin reaches
+	// here once per over-bound message and must never block, so the work runs
+	// on its own goroutine — but spawning one per message meant two thousand
+	// goroutines for one fact, each racing to emit the same sentence and to
+	// arm the same five-second kill timer. The first caller owns the ending;
+	// the rest return without allocating anything.
+	if !a.ending.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
 		_ = a.emit(terminal.ServerMessage{Type: terminal.TypeExecError, Reason: reason})
 		a.kill()
-	})
+	}()
 }
 
 // pumpStdin is the one goroutine that writes the child's stdin. A write that
@@ -1180,6 +1227,13 @@ func (a *attachment) endWith(reason string) {
 // (`head -1`) is a perfectly ordinary thing for a caller to be piping into,
 // and its exit status is still the answer.
 func (a *attachment) pumpStdin() {
+	// However this pump ends, nothing drains the queue afterwards — so the
+	// door has to close on the way out, not only on the caller's EOF.
+	defer func() {
+		a.mu.Lock()
+		a.stdinDone = true
+		a.mu.Unlock()
+	}()
 	for {
 		select {
 		case in := <-a.stdin:
@@ -1225,10 +1279,13 @@ func (a *attachment) Close() {
 // death, an explicit close, a stalled stdin, and the session's own shutdown
 // can all reach it.
 func (a *attachment) kill() {
+	// `closing` is closed and a.proc is read under one hold, which is what
+	// pairs with arm: either this sees the process (and ends it) or arm sees
+	// the closed channel (and ends it), and never neither. See arm.
 	a.mu.Lock()
+	a.closeOnce.Do(func() { close(a.closing) })
 	p := a.proc
 	a.mu.Unlock()
-	a.closeOnce.Do(func() { close(a.closing) })
 	if p == nil {
 		// Nothing has been spawned (yet). Ending the attachment is the whole
 		// of what there is to do; a spawn still in flight finds `closing`

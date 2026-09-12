@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -13,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tokencanopy/rainier/internal/reap"
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/protocol/runner"
 	"github.com/tokencanopy/rainier/protocol/terminal"
@@ -34,6 +37,12 @@ type fakeProc struct {
 	stdinClosed bool
 	sizes       [][2]int
 	signals     []syscall.Signal
+	ignoring    bool
+	// signalled closes on the first signal, so a test can WAIT for one rather
+	// than poll for it — which matters when the test does it a hundred
+	// thousand times.
+	signalled  chan struct{}
+	signalOnce sync.Once
 
 	onStdout func([]byte) error
 	onStderr func([]byte) error
@@ -88,13 +97,27 @@ func (p *fakeProc) Resize(cols, rows int) error {
 func (p *fakeProc) Signal(sig syscall.Signal) error {
 	p.mu.Lock()
 	p.signals = append(p.signals, sig)
+	ignore := p.ignoring
+	ch := p.signalled
 	p.mu.Unlock()
+	if ch != nil {
+		p.signalOnce.Do(func() { close(ch) })
+	}
 	// A real SIGKILL to a process group ends the process; the fake honours
 	// that so the runner's grace-then-kill path terminates in a test.
-	if sig == syscall.SIGKILL || sig == syscall.SIGTERM {
+	if !ignore && (sig == syscall.SIGKILL || sig == syscall.SIGTERM) {
 		p.exit(Status{Signal: signalWireName(sig)})
 	}
 	return nil
+}
+
+// ignoreSignals makes this process record a signal without dying of it, which
+// is what lets a test COUNT the callers that reached kill() rather than having
+// the first one end the race for the rest.
+func (p *fakeProc) ignoreSignals() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ignoring = true
 }
 
 func (p *fakeProc) Wait() Status { <-p.done; return p.status }
@@ -1767,4 +1790,451 @@ func TestAPanicInThePlumbingCostsOneExecAndNotTheSession(t *testing.T) {
 	}
 	p.exit(Status{})
 	drainAttachment(t, b)
+}
+
+// ---------------------------------------------------------------------------
+// ending a session, and the races around it
+// ---------------------------------------------------------------------------
+
+// TestAnExecOpenedDuringTheQuiesceIsRefused. KillAll sweeps what is live at
+// the instant it runs, and the relay conn stays up for the whole of the
+// suspend's budget — so an exec arriving mid-sweep was spawned, never
+// signalled, and then FROZEN alive by `docker pause`, resuming hours later.
+// That is exactly the lifetime rule the suspend path exists to establish.
+func TestAnExecOpenedDuringTheQuiesceIsRefused(t *testing.T) {
+	start := newFakeStarter()
+	r, _ := testRunner(t, start.start)
+	r.grace = 200 * time.Millisecond
+	spec := withTool(t, r, "tool")
+
+	// One exec that will not die politely, so the quiesce really is in
+	// progress when the second one arrives.
+	first := r.OpenExec(spec)
+	p := start.await(t)
+	if m := <-first.Msgs(); m.Type != terminal.TypeExecStarted {
+		t.Fatalf("first message = %q", m.Type)
+	}
+
+	done := make(chan int, 1)
+	go func() { done <- r.KillAllAndWait(5 * time.Second) }()
+	time.Sleep(50 * time.Millisecond) // the sweep is under way
+
+	late := drainAttachment(t, r.OpenExec(spec))
+	if len(late) != 1 || late[0].Reason != terminal.ReasonSessionEnding {
+		t.Fatalf("an exec opened while the session was ending got %+v, want one "+
+			"exec_error %s — it would have been frozen alive", late, terminal.ReasonSessionEnding)
+	}
+	start.mu.Lock()
+	spawned := len(start.procs)
+	start.mu.Unlock()
+	if spawned != 1 {
+		t.Fatalf("%d processes were spawned; the late one must never reach a fork", spawned)
+	}
+
+	p.exit(Status{Signal: "TERM"})
+	if left := <-done; left != 0 {
+		t.Fatalf("%d exec(s) were still live when the quiesce gave up", left)
+	}
+	drainAttachment(t, first)
+}
+
+// TestASpawnInFlightWhenTheSessionEndsIsStillKilled is the other side of the
+// latch, and the reason one sweep is enough. A spawn that took its slot before
+// the latch closed is in the sweep's snapshot — `quiescing` is set and `live`
+// is read under the one hold of the lock `reserve` also takes — so the kill
+// finds an attachment with no process yet, and `arm` ends the process when the
+// starter finally returns.
+func TestASpawnInFlightWhenTheSessionEndsIsStillKilled(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	spawned := make(chan *fakeProc, 1)
+	slow := func(req Request, onStdout, onStderr func([]byte) error) (Proc, error) {
+		once.Do(func() { <-release })
+		p := &fakeProc{pid: 4242, done: make(chan struct{})}
+		spawned <- p
+		return p, nil
+	}
+	r, _ := testRunner(t, slow)
+	r.grace = 100 * time.Millisecond
+	spec := withTool(t, r, "tool")
+
+	a := r.OpenExec(spec)
+	// It has taken its slot and is parked inside the starter.
+	deadline := time.Now().Add(5 * time.Second)
+	for r.LiveCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the exec never took its slot")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	done := make(chan int, 1)
+	go func() { done <- r.KillAllAndWait(5 * time.Second) }()
+	time.Sleep(50 * time.Millisecond)
+	close(release) // the spawn completes into a session that is already ending
+
+	var p *fakeProc
+	select {
+	case p = <-spawned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the spawn never completed")
+	}
+	if left := <-done; left != 0 {
+		t.Fatalf("%d exec(s) survived; a spawn in flight when the session ended must "+
+			"still be reaped", left)
+	}
+	if len(p.sentSignals()) == 0 {
+		t.Fatal("the process that finished spawning into an ending session was never " +
+			"signalled; on a warm suspend it would be frozen alive")
+	}
+	drainAttachment(t, a)
+}
+
+// TestKillFromTwoCallersAtOnceSignalsOnce is killOnce's own witness.
+//
+// The overrun flood drives thousands of messages through ONE path, so the
+// `ending` gate collapses them before kill() is reached and killOnce is never
+// exercised by more than one caller — both gates could be deleted one at a
+// time with the suite green. This reaches kill() from the four callers that
+// genuinely race in production: the caller's Close, the conn's death, the
+// session's KillAll, and a stalled stdin.
+func TestKillFromTwoCallersAtOnceSignalsOnce(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		start := newFakeStarter()
+		r, _ := testRunner(t, start.start)
+		r.grace = time.Hour // the escalation must not be what ends the process
+		spec := withTool(t, r, "tool")
+
+		a := r.OpenExec(spec)
+		p := start.await(t)
+		if m := <-a.Msgs(); m.Type != terminal.TypeExecStarted {
+			t.Fatalf("first message = %q", m.Type)
+		}
+		// A process that ignores the signal, so every caller's kill is
+		// recorded rather than the first one ending the race.
+		p.ignoreSignals()
+
+		var wg sync.WaitGroup
+		for _, kill := range []func(){a.Close, r.KillAll, a.Close, r.KillAll} {
+			wg.Add(1)
+			go func(fn func()) { defer wg.Done(); fn() }(kill)
+		}
+		wg.Wait()
+
+		// Give every racer's goroutine a chance to have signalled.
+		deadline := time.Now().Add(2 * time.Second)
+		for len(p.sentSignals()) == 0 && time.Now().Before(deadline) {
+			time.Sleep(2 * time.Millisecond)
+		}
+		time.Sleep(20 * time.Millisecond)
+		if n := len(p.sentSignals()); n != 1 {
+			t.Fatalf("iteration %d: four concurrent kills delivered %d signals to the "+
+				"process group, want exactly 1 — each also arms its own SIGKILL timer",
+				i, n)
+		}
+		p.exit(Status{Signal: "TERM"})
+		drainAttachment(t, a)
+	}
+}
+
+// TestAnOverrunSpawnsOneGoroutineNotOnePerMessage is the `ending` gate's own
+// witness, and it is about allocation rather than about output: killOnce
+// collapses the KILLS whatever happens here, and emit's closing-first check
+// collapses the SENTENCES, so nothing a caller receives distinguishes one
+// goroutine from two thousand. What distinguishes them is two thousand
+// goroutine stacks for one fact.
+//
+// The outbox is deliberately left FULL and `closing` left open, so every
+// goroutine that reaches emit parks there instead of returning — which is what
+// turns "how many were spawned" into something a test can count at all.
+func TestAnOverrunSpawnsOneGoroutineNotOnePerMessage(t *testing.T) {
+	start := newFakeStarter()
+	r, _ := testRunner(t, start.start)
+	r.grace = time.Hour
+	spec := withTool(t, r, "tool")
+
+	a := r.OpenExec(spec)
+	p := start.await(t)
+	// exec_started is NOT read, and the child fills the rest of the outbox, so
+	// the next emit blocks rather than returning.
+	var filling sync.WaitGroup
+	for i := 0; i < outQueue; i++ {
+		filling.Add(1)
+		go func() { defer filling.Done(); _ = p.onStdout([]byte("x")) }()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(a.Msgs()) < outQueue {
+		if time.Now().After(deadline) {
+			t.Fatalf("the outbox never filled (%d/%d)", len(a.Msgs()), outQueue)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	p.blockWrites()
+	p.ignoreSignals()
+
+	chunk := make([]byte, 64<<10)
+	for i := 0; i < (stdinQueueBytes/len(chunk))+8; i++ {
+		a.Client(terminal.ClientMessage{Type: "stdin", Data: chunk})
+	}
+	base := runtime.NumGoroutine()
+	const flood = 2000
+	for i := 0; i < flood; i++ {
+		a.Client(terminal.ClientMessage{Type: "stdin", Data: []byte("x")})
+	}
+	// Let anything that was going to be spawned be spawned.
+	time.Sleep(200 * time.Millisecond)
+	peak := runtime.NumGoroutine()
+	if peak-base > flood/20 {
+		t.Fatalf("%d messages after an overrun left %d extra goroutines parked; one "+
+			"fact is one goroutine", flood, peak-base)
+	}
+
+	// Unwedge everything so the test can end.
+	go func() {
+		for range a.Msgs() {
+		}
+	}()
+	filling.Wait()
+	p.exit(Status{Signal: "TERM"})
+	waitForLive(t, r, 0)
+}
+
+// waitForLive polls until the runner holds n execs, or fails.
+func waitForLive(t *testing.T, r *Runner, n int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for r.LiveCount() != n {
+		if time.Now().After(deadline) {
+			t.Fatalf("live count is %d, want %d", r.LiveCount(), n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestStdinAfterTheChildClosedItsOwnCannotKillTheCommand is the other exit of
+// the same function, and it has the same consequence.
+//
+// pumpStdin ends on the caller's EOF and also when the child closed its own
+// stdin — `rainier exec s -- sh -c 'head -1; sleep 10' < bigfile` is the
+// ordinary shape of the second. Guarding only the EOF left the second one
+// accumulating to the 8 MiB bound and then killing a healthy command as
+// `stdin_overrun`, for input the child was never going to read.
+func TestStdinAfterTheChildClosedItsOwnCannotKillTheCommand(t *testing.T) {
+	start := newFakeStarter()
+	r, _ := testRunner(t, start.start)
+	spec := withTool(t, r, "tool")
+
+	a := r.OpenExec(spec)
+	p := start.await(t)
+	if m := <-a.Msgs(); m.Type != terminal.TypeExecStarted {
+		t.Fatalf("first message = %q", m.Type)
+	}
+	a.Client(terminal.ClientMessage{Type: "stdin", Data: []byte("first line\n")})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n, _ := p.stdinProgress(); n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first line never reached the child")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// The CHILD closes its own stdin. The next write fails and the pump ends,
+	// with no EOF from the caller anywhere in it.
+	if err := p.CloseStdin(); err != nil {
+		t.Fatal(err)
+	}
+	a.Client(terminal.ClientMessage{Type: "stdin", Data: []byte("ignored\n")})
+	time.Sleep(50 * time.Millisecond)
+
+	// The rest of the caller's file, which nobody is draining.
+	chunk := make([]byte, 64<<10)
+	for i := 0; i < (stdinQueueBytes/len(chunk))+64; i++ {
+		a.Client(terminal.ClientMessage{Type: "stdin", Data: chunk})
+	}
+	p.exit(Status{Code: 0})
+
+	var reason string
+	var exited bool
+	for _, m := range drainAttachment(t, a) {
+		switch m.Type {
+		case terminal.TypeExecError:
+			reason = m.Reason
+		case terminal.TypeExecExit:
+			exited = m.ExitCode == 0 && m.Signal == ""
+		}
+	}
+	if reason != "" {
+		t.Fatalf("a command whose child closed its OWN stdin was killed with %q by "+
+			"input it was never going to read", reason)
+	}
+	if !exited {
+		t.Fatal("the command did not report its own clean exit")
+	}
+}
+
+// TestASpawnTakesAReaperMark pins the CALL SITE of reap.Mark, which nothing
+// else does: internal/reap's own tests drive AwaitStatus with marks a test
+// made up, so the whole pid-wraparound half of the fix could be deleted here
+// with the suite green.
+//
+// Linux only, because Mark is always zero elsewhere by construction.
+func TestASpawnTakesAReaperMark(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the reaper, and therefore a non-zero mark, is linux-only")
+	}
+	reap.Start()
+	// Give the reaper something to count, so a mark taken after it is
+	// non-zero and "no mark at all" is distinguishable from "mark 0".
+	warm := exec.Command("/bin/sh", "-c", "exit 0")
+	if err := warm.Start(); err != nil {
+		t.Skipf("no /bin/sh: %v", err)
+	}
+	warmMark := reap.Mark()
+	if _, ok := reap.AwaitStatus(warm.Process.Pid, warmMark); !ok {
+		t.Skip("this build has no reaper")
+	}
+	if reap.Mark() == 0 {
+		t.Skip("the reaper recorded nothing; nothing to distinguish")
+	}
+
+	dir := t.TempDir()
+	tool := filepath.Join(dir, "tool")
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	proc, err := NewSpawner().Start(Request{
+		Path: tool, Argv: []string{"tool"}, Dir: dir, Env: []string{"PATH=" + dir},
+	}, func([]byte) error { return nil }, func([]byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, ok := proc.(*process)
+	if !ok {
+		t.Fatalf("the spawner returned %T", proc)
+	}
+	if p.mark == 0 {
+		t.Fatal("the spawn took no reaper mark. An outcome the reaper recorded before " +
+			"this child was forked cannot be this child's, and pid_max wraps — without " +
+			"the mark a stale orphan entry is read as this exec's status.")
+	}
+	p.Wait()
+}
+
+// TestArmNeverLosesTheRaceWithKill is the interleaving that leaves a live
+// process with nobody left to signal it:
+//
+//	kill:  lock; read a.proc (nil); unlock
+//	arm:   lock; install a.proc; unlock
+//	arm:   `closing` still open -> report live, start the stdin pump
+//	kill:  close(`closing`); a.proc was nil -> finish and return
+//
+// The process is armed, the attachment is closing, and no path reaches the
+// process again. The ordering is old — this is not a regression — but the
+// CONSEQUENCE is new: before the suspend path, KillAll ran only as the
+// container was being taken away, where a SIGKILL followed regardless. On a
+// warm suspend an escapee is frozen alive and resumes hours later, which is
+// the exact rule the suspend path exists to establish.
+//
+// The invariant, whichever side wins: either `arm` reports the attachment
+// already closing (and ends the process itself), or it reports live and
+// `kill` finds the process and ends it. Never neither.
+func TestArmNeverLosesTheRaceWithKill(t *testing.T) {
+	// PROBABILISTIC, and it says so: the window is one unlocked instruction
+	// pair, so the only way to reach it is to try the interleaving very many
+	// times with real contention — which is why the workers run concurrently
+	// rather than in one loop. Reverting the fix fails this in roughly half of
+	// single runs and in every `-count=5`; passing it once is not proof, and
+	// the deterministic guarantee is the lock pairing described above, which
+	// TestBothOrderingsOfArmAndKillEndTheProcess covers from the other side.
+	const (
+		workers    = 16
+		iterations = 20000
+	)
+	r, _ := testRunner(t, nil)
+	fail := make(chan string, workers)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				// Built directly rather than through newAttachment: its stdin
+				// queue is stdinQueueDepth deep, a quarter of a megabyte per
+				// attachment, which would make this a memory benchmark.
+				// Nothing here feeds stdin.
+				a := &attachment{
+					runner:  r,
+					msgs:    make(chan terminal.ServerMessage, outQueue),
+					closing: make(chan struct{}),
+					stdin:   make(chan stdinPiece, 1),
+				}
+				p := &fakeProc{pid: 7000 + i, done: make(chan struct{}),
+					signalled: make(chan struct{})}
+
+				killed := make(chan struct{})
+				go func() { defer close(killed); a.kill() }()
+				armed := a.arm(p, false)
+				<-killed
+
+				select {
+				case <-p.signalled:
+				case <-time.After(5 * time.Second):
+					select {
+					case fail <- fmt.Sprintf("worker %d iteration %d (arm reported "+
+						"live=%v): the process was armed and NEVER signalled — on a "+
+						"warm suspend it would be frozen alive", w, i, armed):
+					default:
+					}
+					return
+				}
+				a.finish()
+			}
+		}(w)
+	}
+	wg.Wait()
+	select {
+	case msg := <-fail:
+		t.Fatal(msg)
+	default:
+	}
+}
+
+// TestBothOrderingsOfArmAndKillEndTheProcess is the deterministic half of the
+// same invariant: whichever of the two reaches the lock first, the process is
+// ended. It cannot reach the interleaved window — nothing sequential can — so
+// it is a guard against breaking the ordinary paths while fixing the race,
+// not a guard against the race.
+func TestBothOrderingsOfArmAndKillEndTheProcess(t *testing.T) {
+	r, _ := testRunner(t, nil)
+
+	t.Run("kill first, then the spawn completes", func(t *testing.T) {
+		a := newAttachment(r)
+		p := &fakeProc{pid: 11, done: make(chan struct{}), signalled: make(chan struct{})}
+		a.kill()
+		if a.arm(p, false) {
+			t.Fatal("arm reported an attachment live after it had been killed")
+		}
+		select {
+		case <-p.signalled:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a spawn that completed into a killed attachment was never signalled")
+		}
+	})
+
+	t.Run("the spawn completes, then kill", func(t *testing.T) {
+		a := newAttachment(r)
+		p := &fakeProc{pid: 12, done: make(chan struct{}), signalled: make(chan struct{})}
+		if !a.arm(p, false) {
+			t.Fatal("arm reported a live attachment closed")
+		}
+		a.kill()
+		select {
+		case <-p.signalled:
+		case <-time.After(5 * time.Second):
+			t.Fatal("an armed process was never signalled by kill")
+		}
+	})
 }
