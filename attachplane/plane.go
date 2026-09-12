@@ -156,6 +156,13 @@ func (p *Plane) step(ctx context.Context) (context.Context, context.CancelFunc) 
 // application's attachment service to hand authorized streams to.
 func (p *Plane) Broker() control.AttachmentBroker { return broker{p} }
 
+// Typers reports how many terminals attached to session THROUGH THIS REPLICA
+// may currently type into it. A host renders it as a status fact — the count
+// in `rainier info`'s input row, and the one an opening notice names — and
+// never as an authorization input: an attach on another replica is not
+// counted, and the number can change the instant after it is read.
+func (p *Plane) Typers(session control.SessionID) int { return p.owners.typers(session) }
+
 // BackHandler returns the runner's dial-back endpoint. Mount it at the path
 // BackURL names.
 func (p *Plane) BackHandler() http.Handler { return http.HandlerFunc(p.handleAttachBack) }
@@ -205,7 +212,7 @@ func (b broker) Attach(ctx context.Context, target control.AttachTarget, stream 
 	// possibly reach it. What it is told is read now, not above: a peer may
 	// have displaced this attach while it was still opening.
 	mode, generation := own.get()
-	if mode == terminal.ModeControl {
+	if mode == terminal.ModeControl && !own.shared() {
 		// Whoever held control before this attach no longer does: the
 		// application already advanced the generation. Tell them, and — for
 		// the ones this replica is serving — wait until their sandbox has
@@ -213,6 +220,14 @@ func (b broker) Attach(ctx context.Context, target control.AttachTarget, stream 
 		// no keystroke the previous controller has already sent can still
 		// execute after the answer. That is the same order a mid-attach
 		// claim keeps; an attach is a take-over like any other.
+		//
+		// Under a shared policy there is nothing to displace: the application
+		// granted this attach the generation the session is already at, every
+		// peer is typing under that same generation, and no peer has lost
+		// anything to announce. A peer's attach therefore never pushes
+		// `control_changed` — the message is still pushed when an attach
+		// loses input authority for a reason that is not a peer, which is its
+		// own release and a plane-side revocation.
 		p.displace(ctx, own, generation, true)
 	}
 	// What it is told, and what its sandbox is opened as, is what it IS after

@@ -26,7 +26,8 @@ func mkFixPeer(t *testing.T, p *Plane, mode control.AttachmentMode, gen uint64,
 	t.Helper()
 	st := newScriptedStream()
 	o := newOwnership(p, control.AttachTarget{SessionID: "sess_example", Mode: mode,
-		ControllerGeneration: gen, Negotiated: true, MayClaim: mayClaim, Controller: keeper})
+		ControllerGeneration: gen, Negotiated: true, MayClaim: mayClaim, Controller: keeper,
+		Policy: control.PolicyExclusive})
 	o.stream = st
 	p.owners.add(o)
 	t.Cleanup(func() { p.owners.remove(o) })
