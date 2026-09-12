@@ -568,14 +568,36 @@ func (r *registry) childExited(id string, boot uint64, at time.Time) {
 //   - it is negative, which nothing sends, and which would make `liveExecs`
 //     read as "fewer than no commands".
 //
-// The idle clock is stamped only on the transition to zero, so a session that
-// runs three commands and finishes the last one at T is idle from T, and a
-// repeat report of zero does not push that deadline out.
+// The idle clock is stamped only on the TRANSITION to zero, so a session that
+// runs three commands and finishes the last one at T is idle from T. A report
+// of zero against a count that is already zero stamps nothing, which is what
+// keeps the restatement sessiond sends on every connection from pushing the
+// deadline out: a sandbox whose conn flaps once a minute would otherwise never
+// be auto-stopped at all.
 func (r *registry) execCount(id string, boot uint64, live int, seq uint64, at time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.items[id]
-	if !ok || e.boot != boot || seq <= e.execSeq {
+	if !ok || e.boot != boot {
+		return
+	}
+	if seq <= e.execSeq {
+		// Overtaken on its way here. runnerd routes every control frame on a
+		// goroutine of its own (a frame must never stall the demux that
+		// carries every viewer's terminal traffic), so a command short enough
+		// to start and end inside that window can have its two reports applied
+		// end-first — and the end, applied against a count of zero, would
+		// stamp nothing.
+		//
+		// The report still says something true: work HAPPENED, and a report
+		// this runner has already applied says it is over. So the clock starts
+		// NOW rather than never, which is late and never early — the direction
+		// every other decision on this path takes. Only when the entry
+		// believes nothing is running: while a command is live the ordinary
+		// path will stamp the clock when the last one ends.
+		if live > 0 && e.liveExecs == 0 {
+			e.lastExecEndedAt = at
+		}
 		return
 	}
 	e.execSeq = seq

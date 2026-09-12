@@ -444,17 +444,31 @@ const killPollInterval = 20 * time.Millisecond
 // no kill API to fall back on. Capping detached work below the total leaves
 // room for the command that ends it.
 func (r *Runner) reserve(a *attachment, detached bool) string {
+	reason, report := r.reserveLocked(a, detached)
+	report()
+	return reason
+}
+
+// reserveLocked is reserve's whole decision, under ONE hold of the lock it
+// releases with a defer, and it returns the report the caller makes AFTER that
+// hold ends rather than making it here. The defer is not tidiness: OpenExec
+// runs this behind `defer a.guard(...)`, whose recovery calls release — which
+// takes this same mutex. A panic anywhere in here with the unlock written out
+// by hand would leave the mutex held, and the recovery that exists to keep one
+// command's bug from costing the session would deadlock on it, taking every
+// later exec, KillAll and the warm-suspend handshake with it.
+func (r *Runner) reserveLocked(a *attachment, detached bool) (string, func()) {
+	noReport := func() {}
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.quiescing {
 		// This session is ending. Refused rather than spawned into a sandbox
 		// that is about to be frozen or torn down, where the process would
 		// outlive the rule that says it cannot.
-		r.mu.Unlock()
-		return terminal.ReasonSessionEnding
+		return terminal.ReasonSessionEnding, noReport
 	}
 	if len(r.live) >= r.max {
-		r.mu.Unlock()
-		return terminal.ReasonTooManyExecs
+		return terminal.ReasonTooManyExecs, noReport
 	}
 	if detached {
 		n := 0
@@ -464,8 +478,7 @@ func (r *Runner) reserve(a *attachment, detached bool) string {
 			}
 		}
 		if n >= r.maxDetached {
-			r.mu.Unlock()
-			return terminal.ReasonTooManyDetached
+			return terminal.ReasonTooManyDetached, noReport
 		}
 	}
 	r.live[a] = struct{}{}
@@ -474,10 +487,7 @@ func (r *Runner) reserve(a *attachment, detached bool) string {
 	// detached-cap walk just above reads the same flag on every other
 	// attachment.
 	a.setDetached(detached)
-	report := r.noteLive()
-	r.mu.Unlock()
-	report()
-	return ""
+	return "", r.noteLive()
 }
 
 // release gives one exec's slot back. It is idempotent — guard() calls it for
@@ -485,14 +495,21 @@ func (r *Runner) reserve(a *attachment, detached bool) string {
 // changes nothing reports nothing, so a panicking spawn does not put a
 // duplicate count on the wire.
 func (r *Runner) release(a *attachment) {
+	r.releaseLocked(a)()
+}
+
+// releaseLocked is release under a deferred unlock, for the same reason
+// reserveLocked is: guard's recovery path calls release, and a mutex left held
+// by a panic would deadlock the whole exec subsystem rather than costing one
+// command its answer.
+func (r *Runner) releaseLocked(a *attachment) func() {
 	r.mu.Lock()
-	report := func() {}
-	if _, held := r.live[a]; held {
-		delete(r.live, a)
-		report = r.noteLive()
+	defer r.mu.Unlock()
+	if _, held := r.live[a]; !held {
+		return func() {}
 	}
-	r.mu.Unlock()
-	report()
+	delete(r.live, a)
+	return r.noteLive()
 }
 
 // ObserveLive installs the observer described on Runner.onLive. It is called

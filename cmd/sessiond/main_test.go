@@ -375,7 +375,7 @@ func TestServeConnDeliversControlEvents(t *testing.T) {
 		snd := &stubSender{}
 		done := make(chan struct{})
 		go func() {
-			pending, err := serveConn(snd, errc, events, nil)
+			pending, err := serveConn(snd, errc, events, nil, nil, nil)
 			if len(pending) != 0 {
 				t.Errorf("after delivery: pending=%q, want empty", pendingStrings(pending))
 			}
@@ -401,7 +401,7 @@ func TestServeConnDeliversControlEvents(t *testing.T) {
 
 		res := make(chan [][]byte, 1)
 		go func() {
-			pending, _ := serveConn(dead, errc, events, nil)
+			pending, _ := serveConn(dead, errc, events, nil, nil, nil)
 			res <- pending
 		}()
 		// Hand over the event first and wait for the send to be attempted
@@ -421,7 +421,7 @@ func TestServeConnDeliversControlEvents(t *testing.T) {
 		errc2 := make(chan error, 1)
 		errc2 <- errors.New("conn closed later")
 		live := &stubSender{}
-		pending, _ := serveConn(live, errc2, events, first)
+		pending, _ := serveConn(live, errc2, events, nil, nil, first)
 		if len(pending) != 0 {
 			t.Fatalf("after the retry: pending=%q, want empty", pendingStrings(pending))
 		}
@@ -441,13 +441,13 @@ func TestServeConnDeliversControlEvents(t *testing.T) {
 		events <- payload
 		errc := make(chan error, 1)
 		errc <- errors.New("conn closed")
-		pending, _ := serveConn(&stubSender{err: errors.New("write: broken pipe")}, errc, events, nil)
+		pending, _ := serveConn(&stubSender{err: errors.New("write: broken pipe")}, errc, events, nil, nil, nil)
 
 		errc2 := make(chan error, 1)
 		live := &stubSender{}
 		done := make(chan struct{})
 		go func() {
-			serveConn(live, errc2, events, pending)
+			serveConn(live, errc2, events, nil, nil, pending)
 			close(done)
 		}()
 		waitFor(t, "the retained event to be delivered", func() bool { return live.count() == 1 })
@@ -462,7 +462,7 @@ func TestServeConnDeliversControlEvents(t *testing.T) {
 		errc := make(chan error, 1)
 		errc <- errors.New("conn closed")
 		snd := &stubSender{}
-		pending, err := serveConn(snd, errc, nil, nil)
+		pending, err := serveConn(snd, errc, nil, nil, nil, nil)
 		if len(pending) != 0 || err == nil {
 			t.Fatalf("pending=%q err=%v, want empty/non-nil", pendingStrings(pending), err)
 		}
@@ -492,7 +492,7 @@ func TestServeConnQueuesEventsFIFO(t *testing.T) {
 
 	res := make(chan [][]byte, 1)
 	go func() {
-		pending, _ := serveConn(dead, errc, events, nil)
+		pending, _ := serveConn(dead, errc, events, nil, nil, nil)
 		res <- pending
 	}()
 	events <- setup
@@ -511,7 +511,7 @@ func TestServeConnQueuesEventsFIFO(t *testing.T) {
 	errc2 := make(chan error, 1)
 	errc2 <- errors.New("conn closed later")
 	live := &stubSender{}
-	pending, _ := serveConn(live, errc2, events, queued)
+	pending, _ := serveConn(live, errc2, events, nil, nil, queued)
 	if len(pending) != 0 {
 		t.Fatalf("after the drain: pending=%q, want empty", pendingStrings(pending))
 	}

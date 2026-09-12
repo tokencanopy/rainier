@@ -29,41 +29,78 @@ type Hub struct {
 	cancel  context.CancelFunc
 	mu      sync.Mutex
 	next    uint64
-	clients map[uint64]Conn // attachID → client conn
+	clients map[uint64]*hubClient // attachID → client
 	// onControl is wired by the constructor and never written again — see
 	// NewHubWithControl for why it isn't a settable field.
 	onControl func(payload []byte)
-	// clientWrite bounds ONE write to ONE client in readLoop. Set by the
-	// constructor and never written again, for the same reason onControl is:
-	// readLoop is already running by the time a caller could assign it.
-	clientWrite time.Duration
+	// termWrite and execWrite are the per-write budgets below, named on the
+	// hub so a test can drive the drop in milliseconds. Set by the constructor
+	// and never written again, for the same reason onControl is: readLoop is
+	// already running by the time a caller could assign one.
+	termWrite, execWrite time.Duration
 }
 
-// clientWriteBudget is how long readLoop will wait for one client to take one
-// frame before treating it as gone.
+// hubClient is one attached client: its conn, and whether the attachment is an
+// EXEC one. The kind is kept because the two get different write budgets, for
+// the reason attachplane already gives them different ones.
+type hubClient struct {
+	conn Conn
+	exec bool
+}
+
+// The per-write budgets readLoop gives one client for one frame.
 //
 // readLoop demultiplexes every frame for every attachment on this session's
-// conn — terminal input, exec output and the session RPC alike — on ONE
+// conn — terminal output, exec output and the session RPC alike — on ONE
 // goroutine. A write with no bound of its own therefore makes any single stuck
 // client a stall on all of them, for as long as whatever is below is willing
-// to wait.
+// to wait, and this package enforced nothing at all: the bound was the life of
+// the session.
 //
-// That was survivable while a client was always a terminal viewer, because
-// attachplane force-detaches one that exceeds its write budget. `rainier exec`
-// is what makes it reachable: an exec stream blocks BY DESIGN — that is its
-// flow control, the thing that keeps a command from outrunning the caller
-// reading it — and downstream it is bounded only by attachplane's per-frame
-// exec budget, twenty seconds. So one slow exec caller buys twenty seconds of
-// stalled viewers and stalled session RPC per frame, with nothing in this
-// package enforcing anything.
+// The numbers are chosen to sit just ABOVE attachplane's own per-frame
+// budgets, not below them, and that ordering is the whole point. The plane
+// already decides which clients are worth keeping, and it has already made the
+// trade this hop would otherwise re-make worse: sixty seconds for a terminal
+// viewer, because "being disconnected mid-scrollback costs a person their
+// session", and twenty for an exec caller, because a script has nothing to
+// lose by re-running the command and everybody else on the session is waiting
+// behind it. A shorter budget here would silently overrule both — dropping a
+// human mid-scrollback on a hop that cannot see that is what it is doing.
 //
-// Five seconds is chosen to sit inside that twenty: this hop gives up before
-// the hop below it does, so the drop is decided here, where the cost of
-// waiting is actually paid, rather than downstream where it is only one
-// client's problem. It is also far outside any healthy write — the client conn
-// is a websocket to a process on this machine or to the control plane, not to
-// the human's laptop.
-const clientWriteBudget = 5 * time.Second
+// So what this bound buys is not a tighter decision, it is a decision at all:
+//   - the local /attach front has NO plane below it, and was unbounded;
+//   - a plane that is wedged, or a host that mounts a stream of its own
+//     without the budgets, can no longer park this runner's demux for the life
+//     of the session;
+//   - the number is now stated in the package that pays for the wait.
+//
+// It is a mitigation and not a cure, exactly as attachplane's own comment
+// says: the cure is a writer per attachment rather than one per conn, which
+// changes the backpressure an exec stream depends on and is its own piece of
+// work. See docs/design/exec-idle-stop.md.
+const (
+	// clientWriteBase is the part that does not depend on size: what a client
+	// that has taken NOTHING gets. Ten seconds above the plane's sixty.
+	clientWriteBase = 70 * time.Second
+	// execWriteBase is the same for an exec attachment, five above the
+	// plane's twenty — and above internal/relay's own execWriterWait rule
+	// that a healthy exec caller must never be dropped by one hop merely
+	// because another peer is being dropped at the next.
+	execWriteBase = 25 * time.Second
+	// clientWriteRate buys the rest of the budget for a large frame, at the
+	// same floor the plane uses. Without it the base would be a whole-write
+	// deadline and the largest frame attachReadLimit allows would demand
+	// throughput of a client that is making perfectly steady progress.
+	clientWriteRate = 64 << 10 // bytes per second
+)
+
+// writeBudget is how long ONE frame of n bytes may take to reach one client.
+// n is the bytes that actually go on the wire — this hop forwards the payload
+// verbatim — so unlike the plane's own budget there is no base64 adjustment to
+// make.
+func writeBudget(base time.Duration, n int) time.Duration {
+	return base + time.Duration(n)*time.Second/clientWriteRate
+}
 
 func NewHub(ctx context.Context, sessionConn Conn) *Hub {
 	return NewHubWithControl(ctx, sessionConn, nil)
@@ -89,18 +126,19 @@ func NewHub(ctx context.Context, sessionConn Conn) *Hub {
 // every attachment multiplexed over this conn, not just the control channel.
 // nil means control frames are read and dropped.
 func NewHubWithControl(ctx context.Context, sessionConn Conn, onControl func(payload []byte)) *Hub {
-	return newHub(ctx, sessionConn, onControl, clientWriteBudget)
+	return newHub(ctx, sessionConn, onControl, clientWriteBase, execWriteBase)
 }
 
-// newHub is NewHubWithControl with the per-client write budget named, so a
-// test can drive the drop in milliseconds instead of in five seconds. It is
-// unexported because the budget is not a host's choice: it is a property of
-// what this hop owes the OTHER attachments on the same conn.
+// newHub is NewHubWithControl with the two per-write budgets named, so a test
+// can drive the drop in milliseconds instead of in a minute. It is unexported
+// because the budgets are not a host's choice: they are a property of what
+// this hop owes the OTHER attachments on the same conn, and of where they sit
+// relative to the plane's.
 func newHub(ctx context.Context, sessionConn Conn, onControl func(payload []byte),
-	clientWrite time.Duration) *Hub {
+	termWrite, execWrite time.Duration) *Hub {
 	hctx, cancel := context.WithCancel(ctx)
-	h := &Hub{conn: sessionConn, ctx: hctx, cancel: cancel, clients: map[uint64]Conn{},
-		onControl: onControl, clientWrite: clientWrite}
+	h := &Hub{conn: sessionConn, ctx: hctx, cancel: cancel, clients: map[uint64]*hubClient{},
+		onControl: onControl, termWrite: termWrite, execWrite: execWrite}
 	go h.readLoop()
 	return h
 }
@@ -116,7 +154,7 @@ func (h *Hub) readLoop() {
 	defer func() {
 		h.mu.Lock()
 		for id, cl := range h.clients {
-			cl.Close()
+			cl.conn.Close()
 			delete(h.clients, id)
 		}
 		h.mu.Unlock()
@@ -150,7 +188,7 @@ func (h *Hub) readLoop() {
 		case FrameServer:
 			// Forward the terminal.ServerMessage payload verbatim to the
 			// client, under a bound of its own: a client that cannot take a
-			// frame in clientWriteBudget is treated exactly as one whose write
+			// frame in its budget is treated exactly as one whose write
 			// FAILED, because from this loop's point of view — the one
 			// goroutine every other attachment on this conn is also waiting on
 			// — there is no useful difference between the two.
@@ -159,10 +197,10 @@ func (h *Hub) readLoop() {
 				h.mu.Lock()
 				delete(h.clients, f.AttachID)
 				h.mu.Unlock()
-				client.Close()
+				client.conn.Close()
 			}
 		case FrameClose:
-			client.Close()
+			client.conn.Close()
 			h.mu.Lock()
 			delete(h.clients, f.AttachID)
 			h.mu.Unlock()
@@ -170,20 +208,25 @@ func (h *Hub) readLoop() {
 	}
 }
 
-// writeClient is one bounded write to one client. The deadline is derived from
-// h.ctx, so a hub whose session conn has died fails immediately rather than
-// spending the budget on a write that cannot land.
+// writeClient is one bounded write to one client, on the budget its KIND is
+// owed. The deadline is derived from h.ctx, so a hub whose session conn has
+// died fails immediately rather than spending the budget on a write that
+// cannot land.
 //
-// A budget of zero or less means "no bound of its own", which is what this
-// wrote before the bound existed; no production path sets it, and it is here
-// so the shape is explicit rather than accidental.
-func (h *Hub) writeClient(client Conn, payload []byte) error {
-	if h.clientWrite <= 0 {
-		return client.Write(h.ctx, payload)
+// A base of zero or less means "no bound of its own", which is what this wrote
+// before the bound existed; no production path sets it, and it is here so the
+// shape is explicit rather than accidental.
+func (h *Hub) writeClient(client *hubClient, payload []byte) error {
+	base := h.termWrite
+	if client.exec {
+		base = h.execWrite
 	}
-	ctx, cancel := context.WithTimeout(h.ctx, h.clientWrite)
+	if base <= 0 {
+		return client.conn.Write(h.ctx, payload)
+	}
+	ctx, cancel := context.WithTimeout(h.ctx, writeBudget(base, len(payload)))
 	defer cancel()
-	return client.Write(ctx, payload)
+	return client.conn.Write(ctx, payload)
 }
 
 // SendControl writes payload to the session as a FrameControl on AttachID 0:
@@ -248,7 +291,7 @@ func (h *Hub) AttachClient(ctx context.Context, client Conn, o Open) error {
 	h.mu.Lock()
 	h.next++
 	id := h.next
-	h.clients[id] = client
+	h.clients[id] = &hubClient{conn: client, exec: o.Kind == runner.KindExec}
 	h.mu.Unlock()
 
 	open, _ := Encode(Frame{Type: FrameOpen, AttachID: id, Since: o.Since, Cols: o.Cols, Rows: o.Rows,

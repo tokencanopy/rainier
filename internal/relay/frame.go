@@ -72,10 +72,10 @@ type Frame struct {
 //
 //   - An EVENT — "setup_done", "setup_failed"/"stage_failed", "child_exited",
 //     "exec_count", "suspending"/"suspend_ready" — is fire-and-forget and
-//     carries ID 0. Most
-//     travel upward only (sessiond → runnerd), where runnerd turns them into
-//     rwire events for controld; the suspend pair is the one that travels both
-//     ways and stays between runnerd and the sandbox.
+//     carries ID 0. Most travel upward only (sessiond → runnerd), where
+//     runnerd turns them into rwire events for controld; the suspend pair is
+//     the one that travels both ways and stays between runnerd and the
+//     sandbox, and "exec_count" is the one runnerd keeps for itself.
 //   - A REQUEST is Kind "req:<method>" with an ID greater than zero. Either
 //     end may originate one: the sandbox asking controld to mint a git
 //     credential goes up, a diff or a push/pull goes down.

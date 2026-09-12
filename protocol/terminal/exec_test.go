@@ -232,12 +232,34 @@ func TestEveryExecReasonReachesTheContract(t *testing.T) {
 		// repository's documents are not on disk beside it.
 		t.Skipf("the contract document is not in this tree: %v", err)
 	}
-	text := string(b)
+	// §3.9 ONLY, not the whole file: the failure message above names that
+	// section, and a word that turned up in §6's error table instead would
+	// satisfy a whole-document search while leaving the section a caller is
+	// sent to as silent as before.
+	section := execSection(t, string(b))
 	for _, r := range terminal.ExecReasons() {
-		if !strings.Contains(text, "`"+r+"`") {
-			t.Errorf("the reason word %q is not in %s. Add it to §3.9 as the literal "+
+		if !strings.Contains(section, "`"+r+"`") {
+			t.Errorf("the reason word %q is not in %s §3.9. Add it there as the literal "+
 				"word, in backticks, beside the sentence that describes it — a caller "+
 				"who receives it has to be able to find it there.", r, doc)
 		}
 	}
+}
+
+// execSection cuts §3.9 out of the contract: from its heading to the next
+// heading at the same level or above.
+func execSection(t *testing.T, doc string) string {
+	t.Helper()
+	const heading = "### 3.9 "
+	i := strings.Index(doc, heading)
+	if i < 0 {
+		t.Fatalf("the contract has no %q section; this test is looking in the wrong place", heading)
+	}
+	rest := doc[i+len(heading):]
+	for _, next := range []string{"\n### ", "\n## "} {
+		if j := strings.Index(rest, next); j >= 0 {
+			rest = rest[:j]
+		}
+	}
+	return rest
 }

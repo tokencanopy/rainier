@@ -81,6 +81,21 @@ session with a live command in it. An *absolute count* is self-correcting: the n
 transition, or the next reconnection, states the truth again and overwrites whatever was
 lost.
 
+**The report goes to a mailbox of its own, not onto the shared event queue.** `offerControl`
+drops the *arriving* payload when its channel is full and `appendPending` drops the *oldest*
+when the pending queue is at its cap. Neither rule is wrong for the events they were written
+for; both are wrong for an absolute count, where the arriving report is the only true one —
+and a dropped `live:1` with no further transition coming is the cold stop this whole change
+exists to prevent. So a live-exec report waits in a one-slot mailbox that **replaces** what is
+in it, and `serveConn` sends it straight down the connection rather than queueing it: a count
+is only ever about the connection in hand. It also keeps exec traffic from competing with
+`child_exited` for the pending cap, and that exit has no second chance at all.
+
+**Every connection restates the count, as its first message.** A transition that happened
+while there was no connection is genuinely lost — the mailbox holds one report and only a
+live conn drains it — so the dial is where the two ends are re-synchronised. That is what
+makes "an absolute count is self-correcting" true rather than merely likely.
+
 **`Seq` is a monotonic per-`Runner` counter, assigned under the same lock that changes the
 count.** The observer is invoked *outside* that lock — calling a callback under a mutex the
 callback could re-enter is the kind of deadlock nobody finds twice — so two transitions can
@@ -88,6 +103,14 @@ reach the queue in the wrong order. Without a fence, a `reserve`→1 report land
 `release`→0 report would leave the runner believing an exec is live forever. `runnerd`
 applies a report only when `Seq` is strictly greater than the last it applied, so a reordered
 report is dropped rather than believed.
+
+One thing a refused report still tells the runner, and the registry acts on it: a stale
+`live > 0` arriving at an entry that believes nothing is running says *work happened, and a
+report already applied says it is over*. `runnerd` routes every control frame on a goroutine
+of its own, so a command short enough to start and finish inside that window has its two
+reports applied end-first — and the end, applied against a count of zero, would stamp
+nothing. The idle clock therefore starts at the refusal: late, never early, which is the
+direction every other decision on this path takes.
 
 **The boot-epoch fence is the one every other control event carries.** `routeControl` already
 receives the epoch the `/register` conn *read*, and the registry refuses any event naming a
@@ -188,7 +211,19 @@ exactly the cost of an accidental coupling; another one is not the fix.
 | an old `sessiond` that never sends `exec_count` | exactly today's behaviour |
 | `exec_count{live:1}` then the sandbox conn dies for good | the entry keeps `liveExecs = 1` and is never auto-stopped; an operator's stop and a delete are unaffected. Safe direction, and the same shape as the existing "a half-open viewer conn holds a session open" limit |
 | a cold resume | all three fields cleared; the new sandbox's `Seq` starts at 1 |
-| a warm suspend and resume | the quiesce already killed every exec and reported 0; nothing to clear |
+| a warm suspend and resume | the quiesce killed every exec, so there is nothing to clear. The `live:0` report is not *guaranteed* to be on the wire before the freeze — `KillAllAndWait` waits for the live set to empty, and the observer runs after the lock that emptied it — so the runner may learn of it only on the unpause or the next dial. Late, never early, and the restatement on the next connection is what closes it |
+| a report dropped while there is no connection | the mailbox holds one report and only a live conn drains it, so the drop is real — and `serveConn` restates the current count as the FIRST message of every connection, which says what is true then rather than replaying what was true before |
+| a `--detach` exec accepted between `claimIdle` and `docker stop`'s SIGTERM | killed, after its caller was handed a pid and exited 0. The window is the driver call, and reaching it at all needs the full `--idle-stop` of prior idleness, so the exec was started against a session that had been doing nothing for half an hour. Not closed here: closing it means a reservation the sweep respects, which is #85's admission work |
+
+## Rollout
+
+**Roll the runners before the session image.** A `runnerd` that predates `exec_count` logs
+`unknown control kind "exec_count"` once per transition per session and drops it, which is
+correct — the session simply behaves as it does today — but it is log noise proportional to
+how many commands the fleet runs, and it means idle auto-stop can still cold-stop a detached
+run on that runner. It is an operational order, not a check: nothing in a sandbox can detect
+an old runner, exactly as the README's "Roll `controld` before the runners" note says of the
+layer above.
 
 ## Verification
 
@@ -227,21 +262,42 @@ only by `attachplane`'s ~20s per-frame exec budget (`defaultExecWriteBase`). So 
 caller buys ~20 seconds of stalled viewers per frame, with nothing in `internal/relay`
 enforcing anything.
 
-**Fix.** Each per-client write in `readLoop` gets its own short deadline
-(`clientWriteBudget`, 5s) derived from `h.ctx`. A client that exceeds it is dropped from the
-demux and closed, which is precisely what the existing write-error branch already does — the
-change is that a *slow* client is now treated like a *failed* one instead of being waited
-for. Five seconds is comfortably inside `attachplane`'s 20s exec budget, so the hub gives up
-before the hop below it does, and comfortably outside any healthy write on a local socket.
+**Fix.** Each per-client write in `readLoop` gets a deadline of its own, derived from
+`h.ctx`, and a client that exceeds it is dropped from the demux and closed — precisely what
+the existing write-error branch already does. The change is that a *slow* client is now
+treated like a *failed* one instead of being waited for indefinitely.
 
-It is applied to every client rather than only to exec clients. The hub does not track
-attachment kind today, and adding that bookkeeping to buy a *longer* budget for the kind that
-is already force-detached upstream would be machinery for nothing. A terminal viewer that
-cannot take a frame in five seconds is a viewer `attachplane` is about to drop anyway.
+The budgets are **kind-aware and sit just ABOVE `attachplane`'s**, and that ordering is the
+whole design. A first attempt used a flat five seconds on the grounds that a viewer
+`attachplane` would drop anyway is not worth waiting for. That was wrong in both halves:
+`defaultClientWriteBase` is **60 seconds** for a terminal viewer (plus 64 KiB/s of byte
+allowance, so up to ~316s for the largest frame `attachReadLimit` permits), the 20s figure is
+the *exec* base only, and the plane's splice is synchronous — `runner.Read` then
+`client.Send` — so a human legitimately inside their 60–316 seconds backs the runner socket
+up, and a 5s hub bound would have dropped them mid-scrollback. That is exactly the outcome
+the plane spends those seconds to avoid, decided on a hop that cannot see it is deciding it.
 
-**Test.** A slow client on attach id 1 and a viewer on id 2: the viewer's frame arrives
-without waiting for the slow client, and the slow client is closed and removed. It fails
-without the bound (the viewer's frame is still blocked).
+So: 70s base for a terminal attachment, 25s for an exec one, both plus the same 64 KiB/s
+allowance. Each is strictly above the plane's, so **this hop never overrules the plane** —
+`TestTheHubNeverOverrulesThePlane` states that as an invariant, in the same shape
+`internal/relay`'s existing `TestTheWaitAndTheWriteHaveSeparateBudgets` already uses.
+
+What the bound buys, then, is not a tighter decision but a decision at all: the local
+`/attach` front has no plane below it and was unbounded; a wedged plane, or a host that
+mounts a stream without those budgets, can no longer park this runner's demux for the life of
+the session; and the number is now stated in the package that pays for the wait.
+
+It remains a **mitigation, not a cure**, exactly as `attachplane/stream.go`'s own comment
+says: the cure is a writer per attachment rather than one per conn. That is a change to the
+backpressure an exec stream depends on — an exec stream blocks by design, and a per-client
+queue either bounds memory by dropping a caller that is merely slow, or does not bound it at
+all — so it is its own piece of work and not this one.
+
+**Test.** A stuck client on attach id 1 and a viewer on id 2, on injected millisecond
+budgets: the viewer's frame arrives without waiting, and the stuck client is closed and
+removed. It fails without the bound. `TestTheProductionHubIsBounded` pins the wiring
+separately, because passing a zero through `NewHubWithControl` would restore the old
+behaviour while leaving every budget-injecting test green.
 
 ## The emit-ordering guarantee is pinned only probabilistically
 

@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,24 +22,20 @@ import (
 // half an hour after the agent finishes — see docs/design/exec-idle-stop.md.
 // ---------------------------------------------------------------------------
 
-// drainEvents takes every control payload waiting on the queue, decoded.
-func drainEvents(t *testing.T, events <-chan []byte, want int) []relay.ControlEvent {
+// nextReport takes the next report out of the mailbox, decoded, under a bound.
+func nextReport(t *testing.T, m *execCountMailbox) relay.ControlEvent {
 	t.Helper()
-	var out []relay.ControlEvent
-	deadline := time.After(5 * time.Second)
-	for len(out) < want {
-		select {
-		case p := <-events:
-			var ev relay.ControlEvent
-			if err := json.Unmarshal(p, &ev); err != nil {
-				t.Fatalf("undecodable control payload %s: %v", p, err)
-			}
-			out = append(out, ev)
-		case <-deadline:
-			t.Fatalf("only %d control event(s) arrived, want %d: %+v", len(out), want, out)
+	select {
+	case p := <-m.c():
+		var ev relay.ControlEvent
+		if err := json.Unmarshal(p, &ev); err != nil {
+			t.Fatalf("undecodable control payload %s: %v", p, err)
 		}
+		return ev
+	case <-time.After(5 * time.Second):
+		t.Fatal("no live-exec report arrived")
+		return relay.ControlEvent{}
 	}
-	return out
 }
 
 // TestALiveExecIsReportedUpstream wires the exec runner exactly as main does
@@ -46,31 +44,164 @@ func drainEvents(t *testing.T, events <-chan []byte, want int) []relay.ControlEv
 // the pair the runner's idle clock needs.
 func TestALiveExecIsReportedUpstream(t *testing.T) {
 	root := t.TempDir()
-	events := make(chan []byte, pendingCap)
 	execs := sandboxexec.NewRunner(root, []string{"PATH=" + os.Getenv("PATH")},
 		sandboxexec.NewSpawner().Start)
-	execs.ObserveLive(func(live int, seq uint64) {
-		offerControl(events, execCountPayload(live, seq))
-	})
+	// watchExecs, not a hand-rolled copy of it: this is the wiring main
+	// installs, so deleting it there is a compile error here rather than a
+	// green suite over a feature that reports nothing.
+	mailbox := watchExecs(execs)
 
 	execs.OpenExec(runner.ExecSpec{
 		Argv: []string{"/bin/sh", "-c", "sleep 30"}, Detach: true, LogPath: "run.log"})
-	got := drainEvents(t, events, 1)
-	if got[0].Kind != relay.KindExecCount || got[0].Live != 1 || got[0].Seq == 0 {
-		t.Fatalf("a started detached exec queued %+v, want one exec_count live=1 with a sequence", got[0])
+	got := nextReport(t, mailbox)
+	if got.Kind != relay.KindExecCount || got.Live != 1 || got.Seq == 0 {
+		t.Fatalf("a started detached exec reported %+v, want one exec_count live=1 with a sequence", got)
 	}
 
 	// The session ends, which is the bound on a detached run's life — and the
 	// report that starts the runner's idle clock.
 	execs.KillAllAndWait(5 * time.Second)
-	end := drainEvents(t, events, 1)
-	if end[0].Kind != relay.KindExecCount || end[0].Live != 0 {
-		t.Fatalf("the last exec ending queued %+v, want exec_count live=0", end[0])
+	end := nextReport(t, mailbox)
+	if end.Kind != relay.KindExecCount || end.Live != 0 {
+		t.Fatalf("the last exec ending reported %+v, want exec_count live=0", end)
 	}
-	if end[0].Seq <= got[0].Seq {
-		t.Fatalf("the ending report carried seq %d, which is not ahead of %d", end[0].Seq, got[0].Seq)
+	if end.Seq <= got.Seq {
+		t.Fatalf("the ending report carried seq %d, which is not ahead of %d", end.Seq, got.Seq)
 	}
 }
+
+// TestTheMailboxKeepsTheNEWESTReport is the difference between a count that is
+// self-correcting and one that only looks it. `events` drops the ARRIVING
+// payload when it is full — right for an event that has no second chance,
+// wrong for an absolute count, where the arriving one is the only true one.
+// A dropped "one live" with no further transition coming is the cold stop this
+// whole change exists to prevent.
+func TestTheMailboxKeepsTheNEWESTReport(t *testing.T) {
+	m := newExecCountMailbox()
+	for seq := uint64(1); seq <= 5; seq++ {
+		m.offer(execCountPayload(int(seq), seq))
+	}
+	var ev relay.ControlEvent
+	select {
+	case p := <-m.c():
+		if err := json.Unmarshal(p, &ev); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatal("the mailbox is empty after five reports")
+	}
+	if ev.Seq != 5 || ev.Live != 5 {
+		t.Fatalf("the mailbox held live=%d seq=%d, want the newest (5, 5)", ev.Live, ev.Seq)
+	}
+	select {
+	case p := <-m.c():
+		t.Fatalf("the mailbox held a second report: %s", p)
+	default:
+	}
+	// And a nil payload — what execCountPayload returns when encoding failed —
+	// does not clear it.
+	m.offer(execCountPayload(9, 9))
+	m.offer(nil)
+	select {
+	case <-m.c():
+	default:
+		t.Fatal("a nil offer emptied the mailbox")
+	}
+}
+
+// TestConcurrentOffersLeaveTheNewestReport: several exec slots can come back
+// at once, so the discard and the fill have to be one step against each other.
+// Without the lock two offers can both find the slot empty and the older one
+// can be the survivor.
+func TestConcurrentOffersLeaveTheNewestReport(t *testing.T) {
+	for attempt := 0; attempt < 50; attempt++ {
+		m := newExecCountMailbox()
+		var wg sync.WaitGroup
+		const n = 8
+		for i := 1; i <= n; i++ {
+			wg.Add(1)
+			go func(seq uint64) {
+				defer wg.Done()
+				m.offer(execCountPayload(int(seq), seq))
+			}(uint64(i))
+		}
+		wg.Wait()
+		select {
+		case p := <-m.c():
+			var ev relay.ControlEvent
+			if err := json.Unmarshal(p, &ev); err != nil {
+				t.Fatal(err)
+			}
+			if ev.Seq == 0 {
+				t.Fatalf("the mailbox held a report with no sequence: %s", p)
+			}
+		default:
+			t.Fatal("every concurrent offer was lost")
+		}
+	}
+}
+
+// TestServeConnRestatesTheExecCountAndNeverQueuesOne pins the two rules
+// together, on the function the dial loop actually calls. The restatement is
+// what repairs a report lost while there was no connection; not queueing is
+// what keeps a count from competing with the child's exit for the pending cap,
+// since that exit has no second chance at all.
+func TestServeConnRestatesTheExecCountAndNeverQueuesOne(t *testing.T) {
+	sender := &recordingSender{}
+	errc := make(chan error, 1)
+	execCounts := make(chan []byte, 1)
+	reporter := &stubReporter{live: 2, seq: 41}
+
+	// A report that the previous connection never delivered, still waiting.
+	execCounts <- execCountPayload(1, 40)
+
+	done := make(chan [][]byte, 1)
+	go func() {
+		p, _ := serveConn(sender, errc, nil, execCounts, reporter, nil)
+		done <- p
+	}()
+
+	deadline := time.After(5 * time.Second)
+	for {
+		if len(sender.events()) >= 2 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("serveConn sent %+v, want the restatement and the queued report",
+				sender.events())
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	evs := sender.events()
+	if evs[0].Kind != relay.KindExecCount || evs[0].Live != 2 || evs[0].Seq != 41 {
+		t.Fatalf("the connection's FIRST message was %+v, want the restatement", evs[0])
+	}
+	if evs[1].Kind != relay.KindExecCount || evs[1].Seq != 40 {
+		t.Fatalf("the waiting report was %+v", evs[1])
+	}
+
+	errc <- io.EOF
+	select {
+	case pending := <-done:
+		if len(pending) != 0 {
+			t.Fatalf("serveConn queued %d exec count(s) for the next connection; a count "+
+				"is only ever about the connection in hand, and it would compete with the "+
+				"child's exit for the cap", len(pending))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveConn did not return")
+	}
+}
+
+// stubReporter is an exec runner that only has a count.
+type stubReporter struct {
+	live int
+	seq  uint64
+}
+
+func (s *stubReporter) LiveReport() (int, uint64) { return s.live, s.seq }
 
 // TestEveryConnectionRestatesTheExecCount is what repairs a report that was
 // dropped while there was no connection to carry it. The queue drops on

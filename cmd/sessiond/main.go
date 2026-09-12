@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -210,9 +211,17 @@ func main() {
 	// It never blocks: offerControl is the same never-blocking queue the
 	// agent's exit uses, so a report costs the goroutine that released a slot
 	// nothing at all.
-	execs.ObserveLive(func(live int, seq uint64) {
-		offerControl(events, execCountPayload(live, seq))
-	})
+	//
+	// It goes to a mailbox of its own rather than onto `events`, and that is
+	// the difference between a count that is self-correcting and one that only
+	// looks it. `events` drops the NEWEST payload when it is full and the
+	// pending queue behind it drops the OLDEST when it is at its cap; for an
+	// absolute count the newest is the only one that matters, and a dropped
+	// "one live" with no further transition coming is exactly the cold stop
+	// this whole change exists to prevent. The mailbox holds one report and
+	// replaces it, so the newest always wins, and it never displaces the
+	// child's exit out of a queue they would otherwise share.
+	execCounts := watchExecs(execs)
 
 	// The OTHER end of an exec's lifetime, and the one a signal cannot reach.
 	// The default `rainier stop` is a WARM suspend — `docker pause` — which
@@ -273,7 +282,7 @@ func main() {
 		if len(stages) > 0 {
 			startStageWatcher(stageCtx, s.Stop, stages, *logPath, events)
 		}
-		dialLoop(context.Background(), *dial, *sessionID, s, events, rpc, execs)
+		dialLoop(context.Background(), *dial, *sessionID, s, events, execCounts, rpc, execs)
 		return
 	}
 
@@ -309,7 +318,7 @@ func main() {
 // deliberate — an event queues across a reconnect, a request does not (see
 // rpcConn).
 func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, events <-chan []byte,
-	rpc *rpcDispatcher, execs *sandboxexec.Runner) {
+	execCounts *execCountMailbox, rpc *rpcDispatcher, execs *sandboxexec.Runner) {
 	backoff := time.Second
 	var pending [][]byte // control payloads no connection has accepted yet
 	for {
@@ -338,25 +347,8 @@ func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, e
 			// later one — see rpc.go.
 			sender, errc := relay.ServeSessionWithExec(ctx, relay.WSConn(c), s, rpc.OnControl, execs)
 			rpc.online(sender)
-			// This connection's first exec count, restated rather than waited
-			// for. The report queue drops when it is full and drops the oldest
-			// when it is at its cap — both deliberately — so a transition that
-			// happened while there was no connection can be lost, and an
-			// absolute count is only self-correcting if something restates it.
-			// A reconnection is the moment to: it costs one small frame per
-			// dial and it is the only point at which the runner's view and
-			// this sandbox's can have drifted with no further command coming
-			// to repair it.
-			//
-			// Straight down the sender rather than onto the queue, which is
-			// the one place in this file that is right to bypass it: a
-			// restatement is only ever about the connection in hand, and the
-			// next dial makes its own. It carries the highest sequence number
-			// issued so far, so whatever serveConn is about to drain from the
-			// queue behind it cannot overwrite it at the far end.
-			reportExecs(sender, execs)
 			var relayErr error
-			pending, relayErr = serveConn(sender, errc, events, pending)
+			pending, relayErr = serveConn(sender, errc, events, execCounts.c(), execs, pending)
 			rpc.offline()
 			log.Printf("relay ended: %v; redialing", relayErr)
 		} else {
@@ -471,17 +463,90 @@ func quiesceExecs(execs execKiller, notifier eventNotifier, nonce uint64) {
 	}
 }
 
+// execReporter is the one method serveConn needs from the exec runner, named
+// as an interface so the delivery rules can be tested without a sandbox to
+// have processes in.
+type execReporter interface {
+	// LiveReport states the current live-exec count under a fresh sequence
+	// number.
+	LiveReport() (live int, seq uint64)
+}
+
 // reportExecs states this sandbox's live exec count over one connection. A
 // failure is logged and dropped: the conn is already dying (serveConn is about
 // to say so), the next dial restates the count, and there is nothing a
 // sandbox can usefully do about a runner it cannot reach.
-func reportExecs(sender controlSender, execs *sandboxexec.Runner) {
+//
+// A nil reporter is the dev-mode and test shape — no exec runner to speak for
+// — and says nothing at all.
+func reportExecs(sender controlSender, execs execReporter) {
+	if execs == nil {
+		return
+	}
 	if p := execCountPayload(execs.LiveReport()); p != nil {
 		if err := sender.Send(p); err != nil {
 			log.Printf("reporting the live exec count: %v; the next connection restates it", err)
 		}
 	}
 }
+
+// execCountMailbox is the one-slot queue this sandbox's live-exec reports wait
+// in, and REPLACING is the whole of what makes it different from `events`.
+//
+// A live-exec count is absolute, so the newest report is the only one worth
+// delivering and every older one is noise. offerControl's overflow rule is the
+// opposite — it drops the arriving payload, which for a count means dropping
+// the truth and keeping the history — and appendPending's is the opposite of
+// that again. Neither is wrong for the events they were written for; both are
+// wrong for this one, and a count that was dropped with no further transition
+// coming is the cold stop this feature exists to prevent.
+//
+// It holds ONE report. Offering never blocks, so the goroutine that just gave
+// an exec slot back is not made to wait on a connection that may not exist.
+type execCountMailbox struct {
+	mu sync.Mutex
+	ch chan []byte
+}
+
+func newExecCountMailbox() *execCountMailbox {
+	return &execCountMailbox{ch: make(chan []byte, 1)}
+}
+
+// watchExecs is the whole wiring between the exec runner and the mailbox, in
+// one place so that it is a function a test can call rather than three lines
+// inside main that a test can only re-type. It is called before the relay can
+// accept a FrameOpen, so the first exec of the session's life is counted.
+func watchExecs(execs *sandboxexec.Runner) *execCountMailbox {
+	m := newExecCountMailbox()
+	execs.ObserveLive(func(live int, seq uint64) {
+		m.offer(execCountPayload(live, seq))
+	})
+	return m
+}
+
+// offer replaces whatever report is still waiting. The lock makes the discard
+// and the fill one step against other producers — several exec slots can come
+// back at once — so two offers cannot both find the slot empty and leave the
+// older one in it. The consumer only ever makes room, so the second send
+// cannot fail.
+func (m *execCountMailbox) offer(p []byte) {
+	if p == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	select {
+	case <-m.ch:
+	default:
+	}
+	select {
+	case m.ch <- p:
+	default:
+	}
+}
+
+// c is the receive end, for serveConn's select.
+func (m *execCountMailbox) c() <-chan []byte { return m.ch }
 
 // controlSender is the one method serveConn needs from
 // relay.ControlSender — named as an interface so the delivery rules below
@@ -527,7 +592,20 @@ const pendingCap = 8
 // few now that setup and child_exited can both be waiting: a failing setup
 // produces BOTH (the wrapper writes its rc and then exits with it), so the
 // pair is the normal case, not a corner.
-func serveConn(sender controlSender, errc <-chan error, events <-chan []byte, pending [][]byte) ([][]byte, error) {
+func serveConn(sender controlSender, errc <-chan error, events, execCounts <-chan []byte,
+	execs execReporter, pending [][]byte) ([][]byte, error) {
+	// This connection's exec count, restated rather than waited for, and
+	// FIRST. A transition that happened while there was no connection is gone
+	// — the mailbox holds one report and only a live conn drains it — so a
+	// dial is the one moment at which the runner's view and this sandbox's can
+	// have drifted with no further command coming to repair it. It costs one
+	// small frame per dial and it is what makes "an absolute count is
+	// self-correcting" true rather than merely likely.
+	//
+	// It carries the highest sequence number issued so far, so a report the
+	// mailbox is still holding from before this conn — which the loop below
+	// may deliver a moment later — cannot overwrite it at the far end.
+	reportExecs(sender, execs)
 	for {
 		for len(pending) > 0 {
 			if err := sender.Send(pending[0]); err != nil {
@@ -545,6 +623,17 @@ func serveConn(sender controlSender, errc <-chan error, events <-chan []byte, pe
 			return pending, err
 		case p := <-events:
 			pending = appendPending(pending, p)
+		case p := <-execCounts:
+			// Sent, never queued. A live-exec count is only ever about the
+			// connection in hand: if this one dies with the report
+			// undelivered, the next dial's restatement above says what is true
+			// THEN, which is a better answer than replaying what was true
+			// before. Queueing it would also put it in competition with the
+			// child's exit for the pending cap, and that exit has no second
+			// chance at all.
+			if err := sender.Send(p); err != nil {
+				log.Printf("live exec count not delivered (%v); the next connection restates it", err)
+			}
 		}
 	}
 }

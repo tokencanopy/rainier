@@ -285,6 +285,11 @@ which holds no viewer at all — and the timer starts again when the last comman
 ends. A session whose **boot** failed is kept too, however idle: attaching to it
 to read the log that says why is the only thing left to do with it.
 
+**Roll the runners before the session image.** A runner that predates `exec`'s live-count
+report logs an unknown control kind and drops it, which means idle auto-stop on that runner
+can still stop a session running a detached command. Same shape, same reason, as the order
+below.
+
 **Roll `controld` before the runners.** The auto-stop reports itself to the
 control plane with a `suspended_cold` event, which is additive — a control
 plane that predates it logs an unknown state and drops it, and the session row

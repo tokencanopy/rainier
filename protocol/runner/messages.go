@@ -122,12 +122,14 @@ type FromRunner struct {
 	Sessions []SessionInfo `json:"sessions,omitempty"` // announce
 	Used     int           `json:"used"`
 	Total    int           `json:"total"`
-	// Active and IdleExited split Used by what the sandbox is actually doing:
+	// Active and IdleExited split Used by whether the sandbox has WORK in it:
 	// Active counts sandboxes that are up with their child process still
-	// running, IdleExited those that are up with the child gone. Both are
-	// additive to Used/Total and ride every message beside them, so a control
-	// plane can say "16 slots, 3 active, 13 idle" rather than "no free
-	// capacity".
+	// running OR with a `rainier exec` command running (a detached run on a
+	// session whose agent has finished is work, and is exactly what the
+	// runner's idle auto-stop refuses to reclaim), IdleExited those that are
+	// up with neither. Both are additive to Used/Total and ride every message
+	// beside them, so a control plane can say "16 slots, 3 active, 13 idle"
+	// rather than "no free capacity".
 	//
 	// A runner that predates them sends neither, and they read as zero — which
 	// a consumer cannot tell apart from a current runner that is simply

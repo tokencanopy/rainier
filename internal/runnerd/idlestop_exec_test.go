@@ -2,6 +2,7 @@ package runnerd
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -304,5 +305,62 @@ func TestAWarmResumeKeepsTheExecBookkeeping(t *testing.T) {
 	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","live":1,"seq":1}`))
 	if got := liveExecsOn(h.rd, h.id); got != 0 {
 		t.Fatalf("a stale report set live=%d across an unpause, want 0", got)
+	}
+}
+
+// TestAShortCommandWhoseReportsArriveBackwardsStillStartsTheClock. runnerd
+// routes every control frame on a goroutine of its own, so a command short
+// enough to start and end inside that window can have its two reports applied
+// END-FIRST. The end, applied against a count of zero, stamps nothing; the
+// start is then refused as stale. Without the refusal path's own stamp the
+// session would be claimed on the CHILD's exit — half an hour before the rule
+// this feature states, which is the one direction the whole design refuses to
+// take.
+func TestAShortCommandWhoseReportsArriveBackwardsStillStartsTheClock(t *testing.T) {
+	h := newIdleHarness(t)
+	ctx := context.Background()
+	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"child_exited","rc":0}`))
+
+	// A command runs at 29 minutes, and its two reports land backwards.
+	h.clk.set(29 * time.Minute)
+	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","seq":2}`))
+	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"exec_count","live":1,"seq":1}`))
+
+	h.clk.set(30 * time.Minute)
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 0 {
+		t.Fatalf("stopped %v thirty minutes after the child exited, one minute after a "+
+			"command ran in it", stops)
+	}
+	h.clk.set(59 * time.Minute)
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 1 || stops[0] != h.id {
+		t.Fatalf("sweep at 59m stopped %v, want [%s] — thirty minutes after the command",
+			stops, h.id)
+	}
+}
+
+// TestRestatingNoneLiveDoesNotPushTheDeadlineOut. sessiond restates its count
+// on every connection it makes, so a sandbox whose conn flaps sends "none
+// live" again and again. Stamping the clock on every applied zero — rather
+// than only on the TRANSITION to zero — would make a flapping conn keep a
+// genuinely idle session alive forever, which is the leak this feature exists
+// to end, reintroduced by its own repair mechanism.
+func TestRestatingNoneLiveDoesNotPushTheDeadlineOut(t *testing.T) {
+	h := newIdleHarness(t)
+	ctx := context.Background()
+	h.rd.routeControl(h.id, h.boot[h.id], []byte(`{"kind":"child_exited","rc":0}`))
+
+	// A dial a minute for half an hour, each restating "nothing is running".
+	for i := 1; i <= 30; i++ {
+		h.clk.set(time.Duration(i) * time.Minute)
+		h.rd.routeControl(h.id, h.boot[h.id],
+			[]byte(fmt.Sprintf(`{"kind":"exec_count","seq":%d}`, i)))
+	}
+	if e := h.entry(h.id); !e.lastExecEndedAt.IsZero() {
+		t.Fatalf("restating an already-zero count stamped the clock at %s", e.lastExecEndedAt)
+	}
+	h.clk.set(30 * time.Minute)
+	if stops := h.rd.sweepIdle(ctx, 30*time.Minute); len(stops) != 1 || stops[0] != h.id {
+		t.Fatalf("sweep stopped %v, want [%s]: a session running nothing was kept alive by "+
+			"a flapping conn's restatements", stops, h.id)
 	}
 }

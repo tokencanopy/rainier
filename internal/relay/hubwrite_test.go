@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 // ---------------------------------------------------------------------------
@@ -76,7 +78,7 @@ func TestAStuckClientDoesNotStallTheOtherAttachments(t *testing.T) {
 	defer cancel()
 
 	const budget = 150 * time.Millisecond
-	h := newHub(ctx, runnerEnd, nil, budget)
+	h := newHub(ctx, runnerEnd, nil, budget, budget)
 	defer h.Close()
 
 	// Two attachments over the one session conn: a stuck exec caller and a
@@ -84,7 +86,7 @@ func TestAStuckClientDoesNotStallTheOtherAttachments(t *testing.T) {
 	// Attached one at a time, because AttachClient assigns the ids and two
 	// racing goroutines would not agree on which is which.
 	stuck := newStuckConn()
-	go h.AttachClient(ctx, stuck, Open{Kind: "exec"})
+	go h.AttachClient(ctx, stuck, Open{Kind: runner.KindExec})
 	waitForClients(t, h, 1)
 	viewer, viewerEnd := newPipe()
 	go h.AttachClient(ctx, viewer, Open{})
@@ -159,7 +161,7 @@ func TestAHealthyClientIsNotDroppedByTheBudget(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	h := newHub(ctx, runnerEnd, nil, 2*time.Second)
+	h := newHub(ctx, runnerEnd, nil, 2*time.Second, 2*time.Second)
 	defer h.Close()
 	client, clientEnd := newPipe()
 	go h.AttachClient(ctx, client, Open{})
@@ -181,5 +183,91 @@ func TestAHealthyClientIsNotDroppedByTheBudget(t *testing.T) {
 	h.mu.Unlock()
 	if still != 1 {
 		t.Fatalf("a healthy client was dropped; %d attachment(s) left", still)
+	}
+}
+
+// TestTheProductionHubIsBounded pins the wiring, not just the mechanism.
+// NewHubWithControl is what every host actually calls, and passing a zero here
+// — which writeClient reads as "no bound at all" — would restore the very
+// behaviour this change removes while leaving every test above green, because
+// they all name their own budgets.
+func TestTheProductionHubIsBounded(t *testing.T) {
+	_, runnerEnd := newPipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := NewHubWithControl(ctx, runnerEnd, nil)
+	defer h.Close()
+	if h.termWrite <= 0 || h.execWrite <= 0 {
+		t.Fatalf("the production hub writes clients unbounded: term=%s exec=%s",
+			h.termWrite, h.execWrite)
+	}
+}
+
+// TestTheHubNeverOverrulesThePlane is the ordering the two budgets exist
+// inside, stated as an invariant rather than left in a comment.
+//
+// attachplane gives a TERMINAL viewer sixty seconds plus a byte allowance and
+// an EXEC caller twenty plus the same allowance, and it made both trades
+// deliberately — a person disconnected mid-scrollback loses their session,
+// where a script has nothing to lose by re-running its command. A shorter
+// budget on THIS hop would silently overrule those decisions on a hop that
+// cannot see it is making them, and the human's half of that is the expensive
+// one. internal/relay's own execWriterWait carries the same rule for the same
+// reason (see TestTheWaitAndTheWriteHaveSeparateBudgets).
+func TestTheHubNeverOverrulesThePlane(t *testing.T) {
+	// attachplane's defaultClientWriteBase and defaultExecWriteBase. Spelled
+	// as literals because they are unexported there, exactly as
+	// TestTheWaitAndTheWriteHaveSeparateBudgets spells the exec one.
+	const planeTerminalBase, planeExecBase = 60 * time.Second, 20 * time.Second
+	if clientWriteBase <= planeTerminalBase {
+		t.Fatalf("the hub gives a terminal viewer %s where the plane gives it %s; "+
+			"this hop would drop a person the plane meant to keep",
+			clientWriteBase, planeTerminalBase)
+	}
+	if execWriteBase <= planeExecBase {
+		t.Fatalf("the hub gives an exec caller %s where the plane gives it %s",
+			execWriteBase, planeExecBase)
+	}
+	// And the byte allowance has to be at least as generous as the plane's,
+	// or the ordering above holds only for an empty frame. The plane budgets
+	// the BASE64 size of a payload against the same rate, so budgeting the
+	// raw wire bytes here — which is what this hop forwards — is the more
+	// generous of the two for every size.
+	if got, want := writeBudget(clientWriteBase, 16<<20),
+		planeTerminalBase+time.Duration(16<<20)*time.Second/(64<<10); got <= want {
+		t.Fatalf("on the largest frame the hub gives %s and the plane gives at least %s", got, want)
+	}
+}
+
+// TestAnExecAttachmentGetsTheExecBudget: the kind reaches the budget. Without
+// it every attachment would take the terminal one, and the case this bound was
+// added for — an exec caller that has stopped reading — would wait out a
+// person's budget instead of a script's.
+func TestAnExecAttachmentGetsTheExecBudget(t *testing.T) {
+	_, runnerEnd := newPipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newHub(ctx, runnerEnd, nil, time.Minute, 10*time.Millisecond)
+	defer h.Close()
+
+	stuck := newStuckConn()
+	go h.AttachClient(ctx, stuck, Open{Kind: runner.KindExec})
+	waitForClients(t, h, 1)
+	h.mu.Lock()
+	cl := h.clients[1]
+	h.mu.Unlock()
+	if !cl.exec {
+		t.Fatal("an exec attachment was not recorded as one")
+	}
+	// The write returns on the EXEC budget (10ms), not the terminal one (1m).
+	done := make(chan error, 1)
+	go func() { done <- h.writeClient(cl, []byte(`"x"`)) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a stuck client's write succeeded")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the write took the terminal budget, not the exec one")
 	}
 }

@@ -179,3 +179,48 @@ func TestNoObserverIsNoReport(t *testing.T) {
 	r.KillAll()
 	p.exit(Status{Code: 0})
 }
+
+// TestAPanickingSpawnDoesNotWedgeTheRunner. OpenExec runs the whole open
+// behind `defer a.guard(...)`, whose recovery calls release — which takes the
+// runner's mutex. A reserve that unlocked by hand rather than through a defer
+// would leave that mutex held on any panic inside it, and the recovery that
+// exists to keep one command's bug from costing the session would deadlock on
+// it instead: every later exec, every LiveCount, KillAll, and the warm-suspend
+// handshake with them.
+//
+// The panic here is the one this package already scripts (a starter that
+// panics), and the assertion is that the runner is still usable afterwards.
+func TestAPanickingSpawnDoesNotWedgeTheRunner(t *testing.T) {
+	panicking := func(Request, func([]byte) error, func([]byte) error) (Proc, error) {
+		panic("a bug in the spawn")
+	}
+	r, _ := testRunner(t, panicking)
+	var rec liveRecorder
+	r.ObserveLive(rec.observe)
+	spec := withTool(t, r, "tool")
+
+	drainAttachment(t, r.OpenExec(spec))
+
+	// The runner still answers, on a bounded wait rather than by hanging the
+	// suite: a wedged mutex would park this goroutine for good.
+	done := make(chan int, 1)
+	go func() { done <- r.LiveCount() }()
+	select {
+	case n := <-done:
+		if n != 0 {
+			t.Fatalf("the panicking spawn still holds %d slot(s)", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the runner's mutex is still held after a panicking spawn")
+	}
+
+	// And it can still run a command, which is what guard's whole existence
+	// promises.
+	done2 := make(chan struct{})
+	go func() { r.KillAllAndWait(time.Second); close(done2) }()
+	select {
+	case <-done2:
+	case <-time.After(5 * time.Second):
+		t.Fatal("KillAllAndWait could not take the runner's mutex")
+	}
+}
