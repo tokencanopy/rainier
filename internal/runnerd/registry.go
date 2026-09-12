@@ -101,6 +101,34 @@ type sessionEntry struct {
 	// one session (an operator's, arriving while a Delete owns the entry), and
 	// the first to finish must not clear the second's claim.
 	stopsInFlight int
+	// liveExecs is how many commands `rainier exec` is running inside this
+	// sandbox right now, detached ones included, as of the last report this
+	// runner applied. A session running one is not idle, exactly as a session
+	// with a viewer attached is not idle.
+	//
+	// It has to be TOLD, like the child's exit: an ATTACHED exec happens to
+	// hold an attachment (it shares dialAttachBack), but a DETACHED one holds
+	// nothing at all — and a detached run outliving its caller is the whole
+	// meaning of the flag. Without this the 30m default cold-stops a session
+	// whose agent finished, and `docker stop`'s SIGTERM kills
+	// `rainier exec s --detach -- claude --continue`: the case exec exists
+	// for. See docs/design/exec-idle-stop.md.
+	//
+	// Zero is also what an old sessiond that never sends the report leaves
+	// here, which is why the attached-exec case still has its attachment to
+	// fall back on and why this is additive rather than a new requirement.
+	liveExecs int
+	// lastExecEndedAt is when liveExecs last fell to zero. It is to a command
+	// what lastDetachAt is to a viewer: the idle clock starts when the LAST
+	// exec ends, not when the agent's child exited an hour earlier.
+	lastExecEndedAt time.Time
+	// execSeq is the highest sequence number this entry has applied. The
+	// sandbox assigns them under the lock that changes its own count and
+	// reports outside it, so two reports can arrive in the wrong order; a
+	// report that does not advance this is refused rather than believed.
+	// Without it a "one live" landing after a "none live" would pin the
+	// session out of auto-stop for the life of the runner.
+	execSeq uint64
 	// bootFailed records that this session's boot chain failed (setup, clone
 	// or init). Such a session is deliberately never idle-stopped: the whole
 	// reason the CLI lets you attach to a failed session is to read the log
@@ -112,18 +140,27 @@ type sessionEntry struct {
 }
 
 // idleFor reports how long this session has been idle at now, and whether it
-// is idle at all: its container is up, its child has exited, and nothing is
-// attached. Callers must hold the registry lock.
+// is idle at all: its container is up, its child has exited, nothing is
+// attached, and it is running no commands. Callers must hold the registry
+// lock.
 //
 // The clock is the caller's, and both times come from it, so in production
 // both carry Go's monotonic reading and this subtraction uses it — a wall
 // clock stepped by NTP can neither make a session look idle early nor keep
 // one from ever looking idle.
 //
-// The idle clock starts at the LATER of the child's exit and the last
-// detach, which is the whole reason lastDetachAt is kept.
+// The idle clock starts at the LATEST of the child's exit, the last detach and
+// the end of the last exec, which is the whole reason lastDetachAt and
+// lastExecEndedAt are kept.
 func (e *sessionEntry) idleFor(now time.Time) (time.Duration, bool) {
 	if e.state != "running" || e.attachments > 0 || e.childExitedAt.IsZero() {
+		return 0, false
+	}
+	// A live command is activity, on exactly the terms an attachment is: the
+	// sweep's own rule is that a session with work in it is never stopped, and
+	// a detached exec is the work a user most wants left alone. See
+	// sessionEntry.liveExecs.
+	if e.liveExecs > 0 {
 		return 0, false
 	}
 	if e.driverOps > 0 || e.bootFailed {
@@ -132,6 +169,9 @@ func (e *sessionEntry) idleFor(now time.Time) (time.Duration, bool) {
 	since := e.childExitedAt
 	if e.lastDetachAt.After(since) {
 		since = e.lastDetachAt
+	}
+	if e.lastExecEndedAt.After(since) {
+		since = e.lastExecEndedAt
 	}
 	return now.Sub(since), true
 }
@@ -511,6 +551,43 @@ func (r *registry) childExited(id string, boot uint64, at time.Time) {
 	}
 }
 
+// execCount records what the sandbox says it is running: live commands as of
+// sequence seq, reported at time at.
+//
+// Three things can make this report a lie, and each is refused rather than
+// believed:
+//
+//   - it names a boot this session has moved past — the same guard, for the
+//     same reason, as childExited's: a hub read loop stalled on a wedged
+//     viewer drains its buffered frames whenever it comes back, which can be
+//     after the sandbox has been stopped, resumed and re-registered;
+//   - it does not advance the sequence, so it is a report that was overtaken
+//     on its way here (the sandbox numbers them under the lock that changes
+//     the count and sends outside it) or one replayed after a resume cleared
+//     the entry;
+//   - it is negative, which nothing sends, and which would make `liveExecs`
+//     read as "fewer than no commands".
+//
+// The idle clock is stamped only on the transition to zero, so a session that
+// runs three commands and finishes the last one at T is idle from T, and a
+// repeat report of zero does not push that deadline out.
+func (r *registry) execCount(id string, boot uint64, live int, seq uint64, at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.items[id]
+	if !ok || e.boot != boot || seq <= e.execSeq {
+		return
+	}
+	e.execSeq = seq
+	if live < 0 {
+		live = 0
+	}
+	if e.liveExecs > 0 && live == 0 {
+		e.lastExecEndedAt = at
+	}
+	e.liveExecs = live
+}
+
 // currentBoot returns the sandbox-boot epoch id is on, which register READS
 // (rather than mints) and every control frame from that connection then
 // carries. Zero ONLY for a session this registry does not hold: every entry is
@@ -597,6 +674,12 @@ func (r *registry) endOp(id string) {
 // deliberately never reclaims (see sessionEntry.bootFailed). The count says
 // what is up with no agent in it, which is the truth about the machine; it is
 // not a promise about what the sweep will hand back.
+//
+// A session whose agent has gone but which is RUNNING A COMMAND is counted as
+// active, not idle-exited. `rainier exec s --detach -- claude --continue` on a
+// finished session is the shape this feature exists to keep alive, and a box
+// of them reporting "no agents in here" would be the same confident lie the
+// recovered-session exemption above refuses to tell.
 func (r *registry) counts() (active, idleExited int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -604,7 +687,7 @@ func (r *registry) counts() (active, idleExited int) {
 		if e.state != "running" || e.recovered {
 			continue
 		}
-		if e.childExitedAt.IsZero() {
+		if e.childExitedAt.IsZero() || e.liveExecs > 0 {
 			active++
 			continue
 		}
@@ -790,6 +873,16 @@ func (r *registry) resumed(id string, restarted bool) {
 	}
 	e.childExitedAt = time.Time{}
 	e.lastDetachAt = time.Time{}
+	// The restarted container's commands are gone with its process tree, and
+	// its sessiond is a NEW process whose sequence numbers start again at 1 —
+	// so the fence has to be cleared with the count, or every report from the
+	// new sandbox would look stale and be refused for the life of the entry.
+	// A warm resume clears none of this and must not: nothing restarted, the
+	// same sessiond keeps counting, and the suspend handshake has already
+	// killed its execs and reported zero.
+	e.liveExecs = 0
+	e.lastExecEndedAt = time.Time{}
+	e.execSeq = 0
 	// A restart this runner made is a process tree it watched start, so a
 	// recovered session stops being one the moment it is cold-resumed: its
 	// child is running, and `active` can say so.

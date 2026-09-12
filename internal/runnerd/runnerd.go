@@ -1141,6 +1141,17 @@ func (s *Server) routeControl(id string, boot uint64, payload []byte) {
 		// state here — see RunIdleStop for the timeout that does.
 		s.reg.childExited(id, boot, s.now())
 		s.fireEventDetail(id, "child_exited", strconv.Itoa(ev.RC))
+	case relay.KindExecCount:
+		// How many commands `rainier exec` is running in there. Recorded and
+		// not reported: it is the runner's own fact, the way attachment
+		// liveness is, and the only thing above this runner that needs it is
+		// the active/idle_exited split that already rides every message.
+		//
+		// Nothing is logged either. A CI loop is a command per step, so a line
+		// per transition would be the noisiest thing in a runner's log and
+		// would say nothing an operator can act on; the capacity counts are
+		// where this becomes visible.
+		s.reg.execCount(id, boot, ev.Live, ev.Seq, s.now())
 	case "resp":
 		// The sandbox's answer to a request controld sent down. Forwarded
 		// verbatim, id included: an id assigned by one end and echoed by the
@@ -1300,7 +1311,7 @@ func (s *Server) deliverSuspend(id string, nonce uint64, ready bool) {
 	}
 }
 
-// sendSessionRPC delivers one envelope into a sandbox as a control frame:// sendSessionRPC delivers one envelope into a sandbox as a control frame: a
+// sendSessionRPC delivers one envelope into a sandbox as a control frame: a
 // request controld originated, or the response to one the sandbox originated.
 // It is the mirror of routeControl's forwarding, and the one place the
 // envelope/ControlEvent translation happens in this direction.

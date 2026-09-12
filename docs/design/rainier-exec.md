@@ -262,6 +262,21 @@ needed:
   caller has the pid, the sandbox has `ps`, and a listing API would be a
   second source of truth about processes the sandbox already knows about.
 
+  One more thing had to be true for that lifetime rule to hold, and it was not:
+  **the runner's idle auto-stop has to know the command is there.** `runnerd`
+  stops a session whose agent child has exited and that has had no attachment
+  for `--idle-stop` (default 30m) — and a detached exec is neither. `claude
+  --continue` resumed by an unattended supervisor is *exactly* the session
+  whose original agent has finished and whose caller has hung up, so the
+  default would have cold-stopped it half an hour in, and the cold stop's
+  SIGTERM reaches `onShutdownSignal` and kills the command. So the sandbox
+  reports its live exec count to the runner as an `exec_count` control event on
+  every transition, and the runner treats a live exec exactly as it treats an
+  attachment: the session is never idle while one is running, the idle clock
+  restarts when the last one ends, and the capacity line reports such a session
+  as `active`. See [`runner-idle-stop.md`](runner-idle-stop.md) and
+  [`exec-idle-stop.md`](exec-idle-stop.md).
+
 The process is spawned in its own process group with stdin on `/dev/null`,
 and it counts against the same eight-exec cap an attached one does, because
 it is a process in the same container.

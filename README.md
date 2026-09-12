@@ -279,9 +279,11 @@ person.
 Two rules it never breaks: a session whose agent is still running is never
 stopped, however long nobody has been watching it (a long unattended build is
 the point), and nothing is ever deleted. A session with any viewer attached is
-not idle, and the timer starts again when the last one leaves. A session whose
-**boot** failed is kept too, however idle: attaching to it to read the log that
-says why is the only thing left to do with it.
+not idle, and the timer starts again when the last one leaves. The same is true
+of a session running a `rainier exec` command — including a `--detach`ed one,
+which holds no viewer at all — and the timer starts again when the last command
+ends. A session whose **boot** failed is kept too, however idle: attaching to it
+to read the log that says why is the only thing left to do with it.
 
 **Roll `controld` before the runners.** The auto-stop reports itself to the
 control plane with a `suspended_cold` event, which is additive — a control

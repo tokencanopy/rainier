@@ -3,6 +3,7 @@ package runnerd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -61,6 +62,9 @@ type idleHarness struct {
 	// the one a real /register mints. Control frames carry it, and the
 	// registry drops the ones that name a boot the session has moved past.
 	boot map[string]uint64
+	// seq numbers the live-exec reports this harness sends, the way a
+	// sandbox's own exec runner numbers them.
+	seq uint64
 }
 
 // newIdleHarness creates a runner with one running session whose sandbox the
@@ -141,13 +145,17 @@ func (h *idleHarness) used() int {
 type idleAction int
 
 const (
-	childExits     idleAction = iota // sessiond reports child_exited
-	viewerAttaches                   // an attachment opens (either front)
-	viewerDetaches                   // that attachment closes
-	operatorStops                    // `rainier stop`: a cold suspend from controld
-	sessionResumes                   // `rainier attach` on a stopped session
-	warmSuspends                     // a warm suspend: `docker pause`, slot kept
-	sweeps                           // the idle loop looks
+	childExits       idleAction = iota // sessiond reports child_exited
+	viewerAttaches                     // an attachment opens (either front)
+	viewerDetaches                     // that attachment closes
+	operatorStops                      // `rainier stop`: a cold suspend from controld
+	sessionResumes                     // `rainier attach` on a stopped session
+	warmSuspends                       // a warm suspend: `docker pause`, slot kept
+	sweeps                             // the idle loop looks
+	execStarts                         // `rainier exec` starts a command in the sandbox
+	execEnds                           // ...and it finishes, or the session kills it
+	secondExecStarts                   // a second command, while the first is still running
+	secondExecEnds                     // ...and one of the two finishes
 )
 
 // idleStep is one scripted action at a moment on the fake clock, expressed as
@@ -155,6 +163,23 @@ const (
 type idleStep struct {
 	at  time.Duration
 	act idleAction
+}
+
+// execSeq numbers the exec counts the harness sends, exactly as a sandbox's
+// own runner does: a report that does not advance the sequence is refused, so
+// a script that sent two live counts with one number would be testing the
+// fence rather than the rule.
+func (h *idleHarness) nextExecSeq() uint64 {
+	h.seq++
+	return h.seq
+}
+
+// execCount sends one live-exec report up the session's control channel, the
+// way sessiond's observer does.
+func (h *idleHarness) execCount(live int) {
+	h.t.Helper()
+	h.rd.routeControl(h.id, h.boot[h.id],
+		[]byte(fmt.Sprintf(`{"kind":"exec_count","live":%d,"seq":%d}`, live, h.nextExecSeq())))
 }
 
 // run plays one step.
@@ -189,6 +214,16 @@ func (h *idleHarness) run(idle time.Duration, s idleStep) {
 		// that minted only when the production code had already behaved
 		// correctly would be asserting its own premise.
 		h.register(h.id)
+	case execStarts:
+		// Through the real control-frame path, like the child's exit: the
+		// fact has to survive routeControl to be worth anything.
+		h.execCount(1)
+	case execEnds:
+		h.execCount(0)
+	case secondExecStarts:
+		h.execCount(2)
+	case secondExecEnds:
+		h.execCount(1)
 	case sweeps:
 		h.stops = append(h.stops, h.rd.sweepIdle(ctx, idle)...)
 	}
@@ -257,6 +292,127 @@ func TestIdleStopRule(t *testing.T) {
 		},
 		{
 			name: "child exited but a viewer is attached",
+			steps: []idleStep{
+				{at: 0, act: childExits},
+				{at: 1 * time.Minute, act: viewerAttaches},
+				{at: 10 * time.Hour, act: sweeps},
+			},
+			wantStops: 0,
+			wantUsed:  1,
+		},
+		{
+			// The motivating case: `rainier exec s --detach -- claude
+			// --continue` resumes an unattended run, its caller hangs up (that
+			// is the flag), and the agent process that started the session is
+			// long gone. Nothing here is an attachment, so before this rule
+			// the 30m default stopped the session and docker stop's SIGTERM
+			// killed the command.
+			name: "child exited, a detached exec is running",
+			steps: []idleStep{
+				{at: 0, act: execStarts},
+				{at: 1 * time.Minute, act: childExits},
+				{at: 6 * time.Hour, act: sweeps},
+				{at: 12 * time.Hour, act: sweeps},
+			},
+			wantStops: 0,
+			wantUsed:  1,
+		},
+		{
+			name: "the timer runs from the last exec's end, not from the child's exit",
+			steps: []idleStep{
+				{at: 0, act: childExits},
+				{at: 1 * time.Minute, act: execStarts},
+				{at: 2 * time.Hour, act: execEnds},
+				// Two hours past the exit, twenty-nine minutes past the
+				// command — the same rule as the last detach.
+				{at: 2*time.Hour + 29*time.Minute, act: sweeps},
+			},
+			wantStops: 0,
+			wantUsed:  1,
+		},
+		{
+			name: "and fires a timeout after that exec ended",
+			steps: []idleStep{
+				{at: 0, act: childExits},
+				{at: 1 * time.Minute, act: execStarts},
+				{at: 2 * time.Hour, act: execEnds},
+				{at: 2*time.Hour + 30*time.Minute, act: sweeps},
+			},
+			wantStops: 1,
+			wantUsed:  0,
+		},
+		{
+			name: "one of two commands finishing is not the last exec ending",
+			steps: []idleStep{
+				{at: 0, act: childExits},
+				{at: 1 * time.Minute, act: execStarts},
+				{at: 2 * time.Minute, act: secondExecStarts},
+				{at: 3 * time.Minute, act: secondExecEnds},
+				{at: 10 * time.Hour, act: sweeps},
+			},
+			wantStops: 0,
+			wantUsed:  1,
+		},
+		{
+			name: "the clock starts when the second of them ends",
+			steps: []idleStep{
+				{at: 0, act: childExits},
+				{at: 1 * time.Minute, act: execStarts},
+				{at: 2 * time.Minute, act: secondExecStarts},
+				{at: 3 * time.Minute, act: secondExecEnds},
+				{at: 1 * time.Hour, act: execEnds},
+				{at: 1*time.Hour + 30*time.Minute, act: sweeps},
+			},
+			wantStops: 1,
+			wantUsed:  0,
+		},
+		{
+			// A viewer and a command are independent holds on the same
+			// session, and the clock starts at the LATER of the two ends.
+			name: "a viewer leaves while a command is still running",
+			steps: []idleStep{
+				{at: 0, act: childExits},
+				{at: 1 * time.Minute, act: viewerAttaches},
+				{at: 2 * time.Minute, act: execStarts},
+				{at: 1 * time.Hour, act: viewerDetaches},
+				{at: 1*time.Hour + 40*time.Minute, act: sweeps},
+				{at: 2 * time.Hour, act: execEnds},
+				{at: 2*time.Hour + 29*time.Minute, act: sweeps},
+			},
+			wantStops: 0,
+			wantUsed:  1,
+		},
+		{
+			name: "the timer runs from that command's end",
+			steps: []idleStep{
+				{at: 0, act: childExits},
+				{at: 1 * time.Minute, act: viewerAttaches},
+				{at: 2 * time.Minute, act: execStarts},
+				{at: 1 * time.Hour, act: viewerDetaches},
+				{at: 2 * time.Hour, act: execEnds},
+				{at: 2*time.Hour + 30*time.Minute, act: sweeps},
+			},
+			wantStops: 1,
+			wantUsed:  0,
+		},
+		{
+			// An old sessiond sends no exec_count at all, and this is what it
+			// looks like: exactly the behaviour this runner had before the
+			// report existed.
+			name: "a sandbox that never reports a command is stopped as it always was",
+			steps: []idleStep{
+				{at: 0, act: childExits},
+				{at: 30 * time.Minute, act: sweeps},
+			},
+			wantStops: 1,
+			wantUsed:  0,
+		},
+		{
+			// ...and an ATTACHED exec on such a sandbox is still covered, by
+			// the attachment it holds over the session's hub. That accident is
+			// what made this a should-fix rather than a blocker, and it keeps
+			// working.
+			name: "an attached exec on an old sandbox still counts through its attachment",
 			steps: []idleStep{
 				{at: 0, act: childExits},
 				{at: 1 * time.Minute, act: viewerAttaches},
