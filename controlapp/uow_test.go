@@ -102,6 +102,11 @@ func (r *uowEnvRepo) DeleteEnvironment(ctx context.Context, ws control.Workspace
 	return r.sessionStubEnvironmentRepo.DeleteEnvironment(ctx, ws, id)
 }
 
+func (r *uowEnvRepo) DeleteEnvironmentUnlessReferenced(ctx context.Context, ws control.WorkspaceID, id control.EnvironmentID, states []control.SessionState) error {
+	r.deleteDepth = unitDepth(ctx)
+	return r.sessionStubEnvironmentRepo.DeleteEnvironmentUnlessReferenced(ctx, ws, id, states)
+}
+
 // uowRecorder is the event recorder reporting the depth each record ran at.
 type uowRecorder struct {
 	*sessionStubEventRecorder

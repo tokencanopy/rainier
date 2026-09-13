@@ -160,6 +160,9 @@ func (fleetExtEnvironments) UpdateEnvironment(context.Context, control.Workspace
 func (fleetExtEnvironments) DeleteEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID) error {
 	return control.ErrUnsupported
 }
+func (fleetExtEnvironments) DeleteEnvironmentUnlessReferenced(context.Context, control.WorkspaceID, control.EnvironmentID, []control.SessionState) error {
+	return control.ErrUnsupported
+}
 func (fleetExtEnvironments) CountSessionsByEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID, []control.SessionState) (int, error) {
 	return 0, nil
 }
