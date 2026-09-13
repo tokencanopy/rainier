@@ -11,8 +11,10 @@ type reported struct {
 	at   uint64
 }
 
-// LatestSize returns the size of the most recently reported entry, and whether
-// there was one at all.
+// latestSize returns the size of the most recently reported entry, and whether
+// there was one at all. It is unexported because its argument is: the tick that
+// orders these entries is the session's own, so nothing outside this package can
+// build a meaningful one.
 //
 // This is the "latest client" rule: the pty follows the most recent resize from
 // any attachment that may type. It replaced smallest-per-axis when the shared
@@ -30,7 +32,7 @@ type reported struct {
 // Under the exclusive policy exactly one attachment is entitled at any instant,
 // so this returns that attachment's size — the value smallest-per-axis returned
 // too.
-func LatestSize(entries []reported) (Size, bool) {
+func latestSize(entries []reported) (Size, bool) {
 	if len(entries) == 0 {
 		return Size{}, false
 	}

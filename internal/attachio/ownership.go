@@ -179,9 +179,16 @@ func (o *ownership) observe(m terminal.ServerMessage) string {
 //     offers no key. --view asked for it and is told nothing;
 //   - becoming a typer again says so, which is the answer to a release this
 //     client made or a revocation that ended;
-//   - losing the ability to type says so without offering a key that cannot
-//     take it back: under this policy no peer can do that to this attach, only
-//     its own release and a plane-side revocation.
+//   - not being able to type says so, without offering a key that cannot take
+//     it back: under this policy no peer can do that to this attach, only its
+//     own release and a plane-side revocation. That answer is repeated for a
+//     REFUSED CLAIM, which is the press of the take-control key by somebody who
+//     may not drive. An answer it can read is the whole reason that key stays
+//     live under this policy — a key that produces nothing at all is the one
+//     outcome a person cannot tell from a broken connection — and the sentence a
+//     lost race uses ("somebody else got there first; press Ctrl-\ to try
+//     again") is wrong twice over here: nobody got there first, and trying
+//     again cannot work.
 func (o *ownership) sharedNotice(m terminal.ServerMessage, was string, first bool) string {
 	typing := o.mode != terminal.ModeView
 	switch {
@@ -195,6 +202,17 @@ func (o *ownership) sharedNotice(m terminal.ServerMessage, was string, first boo
 	case typing && was == terminal.ModeView:
 		return NoticeHaveControl
 	case !typing && was != terminal.ModeView:
+		return NoticeViewOnly
+	case m.Type == terminal.TypeStale:
+		// A claim this client sent, refused. It was already a viewer, so
+		// nothing about its state changed and the three cases above have
+		// nothing to report — but a person pressed a key, and the answer to
+		// that press is what this policy has to say about it.
+		if o.neverClaim {
+			// --view never sends a claim (see claim()), so this is a `stale`
+			// nobody asked for. Saying nothing is right.
+			return ""
+		}
 		return NoticeViewOnly
 	}
 	return ""

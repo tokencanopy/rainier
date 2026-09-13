@@ -159,8 +159,15 @@ func (p *Plane) Broker() control.AttachmentBroker { return broker{p} }
 // Typers reports how many terminals attached to session THROUGH THIS REPLICA
 // may currently type into it. A host renders it as a status fact — the count
 // in `rainier info`'s input row, and the one an opening notice names — and
-// never as an authorization input: an attach on another replica is not
-// counted, and the number can change the instant after it is read.
+// never as an authorization input.
+//
+// Three ways it is approximate, all of them deliberate: an attach on another
+// replica is not counted; an attach is counted from the moment it is
+// registered, which is before its terminal exists (a client that connects and
+// says nothing is counted until its first-message timeout, and one whose runner
+// never dials back until the pairing TTL); and the number can change the
+// instant after it is read. It is a count and never an identity: nothing about
+// who, where or on what device is derivable from it.
 func (p *Plane) Typers(session control.SessionID) int { return p.owners.typers(session) }
 
 // BackHandler returns the runner's dial-back endpoint. Mount it at the path

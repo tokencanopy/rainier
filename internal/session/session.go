@@ -25,7 +25,7 @@ type viewer struct {
 	// sizeAt is the session tick this viewer last reported its size at — on
 	// its attach, and on every resize after it. It is what makes the pty
 	// follow the LATEST resize from any attachment that may type rather than
-	// the smallest of them: see LatestSize.
+	// the smallest of them: see latestSize.
 	sizeAt uint64
 	bind   Binding
 }
@@ -339,7 +339,7 @@ func (s *Session) SetSize(id int, gen uint64, size Size) bool {
 }
 
 // applySizeLocked resizes the pty to what its TYPERS ask for: the most recent
-// resize any of them reported, the "latest client" rule (LatestSize). With one
+// resize any of them reported, the "latest client" rule (latestSize). With one
 // attachment that is the same rule it has always been. A viewer's size is
 // remembered and never applied, which is what makes a viewer harmless — a
 // session whose typers have all gone keeps the size it had rather than snapping
@@ -353,7 +353,7 @@ func (s *Session) applySizeLocked() {
 		}
 		sizes = append(sizes, reported{size: v.size, at: v.sizeAt})
 	}
-	eff, ok := LatestSize(sizes)
+	eff, ok := latestSize(sizes)
 	if !ok || eff == s.size {
 		return
 	}

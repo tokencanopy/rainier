@@ -1577,7 +1577,7 @@ func runNew(args []string) error {
 	// created seconds ago has a log measured in kilobytes, so replaying it
 	// from the first entry costs nothing and is the only way the user sees
 	// what happened before they got here.
-	return attachWithRetry(cfg, created.ID, terminal.SinceAll)
+	return attachWithRetryFor(cfg, created, terminal.SinceAll)
 }
 
 // newSessionError turns a refusal to create into the one sentence a person
@@ -1674,6 +1674,21 @@ func attachWithRetry(cfg cli.Config, id string, since uint64) error {
 	return attachWithRetrySleep(cfg, id, since, nil)
 }
 
+// attachWithRetryFor is attachWithRetry for a session this command just
+// CREATED, and it exists for one reason: the create's own response is a session
+// view, so it already says which attachment policy the server grants by. An
+// auto-attach that ignored it would print the exclusive policy's copy — "another
+// device took control; press Ctrl-\ to take it back" — on a plane where no
+// device holds anything and that key cannot succeed.
+//
+// The peer count is whatever the create reported, which is zero for a session
+// that does not exist yet, so the opening line is silence either way. The
+// policy is the part that matters, and it matters later: this attach can still
+// be demoted by a plane-side revocation.
+func attachWithRetryFor(cfg cli.Config, s session, since uint64) error {
+	return attachWithRetryOwned(cfg, s.ID, since, withServerPolicy(defaultOwnership(), s), nil, 60*time.Second)
+}
+
 func attachWithRetrySleep(cfg cli.Config, id string, since uint64, sleep func(time.Duration)) error {
 	return attachWithRetryBudget(cfg, id, since, sleep, 60*time.Second)
 }
@@ -1721,6 +1736,13 @@ func withServerPolicy(own attachio.Options, s session) attachio.Options {
 func reconnectOwnership(prev attachio.Options, out attachio.Outcome) attachio.Options {
 	next := prev
 	next.Take = false
+	// The count of other typers is the OPENING attach's, and only the opening
+	// attach's. Each attempt builds its own ownership, so a count carried
+	// forward would re-announce "N other terminals attached" on every
+	// reconnect — hours later, from a number read before the first attach, and
+	// about devices that may all have gone. Zero is silence, which is what a
+	// reconnecting typer prints under either policy.
+	next.OtherTypers = 0
 	switch out.Mode {
 	case terminal.ModeControl:
 		next.Mode = terminal.ModeControl
@@ -2403,7 +2425,11 @@ running keeps what it holds until it exits. It requires --yes in a script.
 // the same retry while the session is still starting. It is a variable only
 // so this CLI's own tests can drive the arc around it (create → attach →
 // remove → report) without a terminal on the other end.
-var agentLoginAttach = attachWithRetry
+// agentLoginAttach is `agent login`'s attach to the throwaway session it just
+// created, as a variable so a test can stand in for the terminal. It takes the
+// created session rather than its id for the reason attachWithRetryFor exists:
+// the policy the server grants by rides the create's own response.
+var agentLoginAttach = attachWithRetryFor
 
 // agentLoginSettle is how long `agent login` waits, once the login session's
 // process has exited, for custody to record the credential before it removes
@@ -2521,7 +2547,7 @@ func runAgentLogin(args []string) error {
 	}
 	fmt.Println(created.ID)
 
-	attachErr := agentLoginAttach(cfg, created.ID, terminal.SinceAll)
+	attachErr := agentLoginAttach(cfg, created, terminal.SinceAll)
 	// Give custody the moment it needs. sessiond puts the agent's last write
 	// as the process exits, which is the same event that ended the attach;
 	// the session is removed only once custody has moved, or once the settle

@@ -1942,7 +1942,8 @@ func useAgentServer(t *testing.T, ts *httptest.Server) *[]string {
 	}
 	var attached []string
 	saved := agentLoginAttach
-	agentLoginAttach = func(cfg cli.Config, id string, since uint64) error {
+	agentLoginAttach = func(cfg cli.Config, s session, since uint64) error {
+		id := s.ID
 		attached = append(attached, id)
 		return nil
 	}

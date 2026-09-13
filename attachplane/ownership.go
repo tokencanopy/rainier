@@ -681,20 +681,31 @@ func (o *ownership) demote(ctx context.Context, from uint64) uint64 {
 	return gen
 }
 
-// heartbeat renews the lease while this attach holds control, on the stream's
-// own liveness cadence. It is also how a controller displaced by an attach on
-// ANOTHER replica finds out: nothing pushes it a message, its own renewal
-// simply stops being accepted, and it demotes itself.
+// heartbeat keeps one attach's view of its own authority current, on the
+// stream's own liveness cadence. It is how an attach fenced somewhere this
+// replica cannot see finds out: nothing pushes it a message, and this loop is
+// the only thing that asks.
+//
+// What it asks differs by policy, and both are the same question:
+//
+//   - EXCLUSIVE renews the lease under the generation this attach holds. A
+//     renewal refused with ErrStale means somebody else's claim advanced past
+//     it, and the attach demotes itself.
+//   - SHARED takes no lease and renews nothing — there is no exclusivity to
+//     hold — so it READS the generation instead, and demotes when the store has
+//     moved past the one this attach is typing under.
+//
+// Under a uniform shared fleet nothing ever advances the generation, so that
+// read never demotes anybody and costs one store read per attach per interval.
+// It is here for the two cases where the generation does move under a shared
+// attach: a plane-side revocation on another replica, and a fleet straddling a
+// policy change, where an exclusive replica's take-over advances the row and
+// fences this attach at the pty. Without it such a terminal simply stops
+// accepting typing, with no notice and no key — the exact outcome conditional
+// ownership was built to avoid — because `displace` only ever reaches the
+// attaches this replica is serving.
 func (o *ownership) heartbeat(ctx context.Context) {
 	if o.keeper == nil {
-		return
-	}
-	if o.shared() {
-		// No lease was taken, so there is nothing to renew. Under the
-		// exclusive policy the heartbeat is also how a controller displaced
-		// from another replica finds out; under shared no attach is ever
-		// displaced by a peer, on this replica or any other, so there is
-		// nothing to find out either.
 		return
 	}
 	t := time.NewTicker(o.plane.heartbeat)
@@ -706,6 +717,10 @@ func (o *ownership) heartbeat(ctx context.Context) {
 		case <-t.C:
 			mode, gen := o.get()
 			if mode != terminal.ModeControl {
+				continue
+			}
+			if o.shared() {
+				o.pollFence(ctx, gen)
 				continue
 			}
 			err := o.keeper.Renew(ctx, gen)
@@ -723,6 +738,27 @@ func (o *ownership) heartbeat(ctx context.Context) {
 			// controller because one write timed out.
 		}
 	}
+}
+
+// pollFence is the shared policy's half of the heartbeat: it asks the store
+// whether the generation this attach is typing under is still the session's,
+// and demotes the attach when it is not.
+//
+// It NEVER advances anything, which is what keeps it a shared-policy operation:
+// State is a read, and demote installs a viewer binding on this attachment
+// alone and tells this client. No peer is touched — a generation that moved
+// under this attach moved for a reason this attach is not party to, and
+// announcing it to peers from here would be this replica guessing at somebody
+// else's handoff.
+//
+// A read that fails leaves the attach alone. The store being briefly unusable
+// is not evidence that anything was taken, and the next tick asks again.
+func (o *ownership) pollFence(ctx context.Context, gen uint64) {
+	current, _, err := o.keeper.State(ctx)
+	if err != nil || current <= gen {
+		return
+	}
+	o.demote(ctx, gen)
 }
 
 // finish ends this attach's ownership. A controller that leaves releases at
@@ -870,8 +906,13 @@ func (t *ownerTable) peers(o *ownership) []*ownership {
 // once per peer, in a queue.
 func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wait bool) {
 	var wg sync.WaitGroup
-	// Zero needs no guard of its own: no row is ever at generation zero, so
-	// every attach is already at or past it and displaceTo refuses each one.
+	// Zero needs no guard of its own, but not for the reason it used to: a row
+	// CAN sit at generation zero for its whole life now, because nothing under
+	// the shared policy advances it. What makes zero safe here is that this
+	// fan-out never runs under that policy — every caller is an exclusive-only
+	// path — and under the exclusive policy a generation somebody won is always
+	// non-zero. A displace call added to a shared path would find displaceTo
+	// refusing every peer at zero and telling nobody; do not add one.
 	for _, other := range p.owners.peers(winner) {
 		// The check and the write are ONE step, under that peer's own lock:
 		// between them, a claim of its own could otherwise land and overwrite

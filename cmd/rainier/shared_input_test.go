@@ -126,6 +126,49 @@ func TestWithServerPolicyFoldsTheViewIntoTheAttach(t *testing.T) {
 	}
 }
 
+// TestTheOpeningCountIsNotReassertedOnAReconnect: the count is the opening
+// attach's, and only the opening attach's. Each reconnect builds a fresh
+// ownership, so a count carried forward would re-announce "N other terminals
+// attached" hours later, from a number read before the first attach, about
+// devices that may all have gone — a false statement about other people's
+// terminals rather than merely an imprecise one.
+func TestTheOpeningCountIsNotReassertedOnAReconnect(t *testing.T) {
+	opening := withServerPolicy(defaultOwnership(), session{
+		Input: inputView{Policy: "shared", Attached: 3}})
+	if opening.OtherTypers != 3 {
+		t.Fatalf("the opening attach asks for %+v", opening)
+	}
+	next := reconnectOwnership(opening, attachio.Outcome{
+		Mode: terminal.ModeControl, Generation: 7})
+	if next.OtherTypers != 0 {
+		t.Fatalf("a reconnect carried a count of %d forward", next.OtherTypers)
+	}
+	// The policy itself is kept: the copy a reconnect prints, if it prints any,
+	// must still be the right policy's.
+	if !next.Shared {
+		t.Fatal("a reconnect forgot the server's policy")
+	}
+	if got := attachio.SharedNotice(next.OtherTypers); got != "" {
+		t.Fatalf("a reconnect would print %q", got)
+	}
+}
+
+// TestAnAutoAttachLearnsThePolicyFromTheCreate: `new` and `agent login` attach
+// to a session they just created, so the policy they print copy under comes off
+// the create's own response rather than defaulting to exclusive.
+func TestAnAutoAttachLearnsThePolicyFromTheCreate(t *testing.T) {
+	created := session{ID: "sess_example", Input: inputView{Policy: "shared"}}
+	own := withServerPolicy(defaultOwnership(), created)
+	if !own.Shared || own.OtherTypers != 0 {
+		t.Fatalf("an auto-attach asks for %+v, want shared with no peers", own)
+	}
+	// And the copy that follows from it: nothing on the way in, and no offer of
+	// a key that cannot succeed if this attach is later revoked.
+	if got := attachio.SharedNotice(own.OtherTypers); got != "" {
+		t.Fatalf("a freshly created session's attach would print %q", got)
+	}
+}
+
 // TestPrepareAttachReturnsTheViewItRead: the policy and the count reach the
 // attach without a second round trip, which is the whole reason prepareAttach
 // hands its row back.

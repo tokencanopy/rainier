@@ -76,18 +76,36 @@ func TestSharedPolicyNeverPrintsTheTakeOverCopy(t *testing.T) {
 				msg(terminal.TypeAttached, terminal.ModeControl, 2),
 				msg(terminal.TypeControlChanged, terminal.ModeView, 3),
 			}, NoticeViewOnly, false},
+		// No server path in this repository produces this one: `demote` only
+		// ever announces `view`. It is here because the CLIENT's rule has to be
+		// total — a hosted plane that ends a revocation is the case it is for —
+		// and because "became a typer again, silently" would be a person who
+		// does not know they may type.
 		{"becoming a typer again says so",
 			Options{Control: true, Mode: terminal.ModeControl, Shared: true},
 			[]terminal.ServerMessage{
 				msg(terminal.TypeAttached, terminal.ModeView, 2),
 				msg(terminal.TypeControlChanged, terminal.ModeControl, 2),
 			}, NoticeHaveControl, false},
-		{"a refused claim does not offer to try again",
+		{"a refused claim is answered, and does not offer to try again",
 			Options{Control: true, Mode: terminal.ModeControl, Shared: true},
 			[]terminal.ServerMessage{
 				msg(terminal.TypeAttached, terminal.ModeView, 2),
 				msg(terminal.TypeStale, "", 2),
-			}, "", false},
+			}, NoticeViewOnly, false},
+		{"a refused claim after a release is answered too",
+			sharedOpts(0),
+			[]terminal.ServerMessage{
+				msg(terminal.TypeAttached, terminal.ModeControl, 2),
+				msg(terminal.TypeControlChanged, terminal.ModeView, 2),
+				msg(terminal.TypeStale, "", 2),
+			}, NoticeViewOnly, false},
+		{"a stale nobody asked for stays silent under --view",
+			Options{Control: true, Mode: terminal.ModeView, NeverClaim: true, Shared: true},
+			[]terminal.ServerMessage{
+				msg(terminal.TypeAttached, terminal.ModeView, 2),
+				msg(terminal.TypeStale, "", 2),
+			}, "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			own := newOwnership(tc.opts)
@@ -166,6 +184,12 @@ func TestSharedPolicyChangesNothingAboutWhatIsSENT(t *testing.T) {
 	// would be the one thing a person cannot tell from a broken connection.
 	if _, ok := viewer.claim(); !ok {
 		t.Fatal("a shared-policy viewer's take-control key sent nothing")
+	}
+	// And the answer to that press is SHOWN. A key that produces no output at
+	// all is exactly the outcome the sentence above says must not happen, and
+	// it is what this client did before the refused-claim case existed.
+	if got := viewer.observe(msg(terminal.TypeStale, "", 9)); got != NoticeViewOnly {
+		t.Fatalf("the take-control key was answered %q, want %q", got, NoticeViewOnly)
 	}
 }
 

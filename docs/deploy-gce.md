@@ -210,12 +210,25 @@ prompt would be a hazard rather than a convenience.
 [`docs/terminal-controller-ownership.md`](terminal-controller-ownership.md) is
 the whole of that model.
 
-The choice applies to attaches made after the process starts; it is not stored
-on a session, so restarting `controld` with the other value changes the rule for
-the next attach and leaves live ones alone. A misspelled value refuses to start
-rather than silently granting the default. `rainier info` reports which rule is
-in force, and the value is safe to change in either direction — nothing in a
-session, a snapshot or the database depends on it.
+The choice is **per process** and is not stored on a session, so restarting
+`controld` with the other value changes the rule for every attach made after it.
+A restart drops the attaches that were live — the runner connections and their
+attachments go with the process — so there are no live attaches to be
+inconsistent, on a single-replica deployment like this one.
+
+**A multi-replica host should roll the policy deliberately, and to one value.**
+There is no fleet coordination behind the flag, so while a roll is in progress
+two replicas can grant different rules for one session. What happens then is
+defined rather than undefined: an exclusive replica's attach advances the
+session's controller generation and fences the shared replica's typers at the
+pty, and each of them notices within one heartbeat interval (≤5s), demotes, and
+tells its terminal. Expect that interval of inconsistency per session that is
+attached across the roll, and nothing worse.
+
+A misspelled value refuses to start rather than silently granting the default.
+`rainier info` reports which rule is in force. Nothing in a session, a snapshot
+or the database depends on the value, so it is safe to change in either
+direction.
 
 Every flag also reads a `RAINIER_*` environment variable
 (`RAINIER_LISTEN`, `RAINIER_DB`, `RAINIER_RUNNER_TOKEN`, `RAINIER_SECRETS_KEY`,

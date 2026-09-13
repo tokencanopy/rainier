@@ -173,7 +173,7 @@ func TestStdinForwarded(t *testing.T) {
 // TestTheLatestAttachSizesProc: two unbound attachments may both type (an
 // older plane, or a direct-to-sandbox attach), and the pty follows the size
 // reported most recently — whole, not axis-by-axis. This is the rule that
-// replaced smallest-per-axis; see LatestSize.
+// replaced smallest-per-axis; see latestSize.
 func TestTheLatestAttachSizesProc(t *testing.T) {
 	s, fp := newFakeSession(t)
 	a, _ := s.Attach(0, Size{120, 40}, Binding{})

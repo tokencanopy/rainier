@@ -158,11 +158,20 @@ branch, and the branch is always "do less":
   `control_changed {view}`. The generation is NOT advanced — advancing is how
   the exclusive policy fences a departing controller, and here it would fence
   every peer typing under that generation. **It is a no-op for peers.**
-- **the heartbeat does not run**, because no lease was taken. Under the
-  exclusive policy the heartbeat is also how a controller displaced from
-  another replica finds out; under shared no attach is ever displaced by a
-  peer, on this replica or any other, so there is nothing to find out.
-  `finish` releases nothing for the same reason.
+- **the heartbeat renews nothing**, because no lease was taken. It still runs,
+  and what it does instead is READ the generation: an attach whose session has
+  moved past the generation it is typing under demotes itself, tells its client
+  `control_changed`, and re-installs its own binding as `view`. `finish`
+  releases nothing, for the same reason nothing is renewed.
+
+  The read is not ceremony. `displace` only ever reaches the attaches THIS
+  replica is serving, so two things can fence a shared attach with nobody to
+  announce it: a plane-side revocation on another replica, and a fleet
+  straddling a policy change, where an exclusive replica's take-over advances
+  the row. Without the read such a terminal simply stops accepting typing, with
+  no notice and no key — the exact outcome conditional ownership was built to
+  avoid. Under a uniform shared fleet nothing advances the generation, so the
+  read never demotes anybody and costs one store read per attach per interval.
 
 `control_changed` is therefore **never pushed by a peer's attach, claim or
 release** under this policy. It is still pushed when THIS attach loses input
@@ -241,6 +250,24 @@ the attach came back a viewer, and under shared a typer never does.
 | **legacy client + shared plane** | A typer, at the current generation, with no generation advance and therefore nothing fenced for any peer. It receives today's message set byte for byte. |
 | **shared plane + old sandbox** | The binding is installed and the acknowledgement may never come; the plane waits its bounded wait and proceeds, as it does today. Nothing about a handoff is load-bearing under shared. |
 | **shared plane + new sandbox** | Every attachment is bound `control` at the current generation. The fence is inert between peers and live for anything stale. |
+| **two replicas running DIFFERENT policies** | Supported but not recommended, and it is the one pairing with an operator constraint: see below. |
+
+**A fleet should run one policy.** The policy is a per-process value with no
+fleet coordination, so a host rolling the flag across several replicas straddles
+the two rules for the length of the roll. What happens then is defined, not
+undefined: an exclusive replica's attach advances the generation and fences the
+shared replica's typers at the pty, and each of them learns within one heartbeat
+interval from the generation read above, demotes, and tells its client. Two
+people can type into one shell for at most that interval, and the shared attach
+does NOT see a live lease as a reason to become a viewer — `grant`'s shared
+branch deliberately ignores the lease, because under its own policy there is
+nothing to hint at.
+
+So: roll the policy deliberately, and expect one heartbeat interval of
+inconsistency per session that is attached across the roll. The alternative —
+making a shared attach honour a live lease — would mean a uniform shared fleet
+behaving differently for a session that happened to have an exclusive-era lease
+still ticking, which is worse.
 
 ## Edge cases
 
@@ -252,11 +279,27 @@ the attach came back a viewer, and under shared a typer never does.
   executes. Verified by test rather than by reading.
 - **A `--view` attach under shared.** Still a viewer: its stdin is dropped at
   the plane, its frames are fenced at the pty, and its resize is remembered and
-  never applied.
+  never applied. That last clause is about a BOUND viewer. An unbound
+  attachment — the new-plane + old-sandbox pairing, and a direct-to-sandbox
+  debugging attach — executes unconditionally and has always sized the pty,
+  which under the latest-client rule means a large viewer on an old sandbox can
+  now enlarge it where smallest-per-axis would have ignored it. That pairing is
+  fenced at the plane alone by construction, which is what the compatibility
+  table already says about it.
+- **Nothing re-asserts a typer's size after a peer takes it.** The CLI sends its
+  size when it GAINS the ability to type, not when the pty moves under it, so a
+  terminal that reconnects often (a browser tab across a hosted lease renewal)
+  re-takes the size on every reconnect and the other typer stays wrong until its
+  own window changes. Accepted: the fix is a client that re-asserts its size,
+  which is a client change and not a policy one.
 - **A claim from a viewer under shared.** Answered `stale`, store untouched.
-  The client renders "somebody else got there first", which is the sentence a
-  refused claim already uses; the alternative is a message every client would
-  have to learn for an answer that is already "you are still a viewer".
+  The CLI renders `[viewing — this terminal may not type]`, NOT the lost-race
+  sentence: "somebody else got there first; press Ctrl-\ to try again" is wrong
+  twice over here, because nobody got there first and trying again cannot work.
+  It must render something — a key that produces nothing at all is the one
+  outcome a person cannot tell from a broken connection — and that answer is
+  the same sentence the opening viewer notice uses, so no client has to learn a
+  new one.
 - **A release, then input.** The releasing attach's own binding is `view` at
   the current generation before its client is told, so a keystroke already in
   flight is dropped at the pty rather than executed after the release.
@@ -316,9 +359,22 @@ the attach came back a viewer, and under shared a typer never does.
 
 ## Release
 
-Cloud pins the merged commit and selects the policy in `cell-gateway`'s
-composition — `controlapp.AttachmentOptions.InputPolicy`, defaulting to
-shared — and then takes the ordinary cell release. Self-hosted operators get
-shared by default and `controld --input-policy exclusive` to keep today's
-behaviour. Rolling order is unconstrained: the change is additive on every
-wire, and a mixed fleet is one of the pairings in the table above.
+Cloud pins the merged commit and makes **two** changes, not one. They are
+separate wires and either alone is a half-shipped feature:
+
+1. **Select the policy** where the cell composes its application —
+   `controlapp.AttachmentOptions.InputPolicy`, defaulting to shared. This is
+   what makes the plane behave shared.
+2. **Report it in the session view** — set `v0wire.SessionDerived.InputPolicy`
+   and `InputAttached` (from the attach plane's `Plane.Typers`) where the
+   gateway renders a session, exactly as `internal/controld`'s renderer does.
+   Without it the view omits `input`, every CLI reads the absent policy as
+   exclusive, and the hosted plane runs shared input while telling people
+   "another device has control; press Ctrl-\ to take it" about a plane where no
+   device holds anything and that key cannot succeed.
+
+Self-hosted operators get shared by default and `controld --input-policy
+exclusive` to keep today's behaviour. Rolling order across the three parties
+(client, plane, sandbox) is unconstrained — the change is additive on every wire
+— but the POLICY itself should be uniform across a host's replicas; see the
+compatibility note above.

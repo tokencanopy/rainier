@@ -326,11 +326,13 @@ func TestSharedPolicyDepartureTellsNobodyAndReleasesNothing(t *testing.T) {
 	assertTypedInOrder(t, staying, 6, "mine")
 }
 
-// TestSharedPolicyRunsNoHeartbeat: no lease was taken, so nothing renews one.
-// Under the exclusive policy this same attach renews six times a lease; here a
-// renewal would install a holder nobody asked for and make `controller.held`
-// true for a session with no controller.
-func TestSharedPolicyRunsNoHeartbeat(t *testing.T) {
+// TestSharedPolicyHeartbeatTakesNoLease: no lease was taken, so nothing renews
+// one. Under the exclusive policy this same attach renews a lease six times a
+// lease-length; here a renewal would install a holder nobody asked for and make
+// `controller.held` true for a session with no controller. The loop still runs
+// — it reads the generation, which is the next test — and what it must never do
+// is write.
+func TestSharedPolicyHeartbeatTakesNoLease(t *testing.T) {
 	p, h, ts := newTestPlane(t, Options{HeartbeatInterval: 5 * time.Millisecond})
 	lease := &fakeLease{gen: 8}
 
@@ -346,6 +348,137 @@ func TestSharedPolicyRunsNoHeartbeat(t *testing.T) {
 	if gen != 8 || holder != "" {
 		t.Fatalf("the lease reads generation %d held by %q; no heartbeat should have run", gen, holder)
 	}
+}
+
+// TestSharedPolicyAttachWhoseGenerationMovesIsToldAndFenced is the case
+// `displace` cannot reach: the generation moved somewhere this replica is not
+// party to — a plane-side revocation, or an exclusive replica's take-over in a
+// fleet straddling a policy change — and the only thing that can notice is this
+// attach's own heartbeat.
+//
+// Without the read, such a terminal stops accepting typing with no notice and no
+// key: its binding is dead at the pty, no peer list contains it, and under a
+// shared policy nothing else asks the store anything.
+func TestSharedPolicyAttachWhoseGenerationMovesIsToldAndFenced(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{HeartbeatInterval: 5 * time.Millisecond})
+	lease := &fakeLease{gen: 5}
+
+	f := startSharedAttach(t, p, h, ts, control.AttachmentController, 5, fakeKeeper{lease, "att_shared"}, true)
+	if m, _ := awaitType(t, f.stream, terminal.TypeAttached); m.Generation.Value() != 5 {
+		t.Fatalf("attached at %q, want 5", m.Generation)
+	}
+	awaitSpliced(t, f)
+
+	// Something else advances the session: another replica's exclusive
+	// take-over, or a revocation. This attach is told nothing by anybody.
+	if _, err := (fakeKeeper{lease, "att_elsewhere"}).Claim(context.Background(), 5); err != nil {
+		t.Fatal(err)
+	}
+
+	m, _ := awaitType(t, f.stream, terminal.TypeControlChanged)
+	if m.Mode != terminal.ModeView || m.Generation.Value() != 6 {
+		t.Fatalf("the fenced attach was told %s at %q, want view at 6", m.Mode, m.Generation)
+	}
+	// Its sandbox was told too, so the pty agrees with the plane.
+	awaitSandbox(t, f.sandbox, func(got []terminal.ClientMessage) bool {
+		for _, c := range got {
+			if c.Type == terminal.TypeControl && c.Mode == terminal.ModeView {
+				return true
+			}
+		}
+		return false
+	}, "the fenced attachment's view binding")
+	// And the plane stops carrying what it types.
+	f.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("gone")}
+	f.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(6)}
+	awaitType(t, f.stream, terminal.TypeStale)
+	for _, got := range f.sandbox.received() {
+		if got.Type == "stdin" {
+			t.Fatal("a fenced attach's keystroke was still carried")
+		}
+	}
+	// The demotion read the store and wrote nothing: the generation is the one
+	// the OTHER claim won, not one this attach advanced.
+	lease.mu.Lock()
+	gen := lease.gen
+	lease.mu.Unlock()
+	if gen != 6 {
+		t.Fatalf("the generation is %d, want the 6 somebody else won", gen)
+	}
+}
+
+// TestSharedPolicyRefusesAClaimFromAViewerThatMayDrive is the guard the design
+// doc's revocation argument rests on, and the target it needs is the one the
+// application really builds for `rainier attach` from a principal a host grants
+// viewing and not driving: AttachmentViewer with MayClaim SET, because the two
+// questions are asked separately.
+//
+// Under the exclusive policy that client's claim is honoured — it is how a
+// reconnecting controller admitted as a viewer takes its session back. Under
+// shared it must not be, or a revoked attachment could re-promote itself by
+// pressing one key, and revocation is the only thing left that moves a shared
+// attach out of `control`.
+func TestSharedPolicyRefusesAClaimFromAViewerThatMayDrive(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{})
+	lease := &fakeLease{gen: 5}
+
+	typer := startSharedAttach(t, p, h, ts, control.AttachmentController, 5, fakeKeeper{lease, "att_typer"}, true)
+	awaitType(t, typer.stream, terminal.TypeAttached)
+	awaitSpliced(t, typer)
+
+	viewer := startSharedViewerThatMayDrive(t, p, h, ts, 5, fakeKeeper{lease, "att_viewer"})
+	if m, _ := awaitType(t, viewer.stream, terminal.TypeAttached); m.Mode != terminal.ModeView {
+		t.Fatalf("the view-only attach was told %s, want view", m.Mode)
+	}
+	awaitViewerSpliced(t, viewer)
+
+	viewer.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(5)}
+	m, _ := awaitType(t, viewer.stream, terminal.TypeStale)
+	if m.Mode != "" || m.Generation.Value() != 5 {
+		t.Fatalf("the claim was answered %s at %q, want a stale at 5", m.Mode, m.Generation)
+	}
+	lease.mu.Lock()
+	gen, holder := lease.gen, lease.holder
+	lease.mu.Unlock()
+	if gen != 5 || holder != "" {
+		t.Fatalf("a view-only claim moved the lease to generation %d held by %q", gen, holder)
+	}
+	// It still may not type, and the typer beside it heard nothing.
+	viewer.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("no")}
+	viewer.stream.in <- terminal.ClientMessage{Type: terminal.TypeClaim, Expected: terminal.GenOf(5)}
+	awaitType(t, viewer.stream, terminal.TypeStale)
+	for _, got := range viewer.sandbox.received() {
+		if got.Type == "stdin" {
+			t.Fatal("a refused claimant's keystroke was carried")
+		}
+	}
+	noOwnershipMessage(t, typer, 200*time.Millisecond)
+}
+
+// startSharedViewerThatMayDrive is the target controlapp builds for a plain
+// `attach` from a principal the host's policy admits as a viewer and would
+// authorize as a controller: AttachmentViewer, negotiated, MayClaim true.
+func startSharedViewerThatMayDrive(t *testing.T, p *Plane, h *fakeHost, ts *httptest.Server,
+	gen uint64, keeper control.ControllerLeaseKeeper) *attachFixture {
+	t.Helper()
+	sandbox := newFakeSandbox(true)
+	h.dialBack = func(at *runner.Attach) { sandbox.serve(t, ts, at) }
+
+	stream := newScriptedStream()
+	stream.in <- terminal.ClientMessage{Type: "resize", Cols: 80, Rows: 24}
+	target := brokerTarget("sess_example", "vm1")
+	target.Mode = control.AttachmentViewer
+	target.ControllerGeneration = gen
+	target.Negotiated = true
+	target.MayClaim = true
+	target.Controller = keeper
+	target.Policy = control.PolicyShared
+
+	done := make(chan error, 1)
+	go func() { done <- p.Broker().Attach(context.Background(), target, stream) }()
+	f := &attachFixture{stream: stream, sandbox: sandbox, done: done}
+	t.Cleanup(f.close)
+	return f
 }
 
 // TestSharedPolicyAttachesALegacyClientWithoutAdvancing is the compatibility

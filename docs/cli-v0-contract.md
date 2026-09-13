@@ -307,11 +307,13 @@ order the pty receives it.
   line: `[2 other terminals attached; everyone may type. Ctrl-] detaches.]`
 - `--take` is accepted and does nothing beyond attaching as a typer. It is kept
   rather than refused because an installed CLI passes it.
-- Ctrl-\ is still intercepted, and answered "you are still a viewer" for an
-  attach that may not type. The take-over copy — "another device has control",
-  "another device took control", "somebody else got there first" — is never
-  printed, because none of it is true: an attach that may not type was refused
-  by the host's policy, not beaten to it, and it is told so.
+- Ctrl-\ is still intercepted, and answered — `[viewing — this terminal may not
+  type]` — for an attach that may not type. It must be answered: a key that
+  produces nothing at all is the one outcome a person cannot tell from a broken
+  connection. The take-over copy — "another device has control", "another device
+  took control", "somebody else got there first; press Ctrl-\ to try again" — is
+  never printed, because none of it is true: an attach that may not type was
+  refused by the host's policy, not beaten to it.
 - A `release` is accepted and stops THAT terminal typing. It is a no-op for
   every other terminal.
 

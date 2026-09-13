@@ -31,13 +31,23 @@ Nothing in the machinery below is removed under the shared policy — the
 generation, the lease, the acknowledged handoff and the pty fence are all
 intact. What differs is that between peers there is nothing to fence: every live
 attach holds the current generation, so the fence is a no-op between them and
-still bites for a stale or revoked attachment. Two things are worth stating
+still bites for a stale or revoked attachment. Four things are worth stating
 separately for a shared-policy host:
 
 - **`control_changed` is never pushed by a peer's attach, claim, release or
   departure.** It is still pushed when an attach loses input authority for a
   reason that is not a peer: its own `release`, and an attachment the plane
   revokes.
+- **A shared attach still finds out when the generation moves under it.** It
+  holds no lease to have refused, so its heartbeat READS the generation instead
+  of renewing one, and demotes itself when the session has moved past the one it
+  is typing under. That is what covers a revocation on another replica, and a
+  fleet straddling a policy change.
+- **One policy per fleet.** The choice is per process, so a host rolling it
+  across replicas straddles the two rules for the length of the roll: an
+  exclusive replica's take-over fences a shared replica's typers, and they learn
+  from the read above within one heartbeat interval rather than instantly. Roll
+  it deliberately.
 - **The pty follows the most recent resize from any terminal that may type**,
   under either policy. With one typer that is the controller's size, which is
   what it always was.
@@ -161,6 +171,14 @@ That last rule is why a **new plane always stamps the frames it forwards**,
 including a legacy client's, which the client cannot stamp itself: an unstamped
 frame reaching a current sandbox therefore means an older plane, and nothing
 else.
+
+One clause on that, since the shared policy: generation **zero** is the empty
+string on the wire (`terminal.GenOf`), and a shared session that no exclusive
+attach has ever touched stays at zero for its whole life — so its frames are
+literally unstamped. It is safe for the reason the fence is arithmetic rather
+than presence: the attachment is BOUND (a sandbox reads that off the mode, not
+off the generation), the session's own generation is zero, and zero equals zero.
+What an unstamped frame no longer proves on its own is that the plane was old.
 
 ## Operating notes
 

@@ -19,7 +19,7 @@ func TestLatestSize(t *testing.T) {
 		{"whatever order it is read in", []reported{{Size{120, 30}, 9}, {Size{80, 40}, 2}}, Size{120, 30}, true},
 	}
 	for _, c := range cases {
-		got, ok := LatestSize(c.in)
+		got, ok := latestSize(c.in)
 		if ok != c.ok || got != c.want {
 			t.Fatalf("%s: = %+v,%v want %+v,%v", c.name, got, ok, c.want, c.ok)
 		}
