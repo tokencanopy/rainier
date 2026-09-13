@@ -22,7 +22,12 @@ type viewer struct {
 	id   int
 	ch   chan terminal.ServerMessage
 	size Size
-	bind Binding
+	// sizeAt is the session tick this viewer last reported its size at — on
+	// its attach, and on every resize after it. It is what makes the pty
+	// follow the LATEST resize from any attachment that may type rather than
+	// the smallest of them: see latestSize.
+	sizeAt uint64
+	bind   Binding
 }
 
 // Binding is what the control plane says one attachment is: whether it may
@@ -62,6 +67,17 @@ type Session struct {
 	// It only ever goes up. A late frame carrying a superseded binding
 	// cannot walk it backwards.
 	controllerGen uint64
+	// sizeTick orders the size reports this session has seen, under s.mu like
+	// everything else here. It is a counter rather than a clock so that two
+	// resizes in the same instant still have an order, and so the rule does
+	// not depend on a monotonic wall time.
+	sizeTick uint64
+}
+
+// nextSizeTick stamps one size report. Callers hold s.mu.
+func (s *Session) nextSizeTick() uint64 {
+	s.sizeTick++
+	return s.sizeTick
 }
 
 func New(cfg Config, start func(argv []string, cols, rows int, onOutput func([]byte)) (Proc, error)) (*Session, error) {
@@ -182,7 +198,8 @@ func (s *Session) Attach(since uint64, size Size, bind Binding) (*Attachment, er
 	if replay {
 		chCap = len(entries) + 256
 	}
-	v := &viewer{id: s.nextID, ch: make(chan terminal.ServerMessage, chCap), size: size, bind: bind}
+	v := &viewer{id: s.nextID, ch: make(chan terminal.ServerMessage, chCap), size: size,
+		sizeAt: s.nextSizeTick(), bind: bind}
 	s.nextID++
 	s.viewers[v.id] = v
 
@@ -313,7 +330,7 @@ func (s *Session) SetSize(id int, gen uint64, size Size) bool {
 	if !ok {
 		return false
 	}
-	v.size = size
+	v.size, v.sizeAt = size, s.nextSizeTick()
 	if !s.mayWriteLocked(v, gen) {
 		return false
 	}
@@ -321,19 +338,22 @@ func (s *Session) SetSize(id int, gen uint64, size Size) bool {
 	return true
 }
 
-// applySizeLocked resizes the pty to what its CONTROLLERS ask for. With one
-// attachment that is the same rule it has always been. With several it is the
-// rule that makes a viewer harmless: a session whose controllers have all
-// gone keeps the size it had rather than snapping to whoever is watching.
+// applySizeLocked resizes the pty to what its TYPERS ask for: the most recent
+// resize any of them reported, the "latest client" rule (latestSize). With one
+// attachment that is the same rule it has always been. A viewer's size is
+// remembered and never applied, which is what makes a viewer harmless — a
+// session whose typers have all gone keeps the size it had rather than snapping
+// to whoever is watching, and a phone watching a laptop's session does not
+// squeeze the laptop's terminal down to phone width.
 func (s *Session) applySizeLocked() {
-	var sizes []Size
+	var sizes []reported
 	for _, v := range s.viewers {
 		if !s.mayWriteLocked(v, v.bind.Generation) {
 			continue
 		}
-		sizes = append(sizes, v.size)
+		sizes = append(sizes, reported{size: v.size, at: v.sizeAt})
 	}
-	eff, ok := EffectiveSize(sizes)
+	eff, ok := latestSize(sizes)
 	if !ok || eff == s.size {
 		return
 	}

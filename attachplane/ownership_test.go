@@ -1158,7 +1158,7 @@ func TestFinishReleasesOnlyTheGenerationItActuallyHeld(t *testing.T) {
 		// This attach holds control at 1; another replica has just taken it.
 		lease := &fakeLease{gen: 2, holder: "att_bbbb"}
 		keeper := &recordingKeeper{fakeKeeper: fakeKeeper{lease, "att_aaaa"}}
-		o := &ownership{plane: p, session: "sess_example", negotiated: true, mayClaim: true,
+		o := &ownership{policy: control.PolicyExclusive, plane: p, session: "sess_example", negotiated: true, mayClaim: true,
 			keeper: keeper, mode: terminal.ModeControl, gen: 1, announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
 		p.owners.add(o)
 
@@ -1248,7 +1248,7 @@ func TestANegotiatedClaimIsAlwaysAnswered(t *testing.T) {
 // alone, because naming it a number it has passed would walk its client
 // backwards.
 func TestDisplaceToRefusesAGenerationThisAttachHasPassed(t *testing.T) {
-	o := &ownership{mode: terminal.ModeControl, gen: 3, announce: make(chan struct{}, 1)}
+	o := &ownership{policy: control.PolicyExclusive, mode: terminal.ModeControl, gen: 3, announce: make(chan struct{}, 1)}
 	switch was, moved := o.displaceTo(2); {
 	case moved:
 		t.Fatal("a displacement to an older generation moved an attach that has passed it")
@@ -1271,7 +1271,7 @@ func TestDisplaceToRefusesAGenerationThisAttachHasPassed(t *testing.T) {
 // refuses) or after it (which then advances over it).
 func TestDisplaceToAndAdvanceAreEachOneStep(t *testing.T) {
 	for range 2000 {
-		o := &ownership{mode: terminal.ModeView, gen: 1, announce: make(chan struct{}, 1)}
+		o := &ownership{policy: control.PolicyExclusive, mode: terminal.ModeView, gen: 1, announce: make(chan struct{}, 1)}
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() { defer wg.Done(); o.advance(terminal.ModeControl, 3) }()
@@ -1289,7 +1289,7 @@ func TestDisplaceToAndAdvanceAreEachOneStep(t *testing.T) {
 // moving the number down would leave this attach — and its client — claiming
 // from a generation that has been superseded, refused every time.
 func TestDemoteToNeverWalksTheGenerationBack(t *testing.T) {
-	o := &ownership{mode: terminal.ModeControl, gen: 5, announce: make(chan struct{}, 1)}
+	o := &ownership{policy: control.PolicyExclusive, mode: terminal.ModeControl, gen: 5, announce: make(chan struct{}, 1)}
 	if got, moved := o.demoteTo(5, 3); got != 5 || !moved {
 		t.Fatalf("demoteTo(5, 3) at generation 5 returned %d, %v; want 5, true", got, moved)
 	}
@@ -1298,7 +1298,7 @@ func TestDemoteToNeverWalksTheGenerationBack(t *testing.T) {
 	}
 	// And it still demotes at a generation it cannot read: being wrong about
 	// the number is survivable, believing you still have control is not.
-	o = &ownership{mode: terminal.ModeControl, gen: 5, announce: make(chan struct{}, 1)}
+	o = &ownership{policy: control.PolicyExclusive, mode: terminal.ModeControl, gen: 5, announce: make(chan struct{}, 1)}
 	if got, moved := o.demoteTo(5, 5); got != 5 || !moved {
 		t.Fatalf("demoteTo(5, 5) returned %d, %v; want 5, true", got, moved)
 	}
@@ -1315,7 +1315,7 @@ func TestDemoteToNeverWalksTheGenerationBack(t *testing.T) {
 // demoting it anyway leaves the plane saying viewer while the store says this
 // attach holds the lease: nobody types until the lease expires.
 func TestDemoteToRefusesAGenerationThisAttachHasLeft(t *testing.T) {
-	o := &ownership{mode: terminal.ModeControl, gen: 3, announce: make(chan struct{}, 1)}
+	o := &ownership{policy: control.PolicyExclusive, mode: terminal.ModeControl, gen: 3, announce: make(chan struct{}, 1)}
 	if got, moved := o.demoteTo(1, 3); moved {
 		t.Fatalf("a demotion decided at generation 1 demoted an attach at 3 (to %d)", got)
 	}
@@ -1331,7 +1331,7 @@ func TestDemoteToRefusesAGenerationThisAttachHasLeft(t *testing.T) {
 // through, or the winner is told "somebody else got there first" about a
 // generation it owns and holds the lease on.
 func TestAdvanceAcceptsTheGenerationThisAttachAlreadyHolds(t *testing.T) {
-	o := &ownership{mode: terminal.ModeView, gen: 4, announce: make(chan struct{}, 1)}
+	o := &ownership{policy: control.PolicyExclusive, mode: terminal.ModeView, gen: 4, announce: make(chan struct{}, 1)}
 	if !o.advance(terminal.ModeControl, 4) {
 		t.Fatal("a claim was refused its own generation")
 	}
@@ -1357,8 +1357,8 @@ func TestAdvanceAcceptsTheGenerationThisAttachAlreadyHolds(t *testing.T) {
 func TestDisplaceAtGenerationZeroTouchesNobody(t *testing.T) {
 	p, _, _ := newTestPlane(t, Options{})
 	stream := newScriptedStream()
-	winner := &ownership{plane: p, session: "sess_example", announce: make(chan struct{}, 1)}
-	peer := &ownership{plane: p, session: "sess_example", negotiated: true, stream: stream,
+	winner := &ownership{policy: control.PolicyExclusive, plane: p, session: "sess_example", announce: make(chan struct{}, 1)}
+	peer := &ownership{policy: control.PolicyExclusive, plane: p, session: "sess_example", negotiated: true, stream: stream,
 		mode: terminal.ModeControl, gen: 2, told: true, announce: make(chan struct{}, 1)}
 	p.owners.add(winner)
 	p.owners.add(peer)
@@ -1548,7 +1548,7 @@ func TestAClaimWhoseBindingNeverLandedGivesTheGenerationBack(t *testing.T) {
 	p, _, _ := newTestPlane(t, Options{ControlAckTimeout: 100 * time.Millisecond})
 	lease := &fakeLease{gen: 1}
 	stream := newScriptedStream()
-	o := &ownership{plane: p, session: "sess_example", negotiated: true, mayClaim: true,
+	o := &ownership{policy: control.PolicyExclusive, plane: p, session: "sess_example", negotiated: true, mayClaim: true,
 		keeper: fakeKeeper{lease, "att_aaaa"}, stream: stream, mode: terminal.ModeView, gen: 1,
 		announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
 	o.bindRunner(blockedConn{})
@@ -1600,7 +1600,7 @@ func TestAStaleAnswerNeverTellsALiveControllerItIsAViewer(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			lease := &fakeLease{gen: tc.store, holder: "att_holder"}
 			stream := newScriptedStream()
-			o := &ownership{plane: p, session: "sess_example", negotiated: true, mayClaim: true,
+			o := &ownership{policy: control.PolicyExclusive, plane: p, session: "sess_example", negotiated: true, mayClaim: true,
 				keeper: fakeKeeper{lease, "att_aaaa"}, stream: stream,
 				mode: tc.mode, gen: tc.held, announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
 
@@ -1626,7 +1626,7 @@ func TestADisplacementNoticeReportsTheModeItReads(t *testing.T) {
 	for _, mode := range []string{terminal.ModeControl, terminal.ModeView} {
 		t.Run(mode, func(t *testing.T) {
 			stream := newScriptedStream()
-			o := &ownership{plane: p, negotiated: true, stream: stream, mode: mode, gen: 5,
+			o := &ownership{policy: control.PolicyExclusive, plane: p, negotiated: true, stream: stream, mode: mode, gen: 5,
 				announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
 
 			if got, gen := o.announceAs(context.Background(), terminal.TypeControlChanged, 0); got != mode || gen != 5 {
@@ -1975,7 +1975,7 @@ func (c ackingConn) Close() error { return nil }
 // key spends looking at a terminal that will not type.
 func TestAStaleAcknowledgementNeverCostsTheNextHandoffItsWait(t *testing.T) {
 	p, _, _ := newTestPlane(t, Options{ControlAckTimeout: 2 * time.Second})
-	o := &ownership{plane: p, session: "sess_example", mode: terminal.ModeControl, gen: 2,
+	o := &ownership{policy: control.PolicyExclusive, plane: p, session: "sess_example", mode: terminal.ModeControl, gen: 2,
 		announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
 	o.bindRunner(ackingConn{o})
 	// The previous handoff's acknowledgement, arriving after it gave up.
@@ -2114,7 +2114,7 @@ func TestTheFanOutReachesEveryPeerAtOnce(t *testing.T) {
 // the store long ago.
 func TestABindingWriteThatNeverLandsDoesNotHoldTheHandoff(t *testing.T) {
 	p, _, _ := newTestPlane(t, Options{ControlAckTimeout: 200 * time.Millisecond})
-	o := &ownership{plane: p, session: "sess_example", mode: terminal.ModeControl, gen: 2,
+	o := &ownership{policy: control.PolicyExclusive, plane: p, session: "sess_example", mode: terminal.ModeControl, gen: 2,
 		announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
 	o.bindRunner(blockedConn{})
 
@@ -2254,7 +2254,7 @@ func TestAClaimThatGivesItsGenerationBackTellsThePeersToo(t *testing.T) {
 	// the generation in the store and then cannot install the binding that
 	// would make the generation mean anything at the pty.
 	stream := newScriptedStream()
-	b := &ownership{plane: p, session: "sess_example", negotiated: true, mayClaim: true,
+	b := &ownership{policy: control.PolicyExclusive, plane: p, session: "sess_example", negotiated: true, mayClaim: true,
 		keeper: fakeKeeper{lease, "att_bbbb"}, stream: stream, mode: terminal.ModeView, gen: 1,
 		announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
 	b.bindRunner(blockedConn{})
@@ -2439,7 +2439,7 @@ func TestAnAnnouncementReportsTheStateItFoundWhenItGotTheHold(t *testing.T) {
 	p, _, _ := newTestPlane(t, Options{})
 	for i := 0; i < 3; i++ {
 		stream := newHoldingStream()
-		o := &ownership{plane: p, session: "sess_example", negotiated: true, stream: stream,
+		o := &ownership{policy: control.PolicyExclusive, plane: p, session: "sess_example", negotiated: true, stream: stream,
 			mode: terminal.ModeView, gen: 1, announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
 
 		// (1) an announcement takes the hold and parks inside it.
@@ -2501,16 +2501,16 @@ func TestAnAnnouncementReportsTheStateItFoundWhenItGotTheHold(t *testing.T) {
 // SANDBOX is still told at once — the install does not wait for the client.
 func TestAPeerThatHasNotBeenToldWhatItIsIsNotToldAboutSomebodyElseFirst(t *testing.T) {
 	p, _, _ := newTestPlane(t, Options{})
-	winner := &ownership{plane: p, session: "sess_example", announce: make(chan struct{}, 1)}
+	winner := &ownership{policy: control.PolicyExclusive, plane: p, session: "sess_example", announce: make(chan struct{}, 1)}
 	p.owners.add(winner)
 
 	// Two attaches registered but still reading their first message: one at
 	// the generation the handoff carries, one behind it.
 	current := newScriptedStream()
 	behind := newScriptedStream()
-	atGen := &ownership{plane: p, session: "sess_example", negotiated: true, stream: current,
+	atGen := &ownership{policy: control.PolicyExclusive, plane: p, session: "sess_example", negotiated: true, stream: current,
 		mode: terminal.ModeView, gen: 4, announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
-	older := &ownership{plane: p, session: "sess_example", negotiated: true, stream: behind,
+	older := &ownership{policy: control.PolicyExclusive, plane: p, session: "sess_example", negotiated: true, stream: behind,
 		mode: terminal.ModeView, gen: 3, announce: make(chan struct{}, 1), ack: make(chan uint64, 1)}
 	p.owners.add(atGen)
 	p.owners.add(older)

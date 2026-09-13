@@ -87,6 +87,11 @@ func (r *sessionRenderer) view(row control.Session) v0wire.SessionView {
 		// SERVER's clock, the one the attachment service measures the same
 		// lease against, so a test can drive an expiry through the JSON.
 		ControllerHeld: control.ControllerLeaseOf(row).Live(r.srv.now()),
+		// The rule this replica grants attachments by, and how many terminals
+		// are typing under it right now. Both are the host's to answer: the
+		// policy is its composition and the count is its plane's live state.
+		InputPolicy:   string(r.srv.inputPolicy()),
+		InputAttached: r.srv.typingAttachments(row.ID),
 	}
 	if env := r.environment(string(row.EnvironmentID)); env != nil {
 		d.Environment = env.Name

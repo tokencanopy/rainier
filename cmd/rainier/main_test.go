@@ -1163,7 +1163,7 @@ func TestPrepareAttach(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
+			if _, err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
 				t.Fatalf("prepareAttach: %v", err)
 			}
 			if resumes != 0 {
@@ -1189,7 +1189,7 @@ func TestPrepareAttach(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
+			if _, err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
 				t.Fatalf("prepareAttach: %v", err)
 			}
 			if resumes != 1 {
@@ -1211,7 +1211,7 @@ func TestPrepareAttach(t *testing.T) {
 		}))
 		defer ts.Close()
 
-		if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
+		if _, err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
 			t.Fatalf("prepareAttach refused an attachable session: %v", err)
 		}
 	})
@@ -1228,7 +1228,7 @@ func TestPrepareAttach(t *testing.T) {
 		}))
 		defer ts.Close()
 
-		if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
+		if _, err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
 			t.Fatalf("prepareAttach refused a failed session with a live runner: %v", err)
 		}
 	})
@@ -1270,7 +1270,7 @@ func TestPrepareAttach(t *testing.T) {
 			}))
 			defer ts.Close()
 
-			err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false)
+			_, err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("prepareAttach error = %v, want one containing %q", err, tc.want)
 			}
@@ -1279,7 +1279,7 @@ func TestPrepareAttach(t *testing.T) {
 				t.Errorf("refusal does not point anywhere: %v", err)
 			}
 			// --since is the documented diagnostic override.
-			if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", true); err != nil {
+			if _, err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", true); err != nil {
 				t.Fatalf("--since must override the refusal, got: %v", err)
 			}
 		})
@@ -1296,7 +1296,7 @@ func TestPrepareAttach(t *testing.T) {
 		}))
 		defer ts.Close()
 
-		if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
+		if _, err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
 			t.Fatalf("prepareAttach refused an unknown state locally: %v", err)
 		}
 	})
@@ -1320,7 +1320,7 @@ func TestPrepareAttach(t *testing.T) {
 		}))
 		defer ts.Close()
 
-		if err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
+		if _, err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false); err != nil {
 			t.Fatalf("prepareAttach: %v", err)
 		}
 		if gets != 4 {
@@ -1342,7 +1342,7 @@ func TestPrepareAttach(t *testing.T) {
 		}))
 		defer ts.Close()
 
-		err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false)
+		_, err := prepareAttach(&cli.Client{Base: ts.URL}, "sess_attach", false)
 		if err == nil || !strings.Contains(err.Error(), "conflict: session cannot be resumed right now") {
 			t.Fatalf("prepareAttach error = %v, want the original resume failure", err)
 		}
@@ -1942,7 +1942,8 @@ func useAgentServer(t *testing.T, ts *httptest.Server) *[]string {
 	}
 	var attached []string
 	saved := agentLoginAttach
-	agentLoginAttach = func(cfg cli.Config, id string, since uint64) error {
+	agentLoginAttach = func(cfg cli.Config, s session, since uint64) error {
+		id := s.ID
 		attached = append(attached, id)
 		return nil
 	}

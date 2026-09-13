@@ -8,6 +8,50 @@ The design that introduced it is
 [`docs/design/2026-09-10-conditional-controller-ownership.md`](design/2026-09-10-conditional-controller-ownership.md);
 this is the operator- and integrator-facing summary of what shipped.
 
+## The policy comes first
+
+Everything below describes the **exclusive** policy. Since
+[`docs/design/2026-09-12-shared-attachment-policy.md`](design/2026-09-12-shared-attachment-policy.md)
+a host chooses which of two rules it grants attachments by, and **shared is the
+default** for the hosted plane and for `controld`:
+
+| Policy | Who may type |
+|---|---|
+| `shared` (default) | Every attach that asked to type may type, at the session's current generation. Nothing is claimed, no generation is advanced on an attach, a claim or a release, and no attach is ever displaced by another one. |
+| `exclusive` | At most one attached terminal is the controller, taken by compare-and-advance on the generation and held under a lease. The whole of the rest of this document. |
+
+`controld --input-policy shared|exclusive` selects it (`RAINIER_INPUT_POLICY`);
+a hosted cell selects it where it composes its application. It is one value,
+read where the application is composed, and carried on every attach so the
+application and the plane cannot disagree about the rule an attach was granted
+under. The session view reports it as `input {policy, attached}`, which is where
+`rainier info`'s input row and the CLI's opening notice come from.
+
+Nothing in the machinery below is removed under the shared policy — the
+generation, the lease, the acknowledged handoff and the pty fence are all
+intact. What differs is that between peers there is nothing to fence: every live
+attach holds the current generation, so the fence is a no-op between them and
+still bites for a stale or revoked attachment. Four things are worth stating
+separately for a shared-policy host:
+
+- **`control_changed` is never pushed by a peer's attach, claim, release or
+  departure.** It is still pushed when an attach loses input authority for a
+  reason that is not a peer: its own `release`, and an attachment the plane
+  revokes.
+- **A shared attach still finds out when the generation moves under it.** It
+  holds no lease to have refused, so its heartbeat READS the generation instead
+  of renewing one, and demotes itself when the session has moved past the one it
+  is typing under. That is what covers a revocation on another replica, and a
+  fleet straddling a policy change.
+- **One policy per fleet.** The choice is per process, so a host rolling it
+  across replicas straddles the two rules for the length of the roll: an
+  exclusive replica's take-over fences a shared replica's typers, and they learn
+  from the read above within one heartbeat interval rather than instantly. Roll
+  it deliberately.
+- **The pty follows the most recent resize from any terminal that may type**,
+  under either policy. With one typer that is the controller's size, which is
+  what it always was.
+
 ## The rule
 
 At most one attached client is the **controller** at any moment. Everyone else
@@ -127,6 +171,14 @@ That last rule is why a **new plane always stamps the frames it forwards**,
 including a legacy client's, which the client cannot stamp itself: an unstamped
 frame reaching a current sandbox therefore means an older plane, and nothing
 else.
+
+One clause on that, since the shared policy: generation **zero** is the empty
+string on the wire (`terminal.GenOf`), and a shared session that no exclusive
+attach has ever touched stays at zero for its whole life — so its frames are
+literally unstamped. It is safe for the reason the fence is arithmetic rather
+than presence: the attachment is BOUND (a sandbox reads that off the mode, not
+off the generation), the session's own generation is zero, and zero equals zero.
+What an unstamped frame no longer proves on its own is that the plane was old.
 
 ## Operating notes
 
