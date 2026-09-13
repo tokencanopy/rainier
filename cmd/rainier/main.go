@@ -1707,8 +1707,14 @@ func defaultOwnership() attachio.Options {
 // withServerPolicy folds what the session view said about the server's
 // attachment policy into what this attach asks for. It changes only the COPY a
 // person sees — the notices, and whether a take-control key is offered — never
-// what the client sends, so an attach whose view read stale, or whose server
-// reported nothing, behaves identically and merely says less.
+// what the client sends.
+//
+// A view that read nothing (an older server) leaves this attach exactly as it
+// was: exclusive copy, which is what every build of this CLI printed before the
+// policy existed. A view that read SHARED against a server since restarted onto
+// exclusive is the one direction that can be wrong rather than merely thin, and
+// internal/attachio's `shared` field says what that costs and why it is
+// accepted.
 //
 // The count excludes this attach, which has not happened yet: "2 other
 // terminals attached" is exactly what the view was reporting a moment before

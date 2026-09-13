@@ -23,6 +23,15 @@ type ownership struct {
 	// session view before this attach dialed. It changes the COPY and nothing
 	// else: under a shared policy no peer holds anything, so "another device
 	// has control" is false and the key it offers cannot succeed.
+	//
+	// It is read once, for the life of the process, and can therefore go stale
+	// in one direction: a server restarted onto the exclusive policy while this
+	// client is reconnecting would have it print "this terminal may not type"
+	// where "another device took control; press Ctrl-\ to take it back" is the
+	// true sentence — withholding a key that would work. Accepted rather than
+	// fixed with a round trip per reconnect, because the only thing that changes
+	// a server's policy is an operator restarting it, which drops the attach
+	// this client is reconnecting from anyway.
 	shared bool
 	// others is how many other terminals could already type when this attach
 	// was prepared, for the one line it opens with. Zero is silence.
