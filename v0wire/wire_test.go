@@ -93,7 +93,8 @@ const fullSessionJSON = `{"id":"sess_example","owner_id":"usr_example","name":"d
 	`"reachable":true,"error":"the setup script failed","environment":"dev",` +
 	`"queue_reason":"waiting for runner runner-example","child_exit_code":0,` +
 	`"created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:06Z",` +
-	`"last_event_at":"2026-01-02T03:04:07Z","controller":{"generation":"6","held":true}}`
+	`"last_event_at":"2026-01-02T03:04:07Z","controller":{"generation":"6","held":true},` +
+	`"input":{"policy":"shared","attached":2}}`
 
 func fullDerived() v0wire.SessionDerived {
 	return v0wire.SessionDerived{
@@ -101,6 +102,8 @@ func fullDerived() v0wire.SessionDerived {
 		Environment:    "dev",
 		QueueReason:    "waiting for runner runner-example",
 		ControllerHeld: true,
+		InputPolicy:    "shared",
+		InputAttached:  2,
 	}
 }
 
@@ -165,12 +168,12 @@ func TestSessionViewKeySet(t *testing.T) {
 	keySet(t, v0wire.RenderSession(control.Session{}, v0wire.SessionDerived{}),
 		"id", "owner_id", "name", "image", "cmd", "egress_allow", "state", "runner",
 		"reachable", "error", "environment", "queue_reason", "child_exit_code",
-		"created_at", "updated_at", "last_event_at", "controller")
+		"created_at", "updated_at", "last_event_at", "controller", "input")
 	// The key set does not depend on how much of the row is populated.
 	keySet(t, v0wire.RenderSession(fullSession(), fullDerived()),
 		"id", "owner_id", "name", "image", "cmd", "egress_allow", "state", "runner",
 		"reachable", "error", "environment", "queue_reason", "child_exit_code",
-		"created_at", "updated_at", "last_event_at", "controller")
+		"created_at", "updated_at", "last_event_at", "controller", "input")
 }
 
 func TestSessionViewNormalizesEmptyAndNull(t *testing.T) {
@@ -182,7 +185,7 @@ func TestSessionViewNormalizesEmptyAndNull(t *testing.T) {
 			`"state":"","runner":"","reachable":false,"error":"","environment":"",`+
 			`"queue_reason":"","child_exit_code":null,"created_at":"0001-01-01T00:00:00Z",`+
 			`"updated_at":"0001-01-01T00:00:00Z","last_event_at":"0001-01-01T00:00:00Z",`+
-			`"controller":{"generation":"0","held":false}}`)
+			`"controller":{"generation":"0","held":false},"input":{"policy":"","attached":0}}`)
 }
 
 func TestSessionViewRendersTimestampsAsUTC(t *testing.T) {

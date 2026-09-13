@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/tokencanopy/rainier/control"
 	"github.com/tokencanopy/rainier/controlapp"
 	"github.com/tokencanopy/rainier/internal/controld"
 	"github.com/tokencanopy/rainier/internal/controld/pgstore"
@@ -26,6 +27,8 @@ func main() {
 	secretsKey := flag.String("secrets-key", envDefault("RAINIER_SECRETS_KEY", ""),
 		"64 hex characters (32 bytes) team secrets are encrypted with at rest (required; or set RAINIER_SECRETS_KEY; generate with: openssl rand -hex 32)")
 	githubAPI := flag.String("github-api", envDefault("RAINIER_GITHUB_API", "https://api.github.com"), "GitHub API base URL")
+	inputPolicy := flag.String("input-policy", envDefault("RAINIER_INPUT_POLICY", string(control.PolicyShared)),
+		"who may type when several terminals are attached to one session: shared (every attached terminal may type) or exclusive (one controller, taken with Ctrl-\\)")
 	flag.Parse()
 
 	// RAINIER_E2E_TEST_AGENT adds the synthetic "test" agent provider to the
@@ -63,6 +66,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("controld: %v", err)
 	}
+	// Refused here rather than at the first attach: a misspelled policy would
+	// otherwise start a controld that silently grants the default.
+	policy := control.InputPolicy(*inputPolicy)
+	if !policy.Valid() || policy == "" {
+		log.Fatalf("controld: --input-policy must be %q or %q", control.PolicyShared, control.PolicyExclusive)
+	}
 
 	adminLogins := splitLogins(*admins)
 	memberLogins := splitLogins(*members)
@@ -76,6 +85,7 @@ func main() {
 	defer st.Close()
 
 	srv, err := controld.New(st, controld.Config{
+		InputPolicy:   policy,
 		RunnerToken:   *runnerToken,
 		SecretsKey:    key,
 		Admins:        adminLogins,

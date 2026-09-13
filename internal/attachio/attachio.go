@@ -64,7 +64,31 @@ const (
 	NoticeTaken       = "[another device took control; press Ctrl-\\ to take it back]"
 	NoticeHaveControl = "[you have control]"
 	NoticeStale       = "[somebody else got there first; press Ctrl-\\ to try again]"
+	// NoticeViewOnly is the viewing notice under a SHARED policy, where the
+	// take-control key cannot succeed and no other device holds anything: this
+	// attach may watch and may not type, which is a host policy's answer about
+	// this person and not a race anybody can win.
+	NoticeViewOnly = "[viewing — this terminal may not type]"
 )
+
+// SharedNotice is the opening line a shared-policy attach prints when other
+// terminals are already able to type: one line, a count, and the key that gets
+// out. The first typer prints nothing at all, exactly as an attach with control
+// has always been silent.
+//
+// The count is pluralized rather than printed as "terminal(s)", and the whole
+// sentence is bracketed like every other notice this package writes, because
+// they are all read in the same scrollback.
+func SharedNotice(others int) string {
+	if others <= 0 {
+		return ""
+	}
+	noun := "terminals"
+	if others == 1 {
+		noun = "terminal"
+	}
+	return fmt.Sprintf("[%d other %s attached; everyone may type. Ctrl-] detaches.]", others, noun)
+}
 
 // attachReadLimit matches sessiond/runnerd/controld's own raised read limit
 // (see internal/server/server.go): a snapshot replaying a large scrollback
@@ -139,6 +163,22 @@ type Options struct {
 	// re-claimed every time it was refused would be two devices fighting for
 	// a keyboard instead of one person deciding.
 	Take bool
+	// Shared says the server told this client, before it dialed, that its
+	// attachment policy is shared: every attached terminal may type, nothing
+	// is claimed and nobody is displaced. It changes only what a person is
+	// TOLD — the take-over copy is wrong under that policy, and the key it
+	// offers cannot succeed — and never what this client sends.
+	//
+	// It is what the SESSION VIEW said, not what the attach socket said: the
+	// terminal protocol carries no policy, and the CLI already reads the view
+	// before it attaches. A server that reports no policy (an older one) leaves
+	// this false, which is today's copy and today's behaviour.
+	Shared bool
+	// OtherTypers is how many other terminals could already type when this
+	// attach was prepared, for the one line a shared-policy attach opens with.
+	// Zero is silence. It is a courtesy count and nothing depends on it being
+	// exact: it was read a moment before this attach existed.
+	OtherTypers int
 	// NeverClaim is `rainier attach --view`: this attach claims nothing, by
 	// any route, for its whole life — not the take-control key and not Take.
 	//

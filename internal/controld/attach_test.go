@@ -47,6 +47,13 @@ func newAttachControld(t *testing.T, opts ...func(*Config)) (*Server, MemStore, 
 		// over a websocket round trip. The attach tests that DO measure
 		// something measure AttachWait, which they pass explicitly.
 		OpTimeout: 10 * time.Second,
+		// The conditional-controller model, named rather than inherited. The
+		// SHIPPED default is control.PolicyShared, and the attach tests built
+		// on this helper are the ones that pin take-overs, leases and
+		// displacement — they must keep testing the model they were written
+		// for. An opts override selects shared where that is the subject; see
+		// shared_input_test.go.
+		InputPolicy: control.PolicyExclusive,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -336,9 +343,9 @@ type attachFixture struct {
 	id  string
 }
 
-func newAttachFixture(t *testing.T) *attachFixture {
+func newAttachFixture(t *testing.T, opts ...func(*Config)) *attachFixture {
 	t.Helper()
-	s, st, ts := newAttachControld(t)
+	s, st, ts := newAttachControld(t, opts...)
 	u, tok := loginUser(t, st, "alice", "member")
 
 	// A real runnerd: fake driver, its own HTTP surface for the session's

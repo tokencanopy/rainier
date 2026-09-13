@@ -67,14 +67,17 @@ func serve(ctx context.Context, c *websocket.Conn, s *session.Session, since uin
 
 	// Liveness: a viewer whose transport has died (terminal closed, laptop
 	// slept, network vanished) never sends a close frame and never errors
-	// out of the reader loop below on its own — it just parks forever,
-	// still counted by EffectiveSize, still clamping every other viewer's
-	// PTY to its last-known size. A periodic ping/pong round trip is the
-	// only way to notice a peer that TCP itself hasn't yet noticed is gone;
-	// a failed ping forces the socket closed so the reader's blocked Read
-	// unblocks with an error, serve returns, and the deferred Detach above
-	// runs — after which applySizeLocked (Plan 1) recomputes EffectiveSize
-	// from the survivors and they regrow.
+	// out of the reader loop below on its own — it just parks forever, still
+	// counted among the attachments that may type. Since the pty follows the
+	// LATEST resize from any of them (session.latestSize, in that package), a parked
+	// attachment that resized last owns the pty's size until something
+	// detaches it, and every other attachment renders a screen that is not
+	// its own. A periodic ping/pong round trip is the only way to notice a
+	// peer that TCP itself hasn't yet noticed is gone; a failed ping forces
+	// the socket closed so the reader's blocked Read unblocks with an error,
+	// serve returns, and the deferred Detach above runs — after which
+	// applySizeLocked recomputes the size from the survivors and the pty
+	// follows whichever of them reported most recently.
 	pingCtx, cancelPing := context.WithCancel(ctx)
 	defer cancelPing()
 	go func() {

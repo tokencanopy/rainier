@@ -49,6 +49,32 @@ type SessionView struct {
 	// only sometimes cannot be told apart from an older server that never had
 	// it.
 	Controller ControllerView `json:"controller"`
+	// Input is the RULE by which this server decides who may type, and how
+	// many terminals currently may. Additive beside Controller rather than
+	// inside it: the controller generation still exists and still means what
+	// it meant, and a client that reads the object it already knows must not
+	// have its meaning changed under it.
+	Input InputView `json:"input"`
+}
+
+// InputView is the session's attachment policy and the number of terminals
+// typing under it. Like ControllerView it names NOBODY: a count is not an
+// identity, and no device, account or location is derivable from it.
+//
+// Policy is control.InputPolicy's own word — "shared" or "exclusive". The
+// EMPTY string is a meaningful answer and not a gap: it is what a server that
+// predates this object says by omitting it, and what a host that renders a view
+// without supplying one says. A client reads an empty or unrecognised policy as
+// exclusive, which is the behaviour every client already has.
+//
+// Attached is how many attached terminals may currently type, as the replica
+// answering this request sees them. It is a status fact — a notice, a status row
+// — and never an authorization input: on a host with several gateway replicas it
+// counts that replica's attaches, and it can change the instant after it is
+// read.
+type InputView struct {
+	Policy   string `json:"policy"`
+	Attached int    `json:"attached"`
 }
 
 // ControllerView is the session's terminal ownership, as much of it as any
@@ -83,6 +109,13 @@ type SessionDerived struct {
 	// arguments rather than reading the wall clock out from under its
 	// callers' tests.
 	ControllerHeld bool
+	// InputPolicy is the attachment policy this host composed its application
+	// with, and InputAttached the number of attached terminals that may
+	// currently type. Neither is on the row: the policy is the host's
+	// composition and the count is live plane state, which is why they arrive
+	// here beside Reachable rather than being read off the session.
+	InputPolicy   string
+	InputAttached int
 }
 
 // RenderSession renders s as its client-facing view, with d supplying the
@@ -113,6 +146,9 @@ func RenderSession(s control.Session, d SessionDerived) SessionView {
 			Generation: strconv.FormatUint(s.ControllerGeneration, 10),
 			Held:       d.ControllerHeld,
 		},
+		// Rendered exactly as the host supplied it, empty included: inventing
+		// a default here would report a policy this server may not be running.
+		Input: InputView{Policy: d.InputPolicy, Attached: d.InputAttached},
 	}
 }
 

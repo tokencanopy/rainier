@@ -289,11 +289,19 @@ func (s *scriptedStream) nextServerMsg(t *testing.T) terminal.ServerMessage {
 // brokerTarget is the resolved binding the attachment service hands a broker.
 // Its generations are fictional and unread by this plane: a self-hosted
 // install has one placement per session and no viewer/controller split yet.
+//
+// It names control.PolicyExclusive, and every ownership literal in this
+// package's tests does the same: this suite IS the conditional-controller
+// model's suite — take-overs, leases, heartbeats, displacement — and it must
+// keep testing that model now that the SHIPPED default is shared input. The
+// shared policy's own behaviour is tested in shared_test.go, where the targets
+// name it.
 func brokerTarget(session, runnerName string) control.AttachTarget {
 	return control.AttachTarget{
 		WorkspaceID: "ws_test", SessionID: control.SessionID(session),
 		PoolID: "pool_test", RunnerID: control.RunnerID(runnerName),
 		PlacementGeneration: 1, ControllerGeneration: 1,
+		Policy: control.PolicyExclusive,
 	}
 }
 

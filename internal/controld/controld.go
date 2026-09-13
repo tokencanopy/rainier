@@ -106,6 +106,15 @@ type Config struct {
 	// MaxTransferBytes is the most this replica relays in one file transfer,
 	// either direction; zero means workspace.MaxBytes; tests lower it.
 	MaxTransferBytes int64
+	// InputPolicy is who may type when several terminals are attached to one
+	// session: control.PolicyShared (the default, and the empty value) or
+	// control.PolicyExclusive, which is the conditional-controller model.
+	// `controld --input-policy` selects it.
+	//
+	// It is read once here and used twice — the attachment service grants by
+	// it, and the session view reports it — so an operator has one knob and
+	// the two can never disagree.
+	InputPolicy control.InputPolicy
 }
 
 // Server is controld: the HTTP/WebSocket surface, the runner plane, and (as
@@ -240,6 +249,21 @@ func New(st Store, cfg Config) (*Server, error) {
 	return s, nil
 }
 
+// inputPolicy is this replica's attachment policy, with the empty value
+// spelled out. Every reader goes through it rather than reading the config
+// field, so "unset means shared" is stated once.
+func (s *Server) inputPolicy() control.InputPolicy { return s.cfg.InputPolicy.Resolved() }
+
+// typingAttachments is how many terminals attached to one session THROUGH THIS
+// REPLICA may currently type. It is the number the session view reports; a
+// Server without an attach plane (a bare one in a test) has none.
+func (s *Server) typingAttachments(id control.SessionID) int {
+	if s.attach == nil {
+		return 0
+	}
+	return s.attach.Typers(id)
+}
+
 // fleetSafetyInterval is how often the fleet service re-drains every known
 // pool even when no wake arrived — the same 10s safety tick today's scheduler
 // loop runs on, so a wake that was coalesced away costs at most that long.
@@ -303,6 +327,7 @@ func (s *Server) compose() error {
 		Broker: s.broker, Events: events, Clock: clock, IDs: ids, UnitOfWork: uow,
 		ExecBroker:       s.attach.ExecBroker(),
 		MaxTransferBytes: s.cfg.MaxTransferBytes,
+		InputPolicy:      s.inputPolicy(),
 	})
 	if err != nil {
 		return fmt.Errorf("controld: composing the attachment service: %w", err)

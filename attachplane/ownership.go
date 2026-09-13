@@ -37,8 +37,18 @@ type ownership struct {
 	session    control.SessionID
 	negotiated bool
 	mayClaim   bool
-	keeper     control.ControllerLeaseKeeper
-	stream     control.TerminalStream
+	// policy is the attachment policy this attach was GRANTED under, read off
+	// its target. Under control.PolicyShared every live attach holds the
+	// session's current generation, so the four places below that would take,
+	// move or give up an exclusive authority have nothing to do — and doing
+	// them anyway would fence peers who are legitimately typing.
+	//
+	// It is not a knob of the plane's: the application advances the generation
+	// and the plane carries the decision, so one value on the target is the
+	// only way the two cannot disagree.
+	policy control.InputPolicy
+	keeper control.ControllerLeaseKeeper
+	stream control.TerminalStream
 
 	// announce serialises everything that TELLS this client what it is, and
 	// holds the state read and the message that reports it together. Without
@@ -104,6 +114,7 @@ func newOwnership(p *Plane, target control.AttachTarget) *ownership {
 	return &ownership{
 		plane:      p,
 		session:    target.SessionID,
+		policy:     target.Policy,
 		negotiated: target.Negotiated || target.Controller != nil,
 		mayClaim:   target.MayClaim && target.Controller != nil,
 		keeper:     target.Controller,
@@ -119,6 +130,12 @@ func (o *ownership) get() (mode string, gen uint64) {
 	defer o.mu.Unlock()
 	return o.mode, o.gen
 }
+
+// shared reports whether this attach was granted under a policy that admits
+// several typers. It reads the policy through control.InputPolicy's own
+// question, so the empty value means shared here exactly as it does
+// everywhere else.
+func (o *ownership) shared() bool { return o.policy.Shared() }
 
 // advance moves this attach to (mode, gen) unless that would move it
 // BACKWARDS, and reports whether it moved. A generation older than the one
@@ -344,6 +361,28 @@ func (o *ownership) acked(gen uint64) {
 // again — never an error, because losing a race is an answer.
 func (o *ownership) claim(ctx context.Context, expected uint64) {
 	if !o.negotiated {
+		return
+	}
+	if o.shared() {
+		// Under a shared policy input authority is settled once, at attach
+		// time, and nothing a client sends changes it. A claim from an attach
+		// that is already a typer is answered at the generation it already
+		// holds — it is asking for what it has — advancing nothing and
+		// displacing nobody. One from an attach that is NOT a typer (a --view
+		// client that sent one anyway, a principal the host grants viewing
+		// and not driving, an attachment the plane revoked) is answered the
+		// way a lost race is answered, and the store is not touched.
+		//
+		// Promoting that second case would be defensible on its own terms —
+		// there is no contention to lose under this policy — and is refused
+		// because it would make a plane-side revocation reversible by the
+		// revoked client, which is the one mechanism left that moves a shared
+		// attach out of `control`.
+		if o.controlling() {
+			o.announceAs(ctx, terminal.TypeAttached, 0)
+			return
+		}
+		o.announceAs(ctx, terminal.TypeStale, 0)
 		return
 	}
 	if mode, gen := o.get(); mode == terminal.ModeControl {
@@ -591,6 +630,16 @@ func (o *ownership) release(ctx context.Context) {
 	if mode != terminal.ModeControl {
 		return
 	}
+	if o.shared() {
+		// Accepted, and a NO-OP FOR PEERS. This attach becomes a viewer at the
+		// same generation, its own attachment's binding is re-installed as
+		// `view` so the pty stops executing what it sends, and its client is
+		// told. The generation is deliberately not advanced: advancing is how
+		// the exclusive policy fences a departing controller, and here it
+		// would fence every peer typing under that generation.
+		o.demote(ctx, gen)
+		return
+	}
 	_ = o.keeper.Release(ctx, gen)
 	o.plane.displace(ctx, o, o.demote(ctx, gen), false)
 }
@@ -632,10 +681,29 @@ func (o *ownership) demote(ctx context.Context, from uint64) uint64 {
 	return gen
 }
 
-// heartbeat renews the lease while this attach holds control, on the stream's
-// own liveness cadence. It is also how a controller displaced by an attach on
-// ANOTHER replica finds out: nothing pushes it a message, its own renewal
-// simply stops being accepted, and it demotes itself.
+// heartbeat keeps one attach's view of its own authority current, on the
+// stream's own liveness cadence. It is how an attach fenced somewhere this
+// replica cannot see finds out: nothing pushes it a message, and this loop is
+// the only thing that asks.
+//
+// What it asks differs by policy, and both are the same question:
+//
+//   - EXCLUSIVE renews the lease under the generation this attach holds. A
+//     renewal refused with ErrStale means somebody else's claim advanced past
+//     it, and the attach demotes itself.
+//   - SHARED takes no lease and renews nothing — there is no exclusivity to
+//     hold — so it READS the generation instead, and demotes when the store has
+//     moved past the one this attach is typing under.
+//
+// Under a uniform shared fleet nothing ever advances the generation, so that
+// read never demotes anybody and costs one store read per attach per interval.
+// It is here for the two cases where the generation does move under a shared
+// attach: a plane-side revocation on another replica, and a fleet straddling a
+// policy change, where an exclusive replica's take-over advances the row and
+// fences this attach at the pty. Without it such a terminal simply stops
+// accepting typing, with no notice and no key — the exact outcome conditional
+// ownership was built to avoid — because `displace` only ever reaches the
+// attaches this replica is serving.
 func (o *ownership) heartbeat(ctx context.Context) {
 	if o.keeper == nil {
 		return
@@ -649,6 +717,10 @@ func (o *ownership) heartbeat(ctx context.Context) {
 		case <-t.C:
 			mode, gen := o.get()
 			if mode != terminal.ModeControl {
+				continue
+			}
+			if o.shared() {
+				o.pollFence(ctx, gen)
 				continue
 			}
 			err := o.keeper.Renew(ctx, gen)
@@ -668,6 +740,27 @@ func (o *ownership) heartbeat(ctx context.Context) {
 	}
 }
 
+// pollFence is the shared policy's half of the heartbeat: it asks the store
+// whether the generation this attach is typing under is still the session's,
+// and demotes the attach when it is not.
+//
+// It NEVER advances anything, which is what keeps it a shared-policy operation:
+// State is a read, and demote installs a viewer binding on this attachment
+// alone and tells this client. No peer is touched — a generation that moved
+// under this attach moved for a reason this attach is not party to, and
+// announcing it to peers from here would be this replica guessing at somebody
+// else's handoff.
+//
+// A read that fails leaves the attach alone. The store being briefly unusable
+// is not evidence that anything was taken, and the next tick asks again.
+func (o *ownership) pollFence(ctx context.Context, gen uint64) {
+	current, _, err := o.keeper.State(ctx)
+	if err != nil || current <= gen {
+		return
+	}
+	o.demote(ctx, gen)
+}
+
 // finish ends this attach's ownership. A controller that leaves releases at
 // once, so the next attach claims with no click rather than waiting out a
 // lease its holder has already walked away from.
@@ -685,6 +778,12 @@ func (o *ownership) finish() {
 	// attach that is walking out of the door.
 	mode, gen := o.get()
 	if o.keeper == nil || mode != terminal.ModeControl {
+		return
+	}
+	if o.shared() {
+		// Nothing was held, so nothing is given back and nobody is told: a
+		// peer's generation did not change because this terminal closed, and
+		// a release here would advance past every typer still in the session.
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
@@ -732,6 +831,27 @@ func (t *ownerTable) remove(o *ownership) {
 	if len(t.m[o.session]) == 0 {
 		delete(t.m, o.session)
 	}
+}
+
+// typers counts the attaches this replica is serving for one session that may
+// currently type into it. It is a status fact — the count `rainier info`
+// reports and an opening notice names — and never an authorization input: on a
+// host with several replicas it is this replica's attaches and not the
+// session's.
+//
+// It reads each attach's own lock while holding the table's. That is the one
+// direction this package ever nests them — nothing takes an attach's lock and
+// then the table's — so it cannot deadlock against a handoff.
+func (t *ownerTable) typers(id control.SessionID) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := 0
+	for o := range t.m[id] {
+		if o.controlling() {
+			n++
+		}
+	}
+	return n
 }
 
 // peers returns the other attaches this replica is serving for one session.
@@ -786,8 +906,13 @@ func (t *ownerTable) peers(o *ownership) []*ownership {
 // once per peer, in a queue.
 func (p *Plane) displace(ctx context.Context, winner *ownership, gen uint64, wait bool) {
 	var wg sync.WaitGroup
-	// Zero needs no guard of its own: no row is ever at generation zero, so
-	// every attach is already at or past it and displaceTo refuses each one.
+	// Zero needs no guard of its own, but not for the reason it used to: a row
+	// CAN sit at generation zero for its whole life now, because nothing under
+	// the shared policy advances it. What makes zero safe here is that this
+	// fan-out never runs under that policy — every caller is an exclusive-only
+	// path — and under the exclusive policy a generation somebody won is always
+	// non-zero. A displace call added to a shared path would find displaceTo
+	// refusing every peer at zero and telling nobody; do not add one.
 	for _, other := range p.owners.peers(winner) {
 		// The check and the write are ONE step, under that peer's own lock:
 		// between them, a claim of its own could otherwise land and overwrite

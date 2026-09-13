@@ -43,6 +43,17 @@ type AttachmentOptions struct {
 	// controld, and making a new dependency mandatory would break a host's
 	// build the moment it took the update, for a capability it may not want.
 	ExecBroker ExecBroker
+	// InputPolicy is who may type when several terminals are attached to one
+	// session: control.PolicyShared (the default, and the empty value) or
+	// control.PolicyExclusive. It is read once, here, and carried on every
+	// AttachTarget this service hands its broker, so the application and the
+	// plane can never disagree about which rule an attach was granted under.
+	//
+	// A host taking this update without naming a policy gets SHARED, which is
+	// a deliberate change of default rather than an oversight: shared typing
+	// is the product decision for both composers, and the exclusive model is
+	// intact behind the other value.
+	InputPolicy control.InputPolicy
 	// MaxTransferBytes bounds one push or pull's compressed bytes. Zero means
 	// workspace.MaxBytes; a negative value is control.ErrInvalid. Hosts lower
 	// it in tests so the overrun path is exercised without streaming the full
@@ -87,6 +98,7 @@ type AttachmentService struct {
 	ids         control.IDGenerator
 	uow         control.UnitOfWork
 	execBroker  ExecBroker
+	policyInput control.InputPolicy
 	maxTransfer int64
 	rpcSeq      atomic.Uint64
 }
@@ -106,6 +118,7 @@ func NewAttachmentService(opts AttachmentOptions) (*AttachmentService, error) {
 		opts.Clock == nil,
 		opts.IDs == nil,
 		opts.UnitOfWork == nil,
+		!opts.InputPolicy.Valid(),
 		opts.MaxTransferBytes < 0:
 		return nil, control.ErrInvalid
 	}
@@ -124,6 +137,7 @@ func NewAttachmentService(opts AttachmentOptions) (*AttachmentService, error) {
 		ids:         opts.IDs,
 		uow:         opts.UnitOfWork,
 		execBroker:  opts.ExecBroker,
+		policyInput: opts.InputPolicy.Resolved(),
 		maxTransfer: maxTransfer,
 	}, nil
 }
@@ -371,6 +385,24 @@ func (k controllerKeeper) State(ctx context.Context) (uint64, bool, error) {
 // grant decides what one attach actually gets: its mode, the generation it
 // holds, and the keeper it runs the rest of its life through.
 //
+// Under control.PolicyShared there is nothing exclusive to take, so nothing is
+// claimed: an attach admitted as a viewer is a viewer at the row's current
+// generation, and EVERY other attach — negotiated or not — is a controller at
+// that same current generation, with no compare-and-advance and no lease. The
+// legacy path is covered by the same rule and deliberately: an unnegotiated
+// attach is recorded as a take-over under the exclusive policy because a
+// client that cannot be told it is a viewer cannot be made one, and under
+// shared there is nobody to displace, so advancing the generation would fence
+// the other typers for nothing.
+//
+// A negotiated attach still carries a keeper under either policy — the
+// contract's invariant is that Controller is non-nil exactly when Negotiated
+// is set, and a viewer reads its own generation through it. What differs is
+// that nothing under the shared policy ever calls Claim, Renew or Release on
+// it.
+//
+// Everything from here down is the EXCLUSIVE rule, unchanged.
+//
 // An UNNEGOTIATED attach behaves exactly as it did before conditional
 // ownership existed. A viewer reads the row's current generation; a
 // controller advances it unconditionally. That is deliberate rather than
@@ -397,9 +429,13 @@ func (k controllerKeeper) State(ctx context.Context) (uint64, bool, error) {
 // answer, not a failure.
 func (s *AttachmentService) grant(ctx context.Context, scope control.Scope, resource control.Resource,
 	row control.Session, cmd control.AttachTerminal) (control.AttachmentMode, uint64, control.ControllerLeaseKeeper, error) {
+	shared := s.policyInput.Shared()
 	if !cmd.Negotiated {
 		if cmd.Mode == control.AttachmentViewer {
 			return control.AttachmentViewer, row.ControllerGeneration, nil, nil
+		}
+		if shared {
+			return control.AttachmentController, row.ControllerGeneration, nil, nil
 		}
 		gen, err := s.sessions.NextControllerGeneration(ctx, row.WorkspaceID, row.ID)
 		if err != nil {
@@ -428,6 +464,13 @@ func (s *AttachmentService) grant(ctx context.Context, scope control.Scope, reso
 		ws:       row.WorkspaceID, id: row.ID, holder: holder}
 	if cmd.Mode == control.AttachmentViewer {
 		return control.AttachmentViewer, row.ControllerGeneration, keeper, nil
+	}
+	if shared {
+		// A typer at the generation the row already carries. Not a claim:
+		// every peer is typing under this same generation, so advancing would
+		// fence all of them, and the lease is an exclusivity hint there is
+		// nothing here to hint at.
+		return control.AttachmentController, row.ControllerGeneration, keeper, nil
 	}
 
 	// A live lease held at a generation this attach is not presenting is
@@ -596,6 +639,7 @@ func (s *AttachmentService) AttachTerminal(ctx context.Context, scope control.Sc
 		PlacementGeneration:  row.PlacementGeneration,
 		ControllerGeneration: generation,
 		Mode:                 mode,
+		Policy:               s.policyInput,
 		Negotiated:           cmd.Negotiated,
 		MayClaim:             mayClaim,
 		Controller:           keeper,

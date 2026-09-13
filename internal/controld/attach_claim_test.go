@@ -247,6 +247,10 @@ func withRecordingPolicy(t *testing.T, fx *attachFixture) *recordingPolicy {
 		Transport: fx.s.transport, Broker: fx.s.broker, Events: fx.st,
 		Clock: fx.s.clock, IDs: idGenerator{}, UnitOfWork: fx.st,
 		MaxTransferBytes: fx.s.cfg.MaxTransferBytes,
+		// The same policy the fixture's own service was composed with: a
+		// re-composition that dropped it would silently move this test to the
+		// default policy and stop testing claims at all.
+		InputPolicy: fx.s.inputPolicy(),
 	})
 	if err != nil {
 		t.Fatalf("composing an attachment service over a recording policy: %v", err)

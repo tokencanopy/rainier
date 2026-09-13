@@ -20,6 +20,64 @@ const (
 	AttachmentController AttachmentMode = "controller"
 )
 
+// InputPolicy names who may type when several terminals are attached to one
+// session. It is the HOST's choice, made once where the application is
+// composed, and it is not negotiated with any client: a client reads what it
+// is told about its own attach and never asks for a policy.
+//
+//	PolicyShared     every attach that asked to type may type, at the
+//	                 session's current generation. Nothing is claimed, no
+//	                 generation is advanced on an attach, and no peer is ever
+//	                 displaced by another attach's arrival.
+//	PolicyExclusive  at most one attached terminal is the controller, taken
+//	                 by compare-and-advance on the generation and held under
+//	                 a lease. This is the model conditional ownership
+//	                 shipped, unchanged.
+//
+// The empty value means PolicyShared, wherever one appears: shared typing is
+// the product default for both composers — the hosted cell gateway and the
+// self-hosted controld binary — and a default that every composer has to
+// restate is a default in name only. A host that wants exclusive ownership
+// names it.
+//
+// It is deliberately not called AttachmentPolicy. That name belongs to the
+// mode-aware AUTHORIZATION seam an application composes ("may this principal
+// drive?"), and two types a reader has to disambiguate by package is worse
+// than one named for what it decides.
+type InputPolicy string
+
+const (
+	PolicyShared    InputPolicy = "shared"
+	PolicyExclusive InputPolicy = "exclusive"
+)
+
+// Shared reports whether p admits several typers, reading the empty value as
+// PolicyShared. Every consumer asks this rather than comparing to a constant,
+// so the default lives in exactly one place.
+func (p InputPolicy) Shared() bool { return p != PolicyExclusive }
+
+// Valid reports whether p is a policy this contract defines. The empty value
+// is valid — it is the default — and anything else is a composition error
+// worth refusing where the application is built rather than at the first
+// attach.
+func (p InputPolicy) Valid() bool {
+	switch p {
+	case "", PolicyShared, PolicyExclusive:
+		return true
+	}
+	return false
+}
+
+// Resolved returns p with the empty value spelled out, for a consumer that
+// carries the policy onward — an AttachTarget, a status view — rather than
+// only asking Shared about it.
+func (p InputPolicy) Resolved() InputPolicy {
+	if p == "" {
+		return PolicyShared
+	}
+	return p
+}
+
 // AttachTerminal is the command for AttachTerminal. Since is the attach
 // cursor (terminal.SinceAll for the whole log, 0 for a snapshot of the
 // current screen). Mode distinguishes viewer from controller intent.
@@ -79,6 +137,16 @@ type AttachTarget struct {
 	// without leaving the replica; the keeper's own Claim asks the policy
 	// again, and that answer is the authority.
 	MayClaim bool
+	// Policy is the attachment policy this attach was granted under, so a
+	// broker fences and announces under the same rule the application
+	// granted by. It is the application's value and not a second knob: a
+	// plane with a policy of its own is a value a composer has to keep equal
+	// to this one, and the failure when they drift is the worst one available
+	// — an application that advances the generation on attach while the plane
+	// declines to tell the peer it displaced.
+	//
+	// The empty value reads as PolicyShared, like every other InputPolicy.
+	Policy InputPolicy
 	// Controller is the live half of the lease — claim, renew, release —
 	// bound by the application to this workspace, session and attach. A
 	// broker drives a handoff through it and is never handed a repository.

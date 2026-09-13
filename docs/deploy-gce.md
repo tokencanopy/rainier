@@ -189,9 +189,51 @@ get the non-admin role. Allowlist entries are matched case-insensitively, as
 GitHub logins are — `Alice` in `--admins` admits the account GitHub reports as
 `alice`.
 
+**Who may type when several terminals are attached to one session** is
+`--input-policy`, and it has two values:
+
+```bash
+./bin/controld --input-policy shared     # the default: every attached terminal may type
+./bin/controld --input-policy exclusive  # one controller at a time; Ctrl-\ takes it
+```
+
+`shared` is the default because two terminals on one session are usually one
+person — the laptop they started it from and the browser tab they opened later —
+and making that person press a key to move between their own windows is friction
+with no benefit. Their input is interleaved at the pty in the order it arrives,
+and the terminal size follows whichever of them resized last.
+
+`exclusive` is the conditional-controller model: one controller, a 30-second
+lease, `Ctrl-\` to take over, and the device that had it told at once. Choose it
+where several PEOPLE attach to one session and two of them typing at the same
+prompt would be a hazard rather than a convenience.
+[`docs/terminal-controller-ownership.md`](terminal-controller-ownership.md) is
+the whole of that model.
+
+The choice is **per process** and is not stored on a session, so restarting
+`controld` with the other value changes the rule for every attach made after it.
+A restart drops the attaches that were live — the runner connections and their
+attachments go with the process — so there are no live attaches to be
+inconsistent, on a single-replica deployment like this one.
+
+**A multi-replica host should roll the policy deliberately, and to one value.**
+There is no fleet coordination behind the flag, so while a roll is in progress
+two replicas can grant different rules for one session. What happens then is
+defined rather than undefined: an exclusive replica's attach advances the
+session's controller generation and fences the shared replica's typers at the
+pty, and each of them notices within one heartbeat interval (≤5s), demotes, and
+tells its terminal. Expect that interval of inconsistency per session that is
+attached across the roll, and nothing worse.
+
+A misspelled value refuses to start rather than silently granting the default.
+`rainier info` reports which rule is in force. Nothing in a session, a snapshot
+or the database depends on the value, so it is safe to change in either
+direction.
+
 Every flag also reads a `RAINIER_*` environment variable
 (`RAINIER_LISTEN`, `RAINIER_DB`, `RAINIER_RUNNER_TOKEN`, `RAINIER_SECRETS_KEY`,
-`RAINIER_ADMINS`, `RAINIER_MEMBERS`, `RAINIER_EXTERNAL_URL`, `RAINIER_GITHUB_API`), so the
+`RAINIER_ADMINS`, `RAINIER_MEMBERS`, `RAINIER_EXTERNAL_URL`, `RAINIER_GITHUB_API`,
+`RAINIER_INPUT_POLICY`), so the
 command above shrinks to `./bin/controld` once those are exported — an
 explicit flag always wins over the environment.
 
