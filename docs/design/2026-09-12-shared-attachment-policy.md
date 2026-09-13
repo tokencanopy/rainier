@@ -301,8 +301,15 @@ still ticking, which is worse.
   the same sentence the opening viewer notice uses, so no client has to learn a
   new one.
 - **A release, then input.** The releasing attach's own binding is `view` at
-  the current generation before its client is told, so a keystroke already in
-  flight is dropped at the pty rather than executed after the release.
+  the current generation before its client is told when the sandbox confirms
+  installation. An older sandbox may not acknowledge, and a failed binding
+  write cannot confirm its PTY fence. In either fallback the plane has already
+  stopped forwarding stdin and resize; the release never advances the shared
+  generation or demotes peers. Already-forwarded bytes on an old sandbox are
+  not covered by an acknowledged PTY-demotion guarantee.
+- **Invalid dimensions.** Attach and resize reject non-positive dimensions,
+  either axis above 4096, or more than 262144 cells before changing session
+  state. This bounds emulator allocation even when the latest typer is hostile.
 - **Two typers resizing at once.** The pty ends at whichever resize the session
   processed last, under one lock; there is no interleaving that leaves the
   emulator and the pty at different sizes.

@@ -2,6 +2,12 @@ package session
 
 type Size struct{ Cols, Rows int }
 
+// Limit both dimensions and total cells before the emulator allocates. This
+// allows large terminals without letting an attach request exhaust the process.
+func (s Size) valid() bool {
+	return s.Cols > 0 && s.Rows > 0 && s.Cols <= 4096 && s.Rows <= 4096 && s.Cols*s.Rows <= 256*1024
+}
+
 // reported is one attachment's last terminal size and WHEN it reported it,
 // counted in the session's own monotonic tick rather than in wall time. The
 // tick is what "most recent" means here: a clock would make the rule depend on

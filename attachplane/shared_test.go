@@ -292,6 +292,55 @@ func TestSharedPolicyReleaseIsANoOpForPeers(t *testing.T) {
 	}
 }
 
+// A legacy sandbox may never acknowledge a binding. Demotion must still
+// fence subsequent input at the plane without changing a peer's authority.
+func TestSharedReleaseWithoutSandboxAcknowledgement(t *testing.T) {
+	p, h, ts := newTestPlane(t, Options{ControlAckTimeout: 20 * time.Millisecond})
+	lease := &fakeLease{gen: 3}
+	a := startSharedAttach(t, p, h, ts, control.AttachmentController, 3, fakeKeeper{lease, "att_release"}, false)
+	awaitType(t, a.stream, terminal.TypeAttached)
+	awaitSpliced(t, a)
+	b := startSharedAttach(t, p, h, ts, control.AttachmentController, 3, fakeKeeper{lease, "att_peer"}, true)
+	awaitType(t, b.stream, terminal.TypeAttached)
+	awaitSpliced(t, b)
+	a.stream.in <- terminal.ClientMessage{Type: terminal.TypeRelease}
+	m, _ := awaitType(t, a.stream, terminal.TypeControlChanged)
+	if m.Mode != terminal.ModeView || m.Generation.Value() != 3 {
+		t.Fatalf("demotion: %+v", m)
+	}
+	a.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("rejected")}
+	a.stream.in <- terminal.ClientMessage{Type: "resize", Cols: 123, Rows: 45}
+	awaitPumpCaughtUp(t, a)
+	for _, m := range a.sandbox.received() {
+		if m.Type == "stdin" || (m.Type == "resize" && m.Cols == 123) {
+			t.Fatalf("released input forwarded: %+v", m)
+		}
+	}
+	b.stream.in <- terminal.ClientMessage{Type: "stdin", Data: []byte("peer")}
+	awaitSharedPumpCaughtUp(t, b)
+	assertTypedInOrder(t, b, 3, "peer")
+	lease.mu.Lock()
+	defer lease.mu.Unlock()
+	if lease.gen != 3 {
+		t.Fatalf("generation advanced: %d", lease.gen)
+	}
+}
+
+func TestSharedReleaseWithFailedBindingWriteStillFencesThePlane(t *testing.T) {
+	p, _, _ := newTestPlane(t, Options{ControlAckTimeout: 20 * time.Millisecond})
+	stream := newScriptedStream()
+	o := newOwnership(p, control.AttachTarget{SessionID: "sess_example", Mode: control.AttachmentController,
+		ControllerGeneration: 3, Negotiated: true, Policy: control.PolicyShared,
+		Controller: fakeKeeper{&fakeLease{gen: 3}, "att_release"}})
+	o.stream = stream
+	o.bindRunner(blockedConn{})
+	o.release(context.Background())
+	m, _ := awaitType(t, stream, terminal.TypeControlChanged)
+	if m.Mode != terminal.ModeView || m.Generation.Value() != 3 || o.mayForward() {
+		t.Fatalf("failed binding left input enabled: %+v", m)
+	}
+}
+
 // TestSharedPolicyDepartureTellsNobodyAndReleasesNothing: a terminal closing
 // is not a generation change. Under the exclusive policy the departing
 // controller releases on its way out and every viewer is told the new number;

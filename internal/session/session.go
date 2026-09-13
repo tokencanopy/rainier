@@ -4,6 +4,7 @@
 package session
 
 import (
+	"errors"
 	"log"
 	"sync"
 
@@ -172,6 +173,9 @@ type Attachment struct {
 // them (an empty log, or a cursor already past its end): a viewer must
 // never open on silence with no screen and no size.
 func (s *Session) Attach(since uint64, size Size, bind Binding) (*Attachment, error) {
+	if !size.valid() {
+		return nil, errors.New("invalid terminal size")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.observeLocked(bind)
@@ -324,6 +328,9 @@ func (s *Session) observeLocked(bind Binding) {
 // the pty follows the controller, so a phone watching a laptop's session does
 // not squeeze the laptop's terminal down to phone width.
 func (s *Session) SetSize(id int, gen uint64, size Size) bool {
+	if !size.valid() {
+		return false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	v, ok := s.viewers[id]
