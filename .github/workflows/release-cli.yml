@@ -211,6 +211,7 @@ jobs:
           [ "$files" = "$expected" ] || { echo "::error::package contains [$files], want [$expected]"; exit 1; }
 
       - name: Publish to npm
+        id: publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -246,7 +247,20 @@ jobs:
         run: |
           set -euo pipefail
           cd "$(mktemp -d)"
-          npm pack "$PACKAGE@$VERSION" >/dev/null
+          # A publish is not immediately readable: the registry serves reads
+          # through a cache that lags the write by seconds. v0.0.11 published
+          # successfully and this step failed on the next line with ETARGET,
+          # reporting a broken release that was in fact fine. Wait for the
+          # version to become resolvable before concluding anything about it.
+          for attempt in $(seq 1 30); do
+            if npm view "$PACKAGE@$VERSION" version >/dev/null 2>&1; then
+              echo "resolvable after ${attempt} attempt(s)"; break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::$PACKAGE@$VERSION did not become resolvable within 5 minutes"; exit 1
+            fi
+            sleep 10
+          done
           # A real install from the registry, downloading and checksum-gating
           # the real archive: the path every user takes.
           npm install -g --ignore-scripts "$PACKAGE@$VERSION"
@@ -255,6 +269,12 @@ jobs:
           npm view "$PACKAGE" dist-tags
 
       - name: Record the pins on main
+        # Keyed to the publish, not to the job: once the package is public the
+        # record must be written even if a later check failed, and it must not
+        # be written if the publish itself did not happen. Twice now a failure
+        # after publishing threw the record away, leaving main describing the
+        # previous release while the registry served the new one.
+        if: ${{ !cancelled() && steps.publish.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
