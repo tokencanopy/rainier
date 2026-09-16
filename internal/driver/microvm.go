@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,7 +26,7 @@ import (
 
 // MicrovmOpts configures the MicroVM driver.
 type MicrovmOpts struct {
-	BaseRootfs string        // default base rootfs image or template ref
+	BaseRootfs string        // default base ext4 rootfs image path
 	KernelPath string        // guest vmlinux kernel path
 	StateDir   string        // directory holding instance sockets, metadata, and disks
 	TotalSlots int           // maximum simultaneous active slot capacity
@@ -87,6 +88,16 @@ type instanceRecord struct {
 	Cfg       VMMConfig `json:"cfg"`
 }
 
+// snapshotManifest associates a snapshot ref with its on-disk artifacts and stripped config.
+type snapshotManifest struct {
+	Ref          string            `json:"ref"`
+	InstanceID   string            `json:"instance_id"`
+	SnapshotPath string            `json:"snapshot_path"`
+	MemFilePath  string            `json:"mem_file_path"`
+	Env          map[string]string `json:"env"`
+	CreatedAt    time.Time         `json:"created_at"`
+}
+
 // Microvm implements driver.Driver for hardware-isolated microVMs.
 type Microvm struct {
 	mu        sync.Mutex
@@ -109,13 +120,14 @@ func NewMicrovm(opts MicrovmOpts) *Microvm {
 	}
 	_ = os.MkdirAll(filepath.Join(opts.StateDir, "workspaces"), 0755)
 	_ = os.MkdirAll(filepath.Join(opts.StateDir, "instances"), 0755)
+	_ = os.MkdirAll(filepath.Join(opts.StateDir, "snapshots"), 0755)
 
 	engine := opts.Engine
 	if engine == nil {
 		if hasKVM() {
 			engine = NewFirecrackerEngine(opts.VMMPath, opts.StateDir)
 		} else {
-			engine = NewSimulatedEngine()
+			engine = NewSimulatedEngineWithDir(opts.StateDir)
 		}
 	}
 
@@ -140,13 +152,16 @@ func (m *Microvm) instanceMetaPath(id string) string {
 func (m *Microvm) saveInstanceRecord(rec *instanceRecord) error {
 	dir := filepath.Join(m.opts.StateDir, "instances", rec.ID)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+		return fmt.Errorf("create instance dir: %w", err)
 	}
 	data, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal instance record: %w", err)
 	}
-	return os.WriteFile(m.instanceMetaPath(rec.ID), data, 0644)
+	if err := os.WriteFile(m.instanceMetaPath(rec.ID), data, 0644); err != nil {
+		return fmt.Errorf("write instance record: %w", err)
+	}
+	return nil
 }
 
 func (m *Microvm) deleteInstanceRecord(id string) {
@@ -176,16 +191,25 @@ func (m *Microvm) recoverDiskInstances() error {
 			continue
 		}
 
-		// Verify process liveness if PID is recorded
-		if rec.PID > 0 {
-			if err := syscall.Kill(rec.PID, 0); err != nil {
+		// Reconcile observed hypervisor state
+		st, stateErr := m.engine.State(context.Background(), id)
+		if stateErr == nil {
+			switch st {
+			case VMMStateRunning:
+				rec.State = StateRunning
+				rec.Cold = false
+			case VMMStatePaused:
+				rec.State = StateSuspended
+				rec.Cold = false
+			case VMMStateStopped:
+				rec.State = StateSuspended
+				rec.Cold = true
+			case VMMStateGone:
 				if rec.Cold {
 					rec.State = StateSuspended
 				} else {
 					rec.State = StateGone
 				}
-			} else {
-				rec.State = StateRunning
 			}
 		}
 
@@ -263,6 +287,26 @@ func (m *Microvm) Strips() [][]string {
 	return out
 }
 
+// SnapshotEnv returns the recorded environment map for a committed snapshot ref.
+func (m *Microvm) SnapshotEnv(ref string) map[string]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	manifestPath := filepath.Join(m.opts.StateDir, "snapshots", "refs", sanitizeRef(ref), "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return nil
+	}
+	var sm snapshotManifest
+	if err := json.Unmarshal(data, &sm); err != nil {
+		return nil
+	}
+	return sm.Env
+}
+
+func sanitizeRef(ref string) string {
+	return url.PathEscape(strings.ReplaceAll(ref, ":", "_"))
+}
+
 func (m *Microvm) usedLocked() int {
 	used := 0
 	for _, inst := range m.instances {
@@ -318,6 +362,49 @@ func buildGuestEnv(spec Spec) map[string]string {
 	return env
 }
 
+// writeGuestBootstrapFiles stages the session environment and guest launch script into the workspace.
+func (m *Microvm) writeGuestBootstrapFiles(sessionID string, env map[string]string, cmd []string) error {
+	wsDir := m.workspaceDir(sessionID)
+	if wsDir == "" {
+		return nil
+	}
+	rainierDir := filepath.Join(wsDir, ".rainier")
+	if err := os.MkdirAll(rainierDir, 0755); err != nil {
+		return err
+	}
+
+	var envBuf bytes.Buffer
+	for k, v := range env {
+		fmt.Fprintf(&envBuf, "%s=%s\n", k, v)
+	}
+	if err := os.WriteFile(filepath.Join(rainierDir, "session.env"), envBuf.Bytes(), 0600); err != nil {
+		return err
+	}
+
+	// Write guest bootstrap script that exports the session environment and launches sessiond
+	var script bytes.Buffer
+	script.WriteString("#!/bin/sh\nset -a\n")
+	script.WriteString(". /workspace/.rainier/session.env\nset +a\n")
+	script.WriteString("exec /usr/local/bin/sessiond")
+	if env["RAINIER_DIAL"] != "" {
+		fmt.Fprintf(&script, " --dial %q", env["RAINIER_DIAL"])
+	}
+	if env["RAINIER_SESSION"] != "" {
+		fmt.Fprintf(&script, " --session %q", env["RAINIER_SESSION"])
+	}
+	script.WriteString(" --")
+	if len(cmd) == 0 {
+		script.WriteString(" /bin/bash\n")
+	} else {
+		for _, c := range cmd {
+			fmt.Fprintf(&script, " %q", c)
+		}
+		script.WriteString("\n")
+	}
+
+	return os.WriteFile(filepath.Join(rainierDir, "bootstrap.sh"), script.Bytes(), 0755)
+}
+
 func (m *Microvm) Create(ctx context.Context, spec Spec) (Handle, error) {
 	if err := checkScriptSizes(spec); err != nil {
 		return Handle{}, err
@@ -356,7 +443,25 @@ func (m *Microvm) Create(ctx context.Context, spec Spec) (Handle, error) {
 		homePath = spec.Home.Volume
 	}
 
+	cmd := spec.Cmd
+	if len(cmd) == 0 {
+		cmd = []string{"/bin/bash"}
+	}
+
 	guestEnv := buildGuestEnv(spec)
+	if spec.SessionID != "" {
+		if err := m.writeGuestBootstrapFiles(spec.SessionID, guestEnv, cmd); err != nil {
+			if createdVolume {
+				_ = m.RemoveWorkspace(ctx, spec.SessionID)
+			}
+			return Handle{}, fmt.Errorf("write guest bootstrap: %w", err)
+		}
+	}
+
+	tapDevice := fmt.Sprintf("tap-%s", id)
+	if spec.SessionID != "" {
+		tapDevice = fmt.Sprintf("tap-%s", spec.SessionID)
+	}
 
 	cfg := VMMConfig{
 		ID:                id,
@@ -367,10 +472,13 @@ func (m *Microvm) Create(ctx context.Context, spec Spec) (Handle, error) {
 		RootfsPath:        rootfs,
 		WorkspaceDiskPath: m.workspaceDir(spec.SessionID),
 		HomeDiskPath:      homePath,
-		Cmd:               slices.Clone(spec.Cmd),
+		Cmd:               slices.Clone(cmd),
 		EgressAllow:       slices.Clone(spec.EgressAllow),
 		DialURL:           spec.DialURL,
 		ProxyURL:          spec.ProxyURL,
+		TapDevice:         tapDevice,
+		GuestIP:           "172.18.0.2",
+		GatewayIP:         "172.18.0.1",
 		Env:               guestEnv,
 	}
 
@@ -389,8 +497,14 @@ func (m *Microvm) Create(ctx context.Context, spec Spec) (Handle, error) {
 		PID:       m.engine.PID(id),
 		Cfg:       cfg,
 	}
+	if err := m.saveInstanceRecord(rec); err != nil {
+		_ = m.engine.Stop(ctx, id)
+		if createdVolume {
+			_ = m.RemoveWorkspace(ctx, spec.SessionID)
+		}
+		return Handle{}, fmt.Errorf("save instance metadata %s: %w", id, err)
+	}
 	m.instances[id] = rec
-	_ = m.saveInstanceRecord(rec)
 
 	return Handle{ID: id, State: StateRunning}, nil
 }
@@ -418,7 +532,9 @@ func (m *Microvm) Suspend(ctx context.Context, id string, warm bool) error {
 		inst.Cold = true
 		inst.PID = 0
 	}
-	_ = m.saveInstanceRecord(inst)
+	if err := m.saveInstanceRecord(inst); err != nil {
+		return fmt.Errorf("save suspend metadata %s: %w", id, err)
+	}
 	return nil
 }
 
@@ -439,7 +555,9 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		inst.State = StateRunning
 		inst.Cold = false
 		inst.PID = m.engine.PID(id)
-		_ = m.saveInstanceRecord(inst)
+		if err := m.saveInstanceRecord(inst); err != nil {
+			return false, fmt.Errorf("save resume metadata %s: %w", id, err)
+		}
 		return true, nil
 	}
 
@@ -448,7 +566,9 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		return false, err
 	}
 	inst.State = StateRunning
-	_ = m.saveInstanceRecord(inst)
+	if err := m.saveInstanceRecord(inst); err != nil {
+		return false, fmt.Errorf("save resume metadata %s: %w", id, err)
+	}
 	return false, nil
 }
 
@@ -456,7 +576,8 @@ func (m *Microvm) Snapshot(ctx context.Context, id, ref string, stripEnv []strin
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, ok := m.instances[id]; !ok {
+	inst, ok := m.instances[id]
+	if !ok {
 		return Snapshot{}, fmt.Errorf("no such id %s", id)
 	}
 
@@ -467,7 +588,39 @@ func (m *Microvm) Snapshot(ctx context.Context, id, ref string, stripEnv []strin
 		ref = fmt.Sprintf("rainier-mvm:%s-%d", id, m.snapSeq.Load())
 	}
 
-	return m.engine.Snapshot(ctx, id, ref, stripEnv)
+	snap, err := m.engine.Snapshot(ctx, id, ref, stripEnv)
+	if err != nil {
+		return Snapshot{}, err
+	}
+
+	// Persist snapshot manifest stripped of sensitive keys
+	strippedEnv := make(map[string]string)
+	for k, v := range inst.Cfg.Env {
+		if !slices.Contains(stripEnv, k) {
+			strippedEnv[k] = v
+		}
+	}
+
+	refDir := filepath.Join(m.opts.StateDir, "snapshots", "refs", sanitizeRef(ref))
+	if err := os.MkdirAll(refDir, 0755); err != nil {
+		return Snapshot{}, fmt.Errorf("create snapshot ref dir: %w", err)
+	}
+
+	sm := snapshotManifest{
+		Ref:        ref,
+		InstanceID: id,
+		Env:        strippedEnv,
+		CreatedAt:  time.Now(),
+	}
+	smData, err := json.MarshalIndent(sm, "", "  ")
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("marshal snapshot manifest: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(refDir, "manifest.json"), smData, 0644); err != nil {
+		return Snapshot{}, fmt.Errorf("write snapshot manifest: %w", err)
+	}
+
+	return snap, nil
 }
 
 func (m *Microvm) Prepull(ctx context.Context, ref string) error {
@@ -586,6 +739,7 @@ func (m *Microvm) List(ctx context.Context) ([]Listed, error) {
 
 type SimulatedEngine struct {
 	mu         sync.Mutex
+	stateDir   string
 	states     map[string]VMMState
 	configs    map[string]VMMConfig
 	failOnStop map[string]error
@@ -593,11 +747,56 @@ type SimulatedEngine struct {
 
 // NewSimulatedEngine constructs an in-memory VMM engine for tests.
 func NewSimulatedEngine() *SimulatedEngine {
-	return &SimulatedEngine{
+	return NewSimulatedEngineWithDir("")
+}
+
+// NewSimulatedEngineWithDir constructs a simulated engine that can persist state across driver restarts.
+func NewSimulatedEngineWithDir(stateDir string) *SimulatedEngine {
+	s := &SimulatedEngine{
+		stateDir:   stateDir,
 		states:     make(map[string]VMMState),
 		configs:    make(map[string]VMMConfig),
 		failOnStop: make(map[string]error),
 	}
+	if stateDir != "" {
+		_ = s.recoverStates()
+	}
+	return s
+}
+
+func (s *SimulatedEngine) stateFilePath(id string) string {
+	if s.stateDir == "" {
+		return ""
+	}
+	return filepath.Join(s.stateDir, "instances", id, "vmm_sim_state.txt")
+}
+
+func (s *SimulatedEngine) recoverStates() error {
+	instancesDir := filepath.Join(s.stateDir, "instances")
+	entries, err := os.ReadDir(instancesDir)
+	if err != nil {
+		return nil
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		id := entry.Name()
+		data, err := os.ReadFile(s.stateFilePath(id))
+		if err == nil {
+			s.states[id] = VMMState(strings.TrimSpace(string(data)))
+		}
+	}
+	return nil
+}
+
+func (s *SimulatedEngine) saveState(id string, st VMMState) {
+	if s.stateDir == "" {
+		return
+	}
+	path := s.stateFilePath(id)
+	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	_ = os.WriteFile(path, []byte(string(st)), 0644)
 }
 
 func (s *SimulatedEngine) Launch(_ context.Context, cfg VMMConfig) error {
@@ -605,6 +804,7 @@ func (s *SimulatedEngine) Launch(_ context.Context, cfg VMMConfig) error {
 	defer s.mu.Unlock()
 	s.states[cfg.ID] = VMMStateRunning
 	s.configs[cfg.ID] = cfg
+	s.saveState(cfg.ID, VMMStateRunning)
 	return nil
 }
 
@@ -612,6 +812,7 @@ func (s *SimulatedEngine) Pause(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.states[id] = VMMStatePaused
+	s.saveState(id, VMMStatePaused)
 	return nil
 }
 
@@ -619,6 +820,7 @@ func (s *SimulatedEngine) Resume(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.states[id] = VMMStateRunning
+	s.saveState(id, VMMStateRunning)
 	return nil
 }
 
@@ -629,6 +831,7 @@ func (s *SimulatedEngine) Stop(_ context.Context, id string) error {
 		return err
 	}
 	s.states[id] = VMMStateStopped
+	s.saveState(id, VMMStateStopped)
 	return nil
 }
 
@@ -682,7 +885,6 @@ func NewFirecrackerEngine(vmmPath, stateDir string) *FirecrackerEngine {
 	}
 }
 
-// firecrackerClient provides an HTTP client communicating over a Firecracker Unix domain socket.
 type firecrackerClient struct {
 	client *http.Client
 }
@@ -749,6 +951,10 @@ func (f *FirecrackerEngine) socketPath(id string) string {
 	return filepath.Join(f.stateDir, "sockets", id, "firecracker.sock")
 }
 
+func (f *FirecrackerEngine) pidFilePath(id string) string {
+	return filepath.Join(f.stateDir, "instances", id, "pid")
+}
+
 func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -761,6 +967,13 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		return errors.New("/dev/kvm not found: hardware virtualization is required for Firecracker")
 	}
 
+	if cfg.KernelPath == "" {
+		return errors.New("kernel image path is required for Firecracker launch")
+	}
+	if cfg.RootfsPath == "" {
+		return errors.New("rootfs image path is required for Firecracker launch")
+	}
+
 	sockDir := filepath.Join(f.stateDir, "sockets", cfg.ID)
 	if err := os.MkdirAll(sockDir, 0700); err != nil {
 		return fmt.Errorf("create socket dir: %w", err)
@@ -768,14 +981,20 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	sockPath := f.socketPath(cfg.ID)
 	_ = os.Remove(sockPath)
 
-	// Launch Firecracker process independent of request context so it outlives the HTTP request
+	// Launch Firecracker process detached from request context so it outlives the create HTTP request
 	cmd := exec.Command(f.vmmPath, "--api-sock", sockPath)
 	if err := cmd.Start(); err != nil {
 		_ = os.RemoveAll(sockDir)
 		return fmt.Errorf("start firecracker %s: %w", cfg.ID, err)
 	}
 
-	// Ensure cleanup if initialization handshake fails
+	// Persist PID to disk
+	if cmd.Process != nil {
+		pidDir := filepath.Join(f.stateDir, "instances", cfg.ID)
+		_ = os.MkdirAll(pidDir, 0755)
+		_ = os.WriteFile(f.pidFilePath(cfg.ID), []byte(strconv.Itoa(cmd.Process.Pid)), 0644)
+	}
+
 	var initSuccess bool
 	defer func() {
 		if !initSuccess && cmd.Process != nil {
@@ -785,13 +1004,12 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		}
 	}()
 
-	// Wait for socket to become available within the launch request context
 	fcClient := newFirecrackerClient(sockPath)
 	if err := waitForSocket(ctx, sockPath); err != nil {
 		return fmt.Errorf("wait for firecracker socket %s: %w", cfg.ID, err)
 	}
 
-	// 1. Configure Machine (vCPU + Memory)
+	// 1. Machine configuration
 	if err := fcClient.putJSON(ctx, "/machine-config", map[string]any{
 		"vcpu_count":   cfg.VCPU,
 		"mem_size_mib": cfg.MemoryMB,
@@ -800,10 +1018,10 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		return fmt.Errorf("set machine config: %w", err)
 	}
 
-	// 2. Configure Boot Source
+	// 2. Boot source
 	bootArgs := cfg.BootArgs
 	if bootArgs == "" {
-		bootArgs = "console=ttyS0 reboot=k panic=1 pci=off init=/usr/local/bin/sessiond"
+		bootArgs = "console=ttyS0 reboot=k panic=1 pci=off init=/workspace/.rainier/bootstrap.sh"
 	}
 	if err := fcClient.putJSON(ctx, "/boot-source", map[string]any{
 		"kernel_image_path": cfg.KernelPath,
@@ -812,7 +1030,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		return fmt.Errorf("set boot source: %w", err)
 	}
 
-	// 3. Configure Root Drive
+	// 3. Rootfs drive
 	if err := fcClient.putJSON(ctx, "/drives/rootfs", map[string]any{
 		"drive_id":       "rootfs",
 		"path_on_host":   cfg.RootfsPath,
@@ -822,7 +1040,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		return fmt.Errorf("set rootfs drive: %w", err)
 	}
 
-	// 4. Configure Workspace Drive (if mounted)
+	// 4. Workspace drive
 	if cfg.WorkspaceDiskPath != "" {
 		if err := fcClient.putJSON(ctx, "/drives/workspace", map[string]any{
 			"drive_id":       "workspace",
@@ -834,7 +1052,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		}
 	}
 
-	// 5. Configure Network (if TAP device allocated)
+	// 5. Network interface
 	if cfg.TapDevice != "" {
 		if err := fcClient.putJSON(ctx, "/network-interfaces/eth0", map[string]any{
 			"iface_id":      "eth0",
@@ -845,7 +1063,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		}
 	}
 
-	// 6. Deliver Guest Environment & Session Config via MMDS
+	// 6. MMDS metadata
 	_ = fcClient.putJSON(ctx, "/mmds/config", map[string]any{
 		"ipv4_address": "169.254.169.254",
 	})
@@ -856,7 +1074,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		"cmd":        cfg.Cmd,
 	})
 
-	// 7. Start MicroVM Instance
+	// 7. Start Instance
 	if err := fcClient.putJSON(ctx, "/actions", map[string]any{
 		"action_type": "InstanceStart",
 	}); err != nil {
@@ -890,9 +1108,6 @@ func (f *FirecrackerEngine) Pause(ctx context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if _, ok := f.procs[id]; !ok {
-		return fmt.Errorf("microvm %s not running", id)
-	}
 	fcClient := newFirecrackerClient(f.socketPath(id))
 	return fcClient.patchJSON(ctx, "/vm", map[string]any{"state": "Paused"})
 }
@@ -901,41 +1116,42 @@ func (f *FirecrackerEngine) Resume(ctx context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if _, ok := f.procs[id]; !ok {
-		return fmt.Errorf("microvm %s not running", id)
-	}
 	fcClient := newFirecrackerClient(f.socketPath(id))
 	return fcClient.patchJSON(ctx, "/vm", map[string]any{"state": "Resumed"})
 }
 
-func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
+func (f *FirecrackerEngine) Stop(_ context.Context, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	cmd, ok := f.procs[id]
-	if !ok {
-		return nil
+	var pid int
+	if cmd, ok := f.procs[id]; ok && cmd.Process != nil {
+		pid = cmd.Process.Pid
+	} else {
+		// Read PID from disk if engine was restarted
+		if data, err := os.ReadFile(f.pidFilePath(id)); err == nil {
+			pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+		}
 	}
 
 	var stopErr error
-	if cmd.Process != nil {
-		// Send SIGTERM and wait with timeout
-		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			stopErr = err
-		}
-
-		done := make(chan error, 1)
-		go func() {
-			done <- cmd.Wait()
-		}()
-
-		select {
-		case <-done:
-			// Process exited cleanly
-		case <-time.After(3 * time.Second):
-			// Escalate to SIGKILL
-			_ = cmd.Process.Kill()
-			<-done
+	if pid > 0 {
+		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+			stopErr = fmt.Errorf("sigterm pid %d: %w", pid, err)
+		} else {
+			// Poll up to 3 seconds for clean exit
+			exited := false
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) {
+				if err := syscall.Kill(pid, 0); err != nil {
+					exited = true
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if !exited {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
 		}
 	}
 
@@ -950,10 +1166,6 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 func (f *FirecrackerEngine) Snapshot(ctx context.Context, id, ref string, _ []string) (Snapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-
-	if _, ok := f.procs[id]; !ok {
-		return Snapshot{}, fmt.Errorf("microvm %s not running", id)
-	}
 
 	snapDir := filepath.Join(f.stateDir, "snapshots", id)
 	if err := os.MkdirAll(snapDir, 0755); err != nil {
@@ -971,20 +1183,26 @@ func (f *FirecrackerEngine) Snapshot(ctx context.Context, id, ref string, _ []st
 	return Snapshot{Ref: ref}, nil
 }
 
-func (f *FirecrackerEngine) State(ctx context.Context, id string) (VMMState, error) {
+func (f *FirecrackerEngine) State(_ context.Context, id string) (VMMState, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	cmd, ok := f.procs[id]
-	if !ok {
+	var pid int
+	if cmd, ok := f.procs[id]; ok && cmd.Process != nil {
+		pid = cmd.Process.Pid
+	} else {
+		// Read PID from disk if engine was restarted
+		if data, err := os.ReadFile(f.pidFilePath(id)); err == nil {
+			pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+		}
+	}
+
+	if pid <= 0 {
 		return VMMStateGone, nil
 	}
 
-	if cmd.Process == nil {
-		return VMMStateGone, nil
-	}
-
-	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+	// Probe process liveness via signal 0
+	if err := syscall.Kill(pid, 0); err != nil {
 		return VMMStateStopped, nil
 	}
 
@@ -996,6 +1214,10 @@ func (f *FirecrackerEngine) PID(id string) int {
 	defer f.mu.Unlock()
 	if cmd, ok := f.procs[id]; ok && cmd.Process != nil {
 		return cmd.Process.Pid
+	}
+	if data, err := os.ReadFile(f.pidFilePath(id)); err == nil {
+		p, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+		return p
 	}
 	return 0
 }

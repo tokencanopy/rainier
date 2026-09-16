@@ -3,7 +3,6 @@ package driver
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -11,9 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 func TestMicrovmSatisfiesContract(t *testing.T) {
@@ -25,7 +25,7 @@ func TestMicrovmSatisfiesContract(t *testing.T) {
 		d := NewMicrovm(MicrovmOpts{
 			TotalSlots: 4,
 			StateDir:   tempDir,
-			Engine:     NewSimulatedEngine(),
+			Engine:     NewSimulatedEngineWithDir(tempDir),
 		})
 		cleanup := func() {
 			_ = os.RemoveAll(tempDir)
@@ -41,11 +41,12 @@ func TestMicrovmRestartRecovery(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 
-	sim := NewSimulatedEngine()
+	// Phase 1: First driver instance creates and suspends sessions
+	engine1 := NewSimulatedEngineWithDir(tempDir)
 	m1 := NewMicrovm(MicrovmOpts{
 		TotalSlots: 4,
 		StateDir:   tempDir,
-		Engine:     sim,
+		Engine:     engine1,
 	})
 	ctx := context.Background()
 
@@ -63,14 +64,16 @@ func TestMicrovmRestartRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Simulate runner restart: create a new driver instance pointing to the same StateDir
+	// Phase 2: Simulate complete runner restart by creating a completely NEW engine
+	// and NEW driver pointing to the same StateDir
+	engine2 := NewSimulatedEngineWithDir(tempDir)
 	m2 := NewMicrovm(MicrovmOpts{
 		TotalSlots: 4,
 		StateDir:   tempDir,
-		Engine:     sim,
+		Engine:     engine2,
 	})
 
-	// List should discover both sessions
+	// List should discover both sessions from disk metadata
 	listed, err := m2.List(ctx)
 	if err != nil {
 		t.Fatalf("List on recovered driver: %v", err)
@@ -91,7 +94,7 @@ func TestMicrovmRestartRecovery(t *testing.T) {
 		t.Errorf("recovered sess-recover-2 state = %s, want suspended", st)
 	}
 
-	// Inspecting the handles on the new driver succeeds
+	// Inspecting the handles on the new driver succeeds and reconciles
 	if g1, err := m2.Inspect(ctx, h1.ID); err != nil || g1.State != StateRunning {
 		t.Errorf("m2.Inspect(h1) = %+v, %v; want running", g1, err)
 	}
@@ -110,7 +113,7 @@ func TestMicrovmWorkspaceFilesSurviveColdPark(t *testing.T) {
 	m := NewMicrovm(MicrovmOpts{
 		TotalSlots: 4,
 		StateDir:   tempDir,
-		Engine:     NewSimulatedEngine(),
+		Engine:     NewSimulatedEngineWithDir(tempDir),
 	})
 	ctx := context.Background()
 
@@ -172,14 +175,14 @@ func TestMicrovmWorkspaceFilesSurviveColdPark(t *testing.T) {
 	}
 }
 
-func TestMicrovmGuestEnvTranslation(t *testing.T) {
+func TestMicrovmGuestEnvTranslationAndBootstrap(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "rainier-mvm-env-*")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tempDir)
 
-	sim := NewSimulatedEngine()
+	sim := NewSimulatedEngineWithDir(tempDir)
 	m := NewMicrovm(MicrovmOpts{
 		TotalSlots: 4,
 		StateDir:   tempDir,
@@ -200,6 +203,7 @@ func TestMicrovmGuestEnvTranslation(t *testing.T) {
 		InitTimeoutSec: 180,
 		GitAuthorName:  "Test Author",
 		GitAuthorEmail: "author@example.invalid",
+		Cmd:            []string{"claude", "--model", "haiku"},
 		Env:            map[string]string{"APP_ENV": "production"},
 	}
 
@@ -234,14 +238,76 @@ func TestMicrovmGuestEnvTranslation(t *testing.T) {
 	if cfg.Env["HTTP_PROXY"] == "" || cfg.Env["NO_PROXY"] == "" {
 		t.Errorf("proxy variables were not injected into guest env: %+v", cfg.Env)
 	}
-	if cfg.Env["RAINIER_SETUP_B64"] == "" {
-		t.Errorf("RAINIER_SETUP_B64 was not injected")
+	if cfg.TapDevice == "" {
+		t.Errorf("TapDevice was not allocated on VMMConfig")
 	}
-	if cfg.Env["RAINIER_REPOS_B64"] == "" {
-		t.Errorf("RAINIER_REPOS_B64 was not injected")
+
+	// Verify guest bootstrap files exist in workspace
+	wsDir := m.workspaceDir("sess-trans")
+	envData, err := os.ReadFile(filepath.Join(wsDir, ".rainier", "session.env"))
+	if err != nil {
+		t.Fatalf("read session.env: %v", err)
 	}
-	if cfg.Env["RAINIER_INIT_B64"] == "" {
-		t.Errorf("RAINIER_INIT_B64 was not injected")
+	if !strings.Contains(string(envData), "RAINIER_DIAL=ws://172.18.0.1:8080") {
+		t.Errorf("session.env missing RAINIER_DIAL: %s", string(envData))
+	}
+
+	bootData, err := os.ReadFile(filepath.Join(wsDir, ".rainier", "bootstrap.sh"))
+	if err != nil {
+		t.Fatalf("read bootstrap.sh: %v", err)
+	}
+	if !strings.Contains(string(bootData), "/usr/local/bin/sessiond") || !strings.Contains(string(bootData), "claude") {
+		t.Errorf("bootstrap.sh missing sessiond or command: %s", string(bootData))
+	}
+}
+
+func TestMicrovmSnapshotRefAssociationAndStrip(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "rainier-mvm-snapref-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	sim := NewSimulatedEngineWithDir(tempDir)
+	m := NewMicrovm(MicrovmOpts{
+		TotalSlots: 4,
+		StateDir:   tempDir,
+		Engine:     sim,
+	})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{
+		SessionID: "sess-snapref",
+		Env: map[string]string{
+			"SECRET_KEY": "super_secret_value",
+			"PUBLIC_KEY": "public_value",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Destroy(ctx, h.ID)
+
+	const ref = "rainier-env:test-env-001"
+	strip := []string{"SECRET_KEY", "RAINIER_SETUP_B64"}
+	snap, err := m.Snapshot(ctx, h.ID, ref, strip)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if snap.Ref != ref {
+		t.Fatalf("snap.Ref = %q, want %q verbatim", snap.Ref, ref)
+	}
+
+	// Verify snapshot manifest was associated on disk and stripped of secrets
+	snapEnv := m.SnapshotEnv(ref)
+	if snapEnv == nil {
+		t.Fatal("SnapshotEnv returned nil for committed ref")
+	}
+	if snapEnv["PUBLIC_KEY"] != "public_value" {
+		t.Errorf("PUBLIC_KEY = %q, want public_value", snapEnv["PUBLIC_KEY"])
+	}
+	if _, exists := snapEnv["SECRET_KEY"]; exists {
+		t.Errorf("SECRET_KEY was not stripped from snapshot manifest: %v", snapEnv)
 	}
 }
 
@@ -252,7 +318,7 @@ func TestMicrovmDestroyContainerEngineFailure(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 
-	sim := NewSimulatedEngine()
+	sim := NewSimulatedEngineWithDir(tempDir)
 	m := NewMicrovm(MicrovmOpts{
 		TotalSlots: 4,
 		StateDir:   tempDir,
@@ -300,6 +366,65 @@ func TestMicrovmFirecrackerFailsClosed(t *testing.T) {
 	err = fc.Launch(context.Background(), VMMConfig{ID: "mvm-fail"})
 	if err == nil {
 		t.Fatal("FirecrackerEngine.Launch must fail closed when binary is missing")
+	}
+}
+
+func TestMicrovmFirecrackerRestartRecovery(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "rainier-fc-recover-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	fc := NewFirecrackerEngine("echo", tempDir)
+	ctx := context.Background()
+
+	// 1. Live process (use current test runner PID)
+	livePID := os.Getpid()
+	pidDir := filepath.Join(tempDir, "instances", "fc-live")
+	if err := os.MkdirAll(pidDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pidDir, "pid"), []byte(strconv.Itoa(livePID)), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := fc.State(ctx, "fc-live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != VMMStateRunning {
+		t.Errorf("fc.State(live) = %s, want running", st)
+	}
+	if pid := fc.PID("fc-live"); pid != livePID {
+		t.Errorf("fc.PID(live) = %d, want %d", pid, livePID)
+	}
+
+	// 2. Stopped/dead process
+	deadPID := 99999999
+	deadDir := filepath.Join(tempDir, "instances", "fc-dead")
+	if err := os.MkdirAll(deadDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deadDir, "pid"), []byte(strconv.Itoa(deadPID)), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err = fc.State(ctx, "fc-dead")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != VMMStateStopped {
+		t.Errorf("fc.State(dead) = %s, want stopped", st)
+	}
+
+	// 3. Unknown/gone process
+	st, err = fc.State(ctx, "fc-unknown")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != VMMStateGone {
+		t.Errorf("fc.State(unknown) = %s, want gone", st)
 	}
 }
 
@@ -377,7 +502,7 @@ func TestMicrovmStateReconciliation(t *testing.T) {
 	}
 	defer os.RemoveAll(tempDir)
 
-	sim := NewSimulatedEngine()
+	sim := NewSimulatedEngineWithDir(tempDir)
 	m := NewMicrovm(MicrovmOpts{
 		TotalSlots: 4,
 		StateDir:   tempDir,
@@ -425,7 +550,7 @@ func TestMicrovmRecordsPrepulls(t *testing.T) {
 	m := NewMicrovm(MicrovmOpts{
 		TotalSlots: 2,
 		StateDir:   tempDir,
-		Engine:     NewSimulatedEngine(),
+		Engine:     NewSimulatedEngineWithDir(tempDir),
 	})
 	ctx := context.Background()
 	if err := m.Prepull(ctx, "rainier-env:e1-aaa"); err != nil {
@@ -453,7 +578,7 @@ func TestMicrovmRecordsSnapshotStrips(t *testing.T) {
 	m := NewMicrovm(MicrovmOpts{
 		TotalSlots: 2,
 		StateDir:   tempDir,
-		Engine:     NewSimulatedEngine(),
+		Engine:     NewSimulatedEngineWithDir(tempDir),
 	})
 	ctx := context.Background()
 	h, err := m.Create(ctx, Spec{SessionID: "mvm-sess-s", Env: map[string]string{"TOKEN": "v"}})
@@ -473,5 +598,3 @@ func TestMicrovmRecordsSnapshotStrips(t *testing.T) {
 }
 
 var _ = io.Discard
-var _ = json.Marshal
-var _ = time.Second

@@ -28,6 +28,10 @@ func main() {
 		"bearer token for the controld dial (required when --controld is set; or set RAINIER_RUNNER_TOKEN, which keeps it out of the process list)")
 	driverFlag := flag.String("driver", envDefault("RAINIER_RUNNER_DRIVER", "docker"),
 		"execution driver for session sandboxes: docker | microvm")
+	kernelPath := flag.String("kernel", envDefault("RAINIER_KERNEL_PATH", ""),
+		"guest vmlinux kernel path for microvm driver (required when --driver=microvm)")
+	rootfsPath := flag.String("rootfs", envDefault("RAINIER_ROOTFS_PATH", ""),
+		"base ext4 rootfs image path for microvm driver (required when --driver=microvm)")
 	hostname, _ := os.Hostname()
 	runnerName := flag.String("runner-name", hostname, "name this runner announces to controld")
 	proxyURL := flag.String("proxy-url", "", "egress proxy URL injected into every session (forwarded to controld dial mode)")
@@ -56,7 +60,8 @@ func main() {
 		})
 	case "microvm":
 		drv = driver.NewMicrovm(driver.MicrovmOpts{
-			BaseRootfs: *image,
+			KernelPath: *kernelPath,
+			BaseRootfs: *rootfsPath,
 			TotalSlots: *slots,
 		})
 	default:
