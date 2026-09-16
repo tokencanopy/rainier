@@ -3,95 +3,289 @@ package driver
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
 
 func TestMicrovmSatisfiesContract(t *testing.T) {
 	RunContract(t, func(t *testing.T) (Driver, func()) {
+		tempDir, err := os.MkdirTemp("", "rainier-mvm-contract-*")
+		if err != nil {
+			t.Fatal(err)
+		}
 		d := NewMicrovm(MicrovmOpts{
 			TotalSlots: 4,
+			StateDir:   tempDir,
 			Engine:     NewSimulatedEngine(),
 		})
-		return d, func() {}
+		cleanup := func() {
+			_ = os.RemoveAll(tempDir)
+		}
+		return d, cleanup
 	})
 }
 
-func TestMicrovmRecordsWorkspaceVolumeAndEnv(t *testing.T) {
+func TestMicrovmWorkspaceFilesSurviveColdPark(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "rainier-mvm-persist-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
 	m := NewMicrovm(MicrovmOpts{
 		TotalSlots: 4,
+		StateDir:   tempDir,
 		Engine:     NewSimulatedEngine(),
 	})
 	ctx := context.Background()
 
 	h, err := m.Create(ctx, Spec{
-		SessionID: "mvm-sess-a",
-		Env:       map[string]string{"FOO": "bar"},
+		SessionID: "sess-persist",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !m.HasWorkspace("mvm-sess-a") {
-		t.Fatalf("Create recorded no workspace volume: %v", m.Volumes())
+
+	wsDir := m.workspaceDir("sess-persist")
+	if wsDir == "" {
+		t.Fatal("empty workspace directory")
 	}
 
-	// Cold park keeps the volume
+	// Write real files into the persistent workspace
+	testFile := filepath.Join(wsDir, "work.txt")
+	testData := []byte("uncommitted agent work that must survive cold park")
+	if err := os.WriteFile(testFile, testData, 0644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	// Cold park stops the VM
 	if err := m.Suspend(ctx, h.ID, false); err != nil {
-		t.Fatal(err)
+		t.Fatalf("cold suspend: %v", err)
 	}
-	if !m.HasWorkspace("mvm-sess-a") {
-		t.Error("cold park dropped the workspace volume")
-	}
-	if _, err := m.Resume(ctx, h.ID); err != nil {
-		t.Fatal(err)
-	}
-	if !m.HasWorkspace("mvm-sess-a") {
-		t.Error("resume dropped the workspace volume")
+	if g, _ := m.Inspect(ctx, h.ID); g.State != StateSuspended {
+		t.Fatalf("state after cold suspend = %s, want suspended", g.State)
 	}
 
-	if err := m.Destroy(ctx, h.ID); err != nil {
-		t.Fatal(err)
+	// File still exists while parked
+	if data, err := os.ReadFile(testFile); err != nil || string(data) != string(testData) {
+		t.Fatalf("file corrupted or missing during cold park: %v", err)
 	}
-	if m.HasWorkspace("mvm-sess-a") {
-		t.Errorf("Destroy left the workspace volume behind: %v", m.Volumes())
+
+	// Resume restarts the microVM
+	restarted, err := m.Resume(ctx, h.ID)
+	if err != nil {
+		t.Fatalf("resume after cold park: %v", err)
+	}
+	if !restarted {
+		t.Error("cold resume did not report restarted = true")
+	}
+	if g, _ := m.Inspect(ctx, h.ID); g.State != StateRunning {
+		t.Fatalf("state after resume = %s, want running", g.State)
+	}
+
+	// File survived and is intact
+	if data, err := os.ReadFile(testFile); err != nil || string(data) != string(testData) {
+		t.Fatalf("file missing or changed after resume: %v", err)
+	}
+
+	// Destroy removes the workspace directory from disk
+	if err := m.Destroy(ctx, h.ID); err != nil {
+		t.Fatalf("destroy: %v", err)
+	}
+	if _, err := os.Stat(wsDir); !os.IsNotExist(err) {
+		t.Errorf("workspace directory %s still exists after Destroy", wsDir)
 	}
 }
 
-func TestMicrovmDestroyContainerKeepsWorkspace(t *testing.T) {
-	m := NewMicrovm(MicrovmOpts{
-		TotalSlots: 4,
-		Engine:     NewSimulatedEngine(),
-	})
-	ctx := context.Background()
-
-	h, err := m.Create(ctx, Spec{SessionID: "mvm-sess-crash"})
+func TestMicrovmGuestEnvTranslation(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "rainier-mvm-env-*")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.DestroyContainer(ctx, h.ID); err != nil {
-		t.Fatal(err)
-	}
-	if g, _ := m.Inspect(ctx, h.ID); g.State != StateGone {
-		t.Fatalf("state after DestroyContainer = %s, want gone", g.State)
-	}
-	if !m.HasWorkspace("mvm-sess-crash") {
-		t.Fatalf("DestroyContainer dropped the workspace volume: %v", m.Volumes())
-	}
-	if used, _, _ := m.Capacity(ctx); used != 0 {
-		t.Fatalf("used after DestroyContainer = %d, want 0", used)
+	defer os.RemoveAll(tempDir)
+
+	sim := NewSimulatedEngine()
+	m := NewMicrovm(MicrovmOpts{
+		TotalSlots: 4,
+		StateDir:   tempDir,
+		Engine:     sim,
+	})
+	ctx := context.Background()
+
+	spec := Spec{
+		SessionID:       "sess-trans",
+		DialURL:         "ws://172.18.0.1:8080",
+		ProxyURL:        "http://172.18.0.1:3128",
+		Setup:           "npm install -g pnpm",
+		SetupTimeoutSec: 600,
+		Repos: []RepoSpec{
+			{Owner: "tokencanopy", Name: "rainier", BaseBranch: "main", SessionBranch: "rainier/feat", Dir: "rainier"},
+		},
+		Init:           "pnpm test",
+		InitTimeoutSec: 180,
+		GitAuthorName:  "Test Author",
+		GitAuthorEmail: "author@example.invalid",
+		Env:            map[string]string{"APP_ENV": "production"},
 	}
 
-	if err := m.RemoveWorkspace(ctx, "mvm-sess-crash"); err != nil {
+	h, err := m.Create(ctx, spec)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if m.HasWorkspace("mvm-sess-crash") {
-		t.Fatalf("RemoveWorkspace left the volume behind: %v", m.Volumes())
+	defer m.Destroy(ctx, h.ID)
+
+	cfg, ok := sim.configs[h.ID]
+	if !ok {
+		t.Fatal("simulated engine did not capture VMMConfig")
+	}
+
+	// Verify required guest env keys were populated
+	checks := map[string]string{
+		"RAINIER_DIAL":             "ws://172.18.0.1:8080",
+		"RAINIER_SESSION":          "sess-trans",
+		"RAINIER_GIT_AUTHOR_NAME":  "Test Author",
+		"RAINIER_GIT_AUTHOR_EMAIL": "author@example.invalid",
+		"APP_ENV":                  "production",
+		"RAINIER_SETUP_TIMEOUT":    "600",
+		"RAINIER_INIT_TIMEOUT":     "180",
+	}
+
+	for k, want := range checks {
+		if got := cfg.Env[k]; got != want {
+			t.Errorf("cfg.Env[%q] = %q, want %q", k, got, want)
+		}
+	}
+
+	if cfg.Env["HTTP_PROXY"] == "" || cfg.Env["NO_PROXY"] == "" {
+		t.Errorf("proxy variables were not injected into guest env: %+v", cfg.Env)
+	}
+	if cfg.Env["RAINIER_SETUP_B64"] == "" {
+		t.Errorf("RAINIER_SETUP_B64 was not injected")
+	}
+	if cfg.Env["RAINIER_REPOS_B64"] == "" {
+		t.Errorf("RAINIER_REPOS_B64 was not injected")
+	}
+	if cfg.Env["RAINIER_INIT_B64"] == "" {
+		t.Errorf("RAINIER_INIT_B64 was not injected")
+	}
+}
+
+func TestMicrovmDestroyContainerEngineFailure(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "rainier-mvm-stoperr-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	sim := NewSimulatedEngine()
+	m := NewMicrovm(MicrovmOpts{
+		TotalSlots: 4,
+		StateDir:   tempDir,
+		Engine:     sim,
+	})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "sess-stopfail"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Configure engine to fail on Stop
+	wantErr := errors.New("hypervisor process hung")
+	sim.failOnStop[h.ID] = wantErr
+
+	err = m.DestroyContainer(ctx, h.ID)
+	if err == nil {
+		t.Fatal("DestroyContainer should have failed when engine.Stop fails")
+	}
+
+	// Instance must be preserved so capacity accounting is not corrupted
+	if g, _ := m.Inspect(ctx, h.ID); g.State == StateGone {
+		t.Error("DestroyContainer prematurely deleted instance when engine.Stop failed")
+	}
+	if used, _, _ := m.Capacity(ctx); used != 1 {
+		t.Errorf("capacity after failed DestroyContainer = %d, want 1", used)
+	}
+
+	// Clear failure and destroy cleanly
+	delete(sim.failOnStop, h.ID)
+	if err := m.Destroy(ctx, h.ID); err != nil {
+		t.Fatalf("clean destroy: %v", err)
+	}
+}
+
+func TestMicrovmFirecrackerFailsClosed(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "rainier-fc-fail-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	fc := NewFirecrackerEngine("/nonexistent/bin/firecracker", tempDir)
+	err = fc.Launch(context.Background(), VMMConfig{ID: "mvm-fail"})
+	if err == nil {
+		t.Fatal("FirecrackerEngine.Launch must fail closed when binary is missing")
+	}
+}
+
+func TestMicrovmStateReconciliation(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "rainier-mvm-reconcile-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	sim := NewSimulatedEngine()
+	m := NewMicrovm(MicrovmOpts{
+		TotalSlots: 4,
+		StateDir:   tempDir,
+		Engine:     sim,
+	})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "sess-reconcile"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Destroy(ctx, h.ID)
+
+	// Simulate unexpected hypervisor process crash
+	sim.mu.Lock()
+	sim.states[h.ID] = VMMStateStopped
+	sim.mu.Unlock()
+
+	// Inspect should reconcile with the hypervisor and reflect that it is no longer running
+	h2, err := m.Inspect(ctx, h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h2.State == StateRunning {
+		t.Errorf("Inspect failed to reconcile stopped engine state: got %s, want suspended", h2.State)
+	}
+
+	// List should also reflect the reconciled state
+	listed, err := m.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].Handle.State == StateRunning {
+		t.Errorf("List failed to reflect stopped engine state: %+v", listed)
 	}
 }
 
 func TestMicrovmRecordsPrepulls(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "rainier-mvm-pulls-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
 	m := NewMicrovm(MicrovmOpts{
 		TotalSlots: 2,
+		StateDir:   tempDir,
 		Engine:     NewSimulatedEngine(),
 	})
 	ctx := context.Background()
@@ -111,8 +305,15 @@ func TestMicrovmRecordsPrepulls(t *testing.T) {
 }
 
 func TestMicrovmRecordsSnapshotStrips(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "rainier-mvm-strips-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
 	m := NewMicrovm(MicrovmOpts{
 		TotalSlots: 2,
+		StateDir:   tempDir,
 		Engine:     NewSimulatedEngine(),
 	})
 	ctx := context.Background()
