@@ -3,11 +3,17 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestMicrovmSatisfiesContract(t *testing.T) {
@@ -26,6 +32,72 @@ func TestMicrovmSatisfiesContract(t *testing.T) {
 		}
 		return d, cleanup
 	})
+}
+
+func TestMicrovmRestartRecovery(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "rainier-mvm-recover-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	sim := NewSimulatedEngine()
+	m1 := NewMicrovm(MicrovmOpts{
+		TotalSlots: 4,
+		StateDir:   tempDir,
+		Engine:     sim,
+	})
+	ctx := context.Background()
+
+	h1, err := m1.Create(ctx, Spec{SessionID: "sess-recover-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, err := m1.Create(ctx, Spec{SessionID: "sess-recover-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Cold park the second session
+	if err := m1.Suspend(ctx, h2.ID, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate runner restart: create a new driver instance pointing to the same StateDir
+	m2 := NewMicrovm(MicrovmOpts{
+		TotalSlots: 4,
+		StateDir:   tempDir,
+		Engine:     sim,
+	})
+
+	// List should discover both sessions
+	listed, err := m2.List(ctx)
+	if err != nil {
+		t.Fatalf("List on recovered driver: %v", err)
+	}
+	if len(listed) != 2 {
+		t.Fatalf("recovered %d sessions, want 2", len(listed))
+	}
+
+	foundMap := make(map[string]State)
+	for _, l := range listed {
+		foundMap[l.SessionID] = l.Handle.State
+	}
+
+	if st := foundMap["sess-recover-1"]; st != StateRunning {
+		t.Errorf("recovered sess-recover-1 state = %s, want running", st)
+	}
+	if st := foundMap["sess-recover-2"]; st != StateSuspended {
+		t.Errorf("recovered sess-recover-2 state = %s, want suspended", st)
+	}
+
+	// Inspecting the handles on the new driver succeeds
+	if g1, err := m2.Inspect(ctx, h1.ID); err != nil || g1.State != StateRunning {
+		t.Errorf("m2.Inspect(h1) = %+v, %v; want running", g1, err)
+	}
+	if g2, err := m2.Inspect(ctx, h2.ID); err != nil || g2.State != StateSuspended {
+		t.Errorf("m2.Inspect(h2) = %+v, %v; want suspended", g2, err)
+	}
 }
 
 func TestMicrovmWorkspaceFilesSurviveColdPark(t *testing.T) {
@@ -231,6 +303,73 @@ func TestMicrovmFirecrackerFailsClosed(t *testing.T) {
 	}
 }
 
+func TestMicrovmFirecrackerClientConfiguration(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "rainier-fc-mock-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	sockPath := filepath.Join(tempDir, "mock.sock")
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	var mu sync.Mutex
+	calls := make(map[string]bool)
+
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			calls[r.Method+" "+r.URL.Path] = true
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		}),
+	}
+	go server.Serve(listener)
+	defer server.Close()
+
+	fc := newFirecrackerClient(sockPath)
+	ctx := context.Background()
+
+	// Exercise each API endpoint
+	if err := fc.putJSON(ctx, "/machine-config", map[string]any{"vcpu_count": 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fc.putJSON(ctx, "/boot-source", map[string]any{"kernel_image_path": "/vmlinux"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fc.putJSON(ctx, "/drives/rootfs", map[string]any{"path_on_host": "/rootfs"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fc.putJSON(ctx, "/actions", map[string]any{"action_type": "InstanceStart"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fc.patchJSON(ctx, "/vm", map[string]any{"state": "Paused"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fc.patchJSON(ctx, "/vm", map[string]any{"state": "Resumed"}); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	expectedCalls := []string{
+		"PUT /machine-config",
+		"PUT /boot-source",
+		"PUT /drives/rootfs",
+		"PUT /actions",
+		"PATCH /vm",
+	}
+	for _, call := range expectedCalls {
+		if !calls[call] {
+			t.Errorf("Firecracker API client missed call %s", call)
+		}
+	}
+}
+
 func TestMicrovmStateReconciliation(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "rainier-mvm-reconcile-*")
 	if err != nil {
@@ -332,3 +471,7 @@ func TestMicrovmRecordsSnapshotStrips(t *testing.T) {
 		t.Errorf("Strips() = %v, want %v (in call order)", got, want)
 	}
 }
+
+var _ = io.Discard
+var _ = json.Marshal
+var _ = time.Second
