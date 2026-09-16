@@ -32,6 +32,7 @@ type MicrovmOpts struct {
 	TotalSlots int           // maximum simultaneous active slot capacity
 	VMMPath    string        // path to Firecracker or VMM executable
 	Engine     MicrovmEngine // optional VMM engine override; defaults to firecracker on KVM or simulated
+	Tap        TapManager    // optional TAP manager override
 }
 
 // VMMState is the hypervisor-observed execution state of a microVM.
@@ -77,6 +78,12 @@ type MicrovmEngine interface {
 	PID(id string) int
 }
 
+// TapManager manages creation, bridge attachment, and teardown of host TAP network devices.
+type TapManager interface {
+	Allocate(tapName, bridgeName string) error
+	Release(tapName string) error
+}
+
 // instanceRecord is the persistent metadata stored on disk for each microVM instance.
 type instanceRecord struct {
 	ID        string    `json:"id"`
@@ -92,10 +99,20 @@ type instanceRecord struct {
 type snapshotManifest struct {
 	Ref          string            `json:"ref"`
 	InstanceID   string            `json:"instance_id"`
-	SnapshotPath string            `json:"snapshot_path"`
-	MemFilePath  string            `json:"mem_file_path"`
+	DiskPath     string            `json:"disk_path"`
 	Env          map[string]string `json:"env"`
+	Cmd          []string          `json:"cmd"`
 	CreatedAt    time.Time         `json:"created_at"`
+}
+
+// guestSessionConfig is the structured JSON configuration written into the guest workspace.
+type guestSessionConfig struct {
+	SessionID   string            `json:"session_id"`
+	DialURL     string            `json:"dial_url"`
+	ProxyURL    string            `json:"proxy_url"`
+	Env         map[string]string `json:"env"`
+	Cmd         []string          `json:"cmd"`
+	EgressAllow []string          `json:"egress_allow"`
 }
 
 // Microvm implements driver.Driver for hardware-isolated microVMs.
@@ -103,6 +120,7 @@ type Microvm struct {
 	mu        sync.Mutex
 	opts      MicrovmOpts
 	engine    MicrovmEngine
+	tap       TapManager
 	seq       int
 	snapSeq   atomic.Int64
 	instances map[string]*instanceRecord
@@ -120,7 +138,7 @@ func NewMicrovm(opts MicrovmOpts) *Microvm {
 	}
 	_ = os.MkdirAll(filepath.Join(opts.StateDir, "workspaces"), 0755)
 	_ = os.MkdirAll(filepath.Join(opts.StateDir, "instances"), 0755)
-	_ = os.MkdirAll(filepath.Join(opts.StateDir, "snapshots"), 0755)
+	_ = os.MkdirAll(filepath.Join(opts.StateDir, "snapshots", "refs"), 0755)
 
 	engine := opts.Engine
 	if engine == nil {
@@ -131,9 +149,15 @@ func NewMicrovm(opts MicrovmOpts) *Microvm {
 		}
 	}
 
+	tap := opts.Tap
+	if tap == nil {
+		tap = NewSimulatedTapManager()
+	}
+
 	m := &Microvm{
 		opts:      opts,
 		engine:    engine,
+		tap:       tap,
 		instances: make(map[string]*instanceRecord),
 	}
 	_ = m.recoverDiskInstances()
@@ -221,26 +245,36 @@ func (m *Microvm) recoverDiskInstances() error {
 	return nil
 }
 
-// workspaceDir returns the host filesystem path for sessionID's persistent workspace.
-func (m *Microvm) workspaceDir(sessionID string) string {
+// workspaceDiskPath returns the host block-device/disk-image path for sessionID's workspace.
+func (m *Microvm) workspaceDiskPath(sessionID string) string {
 	if sessionID == "" {
 		return ""
 	}
-	return filepath.Join(m.opts.StateDir, "workspaces", workspaceVolume(sessionID))
+	return filepath.Join(m.opts.StateDir, "workspaces", workspaceVolume(sessionID)+".ext4")
 }
 
-func (m *Microvm) ensureWorkspaceVolume(sessionID string) (bool, error) {
+func (m *Microvm) ensureWorkspaceDisk(sessionID string) (string, bool, error) {
 	if sessionID == "" {
-		return false, nil
+		return "", false, nil
 	}
-	dir := m.workspaceDir(sessionID)
-	if _, err := os.Stat(dir); err == nil {
-		return false, nil
+	diskPath := m.workspaceDiskPath(sessionID)
+	if _, err := os.Stat(diskPath); err == nil {
+		return diskPath, false, nil
 	}
-	if err := os.MkdirAll(filepath.Join(dir, ".rainier"), 0755); err != nil {
-		return false, fmt.Errorf("create workspace volume %s: %w", sessionID, err)
+
+	// Create disk image file
+	f, err := os.OpenFile(diskPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0644)
+	if err != nil {
+		return "", false, fmt.Errorf("create workspace disk %s: %w", sessionID, err)
 	}
-	return true, nil
+	// Allocate 10 GiB sparse workspace disk
+	if err := f.Truncate(10 * 1024 * 1024 * 1024); err != nil {
+		f.Close()
+		_ = os.Remove(diskPath)
+		return "", false, fmt.Errorf("truncate workspace disk %s: %w", sessionID, err)
+	}
+	f.Close()
+	return diskPath, true, nil
 }
 
 // Volumes returns every live workspace volume name, sorted.
@@ -252,20 +286,24 @@ func (m *Microvm) Volumes() []string {
 	}
 	var out []string
 	for _, e := range entries {
-		if e.IsDir() && strings.HasPrefix(e.Name(), workspaceVolumePrefix) {
-			out = append(out, e.Name())
+		name := e.Name()
+		if strings.HasPrefix(name, workspaceVolumePrefix) {
+			trimmed := strings.TrimSuffix(name, ".ext4")
+			if !slices.Contains(out, trimmed) {
+				out = append(out, trimmed)
+			}
 		}
 	}
 	slices.Sort(out)
 	return out
 }
 
-// HasWorkspace reports whether the workspace volume directory for sessionID exists.
+// HasWorkspace reports whether the workspace disk image for sessionID exists.
 func (m *Microvm) HasWorkspace(sessionID string) bool {
 	if sessionID == "" {
 		return false
 	}
-	_, err := os.Stat(m.workspaceDir(sessionID))
+	_, err := os.Stat(m.workspaceDiskPath(sessionID))
 	return err == nil
 }
 
@@ -362,47 +400,18 @@ func buildGuestEnv(spec Spec) map[string]string {
 	return env
 }
 
-// writeGuestBootstrapFiles stages the session environment and guest launch script into the workspace.
-func (m *Microvm) writeGuestBootstrapFiles(sessionID string, env map[string]string, cmd []string) error {
-	wsDir := m.workspaceDir(sessionID)
-	if wsDir == "" {
-		return nil
-	}
-	rainierDir := filepath.Join(wsDir, ".rainier")
-	if err := os.MkdirAll(rainierDir, 0755); err != nil {
+// stageGuestSessionConfig writes structured JSON configuration for sessiond.
+// Structured JSON completely avoids shell injection, quote escaping, and eval vulnerabilities.
+func (m *Microvm) stageGuestSessionConfig(id string, cfg guestSessionConfig) error {
+	dir := filepath.Join(m.opts.StateDir, "instances", id)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-
-	var envBuf bytes.Buffer
-	for k, v := range env {
-		fmt.Fprintf(&envBuf, "%s=%s\n", k, v)
-	}
-	if err := os.WriteFile(filepath.Join(rainierDir, "session.env"), envBuf.Bytes(), 0600); err != nil {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
 		return err
 	}
-
-	// Write guest bootstrap script that exports the session environment and launches sessiond
-	var script bytes.Buffer
-	script.WriteString("#!/bin/sh\nset -a\n")
-	script.WriteString(". /workspace/.rainier/session.env\nset +a\n")
-	script.WriteString("exec /usr/local/bin/sessiond")
-	if env["RAINIER_DIAL"] != "" {
-		fmt.Fprintf(&script, " --dial %q", env["RAINIER_DIAL"])
-	}
-	if env["RAINIER_SESSION"] != "" {
-		fmt.Fprintf(&script, " --session %q", env["RAINIER_SESSION"])
-	}
-	script.WriteString(" --")
-	if len(cmd) == 0 {
-		script.WriteString(" /bin/bash\n")
-	} else {
-		for _, c := range cmd {
-			fmt.Fprintf(&script, " %q", c)
-		}
-		script.WriteString("\n")
-	}
-
-	return os.WriteFile(filepath.Join(rainierDir, "bootstrap.sh"), script.Bytes(), 0755)
+	return os.WriteFile(filepath.Join(dir, "session.json"), data, 0600)
 }
 
 func (m *Microvm) Create(ctx context.Context, spec Spec) (Handle, error) {
@@ -421,13 +430,15 @@ func (m *Microvm) Create(ctx context.Context, spec Spec) (Handle, error) {
 		return Handle{}, fmt.Errorf("no capacity: %d/%d", used, m.opts.TotalSlots)
 	}
 
-	createdVolume := false
+	var workspaceDisk string
+	createdDisk := false
 	if spec.SessionID != "" {
-		created, err := m.ensureWorkspaceVolume(spec.SessionID)
+		p, created, err := m.ensureWorkspaceDisk(spec.SessionID)
 		if err != nil {
 			return Handle{}, err
 		}
-		createdVolume = created
+		workspaceDisk = p
+		createdDisk = created
 	}
 
 	m.seq++
@@ -449,18 +460,28 @@ func (m *Microvm) Create(ctx context.Context, spec Spec) (Handle, error) {
 	}
 
 	guestEnv := buildGuestEnv(spec)
-	if spec.SessionID != "" {
-		if err := m.writeGuestBootstrapFiles(spec.SessionID, guestEnv, cmd); err != nil {
-			if createdVolume {
-				_ = m.RemoveWorkspace(ctx, spec.SessionID)
-			}
-			return Handle{}, fmt.Errorf("write guest bootstrap: %w", err)
+	guestConfig := guestSessionConfig{
+		SessionID:   spec.SessionID,
+		DialURL:     spec.DialURL,
+		ProxyURL:    spec.ProxyURL,
+		Env:         guestEnv,
+		Cmd:         slices.Clone(cmd),
+		EgressAllow: slices.Clone(spec.EgressAllow),
+	}
+
+	if err := m.stageGuestSessionConfig(id, guestConfig); err != nil {
+		if createdDisk {
+			_ = m.RemoveWorkspace(ctx, spec.SessionID)
 		}
+		return Handle{}, fmt.Errorf("stage guest session config: %w", err)
 	}
 
 	tapDevice := fmt.Sprintf("tap-%s", id)
-	if spec.SessionID != "" {
-		tapDevice = fmt.Sprintf("tap-%s", spec.SessionID)
+	if err := m.tap.Allocate(tapDevice, ""); err != nil {
+		if createdDisk {
+			_ = m.RemoveWorkspace(ctx, spec.SessionID)
+		}
+		return Handle{}, fmt.Errorf("allocate tap device %s: %w", tapDevice, err)
 	}
 
 	cfg := VMMConfig{
@@ -470,7 +491,7 @@ func (m *Microvm) Create(ctx context.Context, spec Spec) (Handle, error) {
 		MemoryMB:          2048,
 		KernelPath:        m.opts.KernelPath,
 		RootfsPath:        rootfs,
-		WorkspaceDiskPath: m.workspaceDir(spec.SessionID),
+		WorkspaceDiskPath: workspaceDisk,
 		HomeDiskPath:      homePath,
 		Cmd:               slices.Clone(cmd),
 		EgressAllow:       slices.Clone(spec.EgressAllow),
@@ -483,7 +504,8 @@ func (m *Microvm) Create(ctx context.Context, spec Spec) (Handle, error) {
 	}
 
 	if err := m.engine.Launch(ctx, cfg); err != nil {
-		if createdVolume {
+		_ = m.tap.Release(tapDevice)
+		if createdDisk {
 			_ = m.RemoveWorkspace(ctx, spec.SessionID)
 		}
 		return Handle{}, fmt.Errorf("launch microvm %s: %w", id, err)
@@ -499,7 +521,8 @@ func (m *Microvm) Create(ctx context.Context, spec Spec) (Handle, error) {
 	}
 	if err := m.saveInstanceRecord(rec); err != nil {
 		_ = m.engine.Stop(ctx, id)
-		if createdVolume {
+		_ = m.tap.Release(tapDevice)
+		if createdDisk {
 			_ = m.RemoveWorkspace(ctx, spec.SessionID)
 		}
 		return Handle{}, fmt.Errorf("save instance metadata %s: %w", id, err)
@@ -606,10 +629,13 @@ func (m *Microvm) Snapshot(ctx context.Context, id, ref string, stripEnv []strin
 		return Snapshot{}, fmt.Errorf("create snapshot ref dir: %w", err)
 	}
 
+	// Persist sanitized disk artifact reference and stripped metadata
 	sm := snapshotManifest{
 		Ref:        ref,
 		InstanceID: id,
+		DiskPath:   inst.Cfg.WorkspaceDiskPath,
 		Env:        strippedEnv,
+		Cmd:        slices.Clone(inst.Cfg.Cmd),
 		CreatedAt:  time.Now(),
 	}
 	smData, err := json.MarshalIndent(sm, "", "  ")
@@ -651,7 +677,8 @@ func (m *Microvm) DestroyContainer(ctx context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, ok := m.instances[id]; !ok {
+	inst, ok := m.instances[id]
+	if !ok {
 		return nil
 	}
 
@@ -660,6 +687,10 @@ func (m *Microvm) DestroyContainer(ctx context.Context, id string) error {
 		if stateErr != nil || (st != VMMStateGone && st != VMMStateStopped) {
 			return fmt.Errorf("destroy microvm %s: %w", id, err)
 		}
+	}
+
+	if inst.Cfg.TapDevice != "" {
+		_ = m.tap.Release(inst.Cfg.TapDevice)
 	}
 
 	delete(m.instances, id)
@@ -671,8 +702,8 @@ func (m *Microvm) RemoveWorkspace(_ context.Context, sessionID string) error {
 	if sessionID == "" {
 		return nil
 	}
-	dir := m.workspaceDir(sessionID)
-	_ = os.RemoveAll(dir)
+	diskPath := m.workspaceDiskPath(sessionID)
+	_ = os.Remove(diskPath)
 	return nil
 }
 
@@ -734,6 +765,33 @@ func (m *Microvm) List(ctx context.Context) ([]Listed, error) {
 }
 
 // ---------------------------------------------------------------------------
+// Simulated TAP Manager
+// ---------------------------------------------------------------------------
+
+type SimulatedTapManager struct {
+	mu        sync.Mutex
+	allocated map[string]bool
+}
+
+func NewSimulatedTapManager() *SimulatedTapManager {
+	return &SimulatedTapManager{allocated: make(map[string]bool)}
+}
+
+func (s *SimulatedTapManager) Allocate(tapName, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.allocated[tapName] = true
+	return nil
+}
+
+func (s *SimulatedTapManager) Release(tapName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.allocated, tapName)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // Simulated Engine (For testing and dev environments without /dev/kvm)
 // ---------------------------------------------------------------------------
 
@@ -745,12 +803,10 @@ type SimulatedEngine struct {
 	failOnStop map[string]error
 }
 
-// NewSimulatedEngine constructs an in-memory VMM engine for tests.
 func NewSimulatedEngine() *SimulatedEngine {
 	return NewSimulatedEngineWithDir("")
 }
 
-// NewSimulatedEngineWithDir constructs a simulated engine that can persist state across driver restarts.
 func NewSimulatedEngineWithDir(stateDir string) *SimulatedEngine {
 	s := &SimulatedEngine{
 		stateDir:   stateDir,
@@ -1018,10 +1074,10 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		return fmt.Errorf("set machine config: %w", err)
 	}
 
-	// 2. Boot source
+	// 2. Boot source (points to rootfs /init binary)
 	bootArgs := cfg.BootArgs
 	if bootArgs == "" {
-		bootArgs = "console=ttyS0 reboot=k panic=1 pci=off init=/workspace/.rainier/bootstrap.sh"
+		bootArgs = "console=ttyS0 reboot=k panic=1 pci=off init=/init"
 	}
 	if err := fcClient.putJSON(ctx, "/boot-source", map[string]any{
 		"kernel_image_path": cfg.KernelPath,
@@ -1040,7 +1096,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		return fmt.Errorf("set rootfs drive: %w", err)
 	}
 
-	// 4. Workspace drive
+	// 4. Workspace drive (raw ext4 block image)
 	if cfg.WorkspaceDiskPath != "" {
 		if err := fcClient.putJSON(ctx, "/drives/workspace", map[string]any{
 			"drive_id":       "workspace",
@@ -1052,7 +1108,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		}
 	}
 
-	// 5. Network interface
+	// 5. Network interface (TAP device)
 	if cfg.TapDevice != "" {
 		if err := fcClient.putJSON(ctx, "/network-interfaces/eth0", map[string]any{
 			"iface_id":      "eth0",
@@ -1063,7 +1119,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		}
 	}
 
-	// 6. MMDS metadata
+	// 6. Deliver session parameters via MMDS
 	_ = fcClient.putJSON(ctx, "/mmds/config", map[string]any{
 		"ipv4_address": "169.254.169.254",
 	})
@@ -1074,7 +1130,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		"cmd":        cfg.Cmd,
 	})
 
-	// 7. Start Instance
+	// 7. Start MicroVM Instance
 	if err := fcClient.putJSON(ctx, "/actions", map[string]any{
 		"action_type": "InstanceStart",
 	}); err != nil {
@@ -1135,7 +1191,8 @@ func (f *FirecrackerEngine) Stop(_ context.Context, id string) error {
 	}
 
 	var stopErr error
-	if pid > 0 {
+	sockPath := f.socketPath(id)
+	if pid > 0 && isFirecrackerPID(pid, sockPath) {
 		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
 			stopErr = fmt.Errorf("sigterm pid %d: %w", pid, err)
 		} else {
@@ -1201,9 +1258,9 @@ func (f *FirecrackerEngine) State(_ context.Context, id string) (VMMState, error
 		return VMMStateGone, nil
 	}
 
-	// Probe process liveness via signal 0
-	if err := syscall.Kill(pid, 0); err != nil {
-		return VMMStateStopped, nil
+	sockPath := f.socketPath(id)
+	if !isFirecrackerPID(pid, sockPath) {
+		return VMMStateGone, nil
 	}
 
 	return VMMStateRunning, nil
@@ -1220,4 +1277,31 @@ func (f *FirecrackerEngine) PID(id string) int {
 		return p
 	}
 	return 0
+}
+
+// isFirecrackerPID verifies that pid is actually a running Firecracker VMM associated with expectedSock.
+// Guards against PID recycling signalling unrelated processes.
+func isFirecrackerPID(pid int, expectedSock string) bool {
+	if pid <= 0 {
+		return false
+	}
+	if err := syscall.Kill(pid, 0); err != nil {
+		return false
+	}
+
+	// Linux: inspect /proc/<pid>/cmdline
+	cmdlinePath := fmt.Sprintf("/proc/%d/cmdline", pid)
+	if data, err := os.ReadFile(cmdlinePath); err == nil {
+		cmdline := string(data)
+		return strings.Contains(cmdline, "firecracker") && strings.Contains(cmdline, expectedSock)
+	}
+
+	// Darwin / fallback: inspect via ps
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=")
+	if out, err := cmd.Output(); err == nil {
+		s := string(out)
+		return strings.Contains(s, "firecracker") && (expectedSock == "" || strings.Contains(s, expectedSock))
+	}
+
+	return false
 }

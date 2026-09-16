@@ -3,15 +3,13 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
-	"strconv"
-	"strings"
 	"sync"
 	"testing"
 )
@@ -124,16 +122,15 @@ func TestMicrovmWorkspaceFilesSurviveColdPark(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wsDir := m.workspaceDir("sess-persist")
-	if wsDir == "" {
-		t.Fatal("empty workspace directory")
+	diskFile := m.workspaceDiskPath("sess-persist")
+	if diskFile == "" {
+		t.Fatal("empty workspace disk file path")
 	}
 
-	// Write real files into the persistent workspace
-	testFile := filepath.Join(wsDir, "work.txt")
+	// Write signature bytes into the persistent workspace disk image
 	testData := []byte("uncommitted agent work that must survive cold park")
-	if err := os.WriteFile(testFile, testData, 0644); err != nil {
-		t.Fatalf("write test file: %v", err)
+	if err := os.WriteFile(diskFile, testData, 0644); err != nil {
+		t.Fatalf("write test disk image: %v", err)
 	}
 
 	// Cold park stops the VM
@@ -144,9 +141,9 @@ func TestMicrovmWorkspaceFilesSurviveColdPark(t *testing.T) {
 		t.Fatalf("state after cold suspend = %s, want suspended", g.State)
 	}
 
-	// File still exists while parked
-	if data, err := os.ReadFile(testFile); err != nil || string(data) != string(testData) {
-		t.Fatalf("file corrupted or missing during cold park: %v", err)
+	// Disk file still exists while parked
+	if data, err := os.ReadFile(diskFile); err != nil || string(data) != string(testData) {
+		t.Fatalf("disk file corrupted or missing during cold park: %v", err)
 	}
 
 	// Resume restarts the microVM
@@ -161,17 +158,17 @@ func TestMicrovmWorkspaceFilesSurviveColdPark(t *testing.T) {
 		t.Fatalf("state after resume = %s, want running", g.State)
 	}
 
-	// File survived and is intact
-	if data, err := os.ReadFile(testFile); err != nil || string(data) != string(testData) {
-		t.Fatalf("file missing or changed after resume: %v", err)
+	// Disk contents survived and are intact
+	if data, err := os.ReadFile(diskFile); err != nil || string(data) != string(testData) {
+		t.Fatalf("disk contents missing or changed after resume: %v", err)
 	}
 
-	// Destroy removes the workspace directory from disk
+	// Destroy removes the workspace disk from the filesystem
 	if err := m.Destroy(ctx, h.ID); err != nil {
 		t.Fatalf("destroy: %v", err)
 	}
-	if _, err := os.Stat(wsDir); !os.IsNotExist(err) {
-		t.Errorf("workspace directory %s still exists after Destroy", wsDir)
+	if _, err := os.Stat(diskFile); !os.IsNotExist(err) {
+		t.Errorf("workspace disk %s still exists after Destroy", diskFile)
 	}
 }
 
@@ -242,22 +239,21 @@ func TestMicrovmGuestEnvTranslationAndBootstrap(t *testing.T) {
 		t.Errorf("TapDevice was not allocated on VMMConfig")
 	}
 
-	// Verify guest bootstrap files exist in workspace
-	wsDir := m.workspaceDir("sess-trans")
-	envData, err := os.ReadFile(filepath.Join(wsDir, ".rainier", "session.env"))
+	// Verify structured JSON session config exists (no shell injection vulnerabilities)
+	jsonPath := filepath.Join(tempDir, "instances", h.ID, "session.json")
+	data, err := os.ReadFile(jsonPath)
 	if err != nil {
-		t.Fatalf("read session.env: %v", err)
+		t.Fatalf("read session.json: %v", err)
 	}
-	if !strings.Contains(string(envData), "RAINIER_DIAL=ws://172.18.0.1:8080") {
-		t.Errorf("session.env missing RAINIER_DIAL: %s", string(envData))
+	var gsc guestSessionConfig
+	if err := json.Unmarshal(data, &gsc); err != nil {
+		t.Fatalf("unmarshal session.json: %v", err)
 	}
-
-	bootData, err := os.ReadFile(filepath.Join(wsDir, ".rainier", "bootstrap.sh"))
-	if err != nil {
-		t.Fatalf("read bootstrap.sh: %v", err)
+	if gsc.SessionID != "sess-trans" {
+		t.Errorf("gsc.SessionID = %q, want sess-trans", gsc.SessionID)
 	}
-	if !strings.Contains(string(bootData), "/usr/local/bin/sessiond") || !strings.Contains(string(bootData), "claude") {
-		t.Errorf("bootstrap.sh missing sessiond or command: %s", string(bootData))
+	if !reflect.DeepEqual(gsc.Cmd, []string{"claude", "--model", "haiku"}) {
+		t.Errorf("gsc.Cmd = %v, want claude --model haiku", gsc.Cmd)
 	}
 }
 
@@ -308,6 +304,17 @@ func TestMicrovmSnapshotRefAssociationAndStrip(t *testing.T) {
 	}
 	if _, exists := snapEnv["SECRET_KEY"]; exists {
 		t.Errorf("SECRET_KEY was not stripped from snapshot manifest: %v", snapEnv)
+	}
+}
+
+func TestMicrovmPIDVerification(t *testing.T) {
+	// A process that is NOT Firecracker must return false to prevent signalling unrelated processes
+	myPID := os.Getpid()
+	if isFirecrackerPID(myPID, "/nonexistent/socket.sock") {
+		t.Error("isFirecrackerPID returned true for the test runner process")
+	}
+	if isFirecrackerPID(99999999, "") {
+		t.Error("isFirecrackerPID returned true for a nonexistent PID")
 	}
 }
 
@@ -366,65 +373,6 @@ func TestMicrovmFirecrackerFailsClosed(t *testing.T) {
 	err = fc.Launch(context.Background(), VMMConfig{ID: "mvm-fail"})
 	if err == nil {
 		t.Fatal("FirecrackerEngine.Launch must fail closed when binary is missing")
-	}
-}
-
-func TestMicrovmFirecrackerRestartRecovery(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "rainier-fc-recover-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	fc := NewFirecrackerEngine("echo", tempDir)
-	ctx := context.Background()
-
-	// 1. Live process (use current test runner PID)
-	livePID := os.Getpid()
-	pidDir := filepath.Join(tempDir, "instances", "fc-live")
-	if err := os.MkdirAll(pidDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(pidDir, "pid"), []byte(strconv.Itoa(livePID)), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	st, err := fc.State(ctx, "fc-live")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st != VMMStateRunning {
-		t.Errorf("fc.State(live) = %s, want running", st)
-	}
-	if pid := fc.PID("fc-live"); pid != livePID {
-		t.Errorf("fc.PID(live) = %d, want %d", pid, livePID)
-	}
-
-	// 2. Stopped/dead process
-	deadPID := 99999999
-	deadDir := filepath.Join(tempDir, "instances", "fc-dead")
-	if err := os.MkdirAll(deadDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(deadDir, "pid"), []byte(strconv.Itoa(deadPID)), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	st, err = fc.State(ctx, "fc-dead")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st != VMMStateStopped {
-		t.Errorf("fc.State(dead) = %s, want stopped", st)
-	}
-
-	// 3. Unknown/gone process
-	st, err = fc.State(ctx, "fc-unknown")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st != VMMStateGone {
-		t.Errorf("fc.State(unknown) = %s, want gone", st)
 	}
 }
 
@@ -596,5 +544,3 @@ func TestMicrovmRecordsSnapshotStrips(t *testing.T) {
 		t.Errorf("Strips() = %v, want %v (in call order)", got, want)
 	}
 }
-
-var _ = io.Discard
