@@ -26,6 +26,8 @@ func main() {
 	controld := flag.String("controld", "", "controld URL to dial (ws://host:port); enables agent (dial) mode when set")
 	runnerToken := flag.String("runner-token", envDefault("RAINIER_RUNNER_TOKEN", ""),
 		"bearer token for the controld dial (required when --controld is set; or set RAINIER_RUNNER_TOKEN, which keeps it out of the process list)")
+	driverFlag := flag.String("driver", envDefault("RAINIER_RUNNER_DRIVER", "docker"),
+		"execution driver for session sandboxes: docker | microvm")
 	hostname, _ := os.Hostname()
 	runnerName := flag.String("runner-name", hostname, "name this runner announces to controld")
 	proxyURL := flag.String("proxy-url", "", "egress proxy URL injected into every session (forwarded to controld dial mode)")
@@ -42,13 +44,24 @@ func main() {
 		capabilities = splitCapabilities(os.Getenv("RAINIER_RUNNER_CAPABILITIES"))
 	}
 
-	drv := driver.NewDocker(driver.DockerOpts{
-		Image:                  *image,
-		Network:                *network,
-		TotalSlots:             *slots,
-		SessionSeccompProfile:  *seccompProfile,
-		SessionAppArmorProfile: *appArmorProfile,
-	})
+	var drv driver.Driver
+	switch *driverFlag {
+	case "docker":
+		drv = driver.NewDocker(driver.DockerOpts{
+			Image:                  *image,
+			Network:                *network,
+			TotalSlots:             *slots,
+			SessionSeccompProfile:  *seccompProfile,
+			SessionAppArmorProfile: *appArmorProfile,
+		})
+	case "microvm":
+		drv = driver.NewMicrovm(driver.MicrovmOpts{
+			BaseRootfs: *image,
+			TotalSlots: *slots,
+		})
+	default:
+		log.Fatalf("unknown --driver %q (valid: docker, microvm)", *driverFlag)
+	}
 	// *proxyURL reaches New directly now (Task 13) so the local HTTP-only
 	// surface — today's default, and every dev/CI compose run — injects it
 	// into every driver.Spec too, not just agent (dial) mode below.
