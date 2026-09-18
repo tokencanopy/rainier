@@ -83,6 +83,8 @@ func workspaceExists(t *testing.T, d Driver, sessionID string) bool {
 		return false
 	case *Fake:
 		return slices.Contains(dd.Volumes(), name)
+	case *Microvm:
+		return slices.Contains(dd.Volumes(), name)
 	default:
 		t.Fatalf("workspaceExists: no volume view for driver %T", d)
 		return false
