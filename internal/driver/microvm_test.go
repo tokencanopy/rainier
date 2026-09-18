@@ -184,6 +184,7 @@ func TestMicrovmGuestEnvTranslationAndBootstrap(t *testing.T) {
 		TotalSlots: 4,
 		StateDir:   tempDir,
 		Engine:     sim,
+		Tap:        NewSimulatedTapManager(),
 	})
 	ctx := context.Background()
 
@@ -269,6 +270,7 @@ func TestMicrovmSnapshotRefAssociationAndStrip(t *testing.T) {
 		TotalSlots: 4,
 		StateDir:   tempDir,
 		Engine:     sim,
+		Tap:        NewSimulatedTapManager(),
 	})
 	ctx := context.Background()
 
@@ -330,6 +332,7 @@ func TestMicrovmDestroyContainerEngineFailure(t *testing.T) {
 		TotalSlots: 4,
 		StateDir:   tempDir,
 		Engine:     sim,
+		Tap:        NewSimulatedTapManager(),
 	})
 	ctx := context.Background()
 
@@ -455,6 +458,7 @@ func TestMicrovmStateReconciliation(t *testing.T) {
 		TotalSlots: 4,
 		StateDir:   tempDir,
 		Engine:     sim,
+		Tap:        NewSimulatedTapManager(),
 	})
 	ctx := context.Background()
 
@@ -499,6 +503,7 @@ func TestMicrovmRecordsPrepulls(t *testing.T) {
 		TotalSlots: 2,
 		StateDir:   tempDir,
 		Engine:     NewSimulatedEngineWithDir(tempDir),
+		Tap:        NewSimulatedTapManager(),
 	})
 	ctx := context.Background()
 	if err := m.Prepull(ctx, "rainier-env:e1-aaa"); err != nil {
@@ -527,6 +532,7 @@ func TestMicrovmRecordsSnapshotStrips(t *testing.T) {
 		TotalSlots: 2,
 		StateDir:   tempDir,
 		Engine:     NewSimulatedEngineWithDir(tempDir),
+		Tap:        NewSimulatedTapManager(),
 	})
 	ctx := context.Background()
 	h, err := m.Create(ctx, Spec{SessionID: "mvm-sess-s", Env: map[string]string{"TOKEN": "v"}})

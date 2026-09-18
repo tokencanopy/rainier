@@ -157,7 +157,7 @@ func NewMicrovm(opts MicrovmOpts) *Microvm {
 
 	tap := opts.Tap
 	if tap == nil {
-		if hasKVM() {
+		if hasKVM() && canManageTap() {
 			tap = NewLinuxTapManager(opts.Network)
 		} else {
 			tap = NewSimulatedTapManager()
@@ -172,6 +172,10 @@ func NewMicrovm(opts MicrovmOpts) *Microvm {
 	}
 	_ = m.recoverDiskInstances()
 	return m
+}
+
+func canManageTap() bool {
+	return os.Geteuid() == 0
 }
 
 func hasKVM() bool {
