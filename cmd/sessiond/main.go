@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	mrand "math/rand"
 	"net/http"
@@ -62,6 +63,9 @@ func main() {
 	sessionID := flag.String("session", "", "session id to register as (relay mode)")
 	flag.Parse()
 	argv := flag.Args()
+	if len(argv) == 0 || *dial == "" || *sessionID == "" {
+		loadGuestConfig(&argv, dial, sessionID)
+	}
 	if len(argv) == 0 {
 		log.Fatal("usage: sessiond [flags] -- <command> [args...]")
 	}
@@ -848,4 +852,64 @@ func controlPayload(ev relay.ControlEvent) []byte {
 		return nil
 	}
 	return b
+}
+
+// loadGuestConfig attempts to read microVM session configuration from
+// /workspace/.rainier/session.json or Firecracker MMDS (169.254.169.254) when
+// running inside a hardware-isolated microVM.
+func loadGuestConfig(argv *[]string, dial, sessionID *string) {
+	type guestConfig struct {
+		SessionID string            `json:"session_id"`
+		DialURL   string            `json:"dial_url"`
+		ProxyURL  string            `json:"proxy_url"`
+		Env       map[string]string `json:"env"`
+		Cmd       []string          `json:"cmd"`
+	}
+
+	var conf guestConfig
+	loaded := false
+
+	// 1. Try reading /workspace/.rainier/session.json
+	if data, err := os.ReadFile("/workspace/.rainier/session.json"); err == nil {
+		if json.Unmarshal(data, &conf) == nil {
+			loaded = true
+		}
+	}
+
+	// 2. Fall back to Firecracker MMDS if not found on disk
+	if !loaded {
+		client := &http.Client{Timeout: 500 * time.Millisecond}
+		if resp, err := client.Get("http://169.254.169.254/mmds"); err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				if json.Unmarshal(body, &conf) == nil {
+					loaded = true
+				}
+			}
+		}
+	}
+
+	if !loaded {
+		return
+	}
+
+	for k, v := range conf.Env {
+		if os.Getenv(k) == "" {
+			_ = os.Setenv(k, v)
+		}
+	}
+	if *dial == "" && conf.DialURL != "" {
+		*dial = conf.DialURL
+	}
+	if *sessionID == "" && conf.SessionID != "" {
+		*sessionID = conf.SessionID
+	}
+	if len(*argv) == 0 {
+		if len(conf.Cmd) > 0 {
+			*argv = conf.Cmd
+		} else {
+			*argv = []string{"/bin/bash"}
+		}
+	}
 }
