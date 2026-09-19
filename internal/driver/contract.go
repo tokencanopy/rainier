@@ -25,34 +25,56 @@ func cleanupSnapshotRef(d Driver, ref string) {
 	dockerRun(context.Background(), "image", "rm", "-f", ref)
 }
 
-// assertStrippedFromImage checks a committed image's own configuration for the
-// values a snapshot was told to strip. Only the docker driver has one to read
-// — every other driver's snapshot is bookkeeping with no config behind it — so
-// this is a no-op for them, and the fake's half of the same guarantee is
-// asserted through Fake.Strips instead.
+// assertStrippedFromImage checks what a snapshot committed for the values it
+// was told to strip. Two drivers keep something to read back and are both
+// asserted here; the fake's half of the same guarantee is asserted through
+// Fake.Strips instead, so this stays a no-op for it.
 //
-// It asserts on the whole rendered env block: `value` must not appear anywhere
-// in it (a stripped key whose value merely moved to another key is still a
-// leak), and each stripped key must be present-but-empty rather than carrying
-// anything at all.
+// Either way the assertion is the same pair: `value` must not appear anywhere
+// in the committed configuration (a stripped key whose value merely moved to
+// another key is still a leak), and each stripped key must be absent or empty
+// rather than carrying anything at all. Docker's semantics are
+// strip-to-empty — the key survives the commit set to "" — which is why an
+// empty value passes here and not only an absent one.
 func assertStrippedFromImage(t *testing.T, d Driver, ref, value string, stripped []string) {
 	t.Helper()
-	if _, ok := d.(*Docker); !ok {
-		return
-	}
-	out, err := dockerRun(context.Background(), "image", "inspect",
-		"-f", "{{range .Config.Env}}{{println .}}{{end}}", ref)
-	if err != nil {
-		t.Fatalf("docker image inspect %s: %v", ref, err)
-	}
-	if strings.Contains(out, value) {
-		t.Fatalf("the committed image's config still carries a stripped value:\n%s", out)
-	}
-	for _, line := range strings.Split(out, "\n") {
-		for _, k := range stripped {
-			if v, ok := strings.CutPrefix(line, k+"="); ok && v != "" {
-				t.Fatalf("stripped key %s carries %q in the committed image's config:\n%s", k, v, out)
+	switch dd := d.(type) {
+	case *Docker:
+		out, err := dockerRun(context.Background(), "image", "inspect",
+			"-f", "{{range .Config.Env}}{{println .}}{{end}}", ref)
+		if err != nil {
+			t.Fatalf("docker image inspect %s: %v", ref, err)
+		}
+		if strings.Contains(out, value) {
+			t.Fatalf("the committed image's config still carries a stripped value:\n%s", out)
+		}
+		for _, line := range strings.Split(out, "\n") {
+			for _, k := range stripped {
+				if v, ok := strings.CutPrefix(line, k+"="); ok && v != "" {
+					t.Fatalf("stripped key %s carries %q in the committed image's config:\n%s", k, v, out)
+				}
 			}
+		}
+	case *Microvm:
+		// The microVM driver's committed configuration is the manifest it
+		// writes beside the ref. Reading it back is what turns this subtest
+		// from "the call did not error" into an assertion for this driver.
+		//
+		// That manifest records env KEYS and no values at all — the host is
+		// shared and the file outlives the session — so the two halves are
+		// asserted separately: the stripped keys are gone from what survived,
+		// and the value appears nowhere in the file the commit wrote.
+		keys, ok := dd.SnapshotEnvKeys(ref)
+		if !ok {
+			t.Fatalf("no snapshot manifest for ref %q: nothing to assert the strip against", ref)
+		}
+		for _, k := range stripped {
+			if slices.Contains(keys, k) {
+				t.Fatalf("stripped key %s survived into the committed manifest: %v", k, keys)
+			}
+		}
+		if raw := dd.snapshotManifestBytes(ref); strings.Contains(string(raw), value) {
+			t.Fatalf("the committed manifest carries a stripped value:\n%s", raw)
 		}
 	}
 }
@@ -82,6 +104,8 @@ func workspaceExists(t *testing.T, d Driver, sessionID string) bool {
 		}
 		return false
 	case *Fake:
+		return slices.Contains(dd.Volumes(), name)
+	case *Microvm:
 		return slices.Contains(dd.Volumes(), name)
 	default:
 		t.Fatalf("workspaceExists: no volume view for driver %T", d)

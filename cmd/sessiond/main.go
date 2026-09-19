@@ -62,6 +62,9 @@ func main() {
 	sessionID := flag.String("session", "", "session id to register as (relay mode)")
 	flag.Parse()
 	argv := flag.Args()
+	if len(argv) == 0 || *dial == "" || *sessionID == "" {
+		loadGuestConfig(&argv, dial, sessionID)
+	}
 	if len(argv) == 0 {
 		log.Fatal("usage: sessiond [flags] -- <command> [args...]")
 	}
@@ -848,4 +851,51 @@ func controlPayload(ev relay.ControlEvent) []byte {
 		return nil
 	}
 	return b
+}
+
+// loadGuestConfig reads the session configuration a microVM host staged for
+// this guest, for the case where sessiond was started with no flags because
+// there was no `docker run` argv to carry them.
+//
+// It carries no environment, and there is deliberately no metadata-service
+// fallback here. The environment is the one thing that must not arrive this
+// way: for a microVM session an environment's decrypted secrets are fetched
+// from cell-gateway against a short-lived bootstrap token, never read out of
+// a file or a metadata endpoint (ADR-0003 §2.7 item 1). The MMDS fallback
+// this replaced answered at 169.254.169.254, the exact address the host is
+// required to drop on every TAP.
+//
+// TODO(PR 2): nothing copies this file into the guest yet. The channel is
+// virtio-vsock (ADR-0003 §2.7 item 2), and it carries the bootstrap token
+// alongside the fields below.
+func loadGuestConfig(argv *[]string, dial, sessionID *string) {
+	type guestConfig struct {
+		SessionID string   `json:"session_id"`
+		DialURL   string   `json:"dial_url"`
+		ProxyURL  string   `json:"proxy_url"`
+		Cmd       []string `json:"cmd"`
+	}
+
+	data, err := os.ReadFile("/workspace/.rainier/session.json")
+	if err != nil {
+		return
+	}
+	var conf guestConfig
+	if err := json.Unmarshal(data, &conf); err != nil {
+		return
+	}
+
+	if *dial == "" && conf.DialURL != "" {
+		*dial = conf.DialURL
+	}
+	if *sessionID == "" && conf.SessionID != "" {
+		*sessionID = conf.SessionID
+	}
+	if len(*argv) == 0 {
+		if len(conf.Cmd) > 0 {
+			*argv = conf.Cmd
+		} else {
+			*argv = []string{"/bin/bash"}
+		}
+	}
 }
