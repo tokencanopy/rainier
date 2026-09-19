@@ -29,6 +29,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -65,6 +66,12 @@ const (
 	// than the caller's: a Create whose context has no deadline must not be
 	// able to wait forever on a VMM that will never answer.
 	firecrackerSocketTimeout = 10 * time.Second
+
+	// firecrackerTermTimeout is how long a VMM gets to exit on SIGTERM before
+	// SIGKILL; firecrackerKillTimeout is how long the reap after SIGKILL may
+	// take before Stop reports that the process outlived it.
+	firecrackerTermTimeout = 3 * time.Second
+	firecrackerKillTimeout = 2 * time.Second
 )
 
 // MicrovmOpts configures the microVM driver.
@@ -123,15 +130,20 @@ type VMMConfig struct {
 	WorkspaceDiskPath string            `json:"workspace_disk_path"`
 	HomeDiskPath      string            `json:"home_disk_path"`
 	Cmd               []string          `json:"cmd"`
-	EgressAllow       []string          `json:"egress_allow"`
 	DialURL           string            `json:"dial_url"`
 	ProxyURL          string            `json:"proxy_url"`
 	TapDevice         string            `json:"tap_device"`
-	GuestIP           string            `json:"guest_ip"`
-	GatewayIP         string            `json:"gateway_ip"`
-	BootArgs          string            `json:"boot_args"`
 	Env               map[string]string `json:"-"`
-	StripEnv          []string          `json:"strip_env"`
+
+	// EgressAllow is the session's allowlist. It is carried and recorded, and
+	// nothing enforces it.
+	//
+	// TODO(PR 3): ADR-0003 §4.3 requires per-TAP nftables drops for cloud
+	// metadata, link-local, RFC1918, the regional control-plane ranges and
+	// neighbouring microVM slots, enforced on the host whatever the guest
+	// does with its own routes or proxy variables. Until those rules exist
+	// this field records an intention, not a boundary.
+	EgressAllow []string `json:"egress_allow"`
 }
 
 // MicrovmEngine is the pluggable hypervisor backend interface.
@@ -180,7 +192,21 @@ type instanceRecord struct {
 	// runnerd restart has no environment behind it, and a cold resume must
 	// say so rather than boot a guest with a silently empty one.
 	envLive bool
+
+	// epoch counts mutations of this record, and exists because Inspect and
+	// List ask the hypervisor with the driver mutex RELEASED (its answer is
+	// socket I/O, and holding the mutex across it froze every other session
+	// on the host). That window is long enough for a Suspend to complete, and
+	// stamping a stale "running" over the record afterwards would leak a slot
+	// and send the next Resume down the warm path into a VM that is no longer
+	// there. A reconcile therefore reads the epoch before it asks, and drops
+	// its answer on the floor if the record moved while it was asking.
+	epoch uint64
 }
+
+// bump marks a record as changed. Every mutation of a live record goes
+// through it, under the driver mutex.
+func (rec *instanceRecord) bump() { rec.epoch++ }
 
 // snapshotManifest records what a snapshot committed.
 //
@@ -198,8 +224,8 @@ type snapshotManifest struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
-// guestSessionConfig is the structured configuration staged on the host for
-// sessiond.
+// guestSessionConfig is the structured configuration staged on the host for a
+// session, ready for the channel that will carry it.
 //
 // It carries no environment. What a session needs in order to identify itself
 // and reach the relay is not secret; what an environment resolved out of its
@@ -207,8 +233,16 @@ type snapshotManifest struct {
 // from cell-gateway against a short-lived bootstrap token, never from a file
 // on the host.
 //
-// TODO(PR 2): this file is staged on the host and nothing copies it into the
-// guest. The delivery channel is virtio-vsock (ADR-0003 §2.7 item 2).
+// TODO(PR 2): nothing reads this yet — it is staged on the host and there is
+// no path into the guest. The channel is virtio-vsock (ADR-0003 §2.7 item 2),
+// which also carries the bootstrap token.
+//
+// It is deliberately NOT delivered through the session's own workspace. A
+// file inside a volume the agent can write is a file the agent can rewrite,
+// and sessiond reading a session id or a dial URL back out of one would let a
+// session re-register as another or point its relay somewhere else. That is
+// why sessiond has no loader for this file: the guest must receive it from
+// the host, over a channel the guest cannot write.
 type guestSessionConfig struct {
 	SessionID   string   `json:"session_id"`
 	DialURL     string   `json:"dial_url"`
@@ -336,6 +370,28 @@ func readableFile(what, path string) error {
 	return f.Close()
 }
 
+// pathSegment is the character set this driver will put in a host path.
+//
+// Every name it joins onto StateDir — a session id, an agent home volume, an
+// instance id — arrives from the control plane or off the disk, and
+// filepath.Join CLEANS its result, so a session id of "../../etc" does not
+// produce a silly path, it produces a real one outside the state directory.
+// RemoveWorkspace would then delete that file. Nothing legitimate needs a
+// separator or a dot segment, so the answer is to refuse rather than to
+// sanitize: a name this rejects is a bug or an attack, and neither is served
+// by guessing what it meant.
+var pathSegment = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+func checkPathSegment(what, name string) error {
+	if name == "" {
+		return fmt.Errorf("microvm: %s is empty", what)
+	}
+	if !pathSegment.MatchString(name) {
+		return fmt.Errorf("microvm: %s %q is not a legal name: only letters, digits, %q and %q, so that it can never name anything outside the state directory", what, name, "_", "-")
+	}
+	return nil
+}
+
 func (m *Microvm) instanceDir(id string) string {
 	return filepath.Join(m.opts.StateDir, "instances", id)
 }
@@ -390,6 +446,9 @@ func (m *Microvm) recoverDiskInstances() {
 			continue
 		}
 		id := entry.Name()
+		if checkPathSegment("instance id", id) != nil {
+			continue
+		}
 		data, err := os.ReadFile(m.instanceMetaPath(id))
 		if err != nil {
 			continue
@@ -418,6 +477,8 @@ func (m *Microvm) recoverDiskInstances() {
 // StateGone deletes a live session from every view runnerd has: Inspect calls
 // it dead and Recover drops it. So the driver's own record is consulted
 // first, and "gone" means gone only for a session the driver did not park.
+// Callers hold the driver mutex, and must have checked that the record has
+// not moved since they asked the hypervisor (see instanceRecord.epoch).
 func reconcileState(rec *instanceRecord, st VMMState) {
 	switch st {
 	case VMMStateRunning:
@@ -436,15 +497,16 @@ func reconcileState(rec *instanceRecord, st VMMState) {
 			rec.State = StateGone
 		}
 	}
+	rec.bump()
 }
 
 // workspaceDiskPath returns the host disk-image path for sessionID's
-// workspace.
-func (m *Microvm) workspaceDiskPath(sessionID string) string {
-	if sessionID == "" {
-		return ""
+// workspace, or an error if sessionID is not a name that may become one.
+func (m *Microvm) workspaceDiskPath(sessionID string) (string, error) {
+	if err := checkPathSegment("session id", sessionID); err != nil {
+		return "", err
 	}
-	return filepath.Join(m.opts.StateDir, "workspaces", workspaceVolume(sessionID)+".ext4")
+	return filepath.Join(m.opts.StateDir, "workspaces", workspaceVolume(sessionID)+".ext4"), nil
 }
 
 // homeDiskPath returns the host disk-image path for an agent home volume.
@@ -454,11 +516,11 @@ func (m *Microvm) workspaceDiskPath(sessionID string) string {
 // session that mounts them, and ADR-0003 §2.3 keeps them out of the workspace
 // disk and its checkpoint — a shared directory is one Volumes() scan or one
 // teardown glob away from treating the two as the same thing.
-func (m *Microvm) homeDiskPath(volume string) string {
-	if volume == "" {
-		return ""
+func (m *Microvm) homeDiskPath(volume string) (string, error) {
+	if err := checkPathSegment("agent home volume", volume); err != nil {
+		return "", err
 	}
-	return filepath.Join(m.opts.StateDir, "homes", volume+".ext4")
+	return filepath.Join(m.opts.StateDir, "homes", volume+".ext4"), nil
 }
 
 // ensureDisk creates and formats a sparse disk image at path if it is not
@@ -517,15 +579,6 @@ func (m *Microvm) Volumes() []string {
 	return out
 }
 
-// HasWorkspace reports whether the workspace disk image for sessionID exists.
-func (m *Microvm) HasWorkspace(sessionID string) bool {
-	if sessionID == "" {
-		return false
-	}
-	_, err := os.Stat(m.workspaceDiskPath(sessionID))
-	return err == nil
-}
-
 // Pulls returns the recorded prepull refs (in call order).
 func (m *Microvm) Pulls() []string {
 	m.mu.Lock()
@@ -544,13 +597,21 @@ func (m *Microvm) Strips() [][]string {
 	return out
 }
 
-func (m *Microvm) snapshotRefDir(ref string) string {
-	return filepath.Join(m.opts.StateDir, "snapshots", "refs", sanitizeRef(ref))
+func (m *Microvm) snapshotRefDir(ref string) (string, error) {
+	seg, err := sanitizeRef(ref)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(m.opts.StateDir, "snapshots", "refs", seg), nil
 }
 
 // snapshotManifestBytes returns the raw manifest a commit wrote, or nil.
 func (m *Microvm) snapshotManifestBytes(ref string) []byte {
-	data, err := os.ReadFile(filepath.Join(m.snapshotRefDir(ref), "manifest.json"))
+	dir, err := m.snapshotRefDir(ref)
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
 	if err != nil {
 		return nil
 	}
@@ -575,8 +636,26 @@ func (m *Microvm) SnapshotEnvKeys(ref string) ([]string, bool) {
 	return sm.EnvKeys, true
 }
 
-func sanitizeRef(ref string) string {
-	return url.PathEscape(strings.ReplaceAll(ref, ":", "_"))
+// sanitizeRef turns an opaque image ref into one path segment, or refuses.
+//
+// Escaping alone is not enough. url.PathEscape leaves "." and ".." exactly as
+// they are, so a ref of ".." used to name the PARENT of the refs directory
+// and a commit wrote its manifest one level up — over whatever was there. The
+// dot segments are therefore rejected outright, and the escaped result is
+// re-checked for a separator rather than trusted to have none.
+func sanitizeRef(ref string) (string, error) {
+	if ref == "" {
+		return "", errors.New("microvm: empty snapshot ref")
+	}
+	seg := url.PathEscape(strings.ReplaceAll(ref, ":", "_"))
+	switch seg {
+	case "", ".", "..":
+		return "", fmt.Errorf("microvm: snapshot ref %q does not name anything this host can store", ref)
+	}
+	if strings.ContainsAny(seg, `/\`) || seg != filepath.Base(seg) {
+		return "", fmt.Errorf("microvm: snapshot ref %q would name a path, not an entry", ref)
+	}
+	return seg, nil
 }
 
 func (m *Microvm) usedLocked() int {
@@ -608,7 +687,11 @@ func (m *Microvm) locateRootfs(rootfsRef string) (string, error) {
 	if fi, err := os.Stat(rootfsRef); err == nil && fi.Mode().IsRegular() {
 		return rootfsRef, nil
 	}
-	cached := filepath.Join(m.opts.StateDir, "rootfs", sanitizeRef(rootfsRef)+".ext4")
+	seg, err := sanitizeRef(rootfsRef)
+	if err != nil {
+		return "", err
+	}
+	cached := filepath.Join(m.opts.StateDir, "rootfs", seg+".ext4")
 	if fi, err := os.Stat(cached); err == nil && fi.Mode().IsRegular() {
 		return cached, nil
 	}
@@ -749,12 +832,20 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 		}
 	}()
 
-	workspaceDisk, created, err := m.ensureDisk(m.workspaceDiskPath(spec.SessionID))
-	if err != nil {
-		return nil, err
-	}
-	if created {
-		undo = append(undo, func() { _ = os.Remove(workspaceDisk) })
+	workspaceDisk := ""
+	if spec.SessionID != "" {
+		path, err := m.workspaceDiskPath(spec.SessionID)
+		if err != nil {
+			return nil, err
+		}
+		disk, created, err := m.ensureDisk(path)
+		if err != nil {
+			return nil, err
+		}
+		workspaceDisk = disk
+		if created {
+			undo = append(undo, func() { _ = os.Remove(disk) })
+		}
 	}
 
 	// The agent home is a disk image like the workspace, created and
@@ -766,7 +857,11 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 	// formatted image is harmless, removing a live one is not.
 	homeDisk := ""
 	if spec.Home != nil {
-		if homeDisk, _, err = m.ensureDisk(m.homeDiskPath(spec.Home.Volume)); err != nil {
+		path, err := m.homeDiskPath(spec.Home.Volume)
+		if err != nil {
+			return nil, err
+		}
+		if homeDisk, _, err = m.ensureDisk(path); err != nil {
 			return nil, err
 		}
 	}
@@ -812,12 +907,7 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 		DialURL:           spec.DialURL,
 		ProxyURL:          spec.ProxyURL,
 		TapDevice:         tapDevice,
-		// TODO(PR 3): one address for every VM on the bridge. A per-host slot
-		// allocator (TAP, IP, MAC, netns) lands with the network work, along
-		// with the nftables drops ADR-0003 §4.3 requires.
-		GuestIP:   "172.18.0.2",
-		GatewayIP: "172.18.0.1",
-		Env:       buildGuestEnv(spec),
+		Env:               buildGuestEnv(spec),
 	}
 
 	if err := m.engine.Launch(ctx, cfg); err != nil {
@@ -878,6 +968,7 @@ func (m *Microvm) Suspend(ctx context.Context, id string, warm bool) error {
 	if !warm {
 		inst.PID = 0
 	}
+	inst.bump()
 	rec := persistable(inst)
 	m.mu.Unlock()
 
@@ -894,8 +985,19 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		m.mu.Unlock()
 		return false, fmt.Errorf("no such id %s", id)
 	}
+	running := inst.State == StateRunning
 	cold, envLive, cfg := inst.Cold, inst.envLive, inst.Cfg
 	m.mu.Unlock()
+
+	// Resuming a session that is already running restarts nothing, and says
+	// so without touching the hypervisor (driver.go's Resume contract). The
+	// call is not merely redundant: Firecracker answers PATCH /vm {"state":
+	// "Resumed"} with 400 on a VM that was never paused, so an unconditional
+	// resume turned "nothing to do" into a failed Resume — and runnerd reads
+	// a failed Resume as a session it could not bring back.
+	if running {
+		return false, nil
+	}
 
 	restarted := false
 	if cold {
@@ -937,6 +1039,7 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 	if restarted {
 		inst.PID = m.engine.PID(id)
 	}
+	inst.bump()
 	rec := persistable(inst)
 	m.mu.Unlock()
 
@@ -975,12 +1078,18 @@ func (m *Microvm) Snapshot(ctx context.Context, id, ref string, stripEnv []strin
 	cmd := slices.Clone(inst.Cfg.Cmd)
 	m.mu.Unlock()
 
+	// The ref becomes a directory name, so it is checked before anything with
+	// a side effect runs rather than on the way to writing the manifest.
+	refDir, err := m.snapshotRefDir(ref)
+	if err != nil {
+		return Snapshot{}, err
+	}
+
 	snap, err := m.engine.Snapshot(ctx, id, ref, stripEnv)
 	if err != nil {
 		return Snapshot{}, err
 	}
 
-	refDir := m.snapshotRefDir(ref)
 	if err := os.MkdirAll(refDir, microvmDirMode); err != nil {
 		return Snapshot{}, fmt.Errorf("create snapshot ref dir: %w", err)
 	}
@@ -1025,6 +1134,13 @@ func (m *Microvm) Destroy(ctx context.Context, id string) error {
 	}
 	m.mu.Unlock()
 
+	// TODO(PR 4): an id this driver does not know resolves to an empty
+	// session id, so RemoveWorkspace below is a no-op and the disk image
+	// stays on the host with nothing left to name it — one leaked workspace
+	// per Destroy that arrives after the record is gone (a reconcile that
+	// raced a crash, a retried rm). Fixing it means finding the workspace
+	// from the disk rather than from the record, which is the same lookup the
+	// image work needs.
 	if err := m.DestroyContainer(ctx, id); err != nil {
 		return err
 	}
@@ -1063,7 +1179,14 @@ func (m *Microvm) RemoveWorkspace(_ context.Context, sessionID string) error {
 	if sessionID == "" {
 		return nil
 	}
-	if err := os.Remove(m.workspaceDiskPath(sessionID)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	// A teardown is the one path where an unchecked id does real damage:
+	// os.Remove of whatever "../../something" resolved to. An id that cannot
+	// name a workspace is an error, not a removal.
+	path, err := m.workspaceDiskPath(sessionID)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove workspace disk for %s: %w", sessionID, err)
 	}
 	return nil
@@ -1071,23 +1194,25 @@ func (m *Microvm) RemoveWorkspace(_ context.Context, sessionID string) error {
 
 func (m *Microvm) Inspect(ctx context.Context, id string) (Handle, error) {
 	m.mu.Lock()
-	_, ok := m.instances[id]
-	m.mu.Unlock()
+	inst, ok := m.instances[id]
 	if !ok {
+		m.mu.Unlock()
 		return Handle{ID: id, State: StateGone}, nil
 	}
+	epoch := inst.epoch
+	m.mu.Unlock()
 
 	// engine.State is I/O against a VMM socket, so it does not run under the
-	// driver mutex.
+	// driver mutex — and the record may therefore have moved underneath it.
 	st, stErr := m.engine.State(ctx, id)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	inst, ok := m.instances[id]
+	inst, ok = m.instances[id]
 	if !ok {
 		return Handle{ID: id, State: StateGone}, nil
 	}
-	if stErr == nil {
+	if stErr == nil && inst.epoch == epoch {
 		reconcileState(inst, st)
 	}
 	return Handle{ID: id, State: inst.State}, nil
@@ -1103,14 +1228,17 @@ func (m *Microvm) Capacity(_ context.Context) (int, int, error) {
 
 func (m *Microvm) List(ctx context.Context) ([]Listed, error) {
 	m.mu.Lock()
-	ids := make([]string, 0, len(m.instances))
-	for id := range m.instances {
-		ids = append(ids, id)
+	epochs := make(map[string]uint64, len(m.instances))
+	for id, inst := range m.instances {
+		epochs[id] = inst.epoch
 	}
 	m.mu.Unlock()
 
-	observed := make(map[string]VMMState, len(ids))
-	for _, id := range ids {
+	// Every engine.State here is I/O against a VMM socket, so none of it runs
+	// under the driver mutex, and each answer is only good for the record as
+	// it stood when the epoch above was read.
+	observed := make(map[string]VMMState, len(epochs))
+	for id := range epochs {
 		if st, err := m.engine.State(ctx, id); err == nil {
 			observed[id] = st
 		}
@@ -1120,7 +1248,7 @@ func (m *Microvm) List(ctx context.Context) ([]Listed, error) {
 	defer m.mu.Unlock()
 	out := make([]Listed, 0, len(m.instances))
 	for id, inst := range m.instances {
-		if st, ok := observed[id]; ok {
+		if st, ok := observed[id]; ok && inst.epoch == epochs[id] {
 			reconcileState(inst, st)
 		}
 		out = append(out, Listed{
@@ -1160,12 +1288,6 @@ func (e *Ext4Formatter) Format(path string) error {
 	return nil
 }
 
-// SimulatedDiskFormatter is the formatting half of the test seam. It is never
-// constructed by production code; see MicrovmOpts.
-type SimulatedDiskFormatter struct{}
-
-func (SimulatedDiskFormatter) Format(string) error { return nil }
-
 // ---------------------------------------------------------------------------
 // Linux TAP Manager (production Linux hosts)
 // ---------------------------------------------------------------------------
@@ -1189,9 +1311,17 @@ func (l *LinuxTapManager) Allocate(tapName, bridgeName string) error {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("ip tuntap add %s: %w: %s", tapName, err, strings.TrimSpace(string(out)))
 	}
+	// A TAP that never reached the bridge is a session with no network at
+	// all, so the attach failing is a failed allocation and not a warning to
+	// swallow. The device this call created is released on the way out —
+	// leaving it behind would also make the next create for the same id fail
+	// on a name that is already taken.
 	if bridgeName != "" {
-		cmdBridge := exec.Command("ip", "link", "set", "dev", tapName, "master", bridgeName)
-		_ = cmdBridge.Run()
+		out, err := exec.Command("ip", "link", "set", "dev", tapName, "master", bridgeName).CombinedOutput()
+		if err != nil {
+			_ = l.Release(tapName)
+			return fmt.Errorf("ip link set %s master %s: %w: %s", tapName, bridgeName, err, strings.TrimSpace(string(out)))
+		}
 	}
 	cmdUp := exec.Command("ip", "link", "set", "dev", tapName, "up")
 	if out, err := cmdUp.CombinedOutput(); err != nil {
@@ -1204,192 +1334,6 @@ func (l *LinuxTapManager) Allocate(tapName, bridgeName string) error {
 func (l *LinuxTapManager) Release(tapName string) error {
 	cmd := exec.Command("ip", "link", "delete", "dev", tapName)
 	return cmd.Run()
-}
-
-// ---------------------------------------------------------------------------
-// Simulated TAP Manager (test seam)
-// ---------------------------------------------------------------------------
-
-// SimulatedTapManager is the networking half of the test seam. It is never
-// constructed by production code; see MicrovmOpts.
-type SimulatedTapManager struct {
-	mu        sync.Mutex
-	allocated map[string]bool
-}
-
-func NewSimulatedTapManager() *SimulatedTapManager {
-	return &SimulatedTapManager{allocated: make(map[string]bool)}
-}
-
-func (s *SimulatedTapManager) Allocate(tapName, _ string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.allocated[tapName] = true
-	return nil
-}
-
-func (s *SimulatedTapManager) Release(tapName string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.allocated, tapName)
-	return nil
-}
-
-// ---------------------------------------------------------------------------
-// Simulated Engine (test seam)
-// ---------------------------------------------------------------------------
-
-// SimulatedEngine is the hypervisor half of the test seam: a state machine
-// with no VM behind it. It is never constructed by production code; see
-// MicrovmOpts. It exists so the shared driver contract (RunContract) can be
-// run against this driver's own lifecycle bookkeeping on a machine with no
-// KVM, which is every developer machine and all of CI.
-//
-// It is NOT a model of Firecracker. Most importantly it reports a stopped VM
-// as VMMStateStopped, where the real engine reports VMMStateGone because a
-// terminated Firecracker leaves no process to ask. A test that cares about
-// that difference injects an engine answering the way the real one does.
-type SimulatedEngine struct {
-	mu         sync.Mutex
-	stateDir   string
-	states     map[string]VMMState
-	configs    map[string]VMMConfig
-	failOnStop map[string]error
-}
-
-func NewSimulatedEngine() *SimulatedEngine {
-	return NewSimulatedEngineWithDir("")
-}
-
-func NewSimulatedEngineWithDir(stateDir string) *SimulatedEngine {
-	s := &SimulatedEngine{
-		stateDir:   stateDir,
-		states:     make(map[string]VMMState),
-		configs:    make(map[string]VMMConfig),
-		failOnStop: make(map[string]error),
-	}
-	if stateDir != "" {
-		s.recoverStates()
-	}
-	return s
-}
-
-func (s *SimulatedEngine) stateFilePath(id string) string {
-	if s.stateDir == "" {
-		return ""
-	}
-	return filepath.Join(s.stateDir, "instances", id, "vmm_sim_state.txt")
-}
-
-func (s *SimulatedEngine) recoverStates() {
-	entries, err := os.ReadDir(filepath.Join(s.stateDir, "instances"))
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		id := entry.Name()
-		if data, err := os.ReadFile(s.stateFilePath(id)); err == nil {
-			s.states[id] = VMMState(strings.TrimSpace(string(data)))
-		}
-	}
-}
-
-func (s *SimulatedEngine) saveState(id string, st VMMState) {
-	if s.stateDir == "" {
-		return
-	}
-	path := s.stateFilePath(id)
-	_ = os.MkdirAll(filepath.Dir(path), microvmDirMode)
-	_ = os.WriteFile(path, []byte(string(st)), microvmFileMode)
-}
-
-// Config returns the VMMConfig this engine was last launched with for id.
-func (s *SimulatedEngine) Config(id string) (VMMConfig, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cfg, ok := s.configs[id]
-	return cfg, ok
-}
-
-// SetState forces the simulated hypervisor's view of id, standing in for an
-// event the driver did not cause — a VMM that crashed, say.
-func (s *SimulatedEngine) SetState(id string, st VMMState) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.states[id] = st
-	s.saveState(id, st)
-}
-
-// FailOnStop makes every Stop of id fail with err, standing in for a VMM that
-// will not die. A nil err clears it.
-func (s *SimulatedEngine) FailOnStop(id string, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err == nil {
-		delete(s.failOnStop, id)
-		return
-	}
-	s.failOnStop[id] = err
-}
-
-func (s *SimulatedEngine) Launch(_ context.Context, cfg VMMConfig) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.states[cfg.ID] = VMMStateRunning
-	s.configs[cfg.ID] = cfg
-	s.saveState(cfg.ID, VMMStateRunning)
-	return nil
-}
-
-func (s *SimulatedEngine) Pause(_ context.Context, id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.states[id] = VMMStatePaused
-	s.saveState(id, VMMStatePaused)
-	return nil
-}
-
-func (s *SimulatedEngine) Resume(_ context.Context, id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.states[id] = VMMStateRunning
-	s.saveState(id, VMMStateRunning)
-	return nil
-}
-
-func (s *SimulatedEngine) Stop(_ context.Context, id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err, ok := s.failOnStop[id]; ok {
-		return err
-	}
-	s.states[id] = VMMStateStopped
-	s.saveState(id, VMMStateStopped)
-	return nil
-}
-
-// Snapshot records the commit and nothing else. The simulated engine has no
-// filesystem to commit, so what it returns is the ref; the driver's manifest
-// beside it is what the contract's strip subtest reads back.
-func (s *SimulatedEngine) Snapshot(_ context.Context, _, ref string, _ []string) (Snapshot, error) {
-	return Snapshot{Ref: ref}, nil
-}
-
-func (s *SimulatedEngine) State(_ context.Context, id string) (VMMState, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	st, ok := s.states[id]
-	if !ok {
-		return VMMStateGone, nil
-	}
-	return st, nil
-}
-
-func (s *SimulatedEngine) PID(_ string) int {
-	return 0
 }
 
 // ---------------------------------------------------------------------------
@@ -1479,10 +1423,24 @@ func (f *FirecrackerEngine) pidFilePath(id string) string {
 	return filepath.Join(f.stateDir, "instances", id, "pid")
 }
 
-func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+// microvmBootArgs is the guest kernel command line.
+//
+// TODO(PR 3): every VM on the bridge gets this one address, gateway and
+// netmask, so two of them collide immediately — against ADR-0003 §5.1's 4 to
+// 6 sessions per host. A per-host slot allocator (TAP, IP, MAC, netns) lands
+// with the network work, and the address then comes from the slot rather than
+// from a constant.
+const microvmBootArgs = "console=ttyS0 reboot=k panic=1 pci=off ip=172.18.0.2::172.18.0.1:255.255.0.0:guest:eth0:off init=/init"
 
+// Launch starts one VMM and configures it.
+//
+// f.mu guards the process map and NOTHING else. Waiting for a socket and
+// PUTting seven endpoints is seconds of I/O, and State, PID and Stop take the
+// same mutex — holding it across a boot froze Inspect and List for every
+// other session on the host behind whichever VM was slowest to come up.
+func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
+	// initErr, vmmPath and stateDir are set once in the constructor and never
+	// written again, so they need no lock.
 	if f.initErr != nil {
 		return f.initErr
 	}
@@ -1542,13 +1500,9 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	}
 
 	// 2. Boot source
-	bootArgs := cfg.BootArgs
-	if bootArgs == "" {
-		bootArgs = "console=ttyS0 reboot=k panic=1 pci=off ip=172.18.0.2::172.18.0.1:255.255.0.0:guest:eth0:off init=/init"
-	}
 	if err := fcClient.putJSON(ctx, "/boot-source", map[string]any{
 		"kernel_image_path": cfg.KernelPath,
-		"boot_args":         bootArgs,
+		"boot_args":         microvmBootArgs,
 	}); err != nil {
 		return fmt.Errorf("set boot source: %w", err)
 	}
@@ -1618,7 +1572,10 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		return fmt.Errorf("start instance %s: %w", cfg.ID, err)
 	}
 
+	f.mu.Lock()
 	f.procs[cfg.ID] = cmd
+	f.mu.Unlock()
+
 	initSuccess = true
 	return nil
 }
@@ -1670,25 +1627,35 @@ func (f *FirecrackerEngine) Stop(_ context.Context, id string) error {
 		pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
 	}
 
+	// waited is the channel this process's own Wait reports on. A VMM this
+	// engine started is a CHILD: signalling it is not enough, because an
+	// un-Waited child stays in the process table as a zombie, and a runner
+	// that parks and resumes sessions all day accumulates one per stopped VM
+	// until it runs out of process slots. Only a tracked cmd can be Waited —
+	// a pid recovered from the pid file after a runnerd restart belongs to no
+	// child of this process, and for that one the kernel has already
+	// reparented it to init, which reaps it.
+	var waited chan error
+	if tracked && cmd.Process != nil {
+		waited = make(chan error, 1)
+		go func() { waited <- cmd.Wait() }()
+	}
+
 	var stopErr error
 	sockPath := f.socketPath(id)
 	if pid > 0 && isFirecrackerPID(pid, sockPath) {
 		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
 			stopErr = fmt.Errorf("sigterm pid %d: %w", pid, err)
-		} else {
-			exited := false
-			deadline := time.Now().Add(3 * time.Second)
-			for time.Now().Before(deadline) {
-				if err := syscall.Kill(pid, 0); err != nil {
-					exited = true
-					break
-				}
-				time.Sleep(50 * time.Millisecond)
-			}
-			if !exited {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
+		} else if !awaitExit(waited, pid, firecrackerTermTimeout) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			if !awaitExit(waited, pid, firecrackerKillTimeout) && stopErr == nil {
+				stopErr = fmt.Errorf("firecracker pid %d did not exit after SIGKILL", pid)
 			}
 		}
+	} else if waited != nil {
+		// Nothing to signal — the process is already gone — but the child
+		// still has to be reaped.
+		<-waited
 	}
 
 	sockDir := filepath.Join(f.stateDir, "sockets", id)
@@ -1696,6 +1663,28 @@ func (f *FirecrackerEngine) Stop(_ context.Context, id string) error {
 		stopErr = fmt.Errorf("remove socket dir: %w", err)
 	}
 	return stopErr
+}
+
+// awaitExit waits up to timeout for a VMM to be gone, and reports whether it
+// is. For a child of this process that means Wait returning (which also reaps
+// it); for a pid inherited across a restart, polling signal 0 is all there is.
+func awaitExit(waited chan error, pid int, timeout time.Duration) bool {
+	if waited != nil {
+		select {
+		case <-waited:
+			return true
+		case <-time.After(timeout):
+			return false
+		}
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
 }
 
 // Snapshot refuses, for two separate reasons that both have to hold.
@@ -1743,29 +1732,53 @@ func (f *FirecrackerEngine) State(ctx context.Context, id string) (VMMState, err
 		return VMMStateGone, nil
 	}
 
-	fcClient := newFirecrackerClient(sockPath)
-	type vmDesc struct {
+	return instanceState(ctx, newFirecrackerClient(sockPath))
+}
+
+// instanceState reads a running VMM's execution state.
+//
+// The endpoint is GET / (InstanceInfo). There is no GET /vm in Firecracker's
+// API — /vm takes a PATCH and nothing else — so the previous code asked for a
+// path that 404s, fell through its own error handling, and returned Running
+// unconditionally. A warm-paused VM therefore reconciled as running, which is
+// precisely the state Inspect exists to tell apart.
+//
+// Anything this cannot read is an error rather than a guess. State's caller
+// leaves the driver's own record alone when State errors, which is the right
+// outcome for a VMM that answered something unexpected: the driver keeps what
+// it knows instead of overwriting it with a default.
+func instanceState(ctx context.Context, c *firecrackerClient) (VMMState, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost/", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("firecracker GET /: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("firecracker GET / failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var info struct {
 		State string `json:"state"`
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost/vm", nil)
-	if err == nil {
-		if resp, err := fcClient.client.Do(req); err == nil {
-			defer resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				var desc vmDesc
-				if json.NewDecoder(resp.Body).Decode(&desc) == nil {
-					if strings.EqualFold(desc.State, "Paused") {
-						return VMMStatePaused, nil
-					}
-					if strings.EqualFold(desc.State, "Resumed") || strings.EqualFold(desc.State, "Running") {
-						return VMMStateRunning, nil
-					}
-				}
-			}
-		}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return "", fmt.Errorf("firecracker GET /: %w", err)
 	}
-
-	return VMMStateRunning, nil
+	switch {
+	case strings.EqualFold(info.State, "Running"):
+		return VMMStateRunning, nil
+	case strings.EqualFold(info.State, "Paused"):
+		return VMMStatePaused, nil
+	default:
+		// "Not started" lands here: the VMM process is up but InstanceStart
+		// was never issued or never took. Launch does not return until it
+		// has, so this is a VM in a state the driver did not put it in, and
+		// naming it beats mapping it onto one of the driver's own.
+		return "", fmt.Errorf("firecracker instance state %q is not one this driver put it in", info.State)
+	}
 }
 
 func (f *FirecrackerEngine) PID(id string) int {

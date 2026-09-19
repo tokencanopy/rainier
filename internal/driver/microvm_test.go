@@ -6,15 +6,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 )
 
@@ -256,9 +260,9 @@ func TestMicrovmWorkspaceFilesSurviveColdPark(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	diskFile := m.workspaceDiskPath("sess-persist")
-	if diskFile == "" {
-		t.Fatal("empty workspace disk file path")
+	diskFile, err := m.workspaceDiskPath("sess-persist")
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	testData := []byte("uncommitted agent work that must survive cold park")
@@ -525,7 +529,11 @@ func TestMicrovmCreateFailsClosedWithoutAFormatter(t *testing.T) {
 	if _, err := m.Create(context.Background(), Spec{SessionID: "sess-nofmt"}); err == nil {
 		t.Fatal("Create succeeded with no way to format the workspace disk")
 	}
-	if _, err := os.Stat(m.workspaceDiskPath("sess-nofmt")); err == nil {
+	leftover, err := m.workspaceDiskPath("sess-nofmt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(leftover); err == nil {
 		t.Error("an unformatted disk image was left behind for the next create to find")
 	}
 }
@@ -795,7 +803,7 @@ func TestMicrovmPrepullNeverFabricatesAnImage(t *testing.T) {
 	if err := m.Prepull(ctx, missing); err == nil {
 		t.Fatal("Prepull of an unresolvable ref = nil, want an error")
 	}
-	cached := filepath.Join(stateDir, "rootfs", sanitizeRef(missing)+".ext4")
+	cached := filepath.Join(stateDir, "rootfs", mustSanitizeRef(t, missing)+".ext4")
 	if _, err := os.Stat(cached); err == nil {
 		t.Fatalf("Prepull left a placeholder image at %s", cached)
 	}
@@ -808,7 +816,7 @@ func TestMicrovmPrepullNeverFabricatesAnImage(t *testing.T) {
 
 	// A ref this host does have resolves, and is recorded.
 	const present = "rainier-env:e1-aaa"
-	if err := os.WriteFile(filepath.Join(stateDir, "rootfs", sanitizeRef(present)+".ext4"), []byte("image"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(stateDir, "rootfs", mustSanitizeRef(t, present)+".ext4"), []byte("image"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := m.Prepull(ctx, present); err != nil {
@@ -900,5 +908,341 @@ func TestMicrovmConcurrentLifecycleCalls(t *testing.T) {
 	}
 	if len(listed) != 8 {
 		t.Fatalf("listed %d sessions after 8 concurrent creates, want 8", len(listed))
+	}
+}
+
+func mustSanitizeRef(t *testing.T, ref string) string {
+	t.Helper()
+	seg, err := sanitizeRef(ref)
+	if err != nil {
+		t.Fatalf("sanitizeRef(%q): %v", ref, err)
+	}
+	return seg
+}
+
+// TestMicrovmHostileNamesNeverBecomePaths: every name this driver joins onto
+// the state directory comes from somewhere else — a control plane, a spec, a
+// directory listing — and filepath.Join CLEANS its result, so "../../x" does
+// not produce a silly path, it produces a real one outside the state
+// directory that RemoveWorkspace would then delete.
+func TestMicrovmHostileNamesNeverBecomePaths(t *testing.T) {
+	stateDir := t.TempDir()
+	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
+	ctx := context.Background()
+
+	// A file outside the state directory that no driver call may reach.
+	outside := filepath.Join(filepath.Dir(stateDir), "rainier-ws-victim.ext4")
+	if err := os.WriteFile(outside, []byte("someone else's data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(outside) })
+
+	hostile := []string{
+		"../victim",
+		"..",
+		".",
+		"a/b",
+		`a\b`,
+		"sess/../../escape",
+		"",
+	}
+	for _, id := range hostile {
+		t.Run("session-"+id, func(t *testing.T) {
+			if _, err := m.workspaceDiskPath(id); err == nil {
+				t.Errorf("workspaceDiskPath(%q) produced a path", id)
+			}
+			if _, err := m.homeDiskPath(id); err == nil {
+				t.Errorf("homeDiskPath(%q) produced a path", id)
+			}
+			if id != "" {
+				// An empty session id names no workspace and is a documented
+				// no-op; every other hostile spelling must be refused.
+				if err := m.RemoveWorkspace(ctx, id); err == nil {
+					t.Errorf("RemoveWorkspace(%q) = nil, want a refusal", id)
+				}
+			}
+			if _, err := m.Create(ctx, Spec{SessionID: id, Image: ""}); id != "" && err == nil {
+				t.Errorf("Create with session id %q succeeded", id)
+			}
+		})
+	}
+
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("a file outside the state directory was removed: %v", err)
+	}
+	// The empty id keeps its documented behavior.
+	if err := m.RemoveWorkspace(ctx, ""); err != nil {
+		t.Errorf(`RemoveWorkspace("") = %v, want nil`, err)
+	}
+}
+
+// TestMicrovmHostileSnapshotRefsAreRefused: url.PathEscape leaves "." and
+// ".." exactly as they are, so a ref of ".." used to name the parent of the
+// refs directory and a commit wrote its manifest one level up.
+func TestMicrovmHostileSnapshotRefsAreRefused(t *testing.T) {
+	stateDir := t.TempDir()
+	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "sess-ref"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ref := range []string{"..", ".", ""} {
+		if ref != "" {
+			// An empty ref is the dev surface's case: the driver mints one.
+			if _, err := m.Snapshot(ctx, h.ID, ref, nil); err == nil {
+				t.Errorf("Snapshot to ref %q succeeded", ref)
+			}
+		}
+		if _, err := sanitizeRef(ref); err == nil {
+			t.Errorf("sanitizeRef(%q) = nil error", ref)
+		}
+	}
+
+	// A ref with separators in it is not refused, it is escaped: the result
+	// has to be ONE entry under the refs directory, and the assertion is that
+	// it stays there rather than that the spelling is rejected.
+	for _, ref := range []string{"../..", "a/../..", `a\..\..`, "rainier-env:x/y"} {
+		seg, err := sanitizeRef(ref)
+		if err != nil {
+			continue
+		}
+		if seg != filepath.Base(seg) || strings.ContainsAny(seg, `/\`) {
+			t.Errorf("sanitizeRef(%q) = %q, which is not one path entry", ref, seg)
+		}
+		dir, err := m.snapshotRefDir(ref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := filepath.Join(stateDir, "snapshots", "refs"); filepath.Dir(dir) != want {
+			t.Errorf("ref %q resolved to %s, outside %s", ref, dir, want)
+		}
+	}
+	// Nothing was written above the refs directory.
+	stray := filepath.Join(stateDir, "snapshots", "manifest.json")
+	if _, err := os.Stat(stray); err == nil {
+		t.Errorf("a snapshot wrote %s, one level above its ref directory", stray)
+	}
+	// An ordinary ref with a colon still works.
+	if _, err := m.Snapshot(ctx, h.ID, "rainier-env:ok-1", nil); err != nil {
+		t.Fatalf("snapshot to an ordinary ref: %v", err)
+	}
+}
+
+// TestMicrovmResumeOfARunningSessionTouchesNothing is driver.go's Resume
+// contract at the engine boundary: an already-running session restarts
+// nothing, and the driver must not ask the hypervisor to unpause a VM that
+// was never paused (Firecracker answers 400).
+func TestMicrovmResumeOfARunningSessionTouchesNothing(t *testing.T) {
+	m, sim := testMicrovm(t, MicrovmOpts{TotalSlots: 4})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "sess-rr"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	counting := &countingResumeEngine{SimulatedEngine: sim}
+	m.engine = counting
+
+	restarted, err := m.Resume(ctx, h.ID)
+	if err != nil {
+		t.Fatalf("Resume of a running session = %v, want nil", err)
+	}
+	if restarted {
+		t.Error("Resume of a running session reported a restart")
+	}
+	if n := counting.resumes.Load(); n != 0 {
+		t.Errorf("Resume of a running session called the hypervisor %d times", n)
+	}
+	if g, _ := m.Inspect(ctx, h.ID); g.State != StateRunning {
+		t.Errorf("state after a no-op resume = %s", g.State)
+	}
+}
+
+type countingResumeEngine struct {
+	*SimulatedEngine
+	resumes atomic.Int64
+}
+
+func (c *countingResumeEngine) Resume(ctx context.Context, id string) error {
+	c.resumes.Add(1)
+	return c.SimulatedEngine.Resume(ctx, id)
+}
+
+// TestMicrovmReconcileDoesNotClobberAConcurrentSuspend is the lost update.
+// Inspect and List ask the hypervisor with the mutex released; a Suspend that
+// completes inside that window must not be overwritten by the stale answer,
+// which would leak a slot and send the next Resume down the warm path into a
+// VM that is no longer there.
+func TestMicrovmReconcileDoesNotClobberAConcurrentSuspend(t *testing.T) {
+	stateDir := t.TempDir()
+	gate := make(chan struct{})
+	m, _ := testMicrovm(t, MicrovmOpts{
+		TotalSlots: 4,
+		StateDir:   stateDir,
+		Engine:     &gatedStateEngine{SimulatedEngine: NewSimulatedEngineWithDir(stateDir), gate: gate},
+	})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "sess-lost"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Inspect blocks inside engine.State holding the answer "running".
+	done := make(chan Handle, 1)
+	go func() {
+		g, _ := m.Inspect(ctx, h.ID)
+		done <- g
+	}()
+	<-gate // Inspect has read the state and is about to return it.
+
+	if err := m.Suspend(ctx, h.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	gate <- struct{}{} // let Inspect finish with its now-stale answer.
+	<-done
+
+	if g, _ := m.Inspect(ctx, h.ID); g.State != StateSuspended {
+		t.Fatalf("state after a cold suspend that raced a reconcile = %s, want %s", g.State, StateSuspended)
+	}
+	if used, _, _ := m.Capacity(ctx); used != 0 {
+		t.Errorf("a cold-suspended session still occupies %d slot(s): the stale reconcile won", used)
+	}
+	if st := listedState(t, m, "sess-lost"); st != StateSuspended {
+		t.Errorf("List reports %q after the raced suspend", st)
+	}
+}
+
+// gatedStateEngine reads the state, then parks on a channel before returning
+// it, so a test can run a whole Suspend inside the window Inspect leaves open.
+type gatedStateEngine struct {
+	*SimulatedEngine
+	gate chan struct{}
+	once sync.Once
+}
+
+func (g *gatedStateEngine) State(ctx context.Context, id string) (VMMState, error) {
+	st, err := g.SimulatedEngine.State(ctx, id)
+	g.once.Do(func() {
+		g.gate <- struct{}{}
+		<-g.gate
+	})
+	return st, err
+}
+
+// TestFirecrackerStateReadsInstanceInfo pins the endpoint and the parse. GET
+// /vm is not a Firecracker route — /vm takes a PATCH and nothing else — so
+// asking for it 404s, and the previous code fell through its own error
+// handling and reported every VM as running, warm-paused ones included.
+func TestFirecrackerStateReadsInstanceInfo(t *testing.T) {
+	dir, err := os.MkdirTemp("", "fcinfo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	var body atomic.Value
+	body.Store(`{"id":"mvm-1","state":"Running"}`)
+	var paths sync.Map
+
+	sockPath := filepath.Join(dir, "s.sock")
+	listener, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths.Store(r.Method+" "+r.URL.Path, true)
+		if r.URL.Path != "/" {
+			// Exactly what Firecracker does with a route it does not serve.
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, body.Load().(string))
+	})}
+	go server.Serve(listener)
+	defer server.Close()
+
+	c := newFirecrackerClient(sockPath)
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		json string
+		want VMMState
+	}{
+		{`{"state":"Running"}`, VMMStateRunning},
+		{`{"state":"Paused"}`, VMMStatePaused},
+	} {
+		body.Store(tc.json)
+		got, err := instanceState(ctx, c)
+		if err != nil {
+			t.Fatalf("instanceState(%s): %v", tc.json, err)
+		}
+		if got != tc.want {
+			t.Errorf("instanceState(%s) = %q, want %q", tc.json, got, tc.want)
+		}
+	}
+	if _, ok := paths.Load("GET /"); !ok {
+		t.Error("instanceState did not ask GET /")
+	}
+	if _, ok := paths.Load("GET /vm"); ok {
+		t.Error("instanceState asked GET /vm, which Firecracker does not serve")
+	}
+
+	// A state this driver did not create the VM in is an error, not Running:
+	// State's caller leaves its own record alone when State errors.
+	body.Store(`{"state":"Not started"}`)
+	if got, err := instanceState(ctx, c); err == nil {
+		t.Errorf("instanceState of a not-started VM = %q, want an error", got)
+	}
+	body.Store(`not json at all`)
+	if got, err := instanceState(ctx, c); err == nil {
+		t.Errorf("instanceState of an unparseable body = %q, want an error", got)
+	}
+}
+
+// TestFirecrackerStopReapsTheChild: a VMM this engine started is a child, and
+// signalling one without Waiting it leaves a zombie per stopped VM.
+func TestFirecrackerStopReapsTheChild(t *testing.T) {
+	dir, err := os.MkdirTemp("", "fcreap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	fc := NewFirecrackerEngine("/nonexistent/bin/firecracker", dir)
+
+	// A stand-in for a launched VMM: a real child of this process that
+	// ignores nothing and exits on SIGTERM.
+	cmd := exec.Command("sleep", "60")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	fc.mu.Lock()
+	fc.procs["mvm-reap"] = cmd
+	fc.mu.Unlock()
+
+	if err := fc.Stop(context.Background(), "mvm-reap"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	// Wait having been called, the pid is fully released: signalling it now
+	// finds nothing. An un-Waited child would still answer signal 0 as a
+	// zombie.
+	if err := syscall.Kill(pid, 0); err == nil {
+		t.Error("the stopped VMM is still in the process table; Stop never Waited it")
+	}
+	fc.mu.Lock()
+	_, stillTracked := fc.procs["mvm-reap"]
+	fc.mu.Unlock()
+	if stillTracked {
+		t.Error("Stop left the process in the engine's map")
+	}
+	// A second Stop of the same id is a no-op, not a double Wait.
+	if err := fc.Stop(context.Background(), "mvm-reap"); err != nil {
+		t.Errorf("second Stop: %v", err)
 	}
 }
