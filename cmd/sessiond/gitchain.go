@@ -44,19 +44,28 @@ import (
 // The stage names. They are wire-visible: they travel in ControlEvent.Stage
 // and controld composes a session's error text out of them.
 const (
-	stageSetup  = "setup"
-	stageClone  = "clone"
-	stageAgents = "agents"
-	stageInit   = "init"
+	// stageSecrets is FIRST in the chain and exists only to fail. A microVM
+	// session whose environment declared secrets it could not be given is
+	// not the environment it was created from, so the agent must not start —
+	// and the way a boot chain refuses to start the agent is a stage that
+	// exits non-zero, which the watcher then reports as stage_failed with a
+	// tail a person can read. See bootconfig.go.
+	stageSecrets = "secrets"
+	stageSetup   = "setup"
+	stageClone   = "clone"
+	stageAgents  = "agents"
+	stageInit    = "init"
 )
 
 // The chain's files, all in the session's own .rainier directory beside the
 // setup script Plan 4 put there.
 const (
-	clonesScriptName = "clones.sh"
-	cloneRCName      = "clone.rc"
-	agentsScriptName = "agents.sh"
-	agentsRCName     = "agents.rc"
+	secretsScriptName = "secrets.sh"
+	secretsRCName     = "secrets.rc"
+	clonesScriptName  = "clones.sh"
+	cloneRCName       = "clone.rc"
+	agentsScriptName  = "agents.sh"
+	agentsRCName      = "agents.rc"
 	// agentsDoneName is the marker sessiond writes when the agent homes are as
 	// ready as they are going to get, and the file the agents stage waits for.
 	// It lives beside the rc files, on the same persistent volume, which is why
@@ -147,6 +156,20 @@ type bootEnv struct {
 
 	GitAuthorName  string
 	GitAuthorEmail string
+
+	// SecretsFailure is the one field that does not come from the
+	// environment block: it is set by the microVM boot when the values this
+	// session's create promised could not be delivered (bootconfig.go).
+	//
+	// It becomes the first stage of the chain, and that stage only fails.
+	// Putting it here rather than handling it in main is what makes it a
+	// STAGE — reported as stage_failed with a tail, with the agent never
+	// exec'd — through exactly the machinery a failed setup or a failed
+	// clone already goes through, rather than through a second path that
+	// would have to be kept in step with it.
+	//
+	// It names a count and never a value; see undeliveredSecrets.
+	SecretsFailure string
 }
 
 // bootEnvFromOS reads the variables the driver injects (internal/driver
@@ -175,7 +198,8 @@ func bootEnvFromOS() bootEnv {
 // design's intent: a home nobody waited for is a login that lands after the
 // agent already read its configuration.
 func (e bootEnv) any() bool {
-	return e.SetupB64 != "" || e.ReposB64 != "" || e.InitB64 != "" || e.AgentsB64 != ""
+	return e.SetupB64 != "" || e.ReposB64 != "" || e.InitB64 != "" || e.AgentsB64 != "" ||
+		e.SecretsFailure != ""
 }
 
 // git reports whether git will run in this session — the clone stage, or an
@@ -337,6 +361,23 @@ func prepareBoot(dir, root string, env bootEnv) ([]bootStage, []envVar, error) {
 	}
 
 	var stages []bootStage
+	// First, and only when the microVM boot could not get what this
+	// session's create promised it. Everything after it is skipped by the
+	// chain's own `exit $rc`, which is the point: an environment missing its
+	// credentials must not run a setup script, clone a repository, or start
+	// an agent that will fail at whatever it reaches for first.
+	if env.SecretsFailure != "" {
+		if err := writeStageScript(dir, secretsScriptName, secretsRCName,
+			[]byte(failingScript(env.SecretsFailure))); err != nil {
+			return nil, nil, err
+		}
+		stages = append(stages, bootStage{
+			Name:       stageSecrets,
+			ScriptPath: dir + "/" + secretsScriptName,
+			RCPath:     dir + "/" + secretsRCName,
+			Timeout:    stageTimeout(""),
+		})
+	}
 	if env.SetupB64 != "" {
 		if err := prepareSetup(dir, env.SetupB64); err != nil {
 			return nil, nil, err
