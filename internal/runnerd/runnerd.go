@@ -121,6 +121,10 @@ type Server struct {
 	// value New leaves — means "derive it from the timeout" (see
 	// idleSweepInterval); a test sets it directly to keep its loop short.
 	idleSweep time.Duration
+	// runnerRPC is the pending table for the session-RPC requests this
+	// RUNNER originates, which today is exactly one: the bootstrap token a
+	// microVM cold resume needs. See runnerRPCTable and microvm.go.
+	runnerRPC *runnerRPCTable
 }
 
 // suspendWaiter is one in-flight suspend's two answers, matched by nonce.
@@ -211,10 +215,19 @@ func (e *egressError) Error() string { return "egress setup: " + e.err.Error() }
 func (e *egressError) Unwrap() error { return e.err }
 
 func New(drv driver.Driver, dialBase, egressAdmin, proxyURL string) *Server {
-	return &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin,
+	s := &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin,
 		proxyURL: proxyURL, hubWait: defaultHubWait, now: time.Now,
 		suspendAckWait: defaultSuspendAckWait, suspendReadyWait: defaultSuspendReadyWait,
-		suspends: map[string]*suspendWaiter{}}
+		suspends: map[string]*suspendWaiter{}, runnerRPC: newRunnerRPCTable()}
+	// The microVM driver is composed BELOW this server and needs two things
+	// from above it — where a guest's control conn goes, and where a cold
+	// resume's bootstrap token comes from — so the runner installs itself
+	// here rather than being passed into the driver's constructor, which
+	// runs first. See driver.MicrovmHost.
+	if hd, ok := drv.(driver.HostedDriver); ok {
+		hd.SetHost(s)
+	}
+	return s
 }
 
 // Recover rebuilds the in-memory registry from the driver's labeled
@@ -384,6 +397,16 @@ func (s *Server) createWithID(ctx context.Context, id string, spec driver.Spec, 
 	spec.SessionID = id
 	spec.DialURL = s.dialBase + "/register"
 	spec.ProxyURL = s.proxyURL
+	if s.withholdsSecrets() {
+		// There is no URL to dial. A microVM guest's control channel is the
+		// vsock conn IT opens to the host, which the driver is already
+		// listening for by the time the VM starts, so a dial URL here would
+		// be a promise of an endpoint the guest has no route to and no
+		// business reaching. Empty is also what makes NO_PROXY inside the
+		// guest the base list and nothing else: there is no dial host to
+		// exempt (design note §4, step 2).
+		spec.DialURL = ""
+	}
 	h, err := s.drv.Create(ctx, spec)
 	if err != nil {
 		s.reg.remove(id)
@@ -650,9 +673,22 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 		// design's lifetime rule. Sent only for the warm case, so the cold
 		// path keeps exactly the shape it has today.
 		if warm {
-			s.quiesceExecs(ctx, id)
+			s.quiesceExecs(ctx, id, false)
 		}
 		if !warm {
+			// A cold microVM suspend TERMINATES the VM, and no memory image
+			// is written anywhere (ADR-0003 §2.2), so the sandbox is told
+			// first — and told that it is COLD: flush what it has, unmount
+			// the agent home, and forget every secret the bootstrap exchange
+			// delivered, before the VM goes.
+			//
+			// The Docker path is deliberately untouched here. `docker stop`
+			// delivers the SIGTERM sessiond's own handler already answers,
+			// and a notice sent there would be a behaviour change on the one
+			// path this design promises to leave exactly as it is.
+			if s.withholdsSecrets() {
+				s.quiesceExecs(ctx, id, true)
+			}
 			// Cold suspend (docker stop) kills the container's sessiond,
 			// which closes its /register conn — the exact same socket-level
 			// event as a crash. Mark "suspending" BEFORE calling Suspend so
@@ -930,6 +966,26 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.SetReadLimit(16 << 20)
+	s.serveSessionConn(r.Context(), id, relay.WSConn(c))
+}
+
+// serveSessionConn is what a registered session's conn MEANS to this runner,
+// with the transport that carried it already resolved: build the hub, publish
+// it, report the session running, and then hold the goroutine until the conn
+// dies so the entry can be settled.
+//
+// It is shared by the two doors a sandbox can arrive at. The WebSocket one
+// above is the Docker path and every session that exists today, where the
+// container dials in over the network and asserts its session id in a query
+// parameter. The vsock one is a microVM guest, whose connection Firecracker
+// forwards to a socket inside that VM's own directory — so the session id is
+// the PATH's and not the guest's claim, which is strictly stronger than the
+// hop it replaces (tenancy §18 item 53).
+//
+// Everything below this line was in the /register handler and is unchanged;
+// the extraction is what keeps the two doors from drifting into meaning two
+// different things.
+func (s *Server) serveSessionConn(ctx context.Context, id string, conn relay.Conn) {
 	// Read BEFORE the hub, because NewHubWithControl starts the read loop.
 	// Every control frame from this conn carries it, and the registry drops
 	// the ones that name a boot the session has moved past. Note READ, not
@@ -944,7 +1000,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	// process on the other end may not be the one that numbered the last
 	// report. See sessionEntry.execReg.
 	reg := s.reg.registration()
-	hub := relay.NewHubWithControl(r.Context(), relay.WSConn(c), func(payload []byte) {
+	hub := relay.NewHubWithControl(ctx, conn, func(payload []byte) {
 		// On its own goroutine, deliberately: this runs on the hub's read
 		// loop, the single goroutine demultiplexing every attachment
 		// multiplexed over this session's conn, and routeControl ends in the
@@ -1226,7 +1282,12 @@ const (
 // sessiond that predates the notice drops it, a conn that has died takes the
 // whole question with it, and a cancelled dispatch is one whose suspend is
 // about to fail on its own. None of those is worse than not sending it at all.
-func (s *Server) quiesceExecs(ctx context.Context, id string) {
+// cold says which kind of suspend is coming. False is a freeze and is the
+// notice this function has always sent, byte for byte: `cold` is omitempty,
+// so a warm notice is unchanged for every sandbox already running. True is
+// the end of this VM, and asks the sandbox for the two things a freeze does
+// not need — a flush and an unmount — before it answers.
+func (s *Server) quiesceExecs(ctx context.Context, id string, cold bool) {
 	hub, ok := s.reg.hub(id)
 	if !ok {
 		return
@@ -1235,7 +1296,7 @@ func (s *Server) quiesceExecs(ctx context.Context, id string) {
 	w := s.armSuspendWaiter(id, nonce)
 	defer s.disarmSuspendWaiter(id, w)
 
-	b, err := json.Marshal(relay.ControlEvent{Kind: relay.KindSuspending, ID: nonce})
+	b, err := json.Marshal(relay.ControlEvent{Kind: relay.KindSuspending, ID: nonce, Cold: cold})
 	if err != nil {
 		log.Printf("session %s: encoding the suspend notice: %v", id, err)
 		return

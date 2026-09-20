@@ -3,7 +3,6 @@ package driver
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +20,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/tokencanopy/rainier/internal/relay"
 )
 
 // testMicrovm builds a driver over a fresh state directory with the whole
@@ -33,7 +34,7 @@ import (
 func testMicrovm(t *testing.T, opts MicrovmOpts) (*Microvm, *SimulatedEngine) {
 	t.Helper()
 	if opts.StateDir == "" {
-		opts.StateDir = t.TempDir()
+		opts.StateDir = shortTempDir(t)
 	}
 	if opts.BaseRootfs == "" {
 		opts.BaseRootfs = writeFakeRootfs(t, opts.StateDir)
@@ -56,6 +57,23 @@ func testMicrovm(t *testing.T, opts MicrovmOpts) (*Microvm, *SimulatedEngine) {
 	return m, sim
 }
 
+// shortTempDir is t.TempDir with a name short enough to hang a unix socket
+// off. t.TempDir composes the TEST's name into the path, and the guest
+// control socket lands at "<dir>/instances/<id>/v1.sock_1024" — which for a
+// test called TestMicrovmSomethingDescriptive is over the 108-byte sun_path
+// limit before the driver has done anything wrong. A production state
+// directory is nowhere near it; this is a fixture concern and not a
+// behaviour one.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "mvm")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 // writeFakeRootfs puts a file where a base rootfs image would be. It is not a
 // filesystem and nothing boots it; it is there so the driver's "this host has
 // the image" check has something true to find.
@@ -71,8 +89,55 @@ func writeFakeRootfs(t *testing.T, dir string) string {
 func TestMicrovmSatisfiesContract(t *testing.T) {
 	RunContract(t, func(t *testing.T) (Driver, func()) {
 		d, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4})
+		// A microVM driver in production always has a runner above it
+		// (runnerd.New installs itself), and a cold resume asks it for a
+		// fresh bootstrap token. The contract drives cold resumes, so the
+		// fixture supplies the smallest thing that can answer one.
+		d.SetHost(&stubMicrovmHost{})
 		return d, func() {}
 	})
+}
+
+// stubMicrovmHost is a runner that mints a token and drops every guest
+// connection. It is what the contract needs and nothing more: the contract is
+// about the driver's own behaviour, and a guest that connects to a fixture
+// has nowhere to go.
+type stubMicrovmHost struct {
+	mu    sync.Mutex
+	mints int
+	conns []string
+	// mintErr, when set, is what a cold resume's mint reports — the state a
+	// runner with no control connection is in.
+	mintErr error
+}
+
+func (h *stubMicrovmHost) GuestConnected(sessionID string, conn relay.Conn) {
+	h.mu.Lock()
+	h.conns = append(h.conns, sessionID)
+	h.mu.Unlock()
+	_ = conn.Close()
+}
+
+func (h *stubMicrovmHost) MintSessionBootstrap(_ context.Context, sessionID string) (string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.mintErr != nil {
+		return "", h.mintErr
+	}
+	h.mints++
+	return fmt.Sprintf("token_example_%s_%d", sessionID, h.mints), nil
+}
+
+func (h *stubMicrovmHost) mintCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.mints
+}
+
+func (h *stubMicrovmHost) connected() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.conns)
 }
 
 // TestMicrovmRefusesToStartWithoutAHost is the fail-closed half: there is no
@@ -137,7 +202,7 @@ func TestMicrovmRefusesToStartWithoutAHost(t *testing.T) {
 // drop it, and runnerd.Recover would forget a session whose files are sitting
 // right there on disk.
 func TestMicrovmColdSuspendedSessionIsNotGone(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := shortTempDir(t)
 	m, _ := testMicrovm(t, MicrovmOpts{
 		TotalSlots: 4,
 		StateDir:   stateDir,
@@ -206,7 +271,7 @@ func listedState(t *testing.T, m *Microvm, sessionID string) State {
 }
 
 func TestMicrovmRestartRecovery(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := shortTempDir(t)
 	m1, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
 	ctx := context.Background()
 
@@ -254,6 +319,7 @@ func TestMicrovmRestartRecovery(t *testing.T) {
 
 func TestMicrovmWorkspaceFilesSurviveColdPark(t *testing.T) {
 	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4})
+	m.SetHost(&stubMicrovmHost{})
 	ctx := context.Background()
 
 	h, err := m.Create(ctx, Spec{SessionID: "sess-persist"})
@@ -321,7 +387,12 @@ func TestMicrovmGuestEnvTranslationAndBootstrap(t *testing.T) {
 		GitAuthorName:  "Test Author",
 		GitAuthorEmail: "author@example.invalid",
 		Cmd:            []string{"claude", "--model", "haiku"},
+		// Env plus a token is what a create from a control plane that
+		// withholds looks like: the values that remain are configuration
+		// (the agent home, the manifest), and this driver refuses a create
+		// carrying values with no token at all.
 		Env:            map[string]string{"APP_ENV": "production"},
+		BootstrapToken: "token_example",
 	}
 
 	h, err := m.Create(ctx, spec)
@@ -340,7 +411,6 @@ func TestMicrovmGuestEnvTranslationAndBootstrap(t *testing.T) {
 		"RAINIER_SESSION":          "sess-trans",
 		"RAINIER_GIT_AUTHOR_NAME":  "Test Author",
 		"RAINIER_GIT_AUTHOR_EMAIL": "author@example.invalid",
-		"APP_ENV":                  "production",
 		"RAINIER_SETUP_TIMEOUT":    "600",
 		"RAINIER_INIT_TIMEOUT":     "180",
 	}
@@ -355,25 +425,22 @@ func TestMicrovmGuestEnvTranslationAndBootstrap(t *testing.T) {
 	if cfg.TapDevice == "" {
 		t.Errorf("TapDevice was not allocated on VMMConfig")
 	}
+	// Spec.Env is no longer copied in. This map is the driver's record of
+	// what a session was CONFIGURED with, read by nothing but a snapshot
+	// manifest; what the guest actually runs on arrives over vsock, so a
+	// create's own env block has no business being duplicated here.
+	if _, copied := cfg.Env["APP_ENV"]; copied {
+		t.Errorf("the create's env block was copied into the driver's own map: %+v", cfg.Env)
+	}
+	if cfg.VsockUDSPath == "" {
+		t.Error("no vsock uds_path was configured; the guest has no control channel")
+	}
 
-	// The staged session config is the non-secret half, and only that half.
-	jsonPath := filepath.Join(m.instanceDir(h.ID), "session.json")
-	data, err := os.ReadFile(jsonPath)
-	if err != nil {
-		t.Fatalf("read session.json: %v", err)
-	}
-	var gsc guestSessionConfig
-	if err := json.Unmarshal(data, &gsc); err != nil {
-		t.Fatalf("unmarshal session.json: %v", err)
-	}
-	if gsc.SessionID != "sess-trans" {
-		t.Errorf("gsc.SessionID = %q, want sess-trans", gsc.SessionID)
-	}
-	if !reflect.DeepEqual(gsc.Cmd, []string{"claude", "--model", "haiku"}) {
-		t.Errorf("gsc.Cmd = %v, want claude --model haiku", gsc.Cmd)
-	}
-	if strings.Contains(string(data), "APP_ENV") || strings.Contains(string(data), "production") {
-		t.Errorf("session.json carries the session environment:\n%s", data)
+	// And nothing is staged on the host for the guest to read. session.json
+	// is gone: the configuration goes over the vsock conn and is written
+	// nowhere.
+	if _, err := os.Stat(filepath.Join(m.instanceDir(h.ID), "session.json")); !os.IsNotExist(err) {
+		t.Errorf("the driver staged a session config on the host: %v", err)
 	}
 }
 
@@ -383,7 +450,7 @@ func TestMicrovmGuestEnvTranslationAndBootstrap(t *testing.T) {
 // write.
 func TestMicrovmWritesNoDecryptedEnvironment(t *testing.T) {
 	const secret = "must-not-reach-host-disk"
-	stateDir := t.TempDir()
+	stateDir := shortTempDir(t)
 	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
 	ctx := context.Background()
 
@@ -391,7 +458,14 @@ func TestMicrovmWritesNoDecryptedEnvironment(t *testing.T) {
 		SessionID: "sess-secret",
 		DialURL:   "ws://runner.example.com:8080",
 		Setup:     "echo setting up",
-		Env:       map[string]string{"DEPLOY_TOKEN": secret},
+		// A withheld create's own env block is CONFIGURATION, and this one
+		// is a fixture standing in for it. The value below must reach the
+		// guest over vsock and no file, which is what the walk asserts; the
+		// token is what makes this an accepted create at all (a create with
+		// values and no token is refused, and asserted by the twelfth
+		// contract subtest).
+		Env:            map[string]string{"DEPLOY_TOKEN": secret},
+		BootstrapToken: "token_must_not_reach_host_disk",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -441,18 +515,43 @@ func TestMicrovmWritesNoDecryptedEnvironment(t *testing.T) {
 		t.Fatalf("walk state dir: %v", err)
 	}
 
-	// The instance record and the staged guest config carry not even the
-	// KEYS: the first is the file a runnerd restart reads back, the second is
-	// bound for the guest, and neither has any business describing an
-	// environment the driver was told to keep in memory.
-	for _, name := range []string{"instance.json", "session.json"} {
-		data, err := os.ReadFile(filepath.Join(m.instanceDir(h.ID), name))
-		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
+	// The bootstrap token is under the same rule as a value and is checked
+	// separately, because it is a capability and not just a string: it
+	// travels from the create into the guest's boot configuration over the
+	// vsock conn, and a copy of it in any host file would be a credential
+	// somebody with a shell on a shared host could spend.
+	err = filepath.WalkDir(stateDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
 		}
-		if strings.Contains(string(data), "DEPLOY_TOKEN") {
-			t.Errorf("%s names a key from the session's decrypted environment:\n%s", name, data)
+		info, ierr := d.Info()
+		if ierr != nil || info.Size() > 1<<20 {
+			return ierr
 		}
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		if strings.Contains(string(data), "token_must_not_reach_host_disk") {
+			t.Errorf("%s carries the session's bootstrap token", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk state dir for the token: %v", err)
+	}
+
+	// The instance record carries not even the KEYS: it is the file a runnerd
+	// restart reads back, and it has no business describing an environment
+	// the driver was told to keep in memory. There is no staged guest config
+	// beside it any more — the configuration goes over vsock and is written
+	// nowhere at all.
+	data, err := os.ReadFile(filepath.Join(m.instanceDir(h.ID), "instance.json"))
+	if err != nil {
+		t.Fatalf("read instance.json: %v", err)
+	}
+	if strings.Contains(string(data), "DEPLOY_TOKEN") {
+		t.Errorf("instance.json names a key from the session's environment:\n%s", data)
 	}
 }
 
@@ -460,11 +559,11 @@ func TestMicrovmWritesNoDecryptedEnvironment(t *testing.T) {
 // decision: having refused to write the environment down, the driver says so
 // rather than boot a guest with an empty one.
 func TestMicrovmColdResumeAfterRestartRefuses(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := shortTempDir(t)
 	m1, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
 	ctx := context.Background()
 
-	h, err := m1.Create(ctx, Spec{SessionID: "sess-resume", Env: map[string]string{"TOKEN": "v"}})
+	h, err := m1.Create(ctx, Spec{SessionID: "sess-resume", Env: map[string]string{"TOKEN": "v"}, BootstrapToken: "token_example"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,10 +572,11 @@ func TestMicrovmColdResumeAfterRestartRefuses(t *testing.T) {
 	}
 
 	m2, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
+	m2.SetHost(&stubMicrovmHost{})
 	if _, err := m2.Resume(ctx, h.ID); err == nil {
-		t.Fatal("cold resume across a restart succeeded; it would have booted a guest with no environment at all")
-	} else if !strings.Contains(err.Error(), "vsock") {
-		t.Errorf("error = %q, want it to name the follow-up work (vsock bootstrap token)", err)
+		t.Fatal("cold resume across a restart succeeded; it would have booted a guest that is never told what it is")
+	} else if !strings.Contains(err.Error(), "held in memory only") {
+		t.Errorf("error = %q, want it to name why the configuration is gone", err)
 	}
 	// And the session is still there to be resumed once that lands.
 	if st := listedState(t, m2, "sess-resume"); st != StateSuspended {
@@ -553,6 +653,7 @@ func TestMicrovmSnapshotRefAssociationAndStrip(t *testing.T) {
 			"SECRET_KEY": "super_secret_value",
 			"PUBLIC_KEY": "public_value",
 		},
+		BootstrapToken: "token_example",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -796,7 +897,7 @@ func TestMicrovmStateReconciliation(t *testing.T) {
 // TestMicrovmPrepullNeverFabricatesAnImage is finding 6's second half: a ref
 // this host cannot boot is an error, not an empty file and a recorded pull.
 func TestMicrovmPrepullNeverFabricatesAnImage(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := shortTempDir(t)
 	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 2, StateDir: stateDir})
 	ctx := context.Background()
 
@@ -844,7 +945,7 @@ func TestMicrovmCreateRefusesAnAbsentImage(t *testing.T) {
 func TestMicrovmRecordsSnapshotStrips(t *testing.T) {
 	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 2})
 	ctx := context.Background()
-	h, err := m.Create(ctx, Spec{SessionID: "mvm-sess-s", Env: map[string]string{"TOKEN": "v"}})
+	h, err := m.Create(ctx, Spec{SessionID: "mvm-sess-s", Env: map[string]string{"TOKEN": "v"}, BootstrapToken: "token_example"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -927,7 +1028,7 @@ func mustSanitizeRef(t *testing.T, ref string) string {
 // not produce a silly path, it produces a real one outside the state
 // directory that RemoveWorkspace would then delete.
 func TestMicrovmHostileNamesNeverBecomePaths(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := shortTempDir(t)
 	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
 	ctx := context.Background()
 
@@ -981,7 +1082,7 @@ func TestMicrovmHostileNamesNeverBecomePaths(t *testing.T) {
 // ".." exactly as they are, so a ref of ".." used to name the parent of the
 // refs directory and a commit wrote its manifest one level up.
 func TestMicrovmHostileSnapshotRefsAreRefused(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := shortTempDir(t)
 	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
 	ctx := context.Background()
 
@@ -1077,7 +1178,7 @@ func (c *countingResumeEngine) Resume(ctx context.Context, id string) error {
 // which would leak a slot and send the next Resume down the warm path into a
 // VM that is no longer there.
 func TestMicrovmReconcileDoesNotClobberAConcurrentSuspend(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := shortTempDir(t)
 	gate := make(chan struct{})
 	m, _ := testMicrovm(t, MicrovmOpts{
 		TotalSlots: 4,

@@ -74,6 +74,25 @@ type Spec struct {
 	// no creator and for every create a control plane older than the field
 	// sent. The session's agents then simply ask for a login.
 	Home *HomeMount
+	// BootstrapToken and SecretNames are the microVM bootstrap exchange
+	// (runner.Spec's two fields of the same names, carried across this
+	// boundary unchanged). For a session placed on a runner that announced
+	// microvm.v1 the control plane leaves the environment's decrypted
+	// secret_refs OUT of Env and puts these here instead: the names the
+	// guest should expect, and the single-use capability it exchanges for
+	// their values once it has booted.
+	//
+	// Both are empty on every Docker create and on every create from a
+	// control plane older than them, which is exactly why the Docker driver
+	// ignores them and Env keeps its meaning. The microVM driver is the only
+	// one that reads them, and the only one that refuses a create carrying
+	// values in Env with no token — see (*Microvm).Create.
+	//
+	// Neither is ever written to host disk, logged, or put in a snapshot
+	// manifest. The token's whole lifetime on a host is the hop from this
+	// struct into the guest's boot configuration.
+	BootstrapToken string
+	SecretNames    []string
 }
 
 // HomeMount names the agent home volume and where it lands in the container.
@@ -178,6 +197,28 @@ type Snapshot struct {
 type Listed struct {
 	SessionID string
 	Handle    Handle
+}
+
+// CapabilityDriver is a driver that names portable capability tokens the
+// runner announces on its behalf.
+//
+// It is an optional interface rather than a method on Driver because most
+// drivers have nothing to say: a capability is a claim the control plane
+// SCHEDULES on, and inventing one per driver would make the fleet's
+// vocabulary an implementation detail of whichever sandbox a runner happens
+// to use. The microVM driver is the one that has something to claim
+// (microvm.v1), and what it claims is the fence the control plane withholds
+// an environment's secret values on — so the announcement and the driver
+// that must honour it are the same fact, read from one place.
+type CapabilityDriver interface {
+	Capabilities() []string
+}
+
+// HostedDriver is a driver that needs the runner above it: see MicrovmHost
+// for the two things, and why they cannot be constructor arguments (the
+// runner is composed OVER the driver, so the driver exists first).
+type HostedDriver interface {
+	SetHost(MicrovmHost)
 }
 
 type Driver interface {

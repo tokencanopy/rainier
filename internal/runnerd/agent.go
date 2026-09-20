@@ -332,7 +332,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 	active, idleExited := s.reg.counts()
 	ann := runner.FromRunner{Type: "announce", Proto: runner.ProtocolVersion, Runner: cfg.RunnerName,
 		Sessions: s.Announce(), Used: used, Total: total, Active: active, IdleExited: idleExited,
-		Capabilities: buildCapabilities(cfg.Capabilities)}
+		Capabilities: buildCapabilities(cfg.Capabilities, s.driverCapabilities()...)}
 	if err := wsjson.Write(connCtx, c, ann); err != nil {
 		return false, err // nothing can have been accepted before the announce
 	}
@@ -449,6 +449,14 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 				Init:  m.Spec.Init, InitTimeoutSec: m.Spec.InitTimeoutSec,
 				GitAuthorName: m.Spec.GitAuthorName, GitAuthorEmail: m.Spec.GitAuthorEmail,
 				Home: driverHome(m.Spec.Home),
+				// The microVM bootstrap pair, carried through like
+				// everything else. This runner does not read the token — it
+				// goes into the guest's boot configuration and is dropped —
+				// and it does not check the names against Env. The DRIVER
+				// decides what an unwithheld create means, because the answer
+				// is different for each one: Docker has always accepted the
+				// values and still does.
+				BootstrapToken: m.Spec.BootstrapToken, SecretNames: m.Spec.SecretNames,
 			}
 			allow = m.Spec.EgressAllow
 		}
@@ -598,6 +606,18 @@ func (s *Server) forwardSessionRPC(m runner.ToRunner, send func(runner.FromRunne
 		log.Printf("agent: session_rpc for %s carried no id or method; ignoring", m.Session)
 		return
 	}
+	// A response to a request this RUNNER originated stops here: the runner
+	// is a pure forwarder for everything a sandbox asked, and the one thing
+	// it asks for itself (a bootstrap token on a cold resume) is answered to
+	// a caller inside this process, not to the guest. The id spaces are
+	// disjoint so the two can share one connection — see
+	// runnerOriginatedIDBase.
+	if env.Method == "resp" && isRunnerOriginated(env.ID) {
+		if !s.runnerRPC.deliver(env) {
+			log.Printf("agent: an answer for this runner's own request %d has no caller waiting (timed out?); dropping", env.ID)
+		}
+		return
+	}
 	err := s.sendSessionRPC(m.Session, env)
 	if err == nil {
 		return
@@ -738,19 +758,45 @@ func (s *Server) dialAttachBack(ctx context.Context, m runner.ToRunner, cfg Agen
 // far worse failure than the 501 this append exists to avoid for what is a
 // cheap pre-check and not the fence. The sandbox's own `exec_started` is the
 // fence, so the only cost of dropping the claim is one wasted round trip.
-func buildCapabilities(declared []string) []string {
+// `microvm.v1` is the second such fact, and the one place this comment needs
+// a caveat: it is not merely a pre-check. The control plane WITHHOLDS an
+// environment's decrypted secret values from a runner that announces it, so
+// announcing it is what makes the withholding happen and failing to announce
+// it is what gets the values dispatched to a driver that will refuse them.
+// It comes from the driver this runner was started with rather than from a
+// flag, for the same reason exec.v1 does: it is already decided by
+// --driver=microvm, and a second flag beside it is a second thing to get
+// wrong. See (*Server).driverCapabilities.
+func buildCapabilities(declared []string, fromBuild ...string) []string {
+	out := declared
+	for _, c := range append([]string{runner.CapabilityExecV1}, fromBuild...) {
+		out = appendCapability(out, c)
+	}
+	return out
+}
+
+// appendCapability adds one build fact to an operator's list, unless it is
+// already there or there is no room for it.
+//
+// The no-room case is why this is not one line. runnerplane refuses a WHOLE
+// registration whose claim carries more than MaxCapabilities, so an operator
+// already passing the maximum would announce one too many after this rolls
+// and never reconnect — a working runner out of the fleet permanently, which
+// is far worse than the capability being absent. The operator's list is
+// otherwise left exactly as given, order included: it is a claim the control
+// plane decides whether to schedule on, not something to tidy.
+func appendCapability(declared []string, capability string) []string {
 	for _, c := range declared {
-		if c == runner.CapabilityExecV1 {
+		if c == capability {
 			return declared
 		}
 	}
 	if len(declared) >= runnerplane.MaxCapabilities {
 		log.Printf("agent: %d capabilities declared, which is runnerplane's maximum; "+
-			"announcing without %s (exec is still fenced by the sandbox's own handshake)",
-			len(declared), runner.CapabilityExecV1)
+			"announcing without %s", len(declared), capability)
 		return declared
 	}
-	return append(append([]string(nil), declared...), runner.CapabilityExecV1)
+	return append(append([]string(nil), declared...), capability)
 }
 
 // attachDialTimeout bounds one attach-back handshake. It sits below

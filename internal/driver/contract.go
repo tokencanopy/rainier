@@ -113,6 +113,20 @@ func workspaceExists(t *testing.T, d Driver, sessionID string) bool {
 	}
 }
 
+// driverCapabilities names the portable capabilities a driver's runner
+// announces on its behalf, so a shared subtest can ask "is this a driver the
+// control plane withholds secrets from?" without a per-driver branch.
+//
+// It asks through the same optional interface the runner asks through
+// (CapabilityDriver), so the subtest below and the announce a runner actually
+// makes cannot come to different conclusions about the same driver.
+func driverCapabilities(d Driver) []string {
+	if cd, ok := d.(CapabilityDriver); ok {
+		return cd.Capabilities()
+	}
+	return nil
+}
+
 func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 	t.Run("create-inspect-destroy", func(t *testing.T) {
 		d, cleanup := newDriver(t)
@@ -254,6 +268,15 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 			Name: "t9", Image: "", SessionID: "s9", DialURL: "ws://x",
 			Setup: "true",
 			Env:   map[string]string{"CONTRACT_SECRET": "must-not-survive"},
+			// The token is here so this subtest can still be written for a
+			// driver that refuses secret VALUES without one — which is the
+			// twelfth subtest below, and is the microVM driver. The Docker
+			// driver ignores the field entirely (nothing in runArgs reads
+			// it), so its create is the one it has always been. Without a
+			// token this create would be a refusal on one driver and a
+			// snapshot on the other, and the shared subtest would have
+			// stopped being shared.
+			BootstrapToken: "contract-token-example",
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -271,6 +294,84 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 			t.Fatalf("snapshot ref = %q, want %q verbatim", snap.Ref, ref)
 		}
 		assertStrippedFromImage(t, d, ref, "must-not-survive", strip)
+	})
+
+	t.Run("a create carrying secret values and no token is refused", func(t *testing.T) {
+		// The twelfth subtest, and the one that makes the fifth honest for a
+		// driver that never accepts secret values at all.
+		//
+		// The compatibility table's "old controld + new runner" row: a
+		// control plane that predates the session bootstrap exchange
+		// dispatches an environment's decrypted secrets in Spec.Env with no
+		// token. Whether that is acceptable is a per-driver question with
+		// two different right answers, which is why it is asserted here
+		// rather than at either driver:
+		//
+		//   - Docker puts them in a `docker run` argv and nothing reaches the
+		//     host filesystem. It has always accepted them and must keep
+		//     accepting them, or a rollback of the control plane would take
+		//     every self-hosted session down.
+		//   - a microVM host has no argv, and every channel it does have ends
+		//     in a file that outlives the session on a machine shared with
+		//     other tenants. It must refuse, loudly, naming what the control
+		//     plane has to be — a refusal costs one session, and a quiet
+		//     write is the exposure ADR-0003 §2.7 was written against.
+		//
+		// The driver announcing microvm.v1 is the one required to refuse,
+		// because that capability is exactly the claim the control plane
+		// withholds on: a driver that announces it and then accepts the
+		// values has told the plane it will do something it does not do.
+		d, cleanup := newDriver(t)
+		defer cleanup()
+		ctx := context.Background()
+
+		spec := Spec{
+			Name: "t10", Image: "", SessionID: "s10", DialURL: "ws://x",
+			Env: map[string]string{"CONTRACT_SECRET": "must-not-be-accepted"},
+		}
+		h, err := d.Create(ctx, spec)
+		if err == nil {
+			defer d.Destroy(ctx, h.ID)
+		}
+		if !slices.Contains(driverCapabilities(d), "microvm.v1") {
+			// Not a withholding driver: accepting is the contract, and a
+			// refusal here would be the rollback failure described above.
+			if err != nil {
+				t.Fatalf("a create carrying env values was refused by a driver that does not withhold: %v", err)
+			}
+			return
+		}
+		if err == nil {
+			t.Fatal("a driver announcing microvm.v1 accepted a create carrying secret values with no bootstrap token")
+		}
+		// The refusal has to say what the operator must change, which is the
+		// control plane's version and not anything about this host.
+		for _, want := range []string{"bootstrap token", "microvm.v1"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("the refusal = %q, want it to name %q", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), "must-not-be-accepted") {
+			t.Fatalf("the refusal quotes the value it refused: %q", err)
+		}
+		// And nothing was half-created: a refused create leaves no session.
+		listed, lerr := d.List(ctx)
+		if lerr != nil {
+			t.Fatal(lerr)
+		}
+		for _, l := range listed {
+			if l.SessionID == "s10" {
+				t.Fatalf("a refused create left a session behind: %+v", l)
+			}
+		}
+		// The same create WITH a token is accepted, which is what makes the
+		// refusal about the token rather than about the env block.
+		spec.BootstrapToken = "contract-token-example"
+		withToken, err := d.Create(ctx, spec)
+		if err != nil {
+			t.Fatalf("a withheld create carrying a token was refused: %v", err)
+		}
+		d.Destroy(ctx, withToken.ID)
 	})
 
 	t.Run("capacity", func(t *testing.T) {
