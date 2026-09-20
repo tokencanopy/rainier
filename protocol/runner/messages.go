@@ -55,6 +55,54 @@ const (
 	MethodRevokeAgentCredentials = "revoke_agent_credentials"
 )
 
+// The two methods a microVM session's bootstrap token rides, added by
+// docs/design/2026-09-20-microvm-bootstrap-token-and-vsock.md §3.
+//
+// They ride the shapes that already exist — up as a FromRunner "session_req",
+// down as a ToRunner "session_rpc" — so neither RPCEnvelope nor either
+// direction's envelope changes. Only the switch that answers them grows.
+//
+// Neither puts a value anywhere a forwarder reads: runnerd is documented as
+// passing RPCEnvelope.Payload through without parsing it, and the control
+// plane's answer names a count in its log and never a name's value.
+const (
+	// MethodFetchSessionSecrets is sandbox → control plane, once per boot:
+	// {"protocol": 1, "token": "<opaque>"} → {"env": {"NAME": "value"}}.
+	// Refused as the usual {"error": sentence} on ok:false when the token is
+	// spent, expired, or fenced by a placement generation that has moved.
+	//
+	// It buys exactly the environment's decrypted secret_refs and nothing
+	// else: a github credential and a coding agent's login set already have
+	// their own methods, unchanged by this one.
+	MethodFetchSessionSecrets = "fetch_session_secrets"
+	// MethodMintSessionBootstrap is runner → control plane, on a cold resume:
+	// {"protocol": 1} → {"token": "<opaque>", "expires_in_sec": 120}. It
+	// carries no session id: the id is FromRunner.Session, which the
+	// placement guard has already checked, which is what keeps a runner
+	// holding session A from minting for session B.
+	MethodMintSessionBootstrap = "mint_session_bootstrap"
+)
+
+// SessionBootstrapProtocolVersion is the independently negotiated version of
+// the two methods above, carried as "protocol" in both request bodies for the
+// same reason AgentCredentialProtocolVersion is: the sandbox ships inside the
+// session image and keeps the sessiond it booted with for life, so the two
+// ends of this exchange are routinely different builds and a mismatch must be
+// an answer rather than a misparse.
+const SessionBootstrapProtocolVersion = 1
+
+// CapabilityMicrovmV1 is the capability token a runnerd built with the
+// microVM driver announces. It is a fact about the BUILD and the configured
+// driver, not a claim an operator makes, so runnerd appends it rather than
+// waiting to be told — the same rule CapabilityExecV1 follows.
+//
+// It is also the fence the control plane keys withholding on: createSpec
+// leaves an environment's decrypted secret values out of Spec.Env, and mints
+// a bootstrap token in their place, exactly for a placement whose runner
+// announced this. A runner that does not announce it is dispatched today's
+// Spec, byte for byte.
+const CapabilityMicrovmV1 = "microvm.v1"
+
 // HomeMount is the agent home a create mounts into a sandbox: one writable
 // volume per (creator, workspace), landing at Path, inside which each coding
 // agent gets its own subdirectory. It is what makes "log in once" true across
@@ -314,6 +362,13 @@ type Spec struct {
 	GitAuthorEmail string `json:"git_author_email,omitempty"`
 	// Env is injected into the container's environment. Values are secrets
 	// as often as not, so this field is never logged verbatim.
+	//
+	// With one exception, which is the whole of the microVM bootstrap design:
+	// for a placement whose runner announced CapabilityMicrovmV1 the control
+	// plane leaves an environment's decrypted secret_refs OUT of this map and
+	// sets BootstrapToken and SecretNames instead, so what remains is
+	// configuration — agent-home paths and the agent manifest. Either the
+	// values or the token, never both.
 	Env map[string]string `json:"env,omitempty"`
 	// Home is the agent home this session mounts: the (creator, workspace)
 	// volume every coding agent keeps its own configuration and credential
@@ -323,6 +378,84 @@ type Spec struct {
 	// does not know the field mounts nothing and the session's agents simply
 	// ask for a login, which is the truthful state, not a failure.
 	Home *HomeMount `json:"home,omitempty"`
+	// BootstrapToken is the single-use capability a microVM session exchanges
+	// for its environment's decrypted secrets, which for such a session are
+	// deliberately absent from Env. Minted per create and per cold resume,
+	// fenced by the placement generation, never written to host disk. Absent
+	// on every Docker create and from every older control plane, which is why
+	// Env keeps its meaning.
+	BootstrapToken string `json:"bootstrap_token,omitempty"`
+	// SecretNames are the NAMES the token will deliver — a name is not a
+	// value, as the launch-material resolver already says — so the guest can
+	// tell "no secrets declared" from "declared and never arrived".
+	SecretNames []string `json:"secret_names,omitempty"`
+}
+
+// BootConfig is the first control frame a microVM session's host sends down
+// the vsock channel, and the whole of what the guest is configured with.
+//
+// It lives here, beside Spec, rather than in internal/relay, because it is
+// the same vocabulary a create resolved: every field below is a field of Spec
+// or a value derived from one, and the two drifting apart would be a session
+// configured with something the control plane never dispatched. relay carries
+// it as an opaque payload on a FrameControl of kind relay.KindBootConfig and
+// interprets none of it.
+//
+// It is NOT a runner-plane message: it never travels between runnerd and
+// controld. It travels between a runner and the sandbox it booted, over the
+// one channel that exists before the guest's network does.
+//
+// Nothing in it is a secret. That is the point of the whole design: Env below
+// is the non-secret configuration block (agent-home paths and the agent
+// manifest — paths and names), SecretNames are names, and BootstrapToken is a
+// capability the control plane can refuse, not a credential. A microVM host
+// writes no part of this to disk, and the values SecretNames names arrive in
+// the guest over the token exchange, from the control plane, never from here.
+type BootConfig struct {
+	// Protocol is SessionBootstrapProtocolVersion. A guest that reads a
+	// version it does not speak fails its boot chain rather than booting on a
+	// configuration it has half understood.
+	Protocol int `json:"protocol"`
+	// SessionID is the session this guest IS. On the WebSocket path the guest
+	// asserts its id in a query parameter and runnerd believes it; over vsock
+	// the listening socket is inside one VM's own directory, so the id is the
+	// host's statement and not the guest's claim.
+	SessionID string `json:"session_id"`
+	// Cmd is the agent argv, ProxyURL the egress proxy every outbound request
+	// must route through (already carrying the session's identity as URL
+	// userinfo), and EgressAllow the allowlist the host enforces and the
+	// guest is told about.
+	Cmd         []string `json:"cmd,omitempty"`
+	ProxyURL    string   `json:"proxy_url,omitempty"`
+	NoProxy     string   `json:"no_proxy,omitempty"`
+	EgressAllow []string `json:"egress_allow,omitempty"`
+	// The boot chain, in the shape Spec carries it rather than base64 in an
+	// environment block: a JSON string holds a multi-line script directly, and
+	// the encoding only ever existed because `docker run -e K=V` carries one
+	// line per variable.
+	Setup           string     `json:"setup,omitempty"`
+	SetupTimeoutSec int        `json:"setup_timeout_sec,omitempty"`
+	Init            string     `json:"init,omitempty"`
+	InitTimeoutSec  int        `json:"init_timeout_sec,omitempty"`
+	Repos           []RepoSpec `json:"repos,omitempty"`
+	GitAuthorName   string     `json:"git_author_name,omitempty"`
+	GitAuthorEmail  string     `json:"git_author_email,omitempty"`
+	// Env is the session's NON-SECRET configuration environment: for a
+	// microVM session that is exactly the agent-home path variables and the
+	// agent manifest (RAINIER_AGENTS_B64), which are paths and names. An
+	// environment's decrypted secret_refs are never in it — the control plane
+	// withholds them from Spec.Env for a runner announcing
+	// CapabilityMicrovmV1, and a host that finds values here with no token
+	// refuses the create rather than delivering them.
+	Env map[string]string `json:"env,omitempty"`
+	// SecretNames and BootstrapToken are the exchange: which names are
+	// expected, and the one-shot capability that fetches their values.
+	// SecretNames non-empty with an empty token is a boot that must FAIL —
+	// the guest was promised credentials it cannot get — and that refusal is
+	// the guest's, not the host's, because only the guest knows whether it
+	// has already been given them.
+	SecretNames    []string `json:"secret_names,omitempty"`
+	BootstrapToken string   `json:"bootstrap_token,omitempty"`
 }
 
 // Attach is the dial_attach block of a ToRunner: controld tells the runner
