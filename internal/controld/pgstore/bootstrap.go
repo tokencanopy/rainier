@@ -35,7 +35,7 @@ func (r pgBootstraps) PutSessionBootstrap(ctx context.Context, ws control.Worksp
 		INSERT INTO session_bootstraps
 			(session_id, workspace_id, token_hash, placement_generation, expires_at, consumed_at)
 		VALUES ($1, $2, $3, $4, $5, NULL)
-		ON CONFLICT (session_id) DO UPDATE SET
+		ON CONFLICT (workspace_id, session_id) DO UPDATE SET
 			workspace_id = EXCLUDED.workspace_id,
 			token_hash = EXCLUDED.token_hash,
 			placement_generation = EXCLUDED.placement_generation,

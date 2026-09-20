@@ -19,12 +19,17 @@
 --
 -- ON DELETE CASCADE because a token outliving the session it names is a row
 -- nothing will ever consume and nothing will ever clean up.
+-- sessions has been keyed by (workspace_id, id) since migration 0007, so the
+-- token row is keyed and referenced the same way: a session id alone is not
+-- unique across workspaces and Postgres rightly refuses a foreign key to it.
 CREATE TABLE IF NOT EXISTS session_bootstraps (
-  session_id           text PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
   workspace_id         text NOT NULL,
+  session_id           text NOT NULL,
   token_hash           text NOT NULL,
   placement_generation bigint NOT NULL,
   expires_at           timestamptz NOT NULL,
   consumed_at          timestamptz,
-  created_at           timestamptz NOT NULL DEFAULT now()
+  created_at           timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (workspace_id, session_id),
+  FOREIGN KEY (workspace_id, session_id) REFERENCES sessions(workspace_id, id) ON DELETE CASCADE
 );
