@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // testMicrovm builds a driver over a fresh state directory with the whole
@@ -1204,6 +1205,43 @@ func TestFirecrackerStateReadsInstanceInfo(t *testing.T) {
 	}
 }
 
+// fakeFirecracker starts a child that passes isFirecrackerPID: a script named
+// `firecracker`, invoked with the same --api-sock argument the engine uses,
+// so both the /proc cmdline and the `ps -o command=` fallback see the binary
+// name and the socket path the check looks for. It exits on SIGTERM within
+// one tick of its loop.
+//
+// A stand-in that does NOT pass the check (plain `sleep`, say) exercises a
+// different branch of Stop entirely — the one that must never signal a pid it
+// cannot identify — so a test that reached for the obvious `sleep 60` was not
+// testing the teardown path it appeared to name.
+func fakeFirecracker(t *testing.T, sockPath string) (*exec.Cmd, int) {
+	t.Helper()
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "firecracker")
+	script := "#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do sleep 0.02; done\n"
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "--api-sock", sockPath)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	// The identity check reads the cmdline, which is not necessarily visible
+	// the instant Start returns.
+	deadline := time.Now().Add(2 * time.Second)
+	for !isFirecrackerPID(pid, sockPath) {
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			t.Skipf("a child named %s with --api-sock %s does not satisfy isFirecrackerPID on this host", bin, sockPath)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return cmd, pid
+}
+
 // TestFirecrackerStopReapsTheChild: a VMM this engine started is a child, and
 // signalling one without Waiting it leaves a zombie per stopped VM.
 func TestFirecrackerStopReapsTheChild(t *testing.T) {
@@ -1214,20 +1252,19 @@ func TestFirecrackerStopReapsTheChild(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 
 	fc := NewFirecrackerEngine("/nonexistent/bin/firecracker", dir)
-
-	// A stand-in for a launched VMM: a real child of this process that
-	// ignores nothing and exits on SIGTERM.
-	cmd := exec.Command("sleep", "60")
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	pid := cmd.Process.Pid
+	cmd, pid := fakeFirecracker(t, fc.socketPath("mvm-reap"))
 	fc.mu.Lock()
 	fc.procs["mvm-reap"] = cmd
 	fc.mu.Unlock()
 
+	start := time.Now()
 	if err := fc.Stop(context.Background(), "mvm-reap"); err != nil {
 		t.Fatalf("Stop: %v", err)
+	}
+	// SIGTERM, not SIGKILL after a timeout: a VMM that exits when asked must
+	// not cost a teardown the escalation deadline.
+	if elapsed := time.Since(start); elapsed > firecrackerTermTimeout {
+		t.Errorf("Stop of a VMM that exits on SIGTERM took %s; it escalated instead of waiting for the exit", elapsed)
 	}
 	// Wait having been called, the pid is fully released: signalling it now
 	// finds nothing. An un-Waited child would still answer signal 0 as a
@@ -1244,5 +1281,68 @@ func TestFirecrackerStopReapsTheChild(t *testing.T) {
 	// A second Stop of the same id is a no-op, not a double Wait.
 	if err := fc.Stop(context.Background(), "mvm-reap"); err != nil {
 		t.Errorf("second Stop: %v", err)
+	}
+}
+
+// TestFirecrackerStopDoesNotHangOnAnUnidentifiableChild is the teardown
+// deadlock. When the tracked child is alive but its pid does not identify as
+// this VM's VMM, Stop must not signal it — and must not wait on it forever
+// either. An unbounded receive there hung Destroy, Suspend and every caller
+// holding that session's teardown, for good.
+func TestFirecrackerStopDoesNotHangOnAnUnidentifiableChild(t *testing.T) {
+	dir, err := os.MkdirTemp("", "fcstuck")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	fc := NewFirecrackerEngine("/nonexistent/bin/firecracker", dir)
+
+	// A live child that is emphatically not a firecracker serving this
+	// socket, so the identity check refuses to signal it.
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	t.Cleanup(func() {
+		// Stop's own reaper goroutine is still sitting in cmd.Wait() — this
+		// is the process it could not identify, so it was never signalled and
+		// never exited. The signal therefore goes raw, by pid: calling
+		// cmd.Process.Kill or cmd.Wait from here would touch exec.Cmd state
+		// that goroutine owns. Killing it is what lets the reaper finish,
+		// which is the arrangement the driver relies on in production too.
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	})
+	if isFirecrackerPID(pid, fc.socketPath("mvm-stuck")) {
+		t.Skip("this host's `sleep` identifies as a firecracker; nothing to test")
+	}
+	fc.mu.Lock()
+	fc.procs["mvm-stuck"] = cmd
+	fc.mu.Unlock()
+
+	// A caller whose context is already cut short must be answered at once.
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- fc.Stop(ctx, "mvm-stuck") }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("Stop reported success over a process it could neither identify nor reap")
+		}
+		if elapsed := time.Since(start); elapsed > firecrackerKillTimeout {
+			t.Errorf("Stop took %s; it ignored the caller's context", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop hung on a live child it could not identify; teardown of that session never returns")
+	}
+
+	// And it was left alone rather than signalled in the VM's name.
+	if err := syscall.Kill(pid, 0); err != nil {
+		t.Errorf("Stop signalled a process it could not identify as this VM's VMM: %v", err)
 	}
 }

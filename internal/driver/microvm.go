@@ -1614,7 +1614,7 @@ func (f *FirecrackerEngine) Resume(ctx context.Context, id string) error {
 	return fcClient.patchJSON(ctx, "/vm", map[string]any{"state": "Resumed"})
 }
 
-func (f *FirecrackerEngine) Stop(_ context.Context, id string) error {
+func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 	f.mu.Lock()
 	cmd, tracked := f.procs[id]
 	delete(f.procs, id)
@@ -1643,19 +1643,30 @@ func (f *FirecrackerEngine) Stop(_ context.Context, id string) error {
 
 	var stopErr error
 	sockPath := f.socketPath(id)
-	if pid > 0 && isFirecrackerPID(pid, sockPath) {
+	switch {
+	case pid > 0 && isFirecrackerPID(pid, sockPath):
 		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
 			stopErr = fmt.Errorf("sigterm pid %d: %w", pid, err)
-		} else if !awaitExit(waited, pid, firecrackerTermTimeout) {
+		} else if !awaitExit(ctx, waited, pid, firecrackerTermTimeout) {
 			_ = syscall.Kill(pid, syscall.SIGKILL)
-			if !awaitExit(waited, pid, firecrackerKillTimeout) && stopErr == nil {
-				stopErr = fmt.Errorf("firecracker pid %d did not exit after SIGKILL", pid)
+			if !awaitExit(ctx, waited, pid, firecrackerKillTimeout) && stopErr == nil {
+				stopErr = notExitedErr(ctx, pid)
 			}
 		}
-	} else if waited != nil {
-		// Nothing to signal — the process is already gone — but the child
-		// still has to be reaped.
-		<-waited
+	case waited != nil:
+		// Nothing was signalled. Either the process is already gone, or the
+		// pid no longer identifies as this VM's VMM and must not be signalled
+		// in its name — that identity check is the whole reason a recycled
+		// pid is never killed here.
+		//
+		// The child still has to be reaped either way, but reaping is not
+		// allowed to block teardown. A bare receive here was unbounded: a
+		// live process that failed the identity check will never exit on its
+		// own, so Stop — and with it Destroy, Suspend and every caller
+		// holding a session's teardown — waited forever.
+		if !awaitExit(ctx, waited, pid, firecrackerKillTimeout) {
+			stopErr = fmt.Errorf("firecracker %s: pid %d is still running but does not identify as this VM's VMM, so it was left alone", id, pid)
+		}
 	}
 
 	sockDir := filepath.Join(f.stateDir, "sockets", id)
@@ -1665,26 +1676,52 @@ func (f *FirecrackerEngine) Stop(_ context.Context, id string) error {
 	return stopErr
 }
 
-// awaitExit waits up to timeout for a VMM to be gone, and reports whether it
-// is. For a child of this process that means Wait returning (which also reaps
-// it); for a pid inherited across a restart, polling signal 0 is all there is.
-func awaitExit(waited chan error, pid int, timeout time.Duration) bool {
+func notExitedErr(ctx context.Context, pid int) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("firecracker pid %d: waiting for it to exit was cut short: %w", pid, err)
+	}
+	return fmt.Errorf("firecracker pid %d did not exit after SIGKILL", pid)
+}
+
+// awaitExit waits for a VMM to be gone and reports whether it is, giving up
+// at timeout or when ctx is done — never later than one of the two. For a
+// child of this process that means Wait returning (which also reaps it); for
+// a pid inherited across a restart, polling signal 0 is all there is, since
+// the kernel reparented it to init and init does the reaping.
+//
+// A false answer leaves the Wait goroutine in place. That is deliberate: it
+// is one goroutine that ends when the process finally does, and the
+// alternative — abandoning the child unreaped — is the zombie this exists to
+// prevent.
+func awaitExit(ctx context.Context, waited chan error, pid int, timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	if waited != nil {
 		select {
 		case <-waited:
 			return true
-		case <-time.After(timeout):
+		case <-timer.C:
+			return false
+		case <-ctx.Done():
 			return false
 		}
 	}
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+
+	poll := time.NewTicker(50 * time.Millisecond)
+	defer poll.Stop()
+	for {
 		if err := syscall.Kill(pid, 0); err != nil {
 			return true
 		}
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-poll.C:
+		case <-timer.C:
+			return false
+		case <-ctx.Done():
+			return false
+		}
 	}
-	return false
 }
 
 // Snapshot refuses, for two separate reasons that both have to hold.
