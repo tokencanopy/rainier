@@ -700,13 +700,23 @@ under the tenant's own key before a single entry is looked at); directory mtime
 restoration, which would need a list of directories; and `io.ReadAll` anywhere
 at all except the manifest, which is capped at 64 KiB on read.
 
-A test proves it rather than asserting it: a synthetic tree of 2 GiB and a
-hundred thousand entries is written through a discarding store while heap usage
-is sampled, and the test fails if the peak crosses a 12 MiB ceiling (measured:
-5.2 MiB). The ceiling is deliberately close to the budget rather than an order
-of magnitude above it — the failure worth catching is not a catastrophic
-O(tree-bytes) buffer, it is the cheap-looking map of path to digest, which at
-that entry count would be around 20 MiB and would sail under a generous ceiling.
+Two tests prove it rather than asserting it, because the claim has two halves
+and a single ceiling test expresses neither well.
+
+**The bytes:** a synthetic 2 GiB sparse tree is written through a discarding
+store while the heap is sampled, failing if the peak crosses a 12 MiB ceiling
+(measured: 4.5 MiB). It skips only if the environment cannot create the sparse
+file.
+
+**The entries:** the same write is measured at two thousand entries and at forty
+thousand, and the *difference* must be under 2 MiB (measured: 0.67 MiB for
+twenty times the entries). That is the property actually being claimed — the
+peak is a function of the frame size, not of the tree — and a ceiling cannot
+express it: "under N bytes at this fixture size" passes for any structure whose
+constant factor the test's author underestimated, and a map of path to digest is
+exactly the kind of thing that gets underestimated. Measuring the slope needs no
+guess, and costs seconds rather than a minute of cryptography.
+
 The read side is measured against a store that streams from disk, because a
 store holding the ciphertext in the heap would put its own allocation inside the
 measurement.
@@ -909,8 +919,8 @@ directions. Setuid dropped. Frame-writer boundaries at, one below and one above
 an exact frame multiple, and a single write spanning many frames. Errors that
 had a path available to leak — a refused source entry, a destination that cannot
 hold the tree — asserted against the fixture's own root rather than a guessed
-prefix. Bounded memory on a 2 GiB, hundred-thousand-entry tree and on the read
-side against a streaming store. A fuzz target for the manifest parser: never
+prefix. Bounded memory in both of §9's senses, and on the read side against a
+streaming store. A fuzz target for the manifest parser: never
 panic, never return an error outside the package's vocabulary, and anything
 accepted must round-trip. A golden manifest, produced with an injected
 deterministic random source and clock, so the on-the-wire shape cannot drift

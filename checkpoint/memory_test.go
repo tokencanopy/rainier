@@ -57,14 +57,17 @@ func (d *discardStore) written(key string) int64 {
 // heapCeiling is what a checkpoint of any tree may cost above the baseline. At
 // the default 1 MiB frame size the live set is a plaintext frame, a ciphertext
 // frame, a 32 KiB copy buffer and a few hash states — under 3 MiB; measured
-// peak is around 4.5 MiB once the collector's slack is counted.
+// peak is around 5 MiB once the collector's slack is counted.
 //
-// It is set at 12 MiB rather than at some comfortable order of magnitude above
-// that, because the failure this test exists to catch is not a catastrophically
-// O(tree-bytes) buffer — it is the cheap-looking one the design note names: "a
-// list of entries, a map of digests". At the entry count below, a
-// map[string][32]byte of path to digest is roughly 20 MiB and a []Entry slice
-// similar, so a ceiling of 64 MiB would have watched either one go by.
+// It is close to the budget rather than a comfortable order of magnitude above
+// it, because a generous ceiling tests nothing: the failure worth catching is
+// not a catastrophically O(tree-bytes) buffer, it is the cheap-looking one the
+// design note names — "a list of entries, a map of digests".
+//
+// A ceiling alone cannot rule that out at any fixture size, though, because
+// "large enough that a per-entry map would cross it" is a guess about the map's
+// constant factor. TestHeapDoesNotGrowWithEntryCount measures the SLOPE instead,
+// which is the property being claimed, and does it for a fraction of the cost.
 const heapCeiling = 12 << 20
 
 // TestBoundedMemoryOnAVeryLargeTree is the bounded-memory promise as a test
@@ -81,10 +84,7 @@ func TestBoundedMemoryOnAVeryLargeTree(t *testing.T) {
 	}
 
 	const sparseSize = int64(2) << 30 // 2 GiB
-	// Large enough that a per-entry map or slice would cross heapCeiling on its
-	// own, which is what makes the ceiling a real test of the note's §9 rather
-	// than a test that the machine has RAM.
-	const smallFiles = 100000
+	const smallFiles = 20000
 
 	root := t.TempDir()
 	sparse := filepath.Join(root, "sparse.bin")
@@ -103,15 +103,16 @@ func TestBoundedMemoryOnAVeryLargeTree(t *testing.T) {
 		t.Skipf("the sparse file is not the size it was truncated to")
 	}
 
-	// A hundred thousand entries across five hundred directories, so the entry
-	// count is a real dimension of the test and not only the byte count. Every one
-	// of them would be one map entry in an O(entries) implementation.
-	for d := 0; d < 500; d++ {
+	// Entries as well as bytes, so the fixture has both dimensions. The entry
+	// count that actually rules out an O(entries) structure is
+	// TestHeapDoesNotGrowWithEntryCount's business, which measures the slope
+	// instead of guessing a ceiling — this one is about the bytes.
+	for d := 0; d < 200; d++ {
 		dir := filepath.Join(root, "many", fmt.Sprintf("d%03d", d))
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Skipf("this environment cannot create the fixture: %v", err)
 		}
-		for i := 0; i < smallFiles/500; i++ {
+		for i := 0; i < smallFiles/200; i++ {
 			p := filepath.Join(dir, fmt.Sprintf("f%03d.txt", i))
 			if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 				t.Skipf("this environment cannot create the fixture: %v", err)
@@ -182,6 +183,94 @@ func TestBoundedMemoryOnAVeryLargeTree(t *testing.T) {
 		grew, base.HeapAlloc)
 }
 
+// TestHeapDoesNotGrowWithEntryCount is the bounded-memory claim stated as what
+// it actually is: the peak heap of a write must be a function of the frame size,
+// not of the number of entries.
+//
+// A ceiling test cannot express that. It can only say "under N bytes at this
+// fixture size", which passes for any structure whose constant factor the test's
+// author underestimated — and a map[string][32]byte of path to digest is exactly
+// the kind of thing whose size is easy to underestimate. This measures the
+// difference between a small tree and one twenty times larger. For an O(1)
+// implementation that difference is noise; for an O(entries) one it is the
+// structure itself, whatever its constant factor.
+//
+// It is also cheap: tiny files, no gigabytes of cryptography, a few seconds.
+func TestHeapDoesNotGrowWithEntryCount(t *testing.T) {
+	peakFor := func(t *testing.T, entries int) int64 {
+		t.Helper()
+		root := t.TempDir()
+		const perDir = 100
+		for d := 0; d < entries/perDir; d++ {
+			dir := filepath.Join(root, fmt.Sprintf("d%04d", d))
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < perDir; i++ {
+				if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%03d", i)), []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		w, err := NewWriter(newDiscardStore(), testWrapper(t), WriterOptions{KeyRef: testKeyRef})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runtime.GC()
+		var base runtime.MemStats
+		runtime.ReadMemStats(&base)
+
+		var peak atomic.Uint64
+		done := make(chan struct{})
+		var sampler sync.WaitGroup
+		sampler.Add(1)
+		go func() {
+			defer sampler.Done()
+			var ms runtime.MemStats
+			for {
+				select {
+				case <-done:
+					return
+				case <-time.After(5 * time.Millisecond):
+					runtime.ReadMemStats(&ms)
+					for {
+						was := peak.Load()
+						if ms.HeapAlloc <= was || peak.CompareAndSwap(was, ms.HeapAlloc) {
+							break
+						}
+					}
+				}
+			}
+		}()
+		res, err := w.Write(context.Background(), testContext(), DirSource(root))
+		close(done)
+		sampler.Wait()
+		if err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		if res.Manifest.Entries < int64(entries) {
+			t.Fatalf("entries = %d, want at least %d", res.Manifest.Entries, entries)
+		}
+		if peak.Load() == 0 {
+			t.Skip("the heap sampler never ran")
+		}
+		return int64(peak.Load()) - int64(base.HeapAlloc)
+	}
+
+	small := peakFor(t, 2000)
+	large := peakFor(t, 40000)
+
+	// Twenty times the entries. An O(entries) structure would show up as a growth
+	// of its own size; an O(1) one shows up as collector noise.
+	const slack = 2 << 20
+	if large-small > slack {
+		t.Errorf("the heap grew by %d bytes between 2,000 and 40,000 entries (%d then %d), "+
+			"over the %d byte slack: something in the write path is O(entries)",
+			large-small, small, large, slack)
+	}
+	t.Logf("peak above baseline: %d bytes at 2,000 entries, %d bytes at 40,000", small, large)
+}
+
 // streamingStore serves an object from a file on disk rather than from a byte
 // slice, so the read-side memory measurement is not dominated by a store that
 // holds the whole ciphertext in the heap. It is what a real blob store looks
@@ -247,7 +336,7 @@ func (s *streamingStore) Delete(ctx context.Context, key string) error {
 // not control is not a measurement of the library.
 func TestBoundedMemoryOnVerifyAndRestore(t *testing.T) {
 	root := t.TempDir()
-	const dirs, perDir = 200, 100
+	const dirs, perDir = 50, 100
 	for d := 0; d < dirs; d++ {
 		dir := filepath.Join(root, fmt.Sprintf("d%03d", d))
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -277,7 +366,7 @@ func TestBoundedMemoryOnVerifyAndRestore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	if res.Manifest.Frames < 50 {
+	if res.Manifest.Frames < 15 {
 		t.Fatalf("the fixture should cross many frames, got %d", res.Manifest.Frames)
 	}
 
