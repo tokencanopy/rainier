@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,18 @@ func main() {
 	controld := flag.String("controld", "", "controld URL to dial (ws://host:port); enables agent (dial) mode when set")
 	runnerToken := flag.String("runner-token", envDefault("RAINIER_RUNNER_TOKEN", ""),
 		"bearer token for the controld dial (required when --controld is set; or set RAINIER_RUNNER_TOKEN, which keeps it out of the process list)")
+	driverFlag := flag.String("driver", envDefault("RAINIER_RUNNER_DRIVER", "docker"),
+		"execution driver for session sandboxes: docker | microvm")
+	kernelPath := flag.String("kernel", envDefault("RAINIER_KERNEL_PATH", ""),
+		"guest vmlinux kernel path for the microvm driver (required when --driver=microvm; the runner refuses to start without a readable one)")
+	rootfsPath := flag.String("rootfs", envDefault("RAINIER_ROOTFS_PATH", ""),
+		"base ext4 rootfs image path for the microvm driver (required when --driver=microvm; the runner refuses to start without a readable one)")
+	microvmStateDir := flag.String("microvm-state-dir", envDefault("RAINIER_MICROVM_STATE_DIR", ""),
+		"host directory holding microVM instance records, sockets, and every session's workspace and agent-home disk image (required when --driver=microvm; there is deliberately no temp-directory default, which would put a tenant's files somewhere the host reaps)")
+	microvmVCPUs := flag.Int("microvm-vcpus", envIntDefault("RAINIER_MICROVM_VCPUS", 4),
+		"vCPUs per microVM session (ADR-0003 §5.1 per-session floor: 4)")
+	microvmMemoryMiB := flag.Int("microvm-memory-mib", envIntDefault("RAINIER_MICROVM_MEMORY_MIB", 8192),
+		"memory in MiB per microVM session (ADR-0003 §5.1 per-session floor: 8192)")
 	hostname, _ := os.Hostname()
 	runnerName := flag.String("runner-name", hostname, "name this runner announces to controld")
 	proxyURL := flag.String("proxy-url", "", "egress proxy URL injected into every session (forwarded to controld dial mode)")
@@ -42,13 +55,38 @@ func main() {
 		capabilities = splitCapabilities(os.Getenv("RAINIER_RUNNER_CAPABILITIES"))
 	}
 
-	drv := driver.NewDocker(driver.DockerOpts{
-		Image:                  *image,
-		Network:                *network,
-		TotalSlots:             *slots,
-		SessionSeccompProfile:  *seccompProfile,
-		SessionAppArmorProfile: *appArmorProfile,
-	})
+	var drv driver.Driver
+	switch *driverFlag {
+	case "docker":
+		drv = driver.NewDocker(driver.DockerOpts{
+			Image:                  *image,
+			Network:                *network,
+			TotalSlots:             *slots,
+			SessionSeccompProfile:  *seccompProfile,
+			SessionAppArmorProfile: *appArmorProfile,
+		})
+	case "microvm":
+		// The microVM driver refuses to construct itself on a host that
+		// cannot boot a microVM — no /dev/kvm, no kernel, no rootfs, no
+		// mkfs.ext4, no firecracker — and this is a Fatal rather than a
+		// fallback for the same reason: a runner that started anyway would
+		// register with controld, accept placements, and report every session
+		// running while nothing executed.
+		mvm, err := driver.NewMicrovm(driver.MicrovmOpts{
+			KernelPath: *kernelPath,
+			BaseRootfs: *rootfsPath,
+			StateDir:   *microvmStateDir,
+			TotalSlots: *slots,
+			VCPU:       *microvmVCPUs,
+			MemoryMiB:  *microvmMemoryMiB,
+		})
+		if err != nil {
+			log.Fatalf("--driver=microvm: %v", err)
+		}
+		drv = mvm
+	default:
+		log.Fatalf("unknown --driver %q (valid: docker, microvm)", *driverFlag)
+	}
 	// *proxyURL reaches New directly now (Task 13) so the local HTTP-only
 	// surface — today's default, and every dev/CI compose run — injects it
 	// into every driver.Spec too, not just agent (dial) mode below.
@@ -139,4 +177,20 @@ func envDefault(env, def string) string {
 		return v
 	}
 	return def
+}
+
+// envIntDefault is envDefault for an integer flag. An unparseable value is
+// the operator's mistake, not a reason to silently run on the default: a
+// microVM slot sized from a typo would make this host's capacity describe a
+// machine nobody configured.
+func envIntDefault(env string, def int) int {
+	v := os.Getenv(env)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Fatalf("%s=%q is not an integer", env, v)
+	}
+	return n
 }
