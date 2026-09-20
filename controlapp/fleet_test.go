@@ -567,6 +567,9 @@ type fleetFixture struct {
 	// checkpoints is the fixture's locator. A test sets its answer BEFORE
 	// starting the scheduler loop, which is the only reader.
 	checkpoints *locatorStub
+	// bootstraps is the fixture's session bootstrap store: what a microVM
+	// create minted, and the four refusals an exchange can meet.
+	bootstraps *bootstrapStub
 }
 
 // fleetTestNoBaseline switches the developer egress baseline OFF for the
@@ -602,6 +605,7 @@ func newFleetFixtureWith(t *testing.T, resolver LaunchMaterialResolver, defaultE
 	clock := &fleetFakeClock{now: time.Unix(1_700_000_000, 0)}
 	ids := &fleetFakeIDs{}
 	ckpts := &locatorStub{}
+	boots := newBootstrapStub()
 	r := resolver
 	if r == nil {
 		r = &fleetFakeResolver{}
@@ -624,6 +628,7 @@ func newFleetFixtureWith(t *testing.T, resolver LaunchMaterialResolver, defaultE
 		LaunchMaterial: r,
 		UnitOfWork:     directUOW{},
 		Checkpoints:    ckpts,
+		Bootstraps:     boots,
 		DefaultEgress:  defaultEgress,
 	})
 	if err != nil {
@@ -632,7 +637,7 @@ func newFleetFixtureWith(t *testing.T, resolver LaunchMaterialResolver, defaultE
 	return &fleetFixture{
 		service: svc, auth: auth, sessions: sessions, envs: envs, fleet: fleet,
 		pools: pools, transport: transport, events: events, clock: clock, ids: ids, st: st,
-		resolver: fr, checkpoints: ckpts,
+		resolver: fr, checkpoints: ckpts, bootstraps: boots,
 	}
 }
 
@@ -695,6 +700,7 @@ func TestNewFleetServiceRequiresEveryPort(t *testing.T) {
 			LaunchMaterial: &fleetFakeResolver{},
 			UnitOfWork:     directUOW{},
 			Checkpoints:    locatorStub{},
+			Bootstraps:     newBootstrapStub(),
 		}
 	}
 	if _, err := NewFleetService(base()); err != nil {
@@ -713,6 +719,7 @@ func TestNewFleetServiceRequiresEveryPort(t *testing.T) {
 		"launch material": func(o *FleetOptions) { o.LaunchMaterial = nil },
 		"unit of work":    func(o *FleetOptions) { o.UnitOfWork = nil },
 		"checkpoints":     func(o *FleetOptions) { o.Checkpoints = nil },
+		"bootstraps":      func(o *FleetOptions) { o.Bootstraps = nil },
 	} {
 		o := base()
 		zero(&o)

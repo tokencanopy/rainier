@@ -146,7 +146,7 @@ func TestCreateSpecCarriesTheHome(t *testing.T) {
 	row := control.Session{ID: "sess_example", WorkspaceID: "ws_example", CreatorID: "user_example",
 		Spec: control.PortableSpec{Image: "registry.example.invalid/base@sha256:0000"}}
 
-	spec, fail := fx.service.createSpec(fleetCtx, row, nil)
+	spec, fail := fx.service.createSpec(fleetCtx, row, nil, nil, 0)
 	if fail != "" {
 		t.Fatalf("createSpec failed: %s", fail)
 	}
@@ -216,7 +216,7 @@ func TestCreateSpecCarriesTheHome(t *testing.T) {
 	// a login that cannot happen.
 	anon := row
 	anon.CreatorID = ""
-	spec, fail = fx.service.createSpec(fleetCtx, anon, nil)
+	spec, fail = fx.service.createSpec(fleetCtx, anon, nil, nil, 0)
 	if fail != "" {
 		t.Fatalf("createSpec failed: %s", fail)
 	}
@@ -247,7 +247,7 @@ func TestCreateSpecCarriesTheHome(t *testing.T) {
 			agentsEnvVar:  "untrusted-manifest",
 			"USER_VALUE":  "preserved",
 		}}})
-	spec, fail = fx.service.createSpec(fleetCtx, row, nil)
+	spec, fail = fx.service.createSpec(fleetCtx, row, nil, nil, 0)
 	if fail != "" {
 		t.Fatalf("createSpec failed: %s", fail)
 	}

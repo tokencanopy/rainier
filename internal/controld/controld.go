@@ -303,6 +303,11 @@ func (s *Server) compose() error {
 		DefaultInitTimeoutSec:  defaultInitTimeoutSec,
 		UnitOfWork:             uow,
 		Checkpoints:            ckpts,
+		// The same store, through the port that mints and spends a microVM
+		// session's bootstrap token. srpc.go reads it through the same
+		// accessor to answer the exchange, so the mint and the redemption
+		// are one table and not two.
+		Bootstraps: s.st.Bootstraps(),
 	})
 	if err != nil {
 		return fmt.Errorf("controld: composing the fleet service: %w", err)

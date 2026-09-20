@@ -113,7 +113,11 @@ func (s *FleetService) drainPool(ctx context.Context, pool control.PoolID) {
 			}
 			return
 		}
-		go s.dispatchCreate(ctx, pool, row, runnerID, env)
+		// The runner's announced capabilities travel with the placement
+		// rather than being re-read at dispatch: they are the claims this
+		// pass placed ON, and a second read could disagree with the decision
+		// already made. createSpec keys its withholding on them.
+		go s.dispatchCreate(ctx, pool, row, runnerID, capabilitiesOf(views, runnerID), env)
 	}
 }
 
@@ -244,6 +248,20 @@ func overridesEnvironmentImage(row control.Session, env control.Environment) boo
 	return row.Spec.Image != env.Image && row.Spec.Image != env.Snapshot.Ref
 }
 
+// capabilitiesOf returns the capabilities the placement pass saw on id, or
+// nil when the view has gone (a runner that disconnected between the pick and
+// the dispatch). Nil is the safe answer: a runner whose claims this pass
+// cannot state is a runner nothing is withheld from, which dispatches today's
+// Spec — the same thing an older runner gets.
+func capabilitiesOf(views []runnerView, id control.RunnerID) []string {
+	for _, v := range views {
+		if v.id == id {
+			return v.caps
+		}
+	}
+	return nil
+}
+
 func hasAllCapabilities(caps, reqs []string) bool {
 	for _, want := range reqs {
 		if !slices.Contains(caps, want) {
@@ -313,8 +331,13 @@ func cloneSession(s control.Session) control.Session {
 // dispatchCreate builds the create spec, pins setup provenance, dispatches,
 // and settles the uncertain-delivery outcome without ever duplicating a
 // delivered create.
-func (s *FleetService) dispatchCreate(ctx context.Context, pool control.PoolID, row control.Session, runnerID control.RunnerID, env *control.Environment) {
-	spec, fail := s.createSpec(ctx, row, env)
+func (s *FleetService) dispatchCreate(ctx context.Context, pool control.PoolID, row control.Session, runnerID control.RunnerID, runnerCaps []string, env *control.Environment) {
+	// Read BEFORE the spec is built, not after, because a microVM create's
+	// bootstrap token is FENCED by this number: the hash recorded against the
+	// session has to name the same placement the create carries, or the first
+	// exchange is refused as superseded by the very placement that minted it.
+	gen := s.placedGeneration(ctx, row)
+	spec, fail := s.createSpec(ctx, row, env, runnerCaps, gen)
 	if fail != "" {
 		s.failCreate(ctx, row, fail)
 		return
@@ -326,7 +349,7 @@ func (s *FleetService) dispatchCreate(ctx context.Context, pool control.PoolID, 
 		Type:                "create",
 		Session:             string(row.ID),
 		Spec:                spec,
-		PlacementGeneration: s.placedGeneration(ctx, row),
+		PlacementGeneration: gen,
 	})
 	switch {
 	case err != nil:
@@ -369,7 +392,13 @@ func (s *FleetService) placedGeneration(ctx context.Context, row control.Session
 // createSpec builds the runner create spec from the session and its current
 // environment, resolving sensitive launch material only here and never
 // storing it.
-func (s *FleetService) createSpec(ctx context.Context, row control.Session, env *control.Environment) (*runner.Spec, string) {
+// runnerCaps are the capabilities the placement's runner announced, and gen
+// the placement generation the create carries. Together they are the whole of
+// what this function needs to decide the one question the microVM bootstrap
+// design added to it: whether this session's environment secrets travel in
+// Spec.Env, as they always have, or stay behind a single-use token the guest
+// exchanges for them after it boots (see §3 of the design note).
+func (s *FleetService) createSpec(ctx context.Context, row control.Session, env *control.Environment, runnerCaps []string, gen uint64) (*runner.Spec, string) {
 	spec := runner.Spec{
 		Name:        row.Name,
 		Image:       row.Spec.Image,
@@ -402,7 +431,17 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 	spec.Repos = slices.Clone(material.Repos)
 	spec.GitAuthorName = material.GitAuthorName
 	spec.GitAuthorEmail = material.GitAuthorEmail
-	spec.Env = cloneMap(material.Environment)
+	// The one branch in this function that is about WHERE the session will
+	// run rather than what it is. A runner announcing microvm.v1 boots each
+	// session in its own VM on a shared regional host, where a driver cannot
+	// hand a value to a daemon through an argv and every channel it does have
+	// ends in a file; so the values stay here and the create carries their
+	// NAMES and a token instead (ADR-0003 §2.7 item 1). Every other runner —
+	// which is every runner today — is dispatched exactly what it always was.
+	withheld := slices.Contains(runnerCaps, runner.CapabilityMicrovmV1)
+	if !withheld {
+		spec.Env = cloneMap(material.Environment)
+	}
 	// The agent home is the creator's, in this workspace: every session they
 	// start there mounts the same volume, and that sameness is the whole of
 	// "log in once". A session with no creator gets none of this — a home
@@ -426,6 +465,38 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 			}
 		}
 		spec.Env = agentEnv
+	}
+	// The names, and then the token, in that order: the names are derived
+	// from the material this function already holds, and they are computed
+	// AFTER the agent-home block so that the one rule that block states —
+	// agent paths and the manifest are launch invariants a workspace's own
+	// configuration may not replace — holds identically on both paths. A
+	// secret_ref that happens to be spelled CLAUDE_CONFIG_DIR is dropped for
+	// a Docker session and must not be smuggled back in as a name a microVM
+	// guest then applies over its own agent home.
+	if withheld {
+		spec.SecretNames = withholdableNames(material.Environment, spec.Env)
+		token, err := s.bootstraps.Mint(ctx, row.WorkspaceID, row.ID, gen)
+		if err != nil {
+			// Fail closed. The alternative to refusing here is a session
+			// dispatched with neither its secrets nor a way to ask for them,
+			// which boots, reports healthy, and fails at whatever the first
+			// credential-shaped thing it does is.
+			return nil, "could not mint this session's bootstrap token"
+		}
+		spec.BootstrapToken = token
+	}
+	// Either the values or the token, never both — stated as a check rather
+	// than as a comment, because it is the whole security claim of §3 and it
+	// is one careless merge away from being false. A spec that reaches here
+	// carrying both is a bug in this function, and a failed create is a much
+	// better answer to it than a secret on a shared host's disk.
+	if spec.BootstrapToken != "" {
+		for _, name := range spec.SecretNames {
+			if _, both := spec.Env[name]; both {
+				return nil, "could not resolve launch material"
+			}
+		}
 	}
 	// The session row stores only the egress its caller or environment
 	// declared; the hosts the resolved material needs are the resolver's
@@ -500,6 +571,33 @@ func boundOr(declared, fallback int) int {
 		return declared
 	}
 	return fallback
+}
+
+// withholdableNames are the names a withheld create promises its guest: every
+// key of the resolved secret environment that the spec's own configuration
+// does not already reserve, sorted.
+//
+// Sorted because the list is on the wire and in a guest's failure message,
+// and a set rendered in map order would make two identical creates look
+// different. Nil when there is nothing to promise, so a session with no
+// secret_refs puts no `secret_names` on the wire at all and its guest reads
+// the honest "none declared" rather than "declared and never arrived".
+func withholdableNames(material, reserved map[string]string) []string {
+	if len(material) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(material))
+	for name := range material {
+		if _, taken := reserved[name]; taken {
+			continue
+		}
+		out = append(out, name)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	slices.Sort(out)
+	return out
 }
 
 func cloneMap(m map[string]string) map[string]string {

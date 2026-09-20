@@ -28,7 +28,12 @@ type Stores struct {
 	Sessions     control.SessionRepository
 	Environments control.EnvironmentRepository
 	Fleet        control.FleetRepository
-	Provision    func(ctx context.Context, ws control.WorkspaceID) error
+	// Bootstraps is the session bootstrap tokens, over the SAME backing
+	// store: a token minted against a session created through Sessions must
+	// be consumable here, and a durable store that keys the two differently
+	// fails the suite rather than a microVM session's boot.
+	Bootstraps control.SessionBootstrapStore
+	Provision  func(ctx context.Context, ws control.WorkspaceID) error
 }
 
 // Run drives the contract. open is called once per case and must return an
@@ -88,6 +93,10 @@ func cases() []suiteCase {
 		{"F5 sessions on a runner", caseSessionsOnRunner},
 		{"F6 oldest queued", caseOldestQueued},
 		{"F7 an empty pool is invalid on every fleet method", caseFleetEmptyPool},
+
+		{"B1 a bootstrap token is single-use and fenced", caseSessionBootstrap},
+		{"B2 a fresh mint retires its predecessor", caseSessionBootstrapRemint},
+		{"B3 an empty workspace, session or hash is invalid", caseSessionBootstrapEmpty},
 	}
 }
 

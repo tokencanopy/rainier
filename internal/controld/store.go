@@ -206,6 +206,12 @@ type Repositories interface {
 	Sessions() control.SessionRepository
 	Environments() control.EnvironmentRepository
 	Fleet() control.FleetRepository
+	// Bootstraps is the session bootstrap tokens: the hash, the placement it
+	// was minted under, its expiry, and the atomic spend. It is a port of its
+	// own rather than four methods on Sessions because minting and spending a
+	// capability has nothing to do with a session's lifecycle — see
+	// control.SessionBootstrapStore.
+	Bootstraps() control.SessionBootstrapStore
 }
 
 // MemStore is the shape the in-memory store has: Store itself, plus the one

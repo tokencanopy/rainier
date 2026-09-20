@@ -529,6 +529,7 @@ func TestPGStoreRepositories(t *testing.T) {
 			Sessions:     st.Sessions(),
 			Environments: st.Environments(),
 			Fleet:        st.Fleet(),
+			Bootstraps:   st.Bootstraps(),
 			Provision:    st.EnsureWorkspace,
 		}
 	})
