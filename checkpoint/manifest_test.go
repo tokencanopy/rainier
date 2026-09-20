@@ -333,7 +333,7 @@ func TestGoldenManifest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := w.Write(context.Background(), testContext(), DirSource(root, DefaultExclusions()...))
+	res, err := w.Write(context.Background(), testContext(), DirSource(root))
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}

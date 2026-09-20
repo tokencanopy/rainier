@@ -291,7 +291,7 @@ func TestSparseAndOversizedEntriesAreRefused(t *testing.T) {
 func TestRestoreIntoARelativeTarget(t *testing.T) {
 	h := newHarness(t, MinFrameSize)
 	ctx := context.Background()
-	if _, err := h.w.Write(ctx, h.c, DirSource(fixtureTree(t), DefaultExclusions()...)); err != nil {
+	if _, err := h.w.Write(ctx, h.c, DirSource(fixtureTree(t))); err != nil {
 		t.Fatal(err)
 	}
 	// A relative target, and "." in particular, must be the caller's business and
@@ -339,7 +339,7 @@ func TestCancellationStopsAWriteAndARestore(t *testing.T) {
 
 	t.Run("restore", func(t *testing.T) {
 		h := newHarness(t, MinFrameSize)
-		if _, err := h.w.Write(context.Background(), h.c, DirSource(fixtureTree(t), DefaultExclusions()...)); err != nil {
+		if _, err := h.w.Write(context.Background(), h.c, DirSource(fixtureTree(t))); err != nil {
 			t.Fatal(err)
 		}
 		r, err := NewReader(ctxBlindStore{h.store}, testWrapper(t), ReaderOptions{

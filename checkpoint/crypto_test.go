@@ -21,7 +21,7 @@ type committed struct {
 func commit(t *testing.T) *committed {
 	t.Helper()
 	h := newHarness(t, MinFrameSize)
-	res, err := h.w.Write(context.Background(), h.c, DirSource(fixtureTree(t), DefaultExclusions()...))
+	res, err := h.w.Write(context.Background(), h.c, DirSource(fixtureTree(t)))
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -361,13 +361,13 @@ func TestFrameNoncesAreUniqueAndDerivedFromTheIndex(t *testing.T) {
 	h := newHarness(t, MinFrameSize)
 	root := fixtureTree(t)
 
-	first, err := h.w.Write(ctx, h.c, DirSource(root, DefaultExclusions()...))
+	first, err := h.w.Write(ctx, h.c, DirSource(root))
 	if err != nil {
 		t.Fatal(err)
 	}
 	second := h.c
 	second.Generation++
-	other, err := h.w.Write(ctx, second, DirSource(root, DefaultExclusions()...))
+	other, err := h.w.Write(ctx, second, DirSource(root))
 	if err != nil {
 		t.Fatal(err)
 	}

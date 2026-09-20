@@ -35,7 +35,7 @@
 // returned:
 //
 //	w, _ := checkpoint.NewWriter(store, keys, checkpoint.WriterOptions{KeyRef: ref})
-//	res, err := w.Write(ctx, c, checkpoint.DirSource("/workspace", ".rainier"))
+//	res, err := w.Write(ctx, c, checkpoint.DirSource("/workspace"))
 //	if err != nil { return err }          // nothing was committed
 //
 //	r, _ := checkpoint.NewReader(store, keys, checkpoint.ReaderOptions{
@@ -53,6 +53,11 @@
 // writer still had in memory, because the claim being tested is that the
 // committed object is restorable, and an in-memory check tests the encoder
 // against itself.
+//
+// DirSource takes no exclusion argument there because it does not need one.
+// DefaultExclusions — the Rainier-owned paths inside a workspace, starting with
+// .rainier — is applied by every Write, and an argument a caller does pass is
+// ADDED to that set rather than replacing it.
 //
 // # Neutrality
 //

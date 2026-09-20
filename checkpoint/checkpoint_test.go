@@ -214,7 +214,7 @@ func TestRoundTrip(t *testing.T) {
 	root := fixtureTree(t)
 	ctx := context.Background()
 
-	res, err := h.w.Write(ctx, h.c, DirSource(root, DefaultExclusions()...))
+	res, err := h.w.Write(ctx, h.c, DirSource(root))
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -260,7 +260,7 @@ func TestRoundTrip(t *testing.T) {
 	// equal tree.
 	next := h.c
 	next.Generation++
-	again, err := h.w.Write(ctx, next, DirSource(target, DefaultExclusions()...))
+	again, err := h.w.Write(ctx, next, DirSource(target))
 	if err != nil {
 		t.Fatalf("Write of the restored tree: %v", err)
 	}
@@ -355,6 +355,11 @@ func compareTrees(t *testing.T, want, got string, exclude []string) {
 	}
 }
 
+// TestExclusionIsPrunedAndNeverRead checkpoints a source that was NEVER TOLD to
+// exclude anything. That is the point of it: a DirSource's extra arguments are
+// ADDED to DefaultExclusions rather than replacing it, so a caller who forgets
+// them — or who never knew the list existed — still cannot put the fixture's
+// planted credential under .rainier into a checkpoint.
 func TestExclusionIsPrunedAndNeverRead(t *testing.T) {
 	h := newHarness(t, MinFrameSize)
 	root := fixtureTree(t)
@@ -366,8 +371,17 @@ func TestExclusionIsPrunedAndNeverRead(t *testing.T) {
 	if err := os.Remove(filepath.Join(root, "src", "link.txt")); err != nil {
 		t.Fatal(err)
 	}
-	rec := &recordingFS{FS: os.DirFS(root)}
-	res, err := h.w.Write(ctx, h.c, Source{FS: recordingWithoutLinks(t, rec), Exclude: DefaultExclusions()})
+	// Built by DirSource with no exclusion argument and only then wrapped in the
+	// recorder, so what is under test is the Source a forgetful caller actually
+	// constructs rather than one this test assembled to suit itself.
+	src := DirSource(root)
+	if len(src.AlsoExclude) != 0 {
+		t.Fatalf("DirSource(root) carries %d exclusions; this test needs it to carry none", len(src.AlsoExclude))
+	}
+	rec := &recordingFS{FS: src.FS}
+	src.FS = recordingWithoutLinks(t, rec)
+
+	res, err := h.w.Write(ctx, h.c, src)
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
@@ -401,6 +415,55 @@ func TestExclusionIsPrunedAndNeverRead(t *testing.T) {
 	}
 	if res.Manifest.Entries == 0 {
 		t.Error("nothing was checkpointed at all")
+	}
+}
+
+// TestCallerExclusionsUnionWithTheDefaults is the other half of the same
+// property: an exclusion the caller DOES pass is honoured, and passing one does
+// not quietly narrow the set to just that one.
+func TestCallerExclusionsUnionWithTheDefaults(t *testing.T) {
+	h := newHarness(t, MinFrameSize)
+	root := fixtureTree(t)
+	ctx := context.Background()
+	if err := os.Remove(filepath.Join(root, "src", "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	// A path the caller's own policy names, alongside the one Rainier's does.
+	if err := os.MkdirAll(filepath.Join(root, "scratch"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "scratch", "big.tmp"), []byte("temporary\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stampTree(t, root)
+
+	src := DirSource(root, "scratch")
+	rec := &recordingFS{FS: src.FS}
+	src.FS = recordingWithoutLinks(t, rec)
+	if _, err := h.w.Write(ctx, h.c, src); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	for _, name := range rec.names() {
+		for _, pre := range []string{".rainier", "scratch"} {
+			if name == pre || strings.HasPrefix(name, pre+"/") {
+				t.Errorf("an excluded path under %q was opened during the walk", pre)
+			}
+		}
+	}
+
+	target := filepath.Join(t.TempDir(), "restored")
+	if _, err := h.r.Restore(ctx, h.c, target); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	// Both are gone, and the rest of the tree is not: a union, not a swap.
+	for _, rel := range []string{".rainier", "scratch"} {
+		if _, err := os.Lstat(filepath.Join(target, rel)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%q survived into the restored tree", rel)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(target, "README.md")); err != nil {
+		t.Errorf("an unexcluded entry did not survive: %v", err)
 	}
 }
 
@@ -511,11 +574,11 @@ func TestPutIfAbsentMakesTheCommitAtomic(t *testing.T) {
 	root := fixtureTree(t)
 	ctx := context.Background()
 
-	first, err := h.w.Write(ctx, h.c, DirSource(root, DefaultExclusions()...))
+	first, err := h.w.Write(ctx, h.c, DirSource(root))
 	if err != nil {
 		t.Fatalf("first Write: %v", err)
 	}
-	_, err = h.w.Write(ctx, h.c, DirSource(root, DefaultExclusions()...))
+	_, err = h.w.Write(ctx, h.c, DirSource(root))
 	if !errors.Is(err, ErrExists) {
 		t.Fatalf("second Write error = %v, want ErrExists", err)
 	}
@@ -555,7 +618,7 @@ func TestAuthorizationIsRequiredAndRunsFirst(t *testing.T) {
 			t.Fatal(err)
 		}
 		c := testContext()
-		res, err := w.Write(ctx, c, DirSource(fixtureTree(t), DefaultExclusions()...))
+		res, err := w.Write(ctx, c, DirSource(fixtureTree(t)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -587,7 +650,7 @@ func TestAuthorizationIsRequiredAndRunsFirst(t *testing.T) {
 func TestRestoreRefusesANonEmptyTarget(t *testing.T) {
 	h := newHarness(t, MinFrameSize)
 	ctx := context.Background()
-	if _, err := h.w.Write(ctx, h.c, DirSource(fixtureTree(t), DefaultExclusions()...)); err != nil {
+	if _, err := h.w.Write(ctx, h.c, DirSource(fixtureTree(t))); err != nil {
 		t.Fatal(err)
 	}
 	target := t.TempDir()
@@ -608,7 +671,7 @@ func TestPreflightReadsNoContent(t *testing.T) {
 	}
 	ctx := context.Background()
 	c := testContext()
-	res, err := w.Write(ctx, c, DirSource(fixtureTree(t), DefaultExclusions()...))
+	res, err := w.Write(ctx, c, DirSource(fixtureTree(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -636,7 +699,7 @@ func TestPreflightReadsNoContent(t *testing.T) {
 func TestPreflightFailsWhenTheKeyVersionIsElsewhere(t *testing.T) {
 	h := newHarness(t, MinFrameSize)
 	ctx := context.Background()
-	if _, err := h.w.Write(ctx, h.c, DirSource(fixtureTree(t), DefaultExclusions()...)); err != nil {
+	if _, err := h.w.Write(ctx, h.c, DirSource(fixtureTree(t))); err != nil {
 		t.Fatal(err)
 	}
 	other, err := NewStaticKeyWrapper("example.test/keys/checkpoint/2", testKey())
@@ -658,7 +721,7 @@ func TestPreflightFailsWhenTheKeyVersionIsElsewhere(t *testing.T) {
 func TestDeleteRemovesTheManifestFirst(t *testing.T) {
 	h := newHarness(t, MinFrameSize)
 	ctx := context.Background()
-	res, err := h.w.Write(ctx, h.c, DirSource(fixtureTree(t), DefaultExclusions()...))
+	res, err := h.w.Write(ctx, h.c, DirSource(fixtureTree(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -695,11 +758,11 @@ func TestSourceValidation(t *testing.T) {
 		src  Source
 	}{
 		{"no file system", Source{}},
-		{"absolute exclusion", Source{FS: os.DirFS(t.TempDir()), Exclude: []string{"/etc"}}},
-		{"unclean exclusion", Source{FS: os.DirFS(t.TempDir()), Exclude: []string{"a/./b"}}},
-		{"escaping exclusion", Source{FS: os.DirFS(t.TempDir()), Exclude: []string{"../x"}}},
-		{"root exclusion", Source{FS: os.DirFS(t.TempDir()), Exclude: []string{"."}}},
-		{"empty exclusion", Source{FS: os.DirFS(t.TempDir()), Exclude: []string{""}}},
+		{"absolute exclusion", Source{FS: os.DirFS(t.TempDir()), AlsoExclude: []string{"/etc"}}},
+		{"unclean exclusion", Source{FS: os.DirFS(t.TempDir()), AlsoExclude: []string{"a/./b"}}},
+		{"escaping exclusion", Source{FS: os.DirFS(t.TempDir()), AlsoExclude: []string{"../x"}}},
+		{"root exclusion", Source{FS: os.DirFS(t.TempDir()), AlsoExclude: []string{"."}}},
+		{"empty exclusion", Source{FS: os.DirFS(t.TempDir()), AlsoExclude: []string{""}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := h.w.Write(ctx, h.c, tc.src); !errors.Is(err, ErrInvalid) {

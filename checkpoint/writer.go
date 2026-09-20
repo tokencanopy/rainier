@@ -296,6 +296,10 @@ func walkTree(ctx context.Context, src Source, tw *tar.Writer, st *writeStats) e
 	tree := newTreeHasher()
 	entryDigest := sha256.New()
 	ordinal := int64(0)
+	// The defaults are folded in HERE, in the one place every checkpoint's tree
+	// passes through, rather than at any of the places a caller builds a Source.
+	// A caller cannot reach the walk with a narrower set than this one.
+	exclusions := src.exclusions()
 
 	err := fs.WalkDir(src.FS, ".", func(name string, d fs.DirEntry, err error) error {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -312,7 +316,7 @@ func walkTree(ctx context.Context, src Source, tw *tar.Writer, st *writeStats) e
 		if name == "." {
 			return nil // the root is the destination, not an entry
 		}
-		if src.excluded(name) {
+		if excluded(exclusions, name) {
 			if d.IsDir() {
 				// Pruned, not filtered: the directory is never opened and nothing
 				// inside it is ever read, which is what makes an exclusion a

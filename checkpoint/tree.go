@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -40,8 +41,13 @@ const (
 	copyBufSize = 32 << 10
 )
 
-// Source is the tree to checkpoint: one file system, and the paths inside it
-// that must not travel.
+// Source is the tree to checkpoint: one file system, and any paths inside it
+// that must not travel ON TOP OF the ones that never travel.
+//
+// DefaultExclusions is applied by every Write, unioned with AlsoExclude. That
+// is a property of the API rather than of the caller's diligence: there is no
+// spelling of Source — zero value, struct literal, DirSource with no extra
+// arguments — that checkpoints /workspace/.rainier.
 //
 // One root, deliberately. PRD §10 wants "the session filesystem and native agent
 // resume state" in a checkpoint while ADR-0003 §2.3 keeps the agent home out of
@@ -55,10 +61,17 @@ type Source struct {
 	// symlink in the tree is refused rather than silently followed or dropped.
 	FS fs.FS
 
-	// Exclude is the caller's explicit exclusion policy: clean, relative,
+	// AlsoExclude is what the caller adds to DefaultExclusions, which a Writer
+	// applies whether or not this field is set: clean, relative,
 	// slash-separated paths. A path matches itself and everything under it, and
 	// an excluded directory is PRUNED — never opened, never read — so a file
 	// inside one cannot reach the store even by accident.
+	//
+	// The name says "also" because the union is not optional. A zero Source is
+	// not the raw tree, and there is no argument, field or option that makes it
+	// one: a caller who never thought about exclusions still gets the set
+	// Rainier owns, which is the only version of that promise that survives a
+	// caller in a hurry.
 	//
 	// This is not a redaction pass. The tenancy specification's §8.2 says a
 	// workload may deliberately write a credential into its own workspace, that
@@ -66,17 +79,23 @@ type Source struct {
 	// redaction as a security boundary". What keeps Rainier-delivered credentials
 	// out of a checkpoint is that they are not files under this root in the first
 	// place (§18 item 38 is the claim being made, and no wider one). This list is
-	// for Rainier-owned paths inside the workspace, and for whatever a caller's
-	// own policy adds.
-	Exclude []string
+	// for whatever a caller's own policy adds on top of the Rainier-owned paths
+	// DefaultExclusions already names.
+	AlsoExclude []string
 }
 
-// DirSource is Source over a directory on the local filesystem.
-func DirSource(dir string, exclude ...string) Source {
-	return Source{FS: os.DirFS(dir), Exclude: exclude}
+// DirSource is Source over a directory on the local filesystem. Any arguments
+// after the directory are ADDED to DefaultExclusions; passing none does not
+// mean "checkpoint everything".
+func DirSource(dir string, alsoExclude ...string) Source {
+	return Source{FS: os.DirFS(dir), AlsoExclude: alsoExclude}
 }
 
 // DefaultExclusions is the set Rainier itself owns inside a session workspace.
+// Every Write applies it, so it is not something a caller opts into; it is
+// exported so that a caller can SEE what will be left out, and so that a test
+// comparing a source tree with a restored one can skip the same paths.
+//
 // It is a function rather than a package variable so that one caller cannot
 // append to another caller's policy.
 func DefaultExclusions() []string {
@@ -86,11 +105,24 @@ func DefaultExclusions() []string {
 	return []string{".rainier"}
 }
 
+// exclusions is the set a walk actually applies: the defaults, always, plus
+// whatever the caller added. Computed once per Write rather than consulted per
+// entry, because the walk's memory is supposed to be O(1) in the tree.
+func (s Source) exclusions() []string {
+	out := DefaultExclusions()
+	for _, e := range s.AlsoExclude {
+		if !slices.Contains(out, e) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 func (s Source) validate() error {
 	if s.FS == nil {
 		return fmt.Errorf("%w: the source has no file system", ErrInvalid)
 	}
-	for i, e := range s.Exclude {
+	for i, e := range s.AlsoExclude {
 		switch {
 		case e == "":
 			return fmt.Errorf("%w: exclusion %d is empty", ErrInvalid, i)
@@ -106,8 +138,8 @@ func (s Source) validate() error {
 }
 
 // excluded reports whether name is an excluded path or sits under one.
-func (s Source) excluded(name string) bool {
-	for _, e := range s.Exclude {
+func excluded(exclusions []string, name string) bool {
+	for _, e := range exclusions {
 		if name == e || strings.HasPrefix(name, e+"/") {
 			return true
 		}
@@ -182,7 +214,7 @@ func checkLink(name, target string) error {
 // ---------------------------------------------------------------------------
 
 // treeHasher folds a tree into one digest, in stream order, one entry at a time
-// and with no state per entry. It is what makes ADR-0003 §19's "checksum-equal
+// and with no state per entry. It is what makes PRD §19's "checksum-equal
 // restore" checkable without a second copy: the writer computes it from the local
 // tree, the reader recomputes it from the decoded stream, and the manifest
 // commits to it in between.

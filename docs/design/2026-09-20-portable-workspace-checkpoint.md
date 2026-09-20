@@ -90,7 +90,8 @@ representation.
 ### 3.1 In
 
 **The session filesystem tree**, as one `fs.FS` rooted at the workspace, minus
-an explicit exclusion list the caller supplies. Directories, regular files and
+the default exclusion list and anything the caller adds to it (§3.2:
+the default set is not opt-in). Directories, regular files and
 symbolic links travel. A file's permission bits (masked to `0o777`) and
 modification time travel. A symlink's target travels, and is refused at pack
 time if it escapes the tree — the same rule `protocol/workspace`'s `checkLink`
@@ -133,6 +134,16 @@ exclusion is not what keeps credentials out of a checkpoint; *the credential
 never being a file under the workspace root* is. The exclusion list exists for
 Rainier-owned paths inside the workspace (`/workspace/.rainier`) and for
 whatever a caller's policy adds.
+
+That list is applied **by construction at the API, not by opting in**. Every
+`Write` unions `DefaultExclusions()` with the caller's `Source.AlsoExclude`
+before the walk begins, and the field is named for the union: there is no
+spelling of a `Source` — zero value, struct literal, `DirSource` with no extra
+arguments — that checkpoints `/workspace/.rainier`, and no flag or escape hatch
+that produces the raw tree. An opt-in default is a default a caller in a hurry
+does not get, and "the Rainier-owned control directory is in this checkpoint"
+is not a mistake that announces itself at the time it is made. Extra arguments
+to `DirSource` *add* to the set; they cannot narrow it.
 
 What the exclusion list is emphatically **not** is a redaction pass. Tenancy
 §8.2 is explicit that a workload may deliberately write a credential into its
@@ -610,7 +621,7 @@ need is a *stack*, not a list: entries arrive depth-first, so the state is the
 chain of directories currently open — O(tree depth), a few hundred at worst.
 That is the one exception, and it is the whole of it.
 
-The tree digest is what makes ADR §19's "checksum-equal restore" checkable
+The tree digest is what makes PRD §19's "checksum-equal restore" checkable
 without a second copy:
 
 ```text
@@ -795,8 +806,9 @@ func NewStaticKeyWrapper(ref KeyRef, key [32]byte) (*StaticKeyWrapper, error)
 type BlobStore interface { PutIfAbsent(...); Open(...); Delete(...) }
 func NewMemoryStore() *MemoryStore
 
-type Source struct { FS fs.FS; Exclude []string }
-func DirSource(dir string, exclude ...string) Source
+type Source struct { FS fs.FS; AlsoExclude []string }  // unioned with the defaults
+func DirSource(dir string, alsoExclude ...string) Source
+func DefaultExclusions() []string        // applied by every Write, §3.2
 
 type Writer struct{ … }
 func NewWriter(store BlobStore, keys Wrapper, opts WriterOptions) (*Writer, error)
@@ -910,7 +922,10 @@ self-inconsistent lengths, content key outside the prefix, oversized manifest, a
 key reference carrying a newline or an ANSI escape.
 
 Exclusion: a planted credential-shaped file inside an excluded subtree, asserted
-against *every path the walk opened* rather than against the restored tree.
+against *every path the walk opened* rather than against the restored tree —
+once through a source given NO exclusion argument at all (the default set is
+applied by construction), and once through a source that adds one of its own
+(the caller's path and the defaults are both pruned, a union and not a swap).
 Put-if-absent: a second write at the same generation loses with `ErrExists` and
 does not disturb the winner. `Authorize` nil at construction, `Authorize`
 failing before any content object is opened and before the target exists.
