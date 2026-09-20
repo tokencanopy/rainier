@@ -336,7 +336,15 @@ func (s *FleetService) dispatchCreate(ctx context.Context, pool control.PoolID, 
 	// bootstrap token is FENCED by this number: the hash recorded against the
 	// session has to name the same placement the create carries, or the first
 	// exchange is refused as superseded by the very placement that minted it.
-	gen := s.placedGeneration(ctx, row)
+	gen, known := s.placedGeneration(ctx, row)
+	if !known && slices.Contains(runnerCaps, runner.CapabilityMicrovmV1) {
+		// Only for a withholding placement, and only because the token's
+		// fence is this number: everywhere else an unknown generation is
+		// inert, and failing a create over a transient read would be a
+		// regression for every session in the fleet.
+		s.failCreate(ctx, row, "could not read this session's placement to mint its bootstrap token")
+		return
+	}
 	spec, fail := s.createSpec(ctx, row, env, runnerCaps, gen)
 	if fail != "" {
 		s.failCreate(ctx, row, fail)
@@ -381,17 +389,27 @@ func (s *FleetService) dispatchCreate(ctx context.Context, pool control.PoolID, 
 // A read that cannot be made carries nothing rather than the value it knows
 // to be stale: zero is "not carried" on the wire and fences nothing, while a
 // wrong number would fence every event this sandbox ever sends.
-func (s *FleetService) placedGeneration(ctx context.Context, row control.Session) uint64 {
+//
+// The bool is the same fact said out loud, and it exists because that
+// reasoning stopped being universally true. Zero fences nothing on an EVENT,
+// which is what this was written for — but the same number is now also the
+// generation a microVM session's bootstrap token is minted against, and
+// there a wrong value is not inert: a token recorded at 0 against a row at 3
+// is refused on its one and only exchange, as superseded by the very
+// placement that minted it. So the caller is told, and refuses the create
+// rather than dispatching a session that cannot get its secrets.
+func (s *FleetService) placedGeneration(ctx context.Context, row control.Session) (uint64, bool) {
 	placed, err := s.sessions.GetSession(ctx, row.WorkspaceID, row.ID)
 	if err != nil {
-		return 0
+		return 0, false
 	}
-	return placed.PlacementGeneration
+	return placed.PlacementGeneration, true
 }
 
 // createSpec builds the runner create spec from the session and its current
 // environment, resolving sensitive launch material only here and never
 // storing it.
+//
 // runnerCaps are the capabilities the placement's runner announced, and gen
 // the placement generation the create carries. Together they are the whole of
 // what this function needs to decide the one question the microVM bootstrap
@@ -488,9 +506,14 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 	}
 	// Either the values or the token, never both — stated as a check rather
 	// than as a comment, because it is the whole security claim of §3 and it
-	// is one careless merge away from being false. A spec that reaches here
-	// carrying both is a bug in this function, and a failed create is a much
-	// better answer to it than a secret on a shared host's disk.
+	// is one careless merge away from being false.
+	//
+	// It is a BACKSTOP and not an independent proof: withholdableNames
+	// already excludes every name spec.Env holds, so as this function stands
+	// it cannot fire. What it is for is the edit that adds a third writer of
+	// spec.Env below the withholding branch, or reorders the two — at which
+	// point a failed create is a much better answer than a secret on a
+	// shared host's disk.
 	if spec.BootstrapToken != "" {
 		for _, name := range spec.SecretNames {
 			if _, both := spec.Env[name]; both {

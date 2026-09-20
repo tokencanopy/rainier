@@ -165,6 +165,13 @@ func TestGuestConnectedBecomesTheSessionsHub(t *testing.T) {
 func TestMintSessionBootstrapRidesTheControlConnection(t *testing.T) {
 	s, _ := testMicrovmServer(t)
 	s.reg.put("sess-mint", &sessionEntry{id: "sess-mint", state: "running"})
+	// A real sandbox on the far side, so "the answer did not reach the
+	// guest" is something this test can actually observe rather than
+	// something the absence of a hub makes true by accident.
+	guest, host := net.Pipe()
+	defer guest.Close()
+	s.GuestConnected("sess-mint", relay.NetConn(host))
+	waitForHub(t, s, "sess-mint")
 
 	fc := newFakeControld(t, testToken)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -218,10 +225,112 @@ func TestMintSessionBootstrapRidesTheControlConnection(t *testing.T) {
 		t.Fatal("the mint never returned")
 	}
 
-	// And the answer did NOT reach the sandbox: the runner is a forwarder
-	// for everything the sandbox asked and a participant only in this one.
-	if _, ok := s.reg.hub("sess-mint"); ok {
-		t.Fatal("this fixture has no sandbox; the assertion below would prove nothing")
+	// And the answer did NOT reach the sandbox. The runner is a pure
+	// forwarder for everything the sandbox asked and a participant only in
+	// this one, so a response on its own id must be consumed here — if it
+	// were forwarded, the guest would receive a `resp` for a request it
+	// never made and its dispatcher would log an unknown id.
+	_ = guest.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, err := guest.Read(make([]byte, 256)); err == nil {
+		t.Fatalf("the runner forwarded its own answer into the sandbox (%d bytes)", n)
+	}
+}
+
+// TestASandboxMayNotMintItsOwnBootstrapToken is the fence on the one door an
+// untrusted peer has into the control plane's method table.
+//
+// The token is single-use and lives 120 seconds, and both of those mean
+// nothing if a guest can ask for a fresh one whenever it likes: it would hold
+// an unbounded, self-renewing capability to re-read its environment's current
+// secrets. controld cannot make this check — a session_req proves only that
+// SOME runner sent it — so the runner refuses it here, and the refusal is not
+// conditional on the driver, because a Docker sandbox is on the same channel.
+func TestASandboxMayNotMintItsOwnBootstrapToken(t *testing.T) {
+	s, _ := testMicrovmServer(t)
+	s.reg.put("sess-guard", &sessionEntry{id: "sess-guard", state: "running"})
+	guest, host := net.Pipe()
+	defer guest.Close()
+	s.GuestConnected("sess-guard", relay.NetConn(host))
+	waitForHub(t, s, "sess-guard")
+
+	// Nothing may be forwarded upstream, so the sink records what was.
+	forwarded := make(chan runner.RPCEnvelope, 4)
+	s.SetOnSessionRPC(func(_ string, env runner.RPCEnvelope) { forwarded <- env })
+	defer s.SetOnSessionRPC(nil)
+
+	sandbox := relay.NetConn(guest)
+	for _, tc := range []struct {
+		name       string
+		ev         relay.ControlEvent
+		wantReason string
+	}{
+		{
+			name:       "the mint method itself",
+			ev:         relay.ControlEvent{Kind: "req:" + runner.MethodMintSessionBootstrap, ID: 7, Payload: []byte(`{"protocol":1}`)},
+			wantReason: "may not mint its own bootstrap token",
+		},
+		{
+			name: "an id from the runner's own space",
+			ev: relay.ControlEvent{Kind: "req:" + runner.MethodFetchSessionSecrets,
+				ID: runnerOriginatedIDBase | 9, Payload: []byte(`{"protocol":1,"token":"x"}`)},
+			wantReason: "reserved for the runner's own requests",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := json.Marshal(tc.ev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			frame, err := relay.Encode(relay.Frame{Type: relay.FrameControl, Payload: payload})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := sandbox.Write(ctx, frame); err != nil {
+				t.Fatal(err)
+			}
+
+			answer := readControlEvent(t, sandbox)
+			if answer.Kind != "resp" || answer.ID != tc.ev.ID || answer.OK {
+				t.Fatalf("the sandbox got %+v, want an ok:false resp for its own id", answer)
+			}
+			if reason := rpcErrorText(answer.Payload); !strings.Contains(reason, tc.wantReason) {
+				t.Fatalf("refusal = %q, want it to name %q", reason, tc.wantReason)
+			}
+			select {
+			case env := <-forwarded:
+				t.Fatalf("the request was forwarded to the control plane anyway: %+v", env)
+			default:
+			}
+		})
+	}
+
+	// And the methods a sandbox IS allowed to originate still go up
+	// untouched — the guard is two names and an id range, not a new
+	// allowlist that every future method has to be added to.
+	allowed := relay.ControlEvent{Kind: "req:" + runner.MethodFetchSessionSecrets, ID: 11,
+		Payload: []byte(`{"protocol":1,"token":"x"}`)}
+	payload, err := json.Marshal(allowed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := relay.Encode(relay.Frame{Type: relay.FrameControl, Payload: payload})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := sandbox.Write(ctx, frame); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case env := <-forwarded:
+		if env.ID != 11 || env.Method != runner.MethodFetchSessionSecrets {
+			t.Fatalf("the forwarded request = %+v", env)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("an ordinary sandbox request was not forwarded")
 	}
 }
 

@@ -78,6 +78,7 @@ type SimulatedEngine struct {
 	states     map[string]VMMState
 	configs    map[string]VMMConfig
 	failOnStop map[string]error
+	failLaunch error
 }
 
 func NewSimulatedEngine() *SimulatedEngine {
@@ -158,9 +159,21 @@ func (s *SimulatedEngine) FailOnStop(id string, err error) {
 	s.failOnStop[id] = err
 }
 
+// FailLaunch makes every Launch fail with err, standing in for a VMM that
+// will not start — the one case that leaves a half-configured boot behind.
+// A nil err clears it.
+func (s *SimulatedEngine) FailLaunch(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failLaunch = err
+}
+
 func (s *SimulatedEngine) Launch(_ context.Context, cfg VMMConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failLaunch != nil {
+		return s.failLaunch
+	}
 	s.states[cfg.ID] = VMMStateRunning
 	s.configs[cfg.ID] = cfg
 	s.saveState(cfg.ID, VMMStateRunning)

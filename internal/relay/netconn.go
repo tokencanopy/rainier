@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net"
 	"sync"
-	"time"
 )
 
 // NetConn adapts a byte STREAM to Conn, which is a message interface.
@@ -45,9 +44,12 @@ func NetConn(c net.Conn) Conn {
 }
 
 const (
-	// netConnReadBuffer is the reader's initial buffer. A control frame is
-	// a few hundred bytes and a terminal frame a few KiB; the buffer grows
-	// for the rare large one rather than being sized for it.
+	// netConnReadBuffer is the reader's buffer, and it is FIXED —
+	// bufio.Reader never grows one. A frame larger than it is assembled a
+	// bufferful at a time by the ErrBufferFull loop in Read, which is what
+	// keeps a 64 KiB buffer from being a 64 KiB frame limit. A control frame
+	// is a few hundred bytes and a terminal frame a few KiB, so the common
+	// case takes one pass.
 	netConnReadBuffer = 64 << 10
 	// maxFrameBytes is the largest single message this transport will
 	// assemble, matching the WebSocket ends' SetReadLimit.
@@ -69,18 +71,33 @@ type netConn struct {
 var ErrFrameTooLarge = errors.New("relay: frame over the transport's size limit")
 
 func (n *netConn) Read(ctx context.Context) ([]byte, error) {
-	// A cancelled ctx unblocks the read by poisoning the conn's deadline,
-	// which is the only thing that can interrupt a blocking stream read. It
-	// is one-shot by design: a cancelled context means this conn is over, and
-	// AfterFunc costs nothing on the path where it never fires.
+	// A cancelled context CLOSES the conn, which is the only thing that can
+	// interrupt a blocking stream read — and it is deliberately the same
+	// answer *websocket.Conn gives, rather than merely poisoning a deadline.
+	//
+	// The difference matters at one caller. connWriter.writeWithin bounds an
+	// exec frame's write and documents the transport's answer to an expired
+	// write context as closing the conn, "because closing it is what makes
+	// sessiond redial". A transport that instead left the conn readable and
+	// unwritable would leave a session whose output and RPC were silently
+	// dead upward while both ends still believed the conn was live — which
+	// is worse than either failing or working.
+	//
+	// It follows that no caller may bound a read or a write on a conn it
+	// wants to keep. cmd/sessiond's boot preamble is the one that tries, and
+	// it closes and re-dials rather than handing on a conn it may have
+	// broken.
 	if ctx.Done() != nil {
-		stop := context.AfterFunc(ctx, func() { _ = n.c.SetReadDeadline(time.Now()) })
+		stop := context.AfterFunc(ctx, func() { _ = n.c.Close() })
 		defer stop()
 	}
 	var line []byte
 	for {
 		chunk, err := n.r.ReadSlice('\n')
-		if len(line)+len(chunk) > maxFrameBytes {
+		// The terminator is not part of the message, so a frame of exactly
+		// maxFrameBytes is readable: the budget is the message's, and the
+		// one byte of framing is this transport's own.
+		if len(line)+len(chunk) > maxFrameBytes+1 {
 			return nil, ErrFrameTooLarge
 		}
 		line = append(line, chunk...)
@@ -90,10 +107,9 @@ func (n *netConn) Read(ctx context.Context) ([]byte, error) {
 		if errors.Is(err, bufio.ErrBufferFull) {
 			continue
 		}
-		if len(line) > 0 && errors.Is(err, net.ErrClosed) {
-			// A partial line at a closed conn is not a message.
-			return nil, err
-		}
+		// Anything else ends the read, whatever was accumulated: a line with
+		// no terminator is not a message, and handing half of one to the
+		// decoder would be worse than reporting the conn's own error.
 		return nil, err
 	}
 	// A JSON value never contains a bare newline or carriage return, so
@@ -113,12 +129,15 @@ func (n *netConn) Write(ctx context.Context, b []byte) error {
 		// and could not resynchronize from.
 		return errors.New("relay: a frame containing a newline cannot be framed by line")
 	}
-	if ctx.Done() != nil {
-		stop := context.AfterFunc(ctx, func() { _ = n.c.SetWriteDeadline(time.Now()) })
-		defer stop()
-	}
 	n.wmu.Lock()
 	defer n.wmu.Unlock()
+	// Same answer as Read's, and for the same reason: a cancelled write
+	// context closes the conn, which is what *websocket.Conn does and what
+	// connWriter.writeWithin's own doc comment relies on.
+	if ctx.Done() != nil {
+		stop := context.AfterFunc(ctx, func() { _ = n.c.Close() })
+		defer stop()
+	}
 	// One Write call, not two: a frame and its terminator must not be
 	// separable by a concurrent writer or by a short write in between.
 	out := make([]byte, 0, len(b)+1)

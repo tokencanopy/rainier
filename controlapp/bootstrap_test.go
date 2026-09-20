@@ -169,6 +169,58 @@ func TestCreateSpecFailsClosedWhenTheTokenCannotBeRecorded(t *testing.T) {
 	}
 }
 
+// TestAnUnreadablePlacementFailsAWithholdingCreateOnly is finding 6 of the
+// branch's own review, and the reason placedGeneration now reports whether
+// it could read anything.
+//
+// Zero has always been "not carried", and on an EVENT it fences nothing. The
+// same number is now also the generation a bootstrap token is minted
+// against, and there it is not inert: a token recorded at 0 against a row at
+// 3 is refused on its one and only exchange, as superseded by the very
+// placement that minted it — a store blip becoming a dead session with a
+// misleading reason and no way back, because a guest cannot re-mint.
+//
+// So a withholding create refuses, and every other create is dispatched
+// exactly as it always was. Both halves are asserted, because failing the
+// second would be a regression for the whole fleet.
+func TestAnUnreadablePlacementFailsAWithholdingCreateOnly(t *testing.T) {
+	// The row is deliberately never seeded, so the read-back GetSession
+	// makes cannot answer — the same shape as a store that is down.
+	row := control.Session{
+		ID: "sess_unplaced", WorkspaceID: "ws_example", State: control.StateCreating,
+		PoolID: "pool_example", RunnerID: "vm1",
+		Spec: control.PortableSpec{Image: "img:latest"},
+	}
+
+	t.Run("a withholding create refuses", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		fx.st.seedRunner(fleetSeededRunner("vm1", 2, 0, true))
+		fx.service.dispatchCreate(fleetCtx, "pool_example", row, "vm1",
+			[]string{runner.CapabilityMicrovmV1}, nil)
+
+		if got := fx.transport.dispatchedCommands(); len(got) != 0 {
+			t.Fatalf("dispatched %d command(s) with a placement it could not read: %+v", len(got), got)
+		}
+		if _, minted := fx.bootstraps.minted("sess_unplaced"); minted {
+			t.Fatal("a token was minted against a placement generation nobody could read")
+		}
+	})
+
+	t.Run("every other create is dispatched", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		fx.st.seedRunner(fleetSeededRunner("vm1", 2, 0, true))
+		fx.service.dispatchCreate(fleetCtx, "pool_example", row, "vm1", nil, nil)
+
+		got := fx.transport.dispatchedCommands()
+		if len(got) != 1 {
+			t.Fatalf("dispatched %d command(s), want 1 — an unreadable placement fences nothing here", len(got))
+		}
+		if got[0].PlacementGeneration != 0 {
+			t.Fatalf("placement generation = %d, want 0 (not carried)", got[0].PlacementGeneration)
+		}
+	})
+}
+
 // TestWithholdableNamesRespectsTheAgentHomeReservation pins that a
 // secret_ref spelled like an agent-home variable is dropped on BOTH paths.
 //

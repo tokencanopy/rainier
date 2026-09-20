@@ -317,18 +317,22 @@ func TestARefusedExchangeFailsTheBootChain(t *testing.T) {
 	boots := &bootstrapper{}
 
 	done := make(chan struct{})
-	var failure *bootFailure
-	var bootErr error
+	var (
+		conn    relay.Conn
+		failure *bootFailure
+		bootErr error
+	)
 	go func() {
 		defer close(done)
-		_, _, failure, bootErr = bootOverVsock(context.Background(), dial, boots)
+		conn, _, failure, bootErr = bootOverVsock(context.Background(), dial, boots)
 	}()
 
-	host := <-hosts
-	host.sendBootConfig(runner.BootConfig{
+	cfg := runner.BootConfig{
 		Protocol: runner.SessionBootstrapProtocolVersion, SessionID: "sess_example",
 		SecretNames: []string{"DEPLOY_KEY", "NPM_TOKEN"}, BootstrapToken: "token_example",
-	})
+	}
+	host := <-hosts
+	host.sendBootConfig(cfg)
 	req := host.nextRequest()
 	host.refuse(req.ID, "this session's bootstrap token has already been exchanged")
 
@@ -338,6 +342,9 @@ func TestARefusedExchangeFailsTheBootChain(t *testing.T) {
 	}
 	if failure == nil {
 		t.Fatal("a refused exchange did not fail the boot")
+	}
+	if conn != nil {
+		t.Fatal("a failed boot handed back a connection it may already have broken")
 	}
 	// The count, the plane's own condition, and no value or name.
 	if !strings.Contains(failure.Error(), "2 secret(s)") {
@@ -368,6 +375,77 @@ func TestARefusedExchangeFailsTheBootChain(t *testing.T) {
 	}
 	if !strings.Contains(string(script), "exit 1") {
 		t.Fatalf("the secrets stage does not fail:\n%s", script)
+	}
+
+	// And the session still comes up. This is the half that decides whether
+	// a user can see WHY: the boot chain has failed and said so, and the
+	// session now has to register so that the failure, the terminal and an
+	// attach are reachable at all.
+	//
+	// The token is spent — the control plane consumes it before it resolves
+	// anything — so the connection that carries the session must not
+	// re-present it. A sessiond that retried would be refused on every
+	// redial, `connect` would drop every connection, and a session that was
+	// merely missing its secrets would be off the air completely.
+	redial, err := dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	redialHost := <-hosts
+	redialDone := make(chan error, 1)
+	go func() { redialDone <- reBootstrap(context.Background(), redial, boots) }()
+	redialHost.sendBootConfig(cfg)
+	if err := <-redialDone; err != nil {
+		t.Fatalf("the connection after a failed boot was refused: %v", err)
+	}
+	if !redialHost.nothingMore(200 * time.Millisecond) {
+		t.Fatal("the redial re-presented a token the control plane had already spent")
+	}
+}
+
+// TestTheBootExchangeIsNumberedOutOfTheDispatchersSpace pins the id the boot
+// exchange uses, which is the one request this process makes before its RPC
+// dispatcher exists.
+//
+// It cannot be 1. The dispatcher counts from 1, so a boot exchange that
+// timed out and was answered late would have its `{"env": …}` matched to the
+// dispatcher's first call — an agent credential fetch, typically — which
+// would decode it as an empty credential set and report a shape it cannot
+// read for a request that was never answered.
+//
+// And it cannot carry the high bit, which runnerd reserves for its own
+// requests and refuses a sandbox for using.
+func TestTheBootExchangeIsNumberedOutOfTheDispatchersSpace(t *testing.T) {
+	cleanEnv(t)
+	dial, hosts := fakeTransport(t)
+	boots := &bootstrapper{}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _, _ = bootOverVsock(context.Background(), dial, boots)
+	}()
+	host := <-hosts
+	host.sendBootConfig(runner.BootConfig{
+		Protocol: runner.SessionBootstrapProtocolVersion, SessionID: "sess_example",
+		SecretNames: []string{"DEPLOY_KEY"}, BootstrapToken: "token_example",
+	})
+	req := host.nextRequest()
+	host.answer(req.ID, map[string]string{"DEPLOY_KEY": "value_example"})
+	<-done
+
+	if req.ID == 0 {
+		t.Fatal("the boot exchange carried no id")
+	}
+	// The dispatcher's own first id, which this must not collide with.
+	d := newRPCDispatcher()
+	d.online(&recordingSender{})
+	firstDispatcherID := d.seq.Add(1)
+	if req.ID == firstDispatcherID {
+		t.Fatalf("the boot exchange uses id %d, which is the dispatcher's first", req.ID)
+	}
+	if req.ID&(1<<63) != 0 {
+		t.Fatalf("the boot exchange uses id %d, which is in the runner's reserved space", req.ID)
 	}
 }
 

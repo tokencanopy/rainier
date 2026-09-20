@@ -36,7 +36,10 @@ func cleanupSnapshotRef(d Driver, ref string) {
 // rather than carrying anything at all. Docker's semantics are
 // strip-to-empty — the key survives the commit set to "" — which is why an
 // empty value passes here and not only an absent one.
-func assertStrippedFromImage(t *testing.T, d Driver, ref, value string, stripped []string) {
+// survivor is a key the create set that the caller did NOT strip, or "" when
+// there is none to name. It is what makes the microVM arm an assertion rather
+// than a statement about an empty list — see below.
+func assertStrippedFromImage(t *testing.T, d Driver, ref, value string, stripped []string, survivor string) {
 	t.Helper()
 	switch dd := d.(type) {
 	case *Docker:
@@ -68,11 +71,23 @@ func assertStrippedFromImage(t *testing.T, d Driver, ref, value string, stripped
 		if !ok {
 			t.Fatalf("no snapshot manifest for ref %q: nothing to assert the strip against", ref)
 		}
+		// The manifest has to actually DESCRIBE the create, or the strip
+		// assertion below is a statement about an empty list. survivor is a
+		// key the create set and the caller did not strip: if the driver
+		// stopped recording what a session was configured with, this fires
+		// first and the strip checks stop being vacuous silently.
+		if survivor != "" && !slices.Contains(keys, survivor) {
+			t.Fatalf("the committed manifest does not describe the create at all "+
+				"(no %s among %v), so the strip below would assert nothing", survivor, keys)
+		}
 		for _, k := range stripped {
 			if slices.Contains(keys, k) {
 				t.Fatalf("stripped key %s survived into the committed manifest: %v", k, keys)
 			}
 		}
+		// Keys and no values, checked against the raw bytes rather than the
+		// decoded keys: the manifest type has no field a value could live in
+		// today, and this is what would notice if one were added.
 		if raw := dd.snapshotManifestBytes(ref); strings.Contains(string(raw), value) {
 			t.Fatalf("the committed manifest carries a stripped value:\n%s", raw)
 		}
@@ -267,15 +282,27 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 		h, err := d.Create(ctx, Spec{
 			Name: "t9", Image: "", SessionID: "s9", DialURL: "ws://x",
 			Setup: "true",
-			Env:   map[string]string{"CONTRACT_SECRET": "must-not-survive"},
+			// CONTRACT_KEPT stands for the configuration a create legitimately
+			// carries — an agent-home path, a manifest — and is what proves
+			// the committed configuration describes this create at all.
+			// CONTRACT_SECRET is the one being stripped.
+			Env: map[string]string{
+				"CONTRACT_SECRET": "must-not-survive",
+				"CONTRACT_KEPT":   "configuration-not-a-credential",
+			},
 			// The token is here so this subtest can still be written for a
 			// driver that refuses secret VALUES without one — which is the
 			// twelfth subtest below, and is the microVM driver. The Docker
 			// driver ignores the field entirely (nothing in runArgs reads
-			// it), so its create is the one it has always been. Without a
-			// token this create would be a refusal on one driver and a
-			// snapshot on the other, and the shared subtest would have
-			// stopped being shared.
+			// it), so its create is the one it has always been.
+			//
+			// The PAIRING is synthetic and worth saying so: the control plane
+			// never sends a secret value together with a token — that is the
+			// whole of §3, and createSpec checks it. What it does send with a
+			// token is the configuration CONTRACT_KEPT stands for. This
+			// subtest keeps the secret-shaped value because stripping is what
+			// it is about, and the rule the plane actually keeps is pinned by
+			// the twelfth subtest below and by controlapp's own matrix.
 			BootstrapToken: "contract-token-example",
 		})
 		if err != nil {
@@ -293,7 +320,7 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 		if snap.Ref != ref {
 			t.Fatalf("snapshot ref = %q, want %q verbatim", snap.Ref, ref)
 		}
-		assertStrippedFromImage(t, d, ref, "must-not-survive", strip)
+		assertStrippedFromImage(t, d, ref, "must-not-survive", strip, "CONTRACT_KEPT")
 	})
 
 	t.Run("a create carrying secret values and no token is refused", func(t *testing.T) {

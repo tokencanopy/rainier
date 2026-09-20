@@ -140,25 +140,6 @@ func (m *Microvm) vsockPaths(id string, boot int) (udsPath, listenPath string, e
 	return udsPath, listenPath, nil
 }
 
-// GuestSocketPath returns the host path a session's guest control channel is
-// currently listening on, and whether there is one — a cold-parked session
-// has none, because its VM is gone and so is its socket.
-//
-// It is exported for the same reason SnapshotEnvKeys and Volumes are: it is
-// how a test above this package can act like a guest, which is the only way
-// to assert what a guest actually receives without a VM. Nothing in
-// production reads it.
-func (m *Microvm) GuestSocketPath(sessionID string) (string, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, inst := range m.instances {
-		if inst.SessionID == sessionID && inst.channel != nil {
-			return inst.channel.path, true
-		}
-	}
-	return "", false
-}
-
 // guestChannel is one instance's host end of the vsock control channel: the
 // listener Firecracker forwards the guest's port-1024 connections to, and the
 // boot configuration whoever connects is handed as their first frame.
@@ -170,30 +151,25 @@ func (m *Microvm) GuestSocketPath(sessionID string) (string, bool) {
 // (*Microvm).Resume).
 type guestChannel struct {
 	listener net.Listener
-	path     string
-
-	mu   sync.Mutex
+	// listenPath is "<udsPath>_1024", the socket this end serves; udsPath is
+	// the one FIRECRACKER binds when it is told about the device. Both are
+	// held because both have to be removed: the second is not this process's
+	// to create, but a VM that died leaves it behind, and a later boot that
+	// found it would fail its PUT /vsock with "address already in use" for a
+	// path nothing is serving.
+	listenPath string
+	udsPath    string
+	// boot is the configuration whoever connects is handed. It is written
+	// once, at construction, and never again: a cold resume mints a new
+	// token and gets a new CHANNEL, because the socket path is per-boot too.
 	boot runner.BootConfig
+
+	mu sync.Mutex
 	// closed makes the accept loop's exit quiet: a listener closed by
 	// teardown reports an error like any other, and logging that as a
 	// failure would put a line in an operator's log for every session that
 	// ends normally.
 	closed bool
-}
-
-// setBoot replaces the configuration the next guest connection is handed. A
-// cold resume mints a new token, and the guest that comes up must get THAT
-// one — the retired token no longer works.
-func (g *guestChannel) setBoot(cfg runner.BootConfig) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.boot = cfg
-}
-
-func (g *guestChannel) currentBoot() runner.BootConfig {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.boot
 }
 
 func (g *guestChannel) close() {
@@ -203,9 +179,10 @@ func (g *guestChannel) close() {
 	if g.listener != nil {
 		_ = g.listener.Close()
 	}
-	// The socket file is the listener's own and goes with it. An absent one
-	// is not an error: a teardown that runs twice is ordinary.
-	_ = os.Remove(g.path)
+	// Both paths, and an absent one is not an error: a teardown that runs
+	// twice is ordinary, and a VM that never started leaves only one of them.
+	_ = os.Remove(g.listenPath)
+	_ = os.Remove(g.udsPath)
 }
 
 func (g *guestChannel) isClosed() bool {
@@ -220,13 +197,18 @@ func (g *guestChannel) isClosed() bool {
 // up, and Firecracker refuses a guest connection whose "<uds_path>_1024" does
 // not exist. A listener created after InstanceStart is a race whose loser is
 // a session that boots and is never configured.
-func (m *Microvm) openGuestChannel(sessionID, listenPath string, cfg runner.BootConfig) (*guestChannel, error) {
+func (m *Microvm) openGuestChannel(sessionID, udsPath, listenPath string, cfg runner.BootConfig) (*guestChannel, error) {
 	if err := os.MkdirAll(filepath.Dir(listenPath), microvmDirMode); err != nil {
 		return nil, fmt.Errorf("create the guest channel directory: %w", err)
 	}
-	// A socket left behind by a VM that is gone would make Listen fail with
-	// "address already in use" for a path nothing is listening on.
+	// Sockets left behind by a VM that is gone would make this Listen, or
+	// Firecracker's own bind at PUT /vsock, fail with "address already in
+	// use" for paths nothing is serving. A launch that failed after the
+	// device was configured leaves exactly that, and the boot counter does
+	// not advance past a failed attempt — so without this a session could
+	// never be resumed again on this runner.
 	_ = os.Remove(listenPath)
+	_ = os.Remove(udsPath)
 	ln, err := net.Listen("unix", listenPath)
 	if err != nil {
 		return nil, fmt.Errorf("listen on the guest control socket %s: %w", listenPath, err)
@@ -240,7 +222,7 @@ func (m *Microvm) openGuestChannel(sessionID, listenPath string, cfg runner.Boot
 		_ = os.Remove(listenPath)
 		return nil, fmt.Errorf("restrict the guest control socket %s: %w", listenPath, err)
 	}
-	g := &guestChannel{listener: ln, path: listenPath, boot: cfg}
+	g := &guestChannel{listener: ln, listenPath: listenPath, udsPath: udsPath, boot: cfg}
 	go m.acceptGuests(sessionID, g)
 	return g, nil
 }
@@ -277,7 +259,7 @@ func (m *Microvm) acceptGuests(sessionID string, g *guestChannel) {
 // redials, where a guest held by a channel nobody serves waits forever.
 func (m *Microvm) serveGuest(sessionID string, g *guestChannel, c net.Conn) {
 	conn := relay.NetConn(c)
-	if err := writeBootConfig(conn, g.currentBoot()); err != nil {
+	if err := writeBootConfig(conn, g.boot); err != nil {
 		log.Printf("microvm: session %s: sending the boot configuration: %v", sessionID, err)
 		_ = conn.Close()
 		return
@@ -395,8 +377,9 @@ func refuseUnwithheldEnv(spec Spec) error {
 	return fmt.Errorf(
 		"microvm: refusing to create session %s: its create carries %d environment value(s) and no bootstrap token, "+
 			"which means a control plane older than the session bootstrap exchange "+
-			"(docs/design/2026-09-20-microvm-bootstrap-token-and-vsock.md). A microVM host has no argv to hand a "+
-			"value to and will not write one to disk, so this session cannot be booted here until the control plane "+
-			"announces it withholds them for a runner announcing %q",
+			"(docs/design/2026-09-20-microvm-bootstrap-token-and-vsock.md). Not all of those values are necessarily "+
+			"secret — a session with a creator carries its agent-home configuration in the same block — but this host "+
+			"cannot tell them apart, has no argv to hand any of them to, and will not write one to disk. Upgrade the "+
+			"control plane to one that withholds them for a runner announcing %q",
 		spec.SessionID, len(spec.Env), runner.CapabilityMicrovmV1)
 }

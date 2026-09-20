@@ -240,6 +240,65 @@ func TestMicrovmColdResumeMintsAFreshTokenAndSocket(t *testing.T) {
 	}
 }
 
+// TestAFailedBootLeavesNoSocketBehind is finding 5 of this branch's own
+// review, and it is the difference between a session that can be resumed
+// again and one that cannot.
+//
+// Firecracker binds "<uds_path>" itself at PUT /vsock; the driver binds
+// "<uds_path>_1024". A launch that fails after the device was configured
+// leaves the first behind, and the boot counter does not advance past a
+// failed attempt — so the next resume would recompute the same path, and
+// Firecracker's bind would fail EADDRINUSE on a socket nothing is serving,
+// forever.
+func TestAFailedBootLeavesNoSocketBehind(t *testing.T) {
+	m, sim := testMicrovm(t, MicrovmOpts{TotalSlots: 4})
+	host := &stubMicrovmHost{}
+	m.SetHost(host)
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "sess-stale", BootstrapToken: "token_example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Destroy(ctx, h.ID)
+	udsPath, listenPath, err := m.vsockPaths(h.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Stand in for what Firecracker leaves at PUT /vsock: the simulated
+	// engine does not bind anything, so the file is created here and the
+	// assertion is about whether the DRIVER cleans it up.
+	if err := os.WriteFile(udsPath, nil, microvmFileMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Suspend(ctx, h.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{udsPath, listenPath} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("a cold park left %s behind: %v", p, err)
+		}
+	}
+
+	// And a resume whose launch fails must not poison the path it was going
+	// to use either: the next one recomputes the same one.
+	sim.FailLaunch(errors.New("the VMM refused to start"))
+	if _, err := m.Resume(ctx, h.ID); err == nil {
+		t.Fatal("a resume whose launch fails reported success")
+	}
+	_, secondListen, err := m.vsockPaths(h.ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(secondListen); !os.IsNotExist(err) {
+		t.Errorf("a failed resume left %s behind", secondListen)
+	}
+	sim.FailLaunch(nil)
+	if _, err := m.Resume(ctx, h.ID); err != nil {
+		t.Fatalf("the resume after a failed one: %v", err)
+	}
+}
+
 // TestMicrovmColdResumeFailsWhenTheTokenCannotBeMinted is the fail-closed
 // half: a resume that cannot get a token reports that, rather than booting a
 // guest that will ask for its secrets and be refused.

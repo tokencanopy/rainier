@@ -32,6 +32,12 @@ var _ driver.MicrovmHost = (*Server)(nil)
 // serveSessionConn blocks for the life of the conn — a loop that waited would
 // never accept the guest's next dial.
 //
+// The context is this runner's own and not a request's, which is the one
+// difference from the WebSocket door: there is no request. The hub's life is
+// then bounded by the conn and by hub.Close(), which is what
+// serveSessionConn's own teardown already relies on — `register` blocks on
+// hub.Done() exactly because r.Context() does not reflect the socket dying.
+//
 // The session id is the DRIVER's, taken from the socket path Firecracker
 // forwarded the connection to, and not anything the guest said. That is the
 // whole difference between this door and the WebSocket one, where `register`
@@ -63,6 +69,39 @@ const runnerOriginatedIDBase uint64 = 1 << 63
 // isRunnerOriginated reports whether an id came from this runner's own
 // counter. forwardSessionRPC asks before it routes a response into a sandbox.
 func isRunnerOriginated(id uint64) bool { return id&runnerOriginatedIDBase != 0 }
+
+// refuseSandboxOrigin reports why an upward request must not be forwarded,
+// or "" when it may be. It is the fence on the one door an untrusted peer
+// has into the control plane's method table.
+//
+// Two things are refused, and only this hop can refuse either of them.
+//
+// A sandbox may not mint its own bootstrap token. The design's whole point
+// is that the token is SINGLE-USE and lives 120 seconds: a guest that could
+// ask for a fresh one whenever it liked would hold an unbounded, self-
+// renewing capability to re-read its environment's current secrets, which is
+// the property being removed rather than added. The method exists for a COLD
+// RESUME, which is a thing the runner does and the guest cannot observe, and
+// controld cannot tell the two apart — a "session_req" proves only that some
+// runner sent it, and which end of the runner originated it is a fact only
+// the runner has. (This applies to a Docker sandbox too, which is why it is
+// not conditional on the driver.)
+//
+// And a sandbox may not use an id from the runner's own space. The high bit
+// is how a response is routed back to a caller inside this process rather
+// than into the sandbox (see forwardSessionRPC), and an id space the
+// untrusted end can write into is not a space: a guest choosing
+// 1<<63|n could have controld's echo delivered to a cold resume that is
+// waiting on that number.
+func refuseSandboxOrigin(method string, id uint64) string {
+	switch {
+	case method == runner.MethodMintSessionBootstrap:
+		return "a sandbox may not mint its own bootstrap token; a fresh one is minted by the runner on a cold resume"
+	case isRunnerOriginated(id):
+		return "this request id is reserved for the runner's own requests"
+	}
+	return ""
+}
 
 // runnerRPCTable is the pending table for requests this runner originated.
 //

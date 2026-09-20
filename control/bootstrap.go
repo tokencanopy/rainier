@@ -87,5 +87,15 @@ type SessionBootstrapStore interface {
 	// It returns nothing but an error on purpose. The VALUES the token buys
 	// are not the store's to know — they are resolved above it, from the
 	// environment, by the one component that holds the secrets key.
+	//
+	// When more than one refusal applies, they are reported in this order:
+	// Unknown, Fenced, Expired, Spent. The order is part of the contract
+	// rather than each store's own choice, because it is what an operator
+	// reads: two implementations that disagreed about whether a replayed,
+	// expired token is "expired" or "already exchanged" would make the same
+	// fleet describe the same failure two ways. It runs from the most
+	// structural fact to the most transient, and it puts the hash first so
+	// that a caller holding no valid token learns nothing at all about the
+	// state of the one that exists.
 	ConsumeSessionBootstrap(ctx context.Context, ws WorkspaceID, id SessionID, hash string, gen uint64, now time.Time) error
 }

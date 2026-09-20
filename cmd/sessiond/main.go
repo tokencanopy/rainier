@@ -97,6 +97,12 @@ func main() {
 		dialer    dialSession
 		preamble  func(context.Context, relay.Conn) error
 		firstConn relay.Conn
+		// overVsock is what puts this process in relay mode on the microVM
+		// path, and it is NOT "firstConn != nil": a boot whose exchange was
+		// refused closes its connection and dials again, and such a session
+		// is still very much in relay mode — it has a boot chain to fail
+		// loudly through.
+		overVsock bool
 		boots     = &bootstrapper{}
 		// secretsFailure is a boot that must not start an agent: the
 		// environment declared credentials this session could not be given.
@@ -114,7 +120,7 @@ func main() {
 			// egress goes. Dying is what makes the runner notice.
 			log.Fatalf("microvm boot: %v", err)
 		}
-		firstConn = conn
+		firstConn, overVsock = conn, true
 		if *sessionID == "" {
 			*sessionID = cfg.SessionID
 		}
@@ -144,7 +150,7 @@ func main() {
 	// A vsock session is in relay mode by construction: it HAS a connection,
 	// it just did not get it from a URL. Everything gated on relay mode
 	// below reads this rather than the flag.
-	relayMode := *dial != "" || firstConn != nil
+	relayMode := *dial != "" || overVsock
 	var stages []bootStage
 	if bootEnvironment.any() && !relayMode {
 		// Can't happen from the driver (it injects RAINIER_DIAL alongside), but

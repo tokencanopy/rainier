@@ -35,11 +35,30 @@ const (
 	// sits under the bootstrap token's own 120-second lifetime, so a refusal
 	// is an answer rather than an expiry.
 	secretsExchangeWait = 30 * time.Second
+	// bootDialAttempts and bootDialBackoff bound the retry on the very first
+	// dial. Everything else in this process redials with backoff for the
+	// life of the session, and the one dial that could not was the one whose
+	// failure is fatal — a guest whose kernel brought /dev/vsock up a moment
+	// after sessiond started, or a host whose accept loop was one scheduling
+	// quantum behind, would have taken the session down for a condition that
+	// resolves itself. The bound exists because a guest that genuinely has
+	// no channel must fail rather than sit in a loop nobody can see.
+	bootDialAttempts = 10
+	bootDialBackoff  = 500 * time.Millisecond
 	// secretsRequestID is the id this end assigns its boot-time exchange.
+	//
 	// The request is made before the RPC dispatcher is serving — there is no
-	// session to serve for yet — so it is numbered by hand, and the
-	// dispatcher's counter is seeded past it (see bootstrapper.exchange).
-	secretsRequestID = 1
+	// session to serve for yet — so it is numbered by hand, and it is
+	// numbered OUT OF the dispatcher's space rather than at the bottom of
+	// it. The dispatcher counts from 1, so a boot exchange numbered 1 whose
+	// answer arrived late would be matched to the first call the dispatcher
+	// made afterwards (an agent credential fetch, typically) and answered
+	// with a body that method cannot read.
+	//
+	// It stays clear of runnerd's own reserved space too: that is the high
+	// BIT (1<<63), and a request carrying it is refused at the runner as a
+	// sandbox using an id that is not its to use.
+	secretsRequestID = 1 << 62
 )
 
 // bootstrapper is the guest side of the boot: it reads a configuration off
@@ -56,8 +75,19 @@ const (
 // needed.
 type bootstrapper struct {
 	mu sync.Mutex
-	// spent is the token whose exchange succeeded, if any.
-	spent string
+	// attempted is the last token this session sent a request for, whatever
+	// the answer was.
+	//
+	// ATTEMPTED and not "spent", which is the difference between a session
+	// that recovers and one that does not. A token is consumed by the
+	// control plane BEFORE the secrets are resolved, so a refused or
+	// timed-out exchange has spent it just as surely as a successful one;
+	// retrying it can only ever be refused. A sessiond that keyed on success
+	// would re-exchange a dead token on every redial, fail the preamble
+	// every time, and take a session that was merely missing its secrets —
+	// and had already said so, loudly, as a failed boot stage — off the air
+	// entirely.
+	attempted string
 	// delivered are the names this session has been given values for, kept
 	// so a cold suspend can forget them by name. NAMES, never values: what
 	// was delivered lives in the process environment and nowhere else.
@@ -137,9 +167,15 @@ func (b *bootstrapper) exchange(ctx context.Context, conn relay.Conn, cfg runner
 		return nil, nil
 	}
 	b.mu.Lock()
-	alreadySpent := cfg.BootstrapToken != "" && cfg.BootstrapToken == b.spent
+	already := cfg.BootstrapToken != "" && cfg.BootstrapToken == b.attempted
+	if !already {
+		// Recorded BEFORE the request goes out, not after it succeeds: the
+		// control plane spends the token when it receives it, so a request
+		// that was sent has spent it whatever comes back.
+		b.attempted = cfg.BootstrapToken
+	}
 	b.mu.Unlock()
-	if alreadySpent {
+	if already {
 		return nil, nil
 	}
 	if cfg.BootstrapToken == "" {
@@ -197,9 +233,6 @@ func (b *bootstrapper) exchange(ctx context.Context, conn relay.Conn, cfg runner
 			// message quotes what it choked on, and that is the secret.
 			return nil, undeliveredSecrets(len(cfg.SecretNames), "the answer could not be decoded")
 		}
-		b.mu.Lock()
-		b.spent = cfg.BootstrapToken
-		b.mu.Unlock()
 		return answer.Env, nil
 	}
 }
@@ -233,7 +266,10 @@ func (b *bootstrapper) forget() int {
 	b.mu.Lock()
 	names := b.delivered
 	b.delivered = nil
-	b.spent = ""
+	// `attempted` is deliberately NOT cleared. The token this session was
+	// handed is spent whether or not this process still holds its values,
+	// and a resume brings a new one — so forgetting which token was already
+	// presented would only make the next connection re-present a dead one.
 	b.mu.Unlock()
 	for _, n := range names {
 		_ = os.Unsetenv(n)
@@ -349,7 +385,7 @@ func applyBootConfig(cfg runner.BootConfig, secrets map[string]string) error {
 // that the boot chain fails loudly enough for a person to see why. The
 // caller turns it into a failing stage.
 func bootOverVsock(ctx context.Context, dial dialSession, b *bootstrapper) (relay.Conn, runner.BootConfig, *bootFailure, error) {
-	conn, err := dial(ctx)
+	conn, err := dialBoot(ctx, dial)
 	if err != nil {
 		return nil, runner.BootConfig{}, nil, err
 	}
@@ -361,15 +397,30 @@ func bootOverVsock(ctx context.Context, dial dialSession, b *bootstrapper) (rela
 	secrets, xerr := b.exchange(ctx, conn, cfg)
 	var failure *bootFailure
 	if xerr != nil {
-		if bf, ok := xerr.(*bootFailure); ok {
-			failure = bf
-		} else {
+		bf, ok := xerr.(*bootFailure)
+		if !ok {
 			_ = conn.Close()
 			return nil, cfg, nil, xerr
 		}
+		failure = bf
+		// The conn is NOT handed back on a failed exchange. It may be
+		// perfectly good (a refusal) or it may not (a timeout, which ends
+		// the read by poisoning the conn's deadline), and the boot has no
+		// way to tell — so it is closed and dialLoop dials a fresh one. The
+		// cost is one extra connection on a session that is about to fail
+		// its boot chain anyway; the alternative is serving a conn that may
+		// already be dead and discovering it one frame later.
+		//
+		// The re-dial is safe precisely because the token is recorded as
+		// ATTEMPTED: the preamble on the new connection reads the
+		// configuration again and asks for nothing.
+		_ = conn.Close()
+		conn = nil
 	}
 	if err := applyBootConfig(cfg, secrets); err != nil {
-		_ = conn.Close()
+		if conn != nil {
+			_ = conn.Close()
+		}
 		return nil, cfg, nil, err
 	}
 	b.remember(namesOf(secrets))
@@ -383,10 +434,19 @@ func bootOverVsock(ctx context.Context, dial dialSession, b *bootstrapper) (rela
 // session has not spent — which is what a cold resume brings and a redial
 // does not.
 //
-// A failure here is an error rather than a failed boot chain: the session is
-// already running, its agent already has whatever it was given, and the
-// answer to a refused re-exchange is to try the next connection rather than
-// to tear down a live session.
+// The two failures it can meet are answered differently, and the difference
+// is the difference between a session that recovers and one that vanishes.
+//
+// A configuration that never arrived means this conn is not usable, so the
+// error is returned and dialLoop backs off and dials another.
+//
+// A refused EXCHANGE does not: the session is already running, its agent
+// already has whatever it was given, and it has already reported a failed
+// boot chain if it was given nothing. Tearing the conn down there would take
+// a session that was merely missing its secrets off the air completely — no
+// terminal, no attach, no events — for as long as the refusal persisted,
+// which for a spent token is forever. So it is logged and the connection is
+// served.
 func reBootstrap(ctx context.Context, conn relay.Conn, b *bootstrapper) error {
 	cfg, err := readBootConfig(ctx, conn)
 	if err != nil {
@@ -394,7 +454,9 @@ func reBootstrap(ctx context.Context, conn relay.Conn, b *bootstrapper) error {
 	}
 	secrets, xerr := b.exchange(ctx, conn, cfg)
 	if xerr != nil {
-		return xerr
+		log.Printf("this session's secrets were not re-delivered on a new connection (%v); "+
+			"serving it anyway — the session is running and has already reported what it was given", xerr)
+		return nil
 	}
 	if len(secrets) == 0 {
 		return nil
@@ -405,6 +467,34 @@ func reBootstrap(ctx context.Context, conn relay.Conn, b *bootstrapper) error {
 	b.remember(namesOf(secrets))
 	log.Printf("sessiond re-applied %d environment secret(s) after a resume", len(secrets))
 	return nil
+}
+
+// dialBoot is the first dial, with the retry every later one already has.
+//
+// A failure here is fatal to the session, which is why it is the one dial
+// that must not give up on the first refusal: a guest whose /dev/vsock came
+// up a moment after this process did, or a host whose accept loop was a
+// scheduling quantum behind, is a condition that resolves itself in
+// milliseconds. A guest that genuinely has no channel still fails, and still
+// fails quickly.
+func dialBoot(ctx context.Context, dial dialSession) (relay.Conn, error) {
+	var err error
+	for attempt := 1; ; attempt++ {
+		var conn relay.Conn
+		conn, err = dial(ctx)
+		if err == nil {
+			return conn, nil
+		}
+		if attempt >= bootDialAttempts || ctx.Err() != nil {
+			return nil, fmt.Errorf("after %d attempt(s): %w", attempt, err)
+		}
+		log.Printf("the host control channel is not answering yet (%v); retrying", err)
+		select {
+		case <-time.After(bootDialBackoff):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 }
 
 // namesOf returns a map's keys. Names, which are not values — the same

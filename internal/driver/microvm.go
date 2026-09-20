@@ -917,7 +917,7 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 	if err != nil {
 		return nil, err
 	}
-	channel, err := m.openGuestChannel(spec.SessionID, listenPath, bootCfg)
+	channel, err := m.openGuestChannel(spec.SessionID, udsPath, listenPath, bootCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -1090,7 +1090,7 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		if channel, err = m.openGuestChannel(sessionID, listenPath, bootCfg); err != nil {
+		if channel, err = m.openGuestChannel(sessionID, udsPath, listenPath, bootCfg); err != nil {
 			return false, err
 		}
 		cfg.VsockUDSPath = udsPath

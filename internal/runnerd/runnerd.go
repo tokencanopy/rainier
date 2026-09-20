@@ -1240,6 +1240,21 @@ func (s *Server) routeControl(id string, boot, reg uint64, payload []byte) {
 			log.Printf("session %s: unknown control kind %q", id, ev.Kind)
 			return
 		}
+		// The forwarder is generic, and that is its whole value — but it is
+		// also an untrusted peer's door into the control plane's method
+		// table, so the two things that are NOT a sandbox's to send are
+		// refused here rather than upstream. controld cannot make this check
+		// itself: a "session_req" proves only that some runner sent it, and
+		// which end of the runner originated it is a fact only the runner
+		// has.
+		if refusal := refuseSandboxOrigin(method, ev.ID); refusal != "" {
+			log.Printf("session %s: refusing %q from a sandbox: %s", id, method, refusal)
+			if err := s.sendSessionRPC(id, runner.RPCEnvelope{ID: ev.ID, Method: "resp",
+				Payload: rpcErrorPayload(refusal)}); err != nil {
+				log.Printf("session %s: refusing %q locally: %v", id, method, err)
+			}
+			return
+		}
 		if s.fireSessionRPC(id, runner.RPCEnvelope{ID: ev.ID, Method: method, Payload: ev.Payload}) {
 			return
 		}
