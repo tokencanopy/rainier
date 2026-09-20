@@ -243,6 +243,35 @@ socket in a workspace must not be able to defeat the durability barrier. The
 skipped count is in the manifest and in the report, so "not the tree the user
 named" is at least never silent.
 
+Three details about what a header carries, each of which is a decision rather
+than a default.
+
+**Modification times are whole seconds.** tar's header field is seconds;
+sub-second precision exists only as a PAX extended record, which costs a 1 KiB
+block *per entry* — a million-file tree would pay a gigabyte for nanoseconds no
+build tool asks for. The truncation happens in this package rather than in
+`archive/tar` (which would do it silently) so that the tree digest can commit to
+the same value a restore reproduces.
+
+**A directory's and a symlink's modification time are not carried at all**, and
+are pinned to the Unix epoch in the header. Neither is restored — a directory's
+mtime is a function of the order its children were written, and `os.Chtimes` on
+a symlink is not in the standard library — and carrying a value the format does
+not preserve would cost the property that makes the rest of this note work: with
+them pinned, *the plaintext stream is a function of exactly what the tree digest
+commits to*. Two checkpoints of the same tree have byte-identical plaintext
+(their ciphertext differs, because the data key is fresh per checkpoint),
+re-checkpointing a restored tree reproduces the same tree digest and the same
+plaintext length, and a future differential format has something stable to diff
+against.
+
+**A hard link travels as an independent regular file.** An `fs.FS` does not
+expose link counts, so this is what falls out naturally rather than a choice
+that was available to make differently; the fidelity loss (two names that shared
+an inode no longer do) is recorded here because it is real, and the alternative —
+refusing a tree that contains one — would be a workspace that cannot be
+checkpointed, which is strictly worse.
+
 The plaintext stream is cut into fixed-size frames (default 1 MiB, every frame
 but the last exactly that size) and each frame is sealed with AES-256-GCM:
 
@@ -555,10 +584,8 @@ tree = SHA-256 over, in stream order, for each entry:
 ```
 
 Directory and symlink modification times are excluded, because the restorer does
-not set them — a directory's mtime is a function of the order its children were
-written, and `os.Chtimes` on a symlink is not in the standard library. Excluding
-what cannot be restored is what keeps the digest an equality and not an
-aspiration.
+not set them and §4.3 does not even carry them. Excluding what cannot be restored
+is what keeps the digest an equality and not an aspiration.
 
 ## 8. How a destination proves authorization and key readiness
 
@@ -709,8 +736,14 @@ func (*Reader) Delete(ctx context.Context, c Context) error
 
 type Manifest struct{ … }
 func ParseManifest(b []byte) (Manifest, error)
+func (Manifest) Encode() ([]byte, error)
 func (Manifest) Summary() Summary         // the content-free operational view
 ```
+
+`Reader.Delete` removes both objects, manifest first, so that an interrupted
+deletion leaves the unreadable state and never the readable one (§10). It is
+idempotent: a missing manifest is success, because a deletion ledger that cannot
+report "already gone" as done never converges.
 
 Storage keys are derived from the prefix and the context, so a restoring caller
 needs only the two things a control plane already holds and never plumbs an
@@ -721,7 +754,15 @@ key, wrong context and tampered bytes, as `seal.go` does and for the same
 reason — the distinction is not actionable and the detail is not safe),
 `ErrManifest`, `ErrFormatVersion`, `ErrContextMismatch`, `ErrTruncated`,
 `ErrTrailingData`, `ErrExists`, `ErrNotFound`, `ErrNoAuthorization`,
-`ErrNotAuthorized`, `ErrTargetNotEmpty`, `ErrSource`.
+`ErrNotAuthorized`, `ErrKeyUnavailable`, `ErrTargetNotEmpty`, `ErrRestore`,
+`ErrSource`, `ErrEntry`, `ErrMismatch`, `ErrTooLarge`, `ErrInvalid`.
+
+Two of those distinctions are load-bearing rather than cosmetic.
+`ErrKeyUnavailable` is *not* folded into `ErrAuth`, because "this key version is
+not replicated here yet" and "somebody tampered with this checkpoint" have
+opposite operator actions, and a key service's transport failure must not be
+reportable as tampering. And a `Wrapper`'s error is passed through rather than
+flattened, for the same reason — a throttled KMS is not a corrupted checkpoint.
 
 **No error carries a path, a file name, a symlink target, a file byte, a key, a
 wrapped key, or a nonce.** §4.2 counts paths as content and §15.1 forbids

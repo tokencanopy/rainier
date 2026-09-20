@@ -41,6 +41,10 @@ test -d runnerplane
 test -f runnerplane/doc.go
 go list ./runnerplane >/dev/null
 
+test -d checkpoint
+test -f checkpoint/doc.go
+go list ./checkpoint >/dev/null
+
 # ---------------------------------------------------------------------------
 # 1. import hygiene
 # ---------------------------------------------------------------------------
@@ -58,8 +62,14 @@ go list ./runnerplane >/dev/null
 # which attachplane's tests pin its own conn against (its shipped code does
 # not import it). Every other row applies to every package unchanged, and the
 # application packages above the wire and the planes get no relaxation.
+#
+# checkpoint is the portable workspace checkpoint format and library. It gets no
+# relaxation at all: it speaks to object storage only through its own
+# put-if-absent port, to a key service only through its own wrapper port, and to
+# no provider SDK ever — which is what "restorable on another qualified
+# provider" has to mean in code rather than in a document.
 bad_imports=0
-for pkg in control controlapp controlapp/repotest v0wire attachplane runnerplane; do
+for pkg in control controlapp controlapp/repotest v0wire attachplane runnerplane checkpoint; do
   http_ok=0; ws_ok=0; relay_ok=0
   case "$pkg" in
     v0wire)      http_ok=1 ;;
