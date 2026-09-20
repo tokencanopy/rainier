@@ -212,10 +212,11 @@ func (m *MemoryStore) Object(key string) ([]byte, bool) {
 	return bytes.Clone(b), true
 }
 
-// Overwrite replaces the bytes at key, bypassing put-if-absent. It is spelled
-// unattractively because that is its whole purpose: the tamper tests need to
-// corrupt a stored object, and no other caller should want this.
-func (m *MemoryStore) Overwrite(key string, b []byte) {
+// overwrite replaces the bytes at key, bypassing put-if-absent. The tamper tests
+// need to corrupt a stored object; nothing else does, which is why it is
+// unexported — a put-if-absent bypass on the public surface of a package whose
+// atomicity story IS put-if-absent would be an odd thing to ship.
+func (m *MemoryStore) overwrite(key string, b []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.objects[key] = bytes.Clone(b)

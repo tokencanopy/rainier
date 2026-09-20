@@ -61,8 +61,10 @@ func NewWriter(store BlobStore, keys Wrapper, opts WriterOptions) (*Writer, erro
 	if err := validPrefix(opts.Prefix); err != nil {
 		return nil, err
 	}
-	if len(opts.KeyRef) > maxKeyRefLen {
-		return nil, fmt.Errorf("%w: the key reference is over the %d character limit", ErrInvalid, maxKeyRefLen)
+	if opts.KeyRef != "" {
+		if err := validKeyRef(opts.KeyRef); err != nil {
+			return nil, err
+		}
 	}
 	if opts.FrameSize == 0 {
 		opts.FrameSize = DefaultFrameSize
@@ -137,19 +139,20 @@ func (w *Writer) Write(ctx context.Context, c Context, src Source) (Result, erro
 	if err != nil {
 		return Result{}, fmt.Errorf("checkpoint: wrapping the checkpoint key: %w", err)
 	}
-	switch {
-	case usedRef == "":
+	if usedRef == "" {
 		return Result{}, fmt.Errorf("%w: the key wrapper did not report the key version it used", ErrInvalid)
-	case len(usedRef) > maxKeyRefLen:
-		return Result{}, fmt.Errorf("%w: the key wrapper reported a reference over the %d character limit", ErrInvalid, maxKeyRefLen)
-	case len(wrapped) < dekLen:
+	}
+	if err := validKeyRef(usedRef); err != nil {
+		return Result{}, fmt.Errorf("%w (reported by the key wrapper)", err)
+	}
+	if len(wrapped) < dekLen {
 		return Result{}, fmt.Errorf("%w: the key wrapper returned an implausibly short wrapped key", ErrInvalid)
 	}
 
 	contentKey := contentKeyFor(w.opts.Prefix, c, attempt)
 	var st writeStats
 	err = w.store.PutIfAbsent(ctx, contentKey, func(dst io.Writer) error {
-		return writeContent(dst, c, kContent, noncePrefix, w.opts.FrameSize, src, &st)
+		return writeContent(ctx, dst, c, kContent, noncePrefix, w.opts.FrameSize, src, &st)
 	})
 	if err != nil {
 		return Result{}, err
@@ -256,7 +259,7 @@ type writeStats struct {
 //
 // The stack is: tar.Writer -> frameWriter -> (counter, SHA-256) -> the store's
 // writer. Nothing in it buffers more than one frame.
-func writeContent(dst io.Writer, c Context, key, noncePrefix []byte, frameSize int64, src Source, st *writeStats) error {
+func writeContent(ctx context.Context, dst io.Writer, c Context, key, noncePrefix []byte, frameSize int64, src Source, st *writeStats) error {
 	counted := &countingWriter{w: dst}
 	digest := sha256.New()
 	fw, err := newFrameWriter(io.MultiWriter(counted, digest), c, key, noncePrefix, frameSize)
@@ -264,7 +267,7 @@ func writeContent(dst io.Writer, c Context, key, noncePrefix []byte, frameSize i
 		return err
 	}
 	tw := tar.NewWriter(fw)
-	if err := walkTree(src, tw, st); err != nil {
+	if err := walkTree(ctx, src, tw, st); err != nil {
 		return err
 	}
 	// tar's end-of-archive marker, then the final frame. Both must succeed before
@@ -288,13 +291,19 @@ func writeContent(dst io.Writer, c Context, key, noncePrefix []byte, frameSize i
 //
 // Refusals name the entry's ORDINAL and its kind, never its path — see errors.go
 // for why, and the design note's §14 for what it costs.
-func walkTree(src Source, tw *tar.Writer, st *writeStats) error {
+func walkTree(ctx context.Context, src Source, tw *tar.Writer, st *writeStats) error {
 	buf := make([]byte, copyBufSize)
 	tree := newTreeHasher()
 	entryDigest := sha256.New()
 	ordinal := int64(0)
 
 	err := fs.WalkDir(src.FS, ".", func(name string, d fs.DirEntry, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// Returned bare, not wrapped in an ErrSource sentence: a caller that
+			// cancelled wants errors.Is(err, context.Canceled) to be true, and
+			// nothing about the tree is wrong.
+			return ctxErr
+		}
 		if err != nil {
 			// fs.WalkDir hands back the file system's own error, which is an
 			// *fs.PathError carrying the path. Reduced, never forwarded.
@@ -368,8 +377,16 @@ func walkTree(src Source, tw *tar.Writer, st *writeStats) error {
 			// Close inside a WalkDir callback would hold one descriptor per file
 			// until the whole walk finished, which is O(entries) of exactly the
 			// resource this package promises to keep constant.
-			digest, err := writeFileEntry(tw, src.FS, name, info, buf, entryDigest)
-			if err != nil {
+			digest, err := writeFileEntry(ctx, tw, src.FS, name, info, buf, entryDigest)
+			switch {
+			case err == nil:
+			case errors.Is(err, ErrTooLarge), ctx.Err() != nil:
+				// Passed through rather than reduced to "entry N could not be
+				// read": neither one is a fact about the tree, and ErrTooLarge in
+				// particular is documented as part of this package's vocabulary,
+				// so it has to survive the trip out.
+				return err
+			default:
 				return fmt.Errorf("%w: entry %d %s", ErrSource, ordinal, err)
 			}
 			st.entries++
@@ -398,7 +415,7 @@ func walkTree(src Source, tw *tar.Writer, st *writeStats) error {
 // file's SHA-256. Its errors are fragments — "could not be opened (permission
 // denied)" — that walkTree prefixes with the ordinal, so that the ordinal is
 // stamped in exactly one place and no path ever is.
-func writeFileEntry(tw *tar.Writer, fsys fs.FS, name string, info fs.FileInfo, buf []byte, digest hash.Hash) ([]byte, error) {
+func writeFileEntry(ctx context.Context, tw *tar.Writer, fsys fs.FS, name string, info fs.FileInfo, buf []byte, digest hash.Hash) ([]byte, error) {
 	size := info.Size()
 	if err := tw.WriteHeader(&tar.Header{
 		Typeflag: tar.TypeReg,
@@ -417,9 +434,17 @@ func writeFileEntry(tw *tar.Writer, fsys fs.FS, name string, info fs.FileInfo, b
 
 	digest.Reset()
 	// Bounded by the size the header already promised, so a file that shrank
-	// under the walk fails rather than desynchronizing the stream.
-	n, err := io.CopyBuffer(io.MultiWriter(tw, digest), io.LimitReader(f, size), buf)
+	// under the walk fails rather than desynchronizing the stream. The context is
+	// checked once per copy buffer, so one enormous file does not make a
+	// cancelled suspend run to completion.
+	n, err := io.CopyBuffer(io.MultiWriter(tw, digest), io.LimitReader(&ctxReader{ctx: ctx, r: f}, size), buf)
 	if err != nil {
+		// A sentinel this package raised below the copy — the frame ceiling, a
+		// cancellation — is returned as itself. Only a file system's own failure
+		// is reduced to a category.
+		if errors.Is(err, ErrTooLarge) || ctx.Err() != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("could not be read (%s)", fsCategory(err))
 	}
 	if n != size {
@@ -503,9 +528,15 @@ func (f *frameWriter) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-// Close seals whatever is pending as the final frame. It is always at least one
-// frame: a tar stream is never empty, and even an empty one would produce a
-// final frame rather than a zero-frame checkpoint no reader could describe.
+// Close seals whatever is pending as the final frame, so a checkpoint always has
+// at least one.
+//
+// Closing a frame writer that was never written to produces a single empty final
+// frame, which no reader can read back — the manifest would have to claim one
+// frame and zero plaintext bytes, and that pair is refused both by
+// Manifest.validate (a tar stream is never shorter than its two trailing zero
+// blocks) and by frameReader. Unreachable through Write for exactly that reason:
+// tar.Writer.Close has already emitted 1024 bytes by the time this is called.
 func (f *frameWriter) Close() error {
 	if f.closed {
 		return nil

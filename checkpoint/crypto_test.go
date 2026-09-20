@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -53,7 +54,7 @@ func (c *committed) setManifestField(t *testing.T, field string, value any) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	c.h.store.Overwrite(c.res.ManifestKey, out)
+	c.h.store.overwrite(c.res.ManifestKey, out)
 }
 
 func TestManifestTamperFailsAuthentication(t *testing.T) {
@@ -97,7 +98,7 @@ func TestManifestTamperFailsAuthentication(t *testing.T) {
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("Verify error = %v, want %v", err, tc.want)
 			}
-			assertNoContentInError(t, err)
+			assertNoContentInError(t, "", err)
 		})
 	}
 }
@@ -189,7 +190,7 @@ func TestContentTamper(t *testing.T) {
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("Verify error = %v, want %v", err, tc.want)
 			}
-			assertNoContentInError(t, err)
+			assertNoContentInError(t, "", err)
 		})
 	}
 }
@@ -228,8 +229,8 @@ func TestContextSwapThroughThePublicAPI(t *testing.T) {
 			content, _ := c.h.store.Object(c.res.ContentKey)
 			attempt := c.res.ContentKey[strings.LastIndex(c.res.ContentKey, ".")+1:]
 			otherContent := contentKeyFor("checkpoints", other, attempt)
-			c.h.store.Overwrite(manifestKey("checkpoints", other), manifest)
-			c.h.store.Overwrite(otherContent, content)
+			c.h.store.overwrite(manifestKey("checkpoints", other), manifest)
+			c.h.store.overwrite(otherContent, content)
 
 			// As copied, the manifest still says whose it is.
 			if _, err := c.h.r.Verify(ctx, other); !errors.Is(err, ErrContextMismatch) {
@@ -253,7 +254,7 @@ func TestContextSwapThroughThePublicAPI(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			c.h.store.Overwrite(manifestKey("checkpoints", other), rewritten)
+			c.h.store.overwrite(manifestKey("checkpoints", other), rewritten)
 
 			if _, err := c.h.r.Verify(ctx, other); !errors.Is(err, ErrAuth) {
 				t.Fatalf("Verify after rewriting identity = %v, want ErrAuth", err)
@@ -468,20 +469,29 @@ func TestSubkeysAreDistinctAndContextBound(t *testing.T) {
 }
 
 // assertNoContentInError is the no-leak rule as a test: an error from this
-// package may not carry a fixture path, a fixture file's name, the planted
-// credential, or base64 that could be key material.
-func assertNoContentInError(t *testing.T, err error) {
+// package may not carry the fixture's own root path, a fixture file's name, or
+// the planted credential.
+//
+// The root is a PARAMETER rather than a guessed "/tmp/" prefix. t.TempDir
+// resolves under TMPDIR, which in this repository's test environment is not
+// under /tmp at all, so a hard-coded prefix is a check that can never fire —
+// which is worse than no check, because it reads like one.
+func assertNoContentInError(t *testing.T, root string, err error) {
 	t.Helper()
 	if err == nil {
 		return
 	}
 	msg := err.Error()
-	for _, forbidden := range []string{
+	forbidden := []string{
 		plantedCredential, "README.md", "big.bin", "run.sh", "ünïcødé", ".credentials.json",
-		"/tmp/", "link.txt", "main.go",
-	} {
-		if strings.Contains(msg, forbidden) {
-			t.Errorf("the error quotes content (%q): %s", forbidden, msg)
+		"link.txt", "main.go", "deep.txt", "moving.bin",
+	}
+	if root != "" {
+		forbidden = append(forbidden, root, filepath.Base(root))
+	}
+	for _, f := range forbidden {
+		if f != "" && strings.Contains(msg, f) {
+			t.Errorf("the error quotes content (%q): %s", f, msg)
 		}
 	}
 }

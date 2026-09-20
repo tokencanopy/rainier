@@ -1,6 +1,7 @@
 package checkpoint
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -55,10 +56,16 @@ func (d *discardStore) written(key string) int64 {
 
 // heapCeiling is what a checkpoint of any tree may cost above the baseline. At
 // the default 1 MiB frame size the live set is a plaintext frame, a ciphertext
-// frame, a 32 KiB copy buffer and a few hash states — under 3 MiB. The ceiling is
-// set an order of magnitude above that so the test fails on an O(tree) structure
-// and not on the garbage collector's timing.
-const heapCeiling = 64 << 20
+// frame, a 32 KiB copy buffer and a few hash states — under 3 MiB; measured
+// peak is around 4.5 MiB once the collector's slack is counted.
+//
+// It is set at 12 MiB rather than at some comfortable order of magnitude above
+// that, because the failure this test exists to catch is not a catastrophically
+// O(tree-bytes) buffer — it is the cheap-looking one the design note names: "a
+// list of entries, a map of digests". At the entry count below, a
+// map[string][32]byte of path to digest is roughly 20 MiB and a []Entry slice
+// similar, so a ceiling of 64 MiB would have watched either one go by.
+const heapCeiling = 12 << 20
 
 // TestBoundedMemoryOnAVeryLargeTree is the bounded-memory promise as a test
 // rather than an assertion in a comment. It checkpoints a tree of several
@@ -74,7 +81,10 @@ func TestBoundedMemoryOnAVeryLargeTree(t *testing.T) {
 	}
 
 	const sparseSize = int64(2) << 30 // 2 GiB
-	const smallFiles = 20000
+	// Large enough that a per-entry map or slice would cross heapCeiling on its
+	// own, which is what makes the ceiling a real test of the note's §9 rather
+	// than a test that the machine has RAM.
+	const smallFiles = 100000
 
 	root := t.TempDir()
 	sparse := filepath.Join(root, "sparse.bin")
@@ -93,15 +103,15 @@ func TestBoundedMemoryOnAVeryLargeTree(t *testing.T) {
 		t.Skipf("the sparse file is not the size it was truncated to")
 	}
 
-	// Twenty thousand entries across two hundred directories, so the entry count
-	// is a real dimension of the test and not only the byte count. Every one of
-	// them would be one map entry in an O(entries) implementation.
-	for d := 0; d < 200; d++ {
+	// A hundred thousand entries across five hundred directories, so the entry
+	// count is a real dimension of the test and not only the byte count. Every one
+	// of them would be one map entry in an O(entries) implementation.
+	for d := 0; d < 500; d++ {
 		dir := filepath.Join(root, "many", fmt.Sprintf("d%03d", d))
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Skipf("this environment cannot create the fixture: %v", err)
 		}
-		for i := 0; i < smallFiles/200; i++ {
+		for i := 0; i < smallFiles/500; i++ {
 			p := filepath.Join(dir, fmt.Sprintf("f%03d.txt", i))
 			if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 				t.Skipf("this environment cannot create the fixture: %v", err)
@@ -172,27 +182,103 @@ func TestBoundedMemoryOnAVeryLargeTree(t *testing.T) {
 		grew, base.HeapAlloc)
 }
 
-// TestBoundedMemoryOnVerifyAndRestore is the read side of the same promise, at a
-// size that fits in a MemoryStore so the whole round trip is exercised: many
-// entries, several hundred frames, one heap ceiling.
+// streamingStore serves an object from a file on disk rather than from a byte
+// slice, so the read-side memory measurement is not dominated by a store that
+// holds the whole ciphertext in the heap. It is what a real blob store looks
+// like from this package's point of view.
+type streamingStore struct {
+	dir  string
+	keys map[string]string // store key -> file path
+}
+
+func newStreamingStore(dir string) *streamingStore {
+	return &streamingStore{dir: dir, keys: make(map[string]string)}
+}
+
+func (s *streamingStore) path(key string) string {
+	if p, ok := s.keys[key]; ok {
+		return p
+	}
+	p := filepath.Join(s.dir, fmt.Sprintf("obj%04d", len(s.keys)))
+	s.keys[key] = p
+	return p
+}
+
+func (s *streamingStore) PutIfAbsent(ctx context.Context, key string, write func(io.Writer) error) error {
+	if _, ok := s.keys[key]; ok {
+		return ErrExists
+	}
+	p := s.path(key)
+	f, err := os.Create(p)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	bw := bufio.NewWriterSize(f, 1<<16)
+	if err := write(bw); err != nil {
+		delete(s.keys, key)
+		os.Remove(p)
+		return err
+	}
+	return bw.Flush()
+}
+
+func (s *streamingStore) Open(ctx context.Context, key string) (io.ReadCloser, error) {
+	p, ok := s.keys[key]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return os.Open(p)
+}
+
+func (s *streamingStore) Delete(ctx context.Context, key string) error {
+	if p, ok := s.keys[key]; ok {
+		delete(s.keys, key)
+		return os.Remove(p)
+	}
+	return nil
+}
+
+// TestBoundedMemoryOnVerifyAndRestore is the read side of the same promise.
+//
+// It runs against a store that streams from disk rather than MemoryStore: a
+// store that keeps the ciphertext in the heap would put its own allocation
+// inside the measurement, and a number dominated by something the library does
+// not control is not a measurement of the library.
 func TestBoundedMemoryOnVerifyAndRestore(t *testing.T) {
 	root := t.TempDir()
-	for d := 0; d < 40; d++ {
+	const dirs, perDir = 200, 100
+	for d := 0; d < dirs; d++ {
 		dir := filepath.Join(root, fmt.Sprintf("d%03d", d))
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		for i := 0; i < 100; i++ {
+		for i := 0; i < perDir; i++ {
 			if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%03d.bin", i)),
 				pseudorandom(4096), 0o644); err != nil {
 				t.Fatal(err)
 			}
 		}
 	}
-	h := newHarness(t, MinFrameSize)
+
+	store := newStreamingStore(t.TempDir())
+	keys := testWrapper(t)
+	w, err := NewWriter(store, keys, WriterOptions{KeyRef: testKeyRef})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := NewReader(store, keys, ReaderOptions{Authorize: (&authorizeRecorder{}).hook})
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := context.Background()
-	if _, err := h.w.Write(ctx, h.c, DirSource(root)); err != nil {
+	c := testContext()
+	res, err := w.Write(ctx, c, DirSource(root))
+	if err != nil {
 		t.Fatalf("Write: %v", err)
+	}
+	if res.Manifest.Frames < 50 {
+		t.Fatalf("the fixture should cross many frames, got %d", res.Manifest.Frames)
 	}
 
 	measure := func(t *testing.T, f func() error) int64 {
@@ -207,22 +293,23 @@ func TestBoundedMemoryOnVerifyAndRestore(t *testing.T) {
 		return int64(after.HeapAlloc) - int64(base.HeapAlloc)
 	}
 
-	// A MemoryStore holds the whole ciphertext, so the growth measured here
-	// includes that; the ceiling is what matters, not the exact number.
 	if grew := measure(t, func() error {
-		_, err := h.r.Verify(ctx, h.c)
+		_, err := r.Verify(ctx, c)
 		return err
 	}); grew > heapCeiling {
-		t.Errorf("Verify grew the heap by %d bytes, over the %d byte ceiling", grew, heapCeiling)
+		t.Errorf("Verify grew the heap by %d bytes over %d entries, past the %d byte ceiling",
+			grew, res.Manifest.Entries, heapCeiling)
 	}
 	target := filepath.Join(t.TempDir(), "r")
 	if grew := measure(t, func() error {
-		_, err := h.r.Restore(ctx, h.c, target)
+		_, err := r.Restore(ctx, c, target)
 		return err
 	}); grew > heapCeiling {
-		t.Errorf("Restore grew the heap by %d bytes, over the %d byte ceiling", grew, heapCeiling)
+		t.Errorf("Restore grew the heap by %d bytes over %d entries, past the %d byte ceiling",
+			grew, res.Manifest.Entries, heapCeiling)
 	}
-	if _, err := os.Stat(filepath.Join(target, "d039", "f099.bin")); err != nil {
+	if _, err := os.Stat(filepath.Join(target, fmt.Sprintf("d%03d", dirs-1),
+		fmt.Sprintf("f%03d.bin", perDir-1))); err != nil {
 		t.Errorf("the restored tree is incomplete: %v", err)
 	}
 }

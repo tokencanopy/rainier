@@ -68,6 +68,13 @@ const (
 
 // Manifest is the committed description of one checkpoint. Field order is the
 // canonical order authInput renders in; a reordering is a format change.
+//
+// Do not log one. Nothing in it is customer content — that is the point of the
+// design — but WrappedKey, ManifestNonce and ManifestAuth are cryptographic
+// material, and the tenancy specification's §15.1 puts key-service responses on
+// the never-logged list without pausing to ask whether a particular one is
+// ciphertext. A "%+v" of a Manifest, a Result or a Preflight prints all three.
+// Summary is the rendering to log: it has nowhere to put them.
 type Manifest struct {
 	Version    string `json:"version"`
 	Workspace  string `json:"workspace"`
@@ -215,8 +222,8 @@ func (m Manifest) validate() error {
 	if m.Compression != compressionNone {
 		return fmt.Errorf("%w: this build implements uncompressed content only", ErrFormatVersion)
 	}
-	if m.KeyRef == "" || len(m.KeyRef) > maxKeyRefLen {
-		return fmt.Errorf("%w: the key reference is empty or over the %d character limit", ErrManifest, maxKeyRefLen)
+	if err := validKeyRef(KeyRef(m.KeyRef)); err != nil {
+		return fmt.Errorf("%w: %s", ErrManifest, err)
 	}
 	if n, err := decodedLen(m.WrappedKey); err != nil || n < dekLen || n > 4096 {
 		return fmt.Errorf("%w: the wrapped key is not base64 of a plausible length", ErrManifest)
@@ -340,7 +347,6 @@ func (m *Manifest) seal(key []byte, c Context, r io.Reader) error {
 		return fmt.Errorf("checkpoint: generating the manifest nonce: %w", err)
 	}
 	m.ManifestNonce = base64.StdEncoding.EncodeToString(nonce)
-	m.ManifestAuth = ""
 	tag := aead.Seal(nil, nonce, nil, m.authInput(c))
 	if len(tag) != tagLen {
 		return fmt.Errorf("%w: the manifest tag is the wrong length", ErrManifest)
@@ -349,10 +355,14 @@ func (m *Manifest) seal(key []byte, c Context, r io.Reader) error {
 	return nil
 }
 
-// checkAuth verifies the tag. The manifest's own nonce and tag are excluded from
-// the input by construction, so a caller cannot get a passing tag by editing
-// them: GCM refuses a wrong nonce and a wrong tag exactly as it refuses a wrong
-// field.
+// checkAuth verifies the tag.
+//
+// The manifest's own nonce and tag are excluded from the authenticated input by
+// OMISSION in authInput — there is no code here that strips them, because there
+// is nothing to strip. Editing either one still fails: GCM refuses a wrong nonce
+// and a wrong tag exactly as it refuses a wrong field, and
+// TestManifestAuthInputCoversEveryField asserts that neither ever appears in
+// authInput.
 func (m Manifest) checkAuth(key []byte, c Context) error {
 	aead, err := newGCM(key)
 	if err != nil {
@@ -366,10 +376,7 @@ func (m Manifest) checkAuth(key []byte, c Context) error {
 	if err != nil || len(tag) != tagLen {
 		return ErrAuth
 	}
-	bare := m
-	bare.ManifestAuth = ""
-	bare.ManifestNonce = ""
-	if _, err := aead.Open(nil, nonce, tag, bare.authInput(c)); err != nil {
+	if _, err := aead.Open(nil, nonce, tag, m.authInput(c)); err != nil {
 		return ErrAuth
 	}
 	return nil

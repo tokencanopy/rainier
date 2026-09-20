@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -38,6 +39,21 @@ type ReaderOptions struct {
 	// principal that just wrote the checkpoint, so its hook returns nil. That is
 	// not a loophole: the library cannot judge a policy, only guarantee the step
 	// exists and is named.
+	//
+	// THE MANIFEST IT RECEIVES IS NOT AUTHENTICATED, and cannot be: the tag can
+	// only be checked with the data key, and unwrapping that key is the step this
+	// hook authorizes. By the time it runs, exactly three things are known about
+	// the manifest — it parsed strictly, its Workspace, Session and Generation
+	// equal the Context the caller supplied, and its ContentKey lives under this
+	// checkpoint's own storage prefix. EVERY OTHER FIELD is whatever was in the
+	// object: CreatedAt, KeyRef, Frames, Entries, FileBytes and both digests are
+	// attacker-chosen for an attacker with write access to the bucket and no key.
+	//
+	// So: decide with it, do not record from it. Branching on KeyRef to check key
+	// readiness is what it is for. Writing CreatedAt into a freshness ledger, or
+	// an audit row, before Verify has returned is recording a forgery. The
+	// authenticated values are the ones in a Report or a Preflight, both of which
+	// are returned only after the tag has been checked.
 	//
 	// Whatever error it returns is wrapped alongside ErrNotAuthorized. Its text
 	// is the caller's own, and this package's no-content rule applies to what the
@@ -149,7 +165,16 @@ func (r *Reader) Restore(ctx context.Context, c Context, target string) (Report,
 	if target == "" {
 		return Report{}, fmt.Errorf("%w: a restore target is required", ErrInvalid)
 	}
-	return r.consume(ctx, c, target)
+	// Made absolute here rather than defended against later. A relative target,
+	// and "." in particular, makes the containment check compare a one-element
+	// path against ".", which refuses every entry — and blames the CHECKPOINT for
+	// what is the caller's spelling. A caller's mistake should never be reported
+	// as a bad checkpoint.
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		return Report{}, fmt.Errorf("%w: the restore target could not be resolved (%s)", ErrInvalid, fsCategory(err))
+	}
+	return r.consume(ctx, c, abs)
 }
 
 // Delete removes the checkpoint, manifest FIRST.
@@ -163,6 +188,15 @@ func (r *Reader) Restore(ctx context.Context, c Context, target string) (Report,
 // A missing manifest is success: an orphan content object without its manifest is
 // unreadable garbage, and a ledger that cannot report "already gone" as done
 // never converges.
+//
+// It does NOT authenticate the manifest, and deliberately cannot: deletion must
+// keep working after the key version behind it has been destroyed, which is the
+// other half of the crypto-shred story. So Authorize runs against an
+// unauthenticated manifest here (see ReaderOptions.Authorize), and the only
+// field acted on is ContentKey, which readManifest has already pinned to this
+// checkpoint's own generation directory with no path elements of its own. The
+// worst a forged manifest can do is delete a sibling attempt object in the
+// generation the caller asked to delete anyway.
 func (r *Reader) Delete(ctx context.Context, c Context) error {
 	m, err := r.readManifest(ctx, c)
 	if errors.Is(err, ErrNotFound) {
@@ -320,7 +354,7 @@ func (r *Reader) consume(ctx context.Context, c Context, target string) (Report,
 	}
 
 	var st streamStats
-	if err := consumeStream(tar.NewReader(fr), target, &st); err != nil {
+	if err := consumeStream(ctx, tar.NewReader(fr), target, m, &st); err != nil {
 		// The frame layer's own refusal outranks whatever the tar layer made of
 		// it. archive/tar sees a failed frame as a malformed archive and says so,
 		// and reporting "entry 1 could not be decoded" for a flipped ciphertext
@@ -412,17 +446,93 @@ type streamStats struct {
 	tree      *treeHasher
 }
 
+// openDir is one directory on the restore walk's open-directory stack. The
+// stack's depth is the tree's depth — a few hundred at worst — which is why this
+// is the one place the reader is allowed to remember anything: it is O(depth),
+// never O(entries).
+type openDir struct {
+	name string      // the entry name, slash-separated
+	path string      // the resolved path, empty when verifying
+	mode fs.FileMode // the mode to apply on the way out
+}
+
 // consumeStream walks the decoded entry stream, applying every rule, and writes
 // into target when target is not empty.
-func consumeStream(tr *tar.Reader, target string, st *streamStats) error {
+//
+// THE STACK IS THE SECURITY BOUNDARY, and it does two jobs no per-entry check
+// can do on its own.
+//
+// First, it makes the containment check sound. checkLink is lexical: it resolves
+// a link's target against the link's own NAME. That is right only if the link is
+// created where its name says, and it is not, if an ancestor component of the
+// name is itself a link. Concretely, `a/d -> ..` is contained (it resolves to
+// the root) and `a/d/up -> ..` is contained (it resolves to `a`), but `a/d/up`
+// is physically created inside whatever `a/d` points at — the root — so its `..`
+// leaves the target, and a later `a/d/up/pwned` lands outside it. Composing two
+// individually contained links escapes. Requiring every entry's parent to be a
+// directory THIS WALK CREATED closes that: a name whose parent chain passes
+// through a link is refused before a syscall sees it, because a link is never
+// pushed onto the stack.
+//
+// Second, it fixes the restore of a write-protected directory. A tree containing
+// a `0555` directory — which `go mod download` produces for every module it
+// extracts, and a vendored or Cargo tree produces too — cannot have its children
+// written if the directory's mode is applied when it is created. Directories are
+// therefore created `0o700` and chmodded to their recorded mode on the way OUT,
+// when the stack pops past them.
+//
+// Both checks run in verify mode as well, with the writes skipped. That is the
+// point: the durability barrier opens the disk-deletion door on Verify's word,
+// so a checkpoint Restore cannot write must not be one Verify calls good.
+//
+// The stack is sound because the Writer emits entries in fs.WalkDir order, which
+// is depth-first: every entry under a directory follows it and precedes the
+// directory's next sibling. That is a rule of the format, enforced here.
+func consumeStream(ctx context.Context, tr *tar.Reader, target string, m Manifest, st *streamStats) error {
 	st.tree = newTreeHasher()
 	buf := make([]byte, copyBufSize)
 	entryDigest := sha256.New()
 	ordinal := int64(0)
+	var stack []openDir
+
+	// pop leaves one directory, applying the mode that was deferred so its
+	// children could be written.
+	pop := func() error {
+		top := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if top.path == "" {
+			return nil
+		}
+		if err := os.Chmod(top.path, top.mode); err != nil {
+			return fmt.Errorf("%w: a directory's mode could not be set (%s)", ErrRestore, fsCategory(err))
+		}
+		return nil
+	}
+	// descendTo leaves every directory that parent is not inside, and then
+	// requires that parent is the directory the walk is now in.
+	descendTo := func(parent string, ordinal int64) error {
+		for len(stack) > 0 && stack[len(stack)-1].name != parent {
+			if err := pop(); err != nil {
+				return err
+			}
+		}
+		if len(stack) == 0 && parent != "." {
+			return fmt.Errorf("%w: entry %d's parent is not a directory this checkpoint created", ErrEntry, ordinal)
+		}
+		return nil
+	}
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
+			for len(stack) > 0 {
+				if err := pop(); err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 		if err != nil {
@@ -435,6 +545,12 @@ func consumeStream(tr *tar.Reader, target string, st *streamStats) error {
 		name := hdr.Name
 		if err := validEntryName(name); err != nil {
 			return fmt.Errorf("%w: entry %d is not a valid tree entry (%s)", ErrEntry, ordinal, err)
+		}
+		if err := noSparseRecords(hdr, ordinal); err != nil {
+			return err
+		}
+		if err := descendTo(path.Dir(name), ordinal); err != nil {
+			return err
 		}
 		st.entries++
 
@@ -449,16 +565,17 @@ func consumeStream(tr *tar.Reader, target string, st *streamStats) error {
 			}
 			st.dirs++
 			st.tree.dir(name, mode)
-			if target == "" {
-				continue
+			var p string
+			if target != "" {
+				if p, err = entryPath(target, name, ordinal); err != nil {
+					return err
+				}
+				// 0o700 now, the recorded mode when the stack pops past it.
+				if err := makeDir(p, 0o700); err != nil {
+					return fmt.Errorf("%w: entry %d could not be created (%s)", ErrRestore, ordinal, fsCategory(err))
+				}
 			}
-			p, err := entryPath(target, name, ordinal)
-			if err != nil {
-				return err
-			}
-			if err := makeDir(p, mode); err != nil {
-				return fmt.Errorf("%w: entry %d could not be created (%s)", ErrRestore, ordinal, fsCategory(err))
-			}
+			stack = append(stack, openDir{name: name, path: p, mode: mode})
 
 		case tar.TypeSymlink:
 			if hdr.Size != 0 {
@@ -476,9 +593,6 @@ func consumeStream(tr *tar.Reader, target string, st *streamStats) error {
 			if err != nil {
 				return err
 			}
-			if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-				return fmt.Errorf("%w: entry %d's parent could not be created (%s)", ErrRestore, ordinal, fsCategory(err))
-			}
 			if err := os.Symlink(hdr.Linkname, p); err != nil {
 				return fmt.Errorf("%w: entry %d could not be created (%s)", ErrRestore, ordinal, fsCategory(err))
 			}
@@ -486,6 +600,16 @@ func consumeStream(tr *tar.Reader, target string, st *streamStats) error {
 		case tar.TypeReg:
 			if hdr.Size < 0 {
 				return fmt.Errorf("%w: entry %d has a negative byte count", ErrEntry, ordinal)
+			}
+			// Bounded against the manifest BEFORE a byte is written. The aggregate
+			// comparison at the end of the stream would catch an over-long entry
+			// eventually; "eventually" is after the destination filesystem is full.
+			// archive/tar's reader honours PAX and GNU sparse entries, where the
+			// header's size is logical and the plaintext is far smaller, so a header
+			// can ask for far more than it costs to produce.
+			if hdr.Size > m.FileBytes-st.fileBytes {
+				return fmt.Errorf("%w: entry %d claims more bytes than the manifest's file-byte total allows",
+					ErrMismatch, ordinal)
 			}
 			mode, err := entryPerm(hdr.Mode, ordinal)
 			if err != nil {
@@ -498,7 +622,7 @@ func consumeStream(tr *tar.Reader, target string, st *streamStats) error {
 				}
 			}
 			entryDigest.Reset()
-			n, err := restoreFile(dst, tr, hdr, mode, ordinal, buf, entryDigest)
+			n, err := restoreFile(ctx, dst, tr, hdr, mode, ordinal, buf, entryDigest)
 			if err != nil {
 				return err
 			}
@@ -520,6 +644,19 @@ func consumeStream(tr *tar.Reader, target string, st *streamStats) error {
 			return fmt.Errorf("%w: entry %d is not a regular file, directory or symbolic link", ErrEntry, ordinal)
 		}
 	}
+}
+
+// noSparseRecords refuses a PAX sparse entry. archive/tar's reader implements
+// them, and their defining property — a header size far larger than the bytes
+// that produced it — is the one thing a bounded restore cannot tolerate. This
+// package's Writer never produces one.
+func noSparseRecords(hdr *tar.Header, ordinal int64) error {
+	for k := range hdr.PAXRecords {
+		if strings.HasPrefix(k, "GNU.sparse.") {
+			return fmt.Errorf("%w: entry %d is a sparse entry", ErrEntry, ordinal)
+		}
+	}
+	return nil
 }
 
 // entryPerm refuses a mode with anything outside the permission bits. Setuid,
@@ -551,7 +688,7 @@ func entryPath(target, name string, ordinal int64) (string, error) {
 // chmodded into place rather than refused; anything else already there is an
 // error, which is what keeps a duplicate entry from quietly winning.
 func makeDir(p string, mode fs.FileMode) error {
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := ensureParent(p); err != nil {
 		return err
 	}
 	if err := os.Mkdir(p, mode); err != nil {
@@ -577,24 +714,31 @@ func makeDir(p string, mode fs.FileMode) error {
 // O_EXCL is deliberate and does two jobs: it refuses to follow a symbolic link
 // that is already at the destination, and it makes a duplicated entry name an
 // error rather than an overwrite.
-func restoreFile(dst string, tr io.Reader, hdr *tar.Header, mode fs.FileMode, ordinal int64, buf []byte, digest io.Writer) (int64, error) {
+func restoreFile(ctx context.Context, dst string, tr io.Reader, hdr *tar.Header, mode fs.FileMode, ordinal int64, buf []byte, digest io.Writer) (int64, error) {
+	src := io.LimitReader(&ctxReader{ctx: ctx, r: tr}, hdr.Size)
 	if dst == "" {
-		n, err := io.CopyBuffer(digest, io.LimitReader(tr, hdr.Size), buf)
+		n, err := io.CopyBuffer(digest, src, buf)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return n, ctxErr
+			}
 			return n, fmt.Errorf("%w: entry %d could not be read", ErrTruncated, ordinal)
 		}
 		return n, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	if err := ensureParent(dst); err != nil {
 		return 0, fmt.Errorf("%w: entry %d's parent could not be created (%s)", ErrRestore, ordinal, fsCategory(err))
 	}
 	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return 0, fmt.Errorf("%w: entry %d could not be created (%s)", ErrRestore, ordinal, fsCategory(err))
 	}
-	n, err := io.CopyBuffer(io.MultiWriter(f, digest), io.LimitReader(tr, hdr.Size), buf)
+	n, err := io.CopyBuffer(io.MultiWriter(f, digest), src, buf)
 	if err != nil {
 		f.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return n, ctxErr
+		}
 		return n, fmt.Errorf("%w: entry %d could not be written (%s)", ErrRestore, ordinal, fsCategory(err))
 	}
 	if err := f.Close(); err != nil {
@@ -608,6 +752,31 @@ func restoreFile(dst string, tr io.Reader, hdr *tar.Header, mode fs.FileMode, or
 		return n, fmt.Errorf("%w: entry %d's modification time could not be set (%s)", ErrRestore, ordinal, fsCategory(err))
 	}
 	return n, nil
+}
+
+// ensureParent creates the directories above p at 0o700, which is enough for
+// this walk to write into them. Every directory a checkpoint actually contains
+// arrives as its own entry and gets its recorded mode when the walk leaves it;
+// this covers only the defensive case of a parent that never had an entry, and
+// it must not leave a world-readable directory behind if it fires.
+func ensureParent(p string) error {
+	return os.MkdirAll(filepath.Dir(p), 0o700)
+}
+
+// ctxReader makes a copy loop cancellable. io.CopyBuffer will not look at a
+// context, and a 40 GiB restore that cannot be abandoned is a restore that fills
+// a destination filesystem after the caller has given up. The check is one
+// comparison per 32 KiB, which is free next to the copy.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c *ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // ---------------------------------------------------------------------------

@@ -124,11 +124,8 @@ func NewStaticKeyWrapper(ref KeyRef, key [dekLen]byte) (*StaticKeyWrapper, error
 // which is how the golden-manifest test gets a byte-for-byte deterministic
 // manifest. Unexported: a caller outside this package gets crypto/rand.
 func newStaticKeyWrapper(ref KeyRef, key [dekLen]byte, r io.Reader) (*StaticKeyWrapper, error) {
-	if ref == "" {
-		return nil, fmt.Errorf("%w: a key reference is required", ErrInvalid)
-	}
-	if len(ref) > maxKeyRefLen {
-		return nil, fmt.Errorf("%w: the key reference is over the %d character limit", ErrInvalid, maxKeyRefLen)
+	if err := validKeyRef(ref); err != nil {
+		return nil, err
 	}
 	if key == ([dekLen]byte{}) {
 		return nil, fmt.Errorf("%w: the wrapping key must not be all zeros (it is indistinguishable from an unset key)", ErrInvalid)
@@ -137,6 +134,34 @@ func newStaticKeyWrapper(ref KeyRef, key [dekLen]byte, r io.Reader) (*StaticKeyW
 		r = cryptoRand
 	}
 	return &StaticKeyWrapper{ref: ref, key: key, rand: r}, nil
+}
+
+// validKeyRef is the charset rule for a key reference: 1 to maxKeyRefLen
+// printable, non-space ASCII characters. A KMS resource name, a fleet key
+// version and everything in between fits; nothing else does.
+//
+// It is stricter than it needs to be for the format, and the strictness buys two
+// things. A manifest is "a thing an operator can read", and KeyRef is the one
+// free-form field an attacker with write access to the bucket and no key fully
+// controls — without this rule it carries newlines, NULs and ANSI escapes
+// straight into a log line and a Summary. And authInput is a hand-rolled
+// `\x00name=value` rendering, so a field that could contain both NUL and '='
+// could in principle forge a field boundary; today it cannot, but only because
+// of what its NEIGHBOURING fields happen to allow, which is not a reason that
+// survives a reordering.
+func validKeyRef(ref KeyRef) error {
+	if ref == "" {
+		return fmt.Errorf("%w: a key reference is required", ErrInvalid)
+	}
+	if len(ref) > maxKeyRefLen {
+		return fmt.Errorf("%w: the key reference is over the %d character limit", ErrInvalid, maxKeyRefLen)
+	}
+	for i := 0; i < len(ref); i++ {
+		if ref[i] <= 0x20 || ref[i] >= 0x7f {
+			return fmt.Errorf("%w: the key reference has a character outside printable ASCII", ErrInvalid)
+		}
+	}
+	return nil
 }
 
 // Ref is the reference this wrapper wraps under. A host uses it to fill

@@ -73,6 +73,75 @@ func TestManifestAuthInputCoversEveryField(t *testing.T) {
 	}
 }
 
+// TestManifestAuthInputBindsEveryFieldsValue is the other half, and the half
+// that matters more. The coverage test above proves each field's NAME appears in
+// the authenticated input; it would still pass if a field were bound to a
+// constant, or to the wrong field's value — `add("frames", "0")` survives it.
+//
+// This one changes exactly one field at a time, through reflection so no field
+// can be forgotten, and requires the authenticated input to change with it. A
+// field bound to a constant, bound to another field, or dropped fails here.
+//
+// It is also the answer to a subtler gap: eleven of the manifest's fields are
+// refused by a CHEAPER, EARLIER check than the tag — the identity comparison,
+// validate()'s enumerations and length arithmetic, the wrapper's key-reference
+// check — so a tamper test for those fields never reaches the tag at all and
+// proves nothing about whether the tag binds them.
+func TestManifestAuthInputBindsEveryFieldsValue(t *testing.T) {
+	base := Manifest{
+		Version: FormatVersion, Workspace: "workspace-alpha", Session: "sess-1", Generation: 7,
+		CreatedAt: "2026-09-20T00:00:00Z", Cipher: cipherName, KDF: kdfName,
+		Compression: compressionNone, KeyRef: "example.test/keys/1", WrappedKey: "AAAA",
+		ContentKey: "p/content.00", FrameSize: MinFrameSize, Frames: 4, NoncePrefix: "BBBB",
+		ContentBytes: 200, ContentDigest: "aa", PlainBytes: 100, Entries: 9,
+		FileBytes: 50, Skipped: 1, TreeDigest: "bb",
+		ManifestNonce: "CCCC", ManifestAuth: "DDDD",
+	}
+	c := testContext()
+	want := string(base.authInput(c))
+
+	typ := reflect.TypeOf(Manifest{})
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		tag := strings.Split(field.Tag.Get("json"), ",")[0]
+		excluded := false
+		for _, e := range authInputExcluded {
+			if tag == e {
+				excluded = true
+			}
+		}
+
+		mutated := base
+		v := reflect.ValueOf(&mutated).Elem().Field(i)
+		switch v.Kind() {
+		case reflect.String:
+			v.SetString(v.String() + "-changed")
+		case reflect.Uint64, reflect.Uint32:
+			v.SetUint(v.Uint() + 1)
+		case reflect.Int64:
+			v.SetInt(v.Int() + 1)
+		default:
+			t.Fatalf("field %s has a kind this test does not know how to change", field.Name)
+		}
+
+		got := string(mutated.authInput(c))
+		switch {
+		case excluded && got != want:
+			t.Errorf("changing %q changed the authenticated input, but it is excluded by definition", tag)
+		case !excluded && got == want:
+			t.Errorf("changing %q did NOT change the authenticated input; its value is not bound", tag)
+		}
+	}
+
+	// And the context is bound too: the same manifest under a different context
+	// authenticates different bytes.
+	other := c
+	other.Generation++
+	if string(base.authInput(other)) == want {
+		t.Error("the authenticated input does not depend on the checkpoint generation")
+	}
+}
+
 func TestSummaryHasNowhereToPutASecret(t *testing.T) {
 	typ := reflect.TypeOf(Summary{})
 	for i := 0; i < typ.NumField(); i++ {

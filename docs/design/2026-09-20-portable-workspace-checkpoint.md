@@ -228,8 +228,12 @@ content object, framed internally, versus many objects addressed by content.
 
 ### 4.3 The content object
 
-Plaintext is a tar stream (`archive/tar`), entries in `fs.WalkDir` order, which
-is lexical and therefore deterministic. `Uname`, `Gname`, `Uid` and `Gid` are
+Plaintext is a tar stream (`archive/tar`), entries in `fs.WalkDir` order:
+depth-first, lexical within each directory, and therefore deterministic. That
+order is a **rule of the format, not an accident of the writer**, and the reader
+enforces it — every entry's parent must be a directory that appeared earlier in
+the stream and that the walk has not yet left. §7 explains why that rule is the
+one that makes containment sound. `Uname`, `Gname`, `Uid` and `Gid` are
 zeroed for the reason `protocol/workspace`'s `TarGz` zeroes them: they are the
 packer's local account names, meaningless in a guest and needlessly
 identifying. Modes are masked to `0o777`; setuid, setgid and sticky bits are
@@ -575,6 +579,37 @@ well-formed and lands inside a target directory, and that it is the tree the
 writer said it was. It does not prove that the destination filesystem has room,
 which is why `Restore` re-checks the same aggregates while writing.
 
+**The structural walk runs the restore path's code, not a copy of it.** `Verify`
+and `Restore` are one function with the writes switched off. That is not a
+tidiness preference: the durability barrier releases the workspace — and,
+eventually, deletes the disk — on `Verify`'s word, so any rule `Restore` applies
+that `Verify` does not is a rule that turns a verified checkpoint into a failed
+cold resume. Two rules in particular are only visible because of it:
+
+- **Every entry's parent must be a directory this walk created.** The symlink
+  check is lexical — it resolves a link's target against the link's own *name* —
+  and that is sound only while the link is created where its name says. It is
+  not, if an ancestor component of the name is itself a link. `a/d -> ..` is
+  contained (it resolves to the root); `a/d/up -> ..` is contained (it resolves
+  to `a`); but `a/d/up` is physically created inside whatever `a/d` points at,
+  which is the root, so its `..` leaves the target and `a/d/up/pwned` lands
+  outside it. Two individually contained links compose into an escape. Requiring
+  the parent to be a directory the walk created closes it, because a link is
+  never one — and it is also what makes §4.3's depth-first rule enforceable
+  rather than assumed.
+- **A directory's recorded mode is applied when the walk LEAVES it**, not when it
+  is created. Directories are created `0o700` and chmodded on the way out. A
+  `0555` directory — which `go mod download` produces for every module it
+  extracts, and a vendored or Cargo tree produces too — otherwise packs cleanly,
+  verifies cleanly, and fails at restore on its first child. This is the failure
+  mode the barrier is least able to survive, because nothing about it is visible
+  until the disk is gone.
+
+Both need the walk to remember something, which §9 otherwise forbids. What they
+need is a *stack*, not a list: entries arrive depth-first, so the state is the
+chain of directories currently open — O(tree depth), a few hundred at worst.
+That is the one exception, and it is the whole of it.
+
 The tree digest is what makes ADR §19's "checksum-equal restore" checkable
 without a second copy:
 
@@ -603,11 +638,34 @@ this is the single easiest way to get this format wrong.
 is a `func(context.Context, Context, Manifest) error` that runs after the
 manifest is parsed and identity-checked and *before* the data key is unwrapped,
 before a content byte is read, and before the target directory is touched. A nil
-`Authorize` is `ErrNoAuthorization` — a programming error with its own typed
-error, refused on every path, so that "we forgot to authorize the restore" is
-not a thing this library can be used to do. The library cannot judge the policy;
-tenancy §4 and §8.2 define it and it lives in the cell. What the library can do
-is guarantee the step exists and runs first.
+hook is refused at `NewReader`, not at the first restore, so that "we forgot to
+authorize the restore" is not a thing this library can be used to do. The library
+cannot judge the policy; tenancy §4 and §8.2 define it and it lives in the cell.
+What the library can do is guarantee the step exists and runs first.
+
+**The manifest that hook receives is not authenticated, and it says so.** It
+cannot be: the tag is checkable only with the data key, and unwrapping that key
+is the step being authorized. So by the time the hook runs, exactly three things
+are known — the manifest parsed strictly, its workspace/session/generation equal
+the caller's context, and its content key is under this checkpoint's own prefix.
+Every other field is whatever was in the object, which for an attacker with
+write access to the bucket and no key means *attacker-chosen*. §5.3 lists "a
+reader that checks the manifest tag after using a manifest field" as exactly the
+degradation the three bindings exist to survive, and this reader is one of them
+by construction. The hook's documentation therefore states the rule outright:
+**decide with it, do not record from it.** Branching on the key reference to
+check readiness is what it is for; writing the creation time into a freshness
+ledger before `Verify` has returned is recording a forgery. The authenticated
+values are the ones in a `Report` or a `Preflight`, both returned only after the
+tag has been checked.
+
+`Delete` is the one operation that authorizes against an unauthenticated
+manifest and then acts. That is deliberate and unavoidable: deletion has to keep
+working after the key version behind it is destroyed, which is the other half of
+§10. The only field it acts on is the content key, already pinned to this
+checkpoint's own generation directory, so the worst a forged manifest achieves
+is deleting a sibling attempt object in the generation the caller asked to
+delete anyway.
 
 **Key readiness is provable without content.** `Preflight` does steps 1–3 of
 §7 — parse, identity, authorize, unwrap, manifest tag — and returns what a
@@ -628,8 +686,9 @@ of an overwrite.
 The rule is that no structure in the library is O(entries) or O(tree bytes).
 Concretely, at any instant a write or a restore holds: one frame's plaintext and
 one frame's ciphertext (`frame_size + 16`), a 32 KiB copy buffer, the tar
-reader's or writer's own fixed buffers, one entry's header, and a handful of
-hash states. That is under 3 MiB at the default frame size, for any tree.
+reader's or writer's own fixed buffers, one entry's header, the O(tree depth)
+directory stack §7 describes, and a handful of hash states. That is under 3 MiB
+at the default frame size, for any tree.
 
 The things that would break it, and are therefore not in the API: a manifest
 that lists entries; a `[]Entry` return anywhere; a map of path to digest for
@@ -641,10 +700,16 @@ under the tenant's own key before a single entry is looked at); directory mtime
 restoration, which would need a list of directories; and `io.ReadAll` anywhere
 at all except the manifest, which is capped at 64 KiB on read.
 
-A test proves it rather than asserting it: a synthetic sparse tree of several
-gigabytes is written through a discarding store while heap usage is sampled, and
-the test fails if the peak crosses a fixed ceiling. It skips only if the
-environment cannot create the sparse file.
+A test proves it rather than asserting it: a synthetic tree of 2 GiB and a
+hundred thousand entries is written through a discarding store while heap usage
+is sampled, and the test fails if the peak crosses a 12 MiB ceiling (measured:
+5.2 MiB). The ceiling is deliberately close to the budget rather than an order
+of magnitude above it — the failure worth catching is not a catastrophic
+O(tree-bytes) buffer, it is the cheap-looking map of path to digest, which at
+that entry count would be around 20 MiB and would sail under a generous ceiling.
+The read side is measured against a store that streams from disk, because a
+store holding the ciphertext in the heap would put its own allocation inside the
+measurement.
 
 ## 10. Deletion
 
@@ -780,7 +845,11 @@ diagnostic channel) as open rather than pretending the trade is free.
   checkpoint age and the operational view that flags workspaces outside it are
   the cloud's.
 - **Upload retry, backoff, concurrency limits, rate limiting.** One attempt per
-  call, a typed error, and an attempt-scoped content key so a retry is safe.
+  call, a typed error, and an attempt-scoped content key so a retry is safe. A
+  call *can* be abandoned: cancelling the context stops a write or a restore
+  inside its copy loop rather than at the next object boundary, and returns
+  `context.Canceled` rather than one of this package's sentinels, because
+  nothing is wrong with the tree or the checkpoint.
 - **Storage backends.** One in-memory store, for tests and for the `MemoryStore`
   a reviewer can read in a minute. GCS, S3 and anything else are the host's,
   behind `PutIfAbsent`.
@@ -798,24 +867,54 @@ diagnostic channel) as open rather than pretending the trade is free.
 
 Round trip over a tree with nested directories, an empty directory, an empty
 file, a file with the exec bit, a symlink, a large-enough file to cross several
-frames, and a Unicode name; byte-for-byte content, mode and mtime equality after
-restore. Tamper on the manifest (each field in turn) and on the content (each
-frame in turn) yielding `ErrAuth`. Context swap in all three components, both
-through the public path (`ErrContextMismatch`) and past it, straight at the
-cryptographic layer (`ErrAuth`), so the test is not a string comparison.
-Truncation at a frame boundary and inside a frame; trailing data. Strict
-manifest parsing: unknown field, missing field, unknown version, out-of-range
-frame size and count, content key outside the prefix, oversized manifest.
-Exclusion: a planted credential-shaped file inside an excluded subtree, with the
-assertion made against *every byte the store received* rather than against the
-restored tree. Put-if-absent: a second write at the same generation loses with
-`ErrExists` and does not disturb the winner. `Authorize` nil, `Authorize`
-failing, and `Authorize` observing the manifest before any content read.
-Non-empty target refused. Bounded memory on a multi-gigabyte sparse tree,
-skipped only if the sparse file cannot be created. A fuzz target for the
-manifest parser: never panic, and anything accepted must round-trip. A golden
-manifest, produced with an injected deterministic random source and clock, so
-the on-the-wire shape cannot drift without a diff.
+frames, and a Unicode name; equality checked by restoring, then *re-checkpointing
+the restored tree* and comparing tree digests and plaintext lengths, which pins
+names, modes, sizes, contents and file modification times in one assertion.
+
+Tamper on every manifest field and on every frame. Eleven of the manifest's
+twenty-one authenticated fields are refused by a cheaper, earlier check than the
+tag — the identity comparison, the enumerations, the length arithmetic, the
+wrapper's key-reference check — so a tamper test for those proves nothing about
+whether the tag binds them; a separate test changes each field in turn through
+reflection and requires the authenticated input to change with it, which is what
+actually rules out a field bound to a constant or to its neighbour's value. A
+second reflection test requires every JSON tag to appear in that input at all,
+so a field added and forgotten cannot become unauthenticated metadata.
+
+Context swap in all three components, both through the public path (copying both
+objects into another session's prefix, then rewriting the identity fields to
+defeat the cheap check) and past it at each cryptographic layer separately — the
+key wrap, the manifest tag, the frame AAD — so the test is not a string
+comparison. Truncation at and inside a frame boundary, trailing data, a swapped
+frame pair, a zeroed object, a missing content object.
+
+Restore-path structure: the chained-symlink escape, an entry whose parent is a
+link or a file or absent, an out-of-order entry, a write-protected directory
+round trip that also asserts the restored modes, a sparse record, an entry
+claiming more bytes than the manifest allows, a non-empty target, a relative
+target. Every one of them asserted in verify mode as well as restore mode.
+
+Strict manifest parsing: unknown field, missing field, unknown version and an
+unknown version *carrying unknown fields*, out-of-range frame size and count,
+self-inconsistent lengths, content key outside the prefix, oversized manifest, a
+key reference carrying a newline or an ANSI escape.
+
+Exclusion: a planted credential-shaped file inside an excluded subtree, asserted
+against *every path the walk opened* rather than against the restored tree.
+Put-if-absent: a second write at the same generation loses with `ErrExists` and
+does not disturb the winner. `Authorize` nil at construction, `Authorize`
+failing before any content object is opened and before the target exists.
+Cancellation on both a write and a restore. Quiesce violation in both
+directions. Setuid dropped. Frame-writer boundaries at, one below and one above
+an exact frame multiple, and a single write spanning many frames. Errors that
+had a path available to leak — a refused source entry, a destination that cannot
+hold the tree — asserted against the fixture's own root rather than a guessed
+prefix. Bounded memory on a 2 GiB, hundred-thousand-entry tree and on the read
+side against a streaming store. A fuzz target for the manifest parser: never
+panic, never return an error outside the package's vocabulary, and anything
+accepted must round-trip. A golden manifest, produced with an injected
+deterministic random source and clock, so the on-the-wire shape cannot drift
+without a diff.
 
 ## 14. Open questions
 

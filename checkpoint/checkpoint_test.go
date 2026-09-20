@@ -44,9 +44,9 @@ func testWrapper(t *testing.T) *StaticKeyWrapper {
 // authorizeRecorder is the authorization hook plus the evidence that it ran, in
 // the right order, with the right argument.
 type authorizeRecorder struct {
-	mu    sync.Mutex
-	calls int
-	last  Manifest
+	mu     sync.Mutex
+	calls  int
+	last   Manifest
 	refuse error
 }
 
@@ -189,7 +189,7 @@ type harness struct {
 	c     Context
 }
 
-func newHarness(t *testing.T, frameSize int64, exclude ...string) *harness {
+func newHarness(t *testing.T, frameSize int64) *harness {
 	t.Helper()
 	store := NewMemoryStore()
 	keys := testWrapper(t)
@@ -206,7 +206,6 @@ func newHarness(t *testing.T, frameSize int64, exclude ...string) *harness {
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
-	_ = exclude
 	return &harness{store: store, w: w, r: r, auth: auth, c: testContext()}
 }
 
@@ -456,6 +455,7 @@ func TestSymlinkRefusals(t *testing.T) {
 			if strings.Contains(err.Error(), tc.target) || strings.Contains(err.Error(), "bad") {
 				t.Errorf("the error quotes a path or a target: %v", err)
 			}
+			assertNoContentInError(t, root, err)
 		})
 	}
 }
@@ -774,5 +774,5 @@ func replaceObject(t *testing.T, store *MemoryStore, key string, mutate func([]b
 	if !ok {
 		t.Fatalf("no object to mutate")
 	}
-	store.Overwrite(key, mutate(bytes.Clone(b)))
+	store.overwrite(key, mutate(bytes.Clone(b)))
 }
