@@ -30,7 +30,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"sync"
 	"syscall"
 )
 
@@ -69,10 +68,11 @@ const (
 	// is well above the system range and above the 65534 (nobody) boundary,
 	// so a jailed VM can never land on a real account on the host.
 	defaultJailUIDFirst = 200000
-	// defaultJailUIDCount bounds it. It is much larger than any host's slot
-	// count so that a uid is never recycled while the previous VM's files
-	// might still exist, without being so large that a misconfiguration
-	// silently walks into another subsystem's range.
+	// defaultJailUIDCount bounds it. The uid is the slot index plus the
+	// bottom of the range (see uidRange.forSlot), so this has to be larger
+	// than any host's --slots — comfortably so, since a host that outgrows
+	// it refuses the creates above it — without being so large that a
+	// misconfiguration silently walks into another subsystem's range.
 	defaultJailUIDCount = 4096
 
 	// defaultJailCgroupParent is where per-VM cgroups are created:
@@ -110,26 +110,36 @@ func jailCgroupPath(cgroupRoot, parent, id string) string {
 }
 
 // ---------------------------------------------------------------------------
-// uid and gid allocation
+// uid and gid derivation
 // ---------------------------------------------------------------------------
 
-// uidAllocator hands out one (uid, gid) pair per live VM from a configured
-// range.
+// uidRange maps a session's NETWORK SLOT to the uid and gid its VMM runs as.
 //
 // Per-VM rather than per-host is the whole point: two sessions sharing a uid
 // share every file-permission decision the kernel makes about them, so one
 // tenant's Firecracker could open the other's disk image, ptrace its VMM, and
 // signal its process. The pair is the same number for both, so a VM's files
 // are readable by its own primary group and nobody else's.
-type uidAllocator struct {
-	mu    sync.Mutex
+//
+// It is DERIVED and not allocated, and that is the whole design: an in-memory
+// allocator does not survive a runnerd restart, and the uid is not in the
+// instance record's JSON either — so a restarted runner handed the first uid
+// out again while a VM that outlived it still owned that uid and a jail full
+// of 0660 files owned by it. The slot index is the one thing that DOES
+// survive (VMMConfig.SlotIndex, re-adopted by reassociateSlot), so the uid is
+// a pure function of it: a recovered session keeps the uid its jail already
+// carries, and the next create — which cannot be given an index the pool
+// still holds — cannot be given that uid either. The two allocators are one.
+//
+// A uid is therefore recycled exactly when its slot index is, which is after
+// the previous VM's jail has been removed (Stop removes it before the slot
+// goes back to the pool) and never while that VM is running.
+type uidRange struct {
 	first int
 	count int
-	held  map[string]int // instance id -> uid
-	used  map[int]bool
 }
 
-func newUIDAllocator(first, count int) (*uidAllocator, error) {
+func newUIDRange(first, count int) (uidRange, error) {
 	if first <= 0 {
 		first = defaultJailUIDFirst
 	}
@@ -137,40 +147,28 @@ func newUIDAllocator(first, count int) (*uidAllocator, error) {
 		count = defaultJailUIDCount
 	}
 	if first < 1000 {
-		return nil, fmt.Errorf("microvm: the per-VM uid range starts at %d, inside the system range; a jailed VM must never run as a real account on this host", first)
+		return uidRange{}, fmt.Errorf("microvm: the per-VM uid range starts at %d, inside the system range; a jailed VM must never run as a real account on this host", first)
 	}
-	return &uidAllocator{first: first, count: count, held: map[string]int{}, used: map[int]bool{}}, nil
+	return uidRange{first: first, count: count}, nil
 }
 
-// claim returns id's uid, allocating one if it has none. It is idempotent so
-// that a relaunch of the same instance keeps the ownership its jail already
-// carries.
-func (a *uidAllocator) claim(id string) (int, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if uid, ok := a.held[id]; ok {
-		return uid, nil
+// forSlot is the uid and gid for the VM holding network slot idx.
+//
+// A zero uidRange — the one an engine that failed to construct carries — has
+// first 0 and count 0 and answers an error for every index, so there is no
+// value of this type that can hand out a uid inside the system range or panic
+// on a nil receiver.
+func (r uidRange) forSlot(idx int) (int, error) {
+	if r.first < 1000 || r.count <= 0 {
+		return 0, fmt.Errorf("microvm: this engine has no usable per-VM uid range (starts at %d, %d wide); see --microvm-uid-first", r.first, r.count)
 	}
-	for i := range a.count {
-		uid := a.first + i
-		if a.used[uid] {
-			continue
-		}
-		a.used[uid] = true
-		a.held[id] = uid
-		return uid, nil
+	if idx < 1 {
+		return 0, fmt.Errorf("microvm: a jailed VM needs a network slot: its uid and gid are derived from the slot index (ADR-0003 §4.5 and §5.2), and a VM with no slot has neither a namespace of its own nor a uid of its own")
 	}
-	return 0, fmt.Errorf("microvm: no free per-VM uid in [%d, %d); every jailed VM needs one of its own", a.first, a.first+a.count)
-}
-
-// release returns id's uid to the range.
-func (a *uidAllocator) release(id string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if uid, ok := a.held[id]; ok {
-		delete(a.used, uid)
-		delete(a.held, id)
+	if idx >= r.count {
+		return 0, fmt.Errorf("microvm: network slot %d is outside the per-VM uid range [%d, %d); widen it (--microvm-uid-count) or reduce --slots", idx, r.first, r.first+r.count)
 	}
+	return r.first + idx, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +241,12 @@ func jailerArgs(spec jailSpec) []string {
 // workspace costs an inode; they fall back to a copy only across filesystems,
 // which is a configuration an operator chose and which the error paths name.
 //
+// Every ownership decision and every readability check is made against the
+// IN-JAIL path, because that is the file the VM opens. On the hard-link
+// branch the two names are one inode and it makes no difference; on the copy
+// branch it is the whole difference, since the copy is a fresh file owned by
+// runnerd at 0600 and the VM is neither its owner nor in its group.
+//
 // The ownership rule is the one in jailDirMode: owner is the VM, group is the
 // runner. The VM needs to read and write its own files; the runner needs to
 // create the next boot's control socket in this directory and remove the
@@ -258,16 +262,16 @@ func (f *FirecrackerEngine) prepareJail(spec jailSpec, cfg VMMConfig) error {
 		if err := os.MkdirAll(dir, jailDirMode); err != nil {
 			return fmt.Errorf("create jail directory %s: %w", dir, err)
 		}
-		if err := chownJailPath(dir, spec.UID, spec.RunnerGID, jailDirMode); err != nil {
+		if err := f.chownJailPath(dir, spec.UID, spec.RunnerGID, jailDirMode); err != nil {
 			return err
 		}
 	}
 
 	// Read-only images shared with every other session on the host: the
-	// guest kernel and the base rootfs. They are hard-linked, which shares
-	// the INODE — so their ownership cannot be changed for one VM without
-	// changing it for every other VM holding the same image. They therefore
-	// have to be readable as they are.
+	// guest kernel and the base rootfs. A hard link shares the INODE — so
+	// their ownership cannot be changed for one VM without changing it for
+	// every other VM holding the same image, and they have to be readable as
+	// they are. A COPY is this VM's alone, so it is simply given to it.
 	for _, img := range []struct{ host, jail string }{
 		{cfg.KernelPath, jailKernelPath},
 		{cfg.RootfsPath, jailRootfsPath},
@@ -275,10 +279,18 @@ func (f *FirecrackerEngine) prepareJail(spec jailSpec, cfg VMMConfig) error {
 		if img.host == "" {
 			continue
 		}
-		if err := checkSharedImageReadable(img.host); err != nil {
+		inJail := filepath.Join(spec.Root, img.jail)
+		copied, err := f.linkOrCopy(img.host, inJail)
+		if err != nil {
 			return err
 		}
-		if err := linkOrCopy(img.host, filepath.Join(spec.Root, img.jail)); err != nil {
+		if copied {
+			if err := f.chownJailPath(inJail, spec.UID, spec.RunnerGID, jailFileMode); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := checkSharedImageReadable(inJail); err != nil {
 			return err
 		}
 	}
@@ -292,12 +304,15 @@ func (f *FirecrackerEngine) prepareJail(spec jailSpec, cfg VMMConfig) error {
 		if img.host == "" {
 			continue
 		}
-		if err := linkOrCopy(img.host, filepath.Join(spec.Root, img.jail)); err != nil {
+		inJail := filepath.Join(spec.Root, img.jail)
+		if _, err := f.linkOrCopy(img.host, inJail); err != nil {
 			return err
 		}
-		// The hard link and its original are one inode, so this changes the
-		// image's ownership on the host too. That is the intent for a
-		// workspace, which belongs to one session.
+		// On the hard-link branch this file and its original are one inode,
+		// so this changes the image's ownership on the host too. That is the
+		// intent for a workspace, which belongs to one session. On the copy
+		// branch the host's image is left alone and the VM is given the copy
+		// it will actually open.
 		//
 		// For the AGENT HOME it is a known rough edge: ADR-0003 §2.3 lets
 		// two concurrent sessions of the same creator mount one home device
@@ -307,7 +322,7 @@ func (f *FirecrackerEngine) prepareJail(spec jailSpec, cfg VMMConfig) error {
 		// session's uid is now the owner of the first's home image. Which of
 		// the two homes materialisations ADR-0003 §9 picks decides the real
 		// answer; until then this is written down rather than papered over.
-		if err := chownJailPath(img.host, spec.UID, spec.RunnerGID, jailFileMode); err != nil {
+		if err := f.chownJailPath(inJail, spec.UID, spec.RunnerGID, jailFileMode); err != nil {
 			return err
 		}
 	}
@@ -317,7 +332,7 @@ func (f *FirecrackerEngine) prepareJail(spec jailSpec, cfg VMMConfig) error {
 	if cfg.VsockUDSPath != "" {
 		sock := filepath.Join(spec.Root, cfg.VsockUDSPath+"_"+strconv.Itoa(guestControlPort))
 		if _, err := os.Stat(sock); err == nil {
-			if err := chownJailPath(sock, spec.UID, spec.RunnerGID, jailFileMode); err != nil {
+			if err := f.chownJailPath(sock, spec.UID, spec.RunnerGID, jailFileMode); err != nil {
 				return err
 			}
 		}
@@ -343,10 +358,14 @@ func (f *FirecrackerEngine) removeJail(id string) error {
 //
 // A jailed Firecracker is neither the owner of the host's kernel image nor in
 // the runner's group, so "other" read is the only bit that can let it in —
-// and the image cannot simply be chowned, because a hard link shares its
-// inode with every other jail holding the same image. Refusing here, with the
-// path and the fix in the message, beats a VM that boots to a kernel it
+// and a hard-linked image cannot simply be chowned, because the link shares
+// its inode with every other jail holding the same image. Refusing here, with
+// the path and the fix in the message, beats a VM that boots to a kernel it
 // cannot read.
+//
+// prepareJail calls it on the IN-JAIL path, which is the file the VM opens;
+// checkMicrovmHost calls it at startup on the operator's own path, so a host
+// with an unreadable kernel is refused before a session ever lands on it.
 func checkSharedImageReadable(path string) error {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -359,29 +378,37 @@ func checkSharedImageReadable(path string) error {
 }
 
 // linkOrCopy hard-links src to dst, falling back to a copy across
-// filesystems.
+// filesystems, and reports which of the two it did.
 //
 // The fallback is real but it is not free: a base rootfs on a different
 // filesystem from --microvm-state-dir is copied on every boot. That is a
 // configuration an operator chose and can undo, which is why it is a slow
 // path rather than an error.
-func linkOrCopy(src, dst string) error {
+//
+// The answer matters to the caller and is not cosmetic. A hard link is the
+// host's own file under another name, with the host's ownership and mode; a
+// copy is a fresh 0600 file owned by runnerd, which a jailed VM cannot open
+// at all. prepareJail chowns the one and checks the other.
+func (f *FirecrackerEngine) linkOrCopy(src, dst string) (copied bool, err error) {
 	if _, err := os.Stat(dst); err == nil {
 		// A relaunch into a jail that was not fully torn down. The link is
 		// removed and remade rather than trusted: the previous boot's image
 		// may not be this boot's.
 		if err := os.Remove(dst); err != nil {
-			return fmt.Errorf("replace stale jail image %s: %w", dst, err)
+			return false, fmt.Errorf("replace stale jail image %s: %w", dst, err)
 		}
 	}
-	err := os.Link(src, dst)
+	err = f.link(src, dst)
 	if err == nil {
-		return nil
+		return false, nil
 	}
 	if !errors.Is(err, syscall.EXDEV) {
-		return fmt.Errorf("link %s into the jail at %s: %w", src, dst, err)
+		return false, fmt.Errorf("link %s into the jail at %s: %w", src, dst, err)
 	}
-	return copyFileInto(src, dst)
+	if err := copyFileInto(src, dst); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func copyFileInto(src, dst string) error {
@@ -409,15 +436,14 @@ func copyFileInto(src, dst string) error {
 // chownJailPath is the one privileged filesystem operation this driver
 // performs in its own right: giving a file to the VM's uid.
 //
-// It needs CAP_CHOWN. It is a named function, called from one place, for the
-// reason the file header gives: if a deployment ever decides runnerd may not
-// hold CAP_CHOWN, this is the call a privileged helper takes over, and there
-// is exactly one of it.
-//
-// Changing ownership to our own uid is unprivileged, which is what lets the
-// tests exercise the whole jail layout on an ordinary machine.
-func chownJailPath(path string, uid, gid int, mode os.FileMode) error {
-	if err := os.Chown(path, uid, gid); err != nil {
+// It needs CAP_CHOWN. It is a named method, and the chown itself is a field
+// on the engine, for the reason the file header gives: if a deployment ever
+// decides runnerd may not hold CAP_CHOWN, this is the call a privileged
+// helper takes over, and there is exactly one of it. The same seam is what
+// lets a test on an ordinary machine watch a jail be given to a uid that
+// machine does not have.
+func (f *FirecrackerEngine) chownJailPath(path string, uid, gid int, mode os.FileMode) error {
+	if err := f.chown(path, uid, gid); err != nil {
 		return fmt.Errorf("microvm: give %s to the jailed VM's uid %d (this needs CAP_CHOWN): %w", path, uid, err)
 	}
 	if err := os.Chmod(path, mode); err != nil {
@@ -481,8 +507,28 @@ func (p *execProcess) Kill() error {
 	if pid <= 0 {
 		return nil
 	}
-	return killProcessTree(pid, syscall.SIGKILL)
+	return killProcessTree(sysSignaller{}, pid, syscall.SIGKILL)
 }
+
+// processSignaller is the two kernel calls killProcessTree makes.
+//
+// It is an interface for one reason: WHO gets signalled is the property that
+// matters here, and a test that only checks the error cannot see it. A fake
+// records every (target, signal) pair, so "a pid that does not lead its group
+// is signalled alone" is an assertion rather than a comment.
+type processSignaller interface {
+	// Getpgid is the process group of pid, as the kernel has it.
+	Getpgid(pid int) (int, error)
+	// Kill signals pid, or the process group -pid when pid is negative.
+	Kill(pid int, sig syscall.Signal) error
+}
+
+// sysSignaller is the real kernel.
+type sysSignaller struct{}
+
+func (sysSignaller) Getpgid(pid int) (int, error) { return syscall.Getpgid(pid) }
+
+func (sysSignaller) Kill(pid int, sig syscall.Signal) error { return syscall.Kill(pid, sig) }
 
 // killProcessTree signals a VMM and whatever it left in its process group.
 //
@@ -492,17 +538,17 @@ func (p *execProcess) Kill() error {
 // started by a runner that is gone, this one has no idea what group it is in,
 // and signalling a group it does not lead could reach anything on the host —
 // including, if the pgid happened to be runnerd's own, every session.
-func killProcessTree(pid int, sig syscall.Signal) error {
+func killProcessTree(sig processSignaller, pid int, s syscall.Signal) error {
 	if pid <= 0 {
 		return nil
 	}
-	if pgid, err := syscall.Getpgid(pid); err == nil && pgid == pid {
-		if err := syscall.Kill(-pgid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
+	if pgid, err := sig.Getpgid(pid); err == nil && pgid == pid {
+		if err := sig.Kill(-pgid, s); err != nil && !errors.Is(err, syscall.ESRCH) {
 			return err
 		}
 		return nil
 	}
-	if err := syscall.Kill(pid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
+	if err := sig.Kill(pid, s); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return err
 	}
 	return nil

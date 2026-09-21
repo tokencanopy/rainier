@@ -540,6 +540,18 @@ func checkMicrovmHost(opts MicrovmOpts) error {
 		log.Print("microvm: no --microvm-control-plane-cidr given, so the per-slot firewall denies only its standing ranges (cloud metadata, link-local, RFC1918, this host's slot ranges). A control plane outside those is reachable from a guest unless it is named.")
 	}
 
+	// The per-VM uid is the slot index plus the bottom of the uid range (see
+	// uidRange), so a range no wider than the slot count is a host whose top
+	// slots cannot boot. Refused here, at startup, rather than at whichever
+	// create happens to be handed the index that does not fit.
+	uids, err := newUIDRange(opts.Jail.UIDFirst, opts.Jail.UIDCount)
+	if err != nil {
+		return err
+	}
+	if opts.TotalSlots >= uids.count {
+		return fmt.Errorf("microvm: --slots is %d and the per-VM uid range is %d wide, but a VM's uid is its slot index above %d: widen --microvm-uid-count or reduce --slots", opts.TotalSlots, uids.count, uids.first)
+	}
+
 	// Machine facts, last, because an operator cannot change them with a
 	// flag and the configuration above is what they came to fix.
 	kvm, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
@@ -547,6 +559,11 @@ func checkMicrovmHost(opts MicrovmOpts) error {
 		return fmt.Errorf("microvm: /dev/kvm is not usable by this process: a microVM session is a hardware-isolated VM and there is no software fallback: %w.\n\n%s", err, MicrovmHostRequirements())
 	}
 	_ = kvm.Close()
+	// Forwarding in the HOST's namespace, which is the hop a slot's own
+	// sysctl does not cover. See checkHostForwarding.
+	if err := checkHostForwarding(); err != nil {
+		return err
+	}
 	return checkMicrovmPrivileges(opts)
 }
 
@@ -1826,16 +1843,28 @@ type FirecrackerEngine struct {
 	stateDir   string
 	netnsDir   string
 	jail       JailOpts
-	uids       *uidAllocator
-	starter    processStarter
-	procs      map[string]vmmProcess
-	initErr    error
+	// uids maps a session's network slot to the uid and gid its VMM runs as.
+	// It is a VALUE and not a pointer: an engine that failed to construct
+	// carries the zero range, whose forSlot answers an error for every index,
+	// so no code path can reach a nil allocator — see uidRange.
+	uids    uidRange
+	starter processStarter
+	// chown and link are the two filesystem operations the jail needs that an
+	// ordinary test process cannot perform. Production is os.Chown and
+	// os.Link; see FirecrackerOpts.
+	chown   func(path string, uid, gid int) error
+	link    func(oldname, newname string) error
+	procs   map[string]vmmProcess
+	initErr error
 	// kvm is the "can this host run a VM at all" check, as a field so the
 	// jail tests can run on a machine without /dev/kvm. Production never
 	// replaces it, and NewMicrovm has already refused on a host where it
 	// answers false, so this is the second of two checks rather than the
 	// only one.
 	kvm func() bool
+	// signals is the kernel, for the one place this engine signals a process
+	// it did not start. See processSignaller.
+	signals processSignaller
 }
 
 // JailOpts is the jail envelope: the uid range, where the per-VM cgroups go,
@@ -1866,6 +1895,19 @@ type FirecrackerOpts struct {
 	// Starter is the test seam that reads back the argv a host would be
 	// asked to run. nil is production.
 	Starter processStarter
+
+	// Chown and Link are the jail's two filesystem seams, and both exist for
+	// the same reason: the thing they do is not something an ordinary test
+	// process on a developer machine can do or arrange. Giving a file to
+	// ANOTHER uid needs CAP_CHOWN, and landing an image on a different
+	// filesystem from the state directory (the EXDEV copy fallback) needs two
+	// filesystems. nil is production — os.Chown and os.Link.
+	//
+	// Chown is also the seam a privileged helper would implement if a
+	// deployment ever decides runnerd may not hold CAP_CHOWN; see
+	// chownJailPath.
+	Chown func(path string, uid, gid int) error
+	Link  func(oldname, newname string) error
 }
 
 // NewFirecrackerEngine builds the production engine, or one that refuses
@@ -1908,7 +1950,11 @@ func NewFirecrackerEngine(opts FirecrackerOpts) *FirecrackerEngine {
 		jailerPath = resolved
 	}
 
-	uids, err := newUIDAllocator(jail.UIDFirst, jail.UIDCount)
+	// The uid range is resolved here and kept as a value. A range this
+	// refuses leaves the engine with the zero range, which hands out nothing:
+	// initErr is what stops the launch, and uidRange.forSlot is what stops it
+	// again if anything ever reaches past initErr.
+	uids, err := newUIDRange(jail.UIDFirst, jail.UIDCount)
 	if err != nil && initErr == nil {
 		initErr = err
 	}
@@ -1916,6 +1962,14 @@ func NewFirecrackerEngine(opts FirecrackerOpts) *FirecrackerEngine {
 	starter := opts.Starter
 	if starter == nil {
 		starter = execStarter{}
+	}
+	chown := opts.Chown
+	if chown == nil {
+		chown = os.Chown
+	}
+	link := opts.Link
+	if link == nil {
+		link = os.Link
 	}
 
 	netnsDir := opts.NetnsDir
@@ -1931,17 +1985,26 @@ func NewFirecrackerEngine(opts FirecrackerOpts) *FirecrackerEngine {
 		jail:       jail,
 		uids:       uids,
 		starter:    starter,
+		chown:      chown,
+		link:       link,
 		procs:      make(map[string]vmmProcess),
 		initErr:    initErr,
 		kvm:        hasKVM,
+		signals:    sysSignaller{},
 	}
 }
 
 // jailSpecFor resolves one instance's jail.
+//
+// The uid and gid come from the session's NETWORK SLOT and not from an
+// allocator: see uidRange. That is what makes them survive a runnerd restart,
+// since the slot index is what the instance record carries and what
+// reassociateSlot re-adopts, and it is why a VM with no slot is refused here
+// rather than given a uid two VMs could share.
 func (f *FirecrackerEngine) jailSpecFor(cfg VMMConfig) (jailSpec, error) {
-	uid, err := f.uids.claim(cfg.ID)
+	uid, err := f.uids.forSlot(cfg.SlotIndex)
 	if err != nil {
-		return jailSpec{}, err
+		return jailSpec{}, fmt.Errorf("jail for %s: %w", cfg.ID, err)
 	}
 	netns := ""
 	if cfg.Netns != "" {
@@ -2077,7 +2140,6 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	}
 	if err := f.prepareJail(spec, cfg); err != nil {
 		_ = f.removeJail(cfg.ID)
-		f.uids.release(cfg.ID)
 		return fmt.Errorf("prepare the jail for %s: %w", cfg.ID, err)
 	}
 
@@ -2093,7 +2155,6 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	proc, err := f.starter.Start(f.jailerPath, jailerArgs(spec))
 	if err != nil {
 		_ = f.removeJail(cfg.ID)
-		f.uids.release(cfg.ID)
 		return fmt.Errorf("start jailed firecracker %s: %w", cfg.ID, err)
 	}
 
@@ -2108,15 +2169,15 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		if initSuccess {
 			return
 		}
-		// A launch that got part-way leaves a live VMM, a jail full of hard
-		// links and a uid nobody else may use. All three go, in that order:
-		// the process first, because removing the jail under a running
-		// Firecracker is how a VMM ends up writing into a directory that has
-		// been unlinked.
+		// A launch that got part-way leaves a live VMM and a jail full of
+		// hard links. Both go, in that order: the process first, because
+		// removing the jail under a running Firecracker is how a VMM ends up
+		// writing into a directory that has been unlinked. The uid needs no
+		// undoing — it is the slot's, and the slot is the caller's to give
+		// back (see uidRange).
 		_ = proc.Kill()
 		_ = proc.Wait()
 		_ = f.removeJail(cfg.ID)
-		f.uids.release(cfg.ID)
 		// And the pid file this launch wrote, which outlives the jail
 		// because it is not in it. A stale one is what State and PID read on
 		// the next boot.
@@ -2317,10 +2378,10 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 		// kernel rather than assuming it, so a pid recovered across a
 		// runnerd restart — whose group this process knows nothing about —
 		// is only ever signalled on its own.
-		if err := killProcessTree(pid, syscall.SIGTERM); err != nil {
+		if err := killProcessTree(f.signals, pid, syscall.SIGTERM); err != nil {
 			stopErr = fmt.Errorf("sigterm pid %d: %w", pid, err)
 		} else if !awaitExit(ctx, waited, pid, firecrackerTermTimeout) {
-			_ = killProcessTree(pid, syscall.SIGKILL)
+			_ = killProcessTree(f.signals, pid, syscall.SIGKILL)
 			if !awaitExit(ctx, waited, pid, firecrackerKillTimeout) && stopErr == nil {
 				stopErr = notExitedErr(ctx, pid)
 			}
@@ -2356,15 +2417,13 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 		stopErr = jailErr
 	}
 
-	// The uid comes back when the JAIL is gone, which is the only thing that
-	// still holds files owned by it. It is deliberately not conditioned on
-	// stopErr: a Stop that could not confirm the process, and whose caller
-	// deletes the record anyway (see DestroyContainer, which proceeds when
-	// the engine reports the VM gone), would otherwise hold that uid for the
-	// life of the runner with nothing left that could ever release it.
-	if jailErr == nil {
-		f.uids.release(id)
-	}
+	// There is no uid to give back. It is derived from the session's network
+	// slot (see uidRange), so it comes back exactly when the slot does — and
+	// the slot is released by the caller AFTER this returns, which is the
+	// ordering that matters: the jail owned by that uid is removed above,
+	// before any other session can be given the index and with it the uid.
+	// The in-memory allocator this replaced could be held forever by a Stop
+	// that failed, and could not survive a runnerd restart at all.
 
 	// The pid file is the engine's own record of a process that no longer
 	// exists. It lives outside the jail, so removeJail does not take it, and

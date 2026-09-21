@@ -39,10 +39,14 @@ func (o Op) String() string {
 type FakeHost struct {
 	mu sync.Mutex
 
-	ops    []Op
-	ns     map[string]bool
-	links  map[string]bool   // "netns/link"
-	rules  map[string]string // netns -> the ruleset last applied there
+	ops   []Op
+	ns    map[string]bool
+	links map[string]bool   // "netns/link"
+	rules map[string]string // netns -> the ruleset last applied there
+	// sysctl is what a slot's namespace was tuned to. It is state and not
+	// just a recorded call, because a second Allocate on a recycled index
+	// must find the value its own setup put there rather than the previous
+	// session's.
 	sysctl map[string]string // "netns key" -> value
 	failOn map[string]error
 }
@@ -77,17 +81,6 @@ func (f *FakeHost) Ops() []Op {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.ops)
-}
-
-// Verbs returns just the verbs, in call order.
-func (f *FakeHost) Verbs() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	out := make([]string, len(f.ops))
-	for i, op := range f.ops {
-		out[i] = op.Verb
-	}
-	return out
 }
 
 // Namespaces returns the namespaces that currently exist, sorted.
@@ -235,15 +228,6 @@ func (f *FakeHost) SetSysctl(_ context.Context, netns, key, value string) error 
 	defer f.mu.Unlock()
 	f.sysctl[netns+" "+key] = value
 	return nil
-}
-
-// Sysctl returns the value last set for key in netns, and whether one was
-// set at all.
-func (f *FakeHost) Sysctl(netns, key string) (string, bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	v, ok := f.sysctl[netns+" "+key]
-	return v, ok
 }
 
 func (f *FakeHost) ApplyNft(_ context.Context, netns, ruleset string) error {

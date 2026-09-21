@@ -55,9 +55,9 @@ func main() {
 	microvmJailer := flag.String("microvm-jailer", envDefault("RAINIER_MICROVM_JAILER", ""),
 		"path to Firecracker's jailer; empty means `jailer` on PATH. Every microVM runs under it (ADR-0003 §4.5: per-VM uid and gid, its own cgroup, its own netns, a chroot, seccomp) and the runner refuses to start without it")
 	microvmUIDFirst := flag.Int("microvm-uid-first", envIntDefault("RAINIER_MICROVM_UID_FIRST", 0),
-		"bottom of the per-VM uid and gid range the jailer drops each microVM to; 0 means 200000")
+		"bottom of the per-VM uid and gid range the jailer drops each microVM to; 0 means 200000. A VM's uid is this plus its network slot index, so it is the same number across a runnerd restart and two live sessions can never share one")
 	microvmUIDCount := flag.Int("microvm-uid-count", envIntDefault("RAINIER_MICROVM_UID_COUNT", 0),
-		"size of the per-VM uid and gid range; 0 means 4096")
+		"size of the per-VM uid and gid range; 0 means 4096. It must be larger than --slots, since a VM's uid is its slot index above --microvm-uid-first, and the runner refuses to start otherwise")
 	microvmCgroupParent := flag.String("microvm-cgroup-parent", envDefault("RAINIER_MICROVM_CGROUP_PARENT", ""),
 		"cgroup v2 parent the jailer creates each microVM's cgroup under, and where host-side metering reads cpu.stat and memory.current (ADR-0003 §4.6); empty means rainier")
 	microvmCgroupRoot := flag.String("microvm-cgroup-root", envDefault("RAINIER_MICROVM_CGROUP_ROOT", ""),

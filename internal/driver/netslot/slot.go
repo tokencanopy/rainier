@@ -25,9 +25,9 @@
 // every address a sandbox's network needs, so that a crashed host can be
 // reconciled from the names alone. What changed: the addressing follows
 // ADR-0003 §5.2 (a /30 per slot from a configurable host-local range) rather
-// than E2B's /32-plus-/31-plus-shared-169.254 layout, the MAC is derived from
-// the index instead of being one constant for every sandbox, and the Slot is
-// a value with no host operations on it. See PROVENANCE.md.
+// than E2B's /32-plus-/31-plus-shared-169.254 layout, both ends of the guest
+// link are derived from the index instead of being a constant pair shared by
+// every sandbox, and the Slot is a value with no host operations on it. See PROVENANCE.md.
 package netslot
 
 import (
@@ -75,11 +75,12 @@ type Slot struct {
 	VethNSIP   netip.Addr
 	UplinkNet  netip.Prefix
 
-	// MAC is the guest NIC's hardware address, derived from Index so a
-	// capture on the host names the slot it came from. TapMAC is the host
-	// end of the same link — the TAP device's own address — and is a
-	// DIFFERENT value on purpose: two interfaces on one segment sharing a
-	// hardware address is a broken segment, not a saving.
+	// MAC is the guest NIC's hardware address; TapMAC is the host end of
+	// the same link, the TAP device's own address. Two values, because two
+	// interfaces on one segment sharing a hardware address is a broken
+	// segment — which is upstream's shape too (it has a constant for each
+	// end). What differs is that both of these are derived from Index, so a
+	// capture on the host names the slot it came from.
 	MAC    string
 	TapMAC string
 }
@@ -188,13 +189,14 @@ func (r resolved) netnsIndexAny(name string) (int, bool) {
 	return idx, true
 }
 
-// slotMAC derives the guest NIC address from the slot index.
+// slotMAC derives one end of a slot's guest link from the slot index. side
+// is 0 for the guest NIC and 1 for the TAP device.
 //
 // 02 is the locally-administered unicast prefix, so this can never collide
-// with a real vendor's assignment. E2B hands every sandbox the same MAC —
-// which is safe there, because each TAP is alone in its own namespace — but a
-// per-slot address costs nothing and makes a capture on the host self-
-// describing.
+// with a real vendor's assignment. E2B has one constant per end and hands
+// every sandbox the same pair — which is safe there, because each TAP is
+// alone in its own namespace — but a per-slot address costs nothing and makes
+// a capture on the host self-describing.
 func slotMAC(side byte, idx int) string {
 	return fmt.Sprintf("02:fc:00:%02x:%02x:%02x", side, byte(idx>>8), byte(idx))
 }

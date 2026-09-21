@@ -8,6 +8,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -333,19 +334,26 @@ func TestMicrovmListAlsoGivesBackTheSlotsOfVMsThatDied(t *testing.T) {
 	}
 }
 
-// TestMicrovmColdResumeDoesNotOrphanASlotTheRecordStillHolds.
+// TestMicrovmColdResumeGivesBackASlotTheRecordStillHolds.
 //
-// An engine that reports a terminated VMM as stopped — which is what a
-// hypervisor with a supervisor in front of it would do — reconciles a running
-// session to COLD without this driver having parked it, so the record is
-// cold and still holding a slot. The cold resume that follows allocates a new
-// one, and if it simply overwrote the old the namespace, veth, TAP and
+// A record can be COLD and still holding a slot: an engine with a supervisor
+// in front of it reports a terminated VMM as stopped, which reconciles a
+// running session to cold without this driver having parked it, and nothing
+// on that path hands the slot back. The cold resume that follows allocates a
+// new one, and if it simply overwrote the old the namespace, veth, TAP and
 // firewall would be orphaned with nothing left naming them: the pool would
 // still count that index in use under this session's key, so no Release could
 // reach it and Reclaim would skip it.
-func TestMicrovmColdResumeDoesNotOrphanASlotTheRecordStillHolds(t *testing.T) {
+//
+// The state is set up directly rather than through Inspect. Inspect detaches
+// an idle record's slot and releases it (detachIdleSlot), so a test that went
+// through it would arrive at the resume with no slot held and would assert
+// nothing about this path at all — which is what the version of this test
+// before it did, twice over, with its own final assertion behind an early
+// return that always fired.
+func TestMicrovmColdResumeGivesBackASlotTheRecordStillHolds(t *testing.T) {
 	stateDir := shortTempDir(t)
-	m, sim, net := testMicrovmNet(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
+	m, _, net := testMicrovmNet(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
 	m.SetHost(&stubMicrovmHost{})
 	ctx := context.Background()
 
@@ -354,31 +362,115 @@ func TestMicrovmColdResumeDoesNotOrphanASlotTheRecordStillHolds(t *testing.T) {
 		t.Fatalf("Create: %v", err)
 	}
 	firstCfg, _ := instanceConfig(m, h.ID)
+	if firstCfg.SlotIndex == 0 {
+		t.Fatal("the created session has no slot")
+	}
 
-	// The record goes cold by RECONCILE rather than by Suspend, so the slot
-	// is never handed back on the way in.
-	sim.SetState(h.ID, VMMStateStopped)
-	if g, _ := m.Inspect(ctx, h.ID); g.State != StateSuspended {
-		t.Fatalf("Inspect after the VMM stopped = %s, want %s", g.State, StateSuspended)
+	// Cold, with the slot still on the record: the state a reconcile leaves
+	// behind when nothing else runs between it and the resume.
+	m.mu.Lock()
+	inst := m.instances[h.ID]
+	inst.State, inst.Cold = StateSuspended, true
+	held := inst.slot
+	m.mu.Unlock()
+	if held == nil {
+		t.Fatal("the record lost its slot before the resume; this test is not exercising the stale-slot path")
 	}
 
 	if _, err := m.Resume(ctx, h.ID); err != nil {
 		t.Fatalf("cold Resume: %v", err)
 	}
+
 	secondCfg, _ := instanceConfig(m, h.ID)
 	if secondCfg.SlotIndex == 0 {
 		t.Fatal("the resumed session has no slot")
 	}
-	if got := net.Namespaces(); len(got) != 1 {
-		t.Fatalf("namespaces after the resume = %v, want exactly one — the old slot was orphaned", got)
+	// One namespace, and it is the one the resumed session is using. Without
+	// the release, the old namespace is still there beside the new one — and
+	// the index it holds can never be given back, because the pool has it
+	// under this session's key.
+	got := net.Namespaces()
+	if len(got) != 1 {
+		t.Fatalf("namespaces after the resume = %v, want exactly one; the slot the record was still holding was orphaned", got)
 	}
-	if secondCfg.Netns == firstCfg.Netns {
-		// Not wrong in itself (the index may be recycled), but then the
-		// single namespace above must be the new one.
-		return
+	if got[0] != secondCfg.Netns {
+		t.Fatalf("the surviving namespace is %s, want the resumed session's %s", got[0], secondCfg.Netns)
 	}
-	if net.Namespaces()[0] != secondCfg.Netns {
-		t.Fatalf("the surviving namespace is %v, want the resumed session's %s", net.Namespaces(), secondCfg.Netns)
+	// The old one was torn down BEFORE the new one was built, which is what
+	// lets the index be reused rather than retired as somebody else's.
+	ops := net.Ops()
+	del, add := -1, -1
+	for i, op := range ops {
+		if op.Verb == "netns-del" && len(op.Args) > 0 && op.Args[0] == firstCfg.Netns {
+			del = i
+		}
+		if add == -1 && del != -1 && op.Verb == "netns-add" && len(op.Args) > 0 && op.Args[0] == secondCfg.Netns {
+			add = i
+		}
+	}
+	if del == -1 {
+		t.Fatalf("the stale namespace %s was never deleted:\n%v", firstCfg.Netns, ops)
+	}
+	if add == -1 {
+		t.Fatalf("the resumed session's namespace %s was not created after the stale one went:\n%v", secondCfg.Netns, ops)
+	}
+
+	// And the pool has the capacity back: a host with four slots that has
+	// leaked one cannot fill them.
+	for i := range 3 {
+		if _, err := m.Create(ctx, Spec{SessionID: fmt.Sprintf("beta-%d", i)}); err != nil {
+			t.Fatalf("create %d of 3 after the resume: %v; an index was lost", i+1, err)
+		}
+	}
+}
+
+// TestMicrovmARecoveredSessionsUIDIsNotHandedToTheNextCreate.
+//
+// The per-VM uid is derived from the session's network slot (see uidRange),
+// and that is what makes it survive a runnerd restart: the slot index is in
+// the instance record, the record is what recovery re-adopts, and the pool
+// will not hand a still-held index to anybody else. Before, the uid came
+// from an in-memory allocator that a restart emptied, so the next create was
+// given the first uid again — while a VM that outlived the restart still
+// owned it, and a jail of 0660 files owned by it.
+func TestMicrovmARecoveredSessionsUIDIsNotHandedToTheNextCreate(t *testing.T) {
+	stateDir := shortTempDir(t)
+	net := netslot.NewFakeHost()
+	ctx := context.Background()
+
+	first, sim, _ := testMicrovmNet(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir, Net: net})
+	survivor, err := first.Create(ctx, Spec{SessionID: "alpha"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	survivorCfg, _ := sim.Config(survivor.ID)
+
+	// The restart: a second driver over the same state directory and the same
+	// host, as a restarted runnerd would be.
+	second, _, _ := testMicrovmNet(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir, Net: net})
+	fresh, err := second.Create(ctx, Spec{SessionID: "beta"})
+	if err != nil {
+		t.Fatalf("Create on the recovered driver: %v", err)
+	}
+	freshCfg, ok := instanceConfig(second, fresh.ID)
+	if !ok {
+		t.Fatal("no record for the new session")
+	}
+
+	uids, err := newUIDRange(0, 0)
+	if err != nil {
+		t.Fatalf("newUIDRange: %v", err)
+	}
+	survivorUID, err := uids.forSlot(survivorCfg.SlotIndex)
+	if err != nil {
+		t.Fatalf("the surviving session's slot has no uid: %v", err)
+	}
+	freshUID, err := uids.forSlot(freshCfg.SlotIndex)
+	if err != nil {
+		t.Fatalf("the new session's slot has no uid: %v", err)
+	}
+	if freshUID == survivorUID {
+		t.Fatalf("the session created after the restart was given uid %d, which the surviving session's jail is owned by", freshUID)
 	}
 }
 

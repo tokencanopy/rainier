@@ -67,15 +67,21 @@ against Firecracker's own jailer documentation.
   implementation without the pool changing. The Linux implementation shells
   out to `ip`, `nft` and `sysctl` (see `host_linux.go`) rather than adding a
   netlink dependency to `go.mod`.
-- **When an index is blocked, and for how long.** Upstream re-checks
-  `isNamespaceAvailable` on every allocation scan, so an index is unavailable
-  only while the namespace exists. Rainier discovers the collision by trying
-  to create the namespace, so it has to tell "the name is taken" apart from
-  "the create failed": a confirmed collision retires the index for the
-  process's lifetime and the allocation moves to the next one, while any
-  other failure marks it *leaked*, which is recoverable. A runner that loses
-  `CAP_NET_ADMIN` for a minute must not come back with a permanently smaller
-  host.
+- **How a foreign index is discovered.** Retiring one is *upstream's*
+  behaviour and not Rainier's invention: `StorageLocal` takes a snapshot of
+  the namespace directory at construction (`getForeignNamespaces`), and
+  `Acquire` skips every index in it for the life of the process — beside a
+  per-scan `isNamespaceAvailable` check that blocks an index only while its
+  namespace is there, and a `leakedNs` set for teardowns that failed. Rainier
+  keeps all three states. What changed is where the foreign set comes from:
+  there is no startup snapshot, because the namespace directory is not this
+  pool's to interpret before `Reclaim` has run and the driver has re-adopted
+  its own survivors. Rainier discovers the collision by trying to create the
+  namespace, which means it has to tell "the name is taken" apart from "the
+  create failed": a confirmed collision retires the index and the allocation
+  moves to the next one, while any other failure marks it *leaked*, which is
+  recoverable. A runner that loses `CAP_NET_ADMIN` for a minute must not come
+  back with a permanently smaller host.
 - **Reclaim is not bounded by the slot count.** Upstream's
   `SlotIndexFromNamespace` rejects an index above the configured size, so
   shrinking the pool orphans the namespaces above it. Rainier bounds what is
@@ -88,10 +94,13 @@ against Firecracker's own jailer documentation.
   second /30 per slot from a configurable uplink range for the veth pair. No
   address is shared between slots, so a rendered firewall can name a
   neighbour.
-- **MAC.** Upstream uses one constant guest MAC for every sandbox, which is
-  safe there because each TAP is alone in its namespace. Rainier derives the
-  MAC from the slot index anyway (`02:fc:00:00:hi:lo`), so a packet capture on
-  the host names the slot it came from.
+- **MAC.** Upstream already uses two addresses for the two ends of the guest
+  link — `tapMAC` `02:FC:00:00:00:05` for the guest NIC and `tapHostMAC`
+  `02:FC:00:00:00:06` for the TAP device itself — but both are *constants*,
+  the same on every sandbox, which is safe there because each TAP is alone in
+  its namespace. Rainier keeps the two-address split and derives both from the
+  slot index instead (`02:fc:00:<side>:hi:lo`), so a packet capture on the
+  host names the slot it came from.
 - **Firewall.** Upstream builds the ruleset programmatically with
   `google/nftables` and expression trees, with a default policy of *accept* and
   the TCP path handed to a userspace proxy by an iptables `REDIRECT`. Rainier

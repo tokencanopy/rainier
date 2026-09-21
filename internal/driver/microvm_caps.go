@@ -126,6 +126,69 @@ func checkMicrovmPrivileges(opts MicrovmOpts) error {
 	return checkCgroupParent(opts)
 }
 
+// hostIPForwardPath is where the kernel publishes the HOST namespace's
+// forwarding switch. It is a variable so a test can point it at a fixture
+// rather than at a machine whose networking it would have to reconfigure.
+var hostIPForwardPath = "/proc/sys/net/ipv4/ip_forward"
+
+// checkHostForwarding refuses a host that cannot forward a guest's packet off
+// the machine.
+//
+// A slot turns forwarding on INSIDE its own namespace (Pool.setup), which is
+// what gets a packet from the TAP to the veth. Getting it from the host end
+// of that veth to the egress proxy is the HOST's namespace, and that half is
+// not this runner's to configure: net.ipv4.ip_forward is machine-wide, shared
+// with everything else on the box, and turning it on for the whole host is an
+// operator's decision and not a driver's. So it is checked and named, exactly
+// like /dev/kvm: a host that has not been prepared is told what to do rather
+// than left to produce sessions whose every packet dies on the host.
+//
+// The other half of that preparation — a SNAT (masquerade) rule for the guest
+// range — cannot be checked this cheaply: it is one rule among whatever else
+// the host's ruleset holds, and a wrong guess either way is worse than the
+// documentation. docs/microvm-host-privileges.md carries both.
+func checkHostForwarding() error {
+	data, err := os.ReadFile(hostIPForwardPath)
+	if err != nil {
+		return fmt.Errorf("microvm: cannot read %s, so this runner cannot tell whether a guest's packets would leave this host at all: %w.\n\n%s", hostIPForwardPath, err, MicrovmHostPreparation())
+	}
+	if strings.TrimSpace(string(data)) == "0" {
+		return fmt.Errorf("microvm: %s is 0, so every packet a guest sends would be forwarded into this slot's veth and dropped by the host. A microVM's only route out is the egress proxy on the host's own network.\n\n%s", hostIPForwardPath, MicrovmHostPreparation())
+	}
+	return nil
+}
+
+// MicrovmHostPreparation is the host-side networking an operator has to set
+// up once, before any session lands. It is separate from the capability list
+// because none of it is something this runner could do for itself: both items
+// are machine-wide and shared with whatever else runs here.
+func MicrovmHostPreparation() string {
+	return `the microvm driver also needs this host prepared, once, outside runnerd:
+
+  net.ipv4.ip_forward=1     a guest's packet arrives on its slot's TAP and
+                            leaves on the slot's veth, which is forwarding.
+                            The slot turns forwarding on inside its OWN
+                            namespace; the hop from the host end of the veth
+                            to the egress proxy is the host's namespace, and
+                            that switch is machine-wide.
+                              sysctl -w net.ipv4.ip_forward=1
+                              (and /etc/sysctl.d/ for the next boot)
+
+  SNAT for the guest range  the guest's source address is a slot's /30 out of
+                            --microvm-guest-cidr, which is host-local: nothing
+                            beyond this machine has a route back to it. Source
+                            NAT on the way out is what gives the egress proxy
+                            an address it can answer.
+                              nft add table ip rainier-nat
+                              nft add chain ip rainier-nat post '{ type nat hook postrouting priority 100; }'
+                              nft add rule ip rainier-nat post ip saddr <guest cidr> oifname <uplink> masquerade
+
+The runner checks the sysctl at startup. It does NOT check the SNAT rule: it
+is one rule among whatever else this host's ruleset holds, and a driver that
+guessed at it would be as likely to report a working host broken as the
+reverse.`
+}
+
 // checkCgroupParent makes sure the jailer will be able to create each VM's
 // cgroup, and that metering will be able to read it (ADR-0003 §4.6).
 //

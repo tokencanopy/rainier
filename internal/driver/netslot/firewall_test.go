@@ -134,6 +134,51 @@ func TestNoProxyMeansNoHostSideDestinationAtAll(t *testing.T) {
 	}
 }
 
+// TestGuestIPv6IsDroppedBeforeAnythingIsAccepted.
+//
+// The deny set is an ipv4_addr interval set, so it has nothing to say about
+// an IPv6 destination: the metadata service, a neighbour and the control
+// plane are all reachable over v6 by a guest that configures itself one,
+// whatever this ruleset says about v4. The guest link is configured IPv4-only
+// by the boot arguments, so the whole family is dropped — and it has to be
+// dropped ABOVE the accepts, or the proxy rule and the established rule would
+// let v6 through ahead of it.
+//
+// The golden file pins these bytes, but only as bytes: a change that moved
+// this rule below the accepts would be a golden diff someone could wave
+// through. This says what the position is FOR.
+func TestGuestIPv6IsDroppedBeforeAnythingIsAccepted(t *testing.T) {
+	rs := goldenRuleset(t)
+
+	ipv6, firstAccept, guestReturn := -1, -1, -1
+	for i, line := range strings.Split(rs, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.Contains(line, "nfproto ipv6"):
+			if !strings.HasSuffix(line, "drop") {
+				t.Fatalf("the IPv6 rule is %q, and the deny set is IPv4-only: anything but a drop is a family with no boundary at all", line)
+			}
+			if ipv6 != -1 {
+				t.Fatalf("two IPv6 rules in one chain:\n%s", rs)
+			}
+			ipv6 = i
+		case strings.HasSuffix(line, "accept") && firstAccept == -1:
+			firstAccept = i
+		case strings.HasPrefix(line, "iifname !="):
+			guestReturn = i
+		}
+	}
+	if ipv6 == -1 {
+		t.Fatalf("nothing in the ruleset drops IPv6 from the guest:\n%s", rs)
+	}
+	if guestReturn == -1 || ipv6 < guestReturn {
+		t.Fatalf("the IPv6 drop is above the interface match, so it drops traffic that is not the guest's:\n%s", rs)
+	}
+	if firstAccept != -1 && ipv6 > firstAccept {
+		t.Fatalf("the IPv6 drop is below an accept, so a v6 packet can be accepted before the family is dropped:\n%s", rs)
+	}
+}
+
 // TestNeighbourSlotsAndTheHostAreDenied walks the rendered deny set and asks
 // it about concrete addresses: the guest next door, its gateway, the uplink
 // veths, the metadata service, the control plane, and this slot's own
