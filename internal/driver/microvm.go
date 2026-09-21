@@ -1866,25 +1866,69 @@ func (m *Microvm) Prepull(ctx context.Context, ref string) error {
 	return nil
 }
 
+// Destroy is the full teardown: the VM and everything of this session on this
+// host, workspace disk included.
+//
+// The session id is resolved BEFORE anything is removed, and from the disk
+// when the live record is gone. That second lookup is the fix for a real leak:
+// an id this driver did not know used to resolve to an empty session id, and
+// RemoveWorkspace treats an empty id as a no-op (it must — "rainier-ws-" alone
+// is a real volume name), so the disk image stayed on the host with nothing
+// left to name it. One leaked workspace per Destroy that arrived after the
+// record was gone — a reconcile that raced a crash, a retried rm — each of
+// them a tenant's files kept forever by a teardown that reported success.
+//
+// An id that names nothing at all is an ERROR rather than a silent success,
+// and that is the honest answer: this driver cannot tell "already gone" from
+// "never here", and the two want opposite things. The message names the call
+// that CAN finish the job, because the caller above has the session id this
+// one does not: RemoveWorkspace takes it, which is exactly why it takes a
+// session id and not a handle (see driver.Driver.RemoveWorkspace), and it is
+// what controld dispatches after an explicit removal anyway.
 func (m *Microvm) Destroy(ctx context.Context, id string) error {
 	m.mu.Lock()
-	sessionID := ""
+	sessionID, known := "", false
 	if inst, ok := m.instances[id]; ok {
-		sessionID = inst.SessionID
+		sessionID, known = inst.SessionID, true
 	}
 	m.mu.Unlock()
 
-	// TODO(PR 4): an id this driver does not know resolves to an empty
-	// session id, so RemoveWorkspace below is a no-op and the disk image
-	// stays on the host with nothing left to name it — one leaked workspace
-	// per Destroy that arrives after the record is gone (a reconcile that
-	// raced a crash, a retried rm). Fixing it means finding the workspace
-	// from the disk rather than from the record, which is the same lookup the
-	// image work needs.
+	// The record on disk outlives this process, and it is still there for any
+	// id whose live record went missing without its directory going with it —
+	// a record that failed to parse at startup, or one this driver never
+	// adopted. DestroyContainer below removes the directory, so this has to
+	// read it first.
+	if !known {
+		if rec, ok := m.diskRecord(id); ok {
+			sessionID, known = rec.SessionID, true
+		}
+	}
+	if !known {
+		return fmt.Errorf("destroy %s: this host has no record of that instance, so it cannot name the session whose workspace disk to remove. "+
+			"If the session is known above this driver, RemoveWorkspace(sessionID) is the call that finishes the teardown", id)
+	}
+
 	if err := m.DestroyContainer(ctx, id); err != nil {
 		return err
 	}
 	return m.RemoveWorkspace(ctx, sessionID)
+}
+
+// diskRecord reads one instance record off the state directory, for a lookup
+// that must work when the in-memory map does not have it.
+func (m *Microvm) diskRecord(id string) (instanceRecord, bool) {
+	if checkPathSegment("instance id", id) != nil {
+		return instanceRecord{}, false
+	}
+	data, err := os.ReadFile(m.instanceMetaPath(id))
+	if err != nil {
+		return instanceRecord{}, false
+	}
+	var rec instanceRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return instanceRecord{}, false
+	}
+	return rec, true
 }
 
 func (m *Microvm) DestroyContainer(ctx context.Context, id string) error {
