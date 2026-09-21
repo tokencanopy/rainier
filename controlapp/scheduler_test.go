@@ -418,7 +418,7 @@ func TestDispatchCreateFailureAndUncertainDelivery(t *testing.T) {
 		fx.transport.dispatchErr = errors.New("connection closed")
 		fx.transport.connectedOverrides["pool_example/vm1"] = false
 
-		fx.service.dispatchCreate(context.Background(), "pool_example", row, "vm1", nil)
+		fx.service.dispatchCreate(context.Background(), "pool_example", row, "vm1", nil, nil)
 
 		got := fleetGetSessionState(t, fx, "ws_example", "sess_conn")
 		if got.State != control.StateQueued || got.RunnerID != "" {
@@ -438,7 +438,7 @@ func TestDispatchCreateFailureAndUncertainDelivery(t *testing.T) {
 		fx.transport.dispatchErr = errors.New("no result before timeout")
 		// Connected stays true: the command was delivered.
 
-		fx.service.dispatchCreate(context.Background(), "pool_example", row, "vm1", nil)
+		fx.service.dispatchCreate(context.Background(), "pool_example", row, "vm1", nil, nil)
 
 		got := fleetGetSessionState(t, fx, "ws_example", "sess_timeout")
 		if got.State != control.StateCreating || got.RunnerID != "vm1" {
@@ -706,7 +706,7 @@ func TestCreateSpecBoundsOnlyTheHooksThatRun(t *testing.T) {
 			if tc.rowImage != "" {
 				r.Spec.Image = tc.rowImage // a row created against a current snapshot boots it
 			}
-			spec, fail := fx.service.createSpec(fleetCtx, r, &env)
+			spec, fail := fx.service.createSpec(fleetCtx, r, &env, nil, 0)
 			if fail != "" {
 				t.Fatalf("createSpec failed: %s", fail)
 			}
@@ -741,7 +741,7 @@ func TestCreateSpecSendsSetupUnlessTheRowBootsTheSnapshot(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			row := control.Session{ID: "sess_example", WorkspaceID: "ws_example", EnvironmentID: "env_example", Spec: control.PortableSpec{Image: tc.rowImage}}
-			spec, fail := fx.service.createSpec(fleetCtx, row, &env)
+			spec, fail := fx.service.createSpec(fleetCtx, row, &env, nil, 0)
 			if fail != "" {
 				t.Fatalf("createSpec failed: %s", fail)
 			}
@@ -774,7 +774,7 @@ func TestDispatchCreateCarriesThePlacementGeneration(t *testing.T) {
 	// BEFORE the placement, one generation behind the store.
 	stale := row
 	stale.PlacementGeneration = 2
-	fx.service.dispatchCreate(context.Background(), "pool_example", stale, "vm1", nil)
+	fx.service.dispatchCreate(context.Background(), "pool_example", stale, "vm1", nil, nil)
 
 	dispatched := fx.transport.dispatchedCommands()
 	if len(dispatched) != 1 {

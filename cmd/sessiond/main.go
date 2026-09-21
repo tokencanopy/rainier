@@ -18,8 +18,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/coder/websocket"
-
 	"github.com/tokencanopy/rainier/internal/eventlog"
 	"github.com/tokencanopy/rainier/internal/reap"
 	"github.com/tokencanopy/rainier/internal/relay"
@@ -60,6 +58,8 @@ func main() {
 	rows := flag.Int("rows", 32, "initial rows")
 	dial := flag.String("dial", "", "runnerd URL to dial and register with (relay mode)")
 	sessionID := flag.String("session", "", "session id to register as (relay mode)")
+	transport := flag.String("transport", envOr("RAINIER_TRANSPORT", transportWebSocket),
+		"how to reach the runner: websocket (the default, and every Docker session) or vsock (a microVM guest, which receives its whole configuration over the channel rather than in its environment)")
 	flag.Parse()
 	argv := flag.Args()
 	if len(argv) == 0 {
@@ -82,6 +82,55 @@ func main() {
 		}
 	}
 
+	// The microVM boot, before anything reads the environment block —
+	// because on this path there IS no environment block until this runs.
+	// The guest opens its vsock channel, reads its whole configuration off
+	// the first frame, exchanges its bootstrap token for the secrets its
+	// create deliberately withheld, and puts both into this process's
+	// environment in the shape everything below already reads.
+	//
+	// The connection it bootstrapped on is kept and served: the
+	// configuration, the terminal stream and the session RPC all ride one
+	// channel by design, and a second dial would be a second guest for a
+	// socket that serves one.
+	var (
+		dialer    dialSession
+		preamble  func(context.Context, relay.Conn) error
+		firstConn relay.Conn
+		// overVsock is what puts this process in relay mode on the microVM
+		// path, and it is NOT "firstConn != nil": a boot whose exchange was
+		// refused closes its connection and dials again, and such a session
+		// is still very much in relay mode — it has a boot chain to fail
+		// loudly through.
+		overVsock bool
+		boots     = &bootstrapper{}
+		// secretsFailure is a boot that must not start an agent: the
+		// environment declared credentials this session could not be given.
+		// It becomes the chain's first stage, which only fails.
+		secretsFailure string
+	)
+	if *transport == transportVsock {
+		dialer = vsockTransport()
+		preamble = func(ctx context.Context, c relay.Conn) error { return reBootstrap(ctx, c, boots) }
+		conn, cfg, failure, err := bootOverVsock(context.Background(), dialer, boots)
+		if err != nil {
+			// Deliberately fatal, and the same judgement prepareBoot's own
+			// failure gets: a guest that could not read its configuration
+			// does not know what session it is, what to run, or where its
+			// egress goes. Dying is what makes the runner notice.
+			log.Fatalf("microvm boot: %v", err)
+		}
+		firstConn, overVsock = conn, true
+		if *sessionID == "" {
+			*sessionID = cfg.SessionID
+		}
+		if failure != nil {
+			secretsFailure = failure.Error()
+		}
+	} else if *transport != transportWebSocket {
+		log.Fatalf("unknown --transport %q (valid: %s, %s)", *transport, transportWebSocket, transportVsock)
+	}
+
 	// The boot chain (design §4.3). An environment's setup script (Plan 4), the
 	// repositories controld resolved, and the environment's per-boot init hook
 	// all arrive as base64 in the environment block, injected by the driver.
@@ -97,8 +146,13 @@ func main() {
 	// exists on a dialed conn, the credential the clone stage needs can only be
 	// minted over it, and the local dev listener has no runnerd to reach.
 	bootEnvironment := bootEnvFromOS()
+	bootEnvironment.SecretsFailure = secretsFailure
+	// A vsock session is in relay mode by construction: it HAS a connection,
+	// it just did not get it from a URL. Everything gated on relay mode
+	// below reads this rather than the flag.
+	relayMode := *dial != "" || overVsock
 	var stages []bootStage
-	if bootEnvironment.any() && *dial == "" {
+	if bootEnvironment.any() && !relayMode {
 		// Can't happen from the driver (it injects RAINIER_DIAL alongside), but
 		// a human running sessiond by hand with the vars set would otherwise
 		// get an environment silently missing its setup and its repositories.
@@ -134,7 +188,7 @@ func main() {
 	// carried no manifest — a session with no creator, or an older controld —
 	// and then nothing in agents.go runs at all.
 	var agents *agentSync
-	if *dial != "" {
+	if relayMode {
 		rpc = newRPCDispatcher()
 		startAgentSocket(context.Background(), agentSocketPath, rpc, events)
 		// The workspace-inspection methods controld drives INTO this sandbox:
@@ -234,6 +288,14 @@ func main() {
 	// the path users actually take.
 	if rpc != nil {
 		rpc.RegisterEventHandler(relay.KindSuspending, func(ev relay.ControlEvent) {
+			if ev.Cold {
+				// Not a freeze: this VM is ending, with no memory image
+				// written anywhere. Everything that has to survive has to be
+				// on a disk by the time this answers, and everything that
+				// must not survive has to be gone.
+				quiesceCold(execs, rpc, agents, boots, ev.ID)
+				return
+			}
 			quiesceExecs(execs, rpc, ev.ID)
 		})
 	}
@@ -278,11 +340,16 @@ func main() {
 		os.Exit(0)
 	}()
 
-	if *dial != "" {
+	if relayMode {
 		if len(stages) > 0 {
 			startStageWatcher(stageCtx, s.Stop, stages, *logPath, events)
 		}
-		dialLoop(context.Background(), *dial, *sessionID, s, events, execCounts, rpc, execs)
+		if dialer == nil {
+			dialer = websocketTransport(*dial, *sessionID)
+		}
+		dialLoop(context.Background(), sessionTransport{
+			dial: dialer, preamble: preamble, first: firstConn, name: *sessionID,
+		}, s, events, execCounts, rpc, execs)
 		return
 	}
 
@@ -317,15 +384,53 @@ func main() {
 // conn's sender for as long as it lives. The asymmetry with events is
 // deliberate — an event queues across a reconnect, a request does not (see
 // rpcConn).
-func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, events <-chan []byte,
+// sessionTransport is how one dialLoop reaches its runner: the dialer, the
+// per-connection preamble (nil on the WebSocket path), the connection the
+// microVM boot already established, and the session's name for the log.
+//
+// It is a struct rather than four parameters because the four are one
+// decision — which transport this session has — and a caller that could
+// supply a vsock preamble with a WebSocket dialer would be describing a
+// session that does not exist.
+type sessionTransport struct {
+	dial     dialSession
+	preamble func(context.Context, relay.Conn) error
+	first    relay.Conn
+	name     string
+}
+
+// connect returns the next connection to serve, running the preamble on it.
+// The connection the boot established is used once, first, and then dropped:
+// the boot already read its configuration and made its exchange, and running
+// the preamble over it again would read a second configuration that is not
+// coming.
+func (t *sessionTransport) connect(ctx context.Context) (relay.Conn, error) {
+	if t.first != nil {
+		c := t.first
+		t.first = nil
+		return c, nil
+	}
+	c, err := t.dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if t.preamble != nil {
+		if err := t.preamble(ctx, c); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
+	}
+	return c, nil
+}
+
+func dialLoop(ctx context.Context, tr sessionTransport, s *session.Session, events <-chan []byte,
 	execCounts *execCountMailbox, rpc *rpcDispatcher, execs *sandboxexec.Runner) {
 	backoff := time.Second
 	var pending [][]byte // control payloads no connection has accepted yet
 	for {
-		c, _, err := websocket.Dial(ctx, dial+"?session="+sessionID, nil)
+		conn, err := tr.connect(ctx)
 		if err == nil {
-			c.SetReadLimit(16 << 20)
-			log.Printf("sessiond registered with runnerd as %s", sessionID)
+			log.Printf("sessiond registered with runnerd as %s", tr.name)
 			backoff = time.Second
 			// WithControl, not plain ServeSession: the returned sender shares
 			// the relay's single writer, so a control event and a terminal
@@ -345,7 +450,7 @@ func dialLoop(ctx context.Context, dial, sessionID string, s *session.Session, e
 			// cannot arrive, and a handler that outlives the conn answers over
 			// the (now dead) conn its request came in on rather than over a
 			// later one — see rpc.go.
-			sender, errc := relay.ServeSessionWithExec(ctx, relay.WSConn(c), s, rpc.OnControl, execs)
+			sender, errc := relay.ServeSessionWithExec(ctx, conn, s, rpc.OnControl, execs)
 			rpc.online(sender)
 			var relayErr error
 			pending, relayErr = serveConn(sender, errc, events, execCounts.c(), execs, pending)
@@ -460,6 +565,52 @@ func quiesceExecs(execs execKiller, notifier eventNotifier, nonce uint64) {
 	if err := notifier.Notify(relay.ControlEvent{
 		Kind: relay.KindSuspendReady, ID: nonce}); err != nil {
 		log.Printf("reporting the suspend ready: %v", err)
+	}
+}
+
+// agentHomeMount is where the agent homes are mounted inside a session. It
+// is controlapp.HomeMountPath, spelled here because this process must not
+// import the control plane's application package — the two ends of the same
+// mount, like every other wire word this file shares with it.
+const agentHomeMount = "/rainier/agents"
+
+// quiesceCold is the cold half of the suspend handshake: this VM is ending,
+// with no memory image written anywhere (ADR-0003 §2.2), so a resume is a
+// fresh boot from disks and nothing else survives.
+//
+// Three things, in the order they have to happen:
+//
+//  1. FLUSH. The last thing an agent wrote is usually the thing worth
+//     keeping — a login completed seconds ago — and the sync's own tick must
+//     not be what decides whether it makes it into custody.
+//  2. END the execs, which is what the warm path does too and for the same
+//     reason: a detached command's lifetime is its session's.
+//  3. UNMOUNT the agent home and FORGET the delivered secrets. The unmount
+//     is what makes the home's filesystem consistent before the block device
+//     goes away under it; forgetting is belt and braces beside a VM that is
+//     about to cease to exist, and it costs nothing.
+//
+// Every step is best effort and the answer goes out regardless, for the same
+// reason the warm path's does: the host terminates the VM when it hears
+// nothing, so staying silent would only make the stop slower and put the
+// reason nowhere.
+func quiesceCold(execs execKiller, notifier eventNotifier, agents *agentSync, boots *bootstrapper, nonce uint64) {
+	if err := notifier.Notify(relay.ControlEvent{Kind: relay.KindSuspendAck, ID: nonce}); err != nil {
+		log.Printf("acknowledging the cold suspend notice: %v", err)
+	}
+	if agents != nil {
+		agents.flush()
+	}
+	if n := execs.KillAllAndWait(execQuiesceBudget); n > 0 {
+		log.Printf("%d exec(s) had not ended %s after the cold suspend notice; answering anyway",
+			n, execQuiesceBudget)
+	}
+	unmountAgentHome(agentHomeMount)
+	if n := boots.forget(); n > 0 {
+		log.Printf("forgot %d delivered environment secret(s) before this VM ends", n)
+	}
+	if err := notifier.Notify(relay.ControlEvent{Kind: relay.KindSuspendReady, ID: nonce}); err != nil {
+		log.Printf("reporting the cold suspend ready: %v", err)
 	}
 }
 

@@ -52,6 +52,15 @@ type FleetOptions struct {
 	// elsewhere; nothing in this task asks it yet.
 	Checkpoints control.CheckpointLocator
 
+	// Bootstraps records the single-use token a microVM session exchanges for
+	// its environment's secrets. It is required rather than optional, like
+	// every other port here, and for a sharper reason than symmetry: a
+	// dispatch that could not mint must REFUSE, and a service with no store
+	// behind it would have to choose between refusing every microVM create
+	// and quietly falling back to putting the secrets in Spec.Env — which is
+	// the exposure this whole design removes.
+	Bootstraps control.SessionBootstrapStore
+
 	// DefaultEgress replaces the built-in developer egress baseline
 	// (DefaultDeveloperEgressHosts) that every dispatched session's allowlist
 	// is unioned with. It is a POINTER because "leave it alone" and "make it
@@ -96,6 +105,11 @@ type FleetService struct {
 	uow         control.UnitOfWork
 	checkpoints control.CheckpointLocator
 
+	// bootstraps mints and records a microVM session's bootstrap token
+	// (FleetOptions.Bootstraps), composed once here over the same clock every
+	// other decision in this service reads.
+	bootstraps SessionBootstrapMinter
+
 	// defaultEgress is the host's developer egress baseline, resolved once at
 	// construction (FleetOptions.DefaultEgress). Held as a plain slice because
 	// by this point "unset" has already been answered.
@@ -126,7 +140,7 @@ func NewFleetService(opts FleetOptions) (*FleetService, error) {
 	if opts.LaunchMaterial == nil {
 		return nil, control.ErrInvalid
 	}
-	if opts.UnitOfWork == nil || opts.Checkpoints == nil {
+	if opts.UnitOfWork == nil || opts.Checkpoints == nil || opts.Bootstraps == nil {
 		return nil, control.ErrInvalid
 	}
 	return &FleetService{
@@ -145,6 +159,7 @@ func NewFleetService(opts FleetOptions) (*FleetService, error) {
 		defaultInitTimeout:  opts.DefaultInitTimeoutSec,
 		uow:                 opts.UnitOfWork,
 		checkpoints:         opts.Checkpoints,
+		bootstraps:          SessionBootstrapMinter{Store: opts.Bootstraps, Clock: opts.Clock},
 		defaultEgress:       resolveDefaultEgress(opts.DefaultEgress),
 		wake:                make(chan control.PoolID, 64),
 		known:               make(map[control.PoolID]struct{}),

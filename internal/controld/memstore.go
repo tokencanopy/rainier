@@ -61,6 +61,11 @@ type memStore struct {
 	// credential set per (user, provider), keyed the same way and holding no
 	// workspace, exactly as the schema does.
 	agentCredentials map[credKey]*AgentCredential
+
+	// bootstraps is the one-shot token a microVM session exchanges for its
+	// environment's secrets, keyed like every other session row and holding
+	// only the HASH — the plaintext left the mint and was never stored.
+	bootstraps map[sessionKey]*bootstrapRow
 }
 
 var _ MemStore = (*memStore)(nil)
@@ -116,6 +121,7 @@ func NewMemStore() MemStore {
 		credentials:   map[credKey]*Credential{},
 
 		agentCredentials: map[credKey]*AgentCredential{},
+		bootstraps:       map[sessionKey]*bootstrapRow{},
 	}
 }
 
@@ -127,11 +133,74 @@ func (m *memStore) Environments() control.EnvironmentRepository { return memEnvi
 
 func (m *memStore) Fleet() control.FleetRepository { return memFleet{m} }
 
+// Bootstraps is the fourth: the session bootstrap tokens, a view over this
+// store's own rows exactly as the other three are.
+func (m *memStore) Bootstraps() control.SessionBootstrapStore { return memBootstraps{m} }
+
 var (
 	_ control.SessionRepository     = memSessions{}
 	_ control.EnvironmentRepository = memEnvironments{}
 	_ control.FleetRepository       = memFleet{}
+	_ control.SessionBootstrapStore = memBootstraps{}
 )
+
+// bootstrapRow is one session's minted token as this store keeps it: the
+// hash, its fence, its expiry, and whether it has been spent. `spent` is the
+// store's own column and no caller's — the whole of single-use is that the
+// check and the mark are one step under this store's mutex.
+type bootstrapRow struct {
+	hash      string
+	gen       uint64
+	expiresAt time.Time
+	spent     bool
+}
+
+// memBootstraps is the in-memory SessionBootstrapStore.
+type memBootstraps struct{ m *memStore }
+
+func (b memBootstraps) PutSessionBootstrap(_ context.Context, ws control.WorkspaceID, id control.SessionID, rec control.SessionBootstrap) error {
+	if ws == "" || id == "" || rec.Hash == "" {
+		return control.ErrInvalid
+	}
+	b.m.mu.Lock()
+	defer b.m.mu.Unlock()
+	// A fresh mint REPLACES its predecessor rather than joining it, which is
+	// what makes a cold resume's token the only one that works and retires
+	// the one the previous boot was handed.
+	b.m.bootstraps[sessionKey{ws: ws, id: id}] = &bootstrapRow{
+		hash: rec.Hash, gen: rec.PlacementGeneration, expiresAt: rec.ExpiresAt,
+	}
+	return nil
+}
+
+// ConsumeSessionBootstrap checks and spends under one lock.
+//
+// The order of the four refusals is deliberate: the hash first, so that a
+// caller holding no valid token learns nothing about the state of the one
+// that exists; then the fence, the expiry, and the spend, from the most
+// structural fact to the most transient.
+func (b memBootstraps) ConsumeSessionBootstrap(_ context.Context, ws control.WorkspaceID, id control.SessionID, hash string, gen uint64, now time.Time) error {
+	if ws == "" || id == "" || hash == "" {
+		return control.ErrInvalid
+	}
+	b.m.mu.Lock()
+	defer b.m.mu.Unlock()
+	row, ok := b.m.bootstraps[sessionKey{ws: ws, id: id}]
+	if !ok || row.hash != hash {
+		return control.ErrBootstrapUnknown
+	}
+	if row.gen != gen {
+		return control.ErrBootstrapFenced
+	}
+	if !now.Before(row.expiresAt) {
+		return control.ErrBootstrapExpired
+	}
+	if row.spent {
+		return control.ErrBootstrapSpent
+	}
+	row.spent = true
+	return nil
+}
 
 // ---------------------------------------------------------------------------
 // clones

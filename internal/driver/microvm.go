@@ -3,16 +3,22 @@
 // The microVM driver: one Firecracker microVM per session, in place of the
 // docker driver's one container per session.
 //
-// This is the second step of that driver, and it is deliberately not a
-// working end-to-end path yet. What it establishes is the seam and the
-// invariants: a production `--driver=microvm` either has hardware
+// This is the third step of that driver, and it is deliberately not a
+// working end-to-end path yet. What the second step established is the seam
+// and the invariants: a production `--driver=microvm` either has hardware
 // virtualization, a kernel, a rootfs, a formatter and the Firecracker binary,
 // or it refuses to start; nothing decrypted is written to host disk; a
 // cold-parked session reads as suspended rather than gone; and the simulated
 // engine behind the tests is reachable only by explicitly injecting it.
-// Guest configuration delivery (vsock), the jailer, per-VM network slots,
-// nftables, metering, and real image and snapshot work by digest each land in
-// their own change — see the TODO markers below and ADR-0003.
+//
+// What this step adds is the host-to-guest channel those invariants were
+// waiting for: virtio-vsock, carrying a session's whole configuration and
+// its bootstrap token, in place of a staged file and in place of MMDS. See
+// microvm_vsock.go, and docs/design/2026-09-20-microvm-bootstrap-token-and-vsock.md.
+//
+// The jailer, per-VM network slots, nftables, metering, and real image and
+// snapshot work by digest each land in their own change — see the TODO
+// markers below and ADR-0003.
 package driver
 
 import (
@@ -37,6 +43,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
 const (
@@ -121,19 +129,27 @@ const (
 // enforcement, not a convention — every structure this driver persists either
 // embeds VMMConfig or is derived from it.
 type VMMConfig struct {
-	ID                string            `json:"id"`
-	SessionID         string            `json:"session_id"`
-	VCPU              int               `json:"vcpu"`
-	MemoryMiB         int               `json:"memory_mib"`
-	KernelPath        string            `json:"kernel_path"`
-	RootfsPath        string            `json:"rootfs_path"`
-	WorkspaceDiskPath string            `json:"workspace_disk_path"`
-	HomeDiskPath      string            `json:"home_disk_path"`
-	Cmd               []string          `json:"cmd"`
-	DialURL           string            `json:"dial_url"`
-	ProxyURL          string            `json:"proxy_url"`
-	TapDevice         string            `json:"tap_device"`
-	Env               map[string]string `json:"-"`
+	ID                string   `json:"id"`
+	SessionID         string   `json:"session_id"`
+	VCPU              int      `json:"vcpu"`
+	MemoryMiB         int      `json:"memory_mib"`
+	KernelPath        string   `json:"kernel_path"`
+	RootfsPath        string   `json:"rootfs_path"`
+	WorkspaceDiskPath string   `json:"workspace_disk_path"`
+	HomeDiskPath      string   `json:"home_disk_path"`
+	Cmd               []string `json:"cmd"`
+	DialURL           string   `json:"dial_url"`
+	ProxyURL          string   `json:"proxy_url"`
+	TapDevice         string   `json:"tap_device"`
+	// VsockUDSPath is the host path Firecracker is told to serve this VM's
+	// virtio-vsock device on: the guest's connections to host port N are
+	// forwarded to "<VsockUDSPath>_N", and 1024 is the only port this design
+	// uses. It is a path and not a value — recorded like every other path
+	// here, and per BOOT rather than per instance, because the documentation
+	// warns that one uds_path cannot be multiplexed across VMs and a cold
+	// resume is a new VM.
+	VsockUDSPath string            `json:"vsock_uds_path"`
+	Env          map[string]string `json:"-"`
 
 	// EgressAllow is the session's allowlist. It is carried and recorded, and
 	// nothing enforces it.
@@ -186,12 +202,36 @@ type instanceRecord struct {
 	PID       int       `json:"pid"`
 	Cfg       VMMConfig `json:"cfg"`
 
-	// envLive marks a record whose Cfg.Env is the live environment THIS
-	// process built in Create. It is unexported and therefore never
-	// serialized, which is the point: a record recovered from disk after a
-	// runnerd restart has no environment behind it, and a cold resume must
-	// say so rather than boot a guest with a silently empty one.
-	envLive bool
+	// boot is the configuration the guest is handed over vsock, and channel
+	// is the host end of that conn. Both are unexported and therefore never
+	// serialized, which is the point: the configuration carries the session's
+	// bootstrap token and ADR-0003 §2.7 item 1 keeps every part of it off a
+	// shared host's disk.
+	//
+	// bootLive says the pair is this process's own. A record recovered from
+	// disk after a runnerd restart has no configuration behind it, and a cold
+	// resume must say so rather than boot a guest that will never be told
+	// what it is. (The bootstrap token would survive such a restart — the
+	// runner can mint a fresh one — but the rest of the configuration would
+	// not, and persisting it is precisely what this design does not do.)
+	boot     runner.BootConfig
+	channel  *guestChannel
+	bootLive bool
+
+	// boots counts launches of this instance, so each one gets a vsock socket
+	// path of its own. A cold resume is a new VM and Firecracker's own
+	// documentation warns that one uds_path cannot be multiplexed across two.
+	//
+	// It is read AND advanced under the driver mutex by the one resume that
+	// claimed the instance (see resuming), so no two boots of one instance
+	// can ever be handed the same path.
+	boots int
+
+	// resuming is the claim one Resume holds over this instance while it is
+	// in flight. A second Resume for the same id is refused rather than run
+	// beside it: see Resume for what two concurrent cold ones would do to
+	// each other's socket.
+	resuming bool
 
 	// epoch counts mutations of this record, and exists because Inspect and
 	// List ask the hypervisor with the driver mutex RELEASED (its answer is
@@ -224,32 +264,24 @@ type snapshotManifest struct {
 	CreatedAt    time.Time `json:"created_at"`
 }
 
-// guestSessionConfig is the structured configuration staged on the host for a
-// session, ready for the channel that will carry it.
+// A session's configuration is no longer staged on the host at all.
 //
-// It carries no environment. What a session needs in order to identify itself
-// and reach the relay is not secret; what an environment resolved out of its
-// secret refs is, and ADR-0003 §2.7 item 1 has those arriving in the guest
-// from cell-gateway against a short-lived bootstrap token, never from a file
-// on the host.
+// It used to be written to "<StateDir>/instances/<id>/session.json", against
+// the day something would carry it into the guest. That day is this change,
+// and what carries it is virtio-vsock: the configuration is composed in
+// memory (bootConfigFor), handed to the guest as the first control frame on
+// the conn it opens, and never written anywhere. A file is not needed, and a
+// file on a shared host that describes one tenant's session — and, once the
+// bootstrap token exists, carries a capability — is exactly what ADR-0003
+// §2.7 asks for there not to be.
 //
-// TODO(PR 2): nothing reads this yet — it is staged on the host and there is
-// no path into the guest. The channel is virtio-vsock (ADR-0003 §2.7 item 2),
-// which also carries the bootstrap token.
-//
-// It is deliberately NOT delivered through the session's own workspace. A
-// file inside a volume the agent can write is a file the agent can rewrite,
-// and sessiond reading a session id or a dial URL back out of one would let a
-// session re-register as another or point its relay somewhere else. That is
-// why sessiond has no loader for this file: the guest must receive it from
-// the host, over a channel the guest cannot write.
-type guestSessionConfig struct {
-	SessionID   string   `json:"session_id"`
-	DialURL     string   `json:"dial_url"`
-	ProxyURL    string   `json:"proxy_url"`
-	Cmd         []string `json:"cmd"`
-	EgressAllow []string `json:"egress_allow"`
-}
+// It was also never delivered through the session's own workspace, for a
+// reason that still holds and is worth keeping written down: a file inside a
+// volume the agent can write is a file the agent can rewrite, and a sessiond
+// reading its session id or its proxy back out of one would let a session
+// re-register as another or point its egress somewhere else. Over vsock the
+// configuration arrives on a socket inside one VM's own directory, which the
+// guest cannot write and cannot forge.
 
 // Microvm implements driver.Driver for hardware-isolated microVMs.
 type Microvm struct {
@@ -264,6 +296,11 @@ type Microvm struct {
 	instances map[string]*instanceRecord
 	pulls     []string
 	strips    [][]string
+
+	// host is the runner above this driver: where a guest's control
+	// connection goes, and who asks the control plane for a fresh bootstrap
+	// token on a cold resume. nil is a real state — see MicrovmHost.
+	host MicrovmHost
 }
 
 // NewMicrovm creates a new microVM driver, or fails.
@@ -400,13 +437,17 @@ func (m *Microvm) instanceMetaPath(id string) string {
 	return filepath.Join(m.instanceDir(id), "instance.json")
 }
 
-// persistable copies a record for writing to disk. The copy drops Cfg.Env —
-// which `json:"-"` would drop anyway — so that a record handed to a goroutine
-// outside the driver mutex carries no reference to the live map either.
+// persistable copies a record for writing to disk. The copy drops Cfg.Env and
+// the guest's boot configuration — which being unexported, or `json:"-"`,
+// would drop anyway — so that a record handed to a goroutine outside the
+// driver mutex carries no reference to the live map, the live configuration,
+// or the bootstrap token in it either.
 func persistable(rec *instanceRecord) instanceRecord {
 	cp := *rec
 	cp.Cfg.Env = nil
-	cp.envLive = false
+	cp.boot = runner.BootConfig{}
+	cp.channel = nil
+	cp.bootLive = false
 	return cp
 }
 
@@ -710,9 +751,19 @@ func (m *Microvm) resolveRootfs(rootfsRef string) (string, error) {
 	return m.locateRootfs(rootfsRef)
 }
 
-// buildGuestEnv translates the full Spec into the environment map passed into
-// the microVM guest. The result is held in memory for the lifetime of this
+// buildGuestEnv is the driver's own record of the CONFIGURATION variables a
+// session was created with. It is held in memory for the lifetime of this
 // process and never written to disk; see VMMConfig.Env.
+//
+// It no longer copies spec.Env, and that deletion is the point of this
+// change. Spec.Env is where an environment's decrypted secret_refs live on
+// the Docker path, and on this one they are not dispatched at all — the
+// create carries their names and a token instead, and the values reach the
+// guest from the control plane over the exchange the boot configuration
+// starts. What a guest actually runs on arrives over vsock
+// (bootConfigFor), not from this map, which is why nothing here is a
+// delivery channel any more: it is what a snapshot's manifest names as
+// having been configured, and nothing else reads it.
 func buildGuestEnv(spec Spec) map[string]string {
 	env := make(map[string]string)
 
@@ -751,24 +802,7 @@ func buildGuestEnv(spec Spec) map[string]string {
 	if spec.GitAuthorEmail != "" {
 		env["RAINIER_GIT_AUTHOR_EMAIL"] = spec.GitAuthorEmail
 	}
-	for k, v := range spec.Env {
-		env[k] = v
-	}
 	return env
-}
-
-// stageGuestSessionConfig writes the non-secret half of a session's
-// configuration for sessiond.
-func (m *Microvm) stageGuestSessionConfig(id string, cfg guestSessionConfig) error {
-	dir := m.instanceDir(id)
-	if err := os.MkdirAll(dir, microvmDirMode); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(dir, "session.json"), data, microvmFileMode)
 }
 
 // reserveSlot takes the capacity decision and an id under the mutex, so that
@@ -803,6 +837,12 @@ func (m *Microvm) Create(ctx context.Context, spec Spec) (Handle, error) {
 		return Handle{}, err
 	}
 	if err := checkHome(spec.Home); err != nil {
+		return Handle{}, err
+	}
+	// Before anything with a side effect, and before a slot is even
+	// reserved: a create this host must not perform is refused rather than
+	// half-performed. See refuseUnwithheldEnv.
+	if err := refuseUnwithheldEnv(spec); err != nil {
 		return Handle{}, err
 	}
 
@@ -876,16 +916,22 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 		cmd = []string{"/bin/bash"}
 	}
 
-	if err := m.stageGuestSessionConfig(id, guestSessionConfig{
-		SessionID:   spec.SessionID,
-		DialURL:     spec.DialURL,
-		ProxyURL:    spec.ProxyURL,
-		Cmd:         slices.Clone(cmd),
-		EgressAllow: slices.Clone(spec.EgressAllow),
-	}); err != nil {
-		return nil, fmt.Errorf("stage guest session config: %w", err)
-	}
 	undo = append(undo, func() { m.deleteInstanceRecord(id) })
+
+	// The guest's control channel, opened BEFORE the VM starts: the guest
+	// dials host port 1024 as soon as its sessiond is up, and a listener
+	// created after InstanceStart is a race whose loser is a session that
+	// boots and is never configured.
+	bootCfg := bootConfigFor(spec)
+	udsPath, listenPath, err := m.vsockPaths(id, 1)
+	if err != nil {
+		return nil, err
+	}
+	channel, err := m.openGuestChannel(spec.SessionID, udsPath, listenPath, bootCfg)
+	if err != nil {
+		return nil, err
+	}
+	undo = append(undo, channel.close)
 
 	tapDevice := "tap-" + id
 	if err := m.tap.Allocate(tapDevice, m.opts.Network); err != nil {
@@ -907,6 +953,7 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 		DialURL:           spec.DialURL,
 		ProxyURL:          spec.ProxyURL,
 		TapDevice:         tapDevice,
+		VsockUDSPath:      udsPath,
 		Env:               buildGuestEnv(spec),
 	}
 
@@ -922,7 +969,10 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 		Volume:    workspaceVolume(spec.SessionID),
 		PID:       m.engine.PID(id),
 		Cfg:       cfg,
-		envLive:   true,
+		boot:      bootCfg,
+		channel:   channel,
+		bootLive:  true,
+		boots:     1,
 	}
 	if err := m.saveRecord(persistable(rec)); err != nil {
 		return nil, fmt.Errorf("save instance metadata %s: %w", id, err)
@@ -967,6 +1017,15 @@ func (m *Microvm) Suspend(ctx context.Context, id string, warm bool) error {
 	inst.Cold = !warm
 	if !warm {
 		inst.PID = 0
+		// The VM is gone, so its vsock socket is a path nothing serves. It
+		// is closed and removed here rather than left for the resume to
+		// overwrite: a stale socket on a shared host is one more file
+		// describing a session that is not running, and the resume gets a
+		// path of its own anyway.
+		if inst.channel != nil {
+			inst.channel.close()
+			inst.channel = nil
+		}
 	}
 	inst.bump()
 	rec := persistable(inst)
@@ -986,8 +1045,8 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		return false, fmt.Errorf("no such id %s", id)
 	}
 	running := inst.State == StateRunning
-	cold, envLive, cfg := inst.Cold, inst.envLive, inst.Cfg
-	m.mu.Unlock()
+	cold, bootLive, cfg := inst.Cold, inst.bootLive, inst.Cfg
+	bootCfg, sessionID := inst.boot, inst.SessionID
 
 	// Resuming a session that is already running restarts nothing, and says
 	// so without touching the hypervisor (driver.go's Resume contract). The
@@ -996,31 +1055,90 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 	// resume turned "nothing to do" into a failed Resume — and runnerd reads
 	// a failed Resume as a session it could not bring back.
 	if running {
+		m.mu.Unlock()
 		return false, nil
 	}
 
+	// One resume at a time per instance, claimed under the same lock that
+	// reads the state it decided on.
+	//
+	// Two concurrent cold resumes would otherwise both see the same state,
+	// both compute the same next boot number, and both open a channel on the
+	// same socket path — and openGuestChannel UNLINKS before it listens, so
+	// the second would remove the first's live socket out from under a VM
+	// that had already been told about it. That session then boots and is
+	// never configured, which is the one outcome this whole path exists to
+	// prevent. The pair of them would also mint two tokens and launch twice.
+	if inst.resuming {
+		m.mu.Unlock()
+		return false, fmt.Errorf("resume of %s: a resume is already in flight for this instance", id)
+	}
+	inst.resuming = true
+	// The boot number is taken HERE, under the same lock, and it advances
+	// even for an attempt that fails: a failed launch may have left a socket
+	// behind at that path, and an attempt that reuses a number is an attempt
+	// that inherits it. The counter is only ever a source of distinct paths.
+	boots := inst.boots
+	if cold {
+		inst.boots++
+		boots = inst.boots
+	}
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		if e, ok := m.instances[id]; ok {
+			e.resuming = false
+		}
+		m.mu.Unlock()
+	}()
+
 	restarted := false
+	var channel *guestChannel
 	if cold {
 		// A cold resume is a fresh boot, and a fresh boot needs the session's
-		// environment. This driver holds that in memory only (ADR-0003 §2.7
-		// item 1), so a record recovered from disk after a runnerd restart
-		// has none — including the case where the original session carried no
-		// Spec.Env at all, which the driver deliberately cannot tell apart,
-		// having refused to write the evidence down.
+		// whole configuration. This driver holds that in memory only
+		// (ADR-0003 §2.7 item 1), so a record recovered from disk after a
+		// runnerd restart has none — including the case where the original
+		// session carried nothing secret at all, which the driver
+		// deliberately cannot tell apart, having refused to write the
+		// evidence down.
 		//
-		// The honest answer is to refuse. Relaunching would boot a guest with
-		// a silently empty environment: no relay dial, no proxy, no
-		// credentials, and an agent that reports itself healthy.
+		// The honest answer is to refuse. Relaunching would boot a guest that
+		// is never told what it is: no session id, no proxy, no boot chain,
+		// no secrets, and an agent that reports itself healthy.
 		//
-		// TODO(PR 2): the fix is not to persist the environment. It is the
-		// bootstrap token over vsock — sessiond asks cell-gateway for fresh
-		// short-lived credentials at boot and after every resume (ADR-0003
-		// §2.7 item 1, §4.3) — after which a cold resume needs nothing from
-		// the host but the token.
-		if !envLive {
-			return false, fmt.Errorf("cold resume of %s: this session's guest environment was held in memory only and did not survive a runnerd restart; a clean relaunch needs the bootstrap token over vsock (ADR-0003 §2.7 item 1), which is not implemented yet", id)
+		// The bootstrap token is not what is missing here — the runner can
+		// mint a fresh one, and does, three lines below. What is missing is
+		// everything else, and persisting THAT is what this design rules out.
+		// Rebuilding it from the control plane on a resume is the follow-up
+		// (a create-shaped resume, ADR-0003 §2.3's portable checkpoint).
+		if !bootLive {
+			return false, fmt.Errorf("cold resume of %s: this session's guest configuration was held in memory only (ADR-0003 §2.7 item 1) and did not survive a runnerd restart; a clean relaunch needs the control plane to re-resolve it, which is the portable-checkpoint work and not this change", id)
 		}
+		// A new VM gets a new token and a new socket. The token because the
+		// old one is single-use and fenced by a placement generation the
+		// plane may have moved past; the socket because Firecracker's own
+		// documentation warns that one uds_path cannot be multiplexed across
+		// two VMs.
+		host := m.currentHost()
+		if host == nil {
+			return false, fmt.Errorf("cold resume of %s: this driver has no runner above it to mint a bootstrap token", id)
+		}
+		token, err := host.MintSessionBootstrap(ctx, sessionID)
+		if err != nil {
+			return false, fmt.Errorf("cold resume of %s: minting a bootstrap token: %w", id, err)
+		}
+		bootCfg.BootstrapToken = token
+		udsPath, listenPath, err := m.vsockPaths(id, boots)
+		if err != nil {
+			return false, err
+		}
+		if channel, err = m.openGuestChannel(sessionID, udsPath, listenPath, bootCfg); err != nil {
+			return false, err
+		}
+		cfg.VsockUDSPath = udsPath
 		if err := m.engine.Launch(ctx, cfg); err != nil {
+			channel.close()
 			return false, fmt.Errorf("relaunch cold microvm %s: %w", id, err)
 		}
 		restarted = true
@@ -1032,12 +1150,23 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 	inst, ok = m.instances[id]
 	if !ok {
 		m.mu.Unlock()
+		if channel != nil {
+			channel.close()
+		}
 		return restarted, fmt.Errorf("no such id %s", id)
 	}
 	inst.State = StateRunning
 	inst.Cold = false
 	if restarted {
 		inst.PID = m.engine.PID(id)
+		if inst.channel != nil {
+			inst.channel.close()
+		}
+		inst.channel = channel
+		inst.boot = bootCfg
+		inst.Cfg.VsockUDSPath = cfg.VsockUDSPath
+		// inst.boots was advanced when this resume claimed the instance, so
+		// that the path it opened could not collide with a concurrent one.
 	}
 	inst.bump()
 	rec := persistable(inst)
@@ -1068,8 +1197,23 @@ func (m *Microvm) Snapshot(ctx context.Context, id, ref string, stripEnv []strin
 		m.snapSeq.Add(1)
 		ref = fmt.Sprintf("rainier-mvm:%s-%d", id, m.snapSeq.Load())
 	}
-	survivingKeys := make([]string, 0, len(inst.Cfg.Env))
+	// What this session was CONFIGURED with, from both places a key can come
+	// from: the driver's own injection (buildGuestEnv) and the configuration
+	// block the guest was handed over vsock. Both, because the strip list is
+	// a promise about the committed image and a key that survived through
+	// the channel the driver does not happen to be looking at is a key that
+	// survived.
+	//
+	// Keys, never values: see snapshotManifest.
+	surviving := map[string]struct{}{}
 	for k := range inst.Cfg.Env {
+		surviving[k] = struct{}{}
+	}
+	for k := range inst.boot.Env {
+		surviving[k] = struct{}{}
+	}
+	survivingKeys := make([]string, 0, len(surviving))
+	for k := range surviving {
 		if !slices.Contains(stripEnv, k) {
 			survivingKeys = append(survivingKeys, k)
 		}
@@ -1155,7 +1299,14 @@ func (m *Microvm) DestroyContainer(ctx context.Context, id string) error {
 		return nil
 	}
 	tapDevice := inst.Cfg.TapDevice
+	channel := inst.channel
+	inst.channel = nil
 	m.mu.Unlock()
+	// Closed before the VM is signalled, so nothing can dial a control
+	// channel for a session that is being torn down.
+	if channel != nil {
+		channel.close()
+	}
 
 	if err := m.engine.Stop(ctx, id); err != nil {
 		st, stateErr := m.engine.State(ctx, id)
@@ -1553,17 +1704,36 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		}
 	}
 
-	// There is deliberately no MMDS configuration here. MMDS answers at
-	// 169.254.169.254 — the exact address ADR-0003 §4.3 requires the host to
-	// drop on every TAP — so the config channel and the metadata-denial rule
-	// could never both hold. The two PUTs also discarded their errors, and
-	// /mmds/config without network_interfaces is rejected outright, so what
-	// the guest actually received was nothing.
+	// 5b. virtio-vsock: the single host-to-guest control channel (ADR-0003
+	// §2.7 item 2). It carries the boot configuration, the bootstrap token,
+	// the sessiond-to-runnerd stream that used to ride a WebSocket through
+	// the TAP device, the lifecycle handshake, and the credential fetch — all
+	// over one conn, because internal/relay already multiplexes exactly those
+	// things over one conn.
 	//
-	// TODO(PR 2): virtio-vsock is the single host-to-guest control channel
-	// (ADR-0003 §2.7 item 2), carrying the boot configuration and the
-	// bootstrap token. Until it lands, a guest booted by this engine receives
-	// no session configuration at all.
+	// The guest's connections to host port N arrive on "<uds_path>_N", and
+	// the driver is already listening on _1024 by the time this runs. The
+	// host never sends CONNECT, so there is no host-initiated direction to
+	// configure.
+	//
+	// There is deliberately still no MMDS configuration. MMDS answers
+	// unauthenticated HTTP at 169.254.169.254 — the exact address ADR-0003
+	// §4.3 requires the host to drop on every TAP — so a configuration
+	// channel that needed it would be at war with the rule that exists to
+	// block it. vsock is invisible to guest routing and to the TAP firewall
+	// alike, which is why the metadata denial can stay unconditional.
+	if cfg.VsockUDSPath != "" {
+		if err := fcClient.putJSON(ctx, "/vsock", map[string]any{
+			"guest_cid": guestCID,
+			"uds_path":  cfg.VsockUDSPath,
+		}); err != nil {
+			// Not a discarded error, unlike the two MMDS PUTs this replaces:
+			// a guest with no control channel is a guest that can never be
+			// configured, and a silently config-less VM reporting itself
+			// healthy is the failure that made this whole design necessary.
+			return fmt.Errorf("configure the guest control channel (vsock): %w", err)
+		}
+	}
 
 	// 6. Start the microVM instance
 	if err := fcClient.putJSON(ctx, "/actions", map[string]any{

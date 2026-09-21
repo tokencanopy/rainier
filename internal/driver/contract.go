@@ -36,7 +36,10 @@ func cleanupSnapshotRef(d Driver, ref string) {
 // rather than carrying anything at all. Docker's semantics are
 // strip-to-empty — the key survives the commit set to "" — which is why an
 // empty value passes here and not only an absent one.
-func assertStrippedFromImage(t *testing.T, d Driver, ref, value string, stripped []string) {
+// survivor is a key the create set that the caller did NOT strip, or "" when
+// there is none to name. It is what makes the microVM arm an assertion rather
+// than a statement about an empty list — see below.
+func assertStrippedFromImage(t *testing.T, d Driver, ref, value string, stripped []string, survivor string) {
 	t.Helper()
 	switch dd := d.(type) {
 	case *Docker:
@@ -68,11 +71,23 @@ func assertStrippedFromImage(t *testing.T, d Driver, ref, value string, stripped
 		if !ok {
 			t.Fatalf("no snapshot manifest for ref %q: nothing to assert the strip against", ref)
 		}
+		// The manifest has to actually DESCRIBE the create, or the strip
+		// assertion below is a statement about an empty list. survivor is a
+		// key the create set and the caller did not strip: if the driver
+		// stopped recording what a session was configured with, this fires
+		// first and the strip checks stop being vacuous silently.
+		if survivor != "" && !slices.Contains(keys, survivor) {
+			t.Fatalf("the committed manifest does not describe the create at all "+
+				"(no %s among %v), so the strip below would assert nothing", survivor, keys)
+		}
 		for _, k := range stripped {
 			if slices.Contains(keys, k) {
 				t.Fatalf("stripped key %s survived into the committed manifest: %v", k, keys)
 			}
 		}
+		// Keys and no values, checked against the raw bytes rather than the
+		// decoded keys: the manifest type has no field a value could live in
+		// today, and this is what would notice if one were added.
 		if raw := dd.snapshotManifestBytes(ref); strings.Contains(string(raw), value) {
 			t.Fatalf("the committed manifest carries a stripped value:\n%s", raw)
 		}
@@ -111,6 +126,20 @@ func workspaceExists(t *testing.T, d Driver, sessionID string) bool {
 		t.Fatalf("workspaceExists: no volume view for driver %T", d)
 		return false
 	}
+}
+
+// driverCapabilities names the portable capabilities a driver's runner
+// announces on its behalf, so a shared subtest can ask "is this a driver the
+// control plane withholds secrets from?" without a per-driver branch.
+//
+// It asks through the same optional interface the runner asks through
+// (CapabilityDriver), so the subtest below and the announce a runner actually
+// makes cannot come to different conclusions about the same driver.
+func driverCapabilities(d Driver) []string {
+	if cd, ok := d.(CapabilityDriver); ok {
+		return cd.Capabilities()
+	}
+	return nil
 }
 
 func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
@@ -253,7 +282,28 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 		h, err := d.Create(ctx, Spec{
 			Name: "t9", Image: "", SessionID: "s9", DialURL: "ws://x",
 			Setup: "true",
-			Env:   map[string]string{"CONTRACT_SECRET": "must-not-survive"},
+			// CONTRACT_KEPT stands for the configuration a create legitimately
+			// carries — an agent-home path, a manifest — and is what proves
+			// the committed configuration describes this create at all.
+			// CONTRACT_SECRET is the one being stripped.
+			Env: map[string]string{
+				"CONTRACT_SECRET": "must-not-survive",
+				"CONTRACT_KEPT":   "configuration-not-a-credential",
+			},
+			// The token is here so this subtest can still be written for a
+			// driver that refuses secret VALUES without one — which is the
+			// twelfth subtest below, and is the microVM driver. The Docker
+			// driver ignores the field entirely (nothing in runArgs reads
+			// it), so its create is the one it has always been.
+			//
+			// The PAIRING is synthetic and worth saying so: the control plane
+			// never sends a secret value together with a token — that is the
+			// whole of §3, and createSpec checks it. What it does send with a
+			// token is the configuration CONTRACT_KEPT stands for. This
+			// subtest keeps the secret-shaped value because stripping is what
+			// it is about, and the rule the plane actually keeps is pinned by
+			// the twelfth subtest below and by controlapp's own matrix.
+			BootstrapToken: "contract-token-example",
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -270,7 +320,85 @@ func RunContract(t *testing.T, newDriver func(t *testing.T) (Driver, func())) {
 		if snap.Ref != ref {
 			t.Fatalf("snapshot ref = %q, want %q verbatim", snap.Ref, ref)
 		}
-		assertStrippedFromImage(t, d, ref, "must-not-survive", strip)
+		assertStrippedFromImage(t, d, ref, "must-not-survive", strip, "CONTRACT_KEPT")
+	})
+
+	t.Run("a create carrying secret values and no token is refused", func(t *testing.T) {
+		// The twelfth subtest, and the one that makes the fifth honest for a
+		// driver that never accepts secret values at all.
+		//
+		// The compatibility table's "old controld + new runner" row: a
+		// control plane that predates the session bootstrap exchange
+		// dispatches an environment's decrypted secrets in Spec.Env with no
+		// token. Whether that is acceptable is a per-driver question with
+		// two different right answers, which is why it is asserted here
+		// rather than at either driver:
+		//
+		//   - Docker puts them in a `docker run` argv and nothing reaches the
+		//     host filesystem. It has always accepted them and must keep
+		//     accepting them, or a rollback of the control plane would take
+		//     every self-hosted session down.
+		//   - a microVM host has no argv, and every channel it does have ends
+		//     in a file that outlives the session on a machine shared with
+		//     other tenants. It must refuse, loudly, naming what the control
+		//     plane has to be — a refusal costs one session, and a quiet
+		//     write is the exposure ADR-0003 §2.7 was written against.
+		//
+		// The driver announcing microvm.v1 is the one required to refuse,
+		// because that capability is exactly the claim the control plane
+		// withholds on: a driver that announces it and then accepts the
+		// values has told the plane it will do something it does not do.
+		d, cleanup := newDriver(t)
+		defer cleanup()
+		ctx := context.Background()
+
+		spec := Spec{
+			Name: "t10", Image: "", SessionID: "s10", DialURL: "ws://x",
+			Env: map[string]string{"CONTRACT_SECRET": "must-not-be-accepted"},
+		}
+		h, err := d.Create(ctx, spec)
+		if err == nil {
+			defer d.Destroy(ctx, h.ID)
+		}
+		if !slices.Contains(driverCapabilities(d), "microvm.v1") {
+			// Not a withholding driver: accepting is the contract, and a
+			// refusal here would be the rollback failure described above.
+			if err != nil {
+				t.Fatalf("a create carrying env values was refused by a driver that does not withhold: %v", err)
+			}
+			return
+		}
+		if err == nil {
+			t.Fatal("a driver announcing microvm.v1 accepted a create carrying secret values with no bootstrap token")
+		}
+		// The refusal has to say what the operator must change, which is the
+		// control plane's version and not anything about this host.
+		for _, want := range []string{"bootstrap token", "microvm.v1"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("the refusal = %q, want it to name %q", err, want)
+			}
+		}
+		if strings.Contains(err.Error(), "must-not-be-accepted") {
+			t.Fatalf("the refusal quotes the value it refused: %q", err)
+		}
+		// And nothing was half-created: a refused create leaves no session.
+		listed, lerr := d.List(ctx)
+		if lerr != nil {
+			t.Fatal(lerr)
+		}
+		for _, l := range listed {
+			if l.SessionID == "s10" {
+				t.Fatalf("a refused create left a session behind: %+v", l)
+			}
+		}
+		// The same create WITH a token is accepted, which is what makes the
+		// refusal about the token rather than about the env block.
+		spec.BootstrapToken = "contract-token-example"
+		withToken, err := d.Create(ctx, spec)
+		if err != nil {
+			t.Fatalf("a withheld create carrying a token was refused: %v", err)
+		}
+		d.Destroy(ctx, withToken.ID)
 	})
 
 	t.Run("capacity", func(t *testing.T) {

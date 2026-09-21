@@ -105,6 +105,14 @@ type Server struct {
 	// written immediately after New.
 	suspendAckWait   time.Duration
 	suspendReadyWait time.Duration
+	// coldSuspendReadyWait is the "are they gone" budget for a COLD suspend,
+	// which asks the sandbox for strictly more work than a freeze does. Same
+	// reason it is a field: a test must not spend the production one.
+	coldSuspendReadyWait time.Duration
+	// displacedHubGrace is how long a hub a re-register replaced keeps
+	// delivering before it is closed. A field for the same reason, and
+	// written only immediately after New.
+	displacedHubGrace time.Duration
 	// now is the clock every idle-stop decision reads: time.Now in
 	// production, a test's own function in tests, so the thirty minutes a
 	// session has to sit idle can be a table row rather than a sleep. A field
@@ -121,6 +129,10 @@ type Server struct {
 	// value New leaves — means "derive it from the timeout" (see
 	// idleSweepInterval); a test sets it directly to keep its loop short.
 	idleSweep time.Duration
+	// runnerRPC is the pending table for the session-RPC requests this
+	// RUNNER originates, which today is exactly one: the bootstrap token a
+	// microVM cold resume needs. See runnerRPCTable and microvm.go.
+	runnerRPC *runnerRPCTable
 }
 
 // suspendWaiter is one in-flight suspend's two answers, matched by nonce.
@@ -211,10 +223,21 @@ func (e *egressError) Error() string { return "egress setup: " + e.err.Error() }
 func (e *egressError) Unwrap() error { return e.err }
 
 func New(drv driver.Driver, dialBase, egressAdmin, proxyURL string) *Server {
-	return &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin,
+	s := &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin,
 		proxyURL: proxyURL, hubWait: defaultHubWait, now: time.Now,
 		suspendAckWait: defaultSuspendAckWait, suspendReadyWait: defaultSuspendReadyWait,
-		suspends: map[string]*suspendWaiter{}}
+		coldSuspendReadyWait: defaultColdSuspendReadyWait,
+		displacedHubGrace:    defaultDisplacedHubGrace,
+		suspends: map[string]*suspendWaiter{}, runnerRPC: newRunnerRPCTable()}
+	// The microVM driver is composed BELOW this server and needs two things
+	// from above it — where a guest's control conn goes, and where a cold
+	// resume's bootstrap token comes from — so the runner installs itself
+	// here rather than being passed into the driver's constructor, which
+	// runs first. See driver.MicrovmHost.
+	if hd, ok := drv.(driver.HostedDriver); ok {
+		hd.SetHost(s)
+	}
+	return s
 }
 
 // Recover rebuilds the in-memory registry from the driver's labeled
@@ -384,6 +407,16 @@ func (s *Server) createWithID(ctx context.Context, id string, spec driver.Spec, 
 	spec.SessionID = id
 	spec.DialURL = s.dialBase + "/register"
 	spec.ProxyURL = s.proxyURL
+	if s.withholdsSecrets() {
+		// There is no URL to dial. A microVM guest's control channel is the
+		// vsock conn IT opens to the host, which the driver is already
+		// listening for by the time the VM starts, so a dial URL here would
+		// be a promise of an endpoint the guest has no route to and no
+		// business reaching. Empty is also what makes NO_PROXY inside the
+		// guest the base list and nothing else: there is no dial host to
+		// exempt (design note §4, step 2).
+		spec.DialURL = ""
+	}
 	h, err := s.drv.Create(ctx, spec)
 	if err != nil {
 		s.reg.remove(id)
@@ -650,9 +683,22 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 		// design's lifetime rule. Sent only for the warm case, so the cold
 		// path keeps exactly the shape it has today.
 		if warm {
-			s.quiesceExecs(ctx, id)
+			s.quiesceExecs(ctx, id, false)
 		}
 		if !warm {
+			// A cold microVM suspend TERMINATES the VM, and no memory image
+			// is written anywhere (ADR-0003 §2.2), so the sandbox is told
+			// first — and told that it is COLD: flush what it has, unmount
+			// the agent home, and forget every secret the bootstrap exchange
+			// delivered, before the VM goes.
+			//
+			// The Docker path is deliberately untouched here. `docker stop`
+			// delivers the SIGTERM sessiond's own handler already answers,
+			// and a notice sent there would be a behaviour change on the one
+			// path this design promises to leave exactly as it is.
+			if s.withholdsSecrets() {
+				s.quiesceExecs(ctx, id, true)
+			}
 			// Cold suspend (docker stop) kills the container's sessiond,
 			// which closes its /register conn — the exact same socket-level
 			// event as a crash. Mark "suspending" BEFORE calling Suspend so
@@ -930,6 +976,26 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.SetReadLimit(16 << 20)
+	s.serveSessionConn(r.Context(), id, relay.WSConn(c))
+}
+
+// serveSessionConn is what a registered session's conn MEANS to this runner,
+// with the transport that carried it already resolved: build the hub, publish
+// it, report the session running, and then hold the goroutine until the conn
+// dies so the entry can be settled.
+//
+// It is shared by the two doors a sandbox can arrive at. The WebSocket one
+// above is the Docker path and every session that exists today, where the
+// container dials in over the network and asserts its session id in a query
+// parameter. The vsock one is a microVM guest, whose connection Firecracker
+// forwards to a socket inside that VM's own directory — so the session id is
+// the PATH's and not the guest's claim, which is strictly stronger than the
+// hop it replaces (tenancy §18 item 53).
+//
+// Everything below this line was in the /register handler and is unchanged;
+// the extraction is what keeps the two doors from drifting into meaning two
+// different things.
+func (s *Server) serveSessionConn(ctx context.Context, id string, conn relay.Conn) {
 	// Read BEFORE the hub, because NewHubWithControl starts the read loop.
 	// Every control frame from this conn carries it, and the registry drops
 	// the ones that name a boot the session has moved past. Note READ, not
@@ -944,7 +1010,7 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 	// process on the other end may not be the one that numbered the last
 	// report. See sessionEntry.execReg.
 	reg := s.reg.registration()
-	hub := relay.NewHubWithControl(r.Context(), relay.WSConn(c), func(payload []byte) {
+	hub := relay.NewHubWithControl(ctx, conn, func(payload []byte) {
 		// On its own goroutine, deliberately: this runs on the hub's read
 		// loop, the single goroutine demultiplexing every attachment
 		// multiplexed over this session's conn, and routeControl ends in the
@@ -965,7 +1031,8 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		// its own and this hop stayed as it is.
 		go s.routeControl(id, boot, reg, payload)
 	})
-	if !s.reg.setHub(id, hub) {
+	displaced, ok := s.reg.setHub(id, hub)
+	if !ok {
 		// The entry vanished between our existence check above and now — a
 		// concurrent DELETE raced this dial-in (session torn down while its
 		// container was still booting). No registry entry will ever exist to
@@ -973,6 +1040,9 @@ func (s *Server) register(w http.ResponseWriter, r *http.Request) {
 		// goroutine and the underlying fd.
 		hub.Close()
 		return
+	}
+	if displaced != nil {
+		go retireDisplacedHub(id, displaced, s.displacedHubGrace)
 	}
 	log.Printf("session %s registered", id)
 	s.fireEvent(id, "running")
@@ -1171,6 +1241,16 @@ func (s *Server) routeControl(id string, boot, reg uint64, payload []byte) {
 			log.Printf("session %s: control response with no id; dropping", id)
 			return
 		}
+		// The id space is fenced for responses too. A response is not a
+		// request, so there is no method here to refuse — but the number on
+		// it is the same number, and a sandbox answering with one out of the
+		// runner's own space has put a runner-space id on the wire for the
+		// control plane to echo. Dropped rather than refused: answering an
+		// answer is meaningless, and there was never a caller for this one.
+		if refusal := refuseSandboxOrigin("resp", ev.ID); refusal != "" {
+			log.Printf("session %s: dropping a control response from a sandbox: %s", id, refusal)
+			return
+		}
 		if !s.fireSessionRPC(id, runner.RPCEnvelope{ID: ev.ID, Method: "resp", OK: ev.OK, Payload: ev.Payload}) {
 			// Nothing to report to and nothing to answer: answering an answer
 			// is meaningless, and whoever asked has already given up (its
@@ -1182,6 +1262,21 @@ func (s *Server) routeControl(id string, boot, reg uint64, payload []byte) {
 		method, isReq := strings.CutPrefix(ev.Kind, "req:")
 		if !isReq || method == "" || ev.ID == 0 {
 			log.Printf("session %s: unknown control kind %q", id, ev.Kind)
+			return
+		}
+		// The forwarder is generic, and that is its whole value — but it is
+		// also an untrusted peer's door into the control plane's method
+		// table, so the two things that are NOT a sandbox's to send are
+		// refused here rather than upstream. controld cannot make this check
+		// itself: a "session_req" proves only that some runner sent it, and
+		// which end of the runner originated it is a fact only the runner
+		// has.
+		if refusal := refuseSandboxOrigin(method, ev.ID); refusal != "" {
+			log.Printf("session %s: refusing %q from a sandbox: %s", id, method, refusal)
+			if err := s.sendSessionRPC(id, runner.RPCEnvelope{ID: ev.ID, Method: "resp",
+				Payload: rpcErrorPayload(refusal)}); err != nil {
+				log.Printf("session %s: refusing %q locally: %v", id, method, err)
+			}
 			return
 		}
 		if s.fireSessionRPC(id, runner.RPCEnvelope{ID: ev.ID, Method: method, Payload: ev.Payload}) {
@@ -1213,9 +1308,35 @@ func (s *Server) routeControl(id string, boot, reg uint64, payload []byte) {
 // arrived — so only a sandbox that actually speaks the vocabulary can spend
 // it. It is comfortably longer than the sandbox's own quiesce budget, so the
 // ordinary answer is the acknowledgement rather than this timeout.
+// defaultColdSuspendReadyWait is the third budget, and it exists because a
+// cold suspend is not a freeze and cannot be paid for at a freeze's price.
+//
+// A warm suspend asks the sandbox for one thing: end your execs. Twelve
+// seconds is comfortably over the ten the sandbox gives that
+// (execQuiesceBudget in cmd/sessiond), because the ten is itself the
+// SIGTERM-then-SIGKILL escalation and nothing follows it.
+//
+// A cold suspend asks for three things, in series, and this VM is about to
+// cease to exist with no memory image (ADR-0003 §2.2), so anything not
+// finished is lost rather than deferred:
+//
+//   - a synchronous agent-home flush, which is a write to a block device;
+//   - the same ten-second exec kill;
+//   - an unmount of /rainier/agents, which syncs that device before it goes.
+//
+// Ten seconds of that is the kill alone, so twelve leaves two for a flush and
+// an unmount — and the first of those two to run slowly is the one whose work
+// is thrown away. Thirty is the kill with a factor of three over it, which is
+// headroom rather than a second stopwatch: a sandbox that answers takes
+// milliseconds, and only one that is genuinely stuck spends any of this.
+//
+// The ACK budget is shared with the warm path deliberately. The cold handler
+// answers the ack before it does any of the work above, so "did you hear me"
+// is the same question at the same price on both paths.
 const (
-	defaultSuspendAckWait   = 2 * time.Second
-	defaultSuspendReadyWait = 12 * time.Second
+	defaultSuspendAckWait       = 2 * time.Second
+	defaultSuspendReadyWait     = 12 * time.Second
+	defaultColdSuspendReadyWait = 30 * time.Second
 )
 
 // quiesceExecs tells the sandbox it is about to be frozen and waits for it to
@@ -1226,7 +1347,12 @@ const (
 // sessiond that predates the notice drops it, a conn that has died takes the
 // whole question with it, and a cancelled dispatch is one whose suspend is
 // about to fail on its own. None of those is worse than not sending it at all.
-func (s *Server) quiesceExecs(ctx context.Context, id string) {
+// cold says which kind of suspend is coming. False is a freeze and is the
+// notice this function has always sent, byte for byte: `cold` is omitempty,
+// so a warm notice is unchanged for every sandbox already running. True is
+// the end of this VM, and asks the sandbox for the two things a freeze does
+// not need — a flush and an unmount — before it answers.
+func (s *Server) quiesceExecs(ctx context.Context, id string, cold bool) {
 	hub, ok := s.reg.hub(id)
 	if !ok {
 		return
@@ -1235,7 +1361,7 @@ func (s *Server) quiesceExecs(ctx context.Context, id string) {
 	w := s.armSuspendWaiter(id, nonce)
 	defer s.disarmSuspendWaiter(id, w)
 
-	b, err := json.Marshal(relay.ControlEvent{Kind: relay.KindSuspending, ID: nonce})
+	b, err := json.Marshal(relay.ControlEvent{Kind: relay.KindSuspending, ID: nonce, Cold: cold})
 	if err != nil {
 		log.Printf("session %s: encoding the suspend notice: %v", id, err)
 		return
@@ -1263,17 +1389,73 @@ func (s *Server) quiesceExecs(ctx context.Context, id string) {
 		return
 	}
 
-	// "Are they gone." Only a sandbox that answered above can spend this.
-	readyTimer := time.NewTimer(s.suspendReadyWait)
+	// "Are they gone." Only a sandbox that answered above can spend this,
+	// and a COLD suspend is given its own budget: it asked for a flush and
+	// an unmount around the same kill, and work this one does not finish is
+	// lost rather than deferred, because there is no memory image and no VM
+	// on the other side of it.
+	readyWait := s.suspendReadyWait
+	if cold {
+		readyWait = s.coldSuspendReadyWait
+	}
+	readyTimer := time.NewTimer(readyWait)
 	defer readyTimer.Stop()
 	select {
 	case <-w.ready:
 	case <-hub.Done():
 	case <-ctx.Done():
 	case <-readyTimer.C:
+		what := "ending its commands"
+		if cold {
+			what = "flushing, ending its commands and unmounting the agent home"
+		}
 		log.Printf("session %s: the sandbox heard the suspend but had not finished "+
-			"ending its commands within %s; suspending anyway", id, s.suspendReadyWait)
+			"%s within %s; suspending anyway", id, what, readyWait)
 	}
+}
+
+// defaultDisplacedHubGrace is how long a hub a re-register replaced has to
+// finish delivering what it had already read, before it is closed.
+//
+// A displaced hub is not immediately useless, which is why this is a grace
+// and not a close. sessiond survives losing its conn and redials, and a hub
+// read loop that was stalled writing to a wedged viewer drains its buffered
+// frames whenever it comes back — and the child_exited on that older conn can
+// be the ONLY copy, because sessiond re-sends only what it never delivered.
+// Dropping it leaves a finished session holding its slot for the life of the
+// runner (TestAChildExitAcrossARedialIsRecordedEndToEnd).
+//
+// But it cannot be kept forever either, and "until its conn dies" is forever
+// when the peer is a sandbox that declines to hang up: nothing in the
+// registry points at a displaced hub, so its readLoop, its conn, its fd and
+// its attachments are held by a structure nothing can reach (review round 2,
+// finding 2).
+//
+// Ninety seconds is over clientWriteBase (70s, internal/relay), which is the
+// longest one stalled write can legitimately hold that read loop up — so a
+// hub that is going to drain has drained, and one that is not is closed. The
+// ordinary case costs nothing: a redial happens because the old conn broke,
+// so the old hub is usually already done before this timer is armed.
+const defaultDisplacedHubGrace = 90 * time.Second
+
+// retireDisplacedHub ends a hub a newer connection replaced, once its grace
+// is up. It returns without closing anything if the hub ends on its own
+// first, which is what nearly every redial looks like.
+//
+// The goroutine that was serving the displaced hub is parked on hub.Done(),
+// so closing here is what lets it go; its hubDied finds a newer hub in the
+// registry and settles nothing, which is already how a stale hub is handled.
+func retireDisplacedHub(id string, h *relay.Hub, grace time.Duration) {
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-h.Done():
+		return
+	case <-timer.C:
+	}
+	log.Printf("session %s: closing the connection a re-register replaced; it had %s to deliver what it had already read",
+		id, grace)
+	h.Close()
 }
 
 // armSuspendWaiter registers this suspend's waiter, replacing any stale entry:

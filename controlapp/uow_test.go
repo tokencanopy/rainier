@@ -490,6 +490,7 @@ func newUOWFleetFixture(t *testing.T) *uowFleetFixture {
 		LaunchMaterial: &fleetFakeResolver{},
 		UnitOfWork:     fx.uow,
 		Checkpoints:    locatorStub{},
+		Bootstraps:     newBootstrapStub(),
 	})
 	if err != nil {
 		t.Fatalf("NewFleetService: %v", err)

@@ -143,6 +143,20 @@ const (
 	//
 	// See docs/design/exec-idle-stop.md.
 	KindExecCount = "exec_count"
+	// KindBootConfig is the FIRST control frame a microVM host sends down the
+	// vsock channel the guest has just opened: the session's whole
+	// configuration, carried as a runner.BootConfig in Payload.
+	//
+	// It travels downward only, and only on that path. A Docker session is
+	// configured through its container's environment block before sessiond
+	// starts and never sees this kind at all; a sessiond that predates it
+	// logs one unknown frame and carries on, which is the honest outcome for
+	// a guest that was configured some other way.
+	//
+	// Its schema is runner.BootConfig, in protocol/runner beside Spec, and
+	// not here: every field of it is a field of the create this session came
+	// from, and relay interprets no payload it carries.
+	KindBootConfig = "boot_config"
 )
 
 type ControlEvent struct {
@@ -199,6 +213,18 @@ type ControlEvent struct {
 	// does not speak this event.
 	Live int    `json:"live,omitempty"`
 	Seq  uint64 `json:"seq,omitempty"`
+	// Cold qualifies a KindSuspending: this is not a freeze, it is the end of
+	// this VM. A cold-suspended microVM session is TERMINATED — ADR-0003 §2.2
+	// keeps no memory image anywhere — so the sandbox is being asked to flush
+	// what it has, unmount the agent home, and forget every secret the
+	// bootstrap exchange delivered, before it answers KindSuspendReady.
+	//
+	// It is omitempty, and false is both the zero value and today's whole
+	// meaning: a warm pause carries no `cold`, so the suspend notice a Plan 6
+	// sandbox has always read is byte-identical. A sessiond that predates the
+	// field reads a plain "suspending", quiesces its execs, and answers; the
+	// host-side unmount still happens, the guest simply did not help.
+	Cold bool `json:"cold,omitempty"`
 }
 
 func Encode(f Frame) ([]byte, error) { return json.Marshal(f) }

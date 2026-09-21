@@ -31,6 +31,7 @@ func fleetExternalOptions() controlapp.FleetOptions {
 		LaunchMaterial: fleetExtResolver{},
 		UnitOfWork:     extDirectUOW{},
 		Checkpoints:    extLocatorStub{},
+		Bootstraps:     extBootstrapStub{},
 	}
 }
 

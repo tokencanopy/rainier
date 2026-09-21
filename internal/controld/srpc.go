@@ -68,6 +68,10 @@ func (s *Server) handleSessionRequest(ctx context.Context, runnerName string, ro
 		return s.answerFetchAgentCredentials(ctx, runnerName, row, env)
 	case runner.MethodPutAgentCredentials:
 		return s.answerPutAgentCredentials(ctx, runnerName, row, env)
+	case runner.MethodFetchSessionSecrets:
+		return s.answerFetchSessionSecrets(ctx, runnerName, row, env)
+	case runner.MethodMintSessionBootstrap:
+		return s.answerMintSessionBootstrap(ctx, runnerName, row, env)
 	default:
 		log.Printf("controld: runner %s: session %s asked for unknown method %q",
 			runnerName, row.ID, clip(env.Method))
