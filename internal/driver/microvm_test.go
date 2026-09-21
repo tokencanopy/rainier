@@ -704,12 +704,13 @@ func TestMicrovmSnapshotRefAssociationAndStrip(t *testing.T) {
 		t.Errorf("the manifest carries environment VALUES:\n%s", raw)
 	}
 
-	// A snapshot ref must not become a bootable rootfs. It used to: the
-	// driver copied the session's WORKSPACE under the ref and resolveRootfs
-	// handed that file back as a root filesystem for any later create naming
-	// it, so a `rainier-env:*` entry was one tenant's workspace booted as
-	// another session's root.
-	if _, err := m.locateRootfs(ref); err == nil {
+	// A snapshot ref must not become a bootable rootfs on the strength of the
+	// manifest alone. It used to: the driver copied the session's WORKSPACE
+	// under the ref and the rootfs lookup handed that file back as a root
+	// filesystem for any later create naming it, so a `rainier-env:*` entry
+	// was one tenant's workspace booted as another session's root. Until the
+	// commit publishes real bytes by digest, the ref resolves to nothing.
+	if _, _, err := m.locateImage(ctx, ref); err == nil {
 		t.Fatal("a snapshot ref resolved to a bootable rootfs")
 	}
 }
@@ -916,16 +917,23 @@ func TestMicrovmStateReconciliation(t *testing.T) {
 // this host cannot boot is an error, not an empty file and a recorded pull.
 func TestMicrovmPrepullNeverFabricatesAnImage(t *testing.T) {
 	stateDir := shortTempDir(t)
-	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 2, StateDir: stateDir})
+	const present = "rainier-env:e1-aaa"
+	src := newDirSource(t, map[string][]byte{present: []byte("an environment image")})
+	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 2, StateDir: stateDir, ImageSource: src})
 	ctx := context.Background()
 
 	const missing = "rainier-env:never-fetched"
 	if err := m.Prepull(ctx, missing); err == nil {
 		t.Fatal("Prepull of an unresolvable ref = nil, want an error")
 	}
-	cached := filepath.Join(stateDir, "rootfs", mustSanitizeRef(t, missing)+".ext4")
-	if _, err := os.Stat(cached); err == nil {
-		t.Fatalf("Prepull left a placeholder image at %s", cached)
+	// Nothing was left behind under the ref, and nothing under a digest: a
+	// failed resolution writes no manifest and fetches no bytes.
+	if data := m.images.manifestBytes(missing); data != nil {
+		t.Fatalf("Prepull of an unresolvable ref published a manifest:\n%s", data)
+	}
+	blobs, _ := os.ReadDir(m.images.blobDir())
+	if len(blobs) != 0 {
+		t.Fatalf("Prepull of an unresolvable ref left %d blob(s) in the store", len(blobs))
 	}
 	if got := m.Pulls(); len(got) != 0 {
 		t.Errorf("Pulls() = %v after a failed prepull, want none recorded", got)
@@ -934,16 +942,20 @@ func TestMicrovmPrepullNeverFabricatesAnImage(t *testing.T) {
 		t.Error("Prepull with an empty ref = nil, want an error")
 	}
 
-	// A ref this host does have resolves, and is recorded.
-	const present = "rainier-env:e1-aaa"
-	if err := os.WriteFile(filepath.Join(stateDir, "rootfs", mustSanitizeRef(t, present)+".ext4"), []byte("image"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	// A ref the source publishes resolves, is fetched by digest, and is
+	// recorded.
 	if err := m.Prepull(ctx, present); err != nil {
-		t.Fatalf("Prepull of a cached ref: %v", err)
+		t.Fatalf("Prepull of a published ref: %v", err)
 	}
 	if got := m.Pulls(); !reflect.DeepEqual(got, []string{present}) {
 		t.Errorf("Pulls() = %v, want %v", got, []string{present})
+	}
+	manifest, ok := m.images.manifest(present)
+	if !ok {
+		t.Fatal("a fetched ref has no manifest on this host")
+	}
+	if _, ok := m.images.have(manifest.Digest); !ok {
+		t.Fatalf("the manifest for %s names %s, which is not in the store", present, manifest.Digest)
 	}
 }
 

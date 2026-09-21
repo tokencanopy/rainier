@@ -145,6 +145,17 @@ type MicrovmOpts struct {
 	// host, not a bug.
 	CgroupRoot string
 
+	// ImageSource is where this host fetches an environment image it does not
+	// already have (ADR-0003 §2.7 item 3): a directory on this host
+	// (DirImageSource) or an HTTPS base URL (HTTPImageSource).
+	//
+	// nil is a legal, and for a self-hosted runner an ordinary, state: the
+	// host then serves the images it already has and reports a clear error
+	// for a ref nobody put there. It is NOT part of the Engine/Net/Format
+	// seam — a source is deployment configuration, not a stand-in for a host
+	// capability — which is why it may be set on its own.
+	ImageSource ImageSource
+
 	Engine MicrovmEngine // test seam; nil in production
 	Net    netslot.Host  // test seam; nil in production
 	Format DiskFormatter // test seam; nil in production
@@ -172,12 +183,25 @@ const (
 // enforcement, not a convention — every structure this driver persists either
 // embeds VMMConfig or is derived from it.
 type VMMConfig struct {
-	ID                string   `json:"id"`
-	SessionID         string   `json:"session_id"`
-	VCPU              int      `json:"vcpu"`
-	MemoryMiB         int      `json:"memory_mib"`
-	KernelPath        string   `json:"kernel_path"`
-	RootfsPath        string   `json:"rootfs_path"`
+	ID         string `json:"id"`
+	SessionID  string `json:"session_id"`
+	VCPU       int    `json:"vcpu"`
+	MemoryMiB  int    `json:"memory_mib"`
+	KernelPath string `json:"kernel_path"`
+	// RootfsPath is the image the VM boots as its ROOT device.
+	RootfsPath string `json:"rootfs_path"`
+	// BaseImagePath and BaseImageDigest are the ENVIRONMENT IMAGE this
+	// session's root filesystem comes from: a file in this host's image store
+	// under its digest, or a plain path for a runner's --rootfs (which nothing
+	// published and which therefore has no digest — see locateImage).
+	//
+	// Both are recorded rather than re-derived because the image a session
+	// booted on is the image it must keep booting on across a park and a
+	// resume, whatever the environment's ref resolves to by then. Neither is
+	// secret: a digest names bytes that every session of the environment
+	// boots.
+	BaseImagePath     string   `json:"base_image_path"`
+	BaseImageDigest   string   `json:"base_image_digest"`
 	WorkspaceDiskPath string   `json:"workspace_disk_path"`
 	HomeDiskPath      string   `json:"home_disk_path"`
 	Cmd               []string `json:"cmd"`
@@ -359,6 +383,7 @@ type Microvm struct {
 	engine    MicrovmEngine
 	slots     *netslot.Pool
 	format    DiskFormatter
+	images    *imageStore
 	seq       int
 	pending   int // slots reserved by an in-flight Create, counted as used
 	snapSeq   atomic.Int64
@@ -426,10 +451,16 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 		return nil, err
 	}
 
+	// The environment images themselves live under "images", by digest, and
+	// are never opened for writing after they land; see image.go.
 	for _, dir := range []string{"workspaces", "homes", "instances", filepath.Join("snapshots", "refs"), "rootfs"} {
 		if err := os.MkdirAll(filepath.Join(opts.StateDir, dir), microvmDirMode); err != nil {
 			return nil, fmt.Errorf("microvm: create state directory: %w", err)
 		}
+	}
+	images, err := newImageStore(opts.StateDir, opts.ImageSource)
+	if err != nil {
+		return nil, err
 	}
 
 	m := &Microvm{
@@ -437,6 +468,7 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 		engine:    engine,
 		slots:     slots,
 		format:    format,
+		images:    images,
 		instances: make(map[string]*instanceRecord),
 	}
 	// Records first, leftovers second, and never the other way round: a
@@ -985,46 +1017,48 @@ func (m *Microvm) usedLocked() int {
 	return used
 }
 
-// locateRootfs finds the host ext4 image for rootfsRef, or says why it
-// cannot.
+// locateImage finds the host ext4 file for one image ref, and the digest it is
+// published under, or says why it cannot.
 //
-// There are exactly two answers: a path on this host, or an image this host
-// has already cached. There is deliberately no third branch that MAKES one.
-// The previous behavior truncated a 1 MiB empty file and called the ref
-// satisfied, so a create for an image nobody had ever fetched succeeded and
-// booted a guest off a megabyte of zeroes.
+// There are exactly three answers, in this order: a path on this host (what
+// --rootfs is), an image already in this host's store, or one fetched by
+// digest from the runner's image source. There is deliberately no fourth
+// branch that MAKES one. The behavior two changes ago truncated a 1 MiB empty
+// file and called the ref satisfied, so a create for an image nobody had ever
+// fetched succeeded and booted a guest off a megabyte of zeroes.
 //
-// TODO(PR 4): fetching a missing ref belongs here — an ext4 image by digest,
-// reflink-copied per session (ADR-0003 §2.7 item 3). Until that exists, a ref
-// this host does not have is an error, not a placeholder.
-func (m *Microvm) locateRootfs(rootfsRef string) (string, error) {
-	if rootfsRef == "" {
-		return "", errors.New("microvm: empty rootfs ref")
+// A path answers with an empty digest, and that is honest rather than lazy:
+// --rootfs names a file an operator put there, which nothing published and
+// nothing can re-fetch. What the digest is FOR is re-resolving the same image
+// later (a cold resume re-clones it), and for a path the path is that name.
+func (m *Microvm) locateImage(ctx context.Context, ref string) (path, digest string, err error) {
+	if ref == "" {
+		return "", "", errors.New("microvm: empty image ref")
 	}
-	if fi, err := os.Stat(rootfsRef); err == nil && fi.Mode().IsRegular() {
-		return rootfsRef, nil
+	if fi, statErr := os.Stat(ref); statErr == nil && fi.Mode().IsRegular() {
+		return ref, "", nil
 	}
-	seg, err := sanitizeRef(rootfsRef)
+	manifest, err := m.images.resolve(ctx, ref)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	cached := filepath.Join(m.opts.StateDir, "rootfs", seg+".ext4")
-	if fi, err := os.Stat(cached); err == nil && fi.Mode().IsRegular() {
-		return cached, nil
+	blob, ok := m.images.have(manifest.Digest)
+	if !ok {
+		return "", "", fmt.Errorf("microvm: image %q resolves to %s, which is not in this host's store", ref, manifest.Digest)
 	}
-	return "", fmt.Errorf("microvm: rootfs %q is not on this host, neither as a path nor as a cached image at %s; fetching an environment image by digest lands with the image work (ADR-0003 §2.7 item 3)", rootfsRef, cached)
+	return blob, manifest.Digest, nil
 }
 
-// resolveRootfs picks the rootfs for a create: the spec's image, else the
-// runner's configured base image.
-func (m *Microvm) resolveRootfs(rootfsRef string) (string, error) {
-	if rootfsRef == "" {
-		rootfsRef = m.opts.BaseRootfs
+// resolveImage picks the image for a create: the spec's, else the runner's
+// configured base rootfs.
+func (m *Microvm) resolveImage(ctx context.Context, ref string) (path, digest string, err error) {
+	if ref == "" {
+		ref = m.opts.BaseRootfs
 	}
-	if rootfsRef == "" {
-		return "", errors.New("microvm: no rootfs image: the spec names none and this runner has no --rootfs")
+	if ref == "" {
+		return "", "", errors.New("microvm: no rootfs image: the spec names none and this runner has no --rootfs")
 	}
-	return m.locateRootfs(rootfsRef)
+	return m.locateImage(ctx, ref)
 }
 
 // buildGuestEnv is the driver's own record of the CONFIGURATION variables a
@@ -1182,7 +1216,7 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 		}
 	}
 
-	rootfsPath, err := m.resolveRootfs(spec.Image)
+	basePath, baseDigest, err := m.resolveImage(ctx, spec.Image)
 	if err != nil {
 		return nil, fmt.Errorf("resolve rootfs: %w", err)
 	}
@@ -1221,7 +1255,9 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 		VCPU:              m.opts.VCPU,
 		MemoryMiB:         m.opts.MemoryMiB,
 		KernelPath:        m.opts.KernelPath,
-		RootfsPath:        rootfsPath,
+		RootfsPath:        basePath,
+		BaseImagePath:     basePath,
+		BaseImageDigest:   baseDigest,
 		WorkspaceDiskPath: workspaceDisk,
 		HomeDiskPath:      homeDisk,
 		Cmd:               slices.Clone(cmd),
@@ -1602,13 +1638,20 @@ func (m *Microvm) Snapshot(ctx context.Context, id, ref string, stripEnv []strin
 	return snap, nil
 }
 
-// Prepull reports whether this host can already boot ref, and records the
-// call. It never fabricates an image: see locateRootfs.
-func (m *Microvm) Prepull(_ context.Context, ref string) error {
+// Prepull resolves ref to an image this host can boot, fetching it by digest
+// if this runner has a source and does not have it, and records the call.
+//
+// It never fabricates an image and never unpacks an OCI one: an environment
+// image is a single ext4 file published by digest (ADR-0003 §2.7 item 3), and
+// an unresolvable ref is an error. Advisory, as driver.Driver says — a failure
+// costs the slow create the prepull was trying to avoid, and on a fleet with
+// no shared image source that failure is the NORMAL outcome for a ref another
+// runner published.
+func (m *Microvm) Prepull(ctx context.Context, ref string) error {
 	if ref == "" {
 		return errors.New("prepull: empty image ref")
 	}
-	if _, err := m.locateRootfs(ref); err != nil {
+	if _, _, err := m.locateImage(ctx, ref); err != nil {
 		return err
 	}
 	m.mu.Lock()
