@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -44,6 +45,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tokencanopy/rainier/internal/driver/netslot"
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
@@ -84,11 +86,11 @@ const (
 
 // MicrovmOpts configures the microVM driver.
 //
-// Engine, Tap and Format are one seam, not three: they are the three places
+// Engine, Net and Format are one seam, not three: they are the three places
 // this driver touches the host, and they are injected TOGETHER by tests or
 // not at all. Production passes none of them and gets the Firecracker engine,
-// the real TAP manager and mkfs.ext4 — after NewMicrovm has checked that this
-// host can actually provide all three. There is deliberately no
+// the real netslot host and mkfs.ext4 — after NewMicrovm has checked that
+// this host can actually provide all three. There is deliberately no
 // "simulate whatever is missing" path: a driver that silently substituted a
 // simulated engine reports every session as running while nothing executes,
 // which is the single worst failure mode this component has.
@@ -100,10 +102,22 @@ type MicrovmOpts struct {
 	VCPU       int    // vCPUs per session; 0 means defaultMicrovmVCPU
 	MemoryMiB  int    // memory per session in MiB; 0 means defaultMicrovmMemoryMiB
 	VMMPath    string // path to the Firecracker executable; empty means "firecracker" on PATH
-	Network    string // network bridge name (default "rainier-internal")
+
+	// SlotGuestCIDR and SlotUplinkCIDR are the two host-local ranges a
+	// session's addresses are carved from, one /30 per slot (ADR-0003 §5.2).
+	// Empty means netslot's defaults.
+	SlotGuestCIDR  string
+	SlotUplinkCIDR string
+	// SlotNamePrefix prefixes the namespace, veth and TAP names this driver
+	// creates, and is what reclaim recognises as its own. Empty means
+	// netslot's default.
+	SlotNamePrefix string
+	// NetnsDir is where named network namespaces live. Empty means netslot's
+	// default, which is where `ip netns` puts them.
+	NetnsDir string
 
 	Engine MicrovmEngine // test seam; nil in production
-	Tap    TapManager    // test seam; nil in production
+	Net    netslot.Host  // test seam; nil in production
 	Format DiskFormatter // test seam; nil in production
 }
 
@@ -140,7 +154,23 @@ type VMMConfig struct {
 	Cmd               []string `json:"cmd"`
 	DialURL           string   `json:"dial_url"`
 	ProxyURL          string   `json:"proxy_url"`
-	TapDevice         string   `json:"tap_device"`
+
+	// The session's network slot (ADR-0003 §5.2). SlotIndex is the one value
+	// the rest can be re-derived from, and is what a record recovered after a
+	// runnerd restart re-associates with (see recoverDiskInstances); the
+	// others are recorded beside it so a host-side investigation does not
+	// need the allocator to read a session's address off disk.
+	//
+	// They replace the single hard-coded 172.18.0.2/172.18.0.1/AA:FC:… every
+	// microVM used to boot with, which collided the moment a host ran the two
+	// concurrent sessions ADR-0003 §5.1 sizes for.
+	SlotIndex    int    `json:"slot_index"`
+	Netns        string `json:"netns"`
+	TapDevice    string `json:"tap_device"`
+	GuestIP      string `json:"guest_ip"`
+	GatewayIP    string `json:"gateway_ip"`
+	GuestNetmask string `json:"guest_netmask"`
+	GuestMAC     string `json:"guest_mac"`
 	// VsockUDSPath is the host path Firecracker is told to serve this VM's
 	// virtio-vsock device on: the guest's connections to host port N are
 	// forwarded to "<VsockUDSPath>_N", and 1024 is the only port this design
@@ -151,14 +181,12 @@ type VMMConfig struct {
 	VsockUDSPath string            `json:"vsock_uds_path"`
 	Env          map[string]string `json:"-"`
 
-	// EgressAllow is the session's allowlist. It is carried and recorded, and
-	// nothing enforces it.
-	//
-	// TODO(PR 3): ADR-0003 §4.3 requires per-TAP nftables drops for cloud
-	// metadata, link-local, RFC1918, the regional control-plane ranges and
-	// neighbouring microVM slots, enforced on the host whatever the guest
-	// does with its own routes or proxy variables. Until those rules exist
-	// this field records an intention, not a boundary.
+	// EgressAllow is the session's per-destination allowlist, which egressd
+	// enforces at the proxy. It is NOT what stops a guest reaching the host's
+	// metadata service or a neighbour: that is the per-slot nftables ruleset
+	// the network slot carries (ADR-0003 §4.3), which is applied on allocate
+	// and holds whatever the guest does with its own routes or proxy
+	// variables.
 	EgressAllow []string `json:"egress_allow"`
 }
 
@@ -171,13 +199,6 @@ type MicrovmEngine interface {
 	Snapshot(ctx context.Context, id, ref string, stripEnv []string) (Snapshot, error)
 	State(ctx context.Context, id string) (VMMState, error)
 	PID(id string) int
-}
-
-// TapManager manages creation, bridge attachment, and teardown of host TAP
-// network devices.
-type TapManager interface {
-	Allocate(tapName, bridgeName string) error
-	Release(tapName string) error
 }
 
 // DiskFormatter puts a filesystem on a freshly created disk image, before any
@@ -217,6 +238,14 @@ type instanceRecord struct {
 	boot     runner.BootConfig
 	channel  *guestChannel
 	bootLive bool
+
+	// slot is the network slot this instance holds, or nil when it holds
+	// none — a cold-parked session, which has no VM and therefore no reason
+	// to keep a /30 and a namespace off the pool for the whole dormant
+	// window. It is unexported because the POOL owns it: what survives on
+	// disk is Cfg.SlotIndex, and a record recovered after a restart is
+	// re-associated through it (see recoverDiskInstances).
+	slot *netslot.Slot
 
 	// boots counts launches of this instance, so each one gets a vsock socket
 	// path of its own. A cold resume is a new VM and Firecracker's own
@@ -288,7 +317,7 @@ type Microvm struct {
 	mu        sync.Mutex
 	opts      MicrovmOpts
 	engine    MicrovmEngine
-	tap       TapManager
+	slots     *netslot.Pool
 	format    DiskFormatter
 	seq       int
 	pending   int // slots reserved by an in-flight Create, counted as used
@@ -323,13 +352,9 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 	if opts.MemoryMiB <= 0 {
 		opts.MemoryMiB = defaultMicrovmMemoryMiB
 	}
-	if opts.Network == "" {
-		opts.Network = "rainier-internal"
-	}
-
-	engine, tap, format := opts.Engine, opts.Tap, opts.Format
+	engine, net, format := opts.Engine, opts.Net, opts.Format
 	switch {
-	case engine == nil && tap == nil && format == nil:
+	case engine == nil && net == nil && format == nil:
 		// The production path. Everything below must be true of this host.
 		if err := checkMicrovmHost(opts); err != nil {
 			return nil, err
@@ -338,13 +363,22 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 		if err != nil {
 			return nil, err
 		}
+		linux, err := netslot.NewLinuxHost(opts.NetnsDir)
+		if err != nil {
+			return nil, err
+		}
 		engine = NewFirecrackerEngine(opts.VMMPath, opts.StateDir)
-		tap = NewLinuxTapManager(opts.Network)
+		net = linux
 		format = ext4
-	case engine != nil && tap != nil && format != nil:
+	case engine != nil && net != nil && format != nil:
 		// The test seam, injected whole.
 	default:
-		return nil, errors.New("microvm: MicrovmOpts.Engine, .Tap and .Format are one seam and must be injected together or not at all; injecting some of them leaves a production component talking to a simulated one")
+		return nil, errors.New("microvm: MicrovmOpts.Engine, .Net and .Format are one seam and must be injected together or not at all; injecting some of them leaves a production component talking to a simulated one")
+	}
+
+	slots, err := netslot.New(opts.slotConfig(), net)
+	if err != nil {
+		return nil, err
 	}
 
 	for _, dir := range []string{"workspaces", "homes", "instances", filepath.Join("snapshots", "refs"), "rootfs"} {
@@ -356,12 +390,44 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 	m := &Microvm{
 		opts:      opts,
 		engine:    engine,
-		tap:       tap,
+		slots:     slots,
 		format:    format,
 		instances: make(map[string]*instanceRecord),
 	}
+	// Records first, leftovers second, and never the other way round: a
+	// session that outlived its runnerd still holds its slot, and a reclaim
+	// that ran first would tear the network out from under a live guest.
 	m.recoverDiskInstances()
+	m.reclaimNetworkSlots()
 	return m, nil
+}
+
+// slotConfig is the network envelope this runner hands the slot allocator.
+func (o MicrovmOpts) slotConfig() netslot.Config {
+	return netslot.Config{
+		GuestCIDR:  o.SlotGuestCIDR,
+		UplinkCIDR: o.SlotUplinkCIDR,
+		Slots:      o.TotalSlots,
+		NamePrefix: o.SlotNamePrefix,
+		NetnsDir:   o.NetnsDir,
+	}
+}
+
+// reclaimNetworkSlots tears down slots left on this host by a previous
+// runnerd, after recoverDiskInstances has re-associated the ones whose
+// sessions are still here.
+//
+// A failure is logged and not fatal. The alternative — refusing to start
+// because one leftover namespace would not go away — takes a whole host's
+// sessions offline over one slot that the pool already knows not to hand out.
+func (m *Microvm) reclaimNetworkSlots() {
+	n, err := m.slots.Reclaim(context.Background())
+	if err != nil {
+		log.Printf("microvm: reclaiming leftover network slots: %v", err)
+	}
+	if n > 0 {
+		log.Printf("microvm: reclaimed %d network slot(s) left by a previous run", n)
+	}
 }
 
 // checkMicrovmHost is the fail-closed preflight for a production microVM
@@ -448,7 +514,27 @@ func persistable(rec *instanceRecord) instanceRecord {
 	cp.boot = runner.BootConfig{}
 	cp.channel = nil
 	cp.bootLive = false
+	cp.slot = nil
 	return cp
+}
+
+// applySlot stamps a network slot's addressing onto a VM configuration.
+// Everything here is derived from the slot index, and is recorded so that a
+// host-side investigation can read a session's address off disk without the
+// allocator.
+func applySlot(cfg *VMMConfig, slot *netslot.Slot) {
+	if slot == nil {
+		cfg.SlotIndex, cfg.Netns, cfg.TapDevice = 0, "", ""
+		cfg.GuestIP, cfg.GatewayIP, cfg.GuestNetmask, cfg.GuestMAC = "", "", "", ""
+		return
+	}
+	cfg.SlotIndex = slot.Index
+	cfg.Netns = slot.Netns
+	cfg.TapDevice = slot.Tap
+	cfg.GuestIP = slot.GuestIP.String()
+	cfg.GatewayIP = slot.GatewayIP.String()
+	cfg.GuestNetmask = slot.GuestNetmask()
+	cfg.GuestMAC = slot.MAC
 }
 
 // saveRecord writes a record copy. It takes a value rather than the pointer
@@ -501,11 +587,49 @@ func (m *Microvm) recoverDiskInstances() {
 		if st, err := m.engine.State(context.Background(), id); err == nil {
 			reconcileState(&rec, st)
 		}
+		m.reassociateSlot(&rec)
 		m.instances[id] = &rec
 		if n, _ := strconv.Atoi(strings.TrimPrefix(id, "mvm-")); n > m.seq {
 			m.seq = n
 		}
 	}
+}
+
+// reassociateSlot puts a recovered record back in touch with its network
+// slot, or clears the record's claim on one.
+//
+// Two cases, and the difference is what the record says about itself rather
+// than what the host says:
+//
+//   - A session that is still running (or warm-paused) is using its slot
+//     right now: its guest is on that address and its TAP is in that
+//     namespace. The slot is re-claimed so the pool will not hand the index
+//     to anyone else, and reclaim leaves it alone.
+//   - A cold-parked session has no VM. Its slot was released at suspend and
+//     the namespace is already gone; the record keeps the index only as
+//     history, and the cold resume allocates a fresh one.
+//
+// A claim that cannot be honoured — two records naming one index, an index
+// outside this runner's envelope after the operator shrank --slots — is
+// logged and dropped rather than fatal: the session keeps its files and
+// reads as suspended, which is recoverable, where refusing to start takes the
+// whole host down.
+func (m *Microvm) reassociateSlot(rec *instanceRecord) {
+	if rec.Cfg.SlotIndex == 0 {
+		return
+	}
+	if rec.State != StateRunning && !(rec.State == StateSuspended && !rec.Cold) {
+		applySlot(&rec.Cfg, nil)
+		return
+	}
+	slot, err := m.slots.Adopt(rec.Cfg.SlotIndex, rec.ID)
+	if err != nil {
+		log.Printf("microvm: %s claims network slot %d and cannot have it (%v); the session keeps its files and its slot is left to reclaim", rec.ID, rec.Cfg.SlotIndex, err)
+		applySlot(&rec.Cfg, nil)
+		return
+	}
+	rec.slot = slot
+	applySlot(&rec.Cfg, slot)
 }
 
 // reconcileState folds the hypervisor's observed state into the driver's own
@@ -933,11 +1057,11 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 	}
 	undo = append(undo, channel.close)
 
-	tapDevice := "tap-" + id
-	if err := m.tap.Allocate(tapDevice, m.opts.Network); err != nil {
-		return nil, fmt.Errorf("allocate tap device %s: %w", tapDevice, err)
+	slot, err := m.slots.Allocate(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("allocate network slot for %s: %w", id, err)
 	}
-	undo = append(undo, func() { _ = m.tap.Release(tapDevice) })
+	undo = append(undo, func() { _ = m.slots.Release(context.WithoutCancel(ctx), slot) })
 
 	cfg := VMMConfig{
 		ID:                id,
@@ -952,10 +1076,10 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 		EgressAllow:       slices.Clone(spec.EgressAllow),
 		DialURL:           spec.DialURL,
 		ProxyURL:          spec.ProxyURL,
-		TapDevice:         tapDevice,
 		VsockUDSPath:      udsPath,
 		Env:               buildGuestEnv(spec),
 	}
+	applySlot(&cfg, slot)
 
 	if err := m.engine.Launch(ctx, cfg); err != nil {
 		return nil, fmt.Errorf("launch microvm %s: %w", id, err)
@@ -969,6 +1093,7 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 		Volume:    workspaceVolume(spec.SessionID),
 		PID:       m.engine.PID(id),
 		Cfg:       cfg,
+		slot:      slot,
 		boot:      bootCfg,
 		channel:   channel,
 		bootLive:  true,
@@ -999,9 +1124,6 @@ func (m *Microvm) Suspend(ctx context.Context, id string, warm bool) error {
 		// anywhere: ADR-0003 §2.2 treats a guest memory image as a
 		// secret-bearing artifact, which is the same reason the Firecracker
 		// engine's Snapshot refuses.
-		//
-		// TODO(PR 3): the TAP device stays allocated for the whole dormant
-		// window and is not re-created after a restart.
 		if err := m.engine.Stop(ctx, id); err != nil {
 			return err
 		}
@@ -1015,6 +1137,7 @@ func (m *Microvm) Suspend(ctx context.Context, id string, warm bool) error {
 	}
 	inst.State = StateSuspended
 	inst.Cold = !warm
+	var released *netslot.Slot
 	if !warm {
 		inst.PID = 0
 		// The VM is gone, so its vsock socket is a path nothing serves. It
@@ -1026,10 +1149,26 @@ func (m *Microvm) Suspend(ctx context.Context, id string, warm bool) error {
 			inst.channel.close()
 			inst.channel = nil
 		}
+		// The slot goes back to the pool for the same reason the VM goes
+		// away: a cold-parked session is not occupying this host, and a /30,
+		// a namespace and a firewall held for a dormant window nobody
+		// bounded is capacity ADR-0003 §5.1 counted on having. A cold resume
+		// allocates a fresh one.
+		released, inst.slot = inst.slot, nil
+		applySlot(&inst.Cfg, nil)
 	}
 	inst.bump()
 	rec := persistable(inst)
 	m.mu.Unlock()
+
+	if released != nil {
+		if err := m.slots.Release(ctx, released); err != nil {
+			// Not fatal to the suspend: the session IS parked, its files are
+			// intact, and the pool has already recorded the index as one
+			// that needs finishing before reuse.
+			log.Printf("microvm: releasing network slot %d for cold-parked %s: %v", released.Index, id, err)
+		}
+	}
 
 	if err := m.saveRecord(rec); err != nil {
 		return fmt.Errorf("save suspend metadata %s: %w", id, err)
@@ -1093,7 +1232,17 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 	}()
 
 	restarted := false
-	var channel *guestChannel
+	var (
+		channel *guestChannel
+		slot    *netslot.Slot
+	)
+	// A cold resume builds a whole new VM, so anything it allocated has to be
+	// given back when it does not get there.
+	defer func() {
+		if slot != nil {
+			_ = m.slots.Release(context.WithoutCancel(ctx), slot)
+		}
+	}()
 	if cold {
 		// A cold resume is a fresh boot, and a fresh boot needs the session's
 		// whole configuration. This driver holds that in memory only
@@ -1137,6 +1286,14 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 			return false, err
 		}
 		cfg.VsockUDSPath = udsPath
+		// A new VM gets a new network slot too: the one this session had was
+		// returned to the pool when it was parked, and may be another
+		// session's by now.
+		if slot, err = m.slots.Allocate(ctx, id); err != nil {
+			channel.close()
+			return false, fmt.Errorf("cold resume of %s: allocating a network slot: %w", id, err)
+		}
+		applySlot(&cfg, slot)
 		if err := m.engine.Launch(ctx, cfg); err != nil {
 			channel.close()
 			return false, fmt.Errorf("relaunch cold microvm %s: %w", id, err)
@@ -1165,6 +1322,11 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		inst.channel = channel
 		inst.boot = bootCfg
 		inst.Cfg.VsockUDSPath = cfg.VsockUDSPath
+		inst.slot = slot
+		applySlot(&inst.Cfg, slot)
+		// The deferred release must not take back the slot the record now
+		// holds, so the handover is recorded by clearing the local.
+		slot = nil
 		// inst.boots was advanced when this resume claimed the instance, so
 		// that the path it opened could not collide with a concurrent one.
 	}
@@ -1298,7 +1460,8 @@ func (m *Microvm) DestroyContainer(ctx context.Context, id string) error {
 		m.mu.Unlock()
 		return nil
 	}
-	tapDevice := inst.Cfg.TapDevice
+	slot := inst.slot
+	inst.slot = nil
 	channel := inst.channel
 	inst.channel = nil
 	m.mu.Unlock()
@@ -1311,11 +1474,27 @@ func (m *Microvm) DestroyContainer(ctx context.Context, id string) error {
 	if err := m.engine.Stop(ctx, id); err != nil {
 		st, stateErr := m.engine.State(ctx, id)
 		if stateErr != nil || (st != VMMStateGone && st != VMMStateStopped) {
+			// The slot is deliberately NOT released here. The VM may still
+			// be alive on that TAP, and taking its namespace away would
+			// leave a running guest with a half-torn-down network while the
+			// index went back to the pool for the next session to build on
+			// top of. The record keeps the slot; a later Destroy, or the
+			// next runnerd's reclaim, finishes it.
+			m.mu.Lock()
+			if inst, ok := m.instances[id]; ok && inst.slot == nil {
+				inst.slot = slot
+			}
+			m.mu.Unlock()
 			return fmt.Errorf("destroy microvm %s: %w", id, err)
 		}
 	}
-	if tapDevice != "" {
-		_ = m.tap.Release(tapDevice)
+	if slot != nil {
+		if err := m.slots.Release(ctx, slot); err != nil {
+			// The VM is gone and the record is going with it, so this is not
+			// a failed teardown of the SESSION. The pool has recorded the
+			// index as one that needs finishing before reuse.
+			log.Printf("microvm: releasing network slot %d for destroyed %s: %v", slot.Index, id, err)
+		}
 	}
 
 	m.mu.Lock()
@@ -1440,54 +1619,6 @@ func (e *Ext4Formatter) Format(path string) error {
 }
 
 // ---------------------------------------------------------------------------
-// Linux TAP Manager (production Linux hosts)
-// ---------------------------------------------------------------------------
-
-type LinuxTapManager struct {
-	bridgeName string
-}
-
-func NewLinuxTapManager(bridgeName string) *LinuxTapManager {
-	if bridgeName == "" {
-		bridgeName = "rainier-internal"
-	}
-	return &LinuxTapManager{bridgeName: bridgeName}
-}
-
-func (l *LinuxTapManager) Allocate(tapName, bridgeName string) error {
-	if bridgeName == "" {
-		bridgeName = l.bridgeName
-	}
-	cmd := exec.Command("ip", "tuntap", "add", "dev", tapName, "mode", "tap")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("ip tuntap add %s: %w: %s", tapName, err, strings.TrimSpace(string(out)))
-	}
-	// A TAP that never reached the bridge is a session with no network at
-	// all, so the attach failing is a failed allocation and not a warning to
-	// swallow. The device this call created is released on the way out —
-	// leaving it behind would also make the next create for the same id fail
-	// on a name that is already taken.
-	if bridgeName != "" {
-		out, err := exec.Command("ip", "link", "set", "dev", tapName, "master", bridgeName).CombinedOutput()
-		if err != nil {
-			_ = l.Release(tapName)
-			return fmt.Errorf("ip link set %s master %s: %w: %s", tapName, bridgeName, err, strings.TrimSpace(string(out)))
-		}
-	}
-	cmdUp := exec.Command("ip", "link", "set", "dev", tapName, "up")
-	if out, err := cmdUp.CombinedOutput(); err != nil {
-		_ = l.Release(tapName)
-		return fmt.Errorf("ip link set %s up: %w: %s", tapName, err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-func (l *LinuxTapManager) Release(tapName string) error {
-	cmd := exec.Command("ip", "link", "delete", "dev", tapName)
-	return cmd.Run()
-}
-
-// ---------------------------------------------------------------------------
 // Firecracker Engine (production Linux hosts with /dev/kvm)
 // ---------------------------------------------------------------------------
 
@@ -1574,14 +1705,37 @@ func (f *FirecrackerEngine) pidFilePath(id string) string {
 	return filepath.Join(f.stateDir, "instances", id, "pid")
 }
 
-// microvmBootArgs is the guest kernel command line.
+// microvmBootArgsBase is the part of the guest kernel command line that is
+// the same for every session.
+const microvmBootArgsBase = "console=ttyS0 reboot=k panic=1 pci=off"
+
+// bootArgs is the guest kernel command line for one VM.
 //
-// TODO(PR 3): every VM on the bridge gets this one address, gateway and
-// netmask, so two of them collide immediately — against ADR-0003 §5.1's 4 to
-// 6 sessions per host. A per-host slot allocator (TAP, IP, MAC, netns) lands
-// with the network work, and the address then comes from the slot rather than
-// from a constant.
-const microvmBootArgs = "console=ttyS0 reboot=k panic=1 pci=off ip=172.18.0.2::172.18.0.1:255.255.0.0:guest:eth0:off init=/init"
+// The addressing comes from the session's network slot. It used to be a
+// constant — one address, one gateway, one /16 netmask for every microVM on
+// the host — which collided the moment a host ran the two concurrent sessions
+// ADR-0003 §5.1 sizes it for. `ip=` is the kernel's own built-in
+// configuration, which is why the netmask is dotted rather than a prefix
+// length: it predates CIDR notation and will not parse "/30".
+//
+// A configuration with no slot gets no `ip=` at all rather than a default.
+// A guest that boots with the wrong address is a guest on someone else's /30.
+func bootArgs(cfg VMMConfig) string {
+	if cfg.GuestIP == "" || cfg.GatewayIP == "" {
+		return microvmBootArgsBase + " init=/init"
+	}
+	return fmt.Sprintf("%s ip=%s::%s:%s:guest:eth0:off init=/init",
+		microvmBootArgsBase, cfg.GuestIP, cfg.GatewayIP, cfg.GuestNetmask)
+}
+
+// vmmCommand is the command that starts one VMM, in its slot's network
+// namespace when it has one.
+func (f *FirecrackerEngine) vmmCommand(cfg VMMConfig, sockPath string) *exec.Cmd {
+	if cfg.Netns == "" {
+		return exec.Command(f.vmmPath, "--api-sock", sockPath)
+	}
+	return exec.Command("ip", "netns", "exec", cfg.Netns, f.vmmPath, "--api-sock", sockPath)
+}
 
 // Launch starts one VMM and configures it.
 //
@@ -1612,10 +1766,18 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	sockPath := f.socketPath(cfg.ID)
 	_ = os.Remove(sockPath)
 
-	// TODO(PR 3): this execs firecracker directly. ADR-0003 §4.5 requires the
-	// jailer: per-VM uid and gid, its own cgroup, its own netns, a per-session
-	// chroot, and seccomp on the VMM process.
-	cmd := exec.Command(f.vmmPath, "--api-sock", sockPath)
+	// The VMM runs INSIDE the session's network namespace, because that is
+	// where its TAP device is: the slot allocator moves the device there so
+	// that one guest's link, addresses and firewall cannot be seen — or
+	// reached — from another's. `ip netns exec` sets the namespace and then
+	// execs, so the process this engine tracks is still Firecracker itself
+	// and Stop's identity check still works on it.
+	//
+	// TODO(PR 3, next commit): the jailer replaces this. ADR-0003 §4.5 wants
+	// per-VM uid and gid, a cgroup, a per-session chroot and seccomp on the
+	// VMM process as well as the namespace, and the jailer takes `--netns`
+	// for exactly this.
+	cmd := f.vmmCommand(cfg, sockPath)
 	if err := cmd.Start(); err != nil {
 		_ = os.RemoveAll(sockDir)
 		return fmt.Errorf("start firecracker %s: %w", cfg.ID, err)
@@ -1653,7 +1815,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	// 2. Boot source
 	if err := fcClient.putJSON(ctx, "/boot-source", map[string]any{
 		"kernel_image_path": cfg.KernelPath,
-		"boot_args":         microvmBootArgs,
+		"boot_args":         bootArgs(cfg),
 	}); err != nil {
 		return fmt.Errorf("set boot source: %w", err)
 	}
@@ -1693,12 +1855,15 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		}
 	}
 
-	// 5. Network interface (TAP device)
+	// 5. Network interface: the slot's TAP device, inside the slot's network
+	// namespace, with the slot's MAC. The VMM process was started inside that
+	// namespace (see the command above), which is the only reason it can open
+	// a device that does not exist in the host's.
 	if cfg.TapDevice != "" {
 		if err := fcClient.putJSON(ctx, "/network-interfaces/eth0", map[string]any{
 			"iface_id":      "eth0",
 			"host_dev_name": cfg.TapDevice,
-			"guest_mac":     "AA:FC:00:00:00:01",
+			"guest_mac":     cfg.GuestMAC,
 		}); err != nil {
 			return fmt.Errorf("set network interface: %w", err)
 		}

@@ -1,7 +1,9 @@
 // internal/driver/microvm_sim_test.go
 //
-// The microVM driver's test seam: a hypervisor, a TAP manager and a disk
-// formatter with no host behind any of them.
+// The microVM driver's test seam: a hypervisor and a disk formatter with no
+// host behind either. The third member of the seam, the network host, is
+// netslot.FakeHost — it lives in the netslot package because the pool's own
+// tests need it too.
 //
 // They live in a _test.go file rather than beside the driver so that the
 // question "can a production path reach the simulated engine?" is answered by
@@ -28,35 +30,6 @@ import (
 type SimulatedDiskFormatter struct{}
 
 func (SimulatedDiskFormatter) Format(string) error { return nil }
-
-// ---------------------------------------------------------------------------
-// Simulated TAP Manager (test seam)
-// ---------------------------------------------------------------------------
-
-// SimulatedTapManager is the networking half of the test seam. It is never
-// constructed by production code; see MicrovmOpts.
-type SimulatedTapManager struct {
-	mu        sync.Mutex
-	allocated map[string]bool
-}
-
-func NewSimulatedTapManager() *SimulatedTapManager {
-	return &SimulatedTapManager{allocated: make(map[string]bool)}
-}
-
-func (s *SimulatedTapManager) Allocate(tapName, _ string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.allocated[tapName] = true
-	return nil
-}
-
-func (s *SimulatedTapManager) Release(tapName string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.allocated, tapName)
-	return nil
-}
 
 // ---------------------------------------------------------------------------
 // Simulated Engine (test seam)

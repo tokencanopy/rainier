@@ -39,6 +39,14 @@ func main() {
 		"vCPUs per microVM session (ADR-0003 §5.1 per-session floor: 4)")
 	microvmMemoryMiB := flag.Int("microvm-memory-mib", envIntDefault("RAINIER_MICROVM_MEMORY_MIB", 8192),
 		"memory in MiB per microVM session (ADR-0003 §5.1 per-session floor: 8192)")
+	microvmGuestCIDR := flag.String("microvm-guest-cidr", envDefault("RAINIER_MICROVM_GUEST_CIDR", ""),
+		"host-local range the guest link addresses are carved from, one /30 per session slot (ADR-0003 §5.2); empty means 10.201.0.0/16")
+	microvmUplinkCIDR := flag.String("microvm-uplink-cidr", envDefault("RAINIER_MICROVM_UPLINK_CIDR", ""),
+		"host-local range the per-slot veth pair addresses are carved from, one /30 per slot; empty means 10.202.0.0/16. It must not overlap --microvm-guest-cidr")
+	microvmSlotPrefix := flag.String("microvm-slot-prefix", envDefault("RAINIER_MICROVM_SLOT_PREFIX", ""),
+		"prefix for the network namespace, veth and TAP names this runner creates, and what it recognises as its own when reclaiming a previous run's leftovers; empty means rnr")
+	microvmNetnsDir := flag.String("microvm-netns-dir", envDefault("RAINIER_MICROVM_NETNS_DIR", ""),
+		"directory holding named network namespaces; empty means /var/run/netns, which is where ip netns puts them")
 	hostname, _ := os.Hostname()
 	runnerName := flag.String("runner-name", hostname, "name this runner announces to controld")
 	proxyURL := flag.String("proxy-url", "", "egress proxy URL injected into every session (forwarded to controld dial mode)")
@@ -79,6 +87,11 @@ func main() {
 			TotalSlots: *slots,
 			VCPU:       *microvmVCPUs,
 			MemoryMiB:  *microvmMemoryMiB,
+
+			SlotGuestCIDR:  *microvmGuestCIDR,
+			SlotUplinkCIDR: *microvmUplinkCIDR,
+			SlotNamePrefix: *microvmSlotPrefix,
+			NetnsDir:       *microvmNetnsDir,
 		})
 		if err != nil {
 			log.Fatalf("--driver=microvm: %v", err)

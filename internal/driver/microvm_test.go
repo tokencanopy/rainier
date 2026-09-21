@@ -21,17 +21,25 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tokencanopy/rainier/internal/driver/netslot"
 	"github.com/tokencanopy/rainier/internal/relay"
 )
 
 // testMicrovm builds a driver over a fresh state directory with the whole
-// test seam injected — simulated hypervisor, simulated TAP manager, no-op
+// test seam injected — simulated hypervisor, recording network host, no-op
 // formatter — and a base rootfs that exists, because the driver now refuses
 // to boot a session off an image this host does not have.
 //
 // Every microVM test goes through here. Nothing in production may construct
 // the simulated trio, and the cost of that rule is one helper.
 func testMicrovm(t *testing.T, opts MicrovmOpts) (*Microvm, *SimulatedEngine) {
+	m, sim, _ := testMicrovmNet(t, opts)
+	return m, sim
+}
+
+// testMicrovmNet is testMicrovm for the tests that want to see what the
+// driver asked the host for.
+func testMicrovmNet(t *testing.T, opts MicrovmOpts) (*Microvm, *SimulatedEngine, *netslot.FakeHost) {
 	t.Helper()
 	if opts.StateDir == "" {
 		opts.StateDir = shortTempDir(t)
@@ -44,8 +52,10 @@ func testMicrovm(t *testing.T, opts MicrovmOpts) (*Microvm, *SimulatedEngine) {
 		sim = NewSimulatedEngineWithDir(opts.StateDir)
 		opts.Engine = sim
 	}
-	if opts.Tap == nil {
-		opts.Tap = NewSimulatedTapManager()
+	net, _ := opts.Net.(*netslot.FakeHost)
+	if opts.Net == nil {
+		net = netslot.NewFakeHost()
+		opts.Net = net
 	}
 	if opts.Format == nil {
 		opts.Format = SimulatedDiskFormatter{}
@@ -54,7 +64,7 @@ func testMicrovm(t *testing.T, opts MicrovmOpts) (*Microvm, *SimulatedEngine) {
 	if err != nil {
 		t.Fatalf("NewMicrovm: %v", err)
 	}
-	return m, sim
+	return m, sim, net
 }
 
 // shortTempDir is t.TempDir with a name short enough to hang a unix socket
