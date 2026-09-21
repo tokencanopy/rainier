@@ -1654,8 +1654,12 @@ func (m *Microvm) Inspect(ctx context.Context, id string) (Handle, error) {
 func (m *Microvm) Capacity(_ context.Context) (int, int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// TODO(PR 3): slots only. ADR-0003 §4.6 wants the microVM's cgroup
-	// (cpu.stat, memory.current) measured from outside the guest.
+	// Slots, and deliberately only slots. Capacity is the ADMISSION
+	// question — how many more sessions may this host take (ADR-0003 §5.1) —
+	// and it is answered from the driver's own accounting, synchronously,
+	// on a path the fleet scheduler calls often. What a session has COST is
+	// a different question with a different consumer, it comes from each
+	// VM's cgroup (§4.6), and it is Usage.
 	return m.usedLocked(), m.opts.TotalSlots, nil
 }
 
