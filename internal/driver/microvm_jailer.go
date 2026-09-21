@@ -267,14 +267,14 @@ func (f *FirecrackerEngine) prepareJail(spec jailSpec, cfg VMMConfig) error {
 		}
 	}
 
-	// Read-only images shared with every other session on the host: the
-	// guest kernel and the base rootfs. A hard link shares the INODE — so
-	// their ownership cannot be changed for one VM without changing it for
-	// every other VM holding the same image, and they have to be readable as
-	// they are. A COPY is this VM's alone, so it is simply given to it.
+	// Read-only images shared with every other session on the host: the guest
+	// kernel, and nothing else since the rootfs became a per-session copy.
+	// A hard link shares the INODE — so their ownership cannot be changed for
+	// one VM without changing it for every other VM holding the same image,
+	// and they have to be readable as they are. A COPY is this VM's alone, so
+	// it is simply given to it.
 	for _, img := range []struct{ host, jail string }{
 		{cfg.KernelPath, jailKernelPath},
-		{cfg.RootfsPath, jailRootfsPath},
 	} {
 		if img.host == "" {
 			continue
@@ -297,7 +297,14 @@ func (f *FirecrackerEngine) prepareJail(spec jailSpec, cfg VMMConfig) error {
 
 	// Per-session writable images: exactly one VM owns each, so each is
 	// chowned to that VM.
+	//
+	// The ROOT filesystem is one of them now. It is this session's own
+	// copy-on-write copy of an environment image (ADR-0003 §2.7 item 3), made
+	// by Create before this runs, so chowning it to the VM's uid gives away
+	// the session's copy and never the shared image it was cloned from — which
+	// is what makes a writable root possible at all without an overlay.
 	for _, img := range []struct{ host, jail string }{
+		{cfg.RootfsPath, jailRootfsPath},
 		{cfg.WorkspaceDiskPath, jailWorkspacePath},
 		{cfg.HomeDiskPath, jailHomePath},
 	} {

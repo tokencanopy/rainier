@@ -156,6 +156,16 @@ type MicrovmOpts struct {
 	// capability — which is why it may be set on its own.
 	ImageSource ImageSource
 
+	// Clone is how a session's writable rootfs is made out of an environment
+	// image. nil means the host implementation (FileCloner): reflink where
+	// the filesystem allows it, a hole-preserving copy where it does not.
+	//
+	// Like ImageSource and unlike Engine/Net/Format it may be set on its own,
+	// because the host implementation works everywhere — the fallback is a
+	// slow copy, not a simulation — so a test that injects one is asking to
+	// OBSERVE the clones, not to substitute for a missing host capability.
+	Clone Cloner
+
 	Engine MicrovmEngine // test seam; nil in production
 	Net    netslot.Host  // test seam; nil in production
 	Format DiskFormatter // test seam; nil in production
@@ -188,18 +198,22 @@ type VMMConfig struct {
 	VCPU       int    `json:"vcpu"`
 	MemoryMiB  int    `json:"memory_mib"`
 	KernelPath string `json:"kernel_path"`
-	// RootfsPath is the image the VM boots as its ROOT device.
+	// RootfsPath is the WRITABLE root filesystem this VM boots: this
+	// session's own copy-on-write copy of BaseImagePath, and nobody else's.
+	// The guest writes into it directly — there is no overlayfs in the guest
+	// and no scratch device beside it — and it goes away with the session.
 	RootfsPath string `json:"rootfs_path"`
-	// BaseImagePath and BaseImageDigest are the ENVIRONMENT IMAGE this
-	// session's root filesystem comes from: a file in this host's image store
-	// under its digest, or a plain path for a runner's --rootfs (which nothing
-	// published and which therefore has no digest — see locateImage).
+	// BaseImagePath and BaseImageDigest are the ENVIRONMENT IMAGE that copy
+	// was made from: a file in this host's image store under its digest, or a
+	// plain path for a runner's --rootfs (which nothing published and which
+	// therefore has no digest — see locateImage).
 	//
-	// Both are recorded rather than re-derived because the image a session
-	// booted on is the image it must keep booting on across a park and a
-	// resume, whatever the environment's ref resolves to by then. Neither is
-	// secret: a digest names bytes that every session of the environment
-	// boots.
+	// Both are recorded rather than re-derived because a cold resume makes a
+	// FRESH copy — the parked session's rootfs is discarded and only the
+	// workspace persists (ADR-0003 §2.3, §4.1) — and it has to make it from
+	// the image this session booted on rather than from whatever the
+	// environment's ref resolves to by then. Neither is secret: a digest names
+	// bytes that every session of the environment boots.
 	BaseImagePath     string   `json:"base_image_path"`
 	BaseImageDigest   string   `json:"base_image_digest"`
 	WorkspaceDiskPath string   `json:"workspace_disk_path"`
@@ -384,6 +398,7 @@ type Microvm struct {
 	slots     *netslot.Pool
 	format    DiskFormatter
 	images    *imageStore
+	cloner    Cloner
 	seq       int
 	pending   int // slots reserved by an in-flight Create, counted as used
 	snapSeq   atomic.Int64
@@ -462,6 +477,10 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 	if err != nil {
 		return nil, err
 	}
+	cloner := opts.Clone
+	if cloner == nil {
+		cloner = NewFileCloner()
+	}
 
 	m := &Microvm{
 		opts:      opts,
@@ -469,6 +488,7 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 		slots:     slots,
 		format:    format,
 		images:    images,
+		cloner:    cloner,
 		instances: make(map[string]*instanceRecord),
 	}
 	// Records first, leftovers second, and never the other way round: a
@@ -551,15 +571,21 @@ func checkMicrovmHost(opts MicrovmOpts) error {
 	if _, err := exec.LookPath(jailer); err != nil {
 		return fmt.Errorf("microvm: firecracker's jailer %q not found: every microVM runs under it (per-VM uid and gid, its own cgroup, its own netns, a chroot, seccomp) and there is deliberately no unjailed fallback: %w", jailer, err)
 	}
-	// A jailed VM runs as neither the owner of the shared images nor a
-	// member of the runner's group, so it can only read them through the
-	// "other" bit. Checked here, at startup, rather than at the first create:
-	// it is a property of the operator's configuration and they can fix it
-	// before a session ever lands.
-	for _, shared := range []string{opts.KernelPath, opts.BaseRootfs} {
-		if err := checkSharedImageReadable(shared); err != nil {
-			return err
-		}
+	// A jailed VM runs as neither the owner of the shared images nor a member
+	// of the runner's group, so it can only read them through the "other" bit.
+	// Checked here, at startup, rather than at the first create: it is a
+	// property of the operator's configuration and they can fix it before a
+	// session ever lands.
+	//
+	// The kernel is the only such image now. The base rootfs used to be one —
+	// it was hard-linked into every jail — and is not any more: each session
+	// boots a copy-on-write COPY of it (ADR-0003 §2.7 item 3), made by runnerd
+	// itself, so what has to be able to read the image is this process, which
+	// readableFile above has already checked. Requiring o+r on it would be
+	// asking an operator to widen a permission for a reader that no longer
+	// exists.
+	if err := checkSharedImageReadable(opts.KernelPath); err != nil {
+		return err
 	}
 
 	// ADR-0003 §4.3 lists the regional control-plane ranges among the drops
@@ -870,6 +896,71 @@ func (m *Microvm) homeDiskPath(volume string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(m.opts.StateDir, "homes", volume+".ext4"), nil
+}
+
+// sessionRootfsPath is where one instance's WRITABLE root filesystem lives:
+// the copy-on-write copy of an environment image that this session boots on
+// and writes to.
+//
+// It is per INSTANCE and not per session id, because it is the one disk of the
+// three that does not outlive the VM. The workspace persists across a cold
+// park (ADR-0003 §2.3) and the agent home outlives every session mounted on
+// it; the rootfs is discarded at every teardown and re-cloned on resume,
+// exactly as §4.1's Suspend row says.
+func (m *Microvm) sessionRootfsPath(id string) (string, error) {
+	if err := checkPathSegment("instance id", id); err != nil {
+		return "", err
+	}
+	return filepath.Join(m.opts.StateDir, "rootfs", id+".ext4"), nil
+}
+
+// cloneSessionRootfs makes this instance's writable rootfs out of an
+// environment image, replacing any copy a previous boot left behind.
+//
+// The replacement is deliberate and it is the whole of "a cold-suspended
+// session boots a fresh clone on resume": what a parked session wrote into its
+// root is gone, because ADR-0003 §2.2 ends the VM and §2.3 persists only the
+// workspace. A resume that reused the old copy would be promising a durability
+// the design does not have.
+func (m *Microvm) cloneSessionRootfs(id, image string) (string, error) {
+	dst, err := m.sessionRootfsPath(id)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), microvmDirMode); err != nil {
+		return "", fmt.Errorf("create the rootfs directory for %s: %w", id, err)
+	}
+	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("remove the previous rootfs of %s: %w", id, err)
+	}
+	method, err := m.cloner.Clone(image, dst)
+	if err != nil {
+		return "", fmt.Errorf("clone the environment image for %s: %w", id, err)
+	}
+	if method != CloneReflink {
+		// Worth a line, once per boot: on a host whose state directory is XFS
+		// with reflinks (ADR-0003 §2.7 item 3) this never happens, and where
+		// it does it is seconds of I/O per create that the design budgeted at
+		// microseconds. It is not an error — the copy is correct — so what it
+		// buys the operator is the ability to find out.
+		log.Printf("microvm: %s copied its root filesystem instead of reflinking it (%s); "+
+			"the state directory's filesystem does not share extents, which costs a full copy of the environment image on every create", id, method)
+	}
+	return dst, nil
+}
+
+// removeSessionRootfs takes an instance's writable rootfs away. Every teardown
+// path calls it — the crash path, the explicit one, and a cold park — because
+// in all three the VM that owned it is gone and nothing will ever read it
+// again. An absent one is success: a teardown that runs twice is ordinary.
+func (m *Microvm) removeSessionRootfs(id string) {
+	path, err := m.sessionRootfsPath(id)
+	if err != nil {
+		return
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("microvm: removing the root filesystem of %s: %v", id, err)
+	}
 }
 
 // ensureDisk creates and formats a sparse disk image at path if it is not
@@ -1221,6 +1312,18 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 		return nil, fmt.Errorf("resolve rootfs: %w", err)
 	}
 
+	// The session's own writable root filesystem, cloned from that image
+	// before anything is started — and before the jail is built, because the
+	// jailer hard-links this file into the chroot and chowns it to the VM's
+	// uid. The guest gets a writable root with no overlayfs above it and no
+	// scratch device beside it: the copy IS the upper layer, and it is the
+	// thing Snapshot later commits.
+	rootfsPath, err := m.cloneSessionRootfs(id, basePath)
+	if err != nil {
+		return nil, err
+	}
+	undo = append(undo, func() { m.removeSessionRootfs(id) })
+
 	cmd := spec.Cmd
 	if len(cmd) == 0 {
 		cmd = []string{"/bin/bash"}
@@ -1255,7 +1358,7 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 		VCPU:              m.opts.VCPU,
 		MemoryMiB:         m.opts.MemoryMiB,
 		KernelPath:        m.opts.KernelPath,
-		RootfsPath:        basePath,
+		RootfsPath:        rootfsPath,
 		BaseImagePath:     basePath,
 		BaseImageDigest:   baseDigest,
 		WorkspaceDiskPath: workspaceDisk,
@@ -1329,6 +1432,18 @@ func (m *Microvm) Suspend(ctx context.Context, id string, warm bool) error {
 	var released *netslot.Slot
 	if !warm {
 		inst.PID = 0
+		// The rootfs goes with the VM. A cold park ends this microVM with no
+		// memory image (ADR-0003 §2.2) and persists only the workspace (§2.3,
+		// and §4.1's Suspend row: "the per-session rootfs copy is discarded"),
+		// so keeping the copy would be holding an environment image's worth of
+		// disk per dormant session for a window nobody bounded — and promising
+		// a durability the resume does not deliver, since Resume clones the
+		// environment image afresh.
+		//
+		// It is removed below, with the driver mutex released, for the reason
+		// every other removal on this path is: unlinking a file is I/O and no
+		// other session on this host should wait behind it.
+		//
 		// The VM is gone, so its vsock socket is a path nothing serves. It
 		// is closed and removed here rather than left for the resume to
 		// overwrite: a stale socket on a shared host is one more file
@@ -1349,6 +1464,10 @@ func (m *Microvm) Suspend(ctx context.Context, id string, warm bool) error {
 	inst.bump()
 	rec := persistable(inst)
 	m.mu.Unlock()
+
+	if !warm {
+		m.removeSessionRootfs(id)
+	}
 
 	if released != nil {
 		if err := m.slots.Release(ctx, released); err != nil {
@@ -1440,11 +1559,20 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		channel *guestChannel
 		slot    *netslot.Slot
 	)
+	// clonedRootfs is a cold resume's fresh root filesystem, until the record
+	// takes ownership of it. A resume that does not get as far as a live VM
+	// must not leave an environment image's worth of disk behind for a session
+	// that is still parked — which is the state a failed cold resume leaves
+	// the session in.
+	clonedRootfs := false
 	// A cold resume builds a whole new VM, so anything it allocated has to be
 	// given back when it does not get there.
 	defer func() {
 		if slot != nil {
 			_ = m.slots.Release(context.WithoutCancel(ctx), slot)
+		}
+		if clonedRootfs {
+			m.removeSessionRootfs(id)
 		}
 	}()
 	if cold {
@@ -1482,6 +1610,23 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 			return false, fmt.Errorf("cold resume of %s: minting a bootstrap token: %w", id, err)
 		}
 		bootCfg.BootstrapToken = token
+		// A fresh root filesystem, cloned from the environment image this
+		// session booted on. The parked session's copy was discarded when it
+		// was parked (ADR-0003 §4.1's Suspend row), so a resume is a fresh
+		// boot with preserved FILES — the workspace disk and the agent home,
+		// which are separate devices and are re-attached unchanged — and not a
+		// fresh boot with a preserved root.
+		//
+		// A record that names no image cannot be resumed, and says so: the
+		// alternative is a VM launched with no root device, which Firecracker
+		// refuses anyway, several steps later, with a message about a drive.
+		if cfg.BaseImagePath == "" {
+			return false, fmt.Errorf("cold resume of %s: this session's record names no environment image to clone a root filesystem from", id)
+		}
+		if _, err := m.cloneSessionRootfs(id, cfg.BaseImagePath); err != nil {
+			return false, fmt.Errorf("cold resume of %s: %w", id, err)
+		}
+		clonedRootfs = true
 		udsPath, listenPath, err := m.vsockPaths(id, boots)
 		if err != nil {
 			return false, err
@@ -1546,8 +1691,11 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		inst.slot = slot
 		applySlot(&inst.Cfg, slot)
 		// The deferred release must not take back the slot the record now
-		// holds, so the handover is recorded by clearing the local.
+		// holds, so the handover is recorded by clearing the local. The fresh
+		// root filesystem is handed over in the same breath and for the same
+		// reason: the VM is running on it now.
 		slot = nil
+		clonedRootfs = false
 		// inst.boots was advanced when this resume claimed the instance, so
 		// that the path it opened could not collide with a concurrent one.
 	}
@@ -1737,6 +1885,13 @@ func (m *Microvm) DestroyContainer(ctx context.Context, id string) error {
 	delete(m.instances, id)
 	m.mu.Unlock()
 
+	// The session's writable root filesystem goes with the VM, on the crash
+	// path as much as on the explicit one: it is a copy of an environment
+	// image, everything in it that anyone wanted is in the workspace, and
+	// nothing will ever read it again. The WORKSPACE is deliberately not
+	// touched here — that is the whole point of DestroyContainer being
+	// separate from Destroy.
+	m.removeSessionRootfs(id)
 	m.deleteInstanceRecord(id)
 	return nil
 }
@@ -2254,12 +2409,19 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		return fmt.Errorf("set boot source: %w", err)
 	}
 
-	// 3. Rootfs drive
+	// 3. Rootfs drive, WRITABLE.
+	//
+	// It is this session's own copy-on-write copy of an environment image
+	// (ADR-0003 §2.7 item 3), made by the driver before this launch, so there
+	// is exactly one VM that can write to it and nothing shared behind it. The
+	// drive used to be read-only with no writable layer above it, which left
+	// the guest with a root filesystem it could not write and left Snapshot
+	// with nothing to commit — the two halves of the same missing piece.
 	if err := fcClient.putJSON(ctx, "/drives/rootfs", map[string]any{
 		"drive_id":       "rootfs",
 		"path_on_host":   jailRootfsPath,
 		"is_root_device": true,
-		"is_read_only":   true,
+		"is_read_only":   false,
 	}); err != nil {
 		return fmt.Errorf("set rootfs drive: %w", err)
 	}
