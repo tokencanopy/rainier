@@ -221,7 +221,17 @@ type instanceRecord struct {
 	// boots counts launches of this instance, so each one gets a vsock socket
 	// path of its own. A cold resume is a new VM and Firecracker's own
 	// documentation warns that one uds_path cannot be multiplexed across two.
+	//
+	// It is read AND advanced under the driver mutex by the one resume that
+	// claimed the instance (see resuming), so no two boots of one instance
+	// can ever be handed the same path.
 	boots int
+
+	// resuming is the claim one Resume holds over this instance while it is
+	// in flight. A second Resume for the same id is refused rather than run
+	// beside it: see Resume for what two concurrent cold ones would do to
+	// each other's socket.
+	resuming bool
 
 	// epoch counts mutations of this record, and exists because Inspect and
 	// List ask the hypervisor with the driver mutex RELEASED (its answer is
@@ -1036,8 +1046,7 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 	}
 	running := inst.State == StateRunning
 	cold, bootLive, cfg := inst.Cold, inst.bootLive, inst.Cfg
-	bootCfg, sessionID, boots := inst.boot, inst.SessionID, inst.boots
-	m.mu.Unlock()
+	bootCfg, sessionID := inst.boot, inst.SessionID
 
 	// Resuming a session that is already running restarts nothing, and says
 	// so without touching the hypervisor (driver.go's Resume contract). The
@@ -1046,8 +1055,42 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 	// resume turned "nothing to do" into a failed Resume — and runnerd reads
 	// a failed Resume as a session it could not bring back.
 	if running {
+		m.mu.Unlock()
 		return false, nil
 	}
+
+	// One resume at a time per instance, claimed under the same lock that
+	// reads the state it decided on.
+	//
+	// Two concurrent cold resumes would otherwise both see the same state,
+	// both compute the same next boot number, and both open a channel on the
+	// same socket path — and openGuestChannel UNLINKS before it listens, so
+	// the second would remove the first's live socket out from under a VM
+	// that had already been told about it. That session then boots and is
+	// never configured, which is the one outcome this whole path exists to
+	// prevent. The pair of them would also mint two tokens and launch twice.
+	if inst.resuming {
+		m.mu.Unlock()
+		return false, fmt.Errorf("resume of %s: a resume is already in flight for this instance", id)
+	}
+	inst.resuming = true
+	// The boot number is taken HERE, under the same lock, and it advances
+	// even for an attempt that fails: a failed launch may have left a socket
+	// behind at that path, and an attempt that reuses a number is an attempt
+	// that inherits it. The counter is only ever a source of distinct paths.
+	boots := inst.boots
+	if cold {
+		inst.boots++
+		boots = inst.boots
+	}
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		if e, ok := m.instances[id]; ok {
+			e.resuming = false
+		}
+		m.mu.Unlock()
+	}()
 
 	restarted := false
 	var channel *guestChannel
@@ -1086,7 +1129,7 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 			return false, fmt.Errorf("cold resume of %s: minting a bootstrap token: %w", id, err)
 		}
 		bootCfg.BootstrapToken = token
-		udsPath, listenPath, err := m.vsockPaths(id, boots+1)
+		udsPath, listenPath, err := m.vsockPaths(id, boots)
 		if err != nil {
 			return false, err
 		}
@@ -1122,7 +1165,8 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		inst.channel = channel
 		inst.boot = bootCfg
 		inst.Cfg.VsockUDSPath = cfg.VsockUDSPath
-		inst.boots++
+		// inst.boots was advanced when this resume claimed the instance, so
+		// that the path it opened could not collide with a concurrent one.
 	}
 	inst.bump()
 	rec := persistable(inst)

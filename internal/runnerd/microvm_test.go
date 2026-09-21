@@ -414,6 +414,10 @@ func TestColdSuspendTellsAMicrovmSandboxItIsCold(t *testing.T) {
 	}
 	s.suspendAckWait = 200 * time.Millisecond
 	s.suspendReadyWait = 200 * time.Millisecond
+	// The cold path has a budget of its own, and this test's sandbox never
+	// answers — so without shortening it too, this test would sit out the
+	// production thirty seconds.
+	s.coldSuspendReadyWait = 200 * time.Millisecond
 	ctx := context.Background()
 	if err := s.CreateWithID(ctx, "sess-cold", driver.Spec{}, nil); err != nil {
 		t.Fatal(err)
@@ -496,4 +500,110 @@ func readControlEvent(t *testing.T, conn relay.Conn) relay.ControlEvent {
 		t.Fatalf("decode a control event: %v", err)
 	}
 	return ev
+}
+
+// TestASandboxMayNotAnswerWithARunnerSpaceID is review round 2, finding 6.
+//
+// The guard used to read only the `req:` arm, so a sandbox could not ASK with
+// an id out of the runner's reserved space but could ANSWER with one — and an
+// answer travels further than a request does, because the runner forwards it
+// to the control plane rather than refusing it locally. An id space the
+// untrusted end can write into is not a space, and it is not a space at
+// either end of it.
+func TestASandboxMayNotAnswerWithARunnerSpaceID(t *testing.T) {
+	s, _ := testMicrovmServer(t)
+	s.reg.put("sess-resp", &sessionEntry{id: "sess-resp", state: "running"})
+	guest, host := net.Pipe()
+	defer guest.Close()
+	s.GuestConnected("sess-resp", relay.NetConn(host))
+	waitForHub(t, s, "sess-resp")
+
+	forwarded := make(chan runner.RPCEnvelope, 4)
+	s.SetOnSessionRPC(func(_ string, env runner.RPCEnvelope) { forwarded <- env })
+	defer s.SetOnSessionRPC(nil)
+
+	sandbox := relay.NetConn(guest)
+	send := func(ev relay.ControlEvent) {
+		t.Helper()
+		payload, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frame, err := relay.Encode(relay.Frame{Type: relay.FrameControl, Payload: payload})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := sandbox.Write(ctx, frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A response numbered out of the runner's own space: dropped, not
+	// forwarded. It is not refused back down either — answering an answer is
+	// meaningless, and there was never a caller for this one.
+	send(relay.ControlEvent{Kind: "resp", ID: runnerOriginatedIDBase | 5, OK: true,
+		Payload: []byte(`{"token":"token_the_sandbox_chose"}`)})
+
+	// An ordinary response after it, to prove the channel still works and
+	// that the drop above is about the id and not about `resp` at all. It
+	// arriving is also what makes the "nothing was forwarded" check below
+	// read over real traffic rather than over an empty channel.
+	send(relay.ControlEvent{Kind: "resp", ID: 12, OK: true, Payload: []byte(`{"ok":true}`)})
+
+	select {
+	case env := <-forwarded:
+		if isRunnerOriginated(env.ID) {
+			t.Fatalf("a sandbox put a runner-space id on the wire: %+v", env)
+		}
+		if env.ID != 12 {
+			t.Fatalf("the forwarded response = %+v, want the sandbox's own id 12", env)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no response reached the control plane at all")
+	}
+	select {
+	case env := <-forwarded:
+		t.Fatalf("a second response was forwarded: %+v", env)
+	default:
+	}
+}
+
+// TestARunnerAnswerForAnotherSessionIsNotDelivered is the other half of
+// review round 2, finding 6: the runner's pending table used to match on the
+// id alone and ignore the session the answer named.
+//
+// The id space is per-process and the session is not, so a mint for one
+// session answered by a message naming another would have been delivered to
+// the first's caller — which is a cold resume booting a VM with a token
+// minted against a different session's row.
+func TestARunnerAnswerForAnotherSessionIsNotDelivered(t *testing.T) {
+	tbl := newRunnerRPCTable()
+	id, ch := tbl.begin("sess-a")
+	defer tbl.end(id)
+
+	answer, err := json.Marshal(map[string]any{"token": "token_for_b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := runner.RPCEnvelope{ID: id, Method: "resp", OK: true, Payload: answer}
+
+	if tbl.deliver("sess-b", env) {
+		t.Fatal("an answer naming another session was delivered to this call")
+	}
+	select {
+	case got := <-ch:
+		t.Fatalf("the caller was woken by another session's answer: %+v", got)
+	default:
+	}
+
+	// The same envelope on the right session is the same call's answer, so
+	// the check above is the session and not a blanket refusal.
+	if !tbl.deliver("sess-a", env) {
+		t.Fatal("the call's own answer was not delivered")
+	}
+	if got := <-ch; got.ID != id {
+		t.Fatalf("delivered %+v, want the call's own id", got)
+	}
 }

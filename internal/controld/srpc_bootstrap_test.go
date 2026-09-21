@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -355,10 +357,36 @@ func TestBootstrapMethodsAreRefusedForAnotherRunnersSession(t *testing.T) {
 //
 // A log line is the easiest place for a value to end up and the hardest place
 // to get it back out of, which is why this is a test and not a review note.
+// syncBuffer is a log sink that can be READ while something is still writing
+// to it.
+//
+// log.Logger serializes its own writers under its own mutex, so concurrent
+// log.Printf calls are safe against each other — but the test's read of the
+// buffer is not one of those writers, and this package's runner-plane
+// goroutines log on their own schedule. A plain bytes.Buffer here is a data
+// race that `go test -race` catches in roughly one run in three, which is
+// the worst frequency a race can have.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
 func TestTheBootstrapExchangeLeavesNothingInTheLog(t *testing.T) {
-	var captured bytes.Buffer
+	captured := &syncBuffer{}
 	prevOut, prevFlags := log.Writer(), log.Flags()
-	log.SetOutput(&captured)
+	log.SetOutput(captured)
 	log.SetFlags(0)
 	t.Cleanup(func() { log.SetOutput(prevOut); log.SetFlags(prevFlags) })
 
@@ -386,6 +414,21 @@ func TestTheBootstrapExchangeLeavesNothingInTheLog(t *testing.T) {
 	if cmd := nextSessionRPC(t, f); cmd.RPC.OK {
 		t.Fatal("the replay succeeded")
 	}
+
+	// Everything this test set in motion is stopped before the log is read.
+	// The runner plane holds a goroutine per connected runner and it logs —
+	// so a grep taken while one is still running is a grep over a buffer
+	// that is still being written, and the question "did anything leak
+	// across this whole exchange" has no answer until the exchange's own
+	// machinery has finished saying things. (syncBuffer makes reading it
+	// safe either way; this makes the answer complete.)
+	f.close()
+	eventually(t, 3*time.Second, func() error {
+		if s.runnerConnected("vm1") {
+			return errors.New("controld has not noticed the runner leaving yet")
+		}
+		return nil
+	})
 
 	out := captured.String()
 	for _, forbidden := range []string{bootstrapFixtureSecret, minted.Token} {

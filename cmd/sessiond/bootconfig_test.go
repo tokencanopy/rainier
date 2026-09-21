@@ -26,9 +26,60 @@ import (
 // fakeHost is the runner's end of a guest's control channel: it writes the
 // boot configuration as the first frame and answers (or refuses) the one
 // exchange the guest makes.
+//
+// It READS the connection continuously, from the moment it exists, and that
+// is load-bearing rather than tidy. net.Pipe is synchronous: a guest that
+// writes a request nobody is reading blocks in Write until its own deadline
+// expires, and relay.NetConn answers an expired write context by closing the
+// conn. A host that only looked for the request afterwards would therefore
+// find a broken connection and read it as silence — which is how an
+// "exactly once" assertion passes for a guest that asked twice. With a
+// reader running the whole time, a request the guest makes is read off the
+// wire as it is written, and is still here to be counted when the assertion
+// runs.
 type fakeHost struct {
 	conn relay.Conn
 	t    *testing.T
+
+	// reqs carries every control REQUEST the guest sent, in order.
+	reqs chan relay.ControlEvent
+	// readErr carries the one error that ended the drain, which is what lets
+	// an assertion tell "the guest sent nothing" from "the connection died".
+	readErr chan error
+}
+
+func newFakeHost(t *testing.T, conn relay.Conn) *fakeHost {
+	h := &fakeHost{
+		conn: conn, t: t,
+		reqs:    make(chan relay.ControlEvent, 8),
+		readErr: make(chan error, 1),
+	}
+	go h.drain()
+	return h
+}
+
+// drain is the reader. It runs until the connection ends, and it never
+// touches *testing.T: a failure reported from this goroutine would be
+// reported after the test that owns it may have finished.
+func (h *fakeHost) drain() {
+	for {
+		raw, err := h.conn.Read(context.Background())
+		if err != nil {
+			h.readErr <- err
+			return
+		}
+		f, derr := relay.Decode(raw)
+		if derr != nil || f.Type != relay.FrameControl {
+			continue
+		}
+		var ev relay.ControlEvent
+		if json.Unmarshal(f.Payload, &ev) != nil {
+			continue
+		}
+		if strings.HasPrefix(ev.Kind, "req:") {
+			h.reqs <- ev
+		}
+	}
 }
 
 func (h *fakeHost) sendBootConfig(cfg runner.BootConfig) {
@@ -57,53 +108,65 @@ func (h *fakeHost) sendControl(ev relay.ControlEvent) {
 	}
 }
 
-// nextRequest reads the next control REQUEST the guest sent, failing the
-// test if none arrives.
+// nextRequest returns the next control REQUEST the guest sent, failing the
+// test if none arrives or if the connection ends first.
 func (h *fakeHost) nextRequest() relay.ControlEvent {
 	h.t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	for {
-		raw, err := h.conn.Read(ctx)
-		if err != nil {
-			h.t.Fatalf("read from the guest: %v", err)
+	select {
+	case ev := <-h.reqs:
+		return ev
+	case err := <-h.readErr:
+		h.t.Fatalf("the guest's connection ended before it asked for anything: %v", err)
+	case <-time.After(5 * time.Second):
+		h.t.Fatal("the guest made no request within 5s")
+	}
+	return relay.ControlEvent{}
+}
+
+// nothingMore asserts the guest made no further request within a short
+// window. It is how "exactly once" is checked, and it fails the test itself
+// so that the reason is the assertion's own sentence.
+//
+// The three ways the window can end are three different facts and only one
+// of them is silence:
+//
+//   - a request arrives: the guest asked for something it must not have
+//     asked for, and `what` says why that matters;
+//   - the window expires with nothing on the conn: silence, which is what
+//     the caller is claiming;
+//   - the connection ends: NOT silence by itself. It is only evidence
+//     because the drain has been reading since this host existed, so a
+//     request the guest did write is already in h.reqs and is checked for
+//     once more before this returns. Without that reader, a guest whose
+//     write timed out on an undrained pipe would break its own connection
+//     and be reported as quiet — which is exactly the assertion this
+//     replaces.
+func (h *fakeHost) nothingMore(within time.Duration, what string) {
+	h.t.Helper()
+	select {
+	case ev := <-h.reqs:
+		h.t.Fatalf("%s: the guest sent %q", what, ev.Kind)
+	case err := <-h.readErr:
+		select {
+		case ev := <-h.reqs:
+			h.t.Fatalf("%s: the guest sent %q", what, ev.Kind)
+		default:
 		}
-		f, err := relay.Decode(raw)
-		if err != nil || f.Type != relay.FrameControl {
-			continue
-		}
-		var ev relay.ControlEvent
-		if json.Unmarshal(f.Payload, &ev) != nil {
-			continue
-		}
-		if strings.HasPrefix(ev.Kind, "req:") {
-			return ev
-		}
+		h.t.Logf("the guest's connection ended within the window (%v) having asked for nothing", err)
+	case <-time.After(within):
 	}
 }
 
-// nothingMore asserts the guest sent no further request within a short
-// window. It is how "exactly once" is checked.
-func (h *fakeHost) nothingMore(within time.Duration) bool {
+// waitClosed returns the error that ended the drain — how a test observes
+// the guest hanging up.
+func (h *fakeHost) waitClosed(within time.Duration) error {
 	h.t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), within)
-	defer cancel()
-	for {
-		raw, err := h.conn.Read(ctx)
-		if err != nil {
-			return true // the window closed with nothing on it
-		}
-		f, derr := relay.Decode(raw)
-		if derr != nil || f.Type != relay.FrameControl {
-			continue
-		}
-		var ev relay.ControlEvent
-		if json.Unmarshal(f.Payload, &ev) != nil {
-			continue
-		}
-		if strings.HasPrefix(ev.Kind, "req:") {
-			return false
-		}
+	select {
+	case err := <-h.readErr:
+		return err
+	case <-time.After(within):
+		h.t.Fatalf("the guest's connection was still open after %s", within)
+		return nil
 	}
 }
 
@@ -136,7 +199,7 @@ func fakeTransport(t *testing.T) (dialSession, <-chan *fakeHost) {
 	return func(context.Context) (relay.Conn, error) {
 		guest, host := net.Pipe()
 		t.Cleanup(func() { _ = guest.Close(); _ = host.Close() })
-		hosts <- &fakeHost{conn: relay.NetConn(host), t: t}
+		hosts <- newFakeHost(t, relay.NetConn(host))
 		return relay.NetConn(guest), nil
 	}, hosts
 }
@@ -271,9 +334,7 @@ func TestBootOverVsockAppliesTheConfigurationAndTheSecrets(t *testing.T) {
 
 	// Exactly once: the token is single-use, so a second exchange on the same
 	// token would be refused and would fail a boot that had already worked.
-	if !host.nothingMore(200 * time.Millisecond) {
-		t.Fatal("the guest made a second request on one boot")
-	}
+	host.nothingMore(200*time.Millisecond, "the guest made a second request on one boot")
 }
 
 // TestBootOverVsockWithNoSecretsDeclaredIsACleanBoot pins the difference
@@ -301,9 +362,7 @@ func TestBootOverVsockWithNoSecretsDeclaredIsACleanBoot(t *testing.T) {
 	if bootErr != nil || failure != nil {
 		t.Fatalf("a session declaring no secrets did not boot cleanly: %v / %v", bootErr, failure)
 	}
-	if !host.nothingMore(200 * time.Millisecond) {
-		t.Fatal("a session declaring no secrets asked for some anyway")
-	}
+	host.nothingMore(200*time.Millisecond, "a session declaring no secrets asked for some anyway")
 }
 
 // TestARefusedExchangeFailsTheBootChain is the compatibility table's last
@@ -395,11 +454,14 @@ func TestARefusedExchangeFailsTheBootChain(t *testing.T) {
 	redialDone := make(chan error, 1)
 	go func() { redialDone <- reBootstrap(context.Background(), redial, boots) }()
 	redialHost.sendBootConfig(cfg)
+	// Asserted BEFORE the preamble is waited on, and that ordering is the
+	// test: a guest that re-presented the token would be sitting in
+	// exchange() waiting out its whole 30-second answer budget, so waiting
+	// on reBootstrap first would turn a bug into a slow pass.
+	redialHost.nothingMore(200*time.Millisecond,
+		"the redial re-presented a token the control plane had already spent")
 	if err := <-redialDone; err != nil {
 		t.Fatalf("the connection after a failed boot was refused: %v", err)
-	}
-	if !redialHost.nothingMore(200 * time.Millisecond) {
-		t.Fatal("the redial re-presented a token the control plane had already spent")
 	}
 }
 
@@ -477,9 +539,7 @@ func TestAMissingTokenWithDeclaredSecretsFailsTheBootChain(t *testing.T) {
 	if !strings.Contains(failure.Error(), "1 secret(s)") || !strings.Contains(failure.Error(), "no bootstrap token") {
 		t.Errorf("the failure = %q", failure)
 	}
-	if !host.nothingMore(200 * time.Millisecond) {
-		t.Fatal("the guest asked for its secrets with no token to ask with")
-	}
+	host.nothingMore(200*time.Millisecond, "the guest asked for its secrets with no token to ask with")
 }
 
 // TestAResumeReExchangesAndARedialDoesNot is the rule that makes single use
@@ -511,6 +571,9 @@ func TestAResumeReExchangesAndARedialDoesNot(t *testing.T) {
 	first := host.nextRequest()
 	host.answer(first.ID, map[string]string{"DEPLOY_KEY": "value_example"})
 	<-done
+	// Exactly one on the boot connection, so the redial below is being
+	// compared against a known number and not against "at least one".
+	host.nothingMore(200*time.Millisecond, "the boot exchanged more than once")
 
 	// A REDIAL inside the same VM: the same configuration, the same token.
 	// Nothing is asked for, because the token has been spent and the values
@@ -523,11 +586,12 @@ func TestAResumeReExchangesAndARedialDoesNot(t *testing.T) {
 	redialDone := make(chan error, 1)
 	go func() { redialDone <- reBootstrap(context.Background(), redialConn, boots) }()
 	redialHost.sendBootConfig(cfg)
+	// Before the wait, for the same reason as above: a guest that
+	// re-exchanged would be blocked on an answer, not finished.
+	redialHost.nothingMore(200*time.Millisecond,
+		"a redial re-exchanged a spent token, which would be refused forever")
 	if err := <-redialDone; err != nil {
 		t.Fatalf("a redial failed: %v", err)
-	}
-	if !redialHost.nothingMore(200 * time.Millisecond) {
-		t.Fatal("a redial re-exchanged a spent token, which would be refused forever")
 	}
 
 	// A RESUME: a new VM, a new socket, a new token. The secrets are fetched

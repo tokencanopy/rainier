@@ -341,15 +341,29 @@ func (r *registry) list() []sessionEntry {
 // still booting/dialing in) — the caller has a live hub with a running
 // readLoop goroutine that will now never be found through the registry, so
 // it must close that hub itself instead of leaking it.
-func (r *registry) setHub(id string, h *relay.Hub) bool {
+//
+// It also RETURNS the hub it displaced, when there was one and it is not the
+// same hub again, because a displaced hub is nobody's otherwise: nothing in
+// the registry points at it any more, so if its conn never dies its readLoop
+// never errors and its conn, its fd and its attachments are held by a
+// structure nothing can reach. That is not hypothetical — the peer on the
+// other end of a displaced conn is a sandbox, and a sandbox can simply
+// decline to hang up. It is returned rather than closed here because the
+// registry is not where a hub's lifetime is decided and because a displaced
+// hub is not immediately useless: see retireDisplacedHub.
+func (r *registry) setHub(id string, h *relay.Hub) (displaced *relay.Hub, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.items[id]
 	if !ok {
-		return false
+		return nil, false
 	}
+	displaced = e.hub
 	e.hub = h
-	return true
+	if displaced == h {
+		displaced = nil
+	}
+	return displaced, true
 }
 
 // hub reads an entry's hub field under the registry lock. attach's

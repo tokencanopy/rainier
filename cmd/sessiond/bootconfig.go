@@ -404,12 +404,17 @@ func bootOverVsock(ctx context.Context, dial dialSession, b *bootstrapper) (rela
 		}
 		failure = bf
 		// The conn is NOT handed back on a failed exchange. It may be
-		// perfectly good (a refusal) or it may not (a timeout, which ends
-		// the read by poisoning the conn's deadline), and the boot has no
-		// way to tell — so it is closed and dialLoop dials a fresh one. The
-		// cost is one extra connection on a session that is about to fail
-		// its boot chain anyway; the alternative is serving a conn that may
-		// already be dead and discovering it one frame later.
+		// perfectly good (a refusal) or it may already be gone: a timeout
+		// expires the context this exchange bounded its read and write
+		// with, and relay.NetConn answers an expired context by CLOSING the
+		// conn — deliberately, and the same answer *websocket.Conn gives
+		// (netconn.go). It is a close, not a poisoned deadline, so there is
+		// nothing here that could be cleared and reused. The boot cannot
+		// tell the two cases apart from the error, so it closes and dialLoop
+		// dials a fresh one. The cost is one extra connection on a session
+		// that is about to fail its boot chain anyway; the alternative is
+		// serving a conn that may already be dead and discovering it one
+		// frame later.
 		//
 		// The re-dial is safe precisely because the token is recorded as
 		// ATTEMPTED: the preamble on the new connection reads the

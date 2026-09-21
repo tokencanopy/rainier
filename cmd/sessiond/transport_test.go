@@ -109,10 +109,10 @@ func TestAFailedPreambleClosesTheConnection(t *testing.T) {
 		t.Fatalf("connect = %v, want the preamble's own error", err)
 	}
 	host := <-hosts
-	// The guest end is closed, so the host's read ends rather than blocking.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if _, err := host.conn.Read(ctx); err == nil {
+	// The guest end is closed, so the host's drain ends rather than
+	// blocking. It is read through the host's own reader rather than off the
+	// conn here: two readers on one net.Pipe end would race.
+	if err := host.waitClosed(2 * time.Second); err == nil {
 		t.Fatal("a connection whose preamble failed was left open")
 	}
 }

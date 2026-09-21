@@ -105,6 +105,14 @@ type Server struct {
 	// written immediately after New.
 	suspendAckWait   time.Duration
 	suspendReadyWait time.Duration
+	// coldSuspendReadyWait is the "are they gone" budget for a COLD suspend,
+	// which asks the sandbox for strictly more work than a freeze does. Same
+	// reason it is a field: a test must not spend the production one.
+	coldSuspendReadyWait time.Duration
+	// displacedHubGrace is how long a hub a re-register replaced keeps
+	// delivering before it is closed. A field for the same reason, and
+	// written only immediately after New.
+	displacedHubGrace time.Duration
 	// now is the clock every idle-stop decision reads: time.Now in
 	// production, a test's own function in tests, so the thirty minutes a
 	// session has to sit idle can be a table row rather than a sleep. A field
@@ -218,6 +226,8 @@ func New(drv driver.Driver, dialBase, egressAdmin, proxyURL string) *Server {
 	s := &Server{drv: drv, reg: newRegistry(), dialBase: dialBase, egressAdmin: egressAdmin,
 		proxyURL: proxyURL, hubWait: defaultHubWait, now: time.Now,
 		suspendAckWait: defaultSuspendAckWait, suspendReadyWait: defaultSuspendReadyWait,
+		coldSuspendReadyWait: defaultColdSuspendReadyWait,
+		displacedHubGrace:    defaultDisplacedHubGrace,
 		suspends: map[string]*suspendWaiter{}, runnerRPC: newRunnerRPCTable()}
 	// The microVM driver is composed BELOW this server and needs two things
 	// from above it — where a guest's control conn goes, and where a cold
@@ -1021,7 +1031,8 @@ func (s *Server) serveSessionConn(ctx context.Context, id string, conn relay.Con
 		// its own and this hop stayed as it is.
 		go s.routeControl(id, boot, reg, payload)
 	})
-	if !s.reg.setHub(id, hub) {
+	displaced, ok := s.reg.setHub(id, hub)
+	if !ok {
 		// The entry vanished between our existence check above and now — a
 		// concurrent DELETE raced this dial-in (session torn down while its
 		// container was still booting). No registry entry will ever exist to
@@ -1029,6 +1040,9 @@ func (s *Server) serveSessionConn(ctx context.Context, id string, conn relay.Con
 		// goroutine and the underlying fd.
 		hub.Close()
 		return
+	}
+	if displaced != nil {
+		go retireDisplacedHub(id, displaced, s.displacedHubGrace)
 	}
 	log.Printf("session %s registered", id)
 	s.fireEvent(id, "running")
@@ -1227,6 +1241,16 @@ func (s *Server) routeControl(id string, boot, reg uint64, payload []byte) {
 			log.Printf("session %s: control response with no id; dropping", id)
 			return
 		}
+		// The id space is fenced for responses too. A response is not a
+		// request, so there is no method here to refuse — but the number on
+		// it is the same number, and a sandbox answering with one out of the
+		// runner's own space has put a runner-space id on the wire for the
+		// control plane to echo. Dropped rather than refused: answering an
+		// answer is meaningless, and there was never a caller for this one.
+		if refusal := refuseSandboxOrigin("resp", ev.ID); refusal != "" {
+			log.Printf("session %s: dropping a control response from a sandbox: %s", id, refusal)
+			return
+		}
 		if !s.fireSessionRPC(id, runner.RPCEnvelope{ID: ev.ID, Method: "resp", OK: ev.OK, Payload: ev.Payload}) {
 			// Nothing to report to and nothing to answer: answering an answer
 			// is meaningless, and whoever asked has already given up (its
@@ -1284,9 +1308,35 @@ func (s *Server) routeControl(id string, boot, reg uint64, payload []byte) {
 // arrived — so only a sandbox that actually speaks the vocabulary can spend
 // it. It is comfortably longer than the sandbox's own quiesce budget, so the
 // ordinary answer is the acknowledgement rather than this timeout.
+// defaultColdSuspendReadyWait is the third budget, and it exists because a
+// cold suspend is not a freeze and cannot be paid for at a freeze's price.
+//
+// A warm suspend asks the sandbox for one thing: end your execs. Twelve
+// seconds is comfortably over the ten the sandbox gives that
+// (execQuiesceBudget in cmd/sessiond), because the ten is itself the
+// SIGTERM-then-SIGKILL escalation and nothing follows it.
+//
+// A cold suspend asks for three things, in series, and this VM is about to
+// cease to exist with no memory image (ADR-0003 §2.2), so anything not
+// finished is lost rather than deferred:
+//
+//   - a synchronous agent-home flush, which is a write to a block device;
+//   - the same ten-second exec kill;
+//   - an unmount of /rainier/agents, which syncs that device before it goes.
+//
+// Ten seconds of that is the kill alone, so twelve leaves two for a flush and
+// an unmount — and the first of those two to run slowly is the one whose work
+// is thrown away. Thirty is the kill with a factor of three over it, which is
+// headroom rather than a second stopwatch: a sandbox that answers takes
+// milliseconds, and only one that is genuinely stuck spends any of this.
+//
+// The ACK budget is shared with the warm path deliberately. The cold handler
+// answers the ack before it does any of the work above, so "did you hear me"
+// is the same question at the same price on both paths.
 const (
-	defaultSuspendAckWait   = 2 * time.Second
-	defaultSuspendReadyWait = 12 * time.Second
+	defaultSuspendAckWait       = 2 * time.Second
+	defaultSuspendReadyWait     = 12 * time.Second
+	defaultColdSuspendReadyWait = 30 * time.Second
 )
 
 // quiesceExecs tells the sandbox it is about to be frozen and waits for it to
@@ -1339,17 +1389,73 @@ func (s *Server) quiesceExecs(ctx context.Context, id string, cold bool) {
 		return
 	}
 
-	// "Are they gone." Only a sandbox that answered above can spend this.
-	readyTimer := time.NewTimer(s.suspendReadyWait)
+	// "Are they gone." Only a sandbox that answered above can spend this,
+	// and a COLD suspend is given its own budget: it asked for a flush and
+	// an unmount around the same kill, and work this one does not finish is
+	// lost rather than deferred, because there is no memory image and no VM
+	// on the other side of it.
+	readyWait := s.suspendReadyWait
+	if cold {
+		readyWait = s.coldSuspendReadyWait
+	}
+	readyTimer := time.NewTimer(readyWait)
 	defer readyTimer.Stop()
 	select {
 	case <-w.ready:
 	case <-hub.Done():
 	case <-ctx.Done():
 	case <-readyTimer.C:
+		what := "ending its commands"
+		if cold {
+			what = "flushing, ending its commands and unmounting the agent home"
+		}
 		log.Printf("session %s: the sandbox heard the suspend but had not finished "+
-			"ending its commands within %s; suspending anyway", id, s.suspendReadyWait)
+			"%s within %s; suspending anyway", id, what, readyWait)
 	}
+}
+
+// defaultDisplacedHubGrace is how long a hub a re-register replaced has to
+// finish delivering what it had already read, before it is closed.
+//
+// A displaced hub is not immediately useless, which is why this is a grace
+// and not a close. sessiond survives losing its conn and redials, and a hub
+// read loop that was stalled writing to a wedged viewer drains its buffered
+// frames whenever it comes back — and the child_exited on that older conn can
+// be the ONLY copy, because sessiond re-sends only what it never delivered.
+// Dropping it leaves a finished session holding its slot for the life of the
+// runner (TestAChildExitAcrossARedialIsRecordedEndToEnd).
+//
+// But it cannot be kept forever either, and "until its conn dies" is forever
+// when the peer is a sandbox that declines to hang up: nothing in the
+// registry points at a displaced hub, so its readLoop, its conn, its fd and
+// its attachments are held by a structure nothing can reach (review round 2,
+// finding 2).
+//
+// Ninety seconds is over clientWriteBase (70s, internal/relay), which is the
+// longest one stalled write can legitimately hold that read loop up — so a
+// hub that is going to drain has drained, and one that is not is closed. The
+// ordinary case costs nothing: a redial happens because the old conn broke,
+// so the old hub is usually already done before this timer is armed.
+const defaultDisplacedHubGrace = 90 * time.Second
+
+// retireDisplacedHub ends a hub a newer connection replaced, once its grace
+// is up. It returns without closing anything if the hub ends on its own
+// first, which is what nearly every redial looks like.
+//
+// The goroutine that was serving the displaced hub is parked on hub.Done(),
+// so closing here is what lets it go; its hubDied finds a newer hub in the
+// registry and settles nothing, which is already how a stale hub is handled.
+func retireDisplacedHub(id string, h *relay.Hub, grace time.Duration) {
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-h.Done():
+		return
+	case <-timer.C:
+	}
+	log.Printf("session %s: closing the connection a re-register replaced; it had %s to deliver what it had already read",
+		id, grace)
+	h.Close()
 }
 
 // armSuspendWaiter registers this suspend's waiter, replacing any stale entry:

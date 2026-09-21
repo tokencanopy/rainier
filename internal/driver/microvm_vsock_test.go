@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -246,10 +247,11 @@ func TestMicrovmColdResumeMintsAFreshTokenAndSocket(t *testing.T) {
 //
 // Firecracker binds "<uds_path>" itself at PUT /vsock; the driver binds
 // "<uds_path>_1024". A launch that fails after the device was configured
-// leaves the first behind, and the boot counter does not advance past a
-// failed attempt — so the next resume would recompute the same path, and
-// Firecracker's bind would fail EADDRINUSE on a socket nothing is serving,
-// forever.
+// leaves the first behind, on a path a later boot can meet again — a create
+// is always boot 1, and a record recovered after a runnerd restart counts
+// from whatever it was — and Firecracker's bind would then fail EADDRINUSE
+// on a socket nothing is serving, forever. So a failed attempt takes both
+// paths with it.
 func TestAFailedBootLeavesNoSocketBehind(t *testing.T) {
 	m, sim := testMicrovm(t, MicrovmOpts{TotalSlots: 4})
 	host := &stubMicrovmHost{}
@@ -390,5 +392,250 @@ func waitFor(t *testing.T, cond func() bool, msg string) {
 			t.Fatal(msg)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// dialRawGuest is dialGuest without the relay framing: the tests below care
+// about BYTES on the socket — whether any arrive at all, and whether reading
+// them is what the far end is waiting for — which a relay.Conn's reader
+// hides.
+func dialRawGuest(t *testing.T, m *Microvm, instanceID string, boot int) net.Conn {
+	t.Helper()
+	_, listenPath, err := m.vsockPaths(instanceID, boot)
+	if err != nil {
+		t.Fatalf("vsock paths: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c, err := net.Dial("unix", listenPath)
+		if err == nil {
+			t.Cleanup(func() { _ = c.Close() })
+			return c
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dial the guest control socket %s: %v", listenPath, err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// oversizedSpec is a create whose boot configuration cannot fit in a socket
+// buffer: two scripts at the driver's own cap, so the JSON the host writes is
+// comfortably past a megabyte. A guest that does not read one of these is a
+// guest the write is genuinely parked on, which is the condition the two
+// tests below are about.
+func oversizedSpec(sessionID string) Spec {
+	script := strings.Repeat("x", MaxSetupBytes)
+	return Spec{
+		SessionID:      sessionID,
+		Setup:          script,
+		Init:           script,
+		SecretNames:    []string{"DEPLOY_KEY"},
+		BootstrapToken: "token_example",
+	}
+}
+
+// TestASilentGuestDoesNotWedgeTheControlChannel is review round 2, finding 1.
+//
+// The accept loop used to write the boot configuration inline. That
+// configuration can exceed a megabyte (two scripts at MaxSetupBytes), so the
+// first process in the guest to connect and then NOT read parked the loop for
+// good: every later connection sat in the kernel's backlog accepted by nobody,
+// the real sessiond's 30-second wait for its configuration expired, and the
+// session died — with no way for a Destroy to break the write, because the
+// channel tracked no connections at all.
+//
+// So: a silent guest holds nothing but its own connection. A second
+// connection is still ANSWERED (refused, per the one-guest-per-boot rule
+// below — but answered, which is the part that proves the loop is alive), and
+// Destroy returns.
+func TestASilentGuestDoesNotWedgeTheControlChannel(t *testing.T) {
+	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4})
+	m.SetHost(&stubMicrovmHost{})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, oversizedSpec("sess-silent"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Destroy(ctx, h.ID)
+
+	// Connect, take ONE byte, and then stop reading. That byte is what makes
+	// this deterministic rather than a race with the dial below: it proves
+	// this connection is the one the channel claimed and that its
+	// configuration is already on its way. The remaining megabyte-odd has
+	// nowhere to go, so the host's write is now parked for good.
+	silent := dialRawGuest(t, m, h.ID, 1)
+	defer silent.Close()
+	if err := silent.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var one [1]byte
+	if _, err := io.ReadFull(silent, one[:]); err != nil {
+		t.Fatalf("the first guest was sent nothing at all: %v", err)
+	}
+
+	// The accept loop must still be serving. A second connection is closed
+	// with nothing on it, and — this is the assertion — it gets that answer
+	// promptly rather than after the silent guest's write deadline.
+	second := dialRawGuest(t, m, h.ID, 1)
+	if err := second.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var buf [1]byte
+	n, err := second.Read(buf[:])
+	if n != 0 {
+		t.Fatalf("a second connection was sent %d byte(s); it must receive nothing at all", n)
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("a second connection ended with %v, want EOF — it must be closed, not left waiting", err)
+	}
+
+	// And the session can still be torn down with that write still parked.
+	done := make(chan error, 1)
+	go func() { done <- m.Destroy(ctx, h.ID) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Destroy: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Destroy never returned while a guest held the control channel open")
+	}
+}
+
+// TestOnlyOneGuestIsServedPerBoot is review round 2, finding 2.
+//
+// /dev/vsock is world-accessible inside an ordinary guest, so every process
+// in the sandbox can dial (2, 1024). The first frame on that connection is
+// the session's whole configuration AND a live, single-use bootstrap token —
+// so a host that served every connection handed both to whoever asked, as
+// often as they asked, and let the last one become the session's hub.
+//
+// The design's model is one guest-initiated connection per boot (§4). This
+// pins it: the first connection is served, every later one receives NOTHING
+// and is closed, the hub the first produced is not displaced, and a Destroy
+// afterwards still cleans the socket up.
+func TestOnlyOneGuestIsServedPerBoot(t *testing.T) {
+	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4})
+	host := &stubMicrovmHost{}
+	m.SetHost(host)
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{
+		SessionID: "sess-once", SecretNames: []string{"DEPLOY_KEY"},
+		BootstrapToken: "token_example",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Destroy(ctx, h.ID)
+
+	// The first connection is sessiond, and it gets everything.
+	if got := readBootConfig(t, dialGuest(t, m, h.ID, 1)).BootstrapToken; got != "token_example" {
+		t.Fatalf("the first guest was handed token %q, want the create's", got)
+	}
+	waitFor(t, func() bool { return host.connCount() == 1 },
+		"the first guest connection never reached the runner")
+
+	// Every later one is a process inside the sandbox dialling a socket that
+	// is not its to dial. It reads EOF, having been sent nothing.
+	for i := 0; i < 2; i++ {
+		other := dialRawGuest(t, m, h.ID, 1)
+		if err := other.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		b, err := io.ReadAll(other)
+		if len(b) != 0 {
+			t.Fatalf("connection %d received %d byte(s) of a session's configuration", i+2, len(b))
+		}
+		if err != nil {
+			t.Fatalf("connection %d was left open rather than closed: %v", i+2, err)
+		}
+	}
+
+	// And it did not become the session's hub: the runner was handed exactly
+	// one connection, the first.
+	if n := host.connCount(); n != 1 {
+		t.Fatalf("the runner was handed %d guest connection(s) for one boot, want 1", n)
+	}
+
+	// A Destroy after all that still tears the channel down.
+	if err := m.Destroy(ctx, h.ID); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	_, listenPath, err := m.vsockPaths(h.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(listenPath); !os.IsNotExist(err) {
+		t.Errorf("Destroy left the guest control socket behind: %v", err)
+	}
+}
+
+// TestTwoConcurrentColdResumesDoNotShareASocket is review round 2, finding 7.
+//
+// The boot counter used to be read with the driver mutex released, so two
+// cold resumes of one instance could compute the same next boot number — and
+// openGuestChannel unlinks before it listens, so the second would remove the
+// first's live socket out from under a VM that had already been told about
+// it. That session boots and is never configured, which is the one outcome
+// this whole path exists to prevent.
+//
+// One resume wins; the other is refused; the winner's socket is there
+// afterwards.
+func TestTwoConcurrentColdResumesDoNotShareASocket(t *testing.T) {
+	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4})
+	m.SetHost(&stubMicrovmHost{})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "sess-race", BootstrapToken: "token_example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Destroy(ctx, h.ID)
+	if err := m.Suspend(ctx, h.ID, false); err != nil {
+		t.Fatal(err)
+	}
+
+	type outcome struct {
+		restarted bool
+		err       error
+	}
+	out := make(chan outcome, 2)
+	start := make(chan struct{})
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			restarted, err := m.Resume(ctx, h.ID)
+			out <- outcome{restarted, err}
+		}()
+	}
+	close(start)
+
+	restarts, refusals := 0, 0
+	for i := 0; i < 2; i++ {
+		o := <-out
+		switch {
+		case o.err == nil && o.restarted:
+			restarts++
+		case o.err != nil && strings.Contains(o.err.Error(), "already in flight"):
+			refusals++
+		default:
+			t.Fatalf("a concurrent resume returned (%v, %v), want a restart or an in-flight refusal", o.restarted, o.err)
+		}
+	}
+	if restarts != 1 || refusals != 1 {
+		t.Fatalf("%d restart(s) and %d refusal(s) from two concurrent resumes, want 1 and 1", restarts, refusals)
+	}
+
+	// The winner's guest channel is live: a guest can still be configured,
+	// which is what the losing unlink used to take away.
+	_, _, err = m.vsockPaths(h.ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readBootConfig(t, dialGuest(t, m, h.ID, 2)).SessionID; got != "sess-race" {
+		t.Fatalf("the resumed guest read session %q off its channel", got)
 	}
 }

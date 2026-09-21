@@ -257,7 +257,14 @@ socket is inside one VM's jail directory, so the connection's identity is its pa
 4. The guest boots. `sessiond` opens `AF_VSOCK` to (2, 1024).
 5. Firecracker forwards it to `<uds_path>_1024`; runnerd accepts and builds the relay hub
    with `relay.NewHubWithControl`, as `register` does today, keyed by the session the
-   socket path names.
+   socket path names. **Exactly one** connection is served per boot generation, and every
+   later one on that socket is closed having received nothing at all: `/dev/vsock` is
+   world-accessible inside an ordinary guest, so any process in the sandbox can dial
+   (2, 1024), and step 6's frame is the session's whole configuration plus a live token.
+   Each accepted connection is handled on a goroutine of its own and that frame's write is
+   bounded, so a peer that connects and never reads holds nothing but its own connection.
+   A sessiond that crashes and restarts inside a live VM is therefore NOT re-served: it is
+   a new boot generation, with a new socket and a fresh mint (open question 2).
 6. runnerd's first frame is `FrameControl{Kind: "boot_config"}`: session id, command,
    proxy URL, egress allowlist, agent manifest, git author, repos, setup and init scripts
    with their bounds, `SecretNames`, and the token.
@@ -271,8 +278,15 @@ socket is inside one VM's jail directory, so the connection's identity is its pa
 Cold suspend reuses the handshake that exists, with one additive field: `ControlEvent`
 gains ``Cold bool `json:"cold,omitempty"` `` on `KindSuspending`, meaning "this is not a
 freeze — flush, unmount `/rainier/agents`, forget every delivered secret". `sessiond`
-answers `KindSuspendAck` at once and `KindSuspendReady` when done, under the budgets that
-already exist (2s and 12s). runnerd then terminates the microVM — no memory image, per
+answers `KindSuspendAck` at once — before any of that work, so the ack budget is the warm
+path's **2s**, unchanged — and `KindSuspendReady` when done, under a cold ready budget of
+**30s** rather than the warm 12s. The warm 12s covers one thing: the sandbox's own 10s
+exec kill (`execQuiesceBudget`), with two to spare. The cold path wraps a synchronous
+agent-home flush and an unmount (which syncs the device before it detaches it) around
+that same 10s kill, and this VM ends with no memory image — so work the budget cuts short
+is lost rather than deferred, where a warm freeze merely postpones it. 30s is the kill
+with a factor of three over it. A sandbox that answers spends none of it; one that
+predates `Cold` answers as fast as it always did. runnerd then terminates the microVM — no memory image, per
 ADR §2.2 — detaches the disk, drops the token, and produces the checkpoint behind the
 §4.4 barrier. A sessiond predating `Cold` reads a plain `suspending`, quiesces its execs,
 and the host-side unmount still happens; the guest simply did not help.

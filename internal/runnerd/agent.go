@@ -612,9 +612,15 @@ func (s *Server) forwardSessionRPC(m runner.ToRunner, send func(runner.FromRunne
 	// a caller inside this process, not to the guest. The id spaces are
 	// disjoint so the two can share one connection — see
 	// runnerOriginatedIDBase.
+	//
+	// The SESSION is part of the match, not just the id: an answer naming a
+	// different session than the call was made for is not that call's answer,
+	// and delivering it would hand a cold resume of one session a token
+	// minted against another's row.
 	if env.Method == "resp" && isRunnerOriginated(env.ID) {
-		if !s.runnerRPC.deliver(env) {
-			log.Printf("agent: an answer for this runner's own request %d has no caller waiting (timed out?); dropping", env.ID)
+		if !s.runnerRPC.deliver(m.Session, env) {
+			log.Printf("agent: an answer for this runner's own request %d on session %s has no caller waiting (timed out, or a different session than it was made for); dropping",
+				env.ID, m.Session)
 		}
 		return
 	}

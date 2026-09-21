@@ -70,9 +70,17 @@ const runnerOriginatedIDBase uint64 = 1 << 63
 // counter. forwardSessionRPC asks before it routes a response into a sandbox.
 func isRunnerOriginated(id uint64) bool { return id&runnerOriginatedIDBase != 0 }
 
-// refuseSandboxOrigin reports why an upward request must not be forwarded,
+// refuseSandboxOrigin reports why an upward message must not be forwarded,
 // or "" when it may be. It is the fence on the one door an untrusted peer
 // has into the control plane's method table.
+//
+// It guards RESPONSES as well as requests, and that is not a formality: an
+// id space is closed at both ends or it is not closed. A sandbox that may
+// not send `req:` numbered 1<<63|n but may send `resp` numbered 1<<63|n has
+// put an id from the runner's space on the wire either way — and the `resp`
+// travels further, because the runner forwards it to the control plane
+// rather than answering it there. `method` is the envelope's method, which
+// is "resp" for a response, so both arms consult the same fence.
 //
 // Two things are refused, and only this hop can refuse either of them.
 //
@@ -98,7 +106,7 @@ func refuseSandboxOrigin(method string, id uint64) string {
 	case method == runner.MethodMintSessionBootstrap:
 		return "a sandbox may not mint its own bootstrap token; a fresh one is minted by the runner on a cold resume"
 	case isRunnerOriginated(id):
-		return "this request id is reserved for the runner's own requests"
+		return "this id is reserved for the runner's own requests"
 	}
 	return ""
 }
@@ -113,20 +121,34 @@ func refuseSandboxOrigin(method string, id uint64) string {
 type runnerRPCTable struct {
 	seq atomic.Uint64
 	mu  sync.Mutex
-	// waiting is id → the one-slot channel its caller is selecting on. Every
-	// caller removes its own entry, so nothing sweeps this map.
-	waiting map[uint64]chan runner.RPCEnvelope
+	// waiting is id → the one call waiting on it. Every caller removes its
+	// own entry, so nothing sweeps this map.
+	waiting map[uint64]pendingRunnerCall
+}
+
+// pendingRunnerCall is one in-flight request this runner made, and it records
+// the SESSION it was made for as well as the channel to answer on.
+//
+// The session is half of the correlation, not decoration. An id alone says
+// "some call is waiting on this number"; a mint for session A answered by a
+// message naming session B would otherwise be delivered to A's caller, which
+// would boot A's new VM with a token minted against B's row. The id spaces
+// are per-process, the sessions are not, so the pair is what identifies a
+// call.
+type pendingRunnerCall struct {
+	session string
+	ch      chan runner.RPCEnvelope
 }
 
 func newRunnerRPCTable() *runnerRPCTable {
-	return &runnerRPCTable{waiting: map[uint64]chan runner.RPCEnvelope{}}
+	return &runnerRPCTable{waiting: map[uint64]pendingRunnerCall{}}
 }
 
-func (t *runnerRPCTable) begin() (uint64, chan runner.RPCEnvelope) {
+func (t *runnerRPCTable) begin(session string) (uint64, chan runner.RPCEnvelope) {
 	id := runnerOriginatedIDBase | t.seq.Add(1)
 	ch := make(chan runner.RPCEnvelope, 1)
 	t.mu.Lock()
-	t.waiting[id] = ch
+	t.waiting[id] = pendingRunnerCall{session: session, ch: ch}
 	t.mu.Unlock()
 	return id, ch
 }
@@ -137,16 +159,21 @@ func (t *runnerRPCTable) end(id uint64) {
 	t.mu.Unlock()
 }
 
-// deliver hands a response to the call waiting on its id, reporting whether
-// anyone was. The channel is buffered by one and every caller removes its own
-// entry, so this never blocks the reader that called it.
-func (t *runnerRPCTable) deliver(env runner.RPCEnvelope) bool {
+// deliver hands a response to the call waiting on its id AND its session,
+// reporting whether one was. The channel is buffered by one and every caller
+// removes its own entry, so this never blocks the reader that called it.
+//
+// A mismatched session is not delivered anywhere: the caller learns nothing
+// arrived and times out, which is the honest outcome for an answer that does
+// not belong to the question.
+func (t *runnerRPCTable) deliver(session string, env runner.RPCEnvelope) bool {
 	t.mu.Lock()
-	ch, ok := t.waiting[env.ID]
+	p, ok := t.waiting[env.ID]
 	t.mu.Unlock()
-	if !ok {
+	if !ok || p.session != session {
 		return false
 	}
+	ch := p.ch
 	select {
 	case ch <- env:
 	default:
@@ -181,7 +208,7 @@ func (s *Server) MintSessionBootstrap(ctx context.Context, sessionID string) (st
 		return "", fmt.Errorf("encoding the bootstrap mint request: %w", err)
 	}
 
-	id, ch := s.runnerRPC.begin()
+	id, ch := s.runnerRPC.begin(sessionID)
 	defer s.runnerRPC.end(id)
 
 	if !s.fireSessionRPC(sessionID, runner.RPCEnvelope{

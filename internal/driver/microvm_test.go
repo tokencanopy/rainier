@@ -128,6 +128,15 @@ func (h *stubMicrovmHost) MintSessionBootstrap(_ context.Context, sessionID stri
 	return fmt.Sprintf("token_example_%s_%d", sessionID, h.mints), nil
 }
 
+// connCount is how many guest connections the runner was handed. One per
+// BOOT is the rule the driver enforces; anything more is a second process in
+// the sandbox having been served a session's configuration.
+func (h *stubMicrovmHost) connCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.conns)
+}
+
 func (h *stubMicrovmHost) mintCount() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()

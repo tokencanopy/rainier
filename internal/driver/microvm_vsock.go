@@ -33,6 +33,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/protocol/runner"
@@ -59,6 +60,21 @@ const (
 	// --microvm-state-dir, and "invalid argument" on a socket is not an error
 	// anybody can act on, where naming the limit and the path is.
 	unixPathMax = 107
+	// bootConfigWriteTimeout bounds the ONE write this driver makes onto a
+	// guest connection, and it exists because the thing written is large and
+	// the peer is untrusted.
+	//
+	// A boot configuration carries two scripts of up to MaxSetupBytes each
+	// (driver.go), so it can reach well over a megabyte — far past any socket
+	// buffer. A guest that connects and never reads would park an unbounded
+	// write forever, which is a session's control channel held open by
+	// whoever dialled it first. Ten seconds is orders of magnitude more than
+	// a guest that IS reading needs, and it is finite.
+	//
+	// relay.NetConn answers an expired write context by CLOSING the conn,
+	// which is exactly the right answer here: a guest that will not take its
+	// own configuration has nothing further to say on this connection.
+	bootConfigWriteTimeout = 10 * time.Second
 )
 
 // MicrovmHost is what the microVM driver needs from the runner above it.
@@ -170,14 +186,75 @@ type guestChannel struct {
 	// failure would put a line in an operator's log for every session that
 	// ends normally.
 	closed bool
+	// served records that this boot generation's ONE guest connection has
+	// been taken. /dev/vsock is world-accessible inside an ordinary guest,
+	// so every process in the sandbox can dial (2, 1024) — and what the
+	// first frame carries is the session's whole configuration and a LIVE
+	// bootstrap token. Serving every connection would hand that to whoever
+	// asked, as many times as they asked, and let the last one become the
+	// session's hub.
+	//
+	// So the model is the design note's: one guest-initiated connection per
+	// boot (§4). The first is sessiond; every later one is refused and closed
+	// having received nothing at all. A sessiond that crashed and came back
+	// is a NEW boot generation — a new VM, a new socket, a new mint (open
+	// question 2) — and not something to re-serve this token to.
+	served bool
+	// conns are the connections this channel is still responsible for. It
+	// holds at most the one served guest, and it exists so close() can end
+	// it: a Destroy that closed only the listener would leave a wedged
+	// boot-config write (a guest that never drains) holding a goroutine and
+	// a socket for as long as its deadline, with nothing able to interrupt
+	// it.
+	conns map[net.Conn]struct{}
+}
+
+// claim reserves this boot generation's one guest connection for c and takes
+// responsibility for closing it. It reports false for a second connection and
+// for one that arrived after teardown — in both cases the caller closes c
+// without writing a byte to it.
+func (g *guestChannel) claim(c net.Conn) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed || g.served {
+		return false
+	}
+	g.served = true
+	if g.conns == nil {
+		g.conns = map[net.Conn]struct{}{}
+	}
+	g.conns[c] = struct{}{}
+	return true
+}
+
+// drop closes a claimed connection this channel will not be handing on, and
+// stops tracking it. The claim is NOT released: a boot generation gets one
+// attempt, and a guest that could not be configured needs a fresh boot and a
+// fresh token rather than a second go at a spent one.
+func (g *guestChannel) drop(c net.Conn) {
+	g.mu.Lock()
+	delete(g.conns, c)
+	g.mu.Unlock()
+	_ = c.Close()
 }
 
 func (g *guestChannel) close() {
 	g.mu.Lock()
 	g.closed = true
+	conns := make([]net.Conn, 0, len(g.conns))
+	for c := range g.conns {
+		conns = append(conns, c)
+	}
+	g.conns = nil
 	g.mu.Unlock()
 	if g.listener != nil {
 		_ = g.listener.Close()
+	}
+	// The accepted connection goes too, and it is what makes Destroy
+	// unblockable: a boot-config write into a guest that is not draining is
+	// only interrupted by the conn dying.
+	for _, c := range conns {
+		_ = c.Close()
 	}
 	// Both paths, and an absent one is not an error: a teardown that runs
 	// twice is ordinary, and a VM that never started leaves only one of them.
@@ -204,9 +281,12 @@ func (m *Microvm) openGuestChannel(sessionID, udsPath, listenPath string, cfg ru
 	// Sockets left behind by a VM that is gone would make this Listen, or
 	// Firecracker's own bind at PUT /vsock, fail with "address already in
 	// use" for paths nothing is serving. A launch that failed after the
-	// device was configured leaves exactly that, and the boot counter does
-	// not advance past a failed attempt — so without this a session could
-	// never be resumed again on this runner.
+	// device was configured leaves exactly that. A resume no longer reuses
+	// the failed attempt's number (Resume advances the counter under the
+	// driver mutex, so no two boots of one instance share a path) — but a
+	// create is always boot 1, and a record recovered after a runnerd
+	// restart counts from whatever it was, so neither path gets to assume
+	// the path it was handed is unused.
 	_ = os.Remove(listenPath)
 	_ = os.Remove(udsPath)
 	ln, err := net.Listen("unix", listenPath)
@@ -227,12 +307,15 @@ func (m *Microvm) openGuestChannel(sessionID, udsPath, listenPath string, cfg ru
 	return g, nil
 }
 
-// acceptGuests serves the channel for the life of the instance.
+// acceptGuests keeps accepting for the life of the instance.
 //
-// It loops rather than accepting once because a sandbox redials: sessiond
-// survives losing its connection and comes back (cmd/sessiond's dial loop),
-// and the guest that reconnects needs its configuration again — it is a new
-// process as often as not, on the far side of a cold resume.
+// It keeps accepting even though exactly one connection is ever SERVED,
+// because the alternative is worse in both directions: an accept loop that
+// stopped would leave later dials queued in the kernel with nobody to refuse
+// them, and a loop that served inline would be wedged for good by the first
+// guest that connected and did not read (the boot config can exceed a
+// megabyte — see bootConfigWriteTimeout). So each connection gets a goroutine
+// of its own, and all but the first are refused in it.
 func (m *Microvm) acceptGuests(sessionID string, g *guestChannel) {
 	for {
 		c, err := g.listener.Accept()
@@ -242,11 +325,11 @@ func (m *Microvm) acceptGuests(sessionID string, g *guestChannel) {
 			}
 			return
 		}
-		m.serveGuest(sessionID, g, c)
+		go m.serveGuest(sessionID, g, c)
 	}
 }
 
-// serveGuest hands one guest connection its configuration and then hands the
+// serveGuest hands ONE guest connection its configuration and then hands the
 // connection to the runner.
 //
 // The boot configuration is the FIRST frame on the conn, written here before
@@ -254,20 +337,36 @@ func (m *Microvm) acceptGuests(sessionID string, g *guestChannel) {
 // the stream" true: the guest reads its whole configuration off the same
 // connection it will then serve its terminal and its RPC over.
 //
+// Every connection after the first is closed having received nothing — not
+// the configuration, not the token, not a byte. See guestChannel.served: the
+// socket is reachable by every process in the sandbox, and this is the one
+// place that decides the first dial is the session's and no other is.
+//
 // A host that has not been installed closes the connection rather than
-// holding it. There is nothing to attach it to, and a guest that is dropped
-// redials, where a guest held by a channel nobody serves waits forever.
+// holding it. There is nothing to attach it to, and the claim stays spent:
+// this boot has had its one connection.
 func (m *Microvm) serveGuest(sessionID string, g *guestChannel, c net.Conn) {
+	if !g.claim(c) {
+		// Not an error the operator can act on and not a rarity worth a
+		// line per occurrence — but it IS somebody in the guest dialling a
+		// socket that is not theirs, so it is said once per attempt and
+		// names nothing about the session but its id.
+		log.Printf("microvm: session %s: refusing a second connection on a control channel that serves one guest per boot", sessionID)
+		_ = c.Close()
+		return
+	}
 	conn := relay.NetConn(c)
-	if err := writeBootConfig(conn, g.boot); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), bootConfigWriteTimeout)
+	defer cancel()
+	if err := writeBootConfig(ctx, conn, g.boot); err != nil {
 		log.Printf("microvm: session %s: sending the boot configuration: %v", sessionID, err)
-		_ = conn.Close()
+		g.drop(c)
 		return
 	}
 	host := m.currentHost()
 	if host == nil {
 		log.Printf("microvm: session %s: a guest connected but this driver has no runner above it to serve it", sessionID)
-		_ = conn.Close()
+		g.drop(c)
 		return
 	}
 	host.GuestConnected(sessionID, conn)
@@ -277,11 +376,13 @@ func (m *Microvm) serveGuest(sessionID string, g *guestChannel, c net.Conn) {
 // the same frame shape every event, request and response on this channel
 // uses, so the guest needs no special reader for it.
 //
-// The context is Background and not the caller's: this is the one write whose
-// failure means the guest is unconfigurable, and inheriting a create's
-// context would make a create that has just returned cancel the configuration
-// of the guest it started.
-func writeBootConfig(conn relay.Conn, cfg runner.BootConfig) error {
+// The context is the caller's own bounded one rather than a create's: this is
+// the one write whose failure means the guest is unconfigurable, so
+// inheriting a create's context would let a create that has just returned
+// cancel the configuration of the guest it started — but leaving it unbounded
+// would let a guest that never reads hold the write open forever. See
+// bootConfigWriteTimeout.
+func writeBootConfig(ctx context.Context, conn relay.Conn, cfg runner.BootConfig) error {
 	body, err := json.Marshal(cfg)
 	if err != nil {
 		// Unreachable — every field is a string, an int, or a slice of them —
@@ -297,7 +398,7 @@ func writeBootConfig(conn relay.Conn, cfg runner.BootConfig) error {
 	if err != nil {
 		return errors.New("the boot configuration frame could not be encoded")
 	}
-	return conn.Write(context.Background(), frame)
+	return conn.Write(ctx, frame)
 }
 
 // bootConfigFor composes what a guest is told about itself.
