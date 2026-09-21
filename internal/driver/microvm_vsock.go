@@ -135,8 +135,20 @@ func (m *Microvm) currentHost() MicrovmHost {
 	return m.host
 }
 
-// vsockPaths returns the Firecracker uds_path for one boot of an instance and
-// the socket the guest's port-1024 connections are forwarded to.
+// vsockSocketName is the file Firecracker binds for one boot, and
+// vsockGuestPath is that same file named from INSIDE the VM's chroot, which
+// is what the VMM is told (see VMMConfig.VsockUDSPath).
+func vsockSocketName(boot int) string { return "v" + strconv.Itoa(boot) + ".sock" }
+func vsockGuestPath(boot int) string  { return "/" + vsockSocketName(boot) }
+
+// vsockPaths returns, for one boot of an instance, the two HOST paths the
+// control channel lives at: the one Firecracker binds, and the one the
+// guest's port-1024 connections are forwarded to and this driver listens on.
+//
+// They are inside the VM's jail, and they have to be: a chrooted Firecracker
+// can neither create a socket outside its root nor connect to one. That is
+// also why the chroot base is one letter — every byte of the jail path is on
+// this socket's budget, and sun_path is 108 bytes.
 //
 // The path is per BOOT, not per instance: Firecracker's own documentation
 // warns that one uds_path cannot be multiplexed across VMs, and a cold resume
@@ -145,7 +157,7 @@ func (m *Microvm) vsockPaths(id string, boot int) (udsPath, listenPath string, e
 	if err := checkPathSegment("instance id", id); err != nil {
 		return "", "", err
 	}
-	udsPath = filepath.Join(m.instanceDir(id), "v"+strconv.Itoa(boot)+".sock")
+	udsPath = filepath.Join(jailRootDir(m.opts.StateDir, id), vsockSocketName(boot))
 	listenPath = udsPath + "_" + strconv.Itoa(guestControlPort)
 	if len(listenPath) > unixPathMax {
 		return "", "", fmt.Errorf(

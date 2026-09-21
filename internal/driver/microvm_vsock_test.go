@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -584,8 +585,20 @@ func TestOnlyOneGuestIsServedPerBoot(t *testing.T) {
 //
 // One resume wins; the other is refused; the winner's socket is there
 // afterwards.
+//
+// The concurrency is forced rather than hoped for. Two goroutines released
+// at the same instant is not the same thing as two resumes in flight: the
+// first can finish before the second is ever scheduled, and then the second
+// answers "already running" and the test asserts nothing. So the engine here
+// parks inside Launch, which is where a real cold resume spends its time, and
+// the winner is held there until the loser has been answered.
 func TestTwoConcurrentColdResumesDoNotShareASocket(t *testing.T) {
-	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4})
+	engine := &parkedLaunchEngine{
+		SimulatedEngine: NewSimulatedEngine(),
+		entered:         make(chan struct{}, 1),
+		release:         make(chan struct{}),
+	}
+	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, Engine: engine})
 	m.SetHost(&stubMicrovmHost{})
 	ctx := context.Background()
 
@@ -597,36 +610,36 @@ func TestTwoConcurrentColdResumesDoNotShareASocket(t *testing.T) {
 	if err := m.Suspend(ctx, h.ID, false); err != nil {
 		t.Fatal(err)
 	}
+	engine.park()
 
 	type outcome struct {
 		restarted bool
 		err       error
 	}
 	out := make(chan outcome, 2)
-	start := make(chan struct{})
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		go func() {
-			<-start
 			restarted, err := m.Resume(ctx, h.ID)
 			out <- outcome{restarted, err}
 		}()
 	}
-	close(start)
 
-	restarts, refusals := 0, 0
-	for i := 0; i < 2; i++ {
-		o := <-out
-		switch {
-		case o.err == nil && o.restarted:
-			restarts++
-		case o.err != nil && strings.Contains(o.err.Error(), "already in flight"):
-			refusals++
-		default:
-			t.Fatalf("a concurrent resume returned (%v, %v), want a restart or an in-flight refusal", o.restarted, o.err)
-		}
+	// Whichever resume claimed the instance is now parked in Launch, so the
+	// first answer can only be the other one's refusal.
+	select {
+	case <-engine.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no cold resume reached the hypervisor")
 	}
-	if restarts != 1 || refusals != 1 {
-		t.Fatalf("%d restart(s) and %d refusal(s) from two concurrent resumes, want 1 and 1", restarts, refusals)
+	loser := <-out
+	if loser.err == nil || !strings.Contains(loser.err.Error(), "already in flight") {
+		t.Fatalf("the second concurrent resume returned (%v, %v), want an in-flight refusal", loser.restarted, loser.err)
+	}
+
+	close(engine.release)
+	winner := <-out
+	if winner.err != nil || !winner.restarted {
+		t.Fatalf("the winning resume returned (%v, %v), want a restart", winner.restarted, winner.err)
 	}
 
 	// The winner's guest channel is live: a guest can still be configured,
@@ -638,4 +651,35 @@ func TestTwoConcurrentColdResumesDoNotShareASocket(t *testing.T) {
 	if got := readBootConfig(t, dialGuest(t, m, h.ID, 2)).SessionID; got != "sess-race" {
 		t.Fatalf("the resumed guest read session %q off its channel", got)
 	}
+}
+
+// parkedLaunchEngine is a simulated engine that can be made to hold one
+// Launch open, so a test can be certain two lifecycle calls are in flight at
+// once rather than hoping the scheduler interleaved them.
+type parkedLaunchEngine struct {
+	*SimulatedEngine
+	mu      sync.Mutex
+	parked  bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+// park arms the engine: the next Launch reports that it arrived and then
+// waits to be released.
+func (e *parkedLaunchEngine) park() {
+	e.mu.Lock()
+	e.parked = true
+	e.mu.Unlock()
+}
+
+func (e *parkedLaunchEngine) Launch(ctx context.Context, cfg VMMConfig) error {
+	e.mu.Lock()
+	parked := e.parked
+	e.parked = false
+	e.mu.Unlock()
+	if parked {
+		e.entered <- struct{}{}
+		<-e.release
+	}
+	return e.SimulatedEngine.Launch(ctx, cfg)
 }
