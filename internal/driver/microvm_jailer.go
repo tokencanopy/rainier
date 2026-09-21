@@ -79,6 +79,10 @@ const (
 	// /sys/fs/cgroup/<parent>/<vm id> on a cgroup v2 host. Metering reads
 	// cpu.stat and memory.current from there (ADR-0003 §4.6).
 	defaultJailCgroupParent = "rainier"
+
+	// defaultCgroupRoot is the cgroup v2 mount point on every distribution
+	// Rainier targets.
+	defaultCgroupRoot = "/sys/fs/cgroup"
 )
 
 // jailBaseDir is the jailer's --chroot-base-dir for a state directory.

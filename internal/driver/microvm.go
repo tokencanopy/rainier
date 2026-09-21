@@ -139,6 +139,12 @@ type MicrovmOpts struct {
 	// is on. Zero values are the defaults.
 	Jail JailOpts
 
+	// CgroupRoot is the cgroup v2 mount point. Empty means
+	// defaultCgroupRoot. It is configurable because the tests point it at a
+	// fixture filesystem, and because a host that mounts it elsewhere is a
+	// host, not a bug.
+	CgroupRoot string
+
 	Engine MicrovmEngine // test seam; nil in production
 	Net    netslot.Host  // test seam; nil in production
 	Format DiskFormatter // test seam; nil in production
@@ -475,11 +481,6 @@ func checkMicrovmHost(opts MicrovmOpts) error {
 	if err := readableFile("base rootfs image (--rootfs / RAINIER_ROOTFS_PATH)", opts.BaseRootfs); err != nil {
 		return err
 	}
-	kvm, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
-	if err != nil {
-		return fmt.Errorf("microvm: /dev/kvm is not usable by this process: a microVM session is a hardware-isolated VM and there is no software fallback: %w", err)
-	}
-	_ = kvm.Close()
 	vmm := opts.VMMPath
 	if vmm == "" {
 		vmm = jailExecName
@@ -506,7 +507,15 @@ func checkMicrovmHost(opts MicrovmOpts) error {
 			return err
 		}
 	}
-	return nil
+
+	// Machine facts, last, because an operator cannot change them with a
+	// flag and the configuration above is what they came to fix.
+	kvm, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("microvm: /dev/kvm is not usable by this process: a microVM session is a hardware-isolated VM and there is no software fallback: %w.\n\n%s", err, MicrovmHostRequirements())
+	}
+	_ = kvm.Close()
+	return checkMicrovmPrivileges(opts)
 }
 
 func readableFile(what, path string) error {
