@@ -339,6 +339,52 @@ func TestMicrovmSnapshotDoesNotHoldTheDriverMutex(t *testing.T) {
 	}
 }
 
+// TestMicrovmSnapshotDoesNotThawASessionSomebodyElseStopped: the snapshot
+// pauses the VM for its copy and unpauses it afterwards, but a session that
+// stopped being a running one while the copy ran is not the snapshot's to
+// restart. Unconditionally resuming would thaw a VM its owner has just frozen.
+func TestMicrovmSnapshotDoesNotThawASessionSomebodyElseStopped(t *testing.T) {
+	cloning := make(chan struct{})
+	release := make(chan struct{})
+	m, sim := testMicrovm(t, MicrovmOpts{TotalSlots: 4, Clone: &blockingCloner{
+		inner: &fakeCloner{}, blockOn: 2, entered: cloning, release: release,
+	}})
+	m.SetHost(&stubMicrovmHost{})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "sess-racing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Snapshot(ctx, h.ID, "rainier-env:racing", nil)
+		done <- err
+	}()
+	select {
+	case <-cloning:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the snapshot never reached the copy")
+	}
+
+	// The session's owner freezes it while the copy is in flight.
+	if err := m.Suspend(ctx, h.ID, true); err != nil {
+		t.Fatalf("warm Suspend during a snapshot: %v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	if st, _ := sim.State(ctx, h.ID); st != VMMStatePaused {
+		t.Errorf("the VM is %s after a snapshot finished inside a warm suspend, want paused: the snapshot thawed a session its owner had just frozen", st)
+	}
+	if g, _ := m.Inspect(ctx, h.ID); g.State != StateSuspended {
+		t.Errorf("the session reads as %s, want suspended", g.State)
+	}
+}
+
 // blockingCloner parks the Nth clone until a test lets it go, standing in for
 // a copy of a multi-gigabyte image.
 type blockingCloner struct {

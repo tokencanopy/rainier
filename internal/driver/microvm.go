@@ -1833,7 +1833,22 @@ func (m *Microvm) Snapshot(ctx context.Context, id, ref string, stripEnv []strin
 		// whose user's terminal stopped answering because somebody cached an
 		// environment. The context is detached for the same reason — a
 		// cancelled snapshot must still thaw the VM it froze.
+		//
+		// Unless the session stopped being a running one while this ran. The
+		// runner above serialises a session's operations, so a suspend or a
+		// destroy landing inside a snapshot is not the ordinary case — but an
+		// unconditional resume here would be a driver that thaws a VM its
+		// owner has just frozen, or restarts one that is being torn down, and
+		// the record is the cheap way to not be that.
 		defer func() {
+			m.mu.Lock()
+			inst, ok := m.instances[id]
+			resumable := ok && inst.State == StateRunning && !inst.Cold
+			m.mu.Unlock()
+			if !resumable {
+				log.Printf("microvm: %s stopped being a running session while it was paused for a snapshot; leaving it as its own teardown left it", id)
+				return
+			}
 			if err := m.engine.Resume(context.WithoutCancel(ctx), id); err != nil {
 				log.Printf("microvm: %s was paused for a snapshot and could not be resumed: %v", id, err)
 			}
