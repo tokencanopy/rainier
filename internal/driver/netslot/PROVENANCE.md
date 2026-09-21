@@ -40,13 +40,17 @@ Upstream paths consulted, all under `packages/orchestrator/pkg/sandbox/`:
 
 | File | Derived from | Carries the Apache-2.0 header |
 |---|---|---|
-| `slot.go` | `network/slot.go` | yes |
-| `pool.go` | `network/storage_local.go`, `network/reclaim.go` | yes |
-| `netns_linux.go` | `network/network.go` (operation order only) | yes |
+| `slot.go` | `network/slot.go` (addressing from one index) | yes |
+| `pool.go` | `network/storage_local.go`, `network/reclaim.go`, and `network/network.go` for the create/remove operation order | yes |
 | `firewall.go` | `network/firewall.go` (rule shape only) | yes |
 
-`host.go`, `fake.go`, `config.go` and the tests are Rainier's own and carry no
-upstream header.
+`host.go`, `host_linux.go`, `host_other.go`, `fake.go`, `config.go` and the
+tests are Rainier's own and carry no upstream header. So is the jailer launch
+in `internal/driver/microvm_jailer.go`: E2B does not use Firecracker's jailer
+at all — its orchestrator starts the VMM under `unshare` with `ip netns exec`
+and a hand-built mount namespace (`fc/script_builder.go`, `fc/process.go` at
+the same commit) — so there was nothing to copy, and that file is written
+against Firecracker's own jailer documentation.
 
 ## What changed
 
