@@ -223,6 +223,59 @@ func TestMicrovmSessionsAreBehindTheirOwnFirewall(t *testing.T) {
 	}
 }
 
+// TestMicrovmResumeOntoAVanishedRecordLeavesNothingRunning is the race
+// between a cold resume and a destroy: the resume launches a VM, and by the
+// time it goes to record it there is no record left.
+//
+// Before, the VM stayed running with nothing on this host naming it — a
+// jailed Firecracker, a jail directory, a uid and a network slot — and the
+// resume's own cleanup then took its namespace away underneath it. Now it is
+// stopped first, and only then does the slot go back.
+func TestMicrovmResumeOntoAVanishedRecordLeavesNothingRunning(t *testing.T) {
+	engine := &parkedLaunchEngine{
+		SimulatedEngine: NewSimulatedEngine(),
+		entered:         make(chan struct{}, 1),
+		release:         make(chan struct{}),
+	}
+	m, _, net := testMicrovmNet(t, MicrovmOpts{TotalSlots: 2, Engine: engine})
+	m.SetHost(&stubMicrovmHost{})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "alpha"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := m.Suspend(ctx, h.ID, false); err != nil {
+		t.Fatalf("cold Suspend: %v", err)
+	}
+
+	engine.park()
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Resume(ctx, h.ID)
+		done <- err
+	}()
+
+	<-engine.entered
+	// The destroy that raced it: the record is gone while the resume is
+	// still inside the hypervisor.
+	m.mu.Lock()
+	delete(m.instances, h.ID)
+	m.mu.Unlock()
+	close(engine.release)
+
+	if err := <-done; err == nil {
+		t.Fatal("a resume onto a record that no longer exists reported success")
+	}
+
+	if st, _ := engine.State(ctx, h.ID); st == VMMStateRunning {
+		t.Error("the VM the resume started is still running with nothing naming it")
+	}
+	if got := net.Namespaces(); len(got) != 0 {
+		t.Errorf("namespaces after the race = %v, want none", got)
+	}
+}
+
 // TestMicrovmDestroyReturnsTheSlot.
 func TestMicrovmDestroyReturnsTheSlot(t *testing.T) {
 	m, _, net := testMicrovmNet(t, MicrovmOpts{TotalSlots: 2})

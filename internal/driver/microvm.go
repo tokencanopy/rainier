@@ -1401,6 +1401,17 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		if channel != nil {
 			channel.close()
 		}
+		// The record went away while this resume was in flight — a Destroy
+		// that raced it. If a VM was started for it, it is now a jailed
+		// Firecracker with nothing left to name it, holding a jail, a uid
+		// and a network slot; and the deferred release is about to take that
+		// slot back out from under it. So it is stopped here rather than
+		// left running, and only then does the slot go.
+		if restarted {
+			if err := m.engine.Stop(context.WithoutCancel(ctx), id); err != nil {
+				log.Printf("microvm: %s was resumed onto a record that no longer exists and could not be stopped: %v", id, err)
+			}
+		}
 		return restarted, fmt.Errorf("no such id %s", id)
 	}
 	inst.State = StateRunning
