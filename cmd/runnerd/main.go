@@ -52,6 +52,16 @@ func main() {
 		"directory holding named network namespaces; empty means /var/run/netns, which is where ip netns puts them")
 	microvmEgressProxy := flag.String("microvm-egress-proxy", envDefault("RAINIER_MICROVM_EGRESS_PROXY", ""),
 		"`ip:port` of the egress proxy, and the only host-side destination a microVM guest's firewall allows (ADR-0003 §4.3). Defaults to the host and port of --proxy-url when that is already an IP literal; a --proxy-url naming a host must be given here as an address, because a rule that named a host would be a rule a guest could move by answering a DNS query")
+	microvmJailer := flag.String("microvm-jailer", envDefault("RAINIER_MICROVM_JAILER", ""),
+		"path to Firecracker's jailer; empty means `jailer` on PATH. Every microVM runs under it (ADR-0003 §4.5: per-VM uid and gid, its own cgroup, its own netns, a chroot, seccomp) and the runner refuses to start without it")
+	microvmUIDFirst := flag.Int("microvm-uid-first", envIntDefault("RAINIER_MICROVM_UID_FIRST", 0),
+		"bottom of the per-VM uid and gid range the jailer drops each microVM to; 0 means 200000")
+	microvmUIDCount := flag.Int("microvm-uid-count", envIntDefault("RAINIER_MICROVM_UID_COUNT", 0),
+		"size of the per-VM uid and gid range; 0 means 4096")
+	microvmCgroupParent := flag.String("microvm-cgroup-parent", envDefault("RAINIER_MICROVM_CGROUP_PARENT", ""),
+		"cgroup v2 parent the jailer creates each microVM's cgroup under, and where host-side metering reads cpu.stat and memory.current (ADR-0003 §4.6); empty means rainier")
+	microvmSeccompOff := flag.Bool("microvm-seccomp-off", os.Getenv("RAINIER_MICROVM_SECCOMP_OFF") == "1",
+		"turn OFF the jailer's seccomp filter on the Firecracker process. Seccomp is on by default and this exists for diagnosing a filter rejection on a new kernel, not for production")
 	var microvmControlPlane capabilityFlag
 	flag.Var(&microvmControlPlane, "microvm-control-plane-cidr",
 		"a regional control-plane range a microVM guest must not be able to reach; repeatable, or set RAINIER_MICROVM_CONTROL_PLANE_CIDRS to a comma-separated list")
@@ -115,6 +125,14 @@ func main() {
 			EgressProxyAddr:   proxyAddr,
 			EgressProxyPort:   proxyPort,
 			ControlPlaneCIDRs: microvmControlPlane,
+
+			Jail: driver.JailOpts{
+				JailerPath:   *microvmJailer,
+				UIDFirst:     *microvmUIDFirst,
+				UIDCount:     *microvmUIDCount,
+				CgroupParent: *microvmCgroupParent,
+				SeccompOff:   *microvmSeccompOff,
+			},
 		})
 		if err != nil {
 			log.Fatalf("--driver=microvm: %v", err)

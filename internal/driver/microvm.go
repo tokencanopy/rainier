@@ -134,6 +134,11 @@ type MicrovmOpts struct {
 	// at somebody's network.
 	ControlPlaneCIDRs []string
 
+	// Jail is the jailer envelope every microVM runs inside (ADR-0003 §4.5):
+	// the per-VM uid range, where the per-VM cgroups go, and whether seccomp
+	// is on. Zero values are the defaults.
+	Jail JailOpts
+
 	Engine MicrovmEngine // test seam; nil in production
 	Net    netslot.Host  // test seam; nil in production
 	Format DiskFormatter // test seam; nil in production
@@ -189,13 +194,17 @@ type VMMConfig struct {
 	GatewayIP    string `json:"gateway_ip"`
 	GuestNetmask string `json:"guest_netmask"`
 	GuestMAC     string `json:"guest_mac"`
-	// VsockUDSPath is the host path Firecracker is told to serve this VM's
+	// VsockUDSPath is the path Firecracker is told to serve this VM's
 	// virtio-vsock device on: the guest's connections to host port N are
 	// forwarded to "<VsockUDSPath>_N", and 1024 is the only port this design
 	// uses. It is a path and not a value — recorded like every other path
 	// here, and per BOOT rather than per instance, because the documentation
 	// warns that one uds_path cannot be multiplexed across VMs and a cold
 	// resume is a new VM.
+	//
+	// It is named from INSIDE the VM's chroot ("/v1.sock"), because the VMM
+	// is jailed and that is the only name it can use. The driver's own end
+	// of the same file is the host path (*Microvm).vsockPaths returns.
 	VsockUDSPath string            `json:"vsock_uds_path"`
 	Env          map[string]string `json:"-"`
 
@@ -385,7 +394,12 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 		if err != nil {
 			return nil, err
 		}
-		engine = NewFirecrackerEngine(opts.VMMPath, opts.StateDir)
+		engine = NewFirecrackerEngine(FirecrackerOpts{
+			VMMPath:  opts.VMMPath,
+			StateDir: opts.StateDir,
+			NetnsDir: opts.NetnsDir,
+			Jail:     opts.Jail,
+		})
 		net = linux
 		format = ext4
 	case engine != nil && net != nil && format != nil:
@@ -468,10 +482,29 @@ func checkMicrovmHost(opts MicrovmOpts) error {
 	_ = kvm.Close()
 	vmm := opts.VMMPath
 	if vmm == "" {
-		vmm = "firecracker"
+		vmm = jailExecName
 	}
 	if _, err := exec.LookPath(vmm); err != nil {
 		return fmt.Errorf("microvm: firecracker executable %q not found: %w", vmm, err)
+	}
+	// The jailer, and it is not optional: ADR-0003 §4.5 requires every
+	// microVM to run under it, and this driver has no unjailed launch path.
+	jailer := opts.Jail.JailerPath
+	if jailer == "" {
+		jailer = "jailer"
+	}
+	if _, err := exec.LookPath(jailer); err != nil {
+		return fmt.Errorf("microvm: firecracker's jailer %q not found: every microVM runs under it (per-VM uid and gid, its own cgroup, its own netns, a chroot, seccomp) and there is deliberately no unjailed fallback: %w", jailer, err)
+	}
+	// A jailed VM runs as neither the owner of the shared images nor a
+	// member of the runner's group, so it can only read them through the
+	// "other" bit. Checked here, at startup, rather than at the first create:
+	// it is a property of the operator's configuration and they can fix it
+	// before a session ever lands.
+	for _, shared := range []string{opts.KernelPath, opts.BaseRootfs} {
+		if err := checkSharedImageReadable(shared); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1097,7 +1130,7 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 		EgressAllow:       slices.Clone(spec.EgressAllow),
 		DialURL:           spec.DialURL,
 		ProxyURL:          spec.ProxyURL,
-		VsockUDSPath:      udsPath,
+		VsockUDSPath:      vsockGuestPath(1),
 		Env:               buildGuestEnv(spec),
 	}
 	applySlot(&cfg, slot)
@@ -1306,7 +1339,7 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		if channel, err = m.openGuestChannel(sessionID, udsPath, listenPath, bootCfg); err != nil {
 			return false, err
 		}
-		cfg.VsockUDSPath = udsPath
+		cfg.VsockUDSPath = vsockGuestPath(boots)
 		// A new VM gets a new network slot too: the one this session had was
 		// returned to the pool when it was parked, and may be another
 		// session's by now.
@@ -1644,30 +1677,145 @@ func (e *Ext4Formatter) Format(path string) error {
 // ---------------------------------------------------------------------------
 
 type FirecrackerEngine struct {
-	mu       sync.Mutex
-	vmmPath  string
-	stateDir string
-	procs    map[string]*exec.Cmd
-	initErr  error
+	mu         sync.Mutex
+	vmmPath    string
+	jailerPath string
+	stateDir   string
+	netnsDir   string
+	jail       JailOpts
+	uids       *uidAllocator
+	starter    processStarter
+	procs      map[string]vmmProcess
+	initErr    error
+	// kvm is the "can this host run a VM at all" check, as a field so the
+	// jail tests can run on a machine without /dev/kvm. Production never
+	// replaces it, and NewMicrovm has already refused on a host where it
+	// answers false, so this is the second of two checks rather than the
+	// only one.
+	kvm func() bool
 }
 
-func NewFirecrackerEngine(vmmPath, stateDir string) *FirecrackerEngine {
+// JailOpts is the jail envelope: the uid range, where the per-VM cgroups go,
+// and whether seccomp is on. Zero values mean the defaults in
+// microvm_jailer.go, and Seccomp is expressed as "off" so that no
+// configuration mistake can leave the filter off by omission.
+type JailOpts struct {
+	JailerPath   string
+	UIDFirst     int
+	UIDCount     int
+	CgroupParent string
+	SeccompOff   bool
+	// RunnerGID is the group given to every jail directory and per-session
+	// image, so runnerd can still create the next boot's control socket and
+	// tear the jail down without being the VM's user. Zero means this
+	// process's own gid, which is what a runner wants in every case that is
+	// not a test.
+	RunnerGID int
+}
+
+// FirecrackerOpts is what the production engine is built from.
+type FirecrackerOpts struct {
+	VMMPath  string
+	StateDir string
+	NetnsDir string
+	Jail     JailOpts
+
+	// Starter is the test seam that reads back the argv a host would be
+	// asked to run. nil is production.
+	Starter processStarter
+}
+
+// NewFirecrackerEngine builds the production engine, or one that refuses
+// every launch and says why.
+//
+// It refuses without the JAILER as firmly as without Firecracker itself.
+// ADR-0003 §4.5 requires every microVM to run under it, and an engine that
+// fell back to exec'ing Firecracker directly would put a tenant's VMM in
+// runnerd's own user, mount namespace and file descriptor table — which is
+// the blast radius the bakeoff names as this substrate's primary risk. There
+// is no flag that produces that launch and no code path that reaches it.
+func NewFirecrackerEngine(opts FirecrackerOpts) *FirecrackerEngine {
+	vmmPath := opts.VMMPath
 	if vmmPath == "" {
-		vmmPath = "firecracker"
+		vmmPath = jailExecName
 	}
-	resolvedPath, err := exec.LookPath(vmmPath)
+	jailerPath := opts.Jail.JailerPath
+	if jailerPath == "" {
+		jailerPath = "jailer"
+	}
+	jail := opts.Jail
+	if jail.CgroupParent == "" {
+		jail.CgroupParent = defaultJailCgroupParent
+	}
+	if jail.RunnerGID <= 0 {
+		jail.RunnerGID = os.Getgid()
+	}
+
 	var initErr error
-	if err != nil {
+	if resolved, err := exec.LookPath(vmmPath); err != nil {
 		initErr = fmt.Errorf("firecracker executable %q not found on PATH: %w", vmmPath, err)
 	} else {
-		vmmPath = resolvedPath
+		vmmPath = resolved
 	}
+	if resolved, err := exec.LookPath(jailerPath); err != nil {
+		if initErr == nil {
+			initErr = fmt.Errorf("firecracker's jailer %q not found on PATH: ADR-0003 §4.5 requires every microVM to run under it — a dedicated uid and gid, its own cgroup, its own netns, a chroot and seccomp — and there is deliberately no unjailed launch path: %w", jailerPath, err)
+		}
+	} else {
+		jailerPath = resolved
+	}
+
+	uids, err := newUIDAllocator(jail.UIDFirst, jail.UIDCount)
+	if err != nil && initErr == nil {
+		initErr = err
+	}
+
+	starter := opts.Starter
+	if starter == nil {
+		starter = execStarter{}
+	}
+
+	netnsDir := opts.NetnsDir
+	if netnsDir == "" {
+		netnsDir = netslot.DefaultNetnsDir
+	}
+
 	return &FirecrackerEngine{
-		vmmPath:  vmmPath,
-		stateDir: stateDir,
-		procs:    make(map[string]*exec.Cmd),
-		initErr:  initErr,
+		vmmPath:    vmmPath,
+		jailerPath: jailerPath,
+		stateDir:   opts.StateDir,
+		netnsDir:   netnsDir,
+		jail:       jail,
+		uids:       uids,
+		starter:    starter,
+		procs:      make(map[string]vmmProcess),
+		initErr:    initErr,
+		kvm:        hasKVM,
 	}
+}
+
+// jailSpecFor resolves one instance's jail.
+func (f *FirecrackerEngine) jailSpecFor(cfg VMMConfig) (jailSpec, error) {
+	uid, err := f.uids.claim(cfg.ID)
+	if err != nil {
+		return jailSpec{}, err
+	}
+	netns := ""
+	if cfg.Netns != "" {
+		netns = filepath.Join(f.netnsDir, cfg.Netns)
+	}
+	return jailSpec{
+		ID:        cfg.ID,
+		ExecFile:  f.vmmPath,
+		Base:      jailBaseDir(f.stateDir),
+		Root:      jailRootDir(f.stateDir, cfg.ID),
+		UID:       uid,
+		GID:       uid,
+		RunnerGID: f.jail.RunnerGID,
+		Netns:     netns,
+		Cgroup:    f.jail.CgroupParent,
+		Seccomp:   !f.jail.SeccompOff,
+	}, nil
 }
 
 type firecrackerClient struct {
@@ -1718,8 +1866,15 @@ func (c *firecrackerClient) patchJSON(ctx context.Context, endpoint string, payl
 	return c.do(ctx, http.MethodPatch, endpoint, payload)
 }
 
+// socketPath is where the VMM's API socket lands ON THE HOST.
+//
+// It is inside the jail, because a chrooted Firecracker can only create it
+// there. What Firecracker itself is told is jailAPISocketPath, the same file
+// named from inside the chroot; this engine's HTTP client dials the host
+// name. The two are one file and there is exactly one place each spelling is
+// produced.
 func (f *FirecrackerEngine) socketPath(id string) string {
-	return filepath.Join(f.stateDir, "sockets", id, "firecracker.sock")
+	return filepath.Join(jailRootDir(f.stateDir, id), jailAPISocketPath)
 }
 
 func (f *FirecrackerEngine) pidFilePath(id string) string {
@@ -1749,15 +1904,6 @@ func bootArgs(cfg VMMConfig) string {
 		microvmBootArgsBase, cfg.GuestIP, cfg.GatewayIP, cfg.GuestNetmask)
 }
 
-// vmmCommand is the command that starts one VMM, in its slot's network
-// namespace when it has one.
-func (f *FirecrackerEngine) vmmCommand(cfg VMMConfig, sockPath string) *exec.Cmd {
-	if cfg.Netns == "" {
-		return exec.Command(f.vmmPath, "--api-sock", sockPath)
-	}
-	return exec.Command("ip", "netns", "exec", cfg.Netns, f.vmmPath, "--api-sock", sockPath)
-}
-
 // Launch starts one VMM and configures it.
 //
 // f.mu guards the process map and NOTHING else. Waiting for a socket and
@@ -1770,7 +1916,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	if f.initErr != nil {
 		return f.initErr
 	}
-	if !hasKVM() {
+	if !f.kvm() {
 		return errors.New("/dev/kvm not found: hardware virtualization is required for Firecracker")
 	}
 	if cfg.KernelPath == "" {
@@ -1780,43 +1926,54 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		return errors.New("rootfs image path is required for Firecracker launch")
 	}
 
-	sockDir := filepath.Join(f.stateDir, "sockets", cfg.ID)
-	if err := os.MkdirAll(sockDir, microvmDirMode); err != nil {
-		return fmt.Errorf("create socket dir: %w", err)
+	// The jail, built before anything is started: a chrooted Firecracker can
+	// only see what is already inside it.
+	spec, err := f.jailSpecFor(cfg)
+	if err != nil {
+		return err
 	}
+	if err := f.prepareJail(spec, cfg); err != nil {
+		_ = f.removeJail(cfg.ID)
+		f.uids.release(cfg.ID)
+		return fmt.Errorf("prepare the jail for %s: %w", cfg.ID, err)
+	}
+
 	sockPath := f.socketPath(cfg.ID)
 	_ = os.Remove(sockPath)
 
-	// The VMM runs INSIDE the session's network namespace, because that is
-	// where its TAP device is: the slot allocator moves the device there so
-	// that one guest's link, addresses and firewall cannot be seen — or
-	// reached — from another's. `ip netns exec` sets the namespace and then
-	// execs, so the process this engine tracks is still Firecracker itself
-	// and Stop's identity check still works on it.
-	//
-	// TODO(PR 3, next commit): the jailer replaces this. ADR-0003 §4.5 wants
-	// per-VM uid and gid, a cgroup, a per-session chroot and seccomp on the
-	// VMM process as well as the namespace, and the jailer takes `--netns`
-	// for exactly this.
-	cmd := f.vmmCommand(cfg, sockPath)
-	if err := cmd.Start(); err != nil {
-		_ = os.RemoveAll(sockDir)
-		return fmt.Errorf("start firecracker %s: %w", cfg.ID, err)
+	// The jailer does the whole of ADR-0003 §4.5's host hardening and then
+	// execve's into Firecracker, so the process this engine tracks IS the
+	// VMM: Stop's reap and its identity check both still work on it. It also
+	// enters the session's network namespace (`--netns`), which is where the
+	// slot's TAP device is — the device does not exist in the host's
+	// namespace at all.
+	proc, err := f.starter.Start(f.jailerPath, jailerArgs(spec))
+	if err != nil {
+		_ = f.removeJail(cfg.ID)
+		f.uids.release(cfg.ID)
+		return fmt.Errorf("start jailed firecracker %s: %w", cfg.ID, err)
 	}
 
-	if cmd.Process != nil {
+	if pid := proc.Pid(); pid > 0 {
 		pidDir := filepath.Join(f.stateDir, "instances", cfg.ID)
 		_ = os.MkdirAll(pidDir, microvmDirMode)
-		_ = os.WriteFile(f.pidFilePath(cfg.ID), []byte(strconv.Itoa(cmd.Process.Pid)), microvmFileMode)
+		_ = os.WriteFile(f.pidFilePath(cfg.ID), []byte(strconv.Itoa(pid)), microvmFileMode)
 	}
 
 	var initSuccess bool
 	defer func() {
-		if !initSuccess && cmd.Process != nil {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-			_ = os.RemoveAll(sockDir)
+		if initSuccess {
+			return
 		}
+		// A launch that got part-way leaves a live VMM, a jail full of hard
+		// links and a uid nobody else may use. All three go, in that order:
+		// the process first, because removing the jail under a running
+		// Firecracker is how a VMM ends up writing into a directory that has
+		// been unlinked.
+		_ = proc.Kill()
+		_ = proc.Wait()
+		_ = f.removeJail(cfg.ID)
+		f.uids.release(cfg.ID)
 	}()
 
 	fcClient := newFirecrackerClient(sockPath)
@@ -1833,9 +1990,14 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		return fmt.Errorf("set machine config: %w", err)
 	}
 
-	// 2. Boot source
+	// 2. Boot source.
+	//
+	// Every path from here on is named from INSIDE the chroot, because that
+	// is the only filesystem the VMM can still see. prepareJail put a hard
+	// link to each of them there; the host names are in cfg and are what the
+	// links point at.
 	if err := fcClient.putJSON(ctx, "/boot-source", map[string]any{
-		"kernel_image_path": cfg.KernelPath,
+		"kernel_image_path": jailKernelPath,
 		"boot_args":         bootArgs(cfg),
 	}); err != nil {
 		return fmt.Errorf("set boot source: %w", err)
@@ -1844,7 +2006,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	// 3. Rootfs drive
 	if err := fcClient.putJSON(ctx, "/drives/rootfs", map[string]any{
 		"drive_id":       "rootfs",
-		"path_on_host":   cfg.RootfsPath,
+		"path_on_host":   jailRootfsPath,
 		"is_root_device": true,
 		"is_read_only":   true,
 	}); err != nil {
@@ -1855,7 +2017,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	if cfg.WorkspaceDiskPath != "" {
 		if err := fcClient.putJSON(ctx, "/drives/workspace", map[string]any{
 			"drive_id":       "workspace",
-			"path_on_host":   cfg.WorkspaceDiskPath,
+			"path_on_host":   jailWorkspacePath,
 			"is_root_device": false,
 			"is_read_only":   false,
 		}); err != nil {
@@ -1868,7 +2030,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	if cfg.HomeDiskPath != "" {
 		if err := fcClient.putJSON(ctx, "/drives/home", map[string]any{
 			"drive_id":       "home",
-			"path_on_host":   cfg.HomeDiskPath,
+			"path_on_host":   jailHomePath,
 			"is_root_device": false,
 			"is_read_only":   false,
 		}); err != nil {
@@ -1877,9 +2039,9 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	}
 
 	// 5. Network interface: the slot's TAP device, inside the slot's network
-	// namespace, with the slot's MAC. The VMM process was started inside that
-	// namespace (see the command above), which is the only reason it can open
-	// a device that does not exist in the host's.
+	// namespace, with the slot's MAC. The jailer put the VMM in that
+	// namespace (`--netns`), which is the only reason it can open a device
+	// that does not exist in the host's.
 	if cfg.TapDevice != "" {
 		if err := fcClient.putJSON(ctx, "/network-interfaces/eth0", map[string]any{
 			"iface_id":      "eth0",
@@ -1929,7 +2091,7 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	}
 
 	f.mu.Lock()
-	f.procs[cfg.ID] = cmd
+	f.procs[cfg.ID] = proc
 	f.mu.Unlock()
 
 	initSuccess = true
@@ -1972,13 +2134,13 @@ func (f *FirecrackerEngine) Resume(ctx context.Context, id string) error {
 
 func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 	f.mu.Lock()
-	cmd, tracked := f.procs[id]
+	proc, tracked := f.procs[id]
 	delete(f.procs, id)
 	f.mu.Unlock()
 
 	var pid int
-	if tracked && cmd.Process != nil {
-		pid = cmd.Process.Pid
+	if tracked {
+		pid = proc.Pid()
 	} else if data, err := os.ReadFile(f.pidFilePath(id)); err == nil {
 		pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
 	}
@@ -1987,24 +2149,31 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 	// engine started is a CHILD: signalling it is not enough, because an
 	// un-Waited child stays in the process table as a zombie, and a runner
 	// that parks and resumes sessions all day accumulates one per stopped VM
-	// until it runs out of process slots. Only a tracked cmd can be Waited —
-	// a pid recovered from the pid file after a runnerd restart belongs to no
-	// child of this process, and for that one the kernel has already
-	// reparented it to init, which reaps it.
+	// until it runs out of process slots. Only a tracked process can be
+	// Waited — a pid recovered from the pid file after a runnerd restart
+	// belongs to no child of this process, and for that one the kernel has
+	// already reparented it to init, which reaps it.
 	var waited chan error
-	if tracked && cmd.Process != nil {
+	if tracked && pid > 0 {
 		waited = make(chan error, 1)
-		go func() { waited <- cmd.Wait() }()
+		go func() { waited <- proc.Wait() }()
 	}
 
 	var stopErr error
-	sockPath := f.socketPath(id)
 	switch {
-	case pid > 0 && isFirecrackerPID(pid, sockPath):
-		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+	case pid > 0 && isFirecrackerPID(pid, id):
+		// The signal goes to the VMM's process GROUP when it leads one,
+		// which is what the jailed launch arranges (execStarter sets
+		// Setpgid). The jailer execve's into Firecracker so the leader IS
+		// the VMM, and the group is what catches anything a jailed VMM left
+		// beside itself. killProcessTree reads the group back from the
+		// kernel rather than assuming it, so a pid recovered across a
+		// runnerd restart — whose group this process knows nothing about —
+		// is only ever signalled on its own.
+		if err := killProcessTree(pid, syscall.SIGTERM); err != nil {
 			stopErr = fmt.Errorf("sigterm pid %d: %w", pid, err)
 		} else if !awaitExit(ctx, waited, pid, firecrackerTermTimeout) {
-			_ = syscall.Kill(pid, syscall.SIGKILL)
+			_ = killProcessTree(pid, syscall.SIGKILL)
 			if !awaitExit(ctx, waited, pid, firecrackerKillTimeout) && stopErr == nil {
 				stopErr = notExitedErr(ctx, pid)
 			}
@@ -2025,9 +2194,24 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 		}
 	}
 
-	sockDir := filepath.Join(f.stateDir, "sockets", id)
-	if err := os.RemoveAll(sockDir); err != nil && stopErr == nil {
-		stopErr = fmt.Errorf("remove socket dir: %w", err)
+	// The jail goes with the VM, and only AFTER it: removing a chroot out
+	// from under a live Firecracker is how a VMM ends up writing into
+	// unlinked files. What is removed is the directory and the hard links in
+	// it, never the images they point at — a session's workspace lives under
+	// the state directory's workspaces/ and survives this untouched.
+	//
+	// It is also what removes the API socket and the guest control socket,
+	// which used to live in their own directory outside the jail and now
+	// cannot: a chrooted Firecracker can neither create nor connect to
+	// anything outside its root.
+	if err := f.removeJail(id); err != nil && stopErr == nil {
+		stopErr = err
+	}
+	// The uid comes back only once the jail that used it is gone. Releasing
+	// it earlier would let the next VM take a number that still owns files
+	// on this host.
+	if stopErr == nil {
+		f.uids.release(id)
 	}
 	return stopErr
 }
@@ -2103,12 +2287,12 @@ func (f *FirecrackerEngine) Snapshot(_ context.Context, _, _ string, _ []string)
 
 func (f *FirecrackerEngine) State(ctx context.Context, id string) (VMMState, error) {
 	f.mu.Lock()
-	cmd, tracked := f.procs[id]
+	proc, tracked := f.procs[id]
 	f.mu.Unlock()
 
 	var pid int
-	if tracked && cmd.Process != nil {
-		pid = cmd.Process.Pid
+	if tracked {
+		pid = proc.Pid()
 	} else if data, err := os.ReadFile(f.pidFilePath(id)); err == nil {
 		pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
 	}
@@ -2120,12 +2304,11 @@ func (f *FirecrackerEngine) State(ctx context.Context, id string) (VMMState, err
 	if pid <= 0 {
 		return VMMStateGone, nil
 	}
-	sockPath := f.socketPath(id)
-	if !isFirecrackerPID(pid, sockPath) {
+	if !isFirecrackerPID(pid, id) {
 		return VMMStateGone, nil
 	}
 
-	return instanceState(ctx, newFirecrackerClient(sockPath))
+	return instanceState(ctx, newFirecrackerClient(f.socketPath(id)))
 }
 
 // instanceState reads a running VMM's execution state.
@@ -2176,10 +2359,10 @@ func instanceState(ctx context.Context, c *firecrackerClient) (VMMState, error) 
 
 func (f *FirecrackerEngine) PID(id string) int {
 	f.mu.Lock()
-	cmd, tracked := f.procs[id]
+	proc, tracked := f.procs[id]
 	f.mu.Unlock()
-	if tracked && cmd.Process != nil {
-		return cmd.Process.Pid
+	if tracked && proc.Pid() > 0 {
+		return proc.Pid()
 	}
 	if data, err := os.ReadFile(f.pidFilePath(id)); err == nil {
 		p, _ := strconv.Atoi(strings.TrimSpace(string(data)))
@@ -2193,9 +2376,17 @@ func hasKVM() bool {
 	return err == nil
 }
 
-// isFirecrackerPID reports whether pid is the Firecracker serving
-// expectedSock, so that a recycled pid is never signalled in a VM's name.
-func isFirecrackerPID(pid int, expectedSock string) bool {
+// isFirecrackerPID reports whether pid is THIS VM's Firecracker, so that a
+// recycled pid is never signalled in a VM's name.
+//
+// marker is what tells one VM's VMM from another's on the same host. Under
+// the jailer it is the instance id, and it is on the command line twice over:
+// the jailer passes its own `--id` through to Firecracker, and the binary it
+// execs lives at <chroot base>/firecracker/<id>/root/firecracker, so the
+// argv carries the id whichever way it is read. It used to be the API socket
+// path, which no longer distinguishes anything — every jailed VMM serves
+// /run/firecracker.socket, because every one of them has a root of its own.
+func isFirecrackerPID(pid int, marker string) bool {
 	if pid <= 0 {
 		return false
 	}
@@ -2205,14 +2396,18 @@ func isFirecrackerPID(pid int, expectedSock string) bool {
 
 	cmdlinePath := fmt.Sprintf("/proc/%d/cmdline", pid)
 	if data, err := os.ReadFile(cmdlinePath); err == nil {
+		// The cmdline is NUL-separated, so a substring search over it can
+		// match across argument boundaries. That is harmless here: both
+		// needles are whole arguments or parts of one path, and the check is
+		// "is this plausibly the VMM we started" rather than a parser.
 		cmdline := string(data)
-		return strings.Contains(cmdline, "firecracker") && strings.Contains(cmdline, expectedSock)
+		return strings.Contains(cmdline, jailExecName) && strings.Contains(cmdline, marker)
 	}
 
 	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=")
 	if out, err := cmd.Output(); err == nil {
 		s := string(out)
-		return strings.Contains(s, "firecracker") && (expectedSock == "" || strings.Contains(s, expectedSock))
+		return strings.Contains(s, jailExecName) && (marker == "" || strings.Contains(s, marker))
 	}
 
 	return false

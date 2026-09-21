@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -718,7 +717,7 @@ func TestMicrovmSnapshotRefAssociationAndStrip(t *testing.T) {
 // TestMicrovmFirecrackerSnapshotRefuses is findings 1 and 2 together: no
 // guest memory image, and no workspace masquerading as an environment image.
 func TestMicrovmFirecrackerSnapshotRefuses(t *testing.T) {
-	fc := NewFirecrackerEngine("/nonexistent/bin/firecracker", t.TempDir())
+	fc := NewFirecrackerEngine(FirecrackerOpts{VMMPath: "/nonexistent/bin/firecracker", StateDir: t.TempDir()})
 	_, err := fc.Snapshot(context.Background(), "mvm-1", "rainier-env:x", nil)
 	if err == nil {
 		t.Fatal("FirecrackerEngine.Snapshot succeeded; it must refuse until the image work lands")
@@ -769,7 +768,7 @@ func TestMicrovmDestroyContainerEngineFailure(t *testing.T) {
 }
 
 func TestMicrovmFirecrackerFailsClosed(t *testing.T) {
-	fc := NewFirecrackerEngine("/nonexistent/bin/firecracker", t.TempDir())
+	fc := NewFirecrackerEngine(FirecrackerOpts{VMMPath: "/nonexistent/bin/firecracker", StateDir: t.TempDir()})
 	if err := fc.Launch(context.Background(), VMMConfig{ID: "mvm-fail"}); err == nil {
 		t.Fatal("FirecrackerEngine.Launch must fail closed when the binary is missing")
 	}
@@ -1326,16 +1325,19 @@ func TestFirecrackerStateReadsInstanceInfo(t *testing.T) {
 }
 
 // fakeFirecracker starts a child that passes isFirecrackerPID: a script named
-// `firecracker`, invoked with the same --api-sock argument the engine uses,
-// so both the /proc cmdline and the `ps -o command=` fallback see the binary
-// name and the socket path the check looks for. It exits on SIGTERM within
-// one tick of its loop.
+// `firecracker`, invoked with the same `--id` argument the jailer passes
+// through to the real one, so both the /proc cmdline and the `ps -o command=`
+// fallback see the binary name and the instance id the check looks for. It
+// exits on SIGTERM within one tick of its loop.
 //
 // A stand-in that does NOT pass the check (plain `sleep`, say) exercises a
 // different branch of Stop entirely — the one that must never signal a pid it
 // cannot identify — so a test that reached for the obvious `sleep 60` was not
 // testing the teardown path it appeared to name.
-func fakeFirecracker(t *testing.T, sockPath string) (*exec.Cmd, int) {
+//
+// It is started the way execStarter starts a jailed VMM, process group and
+// all, because that is what Stop signals.
+func fakeFirecracker(t *testing.T, id string) (vmmProcess, int) {
 	t.Helper()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "firecracker")
@@ -1343,23 +1345,23 @@ func fakeFirecracker(t *testing.T, sockPath string) (*exec.Cmd, int) {
 	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(bin, "--api-sock", sockPath)
-	if err := cmd.Start(); err != nil {
+	proc, err := execStarter{}.Start(bin, []string{"--id", id, "--api-sock", jailAPISocketPath})
+	if err != nil {
 		t.Fatal(err)
 	}
-	pid := cmd.Process.Pid
+	pid := proc.Pid()
 	// The identity check reads the cmdline, which is not necessarily visible
 	// the instant Start returns.
 	deadline := time.Now().Add(2 * time.Second)
-	for !isFirecrackerPID(pid, sockPath) {
+	for !isFirecrackerPID(pid, id) {
 		if time.Now().After(deadline) {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-			t.Skipf("a child named %s with --api-sock %s does not satisfy isFirecrackerPID on this host", bin, sockPath)
+			_ = proc.Kill()
+			_ = proc.Wait()
+			t.Skipf("a child named %s with --id %s does not satisfy isFirecrackerPID on this host", bin, id)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	return cmd, pid
+	return proc, pid
 }
 
 // TestFirecrackerStopReapsTheChild: a VMM this engine started is a child, and
@@ -1371,10 +1373,10 @@ func TestFirecrackerStopReapsTheChild(t *testing.T) {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 
-	fc := NewFirecrackerEngine("/nonexistent/bin/firecracker", dir)
-	cmd, pid := fakeFirecracker(t, fc.socketPath("mvm-reap"))
+	fc := NewFirecrackerEngine(FirecrackerOpts{VMMPath: "/nonexistent/bin/firecracker", StateDir: dir})
+	proc, pid := fakeFirecracker(t, "mvm-reap")
 	fc.mu.Lock()
-	fc.procs["mvm-reap"] = cmd
+	fc.procs["mvm-reap"] = proc
 	fc.mu.Unlock()
 
 	start := time.Now()
@@ -1416,29 +1418,29 @@ func TestFirecrackerStopDoesNotHangOnAnUnidentifiableChild(t *testing.T) {
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
 
-	fc := NewFirecrackerEngine("/nonexistent/bin/firecracker", dir)
+	fc := NewFirecrackerEngine(FirecrackerOpts{VMMPath: "/nonexistent/bin/firecracker", StateDir: dir})
 
-	// A live child that is emphatically not a firecracker serving this
-	// socket, so the identity check refuses to signal it.
-	cmd := exec.Command("sleep", "30")
-	if err := cmd.Start(); err != nil {
+	// A live child that is emphatically not this VM's VMM, so the identity
+	// check refuses to signal it.
+	proc, err := execStarter{}.Start("sleep", []string{"30"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	pid := cmd.Process.Pid
+	pid := proc.Pid()
 	t.Cleanup(func() {
-		// Stop's own reaper goroutine is still sitting in cmd.Wait() — this
-		// is the process it could not identify, so it was never signalled and
+		// Stop's own reaper goroutine is still sitting in Wait() — this is
+		// the process it could not identify, so it was never signalled and
 		// never exited. The signal therefore goes raw, by pid: calling
-		// cmd.Process.Kill or cmd.Wait from here would touch exec.Cmd state
-		// that goroutine owns. Killing it is what lets the reaper finish,
-		// which is the arrangement the driver relies on in production too.
+		// proc.Kill or proc.Wait from here would touch exec.Cmd state that
+		// goroutine owns. Killing it is what lets the reaper finish, which is
+		// the arrangement the driver relies on in production too.
 		_ = syscall.Kill(pid, syscall.SIGKILL)
 	})
-	if isFirecrackerPID(pid, fc.socketPath("mvm-stuck")) {
+	if isFirecrackerPID(pid, "mvm-stuck") {
 		t.Skip("this host's `sleep` identifies as a firecracker; nothing to test")
 	}
 	fc.mu.Lock()
-	fc.procs["mvm-stuck"] = cmd
+	fc.procs["mvm-stuck"] = proc
 	fc.mu.Unlock()
 
 	// A caller whose context is already cut short must be answered at once.
