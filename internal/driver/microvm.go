@@ -200,6 +200,13 @@ type VMMConfig struct {
 	GatewayIP    string `json:"gateway_ip"`
 	GuestNetmask string `json:"guest_netmask"`
 	GuestMAC     string `json:"guest_mac"`
+
+	// CgroupPath is the cgroup v2 directory the jailer creates for this VM,
+	// and the only place this host's spend on the session is measured
+	// (ADR-0003 §4.6). It is recorded rather than recomputed on demand so
+	// that a reading taken after an operator changed --microvm-cgroup-parent
+	// still names the cgroup the VM is actually in.
+	CgroupPath string `json:"cgroup_path"`
 	// VsockUDSPath is the path Firecracker is told to serve this VM's
 	// virtio-vsock device on: the guest's connections to host port N are
 	// forwarded to "<VsockUDSPath>_N", and 1024 is the only port this design
@@ -438,6 +445,21 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 	m.recoverDiskInstances()
 	m.reclaimNetworkSlots()
 	return m, nil
+}
+
+// cgroupPathFor is where the jailer puts one VM's cgroup, and therefore
+// where its usage is read from. Both spellings come from here so the launch
+// and the reading cannot disagree.
+func (m *Microvm) cgroupPathFor(id string) string {
+	root := m.opts.CgroupRoot
+	if root == "" {
+		root = defaultCgroupRoot
+	}
+	parent := m.opts.Jail.CgroupParent
+	if parent == "" {
+		parent = defaultJailCgroupParent
+	}
+	return jailCgroupPath(root, parent, id)
 }
 
 // slotConfig is the network envelope this runner hands the slot allocator.
@@ -1140,6 +1162,7 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 		DialURL:           spec.DialURL,
 		ProxyURL:          spec.ProxyURL,
 		VsockUDSPath:      vsockGuestPath(1),
+		CgroupPath:        m.cgroupPathFor(id),
 		Env:               buildGuestEnv(spec),
 	}
 	applySlot(&cfg, slot)
@@ -1349,6 +1372,11 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 			return false, err
 		}
 		cfg.VsockUDSPath = vsockGuestPath(boots)
+		// A cold resume is a new VM in a cgroup of the same name, and the
+		// name is recomputed rather than inherited so that an operator who
+		// moved --microvm-cgroup-parent between the park and the resume gets
+		// readings from where the VM actually is.
+		cfg.CgroupPath = m.cgroupPathFor(id)
 		// A new VM gets a new network slot too: the one this session had was
 		// returned to the pool when it was parked, and may be another
 		// session's by now.
@@ -1385,6 +1413,7 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		inst.channel = channel
 		inst.boot = bootCfg
 		inst.Cfg.VsockUDSPath = cfg.VsockUDSPath
+		inst.Cfg.CgroupPath = cfg.CgroupPath
 		inst.slot = slot
 		applySlot(&inst.Cfg, slot)
 		// The deferred release must not take back the slot the record now

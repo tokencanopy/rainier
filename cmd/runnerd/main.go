@@ -60,6 +60,8 @@ func main() {
 		"size of the per-VM uid and gid range; 0 means 4096")
 	microvmCgroupParent := flag.String("microvm-cgroup-parent", envDefault("RAINIER_MICROVM_CGROUP_PARENT", ""),
 		"cgroup v2 parent the jailer creates each microVM's cgroup under, and where host-side metering reads cpu.stat and memory.current (ADR-0003 §4.6); empty means rainier")
+	microvmCgroupRoot := flag.String("microvm-cgroup-root", envDefault("RAINIER_MICROVM_CGROUP_ROOT", ""),
+		"cgroup v2 mount point; empty means /sys/fs/cgroup. It is where host-side metering reads each microVM's cpu.stat and memory.current from")
 	microvmSeccompOff := flag.Bool("microvm-seccomp-off", os.Getenv("RAINIER_MICROVM_SECCOMP_OFF") == "1",
 		"turn OFF the jailer's seccomp filter on the Firecracker process. Seccomp is on by default and this exists for diagnosing a filter rejection on a new kernel, not for production")
 	var microvmControlPlane capabilityFlag
@@ -126,6 +128,7 @@ func main() {
 			EgressProxyPort:   proxyPort,
 			ControlPlaneCIDRs: microvmControlPlane,
 
+			CgroupRoot: *microvmCgroupRoot,
 			Jail: driver.JailOpts{
 				JailerPath:   *microvmJailer,
 				UIDFirst:     *microvmUIDFirst,
