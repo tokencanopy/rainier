@@ -313,6 +313,49 @@ func TestMicrovmCreateLeavesNoRootfsWhenItFails(t *testing.T) {
 	}
 }
 
+// TestMicrovmColdResumeLeavesNoRootfsWhenItFails is the rollback half of the
+// resume: a cold resume clones a fresh root filesystem BEFORE it launches, and
+// an attempt that does not end with a running VM leaves the session parked —
+// so the copy it made must go with it, or every failed resume costs this host
+// an environment image's worth of disk for a session that is still dormant.
+func TestMicrovmColdResumeLeavesNoRootfsWhenItFails(t *testing.T) {
+	m, sim, _ := testMicrovmCloning(t, MicrovmOpts{TotalSlots: 2})
+	m.SetHost(&stubMicrovmHost{})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "sess-resumefail"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Suspend(ctx, h.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	rootfs, err := m.sessionRootfsPath(h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(rootfs); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the cold park kept the root filesystem: %v", err)
+	}
+
+	sim.FailLaunch(errors.New("firecracker: no such device"))
+	if _, err := m.Resume(ctx, h.ID); err == nil {
+		t.Fatal("Resume succeeded with an engine that refuses to launch")
+	}
+	if _, err := os.Stat(rootfs); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a failed cold resume left a root filesystem at %s for a session that is still parked", rootfs)
+	}
+
+	// And the session is still resumable once the host is well again.
+	sim.FailLaunch(nil)
+	if restarted, err := m.Resume(ctx, h.ID); err != nil || !restarted {
+		t.Fatalf("Resume after a failed one = %v, %v", restarted, err)
+	}
+	if _, err := os.Stat(rootfs); err != nil {
+		t.Errorf("the resumed session has no root filesystem: %v", err)
+	}
+}
+
 // TestMicrovmCreateRefusesWhenTheCloneFails is the fail-closed half: a host
 // that cannot make the copy has no root filesystem to boot, and a session that
 // booted anyway would be one sharing the environment image with every other

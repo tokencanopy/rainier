@@ -10,6 +10,7 @@ package driver
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -95,6 +96,70 @@ func TestMicrovmCreateBootsFromASnapshotRef(t *testing.T) {
 	}
 	if cfg.RootfsPath == builderRootfs || cfg.RootfsPath == blob {
 		t.Fatalf("the cached session boots %q, which is another session's rootfs or the image itself", cfg.RootfsPath)
+	}
+}
+
+// TestMicrovmCreateRefusesAnImageRefThatNamesAPath is the containment rule,
+// and it is a cross-tenant one.
+//
+// Spec.Image is carried from an environment somebody DECLARED — the wire
+// checks only that it is non-empty — so a path branch that accepted any
+// readable file would let a create name another session's workspace disk or
+// another creator's agent home. Since this change a session's rootfs is
+// writable and Snapshot publishes it by digest, so the sequence would be:
+// boot a copy of somebody else's workspace, read it, and publish it under an
+// environment ref that every later session of that environment boots.
+// "Excluded by construction" (ADR-0003 §2.7 item 3) is only true while nothing
+// can ask for them by name.
+func TestMicrovmCreateRefusesAnImageRefThatNamesAPath(t *testing.T) {
+	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4})
+	ctx := context.Background()
+
+	victim, err := m.Create(ctx, Spec{
+		SessionID: "sess-victim",
+		Home:      &HomeMount{Volume: "home-victim", Path: "/rainier/agents"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := m.workspaceDiskPath("sess-victim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := m.homeDiskPath("home-victim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	victimRootfs, err := m.sessionRootfsPath(victim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := filepath.Join(t.TempDir(), "somebody-elses.ext4")
+	if err := os.WriteFile(elsewhere, []byte("not an environment image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, ref := range []string{
+		workspace,
+		home,
+		victimRootfs,
+		elsewhere,
+		filepath.Join(m.opts.StateDir, "instances", victim.ID, "instance.json"),
+		"../../etc/passwd",
+		"rainier-env:x/../../y",
+	} {
+		h, err := m.Create(ctx, Spec{SessionID: "sess-attacker", Image: ref})
+		if err == nil {
+			t.Errorf("a create booted %q, which is not an environment image", ref)
+			_ = m.Destroy(ctx, h.ID)
+			continue
+		}
+	}
+	// The one path a create may name is the runner's own base rootfs, which is
+	// what an empty Spec.Image resolves to — so the rule above cannot have
+	// broken the ordinary create.
+	if _, err := m.Create(ctx, Spec{SessionID: "sess-ordinary", Image: m.opts.BaseRootfs}); err != nil {
+		t.Errorf("a create naming this runner's own --rootfs was refused: %v", err)
 	}
 }
 

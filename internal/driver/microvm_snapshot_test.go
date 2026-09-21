@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -373,8 +374,11 @@ func TestMicrovmSnapshotDoesNotThawASessionSomebodyElseStopped(t *testing.T) {
 		t.Fatalf("warm Suspend during a snapshot: %v", err)
 	}
 	close(release)
-	if err := <-done; err != nil {
-		t.Fatalf("Snapshot: %v", err)
+	if err := <-done; err == nil {
+		t.Fatal("the snapshot published an image for a session that stopped running while it was being copied")
+	}
+	if _, ok := m.images.manifest("rainier-env:racing"); ok {
+		t.Error("a snapshot of a session that was suspended mid-copy published a manifest")
 	}
 
 	if st, _ := sim.State(ctx, h.ID); st != VMMStatePaused {
@@ -383,6 +387,128 @@ func TestMicrovmSnapshotDoesNotThawASessionSomebodyElseStopped(t *testing.T) {
 	if g, _ := m.Inspect(ctx, h.ID); g.State != StateSuspended {
 		t.Errorf("the session reads as %s, want suspended", g.State)
 	}
+}
+
+// TestMicrovmSnapshotKeepsTheSessionRunningWhileItPublishes is the other side
+// of the same pause: a VM this driver froze for a copy is not a suspended
+// session, and it is unfrozen as soon as the copy exists rather than after the
+// image has been digested and stored.
+//
+// Both halves have bitten. An Inspect landing inside a snapshot used to
+// reconcile the record to "suspended" — the control plane would then see a
+// working session as stopped, and the snapshot's own resume would stand down,
+// because it declines to thaw a session somebody else stopped. And digesting a
+// multi-gigabyte image with the guest still frozen is tens of seconds of a
+// terminal that does not answer, per environment-cache build.
+func TestMicrovmSnapshotKeepsTheSessionRunningWhileItPublishes(t *testing.T) {
+	cloning := make(chan struct{})
+	release := make(chan struct{})
+	m, sim := testMicrovm(t, MicrovmOpts{TotalSlots: 4, Clone: &blockingCloner{
+		inner: &fakeCloner{}, blockOn: 2, entered: cloning, release: release,
+	}})
+	m.SetHost(&stubMicrovmHost{})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "sess-frozen"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Snapshot(ctx, h.ID, "rainier-env:frozen", nil)
+		done <- err
+	}()
+	select {
+	case <-cloning:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the snapshot never reached the copy")
+	}
+
+	// Mid-copy the VM really is paused — that is the point of the pause — and
+	// the SESSION is still a running one to everything above this driver.
+	if st, _ := sim.State(ctx, h.ID); st != VMMStatePaused {
+		t.Errorf("the VM is %s during the copy, want paused: nothing may write to the file being copied", st)
+	}
+	if g, _ := m.Inspect(ctx, h.ID); g.State != StateRunning {
+		t.Errorf("Inspect reads %s during a snapshot, want running: the control plane would see a working session as stopped", g.State)
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if st, _ := sim.State(ctx, h.ID); st != VMMStateRunning {
+		t.Errorf("the VM is %s after the snapshot, want running", st)
+	}
+	if _, ok := m.images.manifest("rainier-env:frozen"); !ok {
+		t.Error("the snapshot published nothing")
+	}
+}
+
+// TestMicrovmSnapshotResumesBeforeItDigestsTheImage pins the ORDER of the last
+// two steps, which is the difference between a pause that lasts a reflink and
+// one that lasts a read of the whole image.
+//
+// Digesting a multi-gigabyte rootfs is tens of seconds. The copy is a file of
+// its own the moment the clone returns, so the guest is let go first and the
+// store work happens behind it; a resume deferred to the end of the method
+// instead would freeze a user's terminal for every environment-cache build.
+func TestMicrovmSnapshotResumesBeforeItDigestsTheImage(t *testing.T) {
+	m, sim := testMicrovm(t, MicrovmOpts{TotalSlots: 4})
+	gated := &gatedResumeEngine{SimulatedEngine: sim, entered: make(chan struct{}), release: make(chan struct{})}
+	m.engine = gated
+	m.SetHost(&stubMicrovmHost{})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "sess-order"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const ref = "rainier-env:order"
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Snapshot(ctx, h.ID, ref, nil)
+		done <- err
+	}()
+
+	select {
+	case <-gated.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the snapshot never resumed the VM")
+	}
+	// The resume is in flight, so the copy exists — and nothing has been
+	// published yet. A snapshot that digested the image first would have the
+	// manifest here and the guest still frozen.
+	if _, ok := m.images.manifest(ref); ok {
+		t.Error("the image was published before the VM was resumed; the guest stayed frozen for the digest of the whole image")
+	}
+	close(gated.release)
+
+	if err := <-done; err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if _, ok := m.images.manifest(ref); !ok {
+		t.Error("the snapshot published nothing")
+	}
+}
+
+// gatedResumeEngine parks the first Resume until a test lets it go, so the
+// order of "unfreeze the guest" and "store the image" can be asserted.
+type gatedResumeEngine struct {
+	*SimulatedEngine
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (e *gatedResumeEngine) Resume(ctx context.Context, id string) error {
+	e.once.Do(func() {
+		close(e.entered)
+		<-e.release
+	})
+	return e.SimulatedEngine.Resume(ctx, id)
 }
 
 // blockingCloner parks the Nth clone until a test lets it go, standing in for

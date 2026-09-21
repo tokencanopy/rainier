@@ -293,8 +293,15 @@ func main() {
 		// guest's page cache would be missing from an image every later
 		// session of the environment boots. Answering is what lets the host
 		// go ahead; not answering is what stops it.
+		// A nil *agentSync put in an interface is not a nil interface, and the
+		// method on it would run on a nil receiver, so the conversion is made
+		// here where the concrete nil is still visible.
+		var agentFlush agentFlusher
+		if agents != nil {
+			agentFlush = agents
+		}
 		rpc.RegisterEventHandler(relay.KindFlush, func(ev relay.ControlEvent) {
-			flushDisks(rpc, agents, ev.ID)
+			flushDisks(rpc, agentFlush, ev.ID)
 		})
 		rpc.RegisterEventHandler(relay.KindSuspending, func(ev relay.ControlEvent) {
 			if ev.Cold {
@@ -599,15 +606,26 @@ func quiesceExecs(execs execKiller, notifier eventNotifier, nonce uint64) {
 // a stop slower; here, silence makes the host refuse to publish. Neither step
 // above can fail — agents.flush logs its own trouble, and sync(2) returns
 // nothing — so the answer is the honest one.
-func flushDisks(notifier eventNotifier, agents *agentSync, nonce uint64) {
+func flushDisks(notifier eventNotifier, agents agentFlusher, nonce uint64) {
 	if agents != nil {
 		agents.flush()
 	}
-	syncDisks()
+	diskSync()
 	if err := notifier.Notify(relay.ControlEvent{Kind: relay.KindFlushed, ID: nonce}); err != nil {
 		log.Printf("reporting the flush: %v", err)
 	}
 }
+
+// agentFlusher is the one thing a flush needs from the agent sync: put the
+// agent's pending write somewhere a filesystem knows about. An interface
+// rather than the concrete type so that a test can see the flush happen —
+// answering "flushed" without having flushed is precisely the failure the host
+// then publishes an image on the strength of.
+type agentFlusher interface{ flush() }
+
+// diskSync is sync(2), as a variable for the same reason: a flush that
+// answered without syncing would pass every test that only reads the answer.
+var diskSync = syncDisks
 
 // agentHomeMount is where the agent homes are mounted inside a session. It
 // is controlapp.HomeMountPath, spelled here because this process must not

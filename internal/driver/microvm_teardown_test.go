@@ -5,6 +5,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -42,6 +43,11 @@ func TestMicrovmDestroyRemovesTheWorkspaceOfARecordOnlyOnDisk(t *testing.T) {
 	delete(m.instances, h.ID)
 	m.mu.Unlock()
 
+	rootfs, err := m.sessionRootfsPath(h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	if err := m.Destroy(ctx, h.ID); err != nil {
 		t.Fatalf("Destroy of an id only the disk knows: %v", err)
 	}
@@ -50,6 +56,36 @@ func TestMicrovmDestroyRemovesTheWorkspaceOfARecordOnlyOnDisk(t *testing.T) {
 	}
 	if workspaceExists(t, m, "sess-orphan") {
 		t.Error("the workspace volume is still listed after a full teardown")
+	}
+
+	// And the rest of the session went with it. A teardown that removed only
+	// the workspace left the VM running, its jail standing, its rootfs copy on
+	// disk and its record in place — so the NEXT runnerd recovered that record,
+	// reported the session running, and held a capacity slot for good, for a
+	// session whose files this very call had just deleted.
+	if _, err := os.Stat(rootfs); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Destroy left the session's root filesystem at %s: %v", rootfs, err)
+	}
+	if _, err := os.Stat(m.instanceMetaPath(h.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Destroy left the instance record at %s: %v", m.instanceMetaPath(h.ID), err)
+	}
+	if st, _ := m.engine.State(ctx, h.ID); st != VMMStateStopped && st != VMMStateGone {
+		t.Errorf("Destroy left the VM %s; a tenant's guest kept running on an unlinked workspace", st)
+	}
+
+	// The restart proves it: nothing comes back.
+	restarted, _, _ := testMicrovmCloning(t, MicrovmOpts{
+		TotalSlots: 2, StateDir: m.opts.StateDir, BaseRootfs: m.opts.BaseRootfs,
+	})
+	listed, err := restarted.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 0 {
+		t.Errorf("a destroyed session came back after a restart: %+v", listed)
+	}
+	if used, _, _ := restarted.Capacity(ctx); used != 0 {
+		t.Errorf("a destroyed session is still holding %d capacity slot(s)", used)
 	}
 }
 

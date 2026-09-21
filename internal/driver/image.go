@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -166,6 +167,10 @@ func digestOf(sum []byte) string { return imageDigestAlgo + ":" + hex.EncodeToSt
 type imageStore struct {
 	root   string
 	source ImageSource
+	// maxBytes is what a single download may write before it is given up on.
+	// A field rather than the constant so a test can reach the cap without
+	// writing 64 GiB; production never changes it.
+	maxBytes int64
 
 	// mu guards inflight only. Everything else the store does is filesystem
 	// work under paths derived from a digest, which is safe to do
@@ -190,6 +195,7 @@ func newImageStore(stateDir string, source ImageSource) (*imageStore, error) {
 	s := &imageStore{
 		root:     filepath.Join(stateDir, "images"),
 		source:   source,
+		maxBytes: maxImageBytes,
 		inflight: map[string]*imagePull{},
 	}
 	for _, dir := range []string{s.blobDir(), s.refDir(), s.tempDir()} {
@@ -197,7 +203,42 @@ func newImageStore(stateDir string, source ImageSource) (*imageStore, error) {
 			return nil, fmt.Errorf("microvm: create the image store directory %s: %w", dir, err)
 		}
 	}
+	s.sweepStaging()
 	return s, nil
+}
+
+// sweepStaging removes whatever a previous run left half-made.
+//
+// Staging holds two things, both of which are one file at a time and neither
+// of which outlives the call that made it: a download on its way to being
+// verified, and a snapshot's copy of a rootfs on its way to being digested. A
+// runner killed in the middle of either leaves the partial file behind, and
+// nothing would ever name it again — a fetch cut off at 40 GiB is 40 GiB of a
+// host's NVMe held by a file with a random name.
+//
+// It runs from the constructor, where "whatever is in here is stale" is true
+// by construction: this process has not started a fetch or a snapshot yet, and
+// a second runnerd over one state directory is a configuration that would
+// already be fighting over instance ids and network slots.
+func (s *imageStore) sweepStaging() {
+	entries, err := os.ReadDir(s.tempDir())
+	if err != nil {
+		return
+	}
+	swept := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if err := os.Remove(filepath.Join(s.tempDir(), e.Name())); err != nil {
+			log.Printf("microvm: removing a half-made image left by a previous run: %v", err)
+			continue
+		}
+		swept++
+	}
+	if swept > 0 {
+		log.Printf("microvm: removed %d half-made image file(s) left by a previous run", swept)
+	}
 }
 
 func (s *imageStore) blobDir() string { return filepath.Join(s.root, "blobs", imageDigestAlgo) }
@@ -254,13 +295,25 @@ func (s *imageStore) manifest(ref string) (ImageManifest, bool) {
 	if _, _, err := parseDigest(m.Digest); err != nil {
 		return ImageManifest{}, false
 	}
+	// The manifest has to be the manifest FOR THIS REF, and the file name is
+	// not proof of that: sanitizeRef maps ':' to '_' so that a ref becomes one
+	// path entry, which means "rainier-env:e1" and "rainier-env_e1" land on
+	// the same file. Whichever was published last would otherwise answer for
+	// both, and a create naming one would boot the other's image.
+	if m.Ref != ref {
+		return ImageManifest{}, false
+	}
 	return m, true
 }
 
 // manifestBytes returns the raw manifest a ref was published with, or nil.
 // Raw, because the strip assertion reads it for values the typed form has no
-// field for — see assertStrippedFromImage.
+// field for — see assertStrippedFromImage. It answers only for a manifest that
+// names this ref, for the reason manifest does.
 func (s *imageStore) manifestBytes(ref string) []byte {
+	if _, ok := s.manifest(ref); !ok {
+		return nil
+	}
 	path, err := s.manifestPath(ref)
 	if err != nil {
 		return nil
@@ -464,17 +517,21 @@ func (s *imageStore) download(ctx context.Context, digest string) error {
 	}
 
 	sum := sha256.New()
-	// maxImageBytes+1 so that an image exactly at the cap still lands and one
-	// byte over is caught rather than silently truncated into a file whose
-	// digest would then merely "not match".
-	n, err := io.Copy(io.MultiWriter(tmp, sum), io.LimitReader(rc, maxImageBytes+1))
+	// cap+1 so that an image exactly at the cap still lands and one byte over
+	// is caught rather than silently truncated into a file whose digest would
+	// then merely "not match".
+	cap := s.maxBytes
+	if cap <= 0 {
+		cap = maxImageBytes
+	}
+	n, err := io.Copy(io.MultiWriter(tmp, sum), io.LimitReader(rc, cap+1))
 	if err != nil {
 		tmp.Close()
 		return fmt.Errorf("download %s: %w", digest, err)
 	}
-	if n > maxImageBytes {
+	if n > cap {
 		tmp.Close()
-		return fmt.Errorf("download %s: the source is still sending past %d bytes; an environment image is one ext4 file, not a stream", digest, int64(maxImageBytes))
+		return fmt.Errorf("download %s: the source is still sending past %d bytes; an environment image is one ext4 file, not a stream", digest, cap)
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("download %s: %w", digest, err)
@@ -542,6 +599,7 @@ func (s *imageStore) publish(staged string, m ImageManifest) (ImageManifest, err
 	if err != nil {
 		return ImageManifest{}, err
 	}
+	landed := false
 	if _, already := s.have(digest); already {
 		// The same bytes are already stored — two snapshots of an environment
 		// nobody changed, which is the common case for a re-run setup. The
@@ -549,8 +607,11 @@ func (s *imageStore) publish(staged string, m ImageManifest) (ImageManifest, err
 		// pointed at what is there: identical content under one name is the
 		// whole point of storing by digest.
 		_ = os.Chmod(dst, microvmFileMode)
-	} else if err := os.Rename(staged, dst); err != nil {
-		return ImageManifest{}, fmt.Errorf("publish %q: store the image: %w", m.Ref, err)
+	} else {
+		if err := os.Rename(staged, dst); err != nil {
+			return ImageManifest{}, fmt.Errorf("publish %q: store the image: %w", m.Ref, err)
+		}
+		landed = true
 	}
 
 	m.Digest = digest
@@ -559,6 +620,14 @@ func (s *imageStore) publish(staged string, m ImageManifest) (ImageManifest, err
 		m.CreatedAt = time.Now()
 	}
 	if err := s.writeManifest(m); err != nil {
+		// The blob is this call's own — nothing referenced it before and the
+		// manifest that would have is what just failed — so it goes with the
+		// failure rather than sitting in the store as an environment image's
+		// worth of disk no ref can name. A digest that was ALREADY there is
+		// left alone: another ref is using it.
+		if landed {
+			_ = os.Remove(dst)
+		}
 		return ImageManifest{}, err
 	}
 	return m, nil
@@ -602,19 +671,31 @@ func (d DirImageSource) Open(_ context.Context, digest string) (io.ReadCloser, e
 //
 // There is no authentication here and no signature check beyond the digest,
 // and both are deliberate for v0. The digest is what makes the transport
-// untrusted-by-construction: a compromised mirror, a cache, or a middlebox can
-// serve whatever it likes and the store will not keep it. What the URL has to
-// be trusted for is the INDEX — which digest a ref means — and that is why the
-// index is fetched from the same configured base rather than followed from
-// anything inside an image.
+// untrusted-by-construction for the IMAGE: a compromised mirror, a cache, or a
+// middlebox can serve whatever it likes and the store will not keep it.
+//
+// What the URL has to be trusted for is the INDEX — which digest a ref means —
+// and that is the whole reason plain HTTP is refused rather than merely
+// discouraged. Over http:// anything on the path rewrites the index to a
+// digest of its own and then serves bytes that match it, and every check in
+// this file passes: the host boots a root filesystem chosen by whoever was in
+// the middle. The digest defends the object, and TLS is what defends the
+// mapping.
 type HTTPImageSource struct {
 	// Base is the prefix every object hangs off, with or without a trailing
-	// slash.
+	// slash. It must be https.
 	Base string
 	// Client is the http.Client to use. nil means a client with a timeout,
 	// because http.DefaultClient has none and an image fetch that hangs holds
 	// a create behind it.
 	Client *http.Client
+	// AllowInsecure permits a plain-http base. It exists for this package's
+	// own tests, which serve an index off a loopback httptest server, and it
+	// is deliberately not reachable from a flag: an operator who wants this
+	// has a reason nobody has heard yet, and a runner that could be pointed at
+	// http:// by configuration is a runner whose root filesystems can be
+	// chosen by the network.
+	AllowInsecure bool
 }
 
 // httpImageTimeout bounds a whole fetch, index or image. Multi-gigabyte
@@ -637,8 +718,11 @@ func (h HTTPImageSource) objectURL(object string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("image base URL %q: %w", h.Base, err)
 	}
-	if base.Scheme == "" || base.Host == "" {
-		return "", fmt.Errorf("image base URL %q names no scheme and host", h.Base)
+	if base.Host == "" {
+		return "", fmt.Errorf("image base URL %q names no host", h.Base)
+	}
+	if base.Scheme != "https" && !h.AllowInsecure {
+		return "", fmt.Errorf("image base URL %q is %q: an image index over anything but https lets whatever is on the path choose which digest a ref means, and the digest check then passes on the bytes it chose", h.Base, base.Scheme)
 	}
 	base.Path = strings.TrimSuffix(base.Path, "/") + "/" + object
 	return base.String(), nil

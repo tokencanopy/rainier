@@ -151,7 +151,14 @@ func newDirSource(t *testing.T, images map[string][]byte) DirImageSource {
 
 func newTestStore(t *testing.T, src ImageSource) *imageStore {
 	t.Helper()
-	s, err := newImageStore(t.TempDir(), src)
+	return newTestStoreIn(t, t.TempDir(), src)
+}
+
+// newTestStoreIn is newTestStore over a directory the caller keeps, for the
+// tests that build a second store over the first one's state — a restart.
+func newTestStoreIn(t *testing.T, dir string, src ImageSource) *imageStore {
+	t.Helper()
+	s, err := newImageStore(dir, src)
 	if err != nil {
 		t.Fatalf("newImageStore: %v", err)
 	}
@@ -269,6 +276,72 @@ func TestImageStoreFetchesADigestOnce(t *testing.T) {
 		t.Errorf("the store holds %d blob(s) after one image, want 1", n)
 	}
 }
+
+// TestImageStoreSweepsStagingOnStart: staging holds one file at a time and
+// nothing that outlives the call that made it, so a runner killed mid-download
+// or mid-snapshot leaves a partial image nothing will ever name again — up to
+// maxImageBytes of a host's NVMe held by a file with a random name.
+func TestImageStoreSweepsStagingOnStart(t *testing.T) {
+	dir := t.TempDir()
+	first := newTestStoreIn(t, dir, nil)
+	leftover := filepath.Join(first.tempDir(), "fetch-123456.ext4")
+	if err := os.WriteFile(leftover, []byte("half an environment image"), microvmFileMode); err != nil {
+		t.Fatal(err)
+	}
+
+	// The restart.
+	second := newTestStoreIn(t, dir, nil)
+	if _, err := os.Stat(leftover); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a restart kept %s, which no fetch and no snapshot will ever finish: %v", leftover, err)
+	}
+	if n := tempCount(t, second); n != 0 {
+		t.Errorf("staging holds %d file(s) after a restart", n)
+	}
+	// It swept staging and nothing else: the blobs and the manifests are the
+	// store, and a sweep that took those would throw away every environment
+	// this host has cached.
+	if n := blobCount(t, second); n != 0 {
+		t.Errorf("blobs = %d", n)
+	}
+}
+
+// TestImageStoreRefusesAnEndlessStream: the digest is only known to be wrong
+// at the END of a download, so a source that answers an endless stream under a
+// legitimate-looking digest would otherwise fill the host's NVMe — taking
+// every other tenant's session on it down — before anything checked anything.
+func TestImageStoreRefusesAnEndlessStream(t *testing.T) {
+	src := &endlessSource{digest: digestOf(make([]byte, 32))}
+	s := newTestStore(t, src)
+	// A cap the test can afford to reach, standing in for maxImageBytes.
+	s.maxBytes = 1 << 20
+
+	err := s.fetch(context.Background(), src.digest)
+	if err == nil {
+		t.Fatal("a download that never ends was stored")
+	}
+	if !strings.Contains(err.Error(), "still sending") {
+		t.Errorf("error = %q, want it to name the cap", err)
+	}
+	if n := blobCount(t, s); n != 0 {
+		t.Errorf("an over-long download left %d blob(s)", n)
+	}
+	if n := tempCount(t, s); n != 0 {
+		t.Errorf("an over-long download left %d file(s) staged", n)
+	}
+}
+
+// endlessSource answers every read with more bytes, forever.
+type endlessSource struct{ digest string }
+
+func (e *endlessSource) Resolve(context.Context, string) (string, error) { return e.digest, nil }
+
+func (e *endlessSource) Open(context.Context, string) (io.ReadCloser, error) {
+	return io.NopCloser(endlessReader{}), nil
+}
+
+type endlessReader struct{}
+
+func (endlessReader) Read(p []byte) (int, error) { return len(p), nil }
 
 // TestImageStoreManifestRoundTrip: what a ref resolves to, and what was
 // recorded about it, survives being written and read back — including the
@@ -406,9 +479,13 @@ func TestDirAndHTTPSourcesAgree(t *testing.T) {
 		t.Fatalf("dir resolve = %s, want %s", digest, digestOf(sum[:]))
 	}
 
-	srv := httptest.NewServer(http.FileServer(http.Dir(dir.Dir)))
+	// A TLS server, because the source refuses a plain-http base: an index
+	// over http lets whatever is on the path choose which digest a ref means.
+	// AllowInsecure is this package's own escape hatch and no flag reaches it;
+	// the test below pins the refusal.
+	srv := httptest.NewTLSServer(http.FileServer(http.Dir(dir.Dir)))
 	defer srv.Close()
-	web := HTTPImageSource{Base: srv.URL}
+	web := HTTPImageSource{Base: srv.URL, Client: srv.Client()}
 	webDigest, err := web.Resolve(ctx, "rainier-env:e1-aaa")
 	if err != nil {
 		t.Fatalf("http resolve: %v", err)
@@ -447,5 +524,34 @@ func TestDirAndHTTPSourcesAgree(t *testing.T) {
 	}
 	if _, err := web.Resolve(ctx, "rainier-env:absent"); err == nil {
 		t.Error("the http source resolved a ref it does not publish")
+	}
+}
+
+// TestHTTPImageSourceRefusesPlaintext. The digest defends the IMAGE — bad
+// bytes are refused however they arrive — but nothing in this package defends
+// the INDEX, which is the mapping from an environment ref to the digest a host
+// will then boot. Over http anything on the path rewrites that mapping and
+// serves bytes matching its own digest, and every check passes.
+func TestHTTPImageSourceRefusesPlaintext(t *testing.T) {
+	ctx := context.Background()
+	plain := httptest.NewServer(http.FileServer(http.Dir(t.TempDir())))
+	defer plain.Close()
+
+	web := HTTPImageSource{Base: plain.URL}
+	_, err := web.Resolve(ctx, "rainier-env:e1-aaa")
+	if err == nil {
+		t.Fatal("the http source read an index over plain http")
+	}
+	if !strings.Contains(err.Error(), "https") {
+		t.Errorf("error = %q, want it to name the scheme", err)
+	}
+	if _, err := web.Open(ctx, digestOf(make([]byte, 32))); err == nil {
+		t.Fatal("the http source opened an image over plain http")
+	}
+	// And a base that names nothing usable is refused before any request.
+	for _, base := range []string{"", "not a url", "/just/a/path", "ftp://images.example.com"} {
+		if _, err := (HTTPImageSource{Base: base}).Resolve(ctx, "rainier-env:e1-aaa"); err == nil {
+			t.Errorf("Resolve against base %q succeeded", base)
+		}
 	}
 }

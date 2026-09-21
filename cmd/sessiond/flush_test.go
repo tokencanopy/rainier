@@ -9,15 +9,22 @@ import (
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
+// recordingAgents stands in for the agent sync: it records that the flush
+// asked for the agent's pending write, which is the step a session's own log
+// would otherwise be the only evidence of.
+type recordingAgents struct{ flushes int }
+
+func (a *recordingAgents) flush() { a.flushes++ }
+
 // flushWired is coldWired's twin for the flush request: the handler wired the
 // way main wires it, so what is exercised is the frame's whole journey rather
 // than flushDisks called directly.
-func flushWired(execs execKiller, boots *bootstrapper) (*rpcDispatcher, *recordingSender) {
+func flushWired(execs execKiller, boots *bootstrapper, agents agentFlusher) (*rpcDispatcher, *recordingSender) {
 	d := newRPCDispatcher()
 	sender := &recordingSender{}
 	d.online(sender)
 	d.RegisterEventHandler(relay.KindFlush, func(ev relay.ControlEvent) {
-		flushDisks(d, nil, ev.ID)
+		flushDisks(d, agents, ev.ID)
 	})
 	d.RegisterEventHandler(relay.KindSuspending, func(ev relay.ControlEvent) {
 		if ev.Cold {
@@ -56,9 +63,25 @@ func TestAFlushAnswersWithTheNonceAndChangesNothingElse(t *testing.T) {
 	}
 	boots.remember([]string{"DEPLOY_KEY"})
 
+	// Both real steps are watched, because a sessiond that answered "flushed"
+	// without doing either would pass a test that only reads the answer — and
+	// the host publishes an environment image on the strength of that answer.
+	agents := &recordingAgents{}
+	synced := 0
+	restore := diskSync
+	diskSync = func() { synced++ }
+	t.Cleanup(func() { diskSync = restore })
+
 	execs := &recordingExecs{}
-	d, sender := flushWired(execs, boots)
+	d, sender := flushWired(execs, boots, agents)
 	d.OnControl(flushFrame(t, 77))
+
+	if agents.flushes != 1 {
+		t.Errorf("the agent's pending write was flushed %d time(s), want 1", agents.flushes)
+	}
+	if synced != 1 {
+		t.Errorf("sync(2) was called %d time(s), want 1: the host copies the file as IT sees it, so an unsynced page is a byte that never reaches the image", synced)
+	}
 
 	got := sender.events()
 	if len(got) != 1 || got[0].Kind != relay.KindFlushed {
