@@ -85,8 +85,20 @@ type ImageManifest struct {
 	SizeBytes int64 `json:"size_bytes"`
 	// InstanceID names the session whose rootfs was committed, for a snapshot.
 	// Empty for a base image, which no session on this host produced.
-	InstanceID   string    `json:"instance_id,omitempty"`
-	EnvKeys      []string  `json:"env_keys,omitempty"`
+	InstanceID string   `json:"instance_id,omitempty"`
+	EnvKeys    []string `json:"env_keys,omitempty"`
+	// Cmd is what the session that produced this image was running, recorded
+	// as description and read by nothing on the create path — which is a
+	// deliberate difference from `docker commit`, and the same conclusion the
+	// Docker driver reached by the other road.
+	//
+	// A commit records the container's own Cmd into the image, and the session
+	// that builds an environment's cache is not always a shell: a login
+	// session runs the agent's login command and exits. The Docker driver has
+	// to pin the BASE image's Cmd on the way in to stop every later session
+	// from booting that login. Here there is nothing to pin and nothing to
+	// undo — a microVM's command comes from its boot configuration over vsock,
+	// per create, and an ext4 file has no CMD to inherit in the first place.
 	Cmd          []string  `json:"cmd,omitempty"`
 	StrippedKeys []string  `json:"stripped_keys,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
