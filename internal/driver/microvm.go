@@ -494,7 +494,51 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 	// that ran first would tear the network out from under a live guest.
 	m.recoverDiskInstances()
 	m.reclaimNetworkSlots()
+	m.reclaimOrphanRootfs()
 	return m, nil
+}
+
+// reclaimOrphanRootfs removes per-session root filesystems left by a previous
+// run with no session left to own them.
+//
+// Every ordinary path takes its own copy away — Destroy, DestroyContainer, a
+// cold park, a create that failed — but a host that is powered off or a
+// runnerd that is killed mid-create takes none of them, and a copy of an
+// environment image is gigabytes. Nothing else would ever name the file again:
+// the id is in its name and there is no record with that id.
+//
+// It runs AFTER recoverDiskInstances, and only after: the records are what
+// tells a live session's rootfs from an orphan, and doing this first would
+// delete the root filesystem out from under every session that outlived its
+// runner. A failure is logged and never fatal — a host that cannot delete a
+// stale file is still a host that can run sessions.
+func (m *Microvm) reclaimOrphanRootfs() {
+	dir := filepath.Join(m.opts.StateDir, "rootfs")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	reclaimed := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		id, ok := strings.CutSuffix(e.Name(), ".ext4")
+		if !ok || checkPathSegment("instance id", id) != nil {
+			continue
+		}
+		if _, live := m.instances[id]; live {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
+			log.Printf("microvm: removing the root filesystem left behind by %s: %v", id, err)
+			continue
+		}
+		reclaimed++
+	}
+	if reclaimed > 0 {
+		log.Printf("microvm: reclaimed %d root filesystem(s) left by a previous run", reclaimed)
+	}
 }
 
 // cgroupPathFor is where the jailer puts one VM's cgroup, and therefore

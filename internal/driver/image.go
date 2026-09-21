@@ -683,7 +683,14 @@ func (h HTTPImageSource) Open(ctx context.Context, digest string) (io.ReadCloser
 	if _, _, err := parseDigest(digest); err != nil {
 		return nil, err
 	}
-	resp, err := h.get(ctx, url.PathEscape(digest)+".ext4")
+	// The digest goes into the path as it is, and needs no escaping: parseDigest
+	// above has already established it is "sha256:" and 64 lower-case hex
+	// digits, every character of which is legal in a path segment. Escaping it
+	// anyway would be the kind of defence that only ever fires when it is
+	// wrong — url.PathEscape leaves this string alone today, and a future
+	// digest form that it did NOT leave alone would be double-encoded by
+	// url.URL's own escaping on the way out.
+	resp, err := h.get(ctx, digest+".ext4")
 	if err != nil {
 		return nil, err
 	}

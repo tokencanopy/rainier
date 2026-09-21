@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 )
@@ -21,6 +22,11 @@ type fakeCloner struct {
 	// err, when set, is what every clone reports.
 	err error
 
+	// mu guards clones. A snapshot's copy and another session's create can be
+	// in flight at once — which is the point of one of the tests — so the
+	// recorder has to be safe to call from two goroutines even where the test
+	// that does it is otherwise ordered by channels.
+	mu     sync.Mutex
 	clones []clonedPair
 }
 
@@ -52,13 +58,22 @@ func (c *fakeCloner) Clone(src, dst string) (CloneMethod, error) {
 	if err := os.WriteFile(dst, data, microvmFileMode); err != nil {
 		return "", err
 	}
+	c.mu.Lock()
 	c.clones = append(c.clones, clonedPair{src: src, dst: dst, method: method})
+	c.mu.Unlock()
 	return method, nil
 }
 
+// copies is what this cloner was asked to do, in order.
+func (c *fakeCloner) copies() []clonedPair {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]clonedPair(nil), c.clones...)
+}
+
 func (c *fakeCloner) sources() []string {
-	out := make([]string, 0, len(c.clones))
-	for _, p := range c.clones {
+	out := []string{}
+	for _, p := range c.copies() {
 		out = append(out, p.src)
 	}
 	return out

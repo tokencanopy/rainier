@@ -66,8 +66,8 @@ func TestMicrovmCreateClonesTheEnvironmentImage(t *testing.T) {
 	if got := cloner.sources(); len(got) != 1 || got[0] != m.opts.BaseRootfs {
 		t.Fatalf("cloned %v, want one copy of the environment image %q", got, m.opts.BaseRootfs)
 	}
-	if cloner.clones[0].dst != want {
-		t.Errorf("cloned into %q, want %q", cloner.clones[0].dst, want)
+	if got := cloner.copies()[0].dst; got != want {
+		t.Errorf("cloned into %q, want %q", got, want)
 	}
 
 	// The workspace and the agent home are devices of their own and were
@@ -77,7 +77,7 @@ func TestMicrovmCreateClonesTheEnvironmentImage(t *testing.T) {
 		if never == "" {
 			t.Fatal("this create was meant to carry both a workspace and an agent home")
 		}
-		for _, p := range cloner.clones {
+		for _, p := range cloner.copies() {
 			if p.src == never || p.dst == never {
 				t.Errorf("%s was cloned; the workspace and the agent home are separate devices and are never part of a rootfs", never)
 			}
@@ -241,6 +241,49 @@ func TestMicrovmColdResumeClonesAFreshRootfs(t *testing.T) {
 	cfg, _ := sim.Config(h.ID)
 	if cfg.WorkspaceDiskPath != workspacePath {
 		t.Errorf("the resumed VM attached %q, want the session's workspace %q", cfg.WorkspaceDiskPath, workspacePath)
+	}
+}
+
+// TestMicrovmReclaimsOrphanRootfsOnStart: every ordinary path takes a
+// session's copy away, but a host that is powered off or a runnerd that is
+// killed mid-create takes none of them — and a copy of an environment image is
+// gigabytes that nothing would ever name again.
+//
+// The live session's copy must survive the same pass, which is the half that
+// makes this dangerous to get wrong: a session that outlived its runner is
+// running on that file.
+func TestMicrovmReclaimsOrphanRootfsOnStart(t *testing.T) {
+	stateDir := shortTempDir(t)
+	rootfsDir := filepath.Join(stateDir, "rootfs")
+	m, _, _ := testMicrovmCloning(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
+	ctx := context.Background()
+
+	live, err := m.Create(ctx, Spec{SessionID: "sess-survivor"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	liveRootfs, err := m.sessionRootfsPath(live.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What a create that was killed between its clone and its record leaves.
+	orphan := filepath.Join(rootfsDir, "mvm-99.ext4")
+	if err := os.WriteFile(orphan, []byte("an environment image nobody owns"), microvmFileMode); err != nil {
+		t.Fatal(err)
+	}
+
+	// A new runner over the same state directory: the restart.
+	restarted, _, _ := testMicrovmCloning(t, MicrovmOpts{
+		TotalSlots: 4, StateDir: stateDir, BaseRootfs: m.opts.BaseRootfs,
+	})
+	if _, err := os.Stat(orphan); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a restart kept %s, which no session owns: %v", orphan, err)
+	}
+	if _, err := os.Stat(liveRootfs); err != nil {
+		t.Fatalf("a restart removed the root filesystem of a session that outlived it: %v", err)
+	}
+	if _, ok := restarted.instances[live.ID]; !ok {
+		t.Fatal("the restart did not recover the live session, so the assertion above proves nothing")
 	}
 }
 

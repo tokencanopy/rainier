@@ -74,7 +74,8 @@ func TestMicrovmCreateBootsFromASnapshotRef(t *testing.T) {
 	}
 
 	// And it really is a copy of the published image, not of the base.
-	last := cloner.clones[len(cloner.clones)-1]
+	copies := cloner.copies()
+	last := copies[len(copies)-1]
 	if last.src != blob {
 		t.Errorf("the cached session's rootfs was cloned from %q, want %q", last.src, blob)
 	}
@@ -130,7 +131,7 @@ func TestMicrovmPrepullThenCreateBootsTheFetchedImage(t *testing.T) {
 	if string(data) != content {
 		t.Errorf("the session's rootfs is %q, want the fetched image %q", data, content)
 	}
-	if got := cloner.clones[0].src; got != cfg.BaseImagePath {
+	if got := cloner.copies()[0].src; got != cfg.BaseImagePath {
 		t.Errorf("cloned from %q, want the fetched image %q", got, cfg.BaseImagePath)
 	}
 }
