@@ -29,9 +29,10 @@ import (
 
 // LinuxHost runs `ip` and `nft` for every operation.
 type LinuxHost struct {
-	ipPath   string
-	nftPath  string
-	netnsDir string
+	ipPath     string
+	nftPath    string
+	sysctlPath string
+	netnsDir   string
 }
 
 var _ Host = (*LinuxHost)(nil)
@@ -50,10 +51,14 @@ func NewLinuxHost(netnsDir string) (*LinuxHost, error) {
 	if err != nil {
 		return nil, fmt.Errorf("netslot: nftables (`nft`) is not on PATH: ADR-0003 §4.3 requires a per-slot ruleset denying cloud metadata, the control plane and every neighbouring session, and a microVM host that cannot install one must not accept sessions: %w", err)
 	}
+	sysctl, err := exec.LookPath("sysctl")
+	if err != nil {
+		return nil, fmt.Errorf("netslot: `sysctl` is not on PATH: a slot's network namespace starts with forwarding OFF, so without it every session would have a network it cannot send a packet through: %w", err)
+	}
 	if netnsDir == "" {
 		netnsDir = DefaultNetnsDir
 	}
-	return &LinuxHost{ipPath: p, nftPath: nft, netnsDir: netnsDir}, nil
+	return &LinuxHost{ipPath: p, nftPath: nft, sysctlPath: sysctl, netnsDir: netnsDir}, nil
 }
 
 // run execs one `ip` invocation, in netns when it is named.
@@ -167,6 +172,25 @@ func (h *LinuxHost) AddRoute(ctx context.Context, netns, dst, via string) error 
 
 func (h *LinuxHost) DelRoute(ctx context.Context, netns, dst, via string) error {
 	return h.runTolerating(ctx, netns, []string{"no such process", "no such file", "cannot find device"}, "route", "delete", dst, "via", via)
+}
+
+// SetSysctl writes one kernel parameter inside netns.
+//
+// Through `ip netns exec` and `sysctl` rather than an os.WriteFile of
+// /proc/sys/...: the net.* tree is per network namespace, and a write from
+// this process would land in the HOST's namespace — turning forwarding on
+// for the whole machine instead of for one slot, which is both wrong and
+// considerably worse than doing nothing.
+func (h *LinuxHost) SetSysctl(ctx context.Context, netns, key, value string) error {
+	if netns == "" {
+		return fmt.Errorf("netslot: refusing to set %s=%s in the host's own namespace; this is only ever a per-slot setting", key, value)
+	}
+	cmd := exec.CommandContext(ctx, h.ipPath, "netns", "exec", netns, h.sysctlPath, "-w", key+"="+value)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("sysctl -w %s=%s in %s: %w: %s", key, value, netns, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 // nft runs one `nft` invocation inside netns, with stdin as the script.

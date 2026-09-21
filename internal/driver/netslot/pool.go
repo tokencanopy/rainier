@@ -62,10 +62,19 @@ type Pool struct {
 	// teardown first, which is how a transient nft or ip failure heals
 	// in-process instead of draining the host until the next restart.
 	leaked map[int]struct{}
-	// foreign is every index whose namespace existed at construction and was
-	// not ours to reclaim. It is a snapshot, never refreshed: a name that
-	// appears later belongs to whoever created it, and Allocate finds out by
-	// failing to create the namespace rather than by polling.
+	// foreign is every index whose namespace this pool tried to create and
+	// found already there, having not created it itself. Something else on
+	// this host is using our naming scheme, and the one safe thing to do
+	// with such an index is never to touch it again — deleting it would
+	// delete another program's namespace.
+	//
+	// It is populated ONLY from that collision, and only when the namespace
+	// is confirmed to exist. A create that failed for any other reason (no
+	// capability, a cancelled context) marks the index leaked instead, which
+	// is recoverable: a leaked index is handed out again once nothing clean
+	// is left, and the allocation that takes it tears it down first. An
+	// index retired here is not recoverable in this process's lifetime,
+	// which is why the bar for it is "the namespace is demonstrably there".
 	foreign map[int]struct{}
 }
 
@@ -104,15 +113,32 @@ func (p *Pool) SlotFor(idx int, key string) (*Slot, error) { return p.cfg.newSlo
 // over: the partially built slot is torn down before the error is returned,
 // and if the teardown itself fails the index is marked leaked rather than
 // returned to the free list.
+//
+// It LOOPS, because one failure is not a failure of the allocation: an index
+// whose namespace turns out to belong to something else on this host is
+// retired and the next one is tried, the way E2B's Acquire scans past a
+// namespace it did not create. The loop is bounded — every turn either
+// returns or retires an index — so a host whose whole range has been taken
+// over answers ErrNoSlots rather than spinning.
 func (p *Pool) Allocate(ctx context.Context, key string) (*Slot, error) {
+	for {
+		slot, retry, err := p.allocateOnce(ctx, key)
+		if retry {
+			continue
+		}
+		return slot, err
+	}
+}
+
+func (p *Pool) allocateOnce(ctx context.Context, key string) (_ *Slot, retry bool, _ error) {
 	idx, wasLeaked, err := p.take()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	slot, err := p.cfg.newSlot(idx, key)
 	if err != nil {
 		p.giveBack(idx, false)
-		return nil, err
+		return nil, false, err
 	}
 
 	// A leaked index still has a namespace on the host, and everything keyed
@@ -122,43 +148,74 @@ func (p *Pool) Allocate(ctx context.Context, key string) (*Slot, error) {
 	if wasLeaked {
 		if err := p.teardown(ctx, slot); err != nil {
 			p.giveBack(idx, true)
-			return nil, fmt.Errorf("netslot: reclaiming leaked slot %d before reuse: %w", idx, err)
+			return nil, false, fmt.Errorf("netslot: reclaiming leaked slot %d before reuse: %w", idx, err)
 		}
 	}
 
 	// The namespace is created on its own, before anything that would need
-	// undoing, because a failure HERE means the name is taken by something
-	// this pool did not create. Tearing that down would delete another
-	// program's namespace, so the index is recorded as foreign and never
-	// offered again in this process's lifetime.
+	// undoing, because its failure has to be told apart from every other
+	// failure here.
+	//
+	//   - The name is taken, and this pool did not take it. Something else on
+	//     the host uses our naming scheme. Deleting it would delete another
+	//     program's namespace, so the index is retired for good and the next
+	//     one is tried.
+	//   - Anything else — no capability, a cancelled context, ENOMEM. The
+	//     index is marked LEAKED, not retired: leaked is recoverable (the
+	//     next allocation that reaches it tears it down first, and tearing
+	//     down a namespace that was never created succeeds), and a runner
+	//     that lost CAP_NET_ADMIN for a minute must not come back with a
+	//     permanently smaller host.
 	if err := p.host.AddNetns(ctx, slot.Netns); err != nil {
-		p.mu.Lock()
-		delete(p.inUse, idx)
-		delete(p.leaked, idx)
-		p.foreign[idx] = struct{}{}
-		p.mu.Unlock()
-		return nil, fmt.Errorf("netslot: creating namespace %s: %w; a namespace of that name this runner did not create is left alone, and slot %d is retired for the lifetime of this process", slot.Netns, err, idx)
+		if p.namespaceExists(ctx, slot.Netns) {
+			p.retire(idx)
+			return nil, true, nil
+		}
+		p.giveBack(idx, true)
+		return nil, false, fmt.Errorf("netslot: creating namespace %s: %w", slot.Netns, err)
 	}
 
 	if err := p.setup(ctx, slot); err != nil {
 		if terr := p.teardown(ctx, slot); terr != nil {
 			p.giveBack(idx, true)
-			return nil, errors.Join(err, fmt.Errorf("netslot: cleaning up slot %d after a failed setup: %w", idx, terr))
+			return nil, false, errors.Join(err, fmt.Errorf("netslot: cleaning up slot %d after a failed setup: %w", idx, terr))
 		}
 		p.giveBack(idx, false)
-		return nil, err
+		return nil, false, err
 	}
 
 	p.mu.Lock()
 	p.inUse[idx] = slot
 	p.mu.Unlock()
-	return slot, nil
+	return slot, false, nil
+}
+
+// namespaceExists reports whether the host currently has a namespace by that
+// name. A listing this cannot read answers false: the caller's other branch
+// is recoverable and this one is not, so an unreadable host must not be able
+// to retire an index permanently.
+func (p *Pool) namespaceExists(ctx context.Context, name string) bool {
+	names, err := p.host.ListNetns(ctx)
+	if err != nil {
+		return false
+	}
+	return slices.Contains(names, name)
+}
+
+// retire takes an index out of circulation for the lifetime of this process.
+// See Pool.foreign.
+func (p *Pool) retire(idx int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.inUse, idx)
+	delete(p.leaked, idx)
+	p.foreign[idx] = struct{}{}
 }
 
 // Adopt records an index as in use WITHOUT building anything, for a slot a
 // previous runnerd built and whose session outlived it. An index already in
-// use, foreign, or outside the envelope is refused: two sessions sharing one
-// slot is two guests on one address.
+// use, retired as foreign, or outside the envelope is refused: two sessions
+// sharing one slot is two guests on one address.
 func (p *Pool) Adopt(idx int, key string) (*Slot, error) {
 	slot, err := p.cfg.newSlot(idx, key)
 	if err != nil {
@@ -168,6 +225,9 @@ func (p *Pool) Adopt(idx int, key string) (*Slot, error) {
 	defer p.mu.Unlock()
 	if held, ok := p.inUse[idx]; ok {
 		return nil, fmt.Errorf("netslot: slot %d is already held by %q", idx, held.Key)
+	}
+	if _, theirs := p.foreign[idx]; theirs {
+		return nil, fmt.Errorf("netslot: slot %d was retired: its namespace belongs to something this runner did not create", idx)
 	}
 	delete(p.leaked, idx)
 	p.inUse[idx] = slot
@@ -210,7 +270,19 @@ func (p *Pool) Release(ctx context.Context, slot *Slot) error {
 // before any host-side state that belongs to a slot, and deleted after all of
 // it, so a name that is present means "this index may still have state" and
 // its absence means it does not. Anything in the namespace directory that is
-// not ours by name is remembered as foreign and never touched again.
+// not ours by name is left alone.
+//
+// It reclaims indexes ABOVE this runner's current slot count as well, which
+// the allocator itself would never hand out. An operator who shrinks --slots
+// is the ordinary way that happens, and a leftover the allocator cannot name
+// is a leftover nothing would ever clean up.
+//
+// What it cannot reconcile is a slot built under DIFFERENT addressing: the
+// host-side route it deletes is derived from this run's guest and uplink
+// ranges, so changing --microvm-guest-cidr or --microvm-uplink-cidr between
+// runs leaves the previous run's host route behind with nothing left to find
+// it by. Changing those ranges on a host with sessions on it is a drain, not
+// a restart.
 //
 // It returns how many slots it reclaimed. Callers run it AFTER re-associating
 // their own surviving sessions (see Adopt): a slot someone holds is not a
@@ -227,7 +299,7 @@ func (p *Pool) Reclaim(ctx context.Context) (int, error) {
 		errs      []error
 	)
 	for _, name := range names {
-		idx, ours := p.cfg.netnsIndex(name)
+		idx, ours := p.cfg.netnsIndexAny(name)
 		if !ours {
 			continue
 		}
@@ -238,15 +310,26 @@ func (p *Pool) Reclaim(ctx context.Context) (int, error) {
 			continue
 		}
 
-		slot, err := p.cfg.newSlot(idx, fmt.Sprintf("reclaim-%d", idx))
+		// Unbounded, so an index above this runner's slot count still gets
+		// torn down. It is only ever used to name what to REMOVE.
+		//
+		// The one thing that can fail here is an index whose /30 does not
+		// fit the configured ranges — a leftover from a run with different
+		// addressing. It is reported and left alone rather than half torn
+		// down: this pool cannot name the host route that belongs to it, so
+		// deleting its namespace would remove the only handle anything has
+		// on the rest.
+		slot, err := p.cfg.newSlotUnbounded(idx, fmt.Sprintf("reclaim-%d", idx))
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, fmt.Errorf("netslot: %s is not reconcilable under this runner's addressing and was left alone: %w", name, err))
 			continue
 		}
 		if err := p.teardown(ctx, slot); err != nil {
-			p.mu.Lock()
-			p.leaked[idx] = struct{}{}
-			p.mu.Unlock()
+			if idx <= p.cfg.slots {
+				p.mu.Lock()
+				p.leaked[idx] = struct{}{}
+				p.mu.Unlock()
+			}
 			errs = append(errs, fmt.Errorf("netslot: reclaiming leftover slot %d: %w", idx, err))
 			continue
 		}
@@ -337,6 +420,16 @@ func (p *Pool) setup(ctx context.Context, s *Slot) error {
 	}
 	if err := p.host.LinkUp(ctx, s.Netns, s.Tap); err != nil {
 		return fmt.Errorf("netslot: bringing %s up: %w", s.Tap, err)
+	}
+	// A guest's packet arrives on the TAP and leaves on the veth, which is
+	// forwarding — and a freshly created network namespace has forwarding
+	// OFF. Without this every microVM has a link, an address, a route and a
+	// firewall, and cannot send a packet through any of them.
+	//
+	// It is namespaced, so this turns forwarding on for ONE slot and not for
+	// the host.
+	if err := p.host.SetSysctl(ctx, s.Netns, "net.ipv4.ip_forward", "1"); err != nil {
+		return fmt.Errorf("netslot: enabling forwarding in %s: %w", s.Netns, err)
 	}
 	// Inside the namespace the way out is the host end of the veth pair;
 	// from the host the way in to the guest's /30 is the namespace end.

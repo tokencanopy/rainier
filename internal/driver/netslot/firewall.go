@@ -95,8 +95,14 @@ const metadataAddress = "169.254.169.254"
 //     IPv4-only, so any IPv6 is either link-local autoconfiguration or an
 //     attempt to reach a denied destination by a family the deny list below
 //     does not name.
-//  3. Established and related return traffic is accepted, so that answers to
-//     a connection this chain already allowed come back.
+//  3. Established traffic is accepted, so later packets of a connection this
+//     chain already allowed are not re-evaluated. ESTABLISHED and not
+//     RELATED: a RELATED match covers conntrack helper expectations, and a
+//     helper active in this namespace would let a guest talking to the
+//     allowed proxy conjure an expectation for some other address and walk
+//     straight past the deny set. Nothing the guest legitimately sends is
+//     RELATED — the answers to its connections arrive on the veth, which
+//     rule 1 has already returned on.
 //  4. The egress proxy, at exactly one address and one port. This is the
 //     ONLY host-side destination a guest may reach (ADR-0003 §4.3). It is
 //     above the deny rules deliberately: the proxy lives on the host's own
@@ -128,7 +134,7 @@ table inet {{ .Table }} {
 		type filter hook prerouting priority -150; policy accept;
 		iifname != "{{ .Tap }}" return
 		meta nfproto ipv6 drop
-		ct state established,related accept
+		ct state established accept
 {{- if .Proxy }}
 		ip daddr {{ .Proxy }} tcp dport {{ .ProxyPort }} accept
 {{- end }}
@@ -171,11 +177,13 @@ func (r resolved) deniedFor() []string {
 	return denied
 }
 
-// dedupeRanges drops exact duplicates. It does NOT merge overlaps: nftables
-// interval sets refuse overlapping elements, and the ranges that can overlap
-// here are the ones an operator configured (a control-plane range inside
-// RFC1918, or a slot range inside it), so the one that must go is the
-// narrower one, not the broader.
+// dedupeRanges returns a non-overlapping set, which is what an nftables
+// interval set requires.
+//
+// CIDR prefixes either nest or are disjoint, so "non-overlapping" here means
+// dropping any range another one already covers. Broadest first, so the one
+// dropped is always the narrower — a control-plane range inside RFC1918, or a
+// slot range inside it, is already denied by the range that contains it.
 func dedupeRanges(cidrs []string) []string {
 	parsed := make([]netip.Prefix, 0, len(cidrs))
 	for _, c := range cidrs {

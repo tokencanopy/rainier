@@ -43,6 +43,7 @@ type FakeHost struct {
 	ns     map[string]bool
 	links  map[string]bool   // "netns/link"
 	rules  map[string]string // netns -> the ruleset last applied there
+	sysctl map[string]string // "netns key" -> value
 	failOn map[string]error
 }
 
@@ -54,6 +55,7 @@ func NewFakeHost() *FakeHost {
 		ns:     make(map[string]bool),
 		links:  make(map[string]bool),
 		rules:  make(map[string]string),
+		sysctl: make(map[string]string),
 		failOn: make(map[string]error),
 	}
 }
@@ -223,6 +225,25 @@ func (f *FakeHost) AddRoute(_ context.Context, netns, dst, via string) error {
 
 func (f *FakeHost) DelRoute(_ context.Context, netns, dst, via string) error {
 	return f.record("route-del", netns, dst, via)
+}
+
+func (f *FakeHost) SetSysctl(_ context.Context, netns, key, value string) error {
+	if err := f.record("sysctl", netns, key, value); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sysctl[netns+" "+key] = value
+	return nil
+}
+
+// Sysctl returns the value last set for key in netns, and whether one was
+// set at all.
+func (f *FakeHost) Sysctl(netns, key string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.sysctl[netns+" "+key]
+	return v, ok
 }
 
 func (f *FakeHost) ApplyNft(_ context.Context, netns, ruleset string) error {

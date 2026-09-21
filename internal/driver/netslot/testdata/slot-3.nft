@@ -25,7 +25,7 @@ table inet rnr-slot-3 {
 		type filter hook prerouting priority -150; policy accept;
 		iifname != "rnr-tap-3" return
 		meta nfproto ipv6 drop
-		ct state established,related accept
+		ct state established accept
 		ip daddr 10.44.0.9 tcp dport 3128 accept
 		ip daddr 169.254.169.254 drop
 		ip daddr @denied4 drop

@@ -156,6 +156,9 @@ func (c Config) resolve() (resolved, error) {
 		if c.ProxyPort <= 0 || c.ProxyPort > 65535 {
 			return resolved{}, fmt.Errorf("netslot: egress proxy address %s was given without a usable port (%d); an allow rule with no port would open every port on the host that answers at that address", c.ProxyAddr, c.ProxyPort)
 		}
+		if err := checkProxyDestination(addr, r.guest, r.uplink); err != nil {
+			return resolved{}, err
+		}
 		r.proxyAddr, r.proxyPort, r.hasProxy = addr, c.ProxyPort, true
 	}
 
@@ -171,6 +174,48 @@ func (c Config) resolve() (resolved, error) {
 	}
 
 	return r, nil
+}
+
+// forbiddenProxyRanges are the places an egress proxy may not be, because
+// the accept rule that names it sits ABOVE every drop in the ruleset.
+//
+// The rule ordering is not negotiable: the proxy lives on the host's own
+// network, which the deny set covers wholesale, so an accept below the drops
+// would never match. That makes the proxy address the one value in this
+// configuration that can turn a control off by being set to the thing the
+// control exists to block — `--microvm-egress-proxy 169.254.169.254:80`
+// would render a ruleset explicitly permitting the cloud metadata service.
+// So the address is checked here instead.
+//
+// RFC1918 is deliberately absent: a proxy on the host's private network is
+// the ordinary case, and the accept-above-drop ordering is exactly what
+// makes it reachable.
+var forbiddenProxyRanges = []struct {
+	cidr string
+	why  string
+}{
+	{"169.254.0.0/16", "link-local, which carries the cloud metadata service the per-slot firewall exists to deny"},
+	{"127.0.0.0/8", "loopback, which in a slot's namespace is the slot's own"},
+	{"0.0.0.0/8", "not a destination"},
+	{"224.0.0.0/4", "multicast"},
+	{"240.0.0.0/4", "reserved"},
+}
+
+// checkProxyDestination refuses an egress proxy the firewall must not be
+// asked to permit.
+func checkProxyDestination(addr netip.Addr, guest, uplink netip.Prefix) error {
+	for _, r := range forbiddenProxyRanges {
+		p := netip.MustParsePrefix(r.cidr)
+		if p.Contains(addr) {
+			return fmt.Errorf("netslot: the egress proxy may not be at %s: it is inside %s (%s). The proxy is the one host-side destination the per-slot firewall allows, and its rule sits above every drop, so pointing it here would turn that denial off", addr, r.cidr, r.why)
+		}
+	}
+	for what, p := range map[string]netip.Prefix{"guest": guest, "uplink": uplink} {
+		if p.Contains(addr) {
+			return fmt.Errorf("netslot: the egress proxy may not be at %s: it is inside this host's own %s slot range %s, so allowing it would allow a neighbouring session's address", addr, what, p)
+		}
+	}
+	return nil
 }
 
 // parseHostRange parses one of the two configurable ranges. It insists on a

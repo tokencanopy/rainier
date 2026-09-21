@@ -56,6 +56,11 @@ func TestEgressProxyEndpoint(t *testing.T) {
 			explicit: "10.44.0.9:not-a-port",
 			wantErr:  "not a port",
 		},
+		{
+			name:     "an IPv6 proxy no guest could reach",
+			explicit: "[fd00::1]:3128",
+			wantErr:  "IPv6",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

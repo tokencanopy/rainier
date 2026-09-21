@@ -117,9 +117,25 @@ func nth(block netip.Prefix, n uint32) netip.Addr {
 	return netip.AddrFrom4([4]byte{byte(word >> 24), byte(word >> 16), byte(word >> 8), byte(word)})
 }
 
-// newSlot derives every name and address for idx.
+// newSlot derives every name and address for idx, refusing an index this
+// host would never hand out.
 func (r resolved) newSlot(idx int, key string) (*Slot, error) {
-	if idx < 1 || idx > r.slots {
+	if idx > r.slots {
+		return nil, fmt.Errorf("netslot: slot index %d is outside [1, %d]", idx, r.slots)
+	}
+	return r.newSlotUnbounded(idx, key)
+}
+
+// newSlotUnbounded is newSlot without the slot-count check, for RECLAIM and
+// nothing else.
+//
+// An operator who shrinks --slots leaves namespaces above the new count on
+// the host, and a reclaim that could not name them would be a reclaim that
+// leaks exactly the slots the resize orphaned. The addresses still have to
+// fit the configured ranges — slotBlock enforces that — so this can name a
+// leftover to remove but never invent one outside the host's own envelope.
+func (r resolved) newSlotUnbounded(idx int, key string) (*Slot, error) {
+	if idx < 1 {
 		return nil, fmt.Errorf("netslot: slot index %d is outside [1, %d]", idx, r.slots)
 	}
 	guestBlock, err := slotBlock(r.guest, idx)
@@ -152,16 +168,21 @@ func (r resolved) netnsName(idx int) string {
 	return fmt.Sprintf("%s-ns-%d", r.prefix, idx)
 }
 
-// netnsIndex is netnsName's inverse, and the reason Reclaim can work from
-// nothing but a directory listing. A name that is not ours, or names an index
-// outside this host's envelope, is not claimed.
-func (r resolved) netnsIndex(name string) (int, bool) {
+// netnsIndexAny is netnsName's inverse, and the reason Reclaim can work from
+// nothing but a directory listing. A name that is not ours is not claimed.
+//
+// It deliberately does NOT bound the index by the host's slot count. An
+// operator who shrinks --slots leaves namespaces above the new count behind,
+// and refusing to read their names is refusing to clean them up — ever, in
+// this run or any later one. The bound belongs on what is handed OUT
+// (newSlot), not on what is recognised as ours.
+func (r resolved) netnsIndexAny(name string) (int, bool) {
 	rest, ok := strings.CutPrefix(name, r.prefix+"-ns-")
 	if !ok || rest == "" {
 		return 0, false
 	}
 	idx, err := strconv.Atoi(rest)
-	if err != nil || idx < 1 || idx > r.slots {
+	if err != nil || idx < 1 {
 		return 0, false
 	}
 	return idx, true

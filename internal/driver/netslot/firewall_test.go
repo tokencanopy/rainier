@@ -92,8 +92,14 @@ func TestTheProxyIsTheOnlyAllowedDestination(t *testing.T) {
 	if len(accepts) != 2 {
 		t.Fatalf("accept rules = %v, want exactly two: return traffic and the proxy", accepts)
 	}
-	if accepts[0] != "ct state established,related accept" {
-		t.Fatalf("first accept = %q, want the established/related rule", accepts[0])
+	if accepts[0] != "ct state established accept" {
+		t.Fatalf("first accept = %q, want the established rule", accepts[0])
+	}
+	// ESTABLISHED and not RELATED: a RELATED match covers conntrack helper
+	// expectations, which a guest talking to the allowed proxy could use to
+	// conjure an accept for some other address ahead of the deny set.
+	if strings.Contains(rs, "related") {
+		t.Fatalf("the ruleset accepts RELATED traffic from the guest:\n%s", rs)
 	}
 	if accepts[1] != "ip daddr 10.44.0.9 tcp dport 3128 accept" {
 		t.Fatalf("second accept = %q, want the egress proxy and nothing else", accepts[1])
@@ -173,14 +179,8 @@ func TestNeighbourSlotsAndTheHostAreDenied(t *testing.T) {
 
 	// And the boundary is not simply "deny everything": a public address is
 	// left to egressd's allowlist, which is where egress policy belongs.
-	for what, addr := range map[string]string{
-		"a public address": "93.184.216.34",
-		"the egress proxy": cfg.ProxyAddr,
-	} {
-		ip := netip.MustParseAddr(addr)
-		if what == "a public address" && anyContains(denied, ip) {
-			t.Errorf("%s (%s) is denied by the slot ruleset; egress policy belongs to egressd, not here", what, addr)
-		}
+	if public := netip.MustParseAddr("93.184.216.34"); anyContains(denied, public) {
+		t.Errorf("the public address %s is denied by the slot ruleset; egress policy belongs to egressd, not here", public)
 	}
 	// The proxy IS inside a denied range (it is on the host's own network) —
 	// which is exactly why the accept rule has to come first.
@@ -194,14 +194,20 @@ func TestNeighbourSlotsAndTheHostAreDenied(t *testing.T) {
 	}
 }
 
-// TestSlotRangesOutsideRFC1918AreNamedExplicitly: the deny set collapses
-// ranges that are already covered, so an operator who puts the slots inside
-// 10/8 sees one entry — but one who puts them somewhere public-ish must see
-// them named, or neighbours would be reachable.
-func TestSlotRangesOutsideRFC1918AreNamedExplicitly(t *testing.T) {
+// TestSlotRangesOutsideTheConstantsAreNamedExplicitly is the test of the one
+// line that puts THIS host's slot ranges in the deny set.
+//
+// The ranges have to be outside every constant in alwaysDenied for the test
+// to mean anything: pick 10.201.0.0/16, or anything else inside 10/8, and
+// dedupeRanges drops it as already covered, the neighbour is denied by the
+// constant, and deleting the line under test leaves the assertion green.
+// 192.0.2.0/24 and 203.0.113.0/24 are documentation ranges covered by none
+// of the constants, so the only thing that can deny the neighbour here is
+// the line this test is for.
+func TestSlotRangesOutsideTheConstantsAreNamedExplicitly(t *testing.T) {
 	cfg := Config{
-		GuestCIDR:  "100.120.0.0/16",
-		UplinkCIDR: "100.121.0.0/16",
+		GuestCIDR:  "192.0.2.0/24",
+		UplinkCIDR: "203.0.113.0/24",
 		Slots:      4,
 		NamePrefix: "rnr",
 	}
@@ -216,8 +222,69 @@ func TestSlotRangesOutsideRFC1918AreNamedExplicitly(t *testing.T) {
 		t.Fatalf("Ruleset: %v", err)
 	}
 	denied := deniedPrefixes(t, rs)
+
+	// The ranges themselves, by name.
+	var sawGuest, sawUplink bool
+	for _, p := range denied {
+		switch p.String() {
+		case "192.0.2.0/24":
+			sawGuest = true
+		case "203.0.113.0/24":
+			sawUplink = true
+		}
+	}
+	if !sawGuest || !sawUplink {
+		t.Fatalf("this host's own slot ranges are not in the deny set: %v", denied)
+	}
+	// And no constant would have covered them, so the line above is the only
+	// thing denying the neighbour.
+	for _, constant := range alwaysDenied {
+		if netip.MustParsePrefix(constant).Contains(neighbour.GuestIP) {
+			t.Fatalf("the neighbour at %s is inside the constant %s, so this test would pass without the slot ranges", neighbour.GuestIP, constant)
+		}
+	}
 	if !anyContains(denied, neighbour.GuestIP) {
 		t.Fatalf("the neighbour at %s is reachable; denied ranges were %v", neighbour.GuestIP, denied)
+	}
+}
+
+// TestTheProxyMayNotBeSomewhereTheFirewallDenies. The proxy's accept rule
+// sits above every drop, so its address is the one value in this
+// configuration that can turn a control off by being set to the thing the
+// control exists to block.
+func TestTheProxyMayNotBeSomewhereTheFirewallDenies(t *testing.T) {
+	cases := []struct {
+		name string
+		addr string
+		want string
+	}{
+		{"the metadata service", "169.254.169.254", "link-local"},
+		{"link-local", "169.254.1.1", "link-local"},
+		{"loopback", "127.0.0.1", "loopback"},
+		{"multicast", "239.1.2.3", "multicast"},
+		{"this host's guest range", "10.201.0.9", "guest slot range"},
+		{"this host's uplink range", "10.202.0.9", "uplink slot range"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := goldenConfig()
+			cfg.ProxyAddr = tc.addr
+			_, err := New(cfg, NewFakeHost())
+			if err == nil {
+				t.Fatalf("a runner was configured with its egress proxy at %s", tc.addr)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want it to name %q", err, tc.want)
+			}
+		})
+	}
+
+	// And the ordinary case still works: a proxy on the host's RFC1918
+	// network is exactly what the accept-above-drop ordering is for.
+	cfg := goldenConfig()
+	cfg.ProxyAddr = "10.44.0.9"
+	if _, err := New(cfg, NewFakeHost()); err != nil {
+		t.Fatalf("a proxy on the host's private network was refused: %v", err)
 	}
 }
 

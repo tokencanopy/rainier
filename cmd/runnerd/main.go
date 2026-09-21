@@ -236,8 +236,16 @@ func egressProxyEndpoint(explicit, proxyURL string) (string, int, error) {
 	if err != nil {
 		return "", 0, fmt.Errorf("the egress proxy endpoint %q is not ip:port; pass --microvm-egress-proxy: %w", raw, err)
 	}
-	if net.ParseIP(host) == nil {
+	ip := net.ParseIP(host)
+	if ip == nil {
 		return "", 0, fmt.Errorf("the egress proxy %q names a host and not an address. The per-slot firewall allows exactly one host-side destination (ADR-0003 §4.3) and it must be an IP: a rule naming a host is a rule the guest can move by answering a DNS query. Pass --microvm-egress-proxy=ip:port", host)
+	}
+	// Refused here rather than three layers down, where the message would be
+	// about a rendered ruleset: the guest link is IPv4 and the per-slot
+	// firewall drops IPv6 from the guest outright, so a v6 proxy is a proxy
+	// no session could reach.
+	if ip.To4() == nil {
+		return "", 0, fmt.Errorf("the egress proxy %q is IPv6. A microVM guest's link is IPv4 and its firewall drops IPv6 from the guest outright, so no session could reach it; give the proxy's IPv4 address", host)
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port <= 0 || port > 65535 {

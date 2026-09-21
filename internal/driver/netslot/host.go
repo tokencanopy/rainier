@@ -65,6 +65,12 @@ type Host interface {
 	// address.
 	AddRoute(ctx context.Context, netns, dst, via string) error
 
+	// SetSysctl sets a kernel parameter inside netns. The net.* tree is
+	// per-namespace, which is the whole reason this is here rather than an
+	// os.WriteFile: a slot needs net.ipv4.ip_forward on in ITS namespace and
+	// nowhere else.
+	SetSysctl(ctx context.Context, netns, key, value string) error
+
 	// DelRoute removes a route. An absent route is success.
 	DelRoute(ctx context.Context, netns, dst, via string) error
 

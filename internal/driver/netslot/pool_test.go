@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -112,6 +113,7 @@ func TestAllocateBuildsTheWholeSlotInOrder(t *testing.T) {
 		{Verb: "tap-add", Netns: "rnr-ns-1", Args: []string{"rnr-tap-1", "02:fc:00:01:00:01"}},
 		{Verb: "addr-add", Netns: "rnr-ns-1", Args: []string{"rnr-tap-1", "10.201.0.5/30"}},
 		{Verb: "link-up", Netns: "rnr-ns-1", Args: []string{"rnr-tap-1"}},
+		{Verb: "sysctl", Netns: "rnr-ns-1", Args: []string{"net.ipv4.ip_forward", "1"}},
 		{Verb: "route-add", Netns: "rnr-ns-1", Args: []string{"default", "10.202.0.5"}},
 		{Verb: "route-add", Args: []string{"10.201.0.4/30", "10.202.0.6"}},
 		{Verb: "nft-apply", Netns: "rnr-ns-1", Args: []string{"<ruleset>"}},
@@ -259,11 +261,15 @@ func TestReclaimFreesOrphansFromAPreviousRun(t *testing.T) {
 	}
 
 	n, err := p.Reclaim(context.Background())
-	if err != nil {
-		t.Fatalf("Reclaim: %v", err)
+	// rnr-ns-99999 is index-shaped and carries this runner's prefix, but its
+	// /30 does not fit the configured range — a leftover from a run with
+	// different addressing. Reclaim reports it and leaves it alone rather
+	// than deleting the one handle anything has on the rest of its state.
+	if err == nil || !strings.Contains(err.Error(), "rnr-ns-99999") {
+		t.Fatalf("Reclaim = %v, want it to report rnr-ns-99999 as not reconcilable", err)
 	}
 	if n != 1 {
-		t.Fatalf("Reclaim freed %d slots, want 1 (slot 1; slot 2 is held, the others are not ours)", n)
+		t.Fatalf("Reclaim freed %d slots, want 1 (slot 1; slot 2 is held, the others it cannot name)", n)
 	}
 	got := host.Namespaces()
 	want := []string{"docker0-ns", "rnr-ns-2", "rnr-ns-99999"}
@@ -277,9 +283,9 @@ func TestReclaimFreesOrphansFromAPreviousRun(t *testing.T) {
 	}
 }
 
-// TestReclaimLeavesForeignNamespacesAlone: a host may run other things. An
-// index whose namespace is not ours is never allocated and never deleted.
-func TestReclaimLeavesForeignNamespacesAlone(t *testing.T) {
+// TestReclaimLeavesNamespacesThatAreNotOursAlone: a host may run other
+// things, and a name that is not ours is never allocated and never deleted.
+func TestReclaimLeavesNamespacesThatAreNotOursAlone(t *testing.T) {
 	host := NewFakeHost()
 	host.Preexisting("cni-abc", "rnr-ns-x")
 
@@ -292,10 +298,99 @@ func TestReclaimLeavesForeignNamespacesAlone(t *testing.T) {
 		t.Fatalf("Reclaim: %v", err)
 	}
 	if n != 0 {
-		t.Fatalf("Reclaim touched %d foreign namespaces, want 0", n)
+		t.Fatalf("Reclaim touched %d namespaces that are not ours, want 0", n)
 	}
 	if got := len(host.Namespaces()); got != 2 {
-		t.Fatalf("foreign namespaces after reclaim = %d, want 2", got)
+		t.Fatalf("namespaces after reclaim = %d, want 2", got)
+	}
+}
+
+// TestReclaimCleansUpAboveTheCurrentSlotCount is the operator who shrank
+// --slots. The allocator would never hand out index 9 on a four-slot host,
+// so if reclaim refused to recognise the name too, the namespaces the resize
+// orphaned would be orphaned for good — in this run and every later one.
+func TestReclaimCleansUpAboveTheCurrentSlotCount(t *testing.T) {
+	host := NewFakeHost()
+	host.Preexisting("rnr-ns-2", "rnr-ns-9")
+
+	p, err := New(testConfig(4), host)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	n, err := p.Reclaim(context.Background())
+	if err != nil {
+		t.Fatalf("Reclaim: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("Reclaim freed %d slots, want 2 (including the one above the envelope)", n)
+	}
+	if got := host.Namespaces(); len(got) != 0 {
+		t.Fatalf("namespaces after reclaim = %v, want none", got)
+	}
+
+	// Reclaiming an index does not make it allocatable: the envelope is
+	// still four.
+	if _, err := p.SlotFor(9, "x"); err == nil {
+		t.Fatal("an index above the slot count was handed out")
+	}
+}
+
+// TestANamespaceSomebodyElseCreatedRetiresItsIndex. Something else on the
+// host using our naming scheme is the one case where deleting a namespace
+// would be deleting another program's, so that index is retired and the next
+// one is used instead — and the allocation still succeeds.
+func TestANamespaceSomebodyElseCreatedRetiresItsIndex(t *testing.T) {
+	host := NewFakeHost()
+	p, err := New(testConfig(4), host)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Planted AFTER construction, so reclaim is not what deals with it: this
+	// is a name that appeared while the runner was up.
+	host.Preexisting("rnr-ns-1")
+
+	slot, err := p.Allocate(context.Background(), "mvm-1")
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	if slot.Index != 2 {
+		t.Fatalf("the allocation took index %d, want 2 — index 1 is somebody else's", slot.Index)
+	}
+	if !slices.Contains(host.Namespaces(), "rnr-ns-1") {
+		t.Fatal("the namespace this runner did not create was deleted")
+	}
+	// And it stays retired: nothing hands it out later, and nothing adopts
+	// it either.
+	if _, err := p.Adopt(1, "mvm-x"); err == nil {
+		t.Fatal("a retired index was adopted")
+	}
+}
+
+// TestATransientCreateFailureDoesNotRetireTheIndex is the other half, and
+// the one that matters operationally: a runner that lost CAP_NET_ADMIN for a
+// minute, or a create whose context was cancelled, must not come back with a
+// permanently smaller host. The index is LEAKED, which is recoverable,
+// rather than retired, which is not.
+func TestATransientCreateFailureDoesNotRetireTheIndex(t *testing.T) {
+	host := NewFakeHost()
+	p, err := New(testConfig(2), host)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	host.FailOn("netns-add", errors.New("operation not permitted"))
+	for range 4 {
+		if _, err := p.Allocate(ctx, "mvm-x"); err == nil {
+			t.Fatal("Allocate succeeded with a failing netns-add")
+		}
+	}
+
+	host.FailOn("netns-add", nil)
+	for i := range 2 {
+		if _, err := p.Allocate(ctx, fmt.Sprintf("mvm-%d", i)); err != nil {
+			t.Fatalf("the host recovered but slot %d was still unavailable: %v", i, err)
+		}
 	}
 }
 

@@ -530,6 +530,16 @@ func checkMicrovmHost(opts MicrovmOpts) error {
 		}
 	}
 
+	// ADR-0003 §4.3 lists the regional control-plane ranges among the drops
+	// every guest must be behind, and they are the one item on that list a
+	// deployment has to supply. A host given none is not misconfigured — a
+	// control plane inside RFC1918 is already covered by the standing
+	// ranges — but it is worth saying out loud rather than leaving an
+	// operator to infer it from a rendered ruleset.
+	if len(opts.ControlPlaneCIDRs) == 0 {
+		log.Print("microvm: no --microvm-control-plane-cidr given, so the per-slot firewall denies only its standing ranges (cloud metadata, link-local, RFC1918, this host's slot ranges). A control plane outside those is reachable from a guest unless it is named.")
+	}
+
 	// Machine facts, last, because an operator cannot change them with a
 	// flag and the configuration above is what they came to fix.
 	kvm, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
@@ -715,6 +725,46 @@ func (m *Microvm) reassociateSlot(rec *instanceRecord) {
 	}
 	rec.slot = slot
 	applySlot(&rec.Cfg, slot)
+}
+
+// detachIdleSlot takes the network slot off a record that has stopped
+// occupying this host, and hands it back for the caller to release with the
+// driver mutex released.
+//
+// It exists because a record can stop occupying the host WITHOUT this driver
+// having done anything: a VM that crashed reconciles to StateGone, and an
+// engine that reports a terminated VMM as VMMStateStopped reconciles a
+// running session to cold. In both cases the slot's namespace, veth, TAP and
+// firewall belong to a VM that is not there, and nothing else would ever give
+// the index back — Capacity would report the slot free while the pool still
+// held it, and the next create would fail at the allocator on a host that
+// had just said it had room.
+//
+// Callers hold the driver mutex.
+func detachIdleSlot(rec *instanceRecord) *netslot.Slot {
+	if rec.slot == nil {
+		return nil
+	}
+	idle := rec.State == StateGone || (rec.State == StateSuspended && rec.Cold)
+	if !idle {
+		return nil
+	}
+	slot := rec.slot
+	rec.slot = nil
+	applySlot(&rec.Cfg, nil)
+	return slot
+}
+
+// releaseSlots gives slots back with the driver mutex released. A failure is
+// logged and not returned: the caller is Inspect, List or a reconcile, and
+// none of them is a teardown — the pool has already recorded the index as
+// one that needs finishing before reuse.
+func (m *Microvm) releaseSlots(ctx context.Context, slots []*netslot.Slot) {
+	for _, s := range slots {
+		if err := m.slots.Release(ctx, s); err != nil {
+			log.Printf("microvm: releasing network slot %d for a session that is no longer running: %v", s.Index, err)
+		}
+	}
 }
 
 // reconcileState folds the hypervisor's observed state into the driver's own
@@ -1304,11 +1354,26 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 	// behind at that path, and an attempt that reuses a number is an attempt
 	// that inherits it. The counter is only ever a source of distinct paths.
 	boots := inst.boots
+	var stale *netslot.Slot
 	if cold {
 		inst.boots++
 		boots = inst.boots
+		// A cold record should hold no slot — Suspend gives it back. It can
+		// still be holding one when the record went cold without this driver
+		// parking it: an engine that reports a terminated VMM as stopped
+		// reconciles a running session to cold, and the slot it was using
+		// stays on the record. Taking it back HERE, before a new one is
+		// allocated, is what stops the assignment below from orphaning a
+		// namespace nothing would ever name again.
+		stale = inst.slot
+		inst.slot = nil
 	}
 	m.mu.Unlock()
+	if stale != nil {
+		if err := m.slots.Release(ctx, stale); err != nil {
+			log.Printf("microvm: releasing the slot %s was still holding when it went cold: %v", id, err)
+		}
+	}
 	defer func() {
 		m.mu.Lock()
 		if e, ok := m.instances[id]; ok {
@@ -1570,6 +1635,14 @@ func (m *Microvm) DestroyContainer(ctx context.Context, id string) error {
 	m.mu.Unlock()
 	// Closed before the VM is signalled, so nothing can dial a control
 	// channel for a session that is being torn down.
+	//
+	// It is not reopened if the teardown below fails. A closed channel
+	// cannot be un-closed, and a fresh one would not help: the one guest
+	// connection this boot gets has already been served (see
+	// guestChannel.served), so a new listener would have nobody to serve.
+	// The session's control channel is gone for this boot either way, and
+	// what brings it back is a cold resume, which is a new boot with a new
+	// socket and a new token.
 	if channel != nil {
 		channel.close()
 	}
@@ -1640,15 +1713,25 @@ func (m *Microvm) Inspect(ctx context.Context, id string) (Handle, error) {
 	st, stErr := m.engine.State(ctx, id)
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	inst, ok = m.instances[id]
 	if !ok {
+		m.mu.Unlock()
 		return Handle{ID: id, State: StateGone}, nil
 	}
+	var idle *netslot.Slot
 	if stErr == nil && inst.epoch == epoch {
 		reconcileState(inst, st)
+		// A VM that went away without this driver parking it has stopped
+		// occupying the host, and its slot has to go back with it.
+		idle = detachIdleSlot(inst)
 	}
-	return Handle{ID: id, State: inst.State}, nil
+	state := inst.State
+	m.mu.Unlock()
+
+	if idle != nil {
+		m.releaseSlots(ctx, []*netslot.Slot{idle})
+	}
+	return Handle{ID: id, State: state}, nil
 }
 
 func (m *Microvm) Capacity(_ context.Context) (int, int, error) {
@@ -1682,17 +1765,24 @@ func (m *Microvm) List(ctx context.Context) ([]Listed, error) {
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	out := make([]Listed, 0, len(m.instances))
+	var idle []*netslot.Slot
 	for id, inst := range m.instances {
 		if st, ok := observed[id]; ok && inst.epoch == epochs[id] {
 			reconcileState(inst, st)
+			if s := detachIdleSlot(inst); s != nil {
+				idle = append(idle, s)
+			}
 		}
 		out = append(out, Listed{
 			SessionID: inst.SessionID,
 			Handle:    Handle{ID: id, State: inst.State},
 		})
 	}
+	m.mu.Unlock()
+
+	m.releaseSlots(ctx, idle)
+
 	slices.SortFunc(out, func(a, b Listed) int { return strings.Compare(a.Handle.ID, b.Handle.ID) })
 	return out, nil
 }
@@ -2027,6 +2117,10 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		_ = proc.Wait()
 		_ = f.removeJail(cfg.ID)
 		f.uids.release(cfg.ID)
+		// And the pid file this launch wrote, which outlives the jail
+		// because it is not in it. A stale one is what State and PID read on
+		// the next boot.
+		_ = os.Remove(f.pidFilePath(cfg.ID))
 	}()
 
 	fcClient := newFirecrackerClient(sockPath)
@@ -2257,14 +2351,27 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 	// which used to live in their own directory outside the jail and now
 	// cannot: a chrooted Firecracker can neither create nor connect to
 	// anything outside its root.
-	if err := f.removeJail(id); err != nil && stopErr == nil {
-		stopErr = err
+	jailErr := f.removeJail(id)
+	if jailErr != nil && stopErr == nil {
+		stopErr = jailErr
 	}
-	// The uid comes back only once the jail that used it is gone. Releasing
-	// it earlier would let the next VM take a number that still owns files
-	// on this host.
-	if stopErr == nil {
+
+	// The uid comes back when the JAIL is gone, which is the only thing that
+	// still holds files owned by it. It is deliberately not conditioned on
+	// stopErr: a Stop that could not confirm the process, and whose caller
+	// deletes the record anyway (see DestroyContainer, which proceeds when
+	// the engine reports the VM gone), would otherwise hold that uid for the
+	// life of the runner with nothing left that could ever release it.
+	if jailErr == nil {
 		f.uids.release(id)
+	}
+
+	// The pid file is the engine's own record of a process that no longer
+	// exists. It lives outside the jail, so removeJail does not take it, and
+	// a stale one is the input to State's and PID's identity check on the
+	// next boot.
+	if err := os.Remove(f.pidFilePath(id)); err != nil && !errors.Is(err, os.ErrNotExist) && stopErr == nil {
+		stopErr = fmt.Errorf("remove the pid file for %s: %w", id, err)
 	}
 	return stopErr
 }

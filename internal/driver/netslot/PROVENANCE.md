@@ -24,11 +24,11 @@ Upstream paths consulted, all under `packages/orchestrator/pkg/sandbox/`:
   pair, TAP device, addresses and routes, and the rule that the namespace is
   deleted **last** so it stays a rediscovery anchor when host-side teardown
   fails.
-- `network/storage_local.go` — the pool: foreign namespaces observed at
-  construction are never allocated; a release whose teardown failed records
-  the index as *leaked* rather than free; leaked indexes are handed out again
-  only when no clean index is left, and the allocation that takes one finishes
-  the teardown first.
+- `network/storage_local.go` — the pool: a namespace this pool did not create
+  blocks its index and is never deleted; a release whose teardown failed
+  records the index as *leaked* rather than free; leaked indexes are handed
+  out again only when no clean index is left, and the allocation that takes
+  one finishes the teardown first.
 - `network/reclaim.go` — startup reclaim: leftovers from a previous run are
   discovered by scanning the host's network-namespace directory, because the
   namespace entry is created first and removed last.
@@ -65,8 +65,22 @@ against Firecracker's own jailer documentation.
   behind the `Host` interface in `host.go`, so the driver's tests run on a
   machine with no `CAP_NET_ADMIN` and a later privileged helper can own the
   implementation without the pool changing. The Linux implementation shells
-  out to `ip` and `nft` (see `host_linux.go`) rather than adding a netlink
-  dependency to `go.mod`.
+  out to `ip`, `nft` and `sysctl` (see `host_linux.go`) rather than adding a
+  netlink dependency to `go.mod`.
+- **When an index is blocked, and for how long.** Upstream re-checks
+  `isNamespaceAvailable` on every allocation scan, so an index is unavailable
+  only while the namespace exists. Rainier discovers the collision by trying
+  to create the namespace, so it has to tell "the name is taken" apart from
+  "the create failed": a confirmed collision retires the index for the
+  process's lifetime and the allocation moves to the next one, while any
+  other failure marks it *leaked*, which is recoverable. A runner that loses
+  `CAP_NET_ADMIN` for a minute must not come back with a permanently smaller
+  host.
+- **Reclaim is not bounded by the slot count.** Upstream's
+  `SlotIndexFromNamespace` rejects an index above the configured size, so
+  shrinking the pool orphans the namespaces above it. Rainier bounds what is
+  handed *out*, not what is recognised as its own, so a resize is followed by
+  a reclaim that actually cleans up.
 - **Addressing.** Upstream gives each slot a /32 host address, a /31 veth
   block and a fixed `169.254.0.22/30` TAP address reused in every namespace.
   Rainier follows ADR-0003 §5.2 instead: one **/30 per slot** carved from a
@@ -84,7 +98,11 @@ against Firecracker's own jailer documentation.
   renders a text ruleset from a template and applies it with `nft -f -`, so the
   exact bytes the kernel is asked for are reviewable and golden-testable, and
   the allow list is exactly one destination: the egress proxy
-  `runnerd` was started with (ADR-0003 §4.3).
+  `runnerd` was started with (ADR-0003 §4.3). The conntrack rule is
+  `established` and not upstream's `established,related`: a RELATED match
+  covers conntrack helper expectations, and a helper active in the namespace
+  would let a guest talking to the allowed proxy conjure an accept for some
+  other address ahead of the deny set.
 - **Iptables, NAT, DSCP, the egress proxy hooks, the hyperloop/portmapper/NFS
   redirects, telemetry and tracing** are not copied. Rainier's guest reaches
   the network only through `egressd`, so the slot needs no in-namespace NAT

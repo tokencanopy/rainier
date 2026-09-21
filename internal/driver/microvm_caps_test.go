@@ -70,8 +70,15 @@ func TestMissingCapabilityFailsClosedAndNamesIt(t *testing.T) {
 
 // TestFullCapabilitiesPassWithoutBeingRoot is the point of the whole check:
 // ADR-0003 §4.5 wants runnerd unprivileged, so holding the named capabilities
-// has to be enough. This test process is not root and the fixture says so.
+// has to be enough.
+//
+// The "without being root" half rests on this process not being root — if it
+// were, a check that secretly required euid 0 would pass here too and the
+// test would prove nothing. So that is asserted rather than assumed.
 func TestFullCapabilitiesPassWithoutBeingRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("this test runs as root, so it cannot tell a capability check from a root check")
+	}
 	writeCapStatus(t, allMicrovmCaps())
 	if err := checkMicrovmPrivileges(MicrovmOpts{CgroupRoot: fakeCgroupV2(t)}); err != nil {
 		t.Fatalf("a runner holding every named capability was refused: %v", err)

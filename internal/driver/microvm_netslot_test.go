@@ -276,6 +276,112 @@ func TestMicrovmResumeOntoAVanishedRecordLeavesNothingRunning(t *testing.T) {
 	}
 }
 
+// TestMicrovmAVMThatDiedGivesItsSlotBack.
+//
+// A VM can stop occupying this host without the driver having done anything:
+// it crashes, the engine reports it gone, and Inspect reconciles the record
+// to StateGone. The slot's namespace, veth, TAP and firewall then belong to a
+// VM that is not there, and nothing else would ever give the index back —
+// Capacity would report it free while the pool still held it, and the next
+// create would fail at the allocator on a host that had just said it had
+// room.
+func TestMicrovmAVMThatDiedGivesItsSlotBack(t *testing.T) {
+	m, sim, net := testMicrovmNet(t, MicrovmOpts{TotalSlots: 1})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "alpha"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// The VMM is gone and the driver did not park it.
+	sim.SetState(h.ID, VMMStateGone)
+
+	if g, _ := m.Inspect(ctx, h.ID); g.State != StateGone {
+		t.Fatalf("Inspect after the VMM vanished = %s, want %s", g.State, StateGone)
+	}
+	if got := net.Namespaces(); len(got) != 0 {
+		t.Fatalf("namespaces after the VMM vanished = %v, want none", got)
+	}
+
+	// The index is genuinely back: this host has exactly one, and another
+	// session must be able to have it.
+	if _, err := m.Create(ctx, Spec{SessionID: "beta"}); err != nil {
+		t.Fatalf("Create after the dead session's slot should have been freed: %v", err)
+	}
+}
+
+// TestMicrovmListAlsoGivesBackTheSlotsOfVMsThatDied. List reconciles every
+// record, so it has to do the same thing Inspect does for one.
+func TestMicrovmListAlsoGivesBackTheSlotsOfVMsThatDied(t *testing.T) {
+	m, sim, net := testMicrovmNet(t, MicrovmOpts{TotalSlots: 2})
+	ctx := context.Background()
+
+	a, err := m.Create(ctx, Spec{SessionID: "alpha"})
+	if err != nil {
+		t.Fatalf("Create alpha: %v", err)
+	}
+	if _, err := m.Create(ctx, Spec{SessionID: "beta"}); err != nil {
+		t.Fatalf("Create beta: %v", err)
+	}
+	sim.SetState(a.ID, VMMStateGone)
+
+	if _, err := m.List(ctx); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if got := net.Namespaces(); len(got) != 1 {
+		t.Fatalf("namespaces after one VM vanished = %v, want only the survivor's", got)
+	}
+}
+
+// TestMicrovmColdResumeDoesNotOrphanASlotTheRecordStillHolds.
+//
+// An engine that reports a terminated VMM as stopped — which is what a
+// hypervisor with a supervisor in front of it would do — reconciles a running
+// session to COLD without this driver having parked it, so the record is
+// cold and still holding a slot. The cold resume that follows allocates a new
+// one, and if it simply overwrote the old the namespace, veth, TAP and
+// firewall would be orphaned with nothing left naming them: the pool would
+// still count that index in use under this session's key, so no Release could
+// reach it and Reclaim would skip it.
+func TestMicrovmColdResumeDoesNotOrphanASlotTheRecordStillHolds(t *testing.T) {
+	stateDir := shortTempDir(t)
+	m, sim, net := testMicrovmNet(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
+	m.SetHost(&stubMicrovmHost{})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "alpha"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	firstCfg, _ := instanceConfig(m, h.ID)
+
+	// The record goes cold by RECONCILE rather than by Suspend, so the slot
+	// is never handed back on the way in.
+	sim.SetState(h.ID, VMMStateStopped)
+	if g, _ := m.Inspect(ctx, h.ID); g.State != StateSuspended {
+		t.Fatalf("Inspect after the VMM stopped = %s, want %s", g.State, StateSuspended)
+	}
+
+	if _, err := m.Resume(ctx, h.ID); err != nil {
+		t.Fatalf("cold Resume: %v", err)
+	}
+	secondCfg, _ := instanceConfig(m, h.ID)
+	if secondCfg.SlotIndex == 0 {
+		t.Fatal("the resumed session has no slot")
+	}
+	if got := net.Namespaces(); len(got) != 1 {
+		t.Fatalf("namespaces after the resume = %v, want exactly one — the old slot was orphaned", got)
+	}
+	if secondCfg.Netns == firstCfg.Netns {
+		// Not wrong in itself (the index may be recycled), but then the
+		// single namespace above must be the new one.
+		return
+	}
+	if net.Namespaces()[0] != secondCfg.Netns {
+		t.Fatalf("the surviving namespace is %v, want the resumed session's %s", net.Namespaces(), secondCfg.Netns)
+	}
+}
+
 // TestMicrovmDestroyReturnsTheSlot.
 func TestMicrovmDestroyReturnsTheSlot(t *testing.T) {
 	m, _, net := testMicrovmNet(t, MicrovmOpts{TotalSlots: 2})
