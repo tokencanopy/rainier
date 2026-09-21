@@ -41,7 +41,8 @@ type FakeHost struct {
 
 	ops    []Op
 	ns     map[string]bool
-	links  map[string]bool // "netns/link"
+	links  map[string]bool   // "netns/link"
+	rules  map[string]string // netns -> the ruleset last applied there
 	failOn map[string]error
 }
 
@@ -52,6 +53,7 @@ func NewFakeHost() *FakeHost {
 	return &FakeHost{
 		ns:     make(map[string]bool),
 		links:  make(map[string]bool),
+		rules:  make(map[string]string),
 		failOn: make(map[string]error),
 	}
 }
@@ -221,4 +223,36 @@ func (f *FakeHost) AddRoute(_ context.Context, netns, dst, via string) error {
 
 func (f *FakeHost) DelRoute(_ context.Context, netns, dst, via string) error {
 	return f.record("route-del", netns, dst, via)
+}
+
+func (f *FakeHost) ApplyNft(_ context.Context, netns, ruleset string) error {
+	// The ruleset is recorded as one argument rather than folded into the
+	// operation line: it is many lines long, and a test that wants it wants
+	// all of it (see Ruleset).
+	if err := f.record("nft-apply", netns, "<ruleset>"); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rules[netns] = ruleset
+	return nil
+}
+
+func (f *FakeHost) DeleteNftTable(_ context.Context, netns, table string) error {
+	if err := f.record("nft-del-table", netns, table); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.rules, netns)
+	return nil
+}
+
+// Ruleset returns the ruleset last applied in netns, and whether there is
+// one. It is how a test asks what a guest is actually behind.
+func (f *FakeHost) Ruleset(netns string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r, ok := f.rules[netns]
+	return r, ok
 }

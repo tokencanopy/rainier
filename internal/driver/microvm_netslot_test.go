@@ -182,6 +182,47 @@ func TestMicrovmColdResumeTakesAFreshSlot(t *testing.T) {
 	}
 }
 
+// TestMicrovmSessionsAreBehindTheirOwnFirewall: the ruleset the host was
+// given names the session's own TAP and the proxy this runner was started
+// with, and it is gone when the session is.
+func TestMicrovmSessionsAreBehindTheirOwnFirewall(t *testing.T) {
+	m, sim, net := testMicrovmNet(t, MicrovmOpts{
+		TotalSlots:        4,
+		EgressProxyAddr:   "10.44.0.9",
+		EgressProxyPort:   3128,
+		ControlPlaneCIDRs: []string{"203.0.113.0/24"},
+	})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "alpha"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cfg, _ := sim.Config(h.ID)
+
+	rules, ok := net.Ruleset(cfg.Netns)
+	if !ok {
+		t.Fatalf("no firewall was installed in %s", cfg.Netns)
+	}
+	for _, want := range []string{
+		`iifname != "` + cfg.TapDevice + `" return`,
+		"ip daddr 10.44.0.9 tcp dport 3128 accept",
+		"ip daddr 169.254.169.254 drop",
+		"203.0.113.0/24",
+	} {
+		if !strings.Contains(rules, want) {
+			t.Fatalf("the session's ruleset does not carry %q:\n%s", want, rules)
+		}
+	}
+
+	if err := m.Destroy(ctx, h.ID); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	if _, ok := net.Ruleset(cfg.Netns); ok {
+		t.Fatal("the session's ruleset outlived the session")
+	}
+}
+
 // TestMicrovmDestroyReturnsTheSlot.
 func TestMicrovmDestroyReturnsTheSlot(t *testing.T) {
 	m, _, net := testMicrovmNet(t, MicrovmOpts{TotalSlots: 2})

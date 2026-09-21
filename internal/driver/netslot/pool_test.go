@@ -114,6 +114,7 @@ func TestAllocateBuildsTheWholeSlotInOrder(t *testing.T) {
 		{Verb: "link-up", Netns: "rnr-ns-1", Args: []string{"rnr-tap-1"}},
 		{Verb: "route-add", Netns: "rnr-ns-1", Args: []string{"default", "10.202.0.5"}},
 		{Verb: "route-add", Args: []string{"10.201.0.4/30", "10.202.0.6"}},
+		{Verb: "nft-apply", Netns: "rnr-ns-1", Args: []string{"<ruleset>"}},
 	}
 	assertOps(t, host.Ops(), want)
 
@@ -177,6 +178,7 @@ func TestTeardownDeletesTheNamespaceLast(t *testing.T) {
 	}
 	teardown := host.Ops()[before:]
 	assertOps(t, teardown, []Op{
+		{Verb: "nft-del-table", Netns: "rnr-ns-1", Args: []string{"rnr-slot-1"}},
 		{Verb: "route-del", Args: []string{"10.201.0.4/30", "10.202.0.6"}},
 		{Verb: "link-del", Args: []string{"rnr-vh-1"}},
 		{Verb: "netns-del", Args: []string{"rnr-ns-1"}},

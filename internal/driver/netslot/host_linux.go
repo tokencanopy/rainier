@@ -27,9 +27,10 @@ import (
 	"strings"
 )
 
-// LinuxHost runs `ip` for every operation.
+// LinuxHost runs `ip` and `nft` for every operation.
 type LinuxHost struct {
 	ipPath   string
+	nftPath  string
 	netnsDir string
 }
 
@@ -45,10 +46,14 @@ func NewLinuxHost(netnsDir string) (*LinuxHost, error) {
 	if err != nil {
 		return nil, fmt.Errorf("netslot: iproute2 (`ip`) is not on PATH: every microVM session needs a network namespace, a veth pair and a TAP device: %w", err)
 	}
+	nft, err := exec.LookPath("nft")
+	if err != nil {
+		return nil, fmt.Errorf("netslot: nftables (`nft`) is not on PATH: ADR-0003 §4.3 requires a per-slot ruleset denying cloud metadata, the control plane and every neighbouring session, and a microVM host that cannot install one must not accept sessions: %w", err)
+	}
 	if netnsDir == "" {
 		netnsDir = DefaultNetnsDir
 	}
-	return &LinuxHost{ipPath: p, netnsDir: netnsDir}, nil
+	return &LinuxHost{ipPath: p, nftPath: nft, netnsDir: netnsDir}, nil
 }
 
 // run execs one `ip` invocation, in netns when it is named.
@@ -162,4 +167,47 @@ func (h *LinuxHost) AddRoute(ctx context.Context, netns, dst, via string) error 
 
 func (h *LinuxHost) DelRoute(ctx context.Context, netns, dst, via string) error {
 	return h.runTolerating(ctx, netns, []string{"no such process", "no such file", "cannot find device"}, "route", "delete", dst, "via", via)
+}
+
+// nft runs one `nft` invocation inside netns, with stdin as the script.
+//
+// `ip netns exec` rather than `nft -n`: nftables has no namespace flag, and
+// the ruleset is namespace-scoped state like a link or a route.
+func (h *LinuxHost) nft(ctx context.Context, netns string, script string, args ...string) error {
+	name, full := h.nftPath, args
+	if netns != "" {
+		name, full = h.ipPath, append([]string{"netns", "exec", netns, h.nftPath}, args...)
+	}
+	cmd := exec.CommandContext(ctx, name, full...)
+	if script != "" {
+		cmd.Stdin = strings.NewReader(script)
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("nft %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (h *LinuxHost) ApplyNft(ctx context.Context, netns, ruleset string) error {
+	// "-f -" reads the whole ruleset from stdin and commits it as one
+	// transaction: either the slot has the ruleset it was rendered or it has
+	// the one it had before, never half of each.
+	return h.nft(ctx, netns, ruleset, "-f", "-")
+}
+
+func (h *LinuxHost) DeleteNftTable(ctx context.Context, netns, table string) error {
+	err := h.nft(ctx, netns, "", strings.Fields(nftDeleteCommand(table))...)
+	if err == nil {
+		return nil
+	}
+	msg := strings.ToLower(err.Error())
+	// A table that is not there, or a namespace that is already gone, is the
+	// state this call wanted.
+	for _, absent := range []string{"no such file or directory", "does not exist", "cannot open network namespace"} {
+		if strings.Contains(msg, absent) {
+			return nil
+		}
+	}
+	return err
 }

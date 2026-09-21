@@ -346,7 +346,7 @@ func (p *Pool) setup(ctx context.Context, s *Slot) error {
 	if err := p.host.AddRoute(ctx, "", s.GuestNet.String(), s.VethNSIP.String()); err != nil {
 		return fmt.Errorf("netslot: host route to %s: %w", s.GuestNet, err)
 	}
-	return nil
+	return p.applyFirewall(ctx, s)
 }
 
 // teardown removes everything setup made, in reverse, and is idempotent.
@@ -358,6 +358,9 @@ func (p *Pool) setup(ctx context.Context, s *Slot) error {
 // it by. A teardown that fails leaves the anchor in place for the next one.
 func (p *Pool) teardown(ctx context.Context, s *Slot) error {
 	var errs []error
+	if err := p.removeFirewall(ctx, s); err != nil {
+		errs = append(errs, err)
+	}
 	if err := p.host.DelRoute(ctx, "", s.GuestNet.String(), s.VethNSIP.String()); err != nil {
 		errs = append(errs, fmt.Errorf("netslot: removing host route to %s: %w", s.GuestNet, err))
 	}

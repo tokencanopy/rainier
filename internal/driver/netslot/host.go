@@ -67,4 +67,14 @@ type Host interface {
 
 	// DelRoute removes a route. An absent route is success.
 	DelRoute(ctx context.Context, netns, dst, via string) error
+
+	// ApplyNft installs a complete nftables ruleset inside netns. The
+	// ruleset is the whole text `nft -f` would be given, and it is
+	// self-contained: it deletes and recreates its own table, so applying it
+	// twice is applying it once.
+	ApplyNft(ctx context.Context, netns, ruleset string) error
+
+	// DeleteNftTable removes one inet table. An absent table is success:
+	// teardown is retried, and a retry has to be able to finish.
+	DeleteNftTable(ctx context.Context, netns, table string) error
 }

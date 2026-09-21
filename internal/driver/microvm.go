@@ -116,6 +116,24 @@ type MicrovmOpts struct {
 	// default, which is where `ip netns` puts them.
 	NetnsDir string
 
+	// EgressProxyAddr and EgressProxyPort are the ONE host-side destination
+	// a guest may reach through its slot's firewall (ADR-0003 §4.3): the
+	// egress proxy this runner was started with. It is an ADDRESS and not a
+	// URL because a rule that named a host would be a rule a guest could
+	// move by answering a DNS query.
+	//
+	// Empty means the guest gets no host-side exception at all, which is a
+	// legal configuration (a runner with no proxy) and never a reason to
+	// leave the firewall off.
+	EgressProxyAddr string
+	EgressProxyPort int
+
+	// ControlPlaneCIDRs are the regional control-plane ranges a guest must
+	// not be able to reach. They are deployment configuration, not a
+	// constant: a host given none denies nothing extra rather than guessing
+	// at somebody's network.
+	ControlPlaneCIDRs []string
+
 	Engine MicrovmEngine // test seam; nil in production
 	Net    netslot.Host  // test seam; nil in production
 	Format DiskFormatter // test seam; nil in production
@@ -405,11 +423,14 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 // slotConfig is the network envelope this runner hands the slot allocator.
 func (o MicrovmOpts) slotConfig() netslot.Config {
 	return netslot.Config{
-		GuestCIDR:  o.SlotGuestCIDR,
-		UplinkCIDR: o.SlotUplinkCIDR,
-		Slots:      o.TotalSlots,
-		NamePrefix: o.SlotNamePrefix,
-		NetnsDir:   o.NetnsDir,
+		GuestCIDR:         o.SlotGuestCIDR,
+		UplinkCIDR:        o.SlotUplinkCIDR,
+		Slots:             o.TotalSlots,
+		NamePrefix:        o.SlotNamePrefix,
+		NetnsDir:          o.NetnsDir,
+		ProxyAddr:         o.EgressProxyAddr,
+		ProxyPort:         o.EgressProxyPort,
+		ControlPlaneCIDRs: slices.Clone(o.ControlPlaneCIDRs),
 	}
 }
 
