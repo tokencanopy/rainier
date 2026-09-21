@@ -274,7 +274,13 @@ type MicrovmEngine interface {
 	Pause(ctx context.Context, id string) error
 	Resume(ctx context.Context, id string) error
 	Stop(ctx context.Context, id string) error
-	Snapshot(ctx context.Context, id, ref string, stripEnv []string) (Snapshot, error)
+	// There is deliberately no Snapshot here. Committing an environment image
+	// is a copy of a FILE the driver owns — the session's rootfs, cloned into
+	// the image store and published by digest (see (*Microvm).Snapshot) — and
+	// the only thing the hypervisor contributes to it is holding still, which
+	// Pause and Resume already say. A snapshot method on this interface could
+	// only have meant the other kind: a guest MEMORY image, which ADR-0003
+	// §2.2 forbids outright for an authenticated session.
 	State(ctx context.Context, id string) (VMMState, error)
 	PID(id string) int
 }
@@ -355,21 +361,13 @@ type instanceRecord struct {
 // through it, under the driver mutex.
 func (rec *instanceRecord) bump() { rec.epoch++ }
 
-// snapshotManifest records what a snapshot committed.
-//
-// EnvKeys is KEYS, never values. The manifest is a file on a shared host that
-// outlives the session, so it is under the same rule as the instance record
-// (see VMMConfig.Env): an environment's decrypted values have no business in
-// it. Keys are enough for what the manifest is for — proving that what a
-// caller named in stripEnv did not survive the commit.
-type snapshotManifest struct {
-	Ref          string    `json:"ref"`
-	InstanceID   string    `json:"instance_id"`
-	EnvKeys      []string  `json:"env_keys"`
-	Cmd          []string  `json:"cmd"`
-	StrippedKeys []string  `json:"stripped_keys"`
-	CreatedAt    time.Time `json:"created_at"`
-}
+// What a snapshot commits is recorded in the image store's manifest for the
+// ref (ImageManifest, image.go), beside the digest the image landed under.
+// There is deliberately no second manifest type: a ref resolves to exactly one
+// image on this host, and "what this session was configured with" and "which
+// bytes that produced" are two halves of one published fact — a snapshot that
+// wrote them to two places could publish an image under a ref whose recorded
+// configuration describes a different commit.
 
 // A session's configuration is no longer staged on the host at all.
 //
@@ -468,7 +466,7 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 
 	// The environment images themselves live under "images", by digest, and
 	// are never opened for writing after they land; see image.go.
-	for _, dir := range []string{"workspaces", "homes", "instances", filepath.Join("snapshots", "refs"), "rootfs"} {
+	for _, dir := range []string{"workspaces", "homes", "instances", "rootfs"} {
 		if err := os.MkdirAll(filepath.Join(opts.StateDir, dir), microvmDirMode); err != nil {
 			return nil, fmt.Errorf("microvm: create state directory: %w", err)
 		}
@@ -1037,40 +1035,21 @@ func (m *Microvm) Strips() [][]string {
 	return out
 }
 
-func (m *Microvm) snapshotRefDir(ref string) (string, error) {
-	seg, err := sanitizeRef(ref)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(m.opts.StateDir, "snapshots", "refs", seg), nil
-}
-
-// snapshotManifestBytes returns the raw manifest a commit wrote, or nil.
+// snapshotManifestBytes returns the raw manifest a commit published, or nil.
 func (m *Microvm) snapshotManifestBytes(ref string) []byte {
-	dir, err := m.snapshotRefDir(ref)
-	if err != nil {
-		return nil
-	}
-	data, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
-	if err != nil {
-		return nil
-	}
-	return data
+	return m.images.manifestBytes(ref)
 }
 
 // SnapshotEnvKeys returns the environment keys a committed snapshot recorded,
 // sorted, and whether there is a manifest at all. It is how the shared
 // contract's strip subtest proves, for this driver, that what a caller named
-// in stripEnv did not survive the commit.
+// in stripEnv did not survive the commit — read back from the PUBLISHED
+// manifest, beside the digest of the image it describes.
 //
-// Keys, not values: see snapshotManifest.
+// Keys, not values: see ImageManifest.
 func (m *Microvm) SnapshotEnvKeys(ref string) ([]string, bool) {
-	data := m.snapshotManifestBytes(ref)
-	if data == nil {
-		return nil, false
-	}
-	var sm snapshotManifest
-	if err := json.Unmarshal(data, &sm); err != nil {
+	sm, ok := m.images.manifest(ref)
+	if !ok {
 		return nil, false
 	}
 	return sm.EnvKeys, true
@@ -1709,13 +1688,35 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 	return restarted, nil
 }
 
-// Snapshot commits the session's environment image.
+// Snapshot publishes this session's root filesystem as an environment image
+// (ADR-0003 §2.7 item 3 and §4.1's Snapshot row).
 //
-// For the Firecracker engine it does not, yet, and says so: see
-// FirecrackerEngine.Snapshot. What this method owns either way is the ref
-// (minted here when the caller names none, returned verbatim when they do)
-// and the manifest recording what the commit would carry, with the caller's
-// stripEnv keys removed from it.
+// Five steps, and the order is the whole of what makes the result usable:
+//
+//  1. ask the guest to FLUSH over vsock. What is copied below is the host's
+//     view of the session's rootfs, and a guest's unsynced writes are not in
+//     it — an image published without them is an environment whose setup
+//     script ran and whose results are half there.
+//  2. PAUSE the VM, so nothing is written to the file between the flush and
+//     the copy. It is unpaused again before this returns, whatever happens.
+//  3. CLONE the per-session rootfs, copy-on-write, into the image store's
+//     staging area — the same Cloner a create uses, so the pause lasts a
+//     reflink and not a copy of the image.
+//  4. digest it and publish it under ref, with the caller's stripEnv keys
+//     removed from the recorded configuration (strip-to-empty, matching the
+//     Docker driver: a stripped key is absent from what the manifest records
+//     as surviving, and its value appears nowhere).
+//  5. RESUME.
+//
+// The workspace and the agent home are separate block devices and are not in
+// the image by construction — there is no step that could put them there,
+// which is the form ADR-0003 §4.1 asks for and what
+// TestMicrovmSnapshotExcludesTheWorkspaceAndHome proves.
+//
+// The driver mutex is held for the bookkeeping at the top and released for
+// every one of the five steps. A snapshot is seconds of guest I/O and a copy
+// of a filesystem; holding the mutex across it would freeze Inspect, List,
+// Capacity, Create and Destroy for every other session on the host.
 func (m *Microvm) Snapshot(ctx context.Context, id, ref string, stripEnv []string) (Snapshot, error) {
 	m.mu.Lock()
 	inst, ok := m.instances[id]
@@ -1735,7 +1736,7 @@ func (m *Microvm) Snapshot(ctx context.Context, id, ref string, stripEnv []strin
 	// the channel the driver does not happen to be looking at is a key that
 	// survived.
 	//
-	// Keys, never values: see snapshotManifest.
+	// Keys, never values: see ImageManifest.
 	surviving := map[string]struct{}{}
 	for k := range inst.Cfg.Env {
 		surviving[k] = struct{}{}
@@ -1751,39 +1752,96 @@ func (m *Microvm) Snapshot(ctx context.Context, id, ref string, stripEnv []strin
 	}
 	slices.Sort(survivingKeys)
 	cmd := slices.Clone(inst.Cfg.Cmd)
+	rootfs := inst.Cfg.RootfsPath
+	sessionID := inst.SessionID
+	running := inst.State == StateRunning
+	parked := inst.State == StateSuspended && inst.Cold
 	m.mu.Unlock()
 
-	// The ref becomes a directory name, so it is checked before anything with
-	// a side effect runs rather than on the way to writing the manifest.
-	refDir, err := m.snapshotRefDir(ref)
-	if err != nil {
+	// The ref becomes a file name in the image store, so it is checked before
+	// anything with a side effect runs rather than on the way to publishing.
+	if _, err := sanitizeRef(ref); err != nil {
 		return Snapshot{}, err
 	}
+	if parked {
+		// A cold-parked session has no root filesystem: it was discarded when
+		// the VM ended (ADR-0003 §4.1), and the environment image it would be
+		// re-cloned from is already published. Committing the base image under
+		// a new ref would publish an environment that never ran its setup.
+		return Snapshot{}, fmt.Errorf("snapshot %s: this session is cold-parked, so its root filesystem is gone (ADR-0003 §2.2 keeps no memory image and §4.1 discards the rootfs copy); resume it before committing an environment image from it", id)
+	}
+	if rootfs == "" {
+		return Snapshot{}, fmt.Errorf("snapshot %s: this session's record names no root filesystem to commit", id)
+	}
 
-	snap, err := m.engine.Snapshot(ctx, id, ref, stripEnv)
+	// 1. The guest puts what it has written on its devices.
+	if err := m.flushGuest(ctx, sessionID); err != nil {
+		return Snapshot{}, fmt.Errorf("snapshot %s: %w", id, err)
+	}
+
+	// 2. Nothing writes to the file between that flush and the copy below.
+	if running {
+		if err := m.engine.Pause(ctx, id); err != nil {
+			return Snapshot{}, fmt.Errorf("snapshot %s: pausing the VM: %w", id, err)
+		}
+		// 5. And it is unpaused again on every path out of here, including the
+		// ones that failed: a session left frozen by a snapshot is a session
+		// whose user's terminal stopped answering because somebody cached an
+		// environment. The context is detached for the same reason — a
+		// cancelled snapshot must still thaw the VM it froze.
+		defer func() {
+			if err := m.engine.Resume(context.WithoutCancel(ctx), id); err != nil {
+				log.Printf("microvm: %s was paused for a snapshot and could not be resumed: %v", id, err)
+			}
+		}()
+	}
+
+	// 3. The copy, into the store so that publishing it is a rename.
+	staged, err := m.images.stage("snapshot-*.ext4")
 	if err != nil {
-		return Snapshot{}, err
+		return Snapshot{}, fmt.Errorf("snapshot %s: %w", id, err)
+	}
+	if _, err := m.cloner.Clone(rootfs, staged); err != nil {
+		_ = os.Remove(staged)
+		return Snapshot{}, fmt.Errorf("snapshot %s: copy the root filesystem: %w", id, err)
 	}
 
-	if err := os.MkdirAll(refDir, microvmDirMode); err != nil {
-		return Snapshot{}, fmt.Errorf("create snapshot ref dir: %w", err)
-	}
-	smData, err := json.MarshalIndent(snapshotManifest{
+	// 4. Digest, store, publish. `publish` consumes the staged file: it is
+	// renamed into the store under its digest or removed, so a failure here
+	// leaves nothing behind either.
+	if _, err := m.images.publish(staged, ImageManifest{
 		Ref:          ref,
 		InstanceID:   id,
 		EnvKeys:      survivingKeys,
 		Cmd:          cmd,
 		StrippedKeys: slices.Clone(stripEnv),
 		CreatedAt:    time.Now(),
-	}, "", "  ")
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("marshal snapshot manifest: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(refDir, "manifest.json"), smData, microvmFileMode); err != nil {
-		return Snapshot{}, fmt.Errorf("write snapshot manifest: %w", err)
+	}); err != nil {
+		return Snapshot{}, fmt.Errorf("snapshot %s: %w", id, err)
 	}
 
-	return snap, nil
+	// The ref comes back VERBATIM. It is controld's content-addressed
+	// environment ref and the only name that environment's cache is recorded
+	// under; see driver.Driver.Snapshot.
+	return Snapshot{Ref: ref}, nil
+}
+
+// flushGuest asks the runner above this driver to have sessionID's guest sync
+// its disks, and reports whether it did.
+//
+// A driver with no runner above it has no guest to ask and says so by
+// succeeding: that is the local dev surface and the contract suite, where
+// nothing ever connected to the control channel (serveGuest closes a
+// connection when there is no host to hand it to), so there is no guest with
+// unsynced writes to miss. Every other failure is the snapshot's failure — see
+// (*Server).FlushGuest in runnerd for why this direction rather than the
+// suspend path's "go ahead anyway".
+func (m *Microvm) flushGuest(ctx context.Context, sessionID string) error {
+	host := m.currentHost()
+	if host == nil || sessionID == "" {
+		return nil
+	}
+	return host.FlushGuest(ctx, sessionID)
 }
 
 // Prepull resolves ref to an image this host can boot, fetching it by digest
@@ -2688,26 +2746,18 @@ func awaitExit(ctx context.Context, waited chan error, pid int, timeout time.Dur
 	}
 }
 
-// Snapshot refuses, for two separate reasons that both have to hold.
+// This engine has no Snapshot, and the absence is the design.
 //
-// The guest-memory half is an invariant: ADR-0003 §2.2 forbids serializing an
-// authenticated session's RAM to durable storage, because an untrusted agent
-// process may have copied a decrypted credential anywhere in its heap. The
-// previous implementation PUT /snapshot/create with a mem_file_path and wrote
-// exactly that artifact.
+// A guest MEMORY image is forbidden: ADR-0003 §2.2 will not have an
+// authenticated session's RAM serialized to durable storage, because an
+// untrusted agent process may have copied a decrypted credential anywhere in
+// its heap. An earlier version of this engine PUT /snapshot/create with a
+// mem_file_path and wrote exactly that artifact.
 //
-// The filesystem half is unbuilt: committing an environment image means
-// committing the session's writable ROOT filesystem (ADR-0003 §4.1, §2.7 item
-// 3), and there is no writable upper layer to commit — the rootfs drive is
-// read-only with no scratch device above it. Committing the WORKSPACE
-// instead, which is what used to happen, inverts the definition: it publishes
-// one tenant's files under an environment ref that later sessions boot as
-// their root.
-//
-// TODO(PR 4): an ext4 image published by digest, reflink-copied per session.
-func (f *FirecrackerEngine) Snapshot(_ context.Context, _, _ string, _ []string) (Snapshot, error) {
-	return Snapshot{}, errors.New("microvm snapshot: committing an environment image for a microVM session is not implemented; it lands with the image work (ADR-0003 §2.7 item 3). Guest memory is never serialized to host disk (ADR-0003 §2.2), and the session workspace is not an environment image")
-}
+// An environment image is a FILESYSTEM image, and it is the driver's to make:
+// the session's rootfs is a file on the host, and what a snapshot does to it
+// is flush the guest, pause, copy, and publish by digest — none of which is
+// something the VMM does. See (*Microvm).Snapshot.
 
 func (f *FirecrackerEngine) State(ctx context.Context, id string) (VMMState, error) {
 	f.mu.Lock()

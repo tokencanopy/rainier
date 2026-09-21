@@ -103,6 +103,19 @@ type MicrovmHost interface {
 	// session id is the runner's own — the control plane answers from the row
 	// its placement guard read, never from anything in the request.
 	MintSessionBootstrap(ctx context.Context, sessionID string) (string, error)
+	// FlushGuest asks sessionID's guest to put what it has written on its
+	// block devices, and returns when it says it has.
+	//
+	// It is the third thing only the runner can do: the guest's control
+	// connection belongs to the session's relay hub, which lives in runnerd,
+	// and the driver handed it over at boot (GuestConnected) precisely so that
+	// everything on it is one multiplexed conn rather than a second channel.
+	//
+	// Snapshot is the only caller. It copies the host file the guest has been
+	// writing into, and a guest's unsynced writes are not in that file — so an
+	// error here is a snapshot refused rather than an image published on
+	// trust. See (*Microvm).Snapshot.
+	FlushGuest(ctx context.Context, sessionID string) error
 }
 
 var (

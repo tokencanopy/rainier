@@ -245,6 +245,70 @@ func (s *Server) MintSessionBootstrap(ctx context.Context, sessionID string) (st
 	return minted.Token, nil
 }
 
+// defaultFlushWait is how long a guest gets to put what it has written on its
+// block devices.
+//
+// A flush is a sync of the session's disks, and what is outstanding on them is
+// whatever a setup script just installed — a node_modules tree, a Rust
+// toolchain, a container image layer. Thirty seconds is the cold suspend's own
+// budget (defaultColdSuspendReadyWait), which covers the same work plus an
+// exec kill and an unmount, so it is the right order of magnitude and the one
+// an operator has already seen.
+//
+// It is finite because the peer is untrusted: a guest that answers nothing
+// must not hold a snapshot open forever, and a snapshot that gives up is a
+// snapshot refused (the session keeps running, and the next one rebuilds the
+// environment from its setup script).
+const defaultFlushWait = 30 * time.Second
+
+// FlushGuest asks sessionID's sandbox to put what it has written on its block
+// devices, and returns when it says it has.
+//
+// It is the third of driver.MicrovmHost's three, and it is here for the same
+// reason as the other two: the session's control connection belongs to its
+// relay hub, and the hub lives in this package.
+//
+// Every way this can fail is an ERROR rather than a shrug, which is the one
+// place it differs from quiesceExecs — and the difference is what is on the
+// other side. A suspend that goes ahead unflushed freezes a container that is
+// about to be thawed again; a SNAPSHOT that goes ahead unflushed publishes an
+// environment image with a setup script's results half in it, which every
+// later session of that environment then boots. So a sandbox that never
+// registered, a sessiond that predates the kind, a conn that died, and a guest
+// that is simply too slow all read the same way here: this guest cannot be
+// flushed, so nothing is published for it.
+func (s *Server) FlushGuest(ctx context.Context, sessionID string) error {
+	hub, ok := s.reg.hub(sessionID)
+	if !ok {
+		return fmt.Errorf("session %s has no sandbox connection to flush; nothing may be published from its filesystem", sessionID)
+	}
+	nonce := s.flushNonce.Add(1)
+	w := s.armFlushWaiter(sessionID, nonce)
+	defer s.disarmFlushWaiter(sessionID, w)
+
+	b, err := json.Marshal(relay.ControlEvent{Kind: relay.KindFlush, ID: nonce})
+	if err != nil {
+		return fmt.Errorf("encoding the flush request for %s: %w", sessionID, err)
+	}
+	if err := hub.SendControl(b); err != nil {
+		return fmt.Errorf("asking session %s to flush: %w", sessionID, err)
+	}
+
+	timer := time.NewTimer(s.flushWait)
+	defer timer.Stop()
+	select {
+	case <-w.done:
+		return nil
+	case <-hub.Done():
+		return fmt.Errorf("session %s lost its sandbox connection before it had flushed", sessionID)
+	case <-ctx.Done():
+		return fmt.Errorf("waiting for session %s to flush: %w", sessionID, ctx.Err())
+	case <-timer.C:
+		return fmt.Errorf("session %s did not report a flush within %s "+
+			"(a sandbox that predates the flush request never will)", sessionID, s.flushWait)
+	}
+}
+
 // rpcErrorText reads the {"error": ...} sentence a failed response carries,
 // falling back to a flat one so a refusal with no body is still a reason.
 func rpcErrorText(payload json.RawMessage) string {

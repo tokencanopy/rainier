@@ -38,7 +38,13 @@ func (c *fakeCloner) Clone(src, dst string) (CloneMethod, error) {
 		method = CloneReflink
 	}
 	// The bytes are copied for real, so a test can plant a marker in a source
-	// and look for it in the result.
+	// and look for it in the result — but only for a source small enough to
+	// hold in memory. A session's workspace is a 10 GiB sparse image and is
+	// never something a clone should have been pointed at, so a test that
+	// points one there gets a failed assertion rather than a dead machine.
+	if fi, err := os.Stat(src); err == nil && fi.Size() > 64<<20 {
+		return "", errors.New("fakeCloner: refusing to clone a disk-sized file; only an environment image and a session rootfs are ever cloned")
+	}
 	data, err := os.ReadFile(src)
 	if err != nil {
 		return "", err
