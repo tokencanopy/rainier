@@ -987,8 +987,11 @@ func TestMicrovmBootSmokeOnKVM(t *testing.T) {
 			"This is the base image under test, not the driver. The rootfs at %s must carry an /init that mounts the\n"+
 			"pseudo-filesystems, mounts /dev/vdb on /workspace, brings the link up, and execs `sessiond --transport=vsock`\n"+
 			"(or sets RAINIER_TRANSPORT=vsock). A sessiond started with no flags takes the WebSocket path and never dials\n"+
-			"vsock at all. The guest kernel must have CONFIG_VIRTIO_VSOCKETS and expose /dev/vsock. Firecracker's own\n"+
-			"stdout for this boot is in the jail at %s.",
+			"vsock at all. The guest kernel must have CONFIG_VIRTIO_VSOCKETS and expose /dev/vsock.\n\n"+
+			"There is nowhere to read the guest's console from, and that is a Phase A finding in its own right: the boot\n"+
+			"args carry console=ttyS0, this engine configures no Firecracker logger, and it starts the VMM with no Stdout,\n"+
+			"so the serial console goes to /dev/null. Reproducing a boot failure today means running the jailer by hand\n"+
+			"against the jail this create left at %s.",
 			fx.connectWait, err, fx.rootfs, jailInstanceDir(stateDir, h.ID))
 	}
 	bootToConnected := guest.at.Sub(start)
