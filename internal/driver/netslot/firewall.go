@@ -245,10 +245,14 @@ func (p *Pool) TableName(slot *Slot) string { return p.cfg.tableName(slot.Index)
 // fact about the machine — which is what ADR-0003 §4.3 asserts and what Phase
 // A's security smoke has to be able to evidence.
 //
-// Two failures are distinguished for the caller:
+// Three failures are distinguished for the caller:
 //
-//   - ErrNoNftTable: the slot has no table. On a live session that is the
-//     finding, not a hiccup — a guest on a TAP with no ruleset.
+//   - ErrNoNftTable: the slot's namespace is there and has no table. On a live
+//     session that is the finding, not a hiccup — a guest on a TAP with no
+//     ruleset.
+//   - ErrNoNetns: the slot's namespace is gone, so there was nowhere to read.
+//     That is the expected end of a teardown and not a finding about any
+//     guest, which is why it is not the error above.
 //   - a host with no NftReader: this pool cannot answer the question at all,
 //     which is an honest refusal rather than an empty string a caller might
 //     read as "no rules".

@@ -1172,7 +1172,12 @@ func TestMicrovmBootSmokeOnKVM(t *testing.T) {
 			t.Fatalf("the network namespace %s survived the teardown; its slot is off the pool for good", ns)
 		}
 	}
-	if _, err := m.slots.Firewall(ctx, slot2); !errors.Is(err, netslot.ErrNoNftTable) {
+	// Either sentinel is the answer here: the namespace is asserted gone just
+	// above, and a read in a namespace that no longer exists reports
+	// ErrNoNetns rather than ErrNoNftTable. What this asserts is that no
+	// ruleset can still be read back for the slot — anything else, including a
+	// table found in a namespace that outlived the teardown, is the failure.
+	if _, err := m.slots.Firewall(ctx, slot2); !errors.Is(err, netslot.ErrNoNftTable) && !errors.Is(err, netslot.ErrNoNetns) {
 		t.Fatalf("ADR-0003 §4.3: slot %d's firewall table survived its release (err = %v)", slot2.Index, err)
 	}
 	if used, _, _ := m.Capacity(ctx); used != 0 {

@@ -166,8 +166,9 @@ func TestMicrovmKVMScriptRunsTheHarnessAndWritesEvidence(t *testing.T) {
 			t.Fatalf("the harness was invoked without %q:\n%s", want, args)
 		}
 	}
-	// Both tests, named: a -run pattern that drifted would run neither and
-	// report success.
+	// Both tests, named, so the command a runbook quotes says which tests its
+	// evidence is for. What catches a pattern that has drifted off them is
+	// TestMicrovmKVMScriptRefusesToCallAnEmptyRunAPass, below.
 	if !strings.Contains(args, "TestMicrovmBootSmokeOnKVM") || !strings.Contains(args, "TestMicrovmSatisfiesContractOnKVM") {
 		t.Fatalf("the -run pattern does not name both harness tests:\n%s", args)
 	}
@@ -284,6 +285,36 @@ func TestMicrovmKVMScriptRefusesToCallASkipAPass(t *testing.T) {
 	}
 }
 
+// TestMicrovmKVMScriptRefusesToCallAnEmptyRunAPass. The quieter half of the
+// same failure, and the one naming the tests in -run does not prevent: a test
+// is renamed, the pattern no longer matches it, and `go test` exits 0 having
+// run nothing and printed no SKIP. Exit status alone cannot tell that from a
+// clean pass, so the script has to require positive evidence that a test
+// actually ran before it writes one down.
+func TestMicrovmKVMScriptRefusesToCallAnEmptyRunAPass(t *testing.T) {
+	h := newKVMScriptHost(t)
+	// Exits 0, prints nothing, writes no timings — `go test -run` against a
+	// pattern that matches no test, exactly.
+	h.goStub = "#!/bin/sh\n" +
+		"if [ \"$1\" = version ]; then echo 'go version go0.0.0-stub'; exit 0; fi\n" +
+		"exit 0\n"
+
+	out, code := h.run(t)
+	if code == 0 {
+		t.Fatalf("script exited 0 for a run in which no test executed:\n%s", out)
+	}
+	raw := h.readFile(t, filepath.Join(h.outDir, "evidence.json"))
+	if strings.Contains(raw, `"result": "pass"`) {
+		t.Fatalf("a run in which no test executed was recorded as a pass:\n%s", raw)
+	}
+	if !strings.Contains(raw, `"result": "no-tests-ran"`) {
+		t.Fatalf("the evidence does not say that nothing ran:\n%s", raw)
+	}
+	if !strings.Contains(raw, `"timings": null`) {
+		t.Fatalf("a run with no timings does not say so:\n%s", raw)
+	}
+}
+
 // TestMicrovmKVMScriptDoesNotCarryStaleTimingsIntoANewRun. The timings file is
 // the harness's output and the evidence quotes it verbatim, so a run that
 // never reached the smoke must not publish the previous run's numbers under
@@ -387,5 +418,66 @@ func TestMicrovmKVMHarnessNeedsAnExplicitOptIn(t *testing.T) {
 		if strings.Contains(body, "\t\t"+seam) {
 			t.Fatalf("the harness injects %s — it must build the driver the production way, or it evidences nothing about Firecracker", seam)
 		}
+	}
+}
+
+// requireKVMHostSource returns the body of the harness's precondition gate,
+// alone.
+//
+// Scoped to the function rather than read off the whole file because the file
+// is ABOUT /dev/kvm and the jailer: its header names both, so a whole-file
+// search for either would keep answering yes long after the gate stopped
+// checking them.
+func requireKVMHostSource(t *testing.T) string {
+	t.Helper()
+	src, err := os.ReadFile("microvm_kvm_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	const decl = "\nfunc requireKVMHost(t *testing.T) kvmFixture {\n"
+	start := strings.Index(body, decl)
+	if start < 0 {
+		t.Fatal("the harness has no requireKVMHost gate; every KVM test goes through it first")
+	}
+	rest := body[start+len(decl):]
+	end := strings.Index(rest, "\n}\n")
+	if end < 0 {
+		t.Fatal("requireKVMHost has no closing brace at column 0; this test cannot tell where the gate ends")
+	}
+	return rest[:end]
+}
+
+// TestMicrovmKVMHarnessGateChecksEveryPrecondition is the other half of the
+// opt-in assertion: that the gate still checks the things it is a gate for.
+//
+// The opt-in test above pins the shape of the gate — the build tag, the exact
+// "1", the order, the single MicrovmOpts — and none of that notices a gate
+// that has quietly lost a check. Delete the /dev/kvm block from requireKVMHost
+// and this package stays green without it: the harness only runs on a machine
+// nobody runs `go test` on, so the checks it dropped are invisible here and
+// the first thing that reports them missing is a Firecracker error on a
+// feasibility host, naming a jail path the operator never chose.
+//
+// So it is asserted about the source, for the same reason the opt-in is: a
+// test that could observe the gate running would be a machine that ran it.
+func TestMicrovmKVMHarnessGateChecksEveryPrecondition(t *testing.T) {
+	gate := requireKVMHostSource(t)
+	for _, want := range []struct{ needle, why string }{
+		{`"/dev/kvm"`, "a microVM session is a hardware-isolated VM and there is no software fallback"},
+		{`"firecracker"`, "the VMM every session is has to be on PATH"},
+		{`"jailer"`, "there is no unjailed launch path (ADR-0003 §4.5)"},
+		{"effectiveCapabilities()", "the gate reads this process's capabilities"},
+		{"microvmCapabilities", "and checks them against the same table the driver's own startup gate uses"},
+		{`"cgroup.controllers"`, "the jailer is asked for cgroup v2 and ADR-0003 §4.6 meters each VM under it"},
+	} {
+		if !strings.Contains(gate, want.needle) {
+			t.Fatalf("requireKVMHost no longer checks %s: %s.\nA harness that boots without it fails on a real host with a message about something else entirely.", want.needle, want.why)
+		}
+	}
+	// And it reports them by skipping rather than failing: a developer machine
+	// is not a broken KVM host.
+	if !strings.Contains(gate, "t.Skipf(") {
+		t.Fatal("the gate does not skip on a machine that cannot boot a microVM; `go test ./...` would then fail everywhere but a feasibility host")
 	}
 }

@@ -488,10 +488,47 @@ func TestFirewallReadsBackWhatTheHostWasGiven(t *testing.T) {
 	}
 }
 
-// TestFirewallReportsAnAbsentTableAsSuch. A released slot has no table, and
-// "no rules" must not read the same as "an empty ruleset": the first is the
-// finding a security check exists to make.
+// TestFirewallReportsAnAbsentTableAsSuch. A live slot whose table has gone is
+// the finding this read exists to make, and "no rules" must not read the same
+// as "an empty ruleset".
+//
+// The namespace is left standing on purpose: that is what makes this the
+// security finding rather than the teardown below.
 func TestFirewallReportsAnAbsentTableAsSuch(t *testing.T) {
+	host := NewFakeHost()
+	p, err := New(goldenConfig(), host)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	slot, err := p.Allocate(ctx, "mvm-1")
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	if err := host.DeleteNftTable(ctx, slot.Netns, p.TableName(slot)); err != nil {
+		t.Fatalf("taking the slot's table away underneath it: %v", err)
+	}
+	got, err := p.Firewall(ctx, slot)
+	if !errors.Is(err, ErrNoNftTable) {
+		t.Fatalf("Firewall of a live slot with no table = %q, %v; want ErrNoNftTable", got, err)
+	}
+	if got != "" {
+		t.Fatalf("Firewall returned a ruleset for a table that is gone: %q", got)
+	}
+}
+
+// TestFirewallDistinguishesAGoneNamespaceFromAnAbsentTable. `ip netns exec`
+// against a namespace that does not exist fails before nft is reached, so a
+// released slot answers a question that could not be asked rather than one
+// about a table.
+//
+// Told apart because the two findings are opposite. A live guest behind no
+// rules is the thing ADR-0003 §4.3's check exists to catch; a torn-down slot
+// behind no rules is teardown having worked. One sentinel for both would make
+// a teardown assertion pass for a slot whose namespace was still up with its
+// firewall stripped off.
+func TestFirewallDistinguishesAGoneNamespaceFromAnAbsentTable(t *testing.T) {
 	host := NewFakeHost()
 	p, err := New(goldenConfig(), host)
 	if err != nil {
@@ -507,11 +544,14 @@ func TestFirewallReportsAnAbsentTableAsSuch(t *testing.T) {
 		t.Fatalf("Release: %v", err)
 	}
 	got, err := p.Firewall(ctx, slot)
-	if !errors.Is(err, ErrNoNftTable) {
-		t.Fatalf("Firewall of a released slot = %q, %v; want ErrNoNftTable", got, err)
+	if !errors.Is(err, ErrNoNetns) {
+		t.Fatalf("Firewall of a released slot = %q, %v; want ErrNoNetns", got, err)
+	}
+	if errors.Is(err, ErrNoNftTable) {
+		t.Fatalf("a gone namespace also reports ErrNoNftTable (%v), so a teardown assertion cannot tell it from a live slot whose firewall was stripped", err)
 	}
 	if got != "" {
-		t.Fatalf("Firewall returned a ruleset for a table that is gone: %q", got)
+		t.Fatalf("Firewall returned a ruleset from a namespace that is gone: %q", got)
 	}
 }
 

@@ -251,7 +251,15 @@ func (h *LinuxHost) ListNft(ctx context.Context, netns, table string) (string, e
 		return out, nil
 	}
 	msg := strings.ToLower(err.Error())
-	for _, absent := range []string{"no such file or directory", "does not exist", "cannot open network namespace"} {
+	// The namespace first, and as its own answer: `ip netns exec` fails before
+	// nft is ever reached, so "cannot open network namespace" says nothing
+	// about any table. Reporting it as ErrNoNftTable would let a teardown
+	// assertion and a live-guest security check read the same sentinel for
+	// opposite findings.
+	if strings.Contains(msg, "cannot open network namespace") {
+		return "", fmt.Errorf("%w: %q", ErrNoNetns, netns)
+	}
+	for _, absent := range []string{"no such file or directory", "does not exist"} {
 		if strings.Contains(msg, absent) {
 			return "", fmt.Errorf("%w: inet %s in %q", ErrNoNftTable, table, netns)
 		}

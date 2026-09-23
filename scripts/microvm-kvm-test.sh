@@ -43,7 +43,8 @@
 #
 # Exit status: 0 the harness passed, 2 a precondition is missing and nothing
 # ran, 3 the harness SKIPPED (which is not a pass and must never be recorded as
-# one), 1 the harness failed.
+# one), 4 the harness ran but nothing in it did (also not a pass), 1 the
+# harness failed.
 #
 # Nothing it writes carries a hostname, an address, a project id or any
 # customer data: the evidence is durations, digests of artefacts the operator
@@ -61,8 +62,14 @@ out_dir="${RAINIER_MICROVM_KVM_OUT:-$repo_root/microvm-kvm-evidence}"
 test_timeout="${RAINIER_MICROVM_KVM_TIMEOUT:-30m}"
 go_bin="${GO:-go}"
 
-# The two tests the harness holds, named rather than matched by prefix: a
-# pattern that drifted would silently run none of them and report success.
+# The two tests the harness holds, named rather than matched by prefix, so the
+# command in the runbook says which tests it is evidence for.
+#
+# Naming them is NOT what stops a drifted pattern being reported as a pass:
+# `go test -run` matching nothing exits 0 and prints no SKIP, so a renamed test
+# would leave this script with a silent, successful, empty run. What stops that
+# is the evidence check further down, which will not write "pass" without
+# something in the log or the timings file to say a test actually ran.
 test_pattern='^(TestMicrovmBootSmokeOnKVM|TestMicrovmSatisfiesContractOnKVM)$'
 
 # ---------------------------------------------------------------------------
@@ -199,6 +206,17 @@ elif grep -q -- '--- SKIP' "$log"; then
   # does not, such as whether the kernel image is world-readable.
   result="skipped"
   status=3
+elif ! { grep -q -- '--- PASS: TestMicrovmBootSmokeOnKVM' "$log" &&
+         grep -q -- '--- PASS: TestMicrovmSatisfiesContractOnKVM' "$log"; } &&
+     [[ ! -s "$timings" ]]; then
+  # `go test -run` that matches no test exits 0 and prints no SKIP, so exit
+  # status alone cannot tell "both tests passed" from "the -run pattern above
+  # drifted and nothing ran at all". A pass is therefore written only against
+  # positive evidence: the harness's own PASS lines, or the timings file it
+  # writes while booting a guest. Neither means nothing ran, which is the one
+  # outcome that must never be filed as ADR-0003 §8 item 1 evidenced.
+  result="no-tests-ran"
+  status=4
 fi
 
 # ---------------------------------------------------------------------------

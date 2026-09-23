@@ -274,6 +274,12 @@ func (f *FakeHost) ListNft(_ context.Context, netns, table string) (string, erro
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// A namespace that is gone is its own answer, as it is on a Linux host
+	// where `ip netns exec` fails before nft runs. Checked first because the
+	// two are not ranked the same way by a caller: see ErrNoNetns.
+	if netns != "" && !f.ns[netns] {
+		return "", fmt.Errorf("%w: %q", ErrNoNetns, netns)
+	}
 	rules, ok := f.rules[netns]
 	if !ok {
 		return "", fmt.Errorf("%w: inet %s in %q", ErrNoNftTable, table, netns)

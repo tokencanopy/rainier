@@ -10,15 +10,33 @@ import (
 // therefore where a previous runnerd's leftovers are found.
 const DefaultNetnsDir = "/var/run/netns"
 
-// ErrNoNftTable is what a read of a slot's firewall reports when the table is
-// not there at all — a slot that was never set up, or one whose teardown has
-// already taken its rules away.
+// ErrNoNftTable is what a read of a slot's firewall reports when the slot's
+// network namespace is there and the table in it is not — a slot that was
+// never set up, or one whose firewall has been taken away underneath a live
+// session.
 //
 // It is a named error rather than an empty string because the two answers are
 // not the same question: "this guest is behind no rules" is the finding a
 // security check exists to make, and an empty ruleset that could also mean "the
 // table is fine, it just has no rules" would make that check unable to fire.
+//
+// It does NOT cover a namespace that is gone; that is ErrNoNetns, and the two
+// are separated for the reason this error exists at all. A live slot whose
+// table vanished is the security finding. A slot whose namespace vanished is a
+// slot that has been torn down, where having no rules is the expected end
+// state and not a finding about any guest.
 var ErrNoNftTable = errors.New("netslot: no such nftables table")
+
+// ErrNoNetns is what a read of a slot's firewall reports when the namespace it
+// would have read in does not exist.
+//
+// `ip netns exec` fails before nft is reached ("Cannot open network
+// namespace"), so this is the answer to a question that could not be asked,
+// not an observation about a table. A teardown assertion wants it; a check
+// that a running guest is behind rules must not accept it in place of
+// ErrNoNftTable, because a vanished namespace means there is no guest there to
+// have a finding about.
+var ErrNoNetns = errors.New("netslot: no such network namespace")
 
 // Host is every privileged operation a slot needs, and the only way this
 // package reaches the machine.
@@ -111,8 +129,9 @@ type Host interface {
 // produced the text. Adding a method to Host would have made every
 // implementation of it carry a call nothing in production makes.
 //
-// An implementation reports ErrNoNftTable when the table is absent, and never
-// an empty ruleset for it: see that error for why the distinction matters.
+// An implementation reports ErrNoNftTable when the table is absent and
+// ErrNoNetns when the namespace is, and never an empty ruleset for either: see
+// those errors for why the distinctions matter.
 type NftReader interface {
 	ListNft(ctx context.Context, netns, table string) (string, error)
 }
