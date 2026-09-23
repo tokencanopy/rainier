@@ -330,8 +330,14 @@ func TestMicrovmKVMScriptIsTheMakeTarget(t *testing.T) {
 	if !strings.Contains(body, "\nmicrovm-kvm-test:\n\t./scripts/microvm-kvm-test.sh\n") {
 		t.Fatal("make microvm-kvm-test does not run scripts/microvm-kvm-test.sh")
 	}
-	if !strings.Contains(body, "microvm-kvm-test") || !strings.Contains(body, ".PHONY:") {
-		t.Fatal("microvm-kvm-test is not declared .PHONY")
+	phony := ""
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, ".PHONY:") {
+			phony = line
+		}
+	}
+	if !strings.Contains(phony, " microvm-kvm-test") {
+		t.Fatalf("microvm-kvm-test is not declared .PHONY, so a file of that name would shadow it: %q", phony)
 	}
 	// And it is NOT part of verify: `make verify` runs on developer machines
 	// and in CI, and neither has /dev/kvm.

@@ -3,6 +3,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -223,5 +224,116 @@ func TestMeteringIsOptionalAndDockerHasNone(t *testing.T) {
 	var mv Driver = m
 	if _, ok := mv.(MeteringDriver); !ok {
 		t.Error("the microvm driver does not implement MeteringDriver")
+	}
+}
+
+// TestTeardownRemovesTheVMsCgroup. The jailer creates a cgroup per VM and
+// moves the VMM into it; when the VMM exits the kernel leaves the directory
+// behind, and neither Firecracker nor the jailer removes it. Before this,
+// nothing did — so a host that ran sessions all day held one empty cgroup per
+// session it had ever run, under the parent every later VM's is created in.
+//
+// The fixture is an EMPTY directory rather than one carrying cpu.stat and
+// memory.current, and the difference is worth naming: on cgroupfs those
+// control files are not ordinary files, cannot be unlinked, and rmdir(2)
+// removes the cgroup with them. On the ordinary filesystem a test runs on,
+// rmdir of a directory with files in it fails — so a fixture that staged them
+// would be asserting a filesystem's rule and not the kernel's. The half only a
+// real host can prove is asserted by the Firecracker-backed harness
+// (internal/driver/microvm_kvm_test.go).
+func TestTeardownRemovesTheVMsCgroup(t *testing.T) {
+	cgroupRoot := t.TempDir()
+	m, _, _ := testMicrovmNet(t, MicrovmOpts{TotalSlots: 2, CgroupRoot: cgroupRoot})
+	m.SetHost(&stubMicrovmHost{})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "sess-cgroup"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	dir := fakeCgroup(t, cgroupRoot, defaultJailCgroupParent, h.ID, nil)
+
+	if err := m.DestroyContainer(ctx, h.ID); err != nil {
+		t.Fatalf("DestroyContainer: %v", err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the VM's cgroup %s survived the teardown (stat err = %v); one per session ever run accumulates under %s",
+			dir, err, filepath.Join(cgroupRoot, defaultJailCgroupParent))
+	}
+	// The parent stays: every later VM's cgroup is created under it, and a
+	// teardown that took it would make the next create's jailer build it
+	// again — or fail.
+	if _, err := os.Stat(filepath.Join(cgroupRoot, defaultJailCgroupParent)); err != nil {
+		t.Fatalf("the teardown removed the parent cgroup every later VM is created under: %v", err)
+	}
+}
+
+// TestACgroupThatWillNotGoDoesNotFailTheTeardown. An rmdir of a cgroup that
+// still holds something answers EBUSY. The session IS gone by then — the VMM
+// was signalled and waited for, the jail is removed, the slot is back — and
+// reporting a failure over a directory would turn that into a teardown the
+// control plane retries forever.
+func TestACgroupThatWillNotGoDoesNotFailTheTeardown(t *testing.T) {
+	cgroupRoot := t.TempDir()
+	m, _, _ := testMicrovmNet(t, MicrovmOpts{TotalSlots: 2, CgroupRoot: cgroupRoot})
+	m.SetHost(&stubMicrovmHost{})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "sess-busy-cgroup"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	dir := fakeCgroup(t, cgroupRoot, defaultJailCgroupParent, h.ID, nil)
+	// A child directory stands in for a cgroup the kernel will not remove:
+	// rmdir answers ENOTEMPTY here and EBUSY there, and this call must treat
+	// both the same way.
+	if err := os.MkdirAll(filepath.Join(dir, "occupied"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.DestroyContainer(ctx, h.ID); err != nil {
+		t.Fatalf("DestroyContainer reported failure over a cgroup that would not go: %v", err)
+	}
+	if g, _ := m.Inspect(ctx, h.ID); g.State != StateGone {
+		t.Fatalf("the session is %s after a teardown whose cgroup would not go, want %s", g.State, StateGone)
+	}
+	if used, _, _ := m.Capacity(ctx); used != 0 {
+		t.Fatalf("the slot was not reclaimed: %d in use", used)
+	}
+}
+
+// TestCrashPathTeardownRemovesTheCgroupOfARecordItNeverAdopted. The other
+// teardown door: an id this process has no live record of, whose record is
+// still on disk — a session that outlived its runnerd. It reads the cgroup
+// path off that record rather than recomputing it, so an operator who moved
+// --microvm-cgroup-parent in between still has the cgroup the VM was in
+// removed.
+func TestCrashPathTeardownRemovesTheCgroupOfARecordItNeverAdopted(t *testing.T) {
+	stateDir := shortTempDir(t)
+	cgroupRoot := t.TempDir()
+	m, _, _ := testMicrovmNet(t, MicrovmOpts{TotalSlots: 2, StateDir: stateDir, CgroupRoot: cgroupRoot})
+	m.SetHost(&stubMicrovmHost{})
+	ctx := context.Background()
+
+	h, err := m.Create(ctx, Spec{SessionID: "sess-orphan-cgroup"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	dir := fakeCgroup(t, cgroupRoot, defaultJailCgroupParent, h.ID, nil)
+
+	// The live record goes, leaving only the one on disk — the state a
+	// session that outlived its runnerd is in. And the operator has moved
+	// --microvm-cgroup-parent since, so a path recomputed now would name a
+	// cgroup that never existed and leave the real one behind forever.
+	m.mu.Lock()
+	delete(m.instances, h.ID)
+	m.opts.CgroupRoot = t.TempDir()
+	m.mu.Unlock()
+
+	if err := m.DestroyContainer(ctx, h.ID); err != nil {
+		t.Fatalf("DestroyContainer on a disk-only record: %v", err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the cgroup of a record this process never adopted survived at %s (stat err = %v)", dir, err)
 	}
 }
