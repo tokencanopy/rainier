@@ -78,12 +78,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/tokencanopy/rainier/internal/driver/netslot"
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
@@ -708,6 +711,474 @@ func (g *kvmGuest) awaitExchange(wait time.Duration) error {
 	case <-time.After(wait):
 		return fmt.Errorf("the guest did not exchange its bootstrap token within %s", wait)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Host observations
+// ---------------------------------------------------------------------------
+
+// kvmLiveRecord copies what an assertion needs out of a live instance record,
+// under the driver mutex. The harness is in this package precisely so it can
+// read the driver's own view of a session rather than re-derive it: a check
+// written against re-derived names would pass on a driver that had stopped
+// recording where it put things.
+func kvmLiveRecord(t *testing.T, m *Microvm, id string) (VMMConfig, *netslot.Slot) {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inst, ok := m.instances[id]
+	if !ok {
+		t.Fatalf("the driver has no live record of %s", id)
+	}
+	if inst.slot == nil {
+		t.Fatalf("%s holds no network slot, so it has neither a namespace nor a uid of its own (ADR-0003 §4.5)", id)
+	}
+	return inst.Cfg, inst.slot
+}
+
+// kvmProcUID is the real uid of a running process, from /proc.
+func kvmProcUID(t *testing.T, pid int) int {
+	t.Helper()
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		t.Fatalf("read /proc/%d/status: %v", pid, err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		rest, ok := strings.CutPrefix(line, "Uid:")
+		if !ok {
+			continue
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			break
+		}
+		uid, err := strconv.Atoi(fields[0])
+		if err != nil {
+			t.Fatalf("parse Uid %q from /proc/%d/status: %v", fields[0], pid, err)
+		}
+		return uid
+	}
+	t.Fatalf("/proc/%d/status has no Uid line", pid)
+	return -1
+}
+
+// kvmNetnsLink is the "net:[<inode>]" a process's network namespace reads as,
+// and the same string for a NAMED namespace on this host. Comparing the two is
+// what turns "the jailer was passed --netns" into "the VMM is in it".
+func kvmNetnsLink(t *testing.T, pid int) string {
+	t.Helper()
+	link, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/net", pid))
+	if err != nil {
+		t.Fatalf("readlink /proc/%d/ns/net: %v", pid, err)
+	}
+	return link
+}
+
+func kvmNamedNetnsLink(t *testing.T, name string) string {
+	t.Helper()
+	fi, err := os.Stat(filepath.Join(netslot.DefaultNetnsDir, name))
+	if err != nil {
+		t.Fatalf("stat the named network namespace %s: %v", name, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("stat %s: no inode available", name)
+	}
+	return fmt.Sprintf("net:[%d]", st.Ino)
+}
+
+// kvmInode identifies a file by identity rather than by path, which is what
+// "the workspace survived" and "the rootfs is a fresh clone" both need: the
+// two live at fixed paths, so a path check cannot tell a kept file from a
+// recreated one.
+func kvmInode(t *testing.T, path string) uint64 {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("stat %s: no inode available", path)
+	}
+	return st.Ino
+}
+
+func kvmAbsent(t *testing.T, what, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("%s survived the teardown at %s (stat err = %v)", what, path, err)
+	}
+}
+
+// kvmScanHostFiles reads every file the DRIVER wrote under the state directory
+// and reports the first one containing needle.
+//
+// Three directories are deliberately skipped, and the reason is the same for
+// all three: they are the guest's own block devices, not this host's writing.
+// A workspace disk, an agent home, and a session's root filesystem are a
+// tenant's filesystem — what a guest chooses to put in its own files is the
+// guest's business, and scanning them would be asserting something about
+// sessiond rather than about the driver. What ADR-0003 §2.2 and §2.7 item 1
+// forbid is the HOST writing a session's configuration down, and that is
+// everything else under here: the instance records, the jail, the image store
+// and its manifests.
+func kvmScanHostFiles(t *testing.T, stateDir, needle, what string) {
+	t.Helper()
+	if needle == "" {
+		t.Fatal("kvmScanHostFiles: an empty needle matches everything")
+	}
+	skip := map[string]bool{"workspaces": true, "homes": true, "rootfs": true}
+	err := filepath.WalkDir(stateDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if rel, rerr := filepath.Rel(stateDir, path); rerr == nil && skip[rel] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return nil
+		}
+		if strings.Contains(string(data), needle) {
+			t.Fatalf("ADR-0003 §2.7 item 1: %s was written to this host's disk, at %s", what, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", stateDir, err)
+	}
+}
+
+// kvmNoMemoryImage is ADR-0003 §2.2 and §8 item 4: a cold suspension writes no
+// guest memory image anywhere, because an authenticated session's RAM is a
+// secret-bearing artefact.
+//
+// The names are the ones Firecracker's own snapshot API produces, which is the
+// only way such a file could appear at all: this driver's MicrovmEngine has no
+// Snapshot method, so there is nothing that could ask for one. That is what
+// makes this check cheap AND worth keeping — it is a regression test for an
+// interface, phrased as a fact about the host.
+func kvmNoMemoryImage(t *testing.T, stateDir string) {
+	t.Helper()
+	suspicious := []string{"memfile", "mem_file", "mem.snapshot", "snapshot.json", "vmstate"}
+	err := filepath.WalkDir(stateDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := strings.ToLower(d.Name())
+		for _, bad := range suspicious {
+			if strings.Contains(name, bad) {
+				t.Fatalf("ADR-0003 §2.2: a cold suspension left what looks like a guest memory image at %s", path)
+			}
+		}
+		if strings.HasSuffix(name, ".snap") {
+			t.Fatalf("ADR-0003 §2.2: a cold suspension left what looks like a guest memory image at %s", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", stateDir, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The boot smoke
+// ---------------------------------------------------------------------------
+
+// kvmTimings is what this harness measures, for the Phase A runbook's evidence
+// table. It is written to the file RAINIER_MICROVM_TEST_TIMINGS names, and
+// carries nothing but durations and the shape they were taken on: no session
+// id, no path, no token, nothing correlated (Bakeoff §12).
+type kvmTimings struct {
+	Schema              string `json:"schema"`
+	BootToConnectedMS   int64  `json:"boot_to_connected_ms"`
+	ColdSuspendMS       int64  `json:"cold_suspend_ms"`
+	ResumeToConnectedMS int64  `json:"resume_to_connected_ms"`
+	DestroyMS           int64  `json:"destroy_ms"`
+	CloneMethod         string `json:"clone_method"`
+	VCPU                int    `json:"vcpu"`
+	MemoryMiB           int    `json:"memory_mib"`
+	Samples             int    `json:"samples"`
+}
+
+const kvmTimingsSchema = "rainier.microvm.kvm-test/v1"
+
+// writeKVMTimings records the run's measurements where the operator's script
+// can pick them up, and logs them either way.
+//
+// One sample each, and the field says so: five samples is not a p95 and one is
+// not a p50. The runbook's §7 table is the place that decides what a single
+// number may be written as, and it already says "anything measured once, say
+// so".
+func writeKVMTimings(t *testing.T, tm kvmTimings) {
+	t.Helper()
+	tm.Schema = kvmTimingsSchema
+	tm.Samples = 1
+	blob, err := json.MarshalIndent(tm, "", "  ")
+	if err != nil {
+		t.Fatalf("encode timings: %v", err)
+	}
+	t.Logf("MICROVM_KVM_TIMINGS %s", strings.ReplaceAll(string(blob), "\n", " "))
+	path := os.Getenv(kvmTimingsEnv)
+	if path == "" {
+		return
+	}
+	if err := os.WriteFile(path, append(blob, '\n'), 0o644); err != nil {
+		t.Fatalf("write %s=%q: %v", kvmTimingsEnv, path, err)
+	}
+}
+
+// TestMicrovmBootSmokeOnKVM is one whole session lifecycle on real hardware,
+// and it runs BEFORE the contract suite below it (source order is run order
+// within a file) for a practical reason: if a guest cannot boot and dial on
+// this host, that is one failure with one message, rather than fourteen
+// contract subtests each failing somewhere in the middle.
+//
+// Every assertion names the ADR section it evidences. The sections are not
+// decoration: this is the only test in the repository that can evidence any of
+// them, and a failure here is a Phase A finding rather than a broken unit.
+func TestMicrovmBootSmokeOnKVM(t *testing.T) {
+	fx := requireKVMHost(t)
+	m, above, clone := newKVMMicrovm(t, fx)
+	defer kvmTeardown(t, m)
+	ctx := context.Background()
+	stateDir := m.opts.StateDir
+
+	const (
+		sessionID  = "kvmsmoke1"
+		secretName = "RAINIER_KVM_SMOKE_SECRET"
+		// Synthetic, and it never leaves this process except down one
+		// session's vsock conn — which is the property being asserted.
+		secretValue = "synthetic-value-not-a-credential"
+	)
+	above.SetSecret(secretName, secretValue)
+
+	// The control plane's half of the create: the token it mints and the
+	// names it declares, with the VALUES withheld (ADR-0003 §2.7 item 1).
+	token, err := above.MintSessionBootstrap(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("mint a bootstrap token: %v", err)
+	}
+
+	start := time.Now()
+	h, err := m.Create(ctx, Spec{
+		Name:           "kvm-smoke",
+		SessionID:      sessionID,
+		BootstrapToken: token,
+		SecretNames:    []string{secretName},
+	})
+	if err != nil {
+		t.Fatalf("Create on a real KVM host: %v", err)
+	}
+
+	// --- ADR-0003 §4.1 (Create row) and §2.7 item 2: the guest boots and
+	// dials (2, 1024), and the driver hands it its whole configuration as the
+	// first frame on that conn.
+	guest, err := above.awaitGuest(ctx, sessionID, fx.connectWait)
+	if err != nil {
+		t.Fatalf("ADR-0003 §4.1: no guest connected over vsock within %s: %v\n\n"+
+			"This is the base image under test, not the driver. The rootfs at %s must carry an /init that mounts the\n"+
+			"pseudo-filesystems, mounts /dev/vdb on /workspace, brings the link up, and execs `sessiond --transport=vsock`\n"+
+			"(or sets RAINIER_TRANSPORT=vsock). A sessiond started with no flags takes the WebSocket path and never dials\n"+
+			"vsock at all. The guest kernel must have CONFIG_VIRTIO_VSOCKETS and expose /dev/vsock. Firecracker's own\n"+
+			"stdout for this boot is in the jail at %s.",
+			fx.connectWait, err, fx.rootfs, jailInstanceDir(stateDir, h.ID))
+	}
+	bootToConnected := guest.at.Sub(start)
+	t.Logf("boot to connected: %s (%d vCPU, %d MiB, rootfs clone by %s)", bootToConnected.Round(time.Millisecond), defaultMicrovmVCPU, defaultMicrovmMemoryMiB, clone)
+
+	// The guest received boot_config, proven by the one thing it could not
+	// have invented: it echoed the exact bootstrap token back in its secrets
+	// exchange. The token is in no other channel and on no disk.
+	if err := guest.awaitExchange(fx.connectWait); err != nil {
+		t.Fatalf("ADR-0003 §2.7 item 2: %v. The guest opened the control channel but never acted on its boot configuration", err)
+	}
+	if got, _ := guest.token(); got != token {
+		t.Fatalf("ADR-0003 §2.7 item 2: the guest exchanged a bootstrap token that is not the one this create carried")
+	}
+
+	cfg, slot := kvmLiveRecord(t, m, h.ID)
+	pid := m.engine.PID(h.ID)
+	if pid <= 0 {
+		t.Fatalf("the driver has no pid for %s, so nothing about the VMM process can be evidenced", h.ID)
+	}
+
+	// --- ADR-0003 §4.3: the per-slot firewall is applied, read back from the
+	// host rather than from the renderer that produced it.
+	rules, err := m.slots.Firewall(ctx, slot)
+	if err != nil {
+		t.Fatalf("ADR-0003 §4.3: slot %d's firewall could not be read back from the host: %v", slot.Index, err)
+	}
+	for _, want := range []string{
+		// This chain has an opinion about exactly one interface: this
+		// session's TAP.
+		`iifname != "` + slot.Tap + `"`,
+		// The named metadata control (Hosted Tenancy §10.2 and §16).
+		"169.254.169.254",
+		// IPv6 from the guest, dropped before anything is accepted.
+		"meta nfproto ipv6 drop",
+		// And the deny set, which contains 10.0.0.0/8 and therefore every
+		// neighbouring slot's /30 on this host — the harness's guest and
+		// uplink ranges are both inside it, so the set dedupes to the
+		// broader range and that is what a reader sees.
+		"10.0.0.0/8",
+	} {
+		if !strings.Contains(rules, want) {
+			t.Fatalf("ADR-0003 §4.3: the ruleset slot %d is actually behind does not contain %q:\n%s", slot.Index, want, rules)
+		}
+	}
+
+	// --- ADR-0003 §4.5: the VM runs under its own uid, in its own network
+	// namespace, in its own cgroup.
+	uids, err := newUIDRange(0, 0)
+	if err != nil {
+		t.Fatalf("uid range: %v", err)
+	}
+	wantUID, err := uids.forSlot(slot.Index)
+	if err != nil {
+		t.Fatalf("uid for slot %d: %v", slot.Index, err)
+	}
+	if got := kvmProcUID(t, pid); got != wantUID {
+		t.Fatalf("ADR-0003 §4.5: the VMM runs as uid %d, want %d (the slot index above the per-VM range). "+
+			"A VMM sharing a uid with another session shares every file-permission decision the kernel makes about them", got, wantUID)
+	}
+	if got, want := kvmNetnsLink(t, pid), kvmNamedNetnsLink(t, slot.Netns); got != want {
+		t.Fatalf("ADR-0003 §4.5: the VMM's network namespace is %s, want %s (%s)", got, want, slot.Netns)
+	}
+	if kvmNetnsLink(t, pid) == kvmNetnsLink(t, os.Getpid()) {
+		t.Fatalf("ADR-0003 §4.5: the VMM is in this process's own network namespace, not a slot's")
+	}
+	if _, err := os.Stat(cfg.CgroupPath); err != nil {
+		t.Fatalf("ADR-0003 §4.5 and §4.6: the VM's cgroup %s is not there, so nothing meters it: %v", cfg.CgroupPath, err)
+	}
+	procCgroup, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		t.Fatalf("read /proc/%d/cgroup: %v", pid, err)
+	}
+	if want := "/" + kvmCgroupChild + "/" + h.ID; !strings.Contains(string(procCgroup), want) {
+		t.Fatalf("ADR-0003 §4.6: the VMM is not in its own cgroup (%q is not in %q)", want, strings.TrimSpace(string(procCgroup)))
+	}
+
+	workspaceInode := kvmInode(t, cfg.WorkspaceDiskPath)
+	rootfsInode := kvmInode(t, cfg.RootfsPath)
+	jailDir := jailInstanceDir(stateDir, h.ID)
+	if _, err := os.Stat(jailDir); err != nil {
+		t.Fatalf("ADR-0003 §4.5: the VM's jail directory %s is not there: %v", jailDir, err)
+	}
+
+	// --- ADR-0003 §2.2: cold suspension terminates the VM and writes no
+	// memory image and no secret to this host's disk.
+	above.forget(sessionID)
+	coldStart := time.Now()
+	if err := m.Suspend(ctx, h.ID, false); err != nil {
+		t.Fatalf("cold suspend: %v", err)
+	}
+	coldSuspend := time.Since(coldStart)
+	t.Logf("cold suspend: %s", coldSuspend.Round(time.Millisecond))
+
+	kvmNoMemoryImage(t, stateDir)
+	kvmScanHostFiles(t, stateDir, token, "this session's bootstrap token")
+	kvmScanHostFiles(t, stateDir, secretValue, "an environment secret value")
+	// The rootfs copy goes with the VM (§4.1's Suspend row); the workspace
+	// stays (§2.3).
+	kvmAbsent(t, "the cold-parked session's root filesystem", cfg.RootfsPath)
+	if _, err := os.Stat(cfg.WorkspaceDiskPath); err != nil {
+		t.Fatalf("ADR-0003 §2.3: a cold suspension took the workspace disk with it: %v", err)
+	}
+
+	// --- ADR-0003 §2.6: a resume is a FRESH BOOT with preserved files.
+	resumeStart := time.Now()
+	restarted, err := m.Resume(ctx, h.ID)
+	if err != nil {
+		t.Fatalf("cold resume: %v", err)
+	}
+	if !restarted {
+		t.Fatal("ADR-0003 §2.6: a cold resume reported no restart; a resumed session is a fresh boot and runnerd decides whether the agent is a new process from this bit")
+	}
+	resumed, err := above.awaitGuest(ctx, sessionID, fx.connectWait)
+	if err != nil {
+		t.Fatalf("ADR-0003 §2.6: the resumed session's guest did not connect within %s: %v", fx.connectWait, err)
+	}
+	resumeToConnected := resumed.at.Sub(resumeStart)
+	t.Logf("resume to connected: %s", resumeToConnected.Round(time.Millisecond))
+
+	if err := resumed.awaitExchange(fx.connectWait); err != nil {
+		t.Fatalf("ADR-0003 §2.6: %v", err)
+	}
+	resumedToken, _ := resumed.token()
+	if resumedToken == token {
+		t.Fatal("ADR-0003 §2.7 item 1: the resumed guest was handed the parked session's token; a bootstrap token is single-use and a new VM gets a new one")
+	}
+	if got := above.mintCount(sessionID); got != 2 {
+		t.Fatalf("the runner minted %d bootstrap token(s) for this session, want 2 (one per boot)", got)
+	}
+
+	cfg2, slot2 := kvmLiveRecord(t, m, h.ID)
+	if got := kvmInode(t, cfg2.WorkspaceDiskPath); got != workspaceInode {
+		t.Fatalf("ADR-0003 §2.6: the workspace disk is a different file after the resume (inode %d, was %d); the session came back to a blank workspace", got, workspaceInode)
+	}
+	if got := kvmInode(t, cfg2.RootfsPath); got == rootfsInode {
+		t.Fatalf("ADR-0003 §4.1 (Suspend row): the resumed session reused the parked boot's root filesystem (inode %d); a cold resume clones a fresh one from the environment image", got)
+	}
+	if got, _ := m.Inspect(ctx, h.ID); got.State != StateRunning {
+		t.Fatalf("after a cold resume the session is %s, want %s", got.State, StateRunning)
+	}
+
+	// --- Teardown: every resource this session held is gone.
+	destroyStart := time.Now()
+	if err := m.Destroy(ctx, h.ID); err != nil {
+		t.Fatalf("Destroy: %v", err)
+	}
+	destroy := time.Since(destroyStart)
+
+	if got, _ := m.Inspect(ctx, h.ID); got.State != StateGone {
+		t.Fatalf("after Destroy the session is %s, want %s", got.State, StateGone)
+	}
+	kvmAbsent(t, "the session's root filesystem clone", cfg2.RootfsPath)
+	kvmAbsent(t, "the session's workspace disk", cfg2.WorkspaceDiskPath)
+	kvmAbsent(t, "the VM's jail directory", jailInstanceDir(stateDir, h.ID))
+	kvmAbsent(t, "the VM's cgroup", cfg2.CgroupPath)
+	// The TAP lives inside the slot's namespace, so the namespace going is
+	// what takes it; the host end of the uplink veth is the half this
+	// namespace can still be seen from.
+	kvmAbsent(t, "the slot's uplink veth", filepath.Join("/sys/class/net", slot2.VethHost))
+
+	observer, err := netslot.NewLinuxHost("")
+	if err != nil {
+		t.Fatalf("a host to observe namespaces with: %v", err)
+	}
+	live, err := observer.ListNetns(ctx)
+	if err != nil {
+		t.Fatalf("list network namespaces: %v", err)
+	}
+	for _, ns := range []string{slot.Netns, slot2.Netns} {
+		if slices.Contains(live, ns) {
+			t.Fatalf("the network namespace %s survived the teardown; its slot is off the pool for good", ns)
+		}
+	}
+	if _, err := m.slots.Firewall(ctx, slot2); !errors.Is(err, netslot.ErrNoNftTable) {
+		t.Fatalf("ADR-0003 §4.3: slot %d's firewall table survived its release (err = %v)", slot2.Index, err)
+	}
+	if used, _, _ := m.Capacity(ctx); used != 0 {
+		t.Fatalf("after the teardown this host reports %d slot(s) in use, want 0", used)
+	}
+
+	writeKVMTimings(t, kvmTimings{
+		BootToConnectedMS:   bootToConnected.Milliseconds(),
+		ColdSuspendMS:       coldSuspend.Milliseconds(),
+		ResumeToConnectedMS: resumeToConnected.Milliseconds(),
+		DestroyMS:           destroy.Milliseconds(),
+		CloneMethod:         string(clone),
+		VCPU:                defaultMicrovmVCPU,
+		MemoryMiB:           defaultMicrovmMemoryMiB,
+	})
 }
 
 // ---------------------------------------------------------------------------
