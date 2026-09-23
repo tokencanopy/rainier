@@ -166,6 +166,14 @@ type MicrovmOpts struct {
 	// OBSERVE the clones, not to substitute for a missing host capability.
 	Clone Cloner
 
+	// Checkpoint is what a cold suspend turns this session's workspace into: a
+	// portable workspace checkpoint, committed and verified before the VM is
+	// terminated (ADR-0003 §4.4). nil is a driver that does not checkpoint —
+	// the local dev surface and the contract suite, which have no store and no
+	// key — and runnerd requires both for --driver=microvm, so no production
+	// path reaches that state. See microvm_checkpoint.go.
+	Checkpoint *CheckpointOpts
+
 	Engine MicrovmEngine // test seam; nil in production
 	Net    netslot.Host  // test seam; nil in production
 	Format DiskFormatter // test seam; nil in production
@@ -307,6 +315,26 @@ type instanceRecord struct {
 	PID       int       `json:"pid"`
 	Cfg       VMMConfig `json:"cfg"`
 
+	// The portable workspace checkpoint this session has, if any. All three are
+	// PERSISTED, and they have to be: a cold resume after a runnerd restart is
+	// exactly the case where the workspace image may be gone and the checkpoint
+	// is the only copy left, and a generation this process forgot would be one
+	// a retry overwrote or one a restore could not name.
+	//
+	// None of them is secret. A generation is a counter, a manifest key is
+	// derived from the workspace and session ids this record already carries,
+	// and the checkpoint itself is unreadable without a key that lives nowhere
+	// near this file.
+	//
+	// CheckpointGeneration is the count of COMMITTED checkpoints, which is the
+	// generation of the newest one and the number the next one is taken at plus
+	// one. It advances only on a commit, so a suspend that failed before the
+	// manifest's put-if-absent leaves the next attempt the same number — which
+	// is what makes a retry a retry rather than a hole in the sequence.
+	CheckpointGeneration uint64 `json:"checkpoint_generation,omitempty"`
+	CheckpointKey        string `json:"checkpoint_key,omitempty"`
+	CheckpointAt         string `json:"checkpoint_at,omitempty"`
+
 	// boot is the configuration the guest is handed over vsock, and channel
 	// is the host end of that conn. Both are unexported and therefore never
 	// serialized, which is the point: the configuration carries the session's
@@ -345,6 +373,14 @@ type instanceRecord struct {
 	// beside it: see Resume for what two concurrent cold ones would do to
 	// each other's socket.
 	resuming bool
+
+	// checkpointing is the same kind of claim for the workspace checkpoint a
+	// cold suspend takes. Two of them on one instance would each send the guest
+	// a cold suspend notice with a nonce of its own, each arm a waiter that
+	// replaces the other's, and each read part of one stream — producing two
+	// checkpoints of two halves of a workspace, both committed and both wrong.
+	// The second is refused rather than queued.
+	checkpointing bool
 
 	// snapshotting is the same kind of claim for a Snapshot, and it does one
 	// more thing: it says that the VM is paused BY THIS DRIVER for a copy, so
@@ -424,6 +460,11 @@ type Microvm struct {
 	// connection goes, and who asks the control plane for a fresh bootstrap
 	// token on a cold resume. nil is a real state — see MicrovmHost.
 	host MicrovmHost
+
+	// ckpt is the portable workspace checkpoint's configuration, or nil for a
+	// driver that does not checkpoint. It is read on every cold suspend and
+	// every cold resume; it is written once, by NewMicrovm.
+	ckpt *CheckpointOpts
 }
 
 // NewMicrovm creates a new microVM driver, or fails.
@@ -496,6 +537,19 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 		cloner = NewFileCloner()
 	}
 
+	// The checkpoint's configuration is validated HERE, once, rather than on
+	// the first cold suspend — which is the worst possible moment to discover
+	// that a store or a key was missing, because by then a guest has been told
+	// its VM is ending.
+	if opts.Checkpoint != nil {
+		if opts.Checkpoint.Store == nil {
+			return nil, errors.New("microvm: a checkpoint configuration needs a blob store (--checkpoint-store-dir): a cold suspend has nowhere to put a workspace without one")
+		}
+		if opts.Checkpoint.Keys == nil {
+			return nil, errors.New("microvm: a checkpoint configuration needs a key wrapper (--checkpoint-key-file): an unencrypted workspace checkpoint is not one")
+		}
+	}
+
 	m := &Microvm{
 		opts:      opts,
 		engine:    engine,
@@ -503,6 +557,7 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 		format:    format,
 		images:    images,
 		cloner:    cloner,
+		ckpt:      opts.Checkpoint,
 		instances: make(map[string]*instanceRecord),
 	}
 	// Records first, leftovers second, and never the other way round: a
@@ -1529,6 +1584,22 @@ func (m *Microvm) Suspend(ctx context.Context, id string, warm bool) error {
 	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("no such id %s", id)
+	}
+
+	// THE DURABILITY BARRIER (ADR-0003 §4.4). A cold suspend ends this VM and
+	// keeps only the workspace, so the workspace becomes a committed, verified
+	// checkpoint FIRST — before the engine is stopped, before the rootfs is
+	// discarded, before the slot goes back to the pool. Every failure below
+	// returns with the VM untouched and running.
+	//
+	// It runs with the driver mutex released: it is a copy of a filesystem
+	// across a socket and can take minutes, and holding the mutex across it
+	// would freeze Inspect, List, Capacity, Create and Destroy for every other
+	// session on this host.
+	if !warm && m.ckpt != nil {
+		if err := m.checkpointOnSuspend(ctx, id); err != nil {
+			return err
+		}
 	}
 
 	if warm {

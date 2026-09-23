@@ -3,6 +3,8 @@ package relay
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -30,6 +32,16 @@ type Hub struct {
 	mu      sync.Mutex
 	next    uint64
 	clients map[uint64]*hubClient // attachID → client
+	// streams is the sink table for FrameStream: stream id → the consumer of
+	// its chunks. It is separate from clients, and the ids come from a
+	// different source (a suspend nonce rather than h.next), because the two
+	// have opposite routing — an attachment's frame is FORWARDED to a client
+	// conn, a stream's frame is CONSUMED by this runner — and a table that
+	// mixed them could route a tenant's workspace into somebody's terminal.
+	//
+	// It holds at most one entry per in-flight stream, which today means at
+	// most one per cold suspend.
+	streams map[uint64]func([]byte) error
 	// onControl is wired by the constructor and never written again — see
 	// NewHubWithControl for why it isn't a settable field.
 	onControl func(payload []byte)
@@ -138,6 +150,7 @@ func newHub(ctx context.Context, sessionConn Conn, onControl func(payload []byte
 	termWrite, execWrite time.Duration) *Hub {
 	hctx, cancel := context.WithCancel(ctx)
 	h := &Hub{conn: sessionConn, ctx: hctx, cancel: cancel, clients: map[uint64]*hubClient{},
+		streams:   map[uint64]func([]byte) error{},
 		onControl: onControl, termWrite: termWrite, execWrite: execWrite}
 	go h.readLoop()
 	return h
@@ -176,6 +189,10 @@ func (h *Hub) readLoop() {
 			if h.onControl != nil {
 				h.onControl(f.Payload)
 			}
+			continue
+		}
+		if f.Type == FrameStream {
+			h.deliverStream(f)
 			continue
 		}
 		h.mu.Lock()
@@ -227,6 +244,62 @@ func (h *Hub) writeClient(client *hubClient, payload []byte) error {
 	ctx, cancel := context.WithTimeout(h.ctx, writeBudget(base, len(payload)))
 	defer cancel()
 	return client.conn.Write(ctx, payload)
+}
+
+// AddStream registers sink as the consumer of stream id's chunks, or refuses
+// if something is already reading that id.
+//
+// The refusal is not a formality. A stream id is a suspend nonce, and two
+// consumers on one id would each get some of a workspace's bytes — a
+// checkpoint of half a tree, committed, verified against its own halves, and
+// wrong. One reader or none.
+//
+// The sink runs ON readLoop's goroutine, which every attachment of this session
+// shares. That is deliberate: it is what back-pressures the guest when the
+// checkpoint writer above is not keeping up, so the workspace is never buffered
+// on this host. It is affordable because the one caller is a COLD suspend — the
+// agent is stopped and the execs are dead by the time a chunk arrives, so there
+// is nothing else on this conn worth not blocking. A sink that returns an error
+// is removed, and its caller learns from its own error rather than from here.
+func (h *Hub) AddStream(id uint64, sink func([]byte) error) error {
+	if sink == nil {
+		return errors.New("relay: a stream needs a sink")
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, live := h.streams[id]; live {
+		return fmt.Errorf("relay: stream %d is already being read", id)
+	}
+	h.streams[id] = sink
+	return nil
+}
+
+// RemoveStream unregisters a stream's sink. Chunks that arrive afterwards are
+// dropped, which is the right answer for a stream whose reader has given up:
+// there is nothing to do with the bytes, and nothing to tell a guest that is
+// about to be terminated anyway.
+func (h *Hub) RemoveStream(id uint64) {
+	h.mu.Lock()
+	delete(h.streams, id)
+	h.mu.Unlock()
+}
+
+// deliverStream hands one chunk to its sink, or drops it. The lookup is under
+// the lock and the call is not: a sink that blocks (which is the point — see
+// AddStream) must not hold the table every attachment's open and close needs.
+func (h *Hub) deliverStream(f Frame) {
+	h.mu.Lock()
+	sink := h.streams[f.AttachID]
+	h.mu.Unlock()
+	if sink == nil {
+		// A stream nobody is reading: a suspend that gave up, or a guest
+		// sending one that was never asked for. Dropped rather than buffered.
+		return
+	}
+	if err := sink(f.Payload); err != nil {
+		log.Printf("relay: dropping stream %d: %v", f.AttachID, err)
+		h.RemoveStream(f.AttachID)
+	}
 }
 
 // SendControl writes payload to the session as a FrameControl on AttachID 0:

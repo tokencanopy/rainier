@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -116,6 +117,41 @@ type MicrovmHost interface {
 	// error here is a snapshot refused rather than an image published on
 	// trust. See (*Microvm).Snapshot.
 	FlushGuest(ctx context.Context, sessionID string) error
+	// StreamWorkspace runs the COLD suspend handshake with sessionID's guest
+	// and copies the workspace the guest streams back into dst, returning when
+	// the guest has said the tree is complete and that it is ready to be
+	// terminated.
+	//
+	// It is the fourth thing only the runner can do, and it is here for the
+	// same reason as FlushGuest: the handshake and the stream ride the
+	// session's relay hub, which lives in runnerd.
+	//
+	// The driver owns the BARRIER — what is done with the bytes, and the rule
+	// that the VM is not terminated until a manifest has committed and
+	// verified. This call owns the hop. Every failure it reports is a suspend
+	// that must not proceed: there is no such thing as a partially streamed
+	// workspace that is worth checkpointing.
+	StreamWorkspace(ctx context.Context, sessionID string, dst io.Writer) (WorkspaceStream, error)
+	// CheckpointCommitted tells the guest its workspace is durable. It is
+	// best effort and answers nothing: the VM is terminated moments later, and
+	// what the event buys is a line in the session's own log saying whether
+	// its work made it out.
+	CheckpointCommitted(sessionID string, nonce uint64)
+}
+
+// WorkspaceStream is what one cold suspend's stream carried, as the guest
+// counted it and as the runner received it. It holds counts and a nonce and
+// nothing else — a name or a path from inside a workspace is session content
+// (tenancy §15.1) and has no business on this seam.
+type WorkspaceStream struct {
+	// Entries is how many tree entries the guest said it streamed.
+	Entries int64
+	// Bytes is how many bytes actually ARRIVED, which the runner has already
+	// checked against the guest's own count.
+	Bytes int64
+	// Nonce is the suspend this stream belonged to, so that the "your
+	// checkpoint committed" event can name it.
+	Nonce uint64
 }
 
 var (

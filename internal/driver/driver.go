@@ -221,6 +221,22 @@ type HostedDriver interface {
 	SetHost(MicrovmHost)
 }
 
+// CheckpointingDriver is a driver whose COLD suspend runs the workspace
+// checkpoint handshake itself: the `suspending{cold}` notice, the stream that
+// follows it, the write, and the verify (ADR-0003 §4.4).
+//
+// The runner asks before it sends a cold notice of its own. The notice and the
+// stream are one handshake with one nonce, so two notices would have the guest
+// quiesce twice and stream into a suspend nobody is reading — which is a failed
+// suspend on a session that had nothing wrong with it.
+//
+// It is an optional interface for the reason CapabilityDriver is: the Docker
+// driver has nothing to say here, and this change promises to leave its
+// behaviour exactly as it is.
+type CheckpointingDriver interface {
+	CheckpointsColdSuspend() bool
+}
+
 type Driver interface {
 	Create(ctx context.Context, spec Spec) (Handle, error)
 	Suspend(ctx context.Context, id string, warm bool) error // warm=pause, cold=stop

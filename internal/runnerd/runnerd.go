@@ -122,6 +122,18 @@ type Server struct {
 	// flushWait is how long a guest gets to flush. A field so a test does not
 	// spend the production budget; written only immediately after New.
 	flushWait time.Duration
+	// workspaces is the one waiter per session for the end marker of a cold
+	// suspend's workspace stream, and the three budgets that stream gets. It is
+	// separate from the suspend waiter that shares its nonce because the two
+	// answer different questions — "the tree is out of the guest" and "this VM
+	// may go" — and the host does the whole checkpoint between them. See
+	// workspacestream.go; the budgets are fields for the reason every other one
+	// here is, and are written only immediately after New.
+	workspaceMu        sync.Mutex
+	workspaces         map[string]*workspaceWaiter
+	workspaceStartWait time.Duration
+	workspaceIdleWait  time.Duration
+	workspaceTotalWait time.Duration
 	// displacedHubGrace is how long a hub a re-register replaced keeps
 	// delivering before it is closed. A field for the same reason, and
 	// written only immediately after New.
@@ -252,8 +264,12 @@ func New(drv driver.Driver, dialBase, egressAdmin, proxyURL string) *Server {
 		coldSuspendReadyWait: defaultColdSuspendReadyWait,
 		displacedHubGrace:    defaultDisplacedHubGrace,
 		flushWait:            defaultFlushWait,
+		workspaceStartWait:   defaultWorkspaceStartWait,
+		workspaceIdleWait:    defaultWorkspaceIdleWait,
+		workspaceTotalWait:   defaultWorkspaceTotalWait,
 		suspends:             map[string]*suspendWaiter{},
 		flushes:              map[string]*flushWaiter{},
+		workspaces:           map[string]*workspaceWaiter{},
 		runnerRPC:            newRunnerRPCTable()}
 	// The microVM driver is composed BELOW this server and needs three things
 	// from above it — where a guest's control conn goes, where a cold resume's
@@ -722,7 +738,13 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 			// delivers the SIGTERM sessiond's own handler already answers,
 			// and a notice sent there would be a behaviour change on the one
 			// path this design promises to leave exactly as it is.
-			if s.withholdsSecrets() {
+			//
+			// Unless the DRIVER sends it. A driver that checkpoints the
+			// workspace owns the whole handshake — the notice, the stream the
+			// guest answers it with, and the barrier that stream feeds — and a
+			// second notice from here would have the sandbox quiesce twice and
+			// stream into a suspend nobody is reading.
+			if s.withholdsSecrets() && !s.driverCheckpointsColdSuspend() {
 				s.quiesceExecs(ctx, id, true)
 			}
 			// Cold suspend (docker stop) kills the container's sessiond,
@@ -1218,6 +1240,12 @@ func (s *Server) routeControl(id string, boot, reg uint64, payload []byte) {
 	case relay.KindSuspendReady:
 		// And its execs are gone, so the container may be frozen.
 		s.deliverSuspend(id, ev.ID, true)
+	case relay.KindWorkspaceEnd:
+		// The sandbox has finished streaming its workspace, or could not. Like
+		// the suspend answers and the flush, it stays between this process and
+		// that sandbox: what is waiting on it is the cold suspend's own
+		// durability barrier, inside this runner.
+		s.deliverWorkspaceEnd(id, ev)
 	case relay.KindFlushed:
 		// The sandbox has put what it wrote on its block devices, so the host
 		// may copy the file underneath it. Like the suspend answers, this
