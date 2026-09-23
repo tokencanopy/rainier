@@ -37,6 +37,7 @@ package netslot
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 	"slices"
@@ -226,7 +227,41 @@ func dedupeRanges(cidrs []string) []string {
 // It is exported so the ruleset a host would be given can be read without a
 // host — which is how the golden test pins it, and how an operator can see
 // what a session is actually behind.
+//
+// It is what this pool WOULD apply, which is not the same claim as Firewall's.
 func (p *Pool) Ruleset(slot *Slot) (string, error) { return p.cfg.ruleset(slot) }
+
+// TableName is the nftables table slot's rules live in, exported so that
+// whoever reads a host's ruleset by hand (`nft -n list table inet <name>`) and
+// whoever reads it through Firewall are naming the same table.
+func (p *Pool) TableName(slot *Slot) string { return p.cfg.tableName(slot.Index) }
+
+// Firewall reads back the ruleset a slot is actually behind, from the host.
+//
+// The difference from Ruleset is the whole point, and it is why this method
+// exists at all: Ruleset is what the renderer produced, and a check written
+// against it proves that a template still renders. This one goes to the host
+// and asks what is installed, so "the per-slot firewall is applied" becomes a
+// fact about the machine — which is what ADR-0003 §4.3 asserts and what Phase
+// A's security smoke has to be able to evidence.
+//
+// Two failures are distinguished for the caller:
+//
+//   - ErrNoNftTable: the slot has no table. On a live session that is the
+//     finding, not a hiccup — a guest on a TAP with no ruleset.
+//   - a host with no NftReader: this pool cannot answer the question at all,
+//     which is an honest refusal rather than an empty string a caller might
+//     read as "no rules".
+func (p *Pool) Firewall(ctx context.Context, slot *Slot) (string, error) {
+	if slot == nil {
+		return "", errors.New("netslot: no slot to read a firewall for")
+	}
+	reader, ok := p.host.(NftReader)
+	if !ok {
+		return "", fmt.Errorf("netslot: this pool's host (%T) cannot read a ruleset back, so what slot %d is behind cannot be evidenced from here", p.host, slot.Index)
+	}
+	return reader.ListNft(ctx, slot.Netns, p.cfg.tableName(slot.Index))
+}
 
 func (r resolved) ruleset(slot *Slot) (string, error) {
 	proxy, proxyPort := "", 0

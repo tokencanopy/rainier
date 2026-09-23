@@ -213,6 +213,52 @@ func (h *LinuxHost) nft(ctx context.Context, netns string, script string, args .
 	return nil
 }
 
+// nftOutput is nft with its standard output kept, for the one call that is a
+// read rather than a write.
+//
+// Separate from nft rather than a flag on it because the error text differs in
+// the way that matters: a write's diagnosis is whatever nft printed, and for a
+// read the printed bytes ARE the answer, so a combined-output capture would
+// hand a caller a ruleset with a warning line in the middle of it.
+func (h *LinuxHost) nftOutput(ctx context.Context, netns string, args ...string) (string, error) {
+	name, full := h.nftPath, args
+	if netns != "" {
+		name, full = h.ipPath, append([]string{"netns", "exec", netns, h.nftPath}, args...)
+	}
+	cmd := exec.CommandContext(ctx, name, full...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("nft %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return string(out), nil
+}
+
+// ListNft prints one table's ruleset as the kernel currently holds it.
+//
+// This is the only place this package reads the network back rather than
+// building it, and it exists for evidence and not for control flow: see
+// NftReader. The text is `nft list table`'s own rendering and not the text
+// ApplyNft was given — the kernel normalises an interval set's elements, drops
+// the `delete table` preamble the applied script carries, and prints its own
+// spacing — so a caller compares it by what it must CONTAIN (a drop for the
+// metadata address, the guest's own TAP on the interface match) rather than
+// byte for byte against a rendered ruleset.
+func (h *LinuxHost) ListNft(ctx context.Context, netns, table string) (string, error) {
+	out, err := h.nftOutput(ctx, netns, "list", "table", "inet", table)
+	if err == nil {
+		return out, nil
+	}
+	msg := strings.ToLower(err.Error())
+	for _, absent := range []string{"no such file or directory", "does not exist", "cannot open network namespace"} {
+		if strings.Contains(msg, absent) {
+			return "", fmt.Errorf("%w: inet %s in %q", ErrNoNftTable, table, netns)
+		}
+	}
+	return "", err
+}
+
 func (h *LinuxHost) ApplyNft(ctx context.Context, netns, ruleset string) error {
 	// "-f -" reads the whole ruleset from stdin and commits it as one
 	// transaction: either the slot has the ruleset it was rendered or it has
