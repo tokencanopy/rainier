@@ -262,9 +262,15 @@ func (m *Microvm) checkpointWorkspace(ctx context.Context, id, sessionID, volume
 	fail := func(stage checkpointStage, err error) (checkpointResult, error) {
 		_ = pr.CloseWithError(err)
 		out := <-done
-		if out.err != nil && (stage == stageStream || err == nil) {
-			// The stream's own failure is the better sentence when the reader's
-			// error is merely "the pipe closed".
+		// Which of the two errors is the CAUSE. A guest that died mid-stream is
+		// seen here as a malformed or truncated stream — the reader's honest
+		// account of a pipe that closed under it — and reporting that would
+		// send somebody looking at a parser when the sandbox is what went away.
+		// A store that refused is the opposite: the stream then fails BECAUSE
+		// this end stopped taking bytes, and naming the stream would hide the
+		// outage. So the stream's own error wins exactly when the local one is
+		// about the bytes.
+		if out.err != nil && (stage == stageStream || isStreamError(err)) {
 			return checkpointResult{}, m.checkpointErr(id, stageStream, out.err)
 		}
 		return checkpointResult{}, m.checkpointErr(id, stage, err)
@@ -322,6 +328,29 @@ func (m *Microvm) checkpointWorkspace(ctx context.Context, id, sessionID, volume
 		Bytes:       out.rep.Bytes,
 		Nonce:       out.rep.Nonce,
 	}, nil
+}
+
+// isStreamError reports whether err is about the BYTES the guest sent rather
+// than about what this host did with them. It is the whole of how the barrier
+// tells a sandbox that went away from a store that would not take an object,
+// which are the two failures with opposite operator actions.
+// The checkpoint sentinels are in the list beside this package's own, and they
+// have to be: the library reduces a file system's error to a CATEGORY rather
+// than wrapping it (checkpoint/tree.go's fsCategory, which exists so that no
+// path can travel out in an error), so a stream that failed under its walk
+// arrives here as ErrSource with the sentence flattened into text. ErrSource
+// and ErrEntry both mean "the bytes I was given are the problem", which for
+// this caller means the stream.
+func isStreamError(err error) bool {
+	for _, s := range []error{
+		checkpoint.ErrSource, checkpoint.ErrEntry,
+		wstream.ErrFormat, wstream.ErrEntry, wstream.ErrTruncated, wstream.ErrLimit, wstream.ErrSource,
+	} {
+		if errors.Is(err, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // checkpointErr is the one shape a failed barrier reports: which stage, and the

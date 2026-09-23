@@ -245,23 +245,36 @@ func TestAColdSuspendKeepsTheVMWhenTheStoreRefuses(t *testing.T) {
 	}
 }
 
-// TestAColdSuspendKeepsTheVMWhenTheGuestDiesMidStream.
+// TestAColdSuspendKeepsTheVMWhenTheGuestDiesMidStream, at both of the two
+// places a guest can die: inside the index, where the tree is not even
+// described yet, and inside the bodies, where the reader sees a truncated tar.
+//
+// Both must name the STREAM and not the parser. A guest that went away is a
+// sandbox problem, and reporting it as a malformed stream would send somebody
+// looking at a format when the VM is what disappeared.
 func TestAColdSuspendKeepsTheVMWhenTheGuestDiesMidStream(t *testing.T) {
-	store := checkpoint.NewMemoryStore()
-	m, sim, host, id, _ := checkpointScene(t, store)
-	host.cut = 64 // a header, an index, and nothing that could be a whole tree
-	ctx := context.Background()
+	for _, cut := range []int64{64, 1024} {
+		t.Run(fmt.Sprintf("after %d bytes", cut), func(t *testing.T) {
+			store := checkpoint.NewMemoryStore()
+			m, sim, host, id, _ := checkpointScene(t, store)
+			host.cut = cut
+			ctx := context.Background()
 
-	err := m.Suspend(ctx, id, false)
-	if err == nil {
-		t.Fatal("a cold suspend whose guest died mid-stream reported success")
-	}
-	if !strings.Contains(err.Error(), "checkpoint stream stage") {
-		t.Errorf("the refusal does not name the stage: %v", err)
-	}
-	assertVMKept(t, m, sim, id)
-	if keys := store.Keys(); len(keys) != 0 {
-		t.Errorf("a failed stream left %v in the store", keys)
+			err := m.Suspend(ctx, id, false)
+			if err == nil {
+				t.Fatal("a cold suspend whose guest died mid-stream reported success")
+			}
+			if !strings.Contains(err.Error(), "checkpoint stream stage") {
+				t.Errorf("the refusal does not name the stage: %v", err)
+			}
+			if !strings.Contains(err.Error(), "ended part way through") {
+				t.Errorf("the refusal does not name the cause: %v", err)
+			}
+			assertVMKept(t, m, sim, id)
+			if keys := store.Keys(); len(keys) != 0 {
+				t.Errorf("a failed stream left %v in the store", keys)
+			}
+		})
 	}
 }
 
