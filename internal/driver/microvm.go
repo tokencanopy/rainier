@@ -302,6 +302,19 @@ type MicrovmEngine interface {
 // attach a 10 GiB file of zeroes to the guest as though it were a filesystem.
 type DiskFormatter interface {
 	Format(path string) error
+	// FormatFromDir is Format with the filesystem POPULATED from dir, which is
+	// how a deep-dormant resume turns a restored checkpoint back into a block
+	// device (ADR-0003 §2.3). `mkfs.ext4 -d` needs no loop device, no
+	// CAP_SYS_ADMIN and no mount — it is the same call the environment-image
+	// build uses (rainier-cloud infra/scripts/build-env-image.sh), for the same
+	// reason: this host must never MOUNT a filesystem it is about to hand a
+	// tenant, and it must never mount one a tenant handed it.
+	//
+	// It is on this interface rather than beside it because the two are one
+	// capability — putting a filesystem on an image — and a driver that could
+	// do one without the other would be a driver that can suspend a session it
+	// cannot resume.
+	FormatFromDir(path, dir string) error
 }
 
 // instanceRecord is the persistent metadata stored on disk for each microVM
@@ -1791,6 +1804,14 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		if !bootLive {
 			return false, fmt.Errorf("cold resume of %s: this session's guest configuration was held in memory only (ADR-0003 §2.7 item 1) and did not survive a runnerd restart; a clean relaunch needs the control plane to re-resolve it, which is the portable-checkpoint work and not this change", id)
 		}
+		// The DEEP-DORMANT case (ADR-0003 §2.3): the workspace image is gone
+		// and the checkpoint is the only copy of this session's work. Rebuilt
+		// before anything else is allocated, because a resume that cannot
+		// produce a workspace should spend no token, no slot and no rootfs on
+		// finding that out.
+		if err := m.ensureWorkspaceForResume(ctx, id); err != nil {
+			return false, err
+		}
 		// A new VM gets a new token and a new socket. The token because the
 		// old one is single-use and fenced by a placement generation the
 		// plane may have moved past; the socket because Firecracker's own
@@ -2472,6 +2493,32 @@ func (e *Ext4Formatter) Format(path string) error {
 	out, err := exec.Command(e.mkfs, "-F", "-q", "-m", "0", path).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("mkfs.ext4 %s: %w: %s", path, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// FormatFromDir is Format with `-d`, which populates the new filesystem from a
+// directory tree without mounting anything.
+//
+// The flags are Format's, plus the tree. Two things are deliberately NOT here:
+//
+//   - no `-N`. mke2fs sizes the inode table from the image's size, which for a
+//     10 GiB workspace is about 655,000 inodes — above wstream's default entry
+//     ceiling, so a restored tree fits. Deriving the count from the tree
+//     instead would size the table for what is being restored rather than for
+//     what the session will write next, and a resumed session that runs out of
+//     inodes is a worse failure than a restore that refuses.
+//   - no `-U`/`-E hash_seed`. An environment image is built reproducibly
+//     because it is published by digest; a workspace image is one session's and
+//     is never addressed by its bytes.
+func (e *Ext4Formatter) FormatFromDir(path, dir string) error {
+	out, err := exec.Command(e.mkfs, "-F", "-q", "-m", "0", "-d", dir, path).CombinedOutput()
+	if err != nil {
+		// The tree's path is this host's own scratch directory, not a name from
+		// inside the workspace, so it is safe to print — and mke2fs's own
+		// message is the only thing that says WHY (no space, too many files for
+		// the inode table, a name it cannot represent).
+		return fmt.Errorf("mkfs.ext4 -d %s: %w: %s", path, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

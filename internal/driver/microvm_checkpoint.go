@@ -22,7 +22,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/tokencanopy/rainier/checkpoint"
@@ -58,6 +61,22 @@ type CheckpointOpts struct {
 	// VerifyTimeout bounds the restore test that follows the commit. Zero means
 	// defaultCheckpointVerifyTimeout.
 	VerifyTimeout time.Duration
+	// OwnerUID and OwnerGID are the user a RESTORED workspace is given to
+	// before it becomes a filesystem: the uid and gid the guest's agent runs
+	// as, which is the session image's own user (1000:1000 for Rainier's).
+	//
+	// They are configuration and not a constant because a checkpoint records
+	// modes and not owners — a uid is not portable across hosts, and the format
+	// is meant to be — so the ownership has to come from somewhere, and the
+	// only party that knows which user this environment's image runs as is the
+	// operator who built it.
+	//
+	// 0, 0 means "leave every restored file owned by whoever restored it". That
+	// is right for a host whose guest runs as root and for a test with no
+	// privilege to give a file away, and wrong for every production microVM
+	// host — see chownTree for what it costs.
+	OwnerUID int
+	OwnerGID int
 }
 
 // defaultCheckpointVerifyTimeout bounds Verify: one sequential read of the
@@ -322,4 +341,213 @@ func (o *CheckpointOpts) verifyTimeout() time.Duration {
 		return o.VerifyTimeout
 	}
 	return defaultCheckpointVerifyTimeout
+}
+
+// ---------------------------------------------------------------------------
+// the deep-dormant resume
+// ---------------------------------------------------------------------------
+
+const (
+	stageRestore checkpointStage = "restore"
+	stageOwner   checkpointStage = "owner"
+	stageMkfs    checkpointStage = "mkfs"
+)
+
+// ensureWorkspaceForResume is the deep-dormant branch of a cold resume: it does
+// nothing at all unless this session's workspace image is GONE.
+//
+// The ordinary cold resume is unchanged and must stay that way. A parked
+// session's workspace disk is right where it was (ADR-0003 §4.1's Suspend row
+// persists it), the guest mounts the same block device, and restoring over it
+// would replace a newer filesystem with an older checkpoint's copy of it.
+//
+// So the image's ABSENCE is the whole trigger, and it is the honest one: the
+// only thing that removes it is RemoveWorkspace, called from above this driver
+// when the session goes deep dormant.
+func (m *Microvm) ensureWorkspaceForResume(ctx context.Context, id string) error {
+	m.mu.Lock()
+	inst, ok := m.instances[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("no such id %s", id)
+	}
+	sessionID, volume := inst.SessionID, inst.Volume
+	diskPath, generation := inst.Cfg.WorkspaceDiskPath, inst.CheckpointGeneration
+	m.mu.Unlock()
+
+	if diskPath == "" {
+		return nil // a session with no workspace disk at all
+	}
+	if _, err := os.Stat(diskPath); err == nil {
+		return nil // the ordinary cold resume: the disk is where it was
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return m.restoreErr(id, stageRestore, err)
+	}
+
+	if m.ckpt == nil {
+		return fmt.Errorf("cold resume of %s: this session's workspace image is gone and this runner has no checkpoint store to restore it from", id)
+	}
+	if generation == 0 {
+		// Said plainly rather than booted around. An empty workspace that looks
+		// like a successful resume is the failure a person discovers by finding
+		// their work missing, which is the one outcome worth refusing for.
+		return fmt.Errorf("cold resume of %s: this session's workspace image is gone and no checkpoint of it was ever committed; there is nothing to restore", id)
+	}
+	return m.restoreWorkspaceDisk(ctx, id, sessionID, volume, diskPath, generation)
+}
+
+// restoreWorkspaceDisk rebuilds a session's workspace image from its newest
+// committed checkpoint, for the case ADR-0003 §2.3 calls deep dormant: the disk
+// has been deleted and the checkpoint is the only copy of the work left.
+//
+// Restore into a scratch directory, chown it to the user the guest runs as,
+// build an ext4 from it with `mkfs.ext4 -d`, remove the scratch directory. The
+// host never mounts anything, at either end of the session's life.
+//
+// The scratch directory is no new exposure — the workspace image on this host
+// is plaintext today, in this same state directory, with provider encryption as
+// defense in depth — but it is 0700, it is never inside a jail, and it is
+// removed before the guest boots, on every path including the failures.
+func (m *Microvm) restoreWorkspaceDisk(ctx context.Context, id, sessionID, volume, diskPath string, generation uint64) error {
+	opts := m.ckpt
+	c := checkpoint.Context{Workspace: volume, Session: sessionID, Generation: generation}
+	if err := c.Validate(); err != nil {
+		return m.restoreErr(id, stageConfig, err)
+	}
+	r, err := checkpoint.NewReader(opts.Store, opts.Keys, checkpoint.ReaderOptions{
+		Prefix: opts.Prefix,
+		// The principal restoring is the one that wrote it, on the host that
+		// holds the session. A DESTINATION in another cell puts its real check
+		// here; this hook exists so that no path through the library can be the
+		// place where authorizing a restore was forgotten.
+		Authorize: func(context.Context, checkpoint.Context, checkpoint.Manifest) error { return nil },
+	})
+	if err != nil {
+		return m.restoreErr(id, stageConfig, err)
+	}
+
+	scratch, err := m.scratchDir(id)
+	if err != nil {
+		return m.restoreErr(id, stageRestore, err)
+	}
+	// Removed on EVERY path, including a restore that failed part way through a
+	// tree: a tenant's files left in a directory nobody names again would be
+	// exactly the exposure this design says it does not add.
+	defer func() {
+		if err := os.RemoveAll(scratch); err != nil {
+			log.Printf("microvm: removing the restore scratch directory of %s: %v", id, err)
+		}
+	}()
+
+	rep, err := r.Restore(ctx, c, scratch)
+	if err != nil {
+		return m.restoreErr(id, stageRestore, err)
+	}
+	if err := chownTree(scratch, opts.OwnerUID, opts.OwnerGID); err != nil {
+		return m.restoreErr(id, stageOwner, err)
+	}
+	if err := m.formatRestored(diskPath, scratch); err != nil {
+		return m.restoreErr(id, stageMkfs, err)
+	}
+	log.Printf("microvm: %s restored its workspace from checkpoint generation %d: %d entries, %d bytes",
+		id, generation, rep.Entries, rep.FileBytes)
+	return nil
+}
+
+// formatRestored creates the image file and populates it from dir, removing a
+// half-built image rather than leaving one for a later boot to find with Stat
+// and attach as a filesystem — which is ensureDisk's rule, applied to the one
+// other place an image is made.
+func (m *Microvm) formatRestored(path, dir string) error {
+	if err := os.MkdirAll(filepath.Dir(path), microvmDirMode); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, microvmFileMode)
+	if err != nil {
+		return err
+	}
+	if err := f.Truncate(workspaceDiskBytes); err != nil {
+		f.Close()
+		_ = os.Remove(path)
+		return err
+	}
+	f.Close()
+	if err := m.format.FormatFromDir(path, dir); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
+}
+
+// scratchDir makes this restore's private directory, 0700, under the state
+// directory. The suffix is the boot counter rather than a random name so that a
+// directory left behind by a host that died mid-restore is recognisably one
+// instance's and is replaced by the next attempt rather than accumulating.
+func (m *Microvm) scratchDir(id string) (string, error) {
+	if err := checkPathSegment("instance id", id); err != nil {
+		return "", err
+	}
+	dir := filepath.Join(m.opts.StateDir, "restore", id)
+	// Whatever a previous attempt left is gone before this one starts: a
+	// restore into a non-empty target is refused by the library, and a
+	// half-restored tree from a host that died is not a tree to build a
+	// filesystem from.
+	if err := os.RemoveAll(dir); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), microvmDirMode); err != nil {
+		return "", err
+	}
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		return "", err
+	}
+	// MkdirAll and Mkdir both mask the mode with the process umask, so the
+	// permission a comment claims is set explicitly rather than requested.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// chownTree gives every restored entry to the user the guest runs as.
+//
+// It is not optional on a real host, and it is the one thing about this path
+// that a fake cannot show. A checkpoint records modes and not owners (the
+// format is portable across hosts, and a uid is not), so a restored tree is
+// owned by whoever restored it — root, on a microVM host. The guest's agent
+// runs as the session image's own user, and the guest's /init chowns the
+// workspace mount point only when it is EMPTY, precisely so that a resumed
+// workspace's contents are left alone. So without this the session comes back
+// with every one of its files owned by root and unwritable by the agent.
+//
+// A zero uid and gid mean "leave it", which is what a test on a machine with no
+// privilege to give a file away wants, and what a host running the guest as
+// root would want. Anything else is applied with Lchown, which changes the LINK
+// rather than what it points at — a symlink out of the tree is impossible
+// (checkLink refuses one at both ends), and following one would still be the
+// wrong thing to do here.
+func chownTree(root string, uid, gid int) error {
+	if uid == 0 && gid == 0 {
+		return nil
+	}
+	return filepath.WalkDir(root, func(p string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if err := os.Lchown(p, uid, gid); err != nil {
+			// The path is this host's scratch directory plus a name from inside
+			// the workspace, so the error is reduced to its cause: a name is
+			// session content (tenancy §15.1).
+			var pe *fs.PathError
+			if errors.As(err, &pe) && pe.Err != nil {
+				return fmt.Errorf("giving a restored entry to %d:%d: %w", uid, gid, pe.Err)
+			}
+			return fmt.Errorf("giving a restored entry to %d:%d", uid, gid)
+		}
+		return nil
+	})
+}
+
+func (m *Microvm) restoreErr(id string, stage checkpointStage, err error) error {
+	return fmt.Errorf("microvm: the cold resume of %s failed at the checkpoint %s stage: %w", id, stage, err)
 }

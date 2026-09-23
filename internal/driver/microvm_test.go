@@ -721,6 +721,10 @@ type failingFormatter struct{}
 
 func (failingFormatter) Format(string) error { return errors.New("mkfs.ext4 is not on PATH") }
 
+func (failingFormatter) FormatFromDir(string, string) error {
+	return errors.New("mkfs.ext4 is not on PATH")
+}
+
 func TestMicrovmSnapshotRefAssociationAndStrip(t *testing.T) {
 	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4})
 	ctx := context.Background()

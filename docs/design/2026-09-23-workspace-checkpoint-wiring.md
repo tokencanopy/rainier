@@ -50,27 +50,25 @@ whose whole premise is that the tenant's kernel is not the host's kernel.
    only an ext4 host can open. It would also defeat the library's per-entry tree
    digest and its exclusions. **Refused.**
 5. **Network filesystem** (9p/virtiofs for the workspace instead of a block
-   device). The host would hold the tree directly and no streaming would be
-   needed — but the host process would then serve a filesystem to a hostile
-   guest, the workspace's I/O path would change for every session, and the
-   change is far larger than the feature. **Refused; worth revisiting only if
-   the workspace device changes for other reasons.**
+   device). The host would hold the tree directly — and would then be serving a
+   filesystem to a hostile guest, with every session's I/O path changed for a
+   feature far smaller than the change. **Refused; worth revisiting only if the
+   workspace device changes for other reasons.**
 6. **Block-level diff** (dirty-page tracking, incremental images). The cheapest
-   possible steady state, and it re-introduces (4)'s portability problem plus a
-   chain of diffs whose base must never be deleted. **Refused for v1**; §4.2 of
-   the format note keeps a differential format open *above* the tree, not below.
+   steady state, and it re-introduces (4)'s portability problem plus a chain of
+   diffs whose base may never be deleted. **Refused for v1**; §4.2 of the format
+   note keeps a differential format open *above* the tree, not below.
 
 ## 3. The shape
 
 **Cold suspend.** During the `suspending{cold:true}` handshake, after sessiond
-has flushed and killed its execs and unmounted the agent home, sessiond opens a
-stream on the existing relay conn and writes the workspace tree. runnerd feeds
-that stream to a tar-backed `fs.FS` (`internal/wstream`), the checkpoint writer
-walks it, encrypts frame by frame and commits to a blob store. Nothing plaintext
-is written to host disk; the host holds one frame, one copy buffer and one entry
-index (§5). When the manifest commits, the host runs `Verify` against the
-committed bytes, tells the guest, and only then terminates the VM, releases the
-slot and discards the rootfs.
+has flushed, killed its execs and unmounted the agent home, it opens a stream on
+the existing relay conn and writes the workspace tree. runnerd feeds that stream
+to a tar-backed `fs.FS` (`internal/wstream`), the checkpoint writer walks it,
+encrypts frame by frame and commits to a blob store. Nothing plaintext is
+written to host disk; the host holds one frame, one copy buffer and one entry
+index (§5). When the manifest commits, the host runs `Verify`, tells the guest,
+and only then terminates the VM, releases the slot and discards the rootfs.
 
 **Deep-dormant resume.** When a cold `Resume` finds the workspace image absent
 and a checkpoint recorded, the driver restores the checkpoint into a 0700
@@ -120,11 +118,10 @@ numbers, all fields so a test can drive them in milliseconds:
 | whole stream | 30 min | 10 GiB (the workspace disk) at ~6 MiB/s |
 | `Verify` | 10 min | one sequential read of the committed object |
 
-Worst case ≈ 41 minutes, and only for a session that is genuinely stuck; the
-ordinary case is the guest's ack plus the copy. The idle budget deliberately
-covers the HOST's slowness too: the stream is back-pressured by the blob store
-through the pipe, so a store that has stopped taking bytes stalls the stream and
-fails the suspend — which keeps the VM, which is the right answer.
+Worst case ≈ 41 minutes, and only for a session that is genuinely stuck. The
+idle budget deliberately covers the HOST's slowness too: the stream is
+back-pressured by the blob store through the pipe, so a store that has stopped
+taking bytes stalls the stream and fails the suspend — which keeps the VM.
 
 **A cold suspend is now one handshake, not two.** `Op` sent the cold notice
 itself before calling the driver; with a checkpointing driver the driver owns
@@ -205,8 +202,18 @@ because it must not be the hop that trusts the guest.
   the scratch directory is removed and no image is created.
 
 Every failure before the manifest commits keeps the VM and names the **stage** —
-`stream`, `write`, `verify`, `restore`, `mkfs` — and never a path, a name or a
-value, because these errors reach a session's error column (tenancy §15.1).
+`stream`, `write`, `verify`, `restore`, `owner`, `mkfs` — and never a path, a
+name or a value, because these errors reach a session's error column (tenancy
+§15.1).
+
+**A kept VM is a degraded VM, and that is inherent rather than new.** By the time
+the stream runs, the guest has already done what #98's cold notice asks: its
+execs are dead, its agent home is unmounted and its delivered secrets are
+forgotten. A suspend that then fails leaves that VM running in exactly that
+state. It is still the right outcome — the workspace disk is intact, the session
+is resumable, and a retry of the suspend works — but a session kept this way is
+not the session the user left, and the alternative (terminating a VM whose
+workspace nobody has a copy of) is the one thing §4.4 forbids.
 
 ## 7. The restore path
 
@@ -219,9 +226,22 @@ value, because these errors reach a session's error column (tenancy §15.1).
    by `defer` on every path.
 3. `Reader.Restore` into it — authorization hook, manifest authentication, tree
    digest, all of the library's checks.
-4. Create the sparse image and `mkfs.ext4 -d <scratch>` through `DiskFormatter`,
-   which grows a `FormatFromDir` method for it.
-5. Remove the scratch tree, attach, boot.
+4. **Give the tree to the user the guest runs as.** A checkpoint records modes
+   and not owners — a uid is not portable, and the format is meant to be — so a
+   restored tree belongs to whoever restored it, which on a microVM host is
+   root. The guest's agent runs as the session image's own user, and the guest's
+   `/init` chowns the workspace mount point only when it is EMPTY (precisely so
+   a resumed workspace's contents are left alone), so without this step the
+   session comes back unable to write its own files. The uid and gid are runner
+   configuration (`--checkpoint-restore-uid/-gid`, default 1000), because the
+   only party that knows which user an environment's image runs as is whoever
+   built it.
+5. Create the sparse image and `mkfs.ext4 -d <scratch>` through `DiskFormatter`,
+   which grows a `FormatFromDir` method for it. No `-N`: mke2fs sizes the inode
+   table from the image, which for 10 GiB is ~655,000 inodes — above the entry
+   ceiling — and sizing it for the restored tree instead would starve what the
+   session writes next.
+6. Remove the scratch tree, attach, boot.
 
 The scratch directory is no new exposure: the workspace image on the host is
 plaintext today, in the same state directory, with provider encryption as
@@ -271,12 +291,12 @@ rainier-cloud substitutes GCS and KMS without touching the driver.
 
 - **The index's memory.** `O(entries)` names on the host is the one place this
   design spends what the library refuses to. 500,000 entries is roughly 50 MB of
-  names; a large `node_modules` gets close. A second stream section carrying the
-  index *incrementally per directory* would remove it, at the cost of a format
-  that no longer round-trips through plain `archive/tar`.
+  names; a large `node_modules` gets close. An index carried *incrementally per
+  directory* would remove it, at the cost of a format that no longer
+  round-trips through plain `archive/tar`.
 - **Compression on the wire.** The stream is plaintext over a vsock socket
   inside one host; the checkpoint is uncompressed by §4.6 of the format note.
   Compressing the hop alone is measurable and unmeasured.
 - **Incremental checkpoints.** Every cold suspend writes the whole tree. The
-  generation counter and the attempt-suffixed content key already leave room for
-  a differential format; nothing here forecloses it.
+  generation counter and the attempt-suffixed content key leave room for a
+  differential format; nothing here forecloses it.
