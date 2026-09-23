@@ -40,15 +40,21 @@
 //	              world-readable (o+r): it is hard-linked into every jail and
 //	              a jailed VMM is neither its owner nor in its group.
 //	rootfs.ext4   an ext4 image of `environments/default` whose /init:
-//	                - mounts /proc, /sys, /dev, and a tmpfs over the writable
-//	                  paths a read-only... (the root here is NOT read-only: it
-//	                  is this session's own copy-on-write copy, so /init may
-//	                  write to it directly);
-//	                - formats and mounts /dev/vdb on /workspace, and /dev/vdc
-//	                  on /rainier/agents when it is present;
+//	                - mounts /proc, /sys and /dev, and a tmpfs on /tmp and
+//	                  /run. The ROOT is writable — it is this session's own
+//	                  copy-on-write copy of this image (ADR-0003 §2.7 item 3),
+//	                  not the image itself — so /init needs no overlay above it;
+//	                - formats-if-empty and mounts /dev/vdb on /workspace, and
+//	                  /dev/vdc on /rainier/agents when that device is present;
 //	                - brings lo and eth0 up;
 //	                - execs `sessiond --transport=vsock` (or with
 //	                  RAINIER_TRANSPORT=vsock in its environment).
+//
+//	              The drive letters follow the order the driver PUTs them:
+//	              rootfs is /dev/vda, the workspace /dev/vdb, the agent home
+//	              /dev/vdc. The boot smoke below creates a session with no
+//	              agent home, so /dev/vdc is absent for it and /init must
+//	              tolerate that.
 //
 // That last line is the one the runbook's draft /init gets wrong today: it
 // execs sessiond with no flags, which takes the WebSocket path, dials nothing
