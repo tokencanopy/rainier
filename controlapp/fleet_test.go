@@ -378,6 +378,9 @@ func (f *fleetFakeEnvironments) UpdateEnvironment(context.Context, control.Works
 func (f *fleetFakeEnvironments) DeleteEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID) error {
 	return control.ErrUnsupported
 }
+func (f *fleetFakeEnvironments) DeleteEnvironmentUnlessReferenced(context.Context, control.WorkspaceID, control.EnvironmentID, []control.SessionState) error {
+	return control.ErrUnsupported
+}
 func (f *fleetFakeEnvironments) CountSessionsByEnvironment(context.Context, control.WorkspaceID, control.EnvironmentID, []control.SessionState) (int, error) {
 	return 0, nil
 }
