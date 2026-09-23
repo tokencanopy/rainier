@@ -12,8 +12,12 @@ and the library, [#99](https://github.com/tokencanopy/rainier/pull/99)) and
 cold-suspend handshake this note extends.
 
 > `Suspend(warm=false)` must not report success, and the host must not release
-> the workspace slot, until the portable checkpoint upload completes and its
-> manifest is committed atomically. (ADR-0003 §4.4)
+> the workspace slot, until the portable checkpoint upload … completes, its
+> manifest is committed atomically, and the restore test passes. (ADR-0003 §4.4)
+
+The ellipsis is "to regional GCS", which this change does not do: a self-hosted
+runner's store is a local directory and a cell's is GCS, behind one
+`checkpoint.BlobStore` (§8). Nothing else is elided.
 
 ## 1. The problem
 
@@ -193,7 +197,25 @@ with it, and both ends charge it the same way.
 - **The sandbox is gone** (a crashed sessiond on a live VM): there is no
   handshake to run, so the suspend fails and the VM stays — and keeps staying,
   since nothing else will produce a checkpoint for it. The escape is `Destroy`.
-  Stricter than §4.4 needs, and a known cost: §10.
+  A known cost: §10.
+
+**The order here is an inversion of §4.4's, not a stricter reading of it.** As
+written, ADR-0003 ordered a cold suspend as flush, terminate, detach, *then*
+produce the checkpoint from the detached disk — and said a host that died
+mid-checkpoint left the disk intact for reconciliation to re-run the checkpoint
+from it. This design checkpoints **from the running guest, before anything is
+torn down**, and it had to: §4.5's rule that the host never mounts or parses a
+tenant's ext4 image leaves the guest as the only party that can read the
+workspace tree, so there is no "checkpoint it later from the disk" path to fall
+back on. The barrier guarantee is unchanged — success is reported only after the
+manifest commit and a passed restore test — but the failure consequence is
+different and is stated plainly: **a host that dies mid-checkpoint has not
+checkpointed that workspace**, and nothing can checkpoint it afterwards. The
+disk stays where it is, the session resumes from it on that host, or it waits
+for its next clean suspend; reconciliation cannot produce a checkpoint from a
+detached disk. rainier-cloud is amending ADR-0003 §4.1, §4.3 and §4.4 to state
+this order (`docs/architecture/adr-0003-serverless-microvm-architecture.md`,
+revision 2.1).
 - **A tampered checkpoint, or a restore's `mkfs` or chown failing**: the scratch
   directory and the partial image are removed, nothing is attached, and the
   session stays parked with its checkpoint intact.
@@ -238,6 +260,26 @@ state. The right outcome, and still not the session the user left.
    entry ceiling), and sizing it for the restored tree would starve what the
    session writes next. Then remove the scratch tree, attach, and boot.
 
+**The precondition, which is not small: the restore is reachable only from a
+record this runnerd process still holds the guest configuration for.** A cold
+resume of a record *recovered from disk* is refused before it gets here — the
+boot configuration is held in memory only (ADR-0003 §2.7 item 1), so a relaunch
+would boot a guest that is never told what it is — and a session dormant long
+enough for the deep-dormant tier to have deleted its workspace image has almost
+certainly outlived the process that created it. So in production this path is
+behind that refusal, and the ORDER of the two is not what puts it there: running
+the restore first would spend minutes of copying and a plaintext scratch tree on
+a resume that is certain to fail a moment later, and widen the very window this
+section bounds. What the driver does instead is tell the two apart and say so —
+"the configuration did not survive a runnerd restart; its workspace image is
+gone as well, so the resume that does re-resolve the configuration must also
+restore committed checkpoint generation *N*" — which costs one `Stat` and no
+tenant bytes, and which is the difference between one operator action and
+another. Making the restore reachable after a restart is the **create-shaped
+resume**, in which the control plane re-resolves the session's configuration
+(§9); persisting that configuration on this host instead is the one answer
+ADR-0003 §2.7 rules out.
+
 The scratch directory is no new exposure: the workspace image on the host is
 plaintext today, in the same state directory, with provider encryption as
 defense in depth. It is `0700`, never inside a jail, removed before the guest
@@ -278,16 +320,44 @@ substitutes GCS and KMS without touching the driver.
   deletion (tenancy §14.2) — above the driver, out of this change.
 - A **dispatch timeout** for a cold stop covering §4's budgets: a cell that
   cancels at 30 s gets a failed suspend and a live VM — safe, and useless.
+- A **create-shaped resume**: a resume of a session whose runner has restarted,
+  in which the control plane re-resolves the guest configuration this host
+  deliberately does not persist. Without it the restore path in §7 is reachable
+  only inside the lifetime of the runnerd that created the session, which is not
+  the lifetime a deep-dormant session has.
+- A **host-wide bound on concurrent checkpoints**. The index is `O(entries)` per
+  in-flight cold suspend, capped at 64 MiB (§5), and nothing bounds how many
+  suspends are in flight: a host drain (§4.5 rotation) cold-suspends every
+  session at once, so the ceiling is 64 MiB × slots — ~2 GB for 32. The driver
+  refuses a second checkpoint *per instance* and has no view of the host, so the
+  admission control belongs above it. (§10 has the alternative: an index carried
+  incrementally per directory, which removes the cost instead of bounding it.)
+- **An owner for §4.4's disk-deletion guard.** "Deep-dormant transition is
+  permitted only after a verified checkpoint exists that is newer than the
+  disk's last write" is, today, owned by nobody: the driver's `RemoveWorkspace`
+  takes a session id, holds no retention policy, and cannot see a workspace's
+  last write; this change does not gate it, and nothing above it does either.
+  The `cell-worker` retention path that decides the transition and calls
+  `RemoveWorkspace` is where it has to live.
+- **Something on the record that distinguishes committed from verified.**
+  `CheckpointAt` is written the moment `Write` returns — a COMMIT time, before
+  the restore test — because a generation is spent either way (§6). So a record
+  that says only "generation 4 at 12:01" cannot answer the freshness question
+  the guard above gates disk deletion on, and the fix is a record field and a
+  view, not a change to this barrier.
+- **A deletion path for the blob store.** `DirBlobStore` has `Get` and
+  `PutIfAbsent` and nothing else, on purpose — the driver never deletes a
+  checkpoint — so the retention window, the orphan sweep and tenancy-directed
+  deletion (§14.2) have no implementation at either end yet.
 
 ## 10. Open questions
 
-- **The index's memory, and how many suspends may spend it at once.** The host's
-  `O(entries)` index is the one place this design spends what the library
-  refuses to: up to 64 MiB per in-flight cold suspend (§5), with nothing
-  bounding how many are in flight — a host drain suspends every session at once,
-  so 32 of them is ~2 GB. A host-wide bound on concurrent checkpoints is the
-  fix; an index carried *incrementally per directory* would remove the cost
-  instead, at the price of a format that no longer round-trips through plain
+- **The index's memory.** The host's `O(entries)` index is the one place this
+  design spends what the library refuses to: up to 64 MiB per in-flight cold
+  suspend (§5). Bounding how many are in flight is §9's, and is admission
+  control rather than a format change. The other answer is a format change: an
+  index carried *incrementally per directory* would remove the cost instead of
+  bounding it, at the price of a stream that no longer round-trips through plain
   `archive/tar`.
 - **A session whose sandbox is gone cannot be cold-parked**, and pins a VM and a
   slot until somebody destroys it (§6). The narrower rule — park without a

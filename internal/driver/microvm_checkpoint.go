@@ -5,8 +5,10 @@
 //
 // ADR-0003 §4.4, quoted, because everything here is an attempt to satisfy
 // exactly it: "Suspend(warm=false) must not report success, and the host must
-// not release the workspace slot, until the portable checkpoint upload
-// completes and its manifest is committed atomically."
+// not release the workspace slot, until the portable checkpoint upload …
+// completes, its manifest is committed atomically, and the restore test
+// passes." The ellipsis is "to regional GCS", which a self-hosted runner writes
+// to a local directory instead, behind the one BlobStore port.
 //
 // The shape is in docs/design/2026-09-23-workspace-checkpoint-wiring.md. In one
 // paragraph: the guest streams its workspace over the relay conn it already
@@ -449,6 +451,79 @@ const (
 	stageMkfs    checkpointStage = "mkfs"
 )
 
+// coldResumeNeedsGuestConfig is the refusal a cold resume gets when the record
+// it is resuming was recovered from disk: the guest configuration this driver
+// holds in memory only (ADR-0003 §2.7 item 1) did not survive the restart.
+//
+// It is stated here, beside the restore, because of what the review found: a
+// session dormant long enough for the deep-dormant tier to have deleted its
+// workspace image has almost certainly outlived the runnerd that created it, so
+// this refusal is the gate the restore path below is actually behind, and the
+// ORDER is not what puts it there. Running the restore first would not change
+// the outcome by one call — it would spend minutes of copying and a plaintext
+// scratch tree on a resume that is certain to fail three lines later, and widen
+// the very exposure window §7 bounds by removing the tree before the guest
+// boots. So the refusal stays first, and it says what it is waiting for.
+//
+// The precondition, written down rather than implied: THE DEEP-DORMANT RESTORE
+// IS REACHABLE ONLY FROM A RECORD THIS PROCESS STILL HAS THE GUEST
+// CONFIGURATION FOR. Making it reachable after a restart is not a change to
+// this barrier; it is the create-shaped resume in which the control plane
+// re-resolves the session's configuration (ADR-0003 §2.3, §2.7 item 1), which
+// is rainier-cloud's and is listed as owed in the note's §9. Persisting the
+// configuration here instead is the one answer this design rules out, and
+// booting a guest that was never told what it is — no session id, no proxy, no
+// boot chain — is what the refusal exists to prevent.
+func (m *Microvm) coldResumeNeedsGuestConfig(id string) error {
+	msg := fmt.Sprintf("cold resume of %s: this session's guest configuration was held in memory only (ADR-0003 §2.7 item 1) and did not survive a runnerd restart; a clean relaunch needs the control plane to re-resolve it, which is the portable-checkpoint work and not this change", id)
+	if note := m.deepDormantNote(id); note != "" {
+		return errors.New(msg + "; " + note)
+	}
+	return errors.New(msg)
+}
+
+// deepDormantNote says, when it applies, that this session is ALSO the
+// deep-dormant case: its workspace image is gone, so whatever resumes it next
+// has to rebuild the disk from a checkpoint before it boots anything.
+//
+// It exists so that the refusal above names which session is which. "Resume
+// failed, configuration is gone" is one operator action (re-dispatch through
+// the control plane); "and the only copy of this person's work is checkpoint
+// generation 4" is a different one, and a session whose image is gone with NO
+// checkpoint behind it is a third that nothing can recover at all. Telling them
+// apart costs one Stat and no tenant bytes.
+//
+// Everything in the note is safe to print: a generation is a counter and an
+// instance id is this host's own. A path, a name or a byte from inside the
+// workspace is not, and none is here (tenancy §15.1).
+func (m *Microvm) deepDormantNote(id string) string {
+	m.mu.Lock()
+	inst, ok := m.instances[id]
+	if !ok {
+		m.mu.Unlock()
+		return ""
+	}
+	diskPath, generation := inst.Cfg.WorkspaceDiskPath, inst.CheckpointGeneration
+	m.mu.Unlock()
+
+	if diskPath == "" {
+		return ""
+	}
+	if _, err := os.Stat(diskPath); err == nil || !errors.Is(err, os.ErrNotExist) {
+		// The image is there, or this host cannot tell — either way the
+		// ordinary cold resume is what this session is waiting for, and the
+		// restore has nothing to say about it.
+		return ""
+	}
+	if generation == 0 {
+		return "its workspace image is gone as well and no checkpoint of it was ever committed, so there is nothing left to restore it from"
+	}
+	if m.ckpt == nil {
+		return fmt.Sprintf("its workspace image is gone as well, and the only copy of this session's work is committed checkpoint generation %d, which this runner has no checkpoint store configured to read", generation)
+	}
+	return fmt.Sprintf("its workspace image is gone as well, so the resume that does re-resolve the configuration must also restore committed checkpoint generation %d before it boots anything", generation)
+}
+
 // ensureWorkspaceForResume is the deep-dormant branch of a cold resume: it does
 // nothing at all unless this session's workspace image is GONE.
 //
@@ -615,8 +690,14 @@ func (m *Microvm) scratchDir(id string) (string, error) {
 	// restore into a non-empty target is refused by the library, and a
 	// half-restored tree from a host that died is not a tree to build a
 	// filesystem from.
+	//
+	// Reduced to its cause, exactly like the deferred removal ten lines below
+	// and for the same reason: what this fails on is an entry INSIDE a previous
+	// restore of this workspace, so the *fs.PathError it returns names a
+	// tenant's file (tenancy §15.1), and this error reaches a session's error
+	// column through restoreErr.
 	if err := os.RemoveAll(dir); err != nil {
-		return "", err
+		return "", fmt.Errorf("clearing the scratch directory a previous restore of %s left: %s", id, pathFreeCause(err))
 	}
 	if err := os.MkdirAll(filepath.Dir(dir), microvmDirMode); err != nil {
 		return "", err

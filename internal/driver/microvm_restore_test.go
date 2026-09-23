@@ -582,3 +582,211 @@ func TestTheRestorePathIsTakenOnlyWhenTheImageIsAbsent(t *testing.T) {
 		t.Fatalf("a resume with no workspace image rebuilt it %d time(s), want 1", format.calls())
 	}
 }
+
+// restartedOver is the same host coming back: a second driver over the state
+// directory a previous one left, which recovers the record off disk and has no
+// guest configuration behind it (ADR-0003 §2.7 item 1).
+func restartedOver(t *testing.T, stateDir string, ckpt *CheckpointOpts) (*Microvm, *recordingFormatter) {
+	t.Helper()
+	format := &recordingFormatter{}
+	m, _ := testMicrovm(t, MicrovmOpts{
+		TotalSlots: 4,
+		StateDir:   stateDir,
+		Format:     format,
+		Checkpoint: ckpt,
+	})
+	m.SetHost(&streamingHost{root: guestWorkspace(t)})
+	return m, format
+}
+
+// TestAColdResumeAfterARestartSaysWhichThingItIsWaitingFor is the precondition
+// the note's §7 now states, held as a test rather than as prose.
+//
+// A session dormant long enough for the deep-dormant tier to have deleted its
+// workspace image has almost certainly outlived the runnerd that created it —
+// so the restore path is behind the refusal that a recovered record has no
+// guest configuration, and no ordering of the two changes that: this driver
+// cannot invent a session id, a proxy or a boot chain, and booting a guest that
+// was never told what it is is the outcome the refusal exists for.
+//
+// What it CAN do is say which of the two things it is waiting for, and spend
+// nothing finding out. So: the refusal names both, no restore runs, and no
+// tenant tree is unpacked onto this host for a resume that is certain to fail.
+func TestAColdResumeAfterARestartSaysWhichThingItIsWaitingFor(t *testing.T) {
+	keys, err := checkpoint.NewStaticKeyWrapper("selfhosted/checkpoint/v1", [32]byte{7, 8, 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ckpt := &CheckpointOpts{Store: checkpoint.NewMemoryStore(), Keys: keys, KeyRef: keys.Ref()}
+	stateDir := shortTempDir(t)
+	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir, Checkpoint: ckpt})
+	m.SetHost(&streamingHost{root: guestWorkspace(t)})
+	ctx := context.Background()
+	h, err := m.Create(ctx, Spec{SessionID: "sess-ckpt", BootstrapToken: "token_example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Suspend(ctx, h.ID, false); err != nil {
+		t.Fatalf("the cold suspend failed: %v", err)
+	}
+	// The deep-dormant transition: the image goes, the checkpoint stays.
+	if err := m.RemoveWorkspace(ctx, "sess-ckpt"); err != nil {
+		t.Fatal(err)
+	}
+
+	again, format := restartedOver(t, stateDir, ckpt)
+	_, err = again.Resume(ctx, h.ID)
+	if err == nil {
+		t.Fatal("a cold resume of a recovered record reported success")
+	}
+	for _, want := range []string{"did not survive a runnerd restart", "generation 1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal does not say %q: %v", want, err)
+		}
+	}
+	// Nothing was spent on it: no mkfs, no scratch tree, and the image is
+	// still absent rather than half built.
+	if format.calls() != 0 {
+		t.Errorf("the refused resume ran %d restore(s)", format.calls())
+	}
+	assertNoScratch(t, again, h.ID)
+	disk, err := again.workspaceDiskPath("sess-ckpt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(disk); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the refused resume left something at the workspace image path (%v)", err)
+	}
+}
+
+// TestAColdResumeAfterARestartWithNoCheckpointSaysThatToo is the same refusal
+// for the session nothing can recover: the image is gone and no checkpoint of
+// it was ever committed. Said plainly, because the alternative is a person
+// discovering it by finding their work missing.
+func TestAColdResumeAfterARestartWithNoCheckpointSaysThatToo(t *testing.T) {
+	stateDir := shortTempDir(t)
+	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
+	m.SetHost(&stubMicrovmHost{})
+	ctx := context.Background()
+	h, err := m.Create(ctx, Spec{SessionID: "sess-nockpt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Suspend(ctx, h.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RemoveWorkspace(ctx, "sess-nockpt"); err != nil {
+		t.Fatal(err)
+	}
+
+	keys, err := checkpoint.NewStaticKeyWrapper("selfhosted/checkpoint/v1", [32]byte{7, 8, 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, format := restartedOver(t, stateDir, &CheckpointOpts{
+		Store: checkpoint.NewMemoryStore(), Keys: keys, KeyRef: keys.Ref(),
+	})
+	_, err = again.Resume(ctx, h.ID)
+	if err == nil {
+		t.Fatal("a cold resume of a recovered record with no workspace reported success")
+	}
+	if !strings.Contains(err.Error(), "no checkpoint of it was ever committed") {
+		t.Errorf("the refusal does not say the work is gone: %v", err)
+	}
+	if format.calls() != 0 {
+		t.Errorf("the refused resume ran %d restore(s)", format.calls())
+	}
+}
+
+// TestAPreviousRunsRestoreScratchIsRemovedAtStartup is reclaimRestoreScratch,
+// which had no test: what is under <state>/restore is a tenant's whole
+// workspace in plaintext, and the note's §7 is only allowed to call the scratch
+// directory "no new exposure" because nothing leaves one behind. A host that
+// was powered off mid-restore leaves one behind, so the next start removes it.
+func TestAPreviousRunsRestoreScratchIsRemovedAtStartup(t *testing.T) {
+	stateDir := shortTempDir(t)
+	planted := filepath.Join(stateDir, "restore", "i-old")
+	if err := os.MkdirAll(filepath.Join(planted, "src"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(planted, "src", "f"), []byte(workspaceMarker), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
+
+	if _, err := os.Stat(planted); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a previous run's restore scratch tree survived the start (%v)", err)
+	}
+	// And nothing of it is anywhere else under the state directory either.
+	assertNoWorkspacePlaintext(t, m.opts.StateDir)
+}
+
+// assertNoWorkspacePlaintext walks a state directory for the fixture
+// workspace's marker: if it is there, this host has a tenant's files on its own
+// disk in the clear.
+func assertNoWorkspacePlaintext(t *testing.T, stateDir string) {
+	t.Helper()
+	err := filepath.WalkDir(stateDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		// The workspace disk image is a 10 GiB sparse file; reading it whole
+		// would be the test's own problem rather than the driver's.
+		if info.Size() > 1<<20 {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if strings.Contains(string(b), workspaceMarker) {
+			return errors.New(strings.TrimPrefix(path, stateDir) + " holds workspace plaintext")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Error(err)
+	}
+}
+
+// TestTheScratchDirectorysRemovalErrorNamesNoPath. What scratchDir's RemoveAll
+// fails on is an entry INSIDE a previous restore of this workspace, so its
+// *fs.PathError names a tenant's file — and this error reaches a session's
+// error column (tenancy §15.1).
+func TestTheScratchDirectorysRemovalErrorNamesNoPath(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root can remove a directory whatever its mode, so there is no failure to observe")
+	}
+	stateDir := shortTempDir(t)
+	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
+
+	const secret = "a-tenant-file-name-that-must-not-travel"
+	locked := filepath.Join(stateDir, "restore", "i-scratch", secret)
+	if err := os.MkdirAll(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locked, "child"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Readable and searchable, not writable: the walk finds the child and
+	// cannot unlink it.
+	if err := os.Chmod(locked, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+
+	_, err := m.scratchDir("i-scratch")
+	if err == nil {
+		t.Fatal("scratchDir succeeded over a directory it cannot clear")
+	}
+	for _, forbidden := range []string{secret, "child", stateDir, "/"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Errorf("the error carries %q out of the workspace: %v", forbidden, err)
+		}
+	}
+}

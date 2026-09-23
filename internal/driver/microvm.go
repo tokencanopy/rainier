@@ -1849,8 +1849,13 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		// everything else, and persisting THAT is what this design rules out.
 		// Rebuilding it from the control plane on a resume is the follow-up
 		// (a create-shaped resume, ADR-0003 §2.3's portable checkpoint).
+		//
+		// This refusal sits ABOVE the deep-dormant restore below it, and the
+		// order is deliberate rather than incidental — see deepDormantNote,
+		// which is what makes a recovered session whose workspace is also gone
+		// say WHICH of the two things it is waiting for.
 		if !bootLive {
-			return false, fmt.Errorf("cold resume of %s: this session's guest configuration was held in memory only (ADR-0003 §2.7 item 1) and did not survive a runnerd restart; a clean relaunch needs the control plane to re-resolve it, which is the portable-checkpoint work and not this change", id)
+			return false, m.coldResumeNeedsGuestConfig(id)
 		}
 		// The DEEP-DORMANT case (ADR-0003 §2.3): the workspace image is gone
 		// and the checkpoint is the only copy of this session's work. Rebuilt

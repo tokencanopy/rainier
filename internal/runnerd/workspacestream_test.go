@@ -346,3 +346,43 @@ type failingWriter struct{}
 func (failingWriter) Write([]byte) (int, error) {
 	return 0, errors.New("the store is not taking bytes")
 }
+
+// TestClampGuestTextBoundsWhatTheSandboxChose. Both strings in the guest's own
+// failure report are the SANDBOX's, and they reach an operator's log and a
+// session's error column. sessiond is careful about what it puts in them; this
+// hop is where that stops being something to rely on, so the bound is here and
+// is tested here.
+func TestClampGuestTextBoundsWhatTheSandboxChose(t *testing.T) {
+	short := "mkfs"
+	if got := clampGuestText(short); got != short {
+		t.Errorf("a short string came back as %q", got)
+	}
+	exact := strings.Repeat("a", maxGuestText)
+	if got := clampGuestText(exact); got != exact {
+		t.Errorf("a string at the bound was truncated (%d bytes)", len(got))
+	}
+
+	over := strings.Repeat("b", maxGuestText+1)
+	got := clampGuestText(over)
+	if len(got) <= maxGuestText {
+		t.Fatalf("the truncated form is %d bytes, which is not the truncation notice plus the bound", len(got))
+	}
+	if !strings.HasPrefix(got, strings.Repeat("b", maxGuestText)) {
+		t.Errorf("the truncated form is not the first %d bytes: %q", maxGuestText, got)
+	}
+	if strings.Count(got, "b") != maxGuestText {
+		t.Errorf("the truncated form carries %d bytes of the sandbox's string, want %d", strings.Count(got, "b"), maxGuestText)
+	}
+	// It says that it did, so nobody reads a clamped stage name as the whole
+	// of what the guest reported.
+	if !strings.Contains(got, "truncated") {
+		t.Errorf("the truncated form does not say it was truncated: %q", got)
+	}
+
+	// And a megabyte of it — the frame limit above this is 16 MiB — comes back
+	// bounded, which is the whole point.
+	huge := clampGuestText(strings.Repeat("c", 1<<20))
+	if len(huge) > maxGuestText+64 {
+		t.Errorf("a 1 MiB guest string came back as %d bytes", len(huge))
+	}
+}
