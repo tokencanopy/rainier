@@ -45,24 +45,53 @@ type kvmScriptHost struct {
 	images string
 	outDir string
 	kvm    string
+	// The three files the script reads the machine's own shape from. They are
+	// fabricated rather than left to the real host because the real host is a
+	// different machine in CI than on a developer's laptop: macOS has no /proc
+	// at all and skips the capability check, a Linux runner has one and holds
+	// none of the seven capabilities. Pointing the script at files this test
+	// wrote is what makes "a host where every precondition holds" mean the
+	// same thing on both, and it is the only way the capability branch gets
+	// exercised anywhere but a real feasibility host.
+	procStatus string
+	ipForward  string
+	cgroupRoot string
 	// goStub is the body of the fake `go`, so a test can make the harness
 	// pass, fail, or skip without one existing.
 	goStub string
 }
+
+// kvmAllCapabilities is a CapEff mask with every bit the script checks set
+// (0 CHOWN, 6 SETGID, 7 SETUID, 12 NET_ADMIN, 18 SYS_CHROOT, 21 SYS_ADMIN,
+// 27 MKNOD), in the field width and hex /proc/self/status prints.
+const kvmAllCapabilities = "000001ffffffffff"
 
 // newKVMScriptHost builds a machine on which every precondition holds.
 func newKVMScriptHost(t *testing.T) *kvmScriptHost {
 	t.Helper()
 	dir := t.TempDir()
 	h := &kvmScriptHost{
-		dir:    dir,
-		binDir: filepath.Join(dir, "bin"),
-		images: filepath.Join(dir, "images"),
-		outDir: filepath.Join(dir, "out"),
-		kvm:    filepath.Join(dir, "kvm"),
+		dir:        dir,
+		binDir:     filepath.Join(dir, "bin"),
+		images:     filepath.Join(dir, "images"),
+		outDir:     filepath.Join(dir, "out"),
+		kvm:        filepath.Join(dir, "kvm"),
+		procStatus: filepath.Join(dir, "proc-status"),
+		ipForward:  filepath.Join(dir, "ip-forward"),
+		cgroupRoot: filepath.Join(dir, "cgroup"),
 	}
-	for _, d := range []string{h.binDir, h.images} {
+	for _, d := range []string{h.binDir, h.images, h.cgroupRoot} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A process holding everything, forwarding on, and a cgroup v2 mount.
+	h.setCapabilities(t, kvmAllCapabilities)
+	for _, f := range []struct{ path, body string }{
+		{h.ipForward, "1\n"},
+		{filepath.Join(h.cgroupRoot, "cgroup.controllers"), "cpuset cpu io memory pids\n"},
+	} {
+		if err := os.WriteFile(f.path, []byte(f.body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -91,6 +120,20 @@ func newKVMScriptHost(t *testing.T) *kvmScriptHost {
 		"echo '--- PASS: TestMicrovmBootSmokeOnKVM (1.23s)'\n" +
 		"echo ok\n"
 	return h
+}
+
+// setCapabilities rewrites the fabricated /proc/self/status with the given
+// CapEff mask, standing in for a process that holds some of what the driver
+// needs and not the rest.
+func (h *kvmScriptHost) setCapabilities(t *testing.T, capEff string) {
+	t.Helper()
+	// The surrounding lines are real ones: the script picks CapEff out by
+	// prefix, and a file holding nothing else would not prove it can.
+	body := "Name:\tbash\nState:\tS (sleeping)\nCapInh:\t0000000000000000\nCapPrm:\t" +
+		capEff + "\nCapEff:\t" + capEff + "\nCapBnd:\t000001ffffffffff\nSeccomp:\t0\n"
+	if err := os.WriteFile(h.procStatus, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (h *kvmScriptHost) stub(t *testing.T, name, body string) {
@@ -124,6 +167,9 @@ func (h *kvmScriptHost) run(t *testing.T) (out string, code int) {
 		"PATH="+h.binDir+string(os.PathListSeparator)+"/usr/bin"+string(os.PathListSeparator)+"/bin",
 		"RAINIER_MICROVM_TEST_IMAGES="+h.images,
 		"RAINIER_MICROVM_KVM_DEVICE="+h.kvm,
+		"RAINIER_MICROVM_KVM_PROC_STATUS="+h.procStatus,
+		"RAINIER_MICROVM_KVM_IP_FORWARD="+h.ipForward,
+		"RAINIER_MICROVM_KVM_CGROUP_ROOT="+h.cgroupRoot,
 		"RAINIER_MICROVM_KVM_OUT="+h.outDir,
 		"KVM_SCRIPT_ARGS="+filepath.Join(h.dir, "go-args"),
 		"KVM_SCRIPT_ENV="+filepath.Join(h.dir, "go-env"),
@@ -260,6 +306,45 @@ func TestMicrovmKVMScriptNamesEveryMissingPrecondition(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(h.outDir, "evidence.json")); err == nil {
 		t.Fatal("a run that never happened wrote evidence")
+	}
+}
+
+// TestMicrovmKVMScriptNamesTheCapabilitiesItIsShortOf. The check an operator
+// is most likely to trip and least able to guess at: every binary is staged,
+// /dev/kvm is there, and the run still cannot build a namespace or a jail
+// because nobody said `sudo -E`.
+//
+// It is also the branch that used to go untested on every machine this suite
+// runs on — read straight from /proc/self/status, which a macOS laptop does
+// not have and a Linux CI runner answers for the test process rather than for
+// a feasibility host. Pointed at a fabricated status file it asserts the same
+// thing on both.
+func TestMicrovmKVMScriptNamesTheCapabilitiesItIsShortOf(t *testing.T) {
+	h := newKVMScriptHost(t)
+	// Everything except CAP_NET_ADMIN (bit 12) and CAP_MKNOD (bit 27).
+	h.setCapabilities(t, "000001fff7ffefff")
+
+	out, code := h.run(t)
+	if code != 2 {
+		t.Fatalf("script exited %d on a host short of two capabilities, want 2:\n%s", code, out)
+	}
+	for _, want := range []string{"CAP_NET_ADMIN", "CAP_MKNOD", "sudo -E"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the report does not name %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "2 precondition(s) missing") {
+		t.Fatalf("the report does not count the capabilities it is short of:\n%s", out)
+	}
+	// The ones it does hold are not named: a report that listed all seven
+	// every time would be one an operator stops reading.
+	for _, held := range []string{"CAP_CHOWN", "CAP_SETUID", "CAP_SYS_ADMIN"} {
+		if strings.Contains(out, held) {
+			t.Fatalf("the report names %q, which this process holds:\n%s", held, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(h.dir, "go-args")); err == nil {
+		t.Fatal("the harness was invoked by a process that cannot build a jail")
 	}
 }
 

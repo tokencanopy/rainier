@@ -36,10 +36,23 @@
 #   RAINIER_MICROVM_KVM_OUT       where the evidence lands (default
 #                                 ./microvm-kvm-evidence).
 #   RAINIER_MICROVM_KVM_TIMEOUT   the go test timeout (default 30m).
-#   RAINIER_MICROVM_KVM_DEVICE    the KVM device node (default /dev/kvm).
-#                                 Overridable so this script's own test can
-#                                 exercise it on a machine that has none.
 #   GO                            the go binary (default `go`).
+#
+# The four places this script reads the machine itself are each overridable,
+# and for one reason: so this script's own test can fabricate a host. Without
+# them the test would only be able to assert the behaviour of whichever branch
+# the machine running `go test` happens to take — a macOS developer's laptop
+# has no /proc and skips the capability check entirely, a Linux CI runner has
+# one and fails it — and the script would be tested on neither of the paths an
+# operator actually runs. An operator sets none of these.
+#
+#   RAINIER_MICROVM_KVM_DEVICE       the KVM device node (default /dev/kvm).
+#   RAINIER_MICROVM_KVM_PROC_STATUS  where this process's capability set is
+#                                    read from (default /proc/self/status).
+#   RAINIER_MICROVM_KVM_IP_FORWARD   where IPv4 forwarding is read from
+#                                    (default /proc/sys/net/ipv4/ip_forward).
+#   RAINIER_MICROVM_KVM_CGROUP_ROOT  the cgroup v2 mount point (default
+#                                    /sys/fs/cgroup).
 #
 # Exit status: 0 the harness passed, 2 a precondition is missing and nothing
 # ran, 3 the harness SKIPPED (which is not a pass and must never be recorded as
@@ -58,6 +71,9 @@ images="${RAINIER_MICROVM_TEST_IMAGES:-}"
 kernel_name="${RAINIER_MICROVM_TEST_KERNEL:-vmlinux}"
 rootfs_name="${RAINIER_MICROVM_TEST_ROOTFS:-rootfs.ext4}"
 kvm_device="${RAINIER_MICROVM_KVM_DEVICE:-/dev/kvm}"
+proc_status="${RAINIER_MICROVM_KVM_PROC_STATUS:-/proc/self/status}"
+ip_forward="${RAINIER_MICROVM_KVM_IP_FORWARD:-/proc/sys/net/ipv4/ip_forward}"
+cgroup_root="${RAINIER_MICROVM_KVM_CGROUP_ROOT:-/sys/fs/cgroup}"
 out_dir="${RAINIER_MICROVM_KVM_OUT:-$repo_root/microvm-kvm-evidence}"
 test_timeout="${RAINIER_MICROVM_KVM_TIMEOUT:-30m}"
 go_bin="${GO:-go}"
@@ -127,8 +143,8 @@ command -v "$go_bin" >/dev/null 2>&1 ||
 # The capability set, from the same seven bits internal/driver checks. A host
 # with no /proc is not a microVM host and will have failed above; the guard is
 # here so this script's own test can run somewhere else.
-if [[ -r /proc/self/status ]]; then
-  capeff="$(awk '/^CapEff:/ {print $2}' /proc/self/status)"
+if [[ -r "$proc_status" ]]; then
+  capeff="$(awk '/^CapEff:/ {print $2}' "$proc_status")"
   if [[ -n "$capeff" ]]; then
     while read -r bit name why; do
       if (( ( 0x$capeff >> bit ) & 1 )); then continue; fi
@@ -145,8 +161,8 @@ CAPS
   fi
 fi
 
-if [[ -r /proc/sys/net/ipv4/ip_forward ]]; then
-  if [[ "$(cat /proc/sys/net/ipv4/ip_forward)" == "0" ]]; then
+if [[ -r "$ip_forward" ]]; then
+  if [[ "$(cat "$ip_forward")" == "0" ]]; then
     note_missing "net.ipv4.ip_forward is 0, so every packet a guest sends would be forwarded into its slot's veth and dropped by this host. \`sysctl -w net.ipv4.ip_forward=1\`."
   fi
 fi
@@ -154,8 +170,8 @@ fi
 # Guarded on the mount point existing at all, like the two checks above: a
 # machine with no /sys/fs/cgroup is not a microVM host and has already failed
 # on /dev/kvm, and the harness checks this again by name either way.
-if [[ -d /sys/fs/cgroup && ! -r /sys/fs/cgroup/cgroup.controllers ]]; then
-  note_missing "/sys/fs/cgroup does not look like a cgroup v2 mount (no cgroup.controllers). The jailer is asked for cgroup v2 and ADR-0003 §4.6 meters each VM from cpu.stat and memory.current under it."
+if [[ -d "$cgroup_root" && ! -r "$cgroup_root/cgroup.controllers" ]]; then
+  note_missing "$cgroup_root does not look like a cgroup v2 mount (no cgroup.controllers). The jailer is asked for cgroup v2 and ADR-0003 §4.6 meters each VM from cpu.stat and memory.current under it."
 fi
 
 if (( ${#missing[@]} > 0 )); then
