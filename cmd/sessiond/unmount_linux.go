@@ -10,6 +10,18 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// syncDisks hands every dirty page on every mounted filesystem to its device
+// and returns when the kernel has taken them: sync(2), which cannot fail and
+// reports nothing.
+//
+// Whole-machine is the right scope inside a microVM, whose only writable
+// devices are this session's own root filesystem, its workspace and its agent
+// home. The host is about to copy the ROOT one while this guest keeps running
+// (a snapshot), and what it copies is the file as the host sees it — so
+// anything still in this guest's page cache is, from the image's point of
+// view, work that never happened.
+func syncDisks() { unix.Sync() }
+
 // unmountAgentHome unmounts the agent home before this VM ends.
 //
 // It is the one filesystem act a cold suspend needs from inside the guest:

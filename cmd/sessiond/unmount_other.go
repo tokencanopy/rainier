@@ -2,7 +2,9 @@
 
 package main
 
-// unmountAgentHome on anything but Linux. A cold suspend only ever happens
-// to a microVM guest, which is Linux by construction; this exists so the
+// unmountAgentHome and syncDisks on anything but Linux. Both only ever happen
+// inside a microVM guest, which is Linux by construction; these exist so the
 // package builds on a developer's machine.
 func unmountAgentHome(string) {}
+
+func syncDisks() {}

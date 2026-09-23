@@ -38,6 +38,10 @@ func main() {
 		"base ext4 rootfs image path for the microvm driver (required when --driver=microvm; the runner refuses to start without a readable one)")
 	microvmStateDir := flag.String("microvm-state-dir", envDefault("RAINIER_MICROVM_STATE_DIR", ""),
 		"host directory holding microVM instance records, sockets, and every session's workspace and agent-home disk image (required when --driver=microvm; there is deliberately no temp-directory default, which would put a tenant's files somewhere the host reaps)")
+	microvmImageDir := flag.String("microvm-image-dir", envDefault("RAINIER_MICROVM_IMAGE_DIR", ""),
+		"directory this host fetches environment images from: an index.json mapping refs to digests, and one `<digest>.ext4` file per image (ADR-0003 §2.7 item 3). Mutually exclusive with --microvm-image-url; with neither, the runner serves only the images already in its store and reports a clear error for anything else")
+	microvmImageURL := flag.String("microvm-image-url", envDefault("RAINIER_MICROVM_IMAGE_URL", ""),
+		"HTTPS base URL this host fetches environment images from: `<base>/index.json` and `<base>/<digest>.ext4`. Every image is verified against its digest while it streams, so the transport is not trusted for the bytes — only for which digest a ref means. No OCI image is ever unpacked on a microVM host")
 	microvmVCPUs := flag.Int("microvm-vcpus", envIntDefault("RAINIER_MICROVM_VCPUS", 4),
 		"vCPUs per microVM session (ADR-0003 §5.1 per-session floor: 4)")
 	microvmMemoryMiB := flag.Int("microvm-memory-mib", envIntDefault("RAINIER_MICROVM_MEMORY_MIB", 8192),
@@ -111,13 +115,26 @@ func main() {
 		if err != nil {
 			log.Fatalf("--driver=microvm: %v", err)
 		}
+		// Where environment images come from. Two sources would be two
+		// answers to "which bytes is this ref", so naming both is a
+		// configuration mistake rather than a preference order.
+		var imageSource driver.ImageSource
+		switch {
+		case *microvmImageDir != "" && *microvmImageURL != "":
+			log.Fatal("--driver=microvm: --microvm-image-dir and --microvm-image-url both name where environment images come from; give one")
+		case *microvmImageDir != "":
+			imageSource = driver.DirImageSource{Dir: *microvmImageDir}
+		case *microvmImageURL != "":
+			imageSource = driver.HTTPImageSource{Base: *microvmImageURL}
+		}
 		mvm, err := driver.NewMicrovm(driver.MicrovmOpts{
-			KernelPath: *kernelPath,
-			BaseRootfs: *rootfsPath,
-			StateDir:   *microvmStateDir,
-			TotalSlots: *slots,
-			VCPU:       *microvmVCPUs,
-			MemoryMiB:  *microvmMemoryMiB,
+			KernelPath:  *kernelPath,
+			BaseRootfs:  *rootfsPath,
+			StateDir:    *microvmStateDir,
+			TotalSlots:  *slots,
+			VCPU:        *microvmVCPUs,
+			MemoryMiB:   *microvmMemoryMiB,
+			ImageSource: imageSource,
 
 			SlotGuestCIDR:  *microvmGuestCIDR,
 			SlotUplinkCIDR: *microvmUplinkCIDR,

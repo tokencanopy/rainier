@@ -112,12 +112,16 @@ func TestMicrovmSatisfiesContract(t *testing.T) {
 // about the driver's own behaviour, and a guest that connects to a fixture
 // has nowhere to go.
 type stubMicrovmHost struct {
-	mu    sync.Mutex
-	mints int
-	conns []string
+	mu      sync.Mutex
+	mints   int
+	conns   []string
+	flushed []string
 	// mintErr, when set, is what a cold resume's mint reports — the state a
 	// runner with no control connection is in.
 	mintErr error
+	// flushErr, when set, is what a snapshot's flush reports — the state a
+	// guest that cannot be asked, or will not answer, leaves the runner in.
+	flushErr error
 }
 
 func (h *stubMicrovmHost) GuestConnected(sessionID string, conn relay.Conn) {
@@ -135,6 +139,27 @@ func (h *stubMicrovmHost) MintSessionBootstrap(_ context.Context, sessionID stri
 	}
 	h.mints++
 	return fmt.Sprintf("token_example_%s_%d", sessionID, h.mints), nil
+}
+
+// FlushGuest is the runner having the guest sync its disks before a snapshot
+// copies the file underneath it.
+func (h *stubMicrovmHost) FlushGuest(_ context.Context, sessionID string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.flushErr != nil {
+		return h.flushErr
+	}
+	h.flushed = append(h.flushed, sessionID)
+	return nil
+}
+
+// flushCount is how many times a guest was asked to flush. A snapshot that
+// skipped it would publish an image missing whatever the guest had not
+// written yet.
+func (h *stubMicrovmHost) flushCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.flushed)
 }
 
 // connCount is how many guest connections the runner was handed. One per
@@ -488,10 +513,14 @@ func TestMicrovmWritesNoDecryptedEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Suspend(ctx, h.ID, false); err != nil {
+	// A snapshot, then a cold park: both write files under the state
+	// directory, and the walk below is about every one of them. The order is
+	// the only one available — a cold-parked session has no root filesystem
+	// left to commit.
+	if _, err := m.Snapshot(ctx, h.ID, "rainier-env:leak-check", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Snapshot(ctx, h.ID, "rainier-env:leak-check", nil); err != nil {
+	if err := m.Suspend(ctx, h.ID, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -704,28 +733,61 @@ func TestMicrovmSnapshotRefAssociationAndStrip(t *testing.T) {
 		t.Errorf("the manifest carries environment VALUES:\n%s", raw)
 	}
 
-	// A snapshot ref must not become a bootable rootfs. It used to: the
-	// driver copied the session's WORKSPACE under the ref and resolveRootfs
-	// handed that file back as a root filesystem for any later create naming
-	// it, so a `rainier-env:*` entry was one tenant's workspace booted as
-	// another session's root.
-	if _, err := m.locateRootfs(ref); err == nil {
-		t.Fatal("a snapshot ref resolved to a bootable rootfs")
+	// The ref resolves to the image the commit published, by digest — and to
+	// the session's ROOT filesystem, which is what an environment image is.
+	// It used to resolve to the session's WORKSPACE: the driver copied that
+	// file under the ref and the rootfs lookup handed it back as a root
+	// filesystem for any later create naming it, so a `rainier-env:*` entry
+	// was one tenant's workspace booted as another session's root.
+	manifest, ok := m.images.manifest(ref)
+	if !ok {
+		t.Fatal("the committed ref has no manifest")
+	}
+	path, digest, err := m.locateImage(ctx, ref)
+	if err != nil {
+		t.Fatalf("the committed ref does not resolve to an image: %v", err)
+	}
+	if digest != manifest.Digest {
+		t.Errorf("the ref resolves to %s, want the published %s", digest, manifest.Digest)
+	}
+	published, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootfsPath, err := m.sessionRootfsPath(h.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootfs, err := os.ReadFile(rootfsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(published) != string(rootfs) {
+		t.Error("the published image is not the session's root filesystem")
 	}
 }
 
-// TestMicrovmFirecrackerSnapshotRefuses is findings 1 and 2 together: no
-// guest memory image, and no workspace masquerading as an environment image.
-func TestMicrovmFirecrackerSnapshotRefuses(t *testing.T) {
-	fc := NewFirecrackerEngine(FirecrackerOpts{VMMPath: "/nonexistent/bin/firecracker", StateDir: t.TempDir()})
-	_, err := fc.Snapshot(context.Background(), "mvm-1", "rainier-env:x", nil)
-	if err == nil {
-		t.Fatal("FirecrackerEngine.Snapshot succeeded; it must refuse until the image work lands")
-	}
-	for _, want := range []string{"not implemented", "Guest memory"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error = %q, want it to mention %q", err, want)
+// TestNoEngineCanBeAskedForAMemoryImage is findings 1 and 2, now enforced by
+// the compiler rather than by an error string: the hypervisor interface has no
+// Snapshot at all.
+//
+// ADR-0003 §2.2 forbids serializing an authenticated session's RAM, and
+// committing an environment image is a copy of a file the DRIVER owns. A
+// method on this interface could only have meant the forbidden one — so the
+// way to keep it out is for there to be nowhere to put it.
+func TestNoEngineCanBeAskedForAMemoryImage(t *testing.T) {
+	engineType := reflect.TypeOf((*MicrovmEngine)(nil)).Elem()
+	for i := range engineType.NumMethod() {
+		if name := engineType.Method(i).Name; name == "Snapshot" {
+			t.Fatal("MicrovmEngine has a Snapshot method again; the only thing a hypervisor could snapshot is guest memory, which ADR-0003 §2.2 forbids for an authenticated session")
 		}
+	}
+	// And the real engine offers none of its own for the driver to find.
+	fc := NewFirecrackerEngine(FirecrackerOpts{VMMPath: "/nonexistent/bin/firecracker", StateDir: t.TempDir()})
+	if _, ok := any(fc).(interface {
+		Snapshot(context.Context, string, string, []string) (Snapshot, error)
+	}); ok {
+		t.Fatal("FirecrackerEngine has a Snapshot method")
 	}
 }
 
@@ -916,16 +978,23 @@ func TestMicrovmStateReconciliation(t *testing.T) {
 // this host cannot boot is an error, not an empty file and a recorded pull.
 func TestMicrovmPrepullNeverFabricatesAnImage(t *testing.T) {
 	stateDir := shortTempDir(t)
-	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 2, StateDir: stateDir})
+	const present = "rainier-env:e1-aaa"
+	src := newDirSource(t, map[string][]byte{present: []byte("an environment image")})
+	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 2, StateDir: stateDir, ImageSource: src})
 	ctx := context.Background()
 
 	const missing = "rainier-env:never-fetched"
 	if err := m.Prepull(ctx, missing); err == nil {
 		t.Fatal("Prepull of an unresolvable ref = nil, want an error")
 	}
-	cached := filepath.Join(stateDir, "rootfs", mustSanitizeRef(t, missing)+".ext4")
-	if _, err := os.Stat(cached); err == nil {
-		t.Fatalf("Prepull left a placeholder image at %s", cached)
+	// Nothing was left behind under the ref, and nothing under a digest: a
+	// failed resolution writes no manifest and fetches no bytes.
+	if data := m.images.manifestBytes(missing); data != nil {
+		t.Fatalf("Prepull of an unresolvable ref published a manifest:\n%s", data)
+	}
+	blobs, _ := os.ReadDir(m.images.blobDir())
+	if len(blobs) != 0 {
+		t.Fatalf("Prepull of an unresolvable ref left %d blob(s) in the store", len(blobs))
 	}
 	if got := m.Pulls(); len(got) != 0 {
 		t.Errorf("Pulls() = %v after a failed prepull, want none recorded", got)
@@ -934,16 +1003,20 @@ func TestMicrovmPrepullNeverFabricatesAnImage(t *testing.T) {
 		t.Error("Prepull with an empty ref = nil, want an error")
 	}
 
-	// A ref this host does have resolves, and is recorded.
-	const present = "rainier-env:e1-aaa"
-	if err := os.WriteFile(filepath.Join(stateDir, "rootfs", mustSanitizeRef(t, present)+".ext4"), []byte("image"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	// A ref the source publishes resolves, is fetched by digest, and is
+	// recorded.
 	if err := m.Prepull(ctx, present); err != nil {
-		t.Fatalf("Prepull of a cached ref: %v", err)
+		t.Fatalf("Prepull of a published ref: %v", err)
 	}
 	if got := m.Pulls(); !reflect.DeepEqual(got, []string{present}) {
 		t.Errorf("Pulls() = %v, want %v", got, []string{present})
+	}
+	manifest, ok := m.images.manifest(present)
+	if !ok {
+		t.Fatal("a fetched ref has no manifest on this host")
+	}
+	if _, ok := m.images.have(manifest.Digest); !ok {
+		t.Fatalf("the manifest for %s names %s, which is not in the store", present, manifest.Digest)
 	}
 }
 
@@ -1131,16 +1204,16 @@ func TestMicrovmHostileSnapshotRefsAreRefused(t *testing.T) {
 		if seg != filepath.Base(seg) || strings.ContainsAny(seg, `/\`) {
 			t.Errorf("sanitizeRef(%q) = %q, which is not one path entry", ref, seg)
 		}
-		dir, err := m.snapshotRefDir(ref)
+		path, err := m.images.manifestPath(ref)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if want := filepath.Join(stateDir, "snapshots", "refs"); filepath.Dir(dir) != want {
-			t.Errorf("ref %q resolved to %s, outside %s", ref, dir, want)
+		if want := filepath.Join(stateDir, "images", "refs"); filepath.Dir(path) != want {
+			t.Errorf("ref %q resolved to %s, outside %s", ref, path, want)
 		}
 	}
 	// Nothing was written above the refs directory.
-	stray := filepath.Join(stateDir, "snapshots", "manifest.json")
+	stray := filepath.Join(stateDir, "images", "manifest.json")
 	if _, err := os.Stat(stray); err == nil {
 		t.Errorf("a snapshot wrote %s, one level above its ref directory", stray)
 	}

@@ -287,6 +287,22 @@ func main() {
 	// CLI's help says and what the design's lifetime rule states — true on
 	// the path users actually take.
 	if rpc != nil {
+		// The host is about to copy this session's root filesystem as an
+		// environment image and the session keeps running (a snapshot). What
+		// the host copies is the file as IT sees it, so anything still in this
+		// guest's page cache would be missing from an image every later
+		// session of the environment boots. Answering is what lets the host
+		// go ahead; not answering is what stops it.
+		// A nil *agentSync put in an interface is not a nil interface, and the
+		// method on it would run on a nil receiver, so the conversion is made
+		// here where the concrete nil is still visible.
+		var agentFlush agentFlusher
+		if agents != nil {
+			agentFlush = agents
+		}
+		rpc.RegisterEventHandler(relay.KindFlush, func(ev relay.ControlEvent) {
+			flushDisks(rpc, agentFlush, ev.ID)
+		})
 		rpc.RegisterEventHandler(relay.KindSuspending, func(ev relay.ControlEvent) {
 			if ev.Cold {
 				// Not a freeze: this VM is ending, with no memory image
@@ -567,6 +583,49 @@ func quiesceExecs(execs execKiller, notifier eventNotifier, nonce uint64) {
 		log.Printf("reporting the suspend ready: %v", err)
 	}
 }
+
+// flushDisks answers a host's flush request: put what this session has
+// written on its block devices, and say so.
+//
+// Two steps, in this order, and both are the same two the cold suspend does
+// first — because it is the same question asked for a different reason:
+//
+//  1. the agent's own pending write, which lives in this process and not in
+//     any filesystem yet. A login completed seconds ago is exactly the thing
+//     an environment snapshot is being taken to keep.
+//  2. sync(2), which returns only once the kernel has handed every dirty page
+//     to its device — which is where the host is reading from.
+//
+// What it does NOT do is everything else the cold path does: no exec kill, no
+// unmount, no forgetting of delivered secrets. This session is staying, its
+// user may be attached to it right now, and a "flush" that ended their
+// commands would be a snapshot that stopped their work.
+//
+// The answer goes out even if this process cannot say anything useful about
+// how it went, for the mirror of the cold path's reason: there, silence makes
+// a stop slower; here, silence makes the host refuse to publish. Neither step
+// above can fail — agents.flush logs its own trouble, and sync(2) returns
+// nothing — so the answer is the honest one.
+func flushDisks(notifier eventNotifier, agents agentFlusher, nonce uint64) {
+	if agents != nil {
+		agents.flush()
+	}
+	diskSync()
+	if err := notifier.Notify(relay.ControlEvent{Kind: relay.KindFlushed, ID: nonce}); err != nil {
+		log.Printf("reporting the flush: %v", err)
+	}
+}
+
+// agentFlusher is the one thing a flush needs from the agent sync: put the
+// agent's pending write somewhere a filesystem knows about. An interface
+// rather than the concrete type so that a test can see the flush happen —
+// answering "flushed" without having flushed is precisely the failure the host
+// then publishes an image on the strength of.
+type agentFlusher interface{ flush() }
+
+// diskSync is sync(2), as a variable for the same reason: a flush that
+// answered without syncing would pass every test that only reads the answer.
+var diskSync = syncDisks
 
 // agentHomeMount is where the agent homes are mounted inside a session. It
 // is controlapp.HomeMountPath, spelled here because this process must not

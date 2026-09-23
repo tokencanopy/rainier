@@ -27,6 +27,17 @@ everything not on this list.
 | `firecracker` and `jailer` on `PATH` | There is no unjailed launch path. |
 | `mkfs.ext4` on `PATH` | Session workspace and agent-home images are formatted before a guest is handed them. |
 
+One thing is **not** on that list and should be, on a production host: a state
+directory on a filesystem that can **reflink** — XFS formatted with
+`reflink=1`, or btrfs. Each session boots a copy-on-write copy of its
+environment image (ADR-0003 §2.7 item 3), and where the filesystem shares
+extents that copy is a constant-time `ioctl(FICLONE)` whatever the image's
+size. Where it cannot, the runner makes a hole-preserving copy instead and
+says so in its log, once per create: correct, and seconds of I/O on a path the
+design budgeted at microseconds. It is not a startup check because the slow
+path really does work, which is what lets a developer machine and CI run this
+driver at all.
+
 The runner's startup error names the first item it is missing and what that
 item is for. `driver.MicrovmHostRequirements()` prints the whole list; it is
 generated from the same table the check reads, so the two cannot drift.
@@ -116,3 +127,11 @@ host qualification (ADR-0003 Phase 1 and the bakeoff's isolation gates), not
 unit tests — and so is the section above: that a guest's packet actually
 crosses the host with forwarding on and a masquerade rule in place is a thing
 only a real host and a real packet can settle.
+
+The same is true of the reflink. Whether `ioctl(FICLONE)` SUCCEEDS is a
+property of the filesystem under the state directory, so the tests inject the
+refusal and exercise the fallback deterministically rather than by accident of
+whichever filesystem `/tmp` happens to be. That a create on XFS with
+`reflink=1` takes microseconds and shares the image's extents — and that a
+guest writing to its root leaves the shared image untouched on a real block
+device rather than on a test's byte comparison — is host qualification too.

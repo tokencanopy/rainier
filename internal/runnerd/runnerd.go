@@ -109,6 +109,19 @@ type Server struct {
 	// which asks the sandbox for strictly more work than a freeze does. Same
 	// reason it is a field: a test must not spend the production one.
 	coldSuspendReadyWait time.Duration
+	// flushes is the one waiter per session for a sandbox's answer to a flush
+	// request, and flushNonce is this runner's source of the nonces that keep
+	// a late answer from satisfying the next request. Separate from the
+	// suspend pair rather than sharing it: a flush happens to a session that
+	// is STAYING, and the two could legitimately be in flight at once (a
+	// snapshot and an idle stop arriving together), where a shared waiter
+	// would have each answer the other's question.
+	flushMu    sync.Mutex
+	flushes    map[string]*flushWaiter
+	flushNonce atomic.Uint64
+	// flushWait is how long a guest gets to flush. A field so a test does not
+	// spend the production budget; written only immediately after New.
+	flushWait time.Duration
 	// displacedHubGrace is how long a hub a re-register replaced keeps
 	// delivering before it is closed. A field for the same reason, and
 	// written only immediately after New.
@@ -142,6 +155,16 @@ type suspendWaiter struct {
 	ready     chan struct{}
 	ackOnce   sync.Once
 	readyOnce sync.Once
+}
+
+// flushWaiter is one in-flight flush's single answer, matched by nonce. There
+// is no ack half: a flush asks for one thing and the answer is that it is
+// done, where a suspend's two answers exist to tell "you are talking to a
+// sandbox that predates this" from "it is working on it".
+type flushWaiter struct {
+	nonce uint64
+	done  chan struct{}
+	once  sync.Once
 }
 
 // SetOnEvent installs f as the session-event callback (nil clears it).
@@ -228,12 +251,15 @@ func New(drv driver.Driver, dialBase, egressAdmin, proxyURL string) *Server {
 		suspendAckWait: defaultSuspendAckWait, suspendReadyWait: defaultSuspendReadyWait,
 		coldSuspendReadyWait: defaultColdSuspendReadyWait,
 		displacedHubGrace:    defaultDisplacedHubGrace,
-		suspends: map[string]*suspendWaiter{}, runnerRPC: newRunnerRPCTable()}
-	// The microVM driver is composed BELOW this server and needs two things
-	// from above it — where a guest's control conn goes, and where a cold
-	// resume's bootstrap token comes from — so the runner installs itself
-	// here rather than being passed into the driver's constructor, which
-	// runs first. See driver.MicrovmHost.
+		flushWait:            defaultFlushWait,
+		suspends:             map[string]*suspendWaiter{},
+		flushes:              map[string]*flushWaiter{},
+		runnerRPC:            newRunnerRPCTable()}
+	// The microVM driver is composed BELOW this server and needs three things
+	// from above it — where a guest's control conn goes, where a cold resume's
+	// bootstrap token comes from, and how a guest is asked to flush before a
+	// snapshot — so the runner installs itself here rather than being passed
+	// into the driver's constructor, which runs first. See driver.MicrovmHost.
 	if hd, ok := drv.(driver.HostedDriver); ok {
 		hd.SetHost(s)
 	}
@@ -1192,6 +1218,12 @@ func (s *Server) routeControl(id string, boot, reg uint64, payload []byte) {
 	case relay.KindSuspendReady:
 		// And its execs are gone, so the container may be frozen.
 		s.deliverSuspend(id, ev.ID, true)
+	case relay.KindFlushed:
+		// The sandbox has put what it wrote on its block devices, so the host
+		// may copy the file underneath it. Like the suspend answers, this
+		// stays between this process and that sandbox: the snapshot waiting on
+		// it is inside this runner.
+		s.deliverFlush(id, ev.ID)
 	case "credential_rejected":
 		// A git operation in the sandbox was refused by GitHub. The vault mints
 		// optimistically (no GitHub round-trip per mint, design §4.2), so an
@@ -1479,6 +1511,45 @@ func (s *Server) disarmSuspendWaiter(id string, w *suspendWaiter) {
 		delete(s.suspends, id)
 	}
 	s.suspendMu.Unlock()
+}
+
+// armFlushWaiter and disarmFlushWaiter are armSuspendWaiter's twin, for the
+// same reasons: a previous flush that timed out left an entry behind and its
+// answer must not find this one, and a flush that finished first must not
+// unregister a concurrent second one's waiter.
+func (s *Server) armFlushWaiter(id string, nonce uint64) *flushWaiter {
+	w := &flushWaiter{nonce: nonce, done: make(chan struct{})}
+	s.flushMu.Lock()
+	s.flushes[id] = w
+	s.flushMu.Unlock()
+	return w
+}
+
+func (s *Server) disarmFlushWaiter(id string, w *flushWaiter) {
+	s.flushMu.Lock()
+	if s.flushes[id] == w {
+		delete(s.flushes, id)
+	}
+	s.flushMu.Unlock()
+}
+
+// deliverFlush wakes this session's flush waiter, and only when the NONCE
+// matches the flush that is actually in flight. A mismatch is a late answer to
+// a flush that already gave up — and letting it release the next one would
+// have a snapshot copy a filesystem on the strength of a sync that finished
+// before the writes it is about to publish.
+func (s *Server) deliverFlush(id string, nonce uint64) {
+	s.flushMu.Lock()
+	w := s.flushes[id]
+	s.flushMu.Unlock()
+	switch {
+	case w == nil:
+		return
+	case w.nonce != nonce:
+		log.Printf("session %s: a flush answer for %d arrived while %d is in flight; dropping it", id, nonce, w.nonce)
+	default:
+		w.once.Do(func() { close(w.done) })
+	}
 }
 
 // deliverSuspend wakes this session's waiter, once per answer, and only when

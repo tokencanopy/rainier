@@ -193,12 +193,10 @@ func (s *SimulatedEngine) Stop(_ context.Context, id string) error {
 	return nil
 }
 
-// Snapshot records the commit and nothing else. The simulated engine has no
-// filesystem to commit, so what it returns is the ref; the driver's manifest
-// beside it is what the contract's strip subtest reads back.
-func (s *SimulatedEngine) Snapshot(_ context.Context, _, ref string, _ []string) (Snapshot, error) {
-	return Snapshot{Ref: ref}, nil
-}
+// There is no Snapshot here either, and for the same reason the real engine
+// has none: publishing an environment image is a copy of a file the DRIVER
+// owns, so the contract's snapshot subtests run against the real image store
+// with this engine merely pausing and resuming underneath them.
 
 func (s *SimulatedEngine) State(_ context.Context, id string) (VMMState, error) {
 	s.mu.Lock()

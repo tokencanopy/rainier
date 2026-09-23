@@ -157,6 +157,31 @@ const (
 	// not here: every field of it is a field of the create this session came
 	// from, and relay interprets no payload it carries.
 	KindBootConfig = "boot_config"
+	// KindFlush is the host asking a sandbox to put what it has written on
+	// its block devices NOW, and to say when it has. KindFlushed is the
+	// answer. Both carry a NONCE in ControlEvent.ID, for the reason the
+	// suspend handshake does: a late answer to a flush that already gave up
+	// must not satisfy the next one.
+	//
+	// It exists for the microVM driver's Snapshot, which publishes a session's
+	// root filesystem as an environment image by copying the host file the
+	// guest has been writing into. A guest's unsynced writes are not in that
+	// file, and an image published without them is an environment whose setup
+	// script ran and whose results are half there — the one failure a cache
+	// must not have, since every later session of that environment boots it.
+	//
+	// It is NOT the cold-suspend notice with the flush in it (KindSuspending
+	// with Cold). That one asks for three things this must not do: it ends
+	// every exec, unmounts the agent home, and forgets the session's
+	// delivered secrets, because the VM is about to cease to exist. A snapshot
+	// leaves the session running and the user attached to it.
+	//
+	// A sandbox that predates the kind logs one unknown frame and answers
+	// nothing, which the host reads as "this guest cannot be flushed" — see
+	// (*Microvm).Snapshot for why that refuses the snapshot rather than
+	// publishing an image nobody can vouch for.
+	KindFlush   = "flush"
+	KindFlushed = "flushed"
 )
 
 type ControlEvent struct {

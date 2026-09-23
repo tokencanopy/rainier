@@ -380,8 +380,10 @@ func TestPrepareJailPutsEveryImageInsideTheRoot(t *testing.T) {
 	}
 
 	// Everything the VM has to be able to open was given to the VM's own uid,
-	// with the runner's group beside it.
-	for _, rel := range []string{"", "/run", jailWorkspacePath} {
+	// with the runner's group beside it — the ROOT filesystem included, since
+	// it is this session's own copy of an environment image and the VM writes
+	// to it.
+	for _, rel := range []string{"", "/run", jailRootfsPath, jailWorkspacePath} {
 		path := filepath.Join(root, rel)
 		owner, ok := fs.ownerOf(path)
 		if !ok {
@@ -396,7 +398,7 @@ func TestPrepareJailPutsEveryImageInsideTheRoot(t *testing.T) {
 	// Nothing in the jail is readable by "other". The VM next door is
 	// neither this VM's uid nor in the runner's group, and that is the whole
 	// of what keeps it out.
-	for _, rel := range []string{"", "/run", jailWorkspacePath} {
+	for _, rel := range []string{"", "/run", jailRootfsPath, jailWorkspacePath} {
 		info, err := os.Stat(filepath.Join(root, rel))
 		if err != nil {
 			t.Fatalf("stat %s: %v", rel, err)
@@ -420,10 +422,14 @@ func TestPrepareJailPutsEveryImageInsideTheRoot(t *testing.T) {
 	}
 }
 
-// TestPrepareJailRefusesAnUnreadableSharedImage. The kernel and the base
-// rootfs are hard-linked into every jail, so their ownership cannot be
-// changed for one VM; a jailed VM can only read them through the "other" bit.
-// Saying so beats a guest that boots to a kernel it cannot open.
+// TestPrepareJailRefusesAnUnreadableSharedImage. The guest kernel is
+// hard-linked into every jail, so its ownership cannot be changed for one VM;
+// a jailed VM can only read it through the "other" bit. Saying so beats a
+// guest that boots to a kernel it cannot open.
+//
+// It is the only shared image left: a session's ROOT filesystem is its own
+// copy-on-write copy of an environment image, and is chowned to the VM like
+// the workspace.
 func TestPrepareJailRefusesAnUnreadableSharedImage(t *testing.T) {
 	fc, stateDir, _ := jailTestEngine(t, &fakeStarter{})
 	kernel := writeJailImage(t, stateDir, "private-vmlinux", 0o600)
