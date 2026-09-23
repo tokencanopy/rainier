@@ -439,3 +439,192 @@ func anyContains(prefixes []netip.Prefix, addr netip.Addr) bool {
 	}
 	return false
 }
+
+// TestFirewallReadsBackWhatTheHostWasGiven. Ruleset is what the renderer
+// produced; Firewall is what the host has. The distinction is the whole reason
+// the read exists (ADR-0003 §4.3 asserts a property of the machine, not of a
+// template), so this asserts that the read goes to the host: the ruleset comes
+// back naming this slot's TAP and its table, and the host recorded a read.
+func TestFirewallReadsBackWhatTheHostWasGiven(t *testing.T) {
+	host := NewFakeHost()
+	p, err := New(goldenConfig(), host)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	slot, err := p.Allocate(ctx, "mvm-1")
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	got, err := p.Firewall(ctx, slot)
+	if err != nil {
+		t.Fatalf("Firewall: %v", err)
+	}
+	if !strings.Contains(got, `iifname != "`+slot.Tap+`" return`) {
+		t.Fatalf("the ruleset read back is not this slot's:\n%s", got)
+	}
+	if !strings.Contains(got, "table inet "+p.TableName(slot)+" {") {
+		t.Fatalf("the ruleset read back is not in this slot's table %q:\n%s", p.TableName(slot), got)
+	}
+	// The named metadata drop is the one control a reader has to be able to
+	// point at in a dump; see firewall.go's metadataAddress.
+	if !strings.Contains(got, "ip daddr "+metadataAddress+" drop") {
+		t.Fatalf("the ruleset read back does not name the metadata drop:\n%s", got)
+	}
+
+	ops := host.Ops()
+	var read *Op
+	for i := range ops {
+		if ops[i].Verb == "nft-list" {
+			read = &ops[i]
+		}
+	}
+	if read == nil {
+		t.Fatal("Firewall answered without asking the host; a read that does not reach the machine evidences nothing")
+	}
+	if read.Netns != slot.Netns || len(read.Args) != 1 || read.Args[0] != p.TableName(slot) {
+		t.Fatalf("Firewall asked the host for %v in %q, want table %q in %q", read.Args, read.Netns, p.TableName(slot), slot.Netns)
+	}
+}
+
+// TestFirewallReportsAnAbsentTableAsSuch. A live slot whose table has gone is
+// the finding this read exists to make, and "no rules" must not read the same
+// as "an empty ruleset".
+//
+// The namespace is left standing on purpose: that is what makes this the
+// security finding rather than the teardown below.
+func TestFirewallReportsAnAbsentTableAsSuch(t *testing.T) {
+	host := NewFakeHost()
+	p, err := New(goldenConfig(), host)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	slot, err := p.Allocate(ctx, "mvm-1")
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	if err := host.DeleteNftTable(ctx, slot.Netns, p.TableName(slot)); err != nil {
+		t.Fatalf("taking the slot's table away underneath it: %v", err)
+	}
+	got, err := p.Firewall(ctx, slot)
+	if !errors.Is(err, ErrNoNftTable) {
+		t.Fatalf("Firewall of a live slot with no table = %q, %v; want ErrNoNftTable", got, err)
+	}
+	if got != "" {
+		t.Fatalf("Firewall returned a ruleset for a table that is gone: %q", got)
+	}
+}
+
+// TestFirewallDistinguishesAGoneNamespaceFromAnAbsentTable. `ip netns exec`
+// against a namespace that does not exist fails before nft is reached, so a
+// released slot answers a question that could not be asked rather than one
+// about a table.
+//
+// Told apart because the two findings are opposite. A live guest behind no
+// rules is the thing ADR-0003 §4.3's check exists to catch; a torn-down slot
+// behind no rules is teardown having worked. One sentinel for both would make
+// a teardown assertion pass for a slot whose namespace was still up with its
+// firewall stripped off.
+func TestFirewallDistinguishesAGoneNamespaceFromAnAbsentTable(t *testing.T) {
+	host := NewFakeHost()
+	p, err := New(goldenConfig(), host)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+
+	slot, err := p.Allocate(ctx, "mvm-1")
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	if err := p.Release(ctx, slot); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	got, err := p.Firewall(ctx, slot)
+	if !errors.Is(err, ErrNoNetns) {
+		t.Fatalf("Firewall of a released slot = %q, %v; want ErrNoNetns", got, err)
+	}
+	if errors.Is(err, ErrNoNftTable) {
+		t.Fatalf("a gone namespace also reports ErrNoNftTable (%v), so a teardown assertion cannot tell it from a live slot whose firewall was stripped", err)
+	}
+	if got != "" {
+		t.Fatalf("Firewall returned a ruleset from a namespace that is gone: %q", got)
+	}
+}
+
+// TestFirewallRefusesAHostThatCannotRead. An honest refusal rather than an
+// empty string: a caller that read "" as "this guest is behind no rules" would
+// report a working host broken, and one that read it as "fine" would miss the
+// case the read exists for.
+func TestFirewallRefusesAHostThatCannotRead(t *testing.T) {
+	p, err := New(goldenConfig(), &nftBlindHost{inner: NewFakeHost()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx := context.Background()
+	slot, err := p.Allocate(ctx, "mvm-1")
+	if err != nil {
+		t.Fatalf("Allocate: %v", err)
+	}
+	got, err := p.Firewall(ctx, slot)
+	if err == nil {
+		t.Fatalf("Firewall on a host with no read half returned %q and no error", got)
+	}
+	if got != "" {
+		t.Fatalf("Firewall returned %q beside its refusal", got)
+	}
+	if !strings.Contains(err.Error(), "cannot read a ruleset back") {
+		t.Fatalf("the refusal = %q, want it to name what the host cannot do", err)
+	}
+}
+
+// nftBlindHost is a Host with no read half — every method forwarded to a
+// FakeHost, and ListNft deliberately not among them. It is written out rather
+// than embedded because embedding *FakeHost would promote ListNft and make
+// this type the thing it exists not to be.
+type nftBlindHost struct{ inner *FakeHost }
+
+var _ Host = (*nftBlindHost)(nil)
+
+func (h *nftBlindHost) AddNetns(ctx context.Context, name string) error {
+	return h.inner.AddNetns(ctx, name)
+}
+func (h *nftBlindHost) DelNetns(ctx context.Context, name string) error {
+	return h.inner.DelNetns(ctx, name)
+}
+func (h *nftBlindHost) ListNetns(ctx context.Context) ([]string, error) {
+	return h.inner.ListNetns(ctx)
+}
+func (h *nftBlindHost) AddVeth(ctx context.Context, hostName, peerName, peerNetns string) error {
+	return h.inner.AddVeth(ctx, hostName, peerName, peerNetns)
+}
+func (h *nftBlindHost) DelLink(ctx context.Context, netns, name string) error {
+	return h.inner.DelLink(ctx, netns, name)
+}
+func (h *nftBlindHost) AddTap(ctx context.Context, netns, name, mac string) error {
+	return h.inner.AddTap(ctx, netns, name, mac)
+}
+func (h *nftBlindHost) AddAddr(ctx context.Context, netns, link, cidr string) error {
+	return h.inner.AddAddr(ctx, netns, link, cidr)
+}
+func (h *nftBlindHost) LinkUp(ctx context.Context, netns, link string) error {
+	return h.inner.LinkUp(ctx, netns, link)
+}
+func (h *nftBlindHost) AddRoute(ctx context.Context, netns, dst, via string) error {
+	return h.inner.AddRoute(ctx, netns, dst, via)
+}
+func (h *nftBlindHost) DelRoute(ctx context.Context, netns, dst, via string) error {
+	return h.inner.DelRoute(ctx, netns, dst, via)
+}
+func (h *nftBlindHost) SetSysctl(ctx context.Context, netns, key, value string) error {
+	return h.inner.SetSysctl(ctx, netns, key, value)
+}
+func (h *nftBlindHost) ApplyNft(ctx context.Context, netns, ruleset string) error {
+	return h.inner.ApplyNft(ctx, netns, ruleset)
+}
+func (h *nftBlindHost) DeleteNftTable(ctx context.Context, netns, table string) error {
+	return h.inner.DeleteNftTable(ctx, netns, table)
+}

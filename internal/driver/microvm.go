@@ -1037,6 +1037,47 @@ func (m *Microvm) removeSessionRootfs(id string) {
 	}
 }
 
+// removeCgroup takes away the cgroup the jailer made for one VM.
+//
+// Nothing else does, and that is the whole reason this exists. The jailer
+// creates the per-VM cgroup and moves the VMM into it; when the VMM exits the
+// kernel leaves the (now empty) cgroup directory exactly where it was, and
+// Firecracker does not remove it either. So a host that ran sessions all day
+// was a host with one empty cgroup per session it had ever run, accumulating
+// under the parent every later VM's cgroup is created in — a leaked kernel
+// object per session, and the reason "every resource this session held is
+// gone" was not true.
+//
+// dir is the path the RECORD carries rather than one recomputed here, so an
+// operator who moved --microvm-cgroup-parent between the create and the
+// teardown has the cgroup the VM was actually in removed, not the one a VM
+// created now would get.
+//
+// Ordering: it runs after engine.Stop, which has waited for the VMM to exit.
+// An rmdir of a cgroup that still holds a process answers EBUSY, and that case
+// is deliberately logged rather than retried or forced: something is still in
+// there, and taking the accounting out from under it is not this call's
+// decision. A failure is never fatal — a teardown that reported failure over a
+// directory would turn a session that IS gone into one the control plane
+// retries forever.
+//
+// It is NOT called on a cold park. A parked session's VM is gone, but its
+// cgroup has the instance's own name, nothing else on this host can be given
+// that name while the record exists, and the resume puts a new VM in a cgroup
+// of exactly that path. Removing it there would be churn with a window in it.
+func (m *Microvm) removeCgroup(id, dir string) {
+	if dir == "" {
+		return
+	}
+	// os.Remove and not os.RemoveAll: a cgroup's control files (cpu.stat,
+	// memory.current, cgroup.procs) are not ordinary files and cannot be
+	// unlinked, so RemoveAll would fail on the first of them. rmdir(2) is what
+	// removes a cgroup, and the kernel removes it with its control files.
+	if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("microvm: removing the cgroup of %s at %s: %v", id, dir, err)
+	}
+}
+
 // ensureDisk creates and formats a sparse disk image at path if it is not
 // already there, and reports whether this call is the one that created it.
 func (m *Microvm) ensureDisk(path string) (string, bool, error) {
@@ -2141,7 +2182,8 @@ func (m *Microvm) diskRecord(id string) (instanceRecord, bool) {
 // of this pool's indices, and the startup reclaim is what tears down whatever
 // namespace a previous runner left.
 func (m *Microvm) destroyUnrecorded(ctx context.Context, id string) error {
-	if _, onDisk := m.diskRecord(id); !onDisk {
+	rec, onDisk := m.diskRecord(id)
+	if !onDisk {
 		return nil
 	}
 	if err := m.engine.Stop(ctx, id); err != nil {
@@ -2150,6 +2192,7 @@ func (m *Microvm) destroyUnrecorded(ctx context.Context, id string) error {
 			return fmt.Errorf("destroy microvm %s (recorded on disk only): %w", id, err)
 		}
 	}
+	m.removeCgroup(id, rec.Cfg.CgroupPath)
 	m.removeSessionRootfs(id)
 	m.deleteInstanceRecord(id)
 	return nil
@@ -2166,6 +2209,7 @@ func (m *Microvm) DestroyContainer(ctx context.Context, id string) error {
 	inst.slot = nil
 	channel := inst.channel
 	inst.channel = nil
+	cgroup := inst.Cfg.CgroupPath
 	m.mu.Unlock()
 	// Closed before the VM is signalled, so nothing can dial a control
 	// channel for a session that is being torn down.
@@ -2210,6 +2254,11 @@ func (m *Microvm) DestroyContainer(ctx context.Context, id string) error {
 	m.mu.Lock()
 	delete(m.instances, id)
 	m.mu.Unlock()
+
+	// The VM's cgroup goes with the VM. Nothing else removes it — see
+	// removeCgroup — and it is taken here rather than in Stop because the
+	// path is the RECORD's and the engine does not have one.
+	m.removeCgroup(id, cgroup)
 
 	// The session's writable root filesystem goes with the VM, on the crash
 	// path as much as on the explicit one: it is a copy of an environment

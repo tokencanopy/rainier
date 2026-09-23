@@ -1,11 +1,42 @@
 // internal/driver/netslot/host.go
 package netslot
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // DefaultNetnsDir is where `ip netns` keeps its named namespaces, and
 // therefore where a previous runnerd's leftovers are found.
 const DefaultNetnsDir = "/var/run/netns"
+
+// ErrNoNftTable is what a read of a slot's firewall reports when the slot's
+// network namespace is there and the table in it is not — a slot that was
+// never set up, or one whose firewall has been taken away underneath a live
+// session.
+//
+// It is a named error rather than an empty string because the two answers are
+// not the same question: "this guest is behind no rules" is the finding a
+// security check exists to make, and an empty ruleset that could also mean "the
+// table is fine, it just has no rules" would make that check unable to fire.
+//
+// It does NOT cover a namespace that is gone; that is ErrNoNetns, and the two
+// are separated for the reason this error exists at all. A live slot whose
+// table vanished is the security finding. A slot whose namespace vanished is a
+// slot that has been torn down, where having no rules is the expected end
+// state and not a finding about any guest.
+var ErrNoNftTable = errors.New("netslot: no such nftables table")
+
+// ErrNoNetns is what a read of a slot's firewall reports when the namespace it
+// would have read in does not exist.
+//
+// `ip netns exec` fails before nft is reached ("Cannot open network
+// namespace"), so this is the answer to a question that could not be asked,
+// not an observation about a table. A teardown assertion wants it; a check
+// that a running guest is behind rules must not accept it in place of
+// ErrNoNftTable, because a vanished namespace means there is no guest there to
+// have a finding about.
+var ErrNoNetns = errors.New("netslot: no such network namespace")
 
 // Host is every privileged operation a slot needs, and the only way this
 // package reaches the machine.
@@ -83,4 +114,24 @@ type Host interface {
 	// DeleteNftTable removes one inet table. An absent table is success:
 	// teardown is retried, and a retry has to be able to finish.
 	DeleteNftTable(ctx context.Context, netns, table string) error
+}
+
+// NftReader is the read half of ApplyNft: what is installed in a slot's
+// namespace right now, as the host has it.
+//
+// It is an OPTIONAL interface rather than a method on Host for one reason. No
+// production path needs it: applying a ruleset is a write the pool makes and
+// then relies on, and a driver that read its own firewall back on every create
+// would be paying for a check the kernel already enforced. What needs it is
+// EVIDENCE — a Phase A operator, or the host-gated harness in internal/driver,
+// asking "is this guest actually behind the ruleset ADR-0003 §4.3 requires?"
+// and being able to answer from the host rather than from the renderer that
+// produced the text. Adding a method to Host would have made every
+// implementation of it carry a call nothing in production makes.
+//
+// An implementation reports ErrNoNftTable when the table is absent and
+// ErrNoNetns when the namespace is, and never an empty ruleset for either: see
+// those errors for why the distinctions matter.
+type NftReader interface {
+	ListNft(ctx context.Context, netns, table string) (string, error)
 }

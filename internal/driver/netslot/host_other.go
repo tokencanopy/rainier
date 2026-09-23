@@ -23,7 +23,10 @@ import (
 // LinuxHost is declared on every platform. Off Linux it can only be nil.
 type LinuxHost struct{}
 
-var _ Host = (*LinuxHost)(nil)
+var (
+	_ Host      = (*LinuxHost)(nil)
+	_ NftReader = (*LinuxHost)(nil)
+)
 
 // NewLinuxHost always fails off Linux.
 func NewLinuxHost(string) (*LinuxHost, error) { return nil, unsupported() }
@@ -45,3 +48,7 @@ func (*LinuxHost) DelRoute(context.Context, string, string, string) error  { ret
 func (*LinuxHost) SetSysctl(context.Context, string, string, string) error { return unsupported() }
 func (*LinuxHost) ApplyNft(context.Context, string, string) error          { return unsupported() }
 func (*LinuxHost) DeleteNftTable(context.Context, string, string) error    { return unsupported() }
+
+func (*LinuxHost) ListNft(context.Context, string, string) (string, error) {
+	return "", unsupported()
+}

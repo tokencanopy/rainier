@@ -51,7 +51,10 @@ type FakeHost struct {
 	failOn map[string]error
 }
 
-var _ Host = (*FakeHost)(nil)
+var (
+	_ Host      = (*FakeHost)(nil)
+	_ NftReader = (*FakeHost)(nil)
+)
 
 // NewFakeHost builds an empty host.
 func NewFakeHost() *FakeHost {
@@ -251,6 +254,40 @@ func (f *FakeHost) DeleteNftTable(_ context.Context, netns, table string) error 
 	defer f.mu.Unlock()
 	delete(f.rules, netns)
 	return nil
+}
+
+// ListNft is the read half, recorded like every other operation.
+//
+// It answers with what ApplyNft last installed in netns, which is a stronger
+// fake than it looks: a Pool that read a slot's firewall back from anywhere
+// but the host would still pass a test written against the RENDERER, and would
+// fail this one the moment the ruleset it read was not the one the host was
+// given.
+//
+// The table name is checked rather than ignored, because the caller composes
+// it from a slot index and a name prefix and a Pool that asked for the wrong
+// table would otherwise be indistinguishable from one that asked for the
+// right one.
+func (f *FakeHost) ListNft(_ context.Context, netns, table string) (string, error) {
+	if err := f.record("nft-list", netns, table); err != nil {
+		return "", err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	// A namespace that is gone is its own answer, as it is on a Linux host
+	// where `ip netns exec` fails before nft runs. Checked first because the
+	// two are not ranked the same way by a caller: see ErrNoNetns.
+	if netns != "" && !f.ns[netns] {
+		return "", fmt.Errorf("%w: %q", ErrNoNetns, netns)
+	}
+	rules, ok := f.rules[netns]
+	if !ok {
+		return "", fmt.Errorf("%w: inet %s in %q", ErrNoNftTable, table, netns)
+	}
+	if !strings.Contains(rules, "table inet "+table+" {") {
+		return "", fmt.Errorf("%w: inet %s in %q", ErrNoNftTable, table, netns)
+	}
+	return rules, nil
 }
 
 // Ruleset returns the ruleset last applied in netns, and whether there is
