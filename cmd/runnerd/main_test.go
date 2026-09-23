@@ -2,84 +2,108 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// TestEgressProxyEndpoint covers the one flag that decides what a microVM
-// guest's firewall lets out.
-func TestEgressProxyEndpoint(t *testing.T) {
+// The two flags a microVM runner cannot start without, and what each refusal
+// has to say. They are Fatals in main for the reason the kernel and the rootfs
+// are: a runner that started without a checkpoint store would accept placements
+// and then fail every cold suspend, with a tenant's work still inside a VM the
+// durability barrier will not let it terminate.
+
+func keyFile(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "checkpoint.key")
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	if err := os.WriteFile(p, key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestCheckpointConfigBuildsTheDriversPorts(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "checkpoints")
+	opts, err := checkpointConfig(dir, keyFile(t), 1000, 1000)
+	if err != nil {
+		t.Fatalf("checkpointConfig: %v", err)
+	}
+	if opts.Store == nil || opts.Keys == nil {
+		t.Fatalf("the configuration is %+v, want a store and a key wrapper", opts)
+	}
+	if opts.KeyRef == "" {
+		t.Error("the configuration names no key reference; a manifest has to record one")
+	}
+	if opts.OwnerUID != 1000 || opts.OwnerGID != 1000 {
+		t.Errorf("the restored workspace would be given to %d:%d, want 1000:1000", opts.OwnerUID, opts.OwnerGID)
+	}
+	// The store directory is created, because a runner that started without one
+	// would discover it at the worst possible moment.
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("the store directory was not created: %v", err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Errorf("the store directory is mode %v, want 0700", info.Mode().Perm())
+	}
+}
+
+func TestCheckpointConfigRefusesWhatARunnerCannotStartWith(t *testing.T) {
+	good := keyFile(t)
+	loose := filepath.Join(t.TempDir(), "loose.key")
+	if err := os.WriteFile(loose, make([]byte, 32), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	cases := []struct {
-		name     string
-		explicit string
-		proxyURL string
-		wantAddr string
-		wantPort int
-		wantErr  string
+		name  string
+		dir   string
+		key   string
+		uid   int
+		gid   int
+		wants string
 	}{
-		{
-			name:     "no proxy at all is a runner with no exception",
-			wantAddr: "",
-			wantPort: 0,
-		},
-		{
-			name:     "an explicit address wins",
-			explicit: "10.44.0.9:3128",
-			proxyURL: "http://egressd:3129",
-			wantAddr: "10.44.0.9",
-			wantPort: 3128,
-		},
-		{
-			name:     "a proxy URL that is already an address",
-			proxyURL: "http://10.44.0.9:3129",
-			wantAddr: "10.44.0.9",
-			wantPort: 3129,
-		},
-		{
-			name:     "a proxy URL with no port takes the scheme's",
-			proxyURL: "https://10.44.0.9",
-			wantAddr: "10.44.0.9",
-			wantPort: 443,
-		},
-		{
-			name:     "a proxy URL naming a host must be given as an address",
-			proxyURL: "http://egressd:3129",
-			wantErr:  "names a host and not an address",
-		},
-		{
-			name:     "an explicit endpoint that is not ip:port",
-			explicit: "10.44.0.9",
-			wantErr:  "not ip:port",
-		},
-		{
-			name:     "an explicit endpoint with a nonsense port",
-			explicit: "10.44.0.9:not-a-port",
-			wantErr:  "not a port",
-		},
-		{
-			name:     "an IPv6 proxy no guest could reach",
-			explicit: "[fd00::1]:3128",
-			wantErr:  "IPv6",
-		},
+		{"no store directory", "", good, 1000, 1000, "--checkpoint-store-dir is required"},
+		{"no key file", t.TempDir(), "", 1000, 1000, "--checkpoint-key-file is required"},
+		{"a key file that is not there", t.TempDir(), filepath.Join(t.TempDir(), "nope"), 1000, 1000, "checkpoint key file"},
+		{"a key anyone can read", t.TempDir(), loose, 1000, 1000, "readable by group or other"},
+		{"a negative uid", t.TempDir(), good, -1, 1000, "must not be negative"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			addr, port, err := egressProxyEndpoint(tc.explicit, tc.proxyURL)
-			if tc.wantErr != "" {
-				if err == nil {
-					t.Fatalf("egressProxyEndpoint(%q, %q) = %q/%d, want an error naming %q", tc.explicit, tc.proxyURL, addr, port, tc.wantErr)
-				}
-				if !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("error = %q, want it to name %q", err, tc.wantErr)
-				}
-				return
+			_, err := checkpointConfig(tc.dir, tc.key, tc.uid, tc.gid)
+			if err == nil {
+				t.Fatal("the configuration was accepted")
 			}
-			if err != nil {
-				t.Fatalf("egressProxyEndpoint(%q, %q): %v", tc.explicit, tc.proxyURL, err)
-			}
-			if addr != tc.wantAddr || port != tc.wantPort {
-				t.Fatalf("egressProxyEndpoint(%q, %q) = %q/%d, want %q/%d", tc.explicit, tc.proxyURL, addr, port, tc.wantAddr, tc.wantPort)
+			if !strings.Contains(err.Error(), tc.wants) {
+				t.Errorf("the refusal is %q, want it to name %q", err, tc.wants)
 			}
 		})
+	}
+}
+
+// TestCheckpointConfigSaysWhyRatherThanWhat. These lines are what an operator
+// reads at three in the morning, so each one names the consequence and not just
+// the missing argument.
+func TestCheckpointConfigSaysWhyRatherThanWhat(t *testing.T) {
+	_, err := checkpointConfig("", keyFile(t), 1000, 1000)
+	if err == nil {
+		t.Fatal("an empty store directory was accepted")
+	}
+	for _, want := range []string{"portable checkpoint", "no default"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal %q does not explain %q", err, want)
+		}
+	}
+	if _, err = checkpointConfig(t.TempDir(), "", 1000, 1000); err == nil {
+		t.Fatal("an empty key file was accepted")
+	}
+	if !strings.Contains(err.Error(), "in the clear") {
+		t.Errorf("the refusal %q does not explain what an unencrypted checkpoint would be", err)
 	}
 }

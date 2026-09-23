@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tokencanopy/rainier/checkpoint"
 	"github.com/tokencanopy/rainier/internal/driver"
 	"github.com/tokencanopy/rainier/internal/runnerd"
 )
@@ -68,6 +70,14 @@ func main() {
 		"cgroup v2 mount point; empty means /sys/fs/cgroup. It is where host-side metering reads each microVM's cpu.stat and memory.current from")
 	microvmSeccompOff := flag.Bool("microvm-seccomp-off", os.Getenv("RAINIER_MICROVM_SECCOMP_OFF") == "1",
 		"turn OFF the jailer's seccomp filter on the Firecracker process. Seccomp is on by default and this exists for diagnosing a filter rejection on a new kernel, not for production")
+	checkpointStoreDir := flag.String("checkpoint-store-dir", envDefault("RAINIER_CHECKPOINT_STORE_DIR", ""),
+		"host directory holding the portable workspace checkpoints a cold suspend writes (required when --driver=microvm). A cold suspend does not report success until a session's workspace is a committed, verified checkpoint in here (ADR-0003 §4.4), and a deep-dormant resume rebuilds the workspace image from it. A hosted cell puts these in regional object storage instead")
+	checkpointKeyFile := flag.String("checkpoint-key-file", envDefault("RAINIER_CHECKPOINT_KEY_FILE", ""),
+		"file holding the 32-byte key every workspace checkpoint is wrapped under, as 64 hex characters or 32 raw bytes, mode 0600 (required when --driver=microvm). Without it the checkpoints in --checkpoint-store-dir would be a tenant's files in the clear on this host; with it, losing this file means losing every checkpoint it wrapped")
+	checkpointRestoreUID := flag.Int("checkpoint-restore-uid", envIntDefault("RAINIER_CHECKPOINT_RESTORE_UID", 1000),
+		"uid a restored workspace's files are given to before they become a filesystem: the user the session image runs its agent as. A checkpoint records modes and not owners, so without this a restored workspace comes back owned by root and the agent cannot write it. 0 means leave every file owned by this runner")
+	checkpointRestoreGID := flag.Int("checkpoint-restore-gid", envIntDefault("RAINIER_CHECKPOINT_RESTORE_GID", 1000),
+		"gid a restored workspace's files are given to; see --checkpoint-restore-uid")
 	var microvmControlPlane capabilityFlag
 	flag.Var(&microvmControlPlane, "microvm-control-plane-cidr",
 		"a regional control-plane range a microVM guest must not be able to reach; repeatable, or set RAINIER_MICROVM_CONTROL_PLANE_CIDRS to a comma-separated list")
@@ -127,7 +137,19 @@ func main() {
 		case *microvmImageURL != "":
 			imageSource = driver.HTTPImageSource{Base: *microvmImageURL}
 		}
+		// Where a cold suspend's workspace checkpoint goes, and what wraps it.
+		// Both are REQUIRED here, and this is a Fatal for the same reason the
+		// kernel and the rootfs are: a runner that started without them would
+		// accept placements and then fail every cold suspend — with a tenant's
+		// work still inside a VM the durability barrier will not let it
+		// terminate.
+		ckpt, err := checkpointConfig(*checkpointStoreDir, *checkpointKeyFile,
+			*checkpointRestoreUID, *checkpointRestoreGID)
+		if err != nil {
+			log.Fatalf("--driver=microvm: %v", err)
+		}
 		mvm, err := driver.NewMicrovm(driver.MicrovmOpts{
+			Checkpoint:  ckpt,
 			KernelPath:  *kernelPath,
 			BaseRootfs:  *rootfsPath,
 			StateDir:    *microvmStateDir,
@@ -212,6 +234,43 @@ func main() {
 	}); err != nil {
 		log.Fatalf("agent: %v", err)
 	}
+}
+
+// checkpointConfig builds the microVM driver's checkpoint configuration from
+// the two required flags, or says which one is missing and why it matters.
+//
+// It is a function of its arguments rather than of the flag variables so that
+// the refusals are testable: every one of them is a condition a real deployment
+// gets wrong at some point, and "the runner started anyway" is the outcome none
+// of them may have.
+func checkpointConfig(storeDir, keyFile string, uid, gid int) (*driver.CheckpointOpts, error) {
+	switch {
+	case storeDir == "":
+		return nil, errors.New("--checkpoint-store-dir is required: a cold suspend turns a session's workspace into a portable checkpoint before it terminates the VM (ADR-0003 §4.4), and there is deliberately no default — a temp-directory one would put a tenant's only durable copy somewhere the host reaps")
+	case keyFile == "":
+		return nil, errors.New("--checkpoint-key-file is required: a workspace checkpoint is encrypted under it, and an unencrypted one would be a tenant's files in the clear on this host")
+	case uid < 0 || gid < 0:
+		return nil, errors.New("--checkpoint-restore-uid and --checkpoint-restore-gid must not be negative")
+	}
+	store, err := driver.NewDirBlobStore(storeDir)
+	if err != nil {
+		return nil, err
+	}
+	key, err := driver.LoadCheckpointKey(keyFile)
+	if err != nil {
+		return nil, err
+	}
+	keys, err := checkpoint.NewStaticKeyWrapper(driver.SelfHostedCheckpointKeyRef, key)
+	if err != nil {
+		return nil, err
+	}
+	return &driver.CheckpointOpts{
+		Store:    store,
+		Keys:     keys,
+		KeyRef:   driver.SelfHostedCheckpointKeyRef,
+		OwnerUID: uid,
+		OwnerGID: gid,
+	}, nil
 }
 
 // egressProxyEndpoint resolves the one host-side destination a microVM
