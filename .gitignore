@@ -3,6 +3,12 @@ bin/
 .superpowers/
 *.log
 
+# scripts/microvm-kvm-test.sh writes its evidence here by default (timings, the
+# go test log, and the digests the run was pinned to). It is a Phase A
+# operator's own record, produced on their host and belonging in the private
+# experiment system, not in this repository.
+/microvm-kvm-evidence/
+
 # `go build ./...` writes one executable per main package into the CURRENT
 # directory rather than into bin/, so running it at the repo root leaves
 # multi-megabyte unstripped binaries sitting beside the source, where

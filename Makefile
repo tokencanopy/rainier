@@ -1,4 +1,4 @@
-.PHONY: test build demo e2e verify module-path protocols control session-image session-image-security-policy session-image-smoke session-image-browser-e2e session-image-verify
+.PHONY: test build demo e2e verify module-path protocols control session-image session-image-security-policy session-image-smoke session-image-browser-e2e session-image-verify microvm-kvm-test
 
 DOCKER ?= docker
 SESSION_IMAGE ?= rainier-session:smoke
@@ -63,6 +63,23 @@ session-image-browser-e2e:
 	DOCKER="$(DOCKER)" ./scripts/session-image-browser-e2e.sh "$(SESSION_IMAGE)"
 
 session-image-verify: session-image session-image-smoke session-image-browser-e2e
+
+# microvm-kvm-test runs the Firecracker-backed driver harness
+# (internal/driver/microvm_kvm_test.go) on a real KVM host: ADR-0003 §7 Phase 1
+# and §8 acceptance criterion 1, and the Phase A runbook's experiment (a).
+#
+# It is deliberately NOT part of `verify`, and there is no arrangement of flags
+# that would make it so. It boots real microVMs, needs /dev/kvm, the jailer, a
+# guest kernel and a base ext4 rootfs the operator staged, and seven Linux
+# capabilities; on every other machine the harness skips and this target's
+# script exits 2 naming what is missing.
+#
+#   RAINIER_MICROVM_TEST_IMAGES=/mnt/mvm make microvm-kvm-test
+#
+# See the head of scripts/microvm-kvm-test.sh for every input and for where the
+# evidence lands.
+microvm-kvm-test:
+	./scripts/microvm-kvm-test.sh
 
 verify: module-path protocols control session-image-security-policy test build
 	go vet ./...
