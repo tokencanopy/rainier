@@ -63,6 +63,9 @@ type streamingHost struct {
 	cut int64
 	// err, when set, is a handshake that failed before a byte moved.
 	err error
+	// entriesFudge is added to the entry count the guest reports, standing in
+	// for two ends that do not agree about what was carried.
+	entriesFudge int64
 
 	mu     sync.Mutex
 	calls  int
@@ -97,7 +100,7 @@ func (h *streamingHost) StreamWorkspace(ctx context.Context, _ string, dst io.Wr
 	if err != nil {
 		return WorkspaceStream{}, err
 	}
-	return WorkspaceStream{Entries: rep.Entries, Bytes: rep.Bytes, Nonce: 7}, nil
+	return WorkspaceStream{Entries: rep.Entries + h.entriesFudge, Bytes: rep.Bytes, Nonce: 7}, nil
 }
 
 func (h *streamingHost) CheckpointCommitted(_ string, nonce uint64) {
@@ -308,11 +311,159 @@ func TestAColdSuspendKeepsTheVMWhenVerifyFails(t *testing.T) {
 		t.Errorf("the refusal does not name the stage: %v", err)
 	}
 	assertVMKept(t, m, sim, id)
-	// The generation is NOT recorded: a checkpoint that cannot be read back is
-	// not one, and the retry must not believe it has a newer one than it does.
+	// The generation IS recorded, and persisted, even though the suspend
+	// failed. A manifest key has no attempt suffix and put-if-absent never
+	// overwrites, so the generation whose manifest committed is spent for good
+	// — a record that pretended otherwise would have every later attempt lose
+	// its manifest put to ErrExists, and this session could never be cold
+	// parked again.
+	rec, ok := m.diskRecord(id)
+	if !ok {
+		t.Fatal("no instance record was written")
+	}
+	if rec.CheckpointGeneration != 1 {
+		t.Errorf("the record says generation %d after a committed-but-unverified checkpoint, want 1", rec.CheckpointGeneration)
+	}
+}
+
+// TestAColdSuspendAfterAFailedVerifyTakesTheNextGeneration is the other half of
+// that rule, and the reason it matters: the session is still parkable.
+func TestAColdSuspendAfterAFailedVerifyTakesTheNextGeneration(t *testing.T) {
+	store := &tamperingStore{MemoryStore: checkpoint.NewMemoryStore(), once: true}
+	m, _, _, id, _ := checkpointScene(t, store)
+	ctx := context.Background()
+
+	if err := m.Suspend(ctx, id, false); err == nil {
+		t.Fatal("the tampered checkpoint verified")
+	}
+	if err := m.Suspend(ctx, id, false); err != nil {
+		t.Fatalf("the retry after a failed verify also failed: %v", err)
+	}
 	rec, _ := m.diskRecord(id)
-	if rec.CheckpointGeneration != 0 {
-		t.Errorf("a failed verify recorded generation %d", rec.CheckpointGeneration)
+	if rec.CheckpointGeneration != 2 {
+		t.Fatalf("the retry took generation %d, want 2", rec.CheckpointGeneration)
+	}
+	reader, err := checkpoint.NewReader(store, mustKeys(t), checkpoint.ReaderOptions{
+		Authorize: func(context.Context, checkpoint.Context, checkpoint.Manifest) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Verify(ctx, checkpoint.Context{
+		Workspace: workspaceVolume("sess-ckpt"), Session: "sess-ckpt", Generation: 2}); err != nil {
+		t.Errorf("the retry's checkpoint does not verify: %v", err)
+	}
+}
+
+// TestAColdSuspendSkipsAGenerationTheStoreAlreadyHas is the self-healing half:
+// the record can be BEHIND the store — a host that died between the commit and
+// its own record write, a record recovered from an older copy — and a generation
+// whose manifest exists is spent whatever this record believes.
+func TestAColdSuspendSkipsAGenerationTheStoreAlreadyHas(t *testing.T) {
+	store := checkpoint.NewMemoryStore()
+	m, _, _, id, _ := checkpointScene(t, store)
+	ctx := context.Background()
+
+	if err := m.Suspend(ctx, id, false); err != nil {
+		t.Fatal(err)
+	}
+	// The record forgets, which is what a crash between the commit and the
+	// record's own write leaves behind.
+	m.mu.Lock()
+	m.instances[id].CheckpointGeneration = 0
+	m.mu.Unlock()
+
+	if err := m.Suspend(ctx, id, false); err != nil {
+		t.Fatalf("a suspend whose record was behind the store failed: %v", err)
+	}
+	rec, _ := m.diskRecord(id)
+	if rec.CheckpointGeneration != 2 {
+		t.Fatalf("the suspend took generation %d, want it to skip the one the store already had", rec.CheckpointGeneration)
+	}
+}
+
+// TestAColdSuspendAppliesTheHostsOwnExclusions. The guest applies the
+// checkpoint library's exclusions; the HOST applies those plus whatever this
+// deployment added, and the guest never hears about the difference. An entry
+// the guest streamed and this host excludes must not reach the checkpoint.
+func TestAColdSuspendAppliesTheHostsOwnExclusions(t *testing.T) {
+	stateDir := shortTempDir(t)
+	store := checkpoint.NewMemoryStore()
+	keys, err := checkpoint.NewStaticKeyWrapper("selfhosted/checkpoint/v1", [32]byte{7, 8, 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, _ := testMicrovm(t, MicrovmOpts{
+		TotalSlots: 4,
+		StateDir:   stateDir,
+		Checkpoint: &CheckpointOpts{
+			Store: store, Keys: keys, KeyRef: keys.Ref(),
+			// This host's own policy, on top of the library's. The fake guest
+			// streams everything, including "src".
+			Limits: wstream.Limits{Exclude: []string{"src"}},
+		},
+	})
+	m.SetHost(&streamingHost{root: guestWorkspace(t)})
+	ctx := context.Background()
+	h, err := m.Create(ctx, Spec{SessionID: "sess-ckpt", BootstrapToken: "token_example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Suspend(ctx, h.ID, false); err != nil {
+		t.Fatal(err)
+	}
+
+	reader, err := checkpoint.NewReader(store, mustKeys(t), checkpoint.ReaderOptions{
+		Authorize: func(context.Context, checkpoint.Context, checkpoint.Manifest) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := reader.Verify(ctx, checkpoint.Context{
+		Workspace: workspaceVolume("sess-ckpt"), Session: "sess-ckpt", Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// README.md and the symlink; "src", "src/main.go" and ".rainier" are all
+	// excluded — two by this host's configuration, one by the library's.
+	if rep.Entries != 2 {
+		t.Errorf("the checkpoint carries %d entries, want 2 (src and .rainier excluded)", rep.Entries)
+	}
+}
+
+// TestAColdSuspendRefusesCountsTheGuestDisagreesWith: the guest says how many
+// entries it streamed and the host counts what it indexed, and a difference
+// means the two ends do not agree about what was carried.
+func TestAColdSuspendRefusesCountsTheGuestDisagreesWith(t *testing.T) {
+	store := checkpoint.NewMemoryStore()
+	m, sim, host, id, _ := checkpointScene(t, store)
+	host.entriesFudge = 1
+
+	err := m.Suspend(context.Background(), id, false)
+	if err == nil {
+		t.Fatal("a stream whose counts disagree was accepted")
+	}
+	if !strings.Contains(err.Error(), "checkpoint stream stage") {
+		t.Errorf("the refusal does not name the stage: %v", err)
+	}
+	assertVMKept(t, m, sim, id)
+}
+
+// TestACreateRefusesASessionItCouldNeverCheckpoint. The checkpoint format's
+// identifier rule is stricter than this driver's path-segment one, and a
+// session that passed one and not the other would create happily and then fail
+// every cold suspend at the configuration stage.
+func TestACreateRefusesASessionItCouldNeverCheckpoint(t *testing.T) {
+	store := checkpoint.NewMemoryStore()
+	m, _, _, _, _ := checkpointScene(t, store)
+	ctx := context.Background()
+
+	for _, id := range []string{"_leading-underscore", "-leading-dash", strings.Repeat("s", 130)} {
+		if _, err := m.Create(ctx, Spec{SessionID: id, BootstrapToken: "token_example"}); err == nil {
+			t.Errorf("the session id %q was created and could never have been cold suspended", id)
+		} else if !strings.Contains(err.Error(), "could never be cold suspended") {
+			t.Errorf("the refusal for %q is %v", id, err)
+		}
 	}
 }
 
@@ -521,13 +672,21 @@ func (r *refusingStore) PutIfAbsent(context.Context, string, func(io.Writer) err
 // attacker with write access to the bucket and no key.
 type tamperingStore struct {
 	*checkpoint.MemoryStore
+	// once stops after the first content object, so a test can show that the
+	// NEXT attempt succeeds.
+	once     bool
+	tampered bool
 }
 
 func (s *tamperingStore) PutIfAbsent(ctx context.Context, key string, write func(io.Writer) error) error {
 	if err := s.MemoryStore.PutIfAbsent(ctx, key, write); err != nil {
 		return err
 	}
+	if s.once && s.tampered {
+		return nil
+	}
 	if strings.Contains(key, "/content.") {
+		s.tampered = true
 		b, ok := s.MemoryStore.Object(key)
 		if ok && len(b) > 0 {
 			b[len(b)/2] ^= 0xff

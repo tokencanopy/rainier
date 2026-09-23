@@ -86,6 +86,44 @@ func TestDirStoreNeverOverwrites(t *testing.T) {
 	}
 }
 
+// TestDirStoreRefusesAKeyThatAppearedWhileItWasWriting is the conditional
+// create at the only place it is actually conditional.
+//
+// The existence check before the write catches a key that is already there, but
+// it is a check and not a commit: the interesting case is the object appearing
+// DURING a write, which is a retry racing a reconciler over a multi-megabyte
+// upload. What refuses it is link(2), which fails with EEXIST where rename
+// would silently replace a committed manifest — and replacing a manifest is the
+// one operation this format has no answer for, because the data key inside it
+// is the only way to read the content object it names.
+func TestDirStoreRefusesAKeyThatAppearedWhileItWasWriting(t *testing.T) {
+	s, _ := dirStore(t)
+	ctx := context.Background()
+	const key = "p/manifest.json"
+
+	err := s.PutIfAbsent(ctx, key, func(w io.Writer) error {
+		// The winner commits after this writer's existence check and before its
+		// own commit.
+		if err := put(t, s, key, "the winner"); err != nil {
+			return err
+		}
+		_, err := io.WriteString(w, "the loser")
+		return err
+	})
+	if !errors.Is(err, checkpoint.ErrExists) {
+		t.Fatalf("the losing put gave %v, want ErrExists", err)
+	}
+	rc, err := s.Open(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	got, _ := io.ReadAll(rc)
+	if string(got) != "the winner" {
+		t.Fatalf("the object is %q; the committed bytes were replaced", got)
+	}
+}
+
 // TestDirStoreConcurrentPutsHaveOneWinner: two writers at one generation, which
 // is a retry racing a reconciler. Exactly one may believe it committed.
 func TestDirStoreConcurrentPutsHaveOneWinner(t *testing.T) {
@@ -246,6 +284,30 @@ func TestDirStoreServesTheCheckpointLibrary(t *testing.T) {
 	}
 	if _, err := r.Verify(ctx, c); err != nil {
 		t.Fatalf("the committed checkpoint no longer verifies after a lost race: %v", err)
+	}
+}
+
+// TestDirStoreTightensADirectoryItDidNotCreate. MkdirAll is a no-op on a
+// directory that is already there, so an operator who made it with the default
+// umask would leave the layout — which names a workspace and a session for
+// every checkpoint on this host — readable by everybody.
+func TestDirStoreTightensADirectoryItDidNotCreate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "premade")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewDirBlobStore(dir); err != nil {
+		t.Fatalf("NewDirBlobStore: %v", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Errorf("a pre-existing store directory is still mode %v", info.Mode().Perm())
 	}
 }
 

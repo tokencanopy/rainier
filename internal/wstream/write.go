@@ -75,7 +75,11 @@ func Write(ctx context.Context, fsys fs.FS, w io.Writer, lim Limits) (Report, er
 		}
 		rec = append(rec[:0], kind)
 		rec = append(rec, name...)
-		indexBytes += int64(len(rec))
+		// Charged the same way the HOST charges it (fs.go's readIndex): the
+		// record's bytes plus what holding the entry costs. Both ends applying
+		// the same arithmetic is what keeps a tree that this end streamed
+		// happily from being refused at the other end's index.
+		indexBytes += int64(len(rec)) + indexEntryOverhead
 		if indexBytes > lim.MaxIndexBytes {
 			return fmt.Errorf("%w: the tree's names are more than %d bytes", ErrLimit, lim.MaxIndexBytes)
 		}

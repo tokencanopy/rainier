@@ -45,7 +45,10 @@ type FS struct {
 	// Keyed by name; "." is the root and is synthesized.
 	nodes map[string]*node
 
-	tr *tar.Reader
+	// src is the stream under the tar reader, kept so that Drain can read the
+	// rest of it through the SAME byte limit everything else passed.
+	src io.Reader
+	tr  *tar.Reader
 	// pos is how many tar entries have been consumed. After seek(i) it is i+1
 	// and cur is entry i.
 	pos int
@@ -110,8 +113,34 @@ func NewFS(r io.Reader, lim Limits) (*FS, error) {
 	if err := f.readIndex(br); err != nil {
 		return nil, err
 	}
+	f.src = br
 	f.tr = tar.NewReader(br)
 	return f, nil
+}
+
+// Drain reads whatever is left of the stream and discards it.
+//
+// A walk stops at the last entry it was interested in, which leaves at least
+// the tar's two trailing zero blocks unread, and leaves more than that when the
+// host excluded entries the guest still sent. Those bytes are not optional to
+// consume: the guest is blocked writing them, and a guest that is blocked
+// writing cannot send the marker that says its tree was complete.
+//
+// It reads through this stream's own byte limit, so a guest that keeps writing
+// forever is stopped by Limits.MaxTotalBytes — the bound that already governs
+// everything else it sends — rather than by a second, smaller number that would
+// turn an ordinary exclusion into a failed suspend.
+func (f *FS) Drain() error {
+	if f.err != nil {
+		return f.err
+	}
+	if _, err := io.Copy(io.Discard, f.src); err != nil {
+		if errors.Is(err, errStreamTooLarge) {
+			return f.fail(fmt.Errorf("%w: the stream is over %d bytes", ErrLimit, f.lim.MaxTotalBytes))
+		}
+		return f.fail(fmt.Errorf("%w: the stream could not be read to its end", ErrTruncated))
+	}
+	return nil
 }
 
 // readIndex parses the index section and builds the tree, refusing anything
@@ -137,7 +166,13 @@ func (f *FS) readIndex(br *bufio.Reader) error {
 		if n > maxRecordLen {
 			return fmt.Errorf("%w: an index record claims %d bytes", ErrFormat, n)
 		}
-		indexBytes += int64(n)
+		// The record's bytes PLUS what holding it costs. MaxIndexBytes is the
+		// host's memory bound, and counting only the names would understate it
+		// by more than half: every entry also carries a stream record, a tree
+		// node, a map entry and a child pointer. indexEntryOverhead is a
+		// generous estimate of the four, so the limit bounds what this type
+		// actually holds rather than what it reads.
+		indexBytes += int64(n) + indexEntryOverhead
 		if indexBytes > f.lim.MaxIndexBytes {
 			return fmt.Errorf("%w: the index is over %d bytes", ErrLimit, f.lim.MaxIndexBytes)
 		}
@@ -274,6 +309,15 @@ func (f *FS) ReadLink(name string) (string, error) {
 	}
 	if err := f.seek(n.pos); err != nil {
 		return "", &fs.PathError{Op: "readlink", Path: name, Err: err}
+	}
+	// The cursor is ON this entry, checked here rather than assumed. seek
+	// refuses to go backwards, but a caller that asked about an entry the
+	// stream had already passed would otherwise be handed the CURRENT entry's
+	// target — a symlink checkpointed with somebody else's destination, which
+	// is the quietest way this design could go wrong.
+	if f.cur == nil || f.pos != n.pos+1 {
+		return "", &fs.PathError{Op: "readlink", Path: name,
+			Err: f.fail(fmt.Errorf("%w: the tree was walked out of the order the stream is in", ErrFormat))}
 	}
 	return f.cur.Linkname, nil
 }
@@ -412,6 +456,13 @@ func (f *FS) checkHeader(hdr *tar.Header, want idxEntry, ord int64) error {
 	case KindSymlink:
 		if err := validLink(want.name, hdr.Linkname); err != nil {
 			return fmt.Errorf("%w: entry %d is a symbolic link that is not allowed (%s)", ErrEntry, ord, err)
+		}
+		if hdr.Size != 0 {
+			// archive/tar treats a symlink header as header-only and would
+			// re-read the claimed body as the next header, so this is refused
+			// here rather than left to fail as a mysterious format error one
+			// entry later.
+			return fmt.Errorf("%w: entry %d is a symbolic link with a body", ErrFormat, ord)
 		}
 	case KindDir:
 		if hdr.Size != 0 {

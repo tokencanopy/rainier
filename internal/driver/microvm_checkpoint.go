@@ -85,16 +85,6 @@ type CheckpointOpts struct {
 // the guest was able to stream inside its own budget.
 const defaultCheckpointVerifyTimeout = 10 * time.Minute
 
-// maxStreamTrailerBytes is how much of the stream may follow the last tree
-// entry the checkpoint writer read.
-//
-// There is always SOME: a tar ends with two zero blocks the reader above never
-// asks for, because it stops at the last entry the index named. Those bytes
-// still have to be drained, or the guest blocks writing them and never sends
-// the end marker the barrier is waiting for. A megabyte is a thousand times the
-// trailer and still a bound.
-const maxStreamTrailerBytes = 1 << 20
-
 // checkpointStage names which step of the barrier failed. It travels into a
 // session's error column, so it is a WORD and never a path, a name or a value
 // (tenancy §15.1) — the cost of that rule is that an operator gets a stage and
@@ -164,27 +154,47 @@ func (m *Microvm) checkpointOnSuspend(ctx context.Context, id string) error {
 		return nil
 	}
 
-	res, err := m.checkpointWorkspace(ctx, id, sessionID, volume, generation)
-	if err != nil {
-		return err
-	}
+	_, err := m.checkpointWorkspace(ctx, id, sessionID, volume, generation, m.recordCheckpoint)
+	return err
+}
 
+// recordCheckpoint puts a COMMITTED checkpoint on the instance record and on
+// this host's disk, and it is called the moment the manifest's put-if-absent
+// returns — before the verify, before the drain, before anything else that can
+// still fail.
+//
+// That timing is the whole point, and getting it wrong is a trap with no
+// bottom. A manifest key is derived from (workspace, session, generation) with
+// no attempt suffix, and put-if-absent never overwrites: a generation whose
+// manifest is committed is SPENT, permanently, whatever happens next. If the
+// record only advanced on success, a failed verify would leave every later
+// attempt recomputing the same spent generation, losing its manifest put to
+// ErrExists, and this session could never be cold-parked again — while each
+// attempt left another orphan content object behind.
+//
+// Persisted rather than merely bumped, for the same reason: `Suspend` has
+// returns between here and its own saveRecord, and a runnerd restart that read
+// back the older generation would walk into the same trap from the other side,
+// and would restore an older checkpoint than the one that exists.
+func (m *Microvm) recordCheckpoint(id string, res checkpointResult) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	inst, ok = m.instances[id]
+	inst, ok := m.instances[id]
 	if !ok {
-		// A Destroy raced the checkpoint. The objects are committed and
-		// verified and are left exactly where they are: deleting a tenant's
-		// only copy of their work because the record went away is the one
-		// outcome this barrier exists to prevent, and the retention sweeper
-		// above this driver is what removes a checkpoint on purpose.
+		m.mu.Unlock()
+		// A Destroy raced the checkpoint. The objects are committed and are
+		// left exactly where they are: deleting a tenant's only copy of their
+		// work because the record went away is the one outcome this barrier
+		// exists to prevent, and the retention sweeper above this driver is
+		// what removes a checkpoint on purpose.
 		return fmt.Errorf("no such id %s", id)
 	}
 	inst.CheckpointGeneration = res.Generation
 	inst.CheckpointKey = res.ManifestKey
 	inst.CheckpointAt = time.Now().UTC().Format(time.RFC3339)
 	inst.bump()
-	return nil
+	rec := persistable(inst)
+	m.mu.Unlock()
+	return m.saveRecord(rec)
 }
 
 // checkpointWorkspace is the barrier, in the order the barrier is:
@@ -205,7 +215,8 @@ func (m *Microvm) checkpointOnSuspend(ctx context.Context, id string) error {
 // one — and leaves the committed objects for the sweeper rather than deleting
 // them, because a reconciler racing itself would then be able to delete the
 // checkpoint it had just written.
-func (m *Microvm) checkpointWorkspace(ctx context.Context, id, sessionID, volume string, generation uint64) (checkpointResult, error) {
+func (m *Microvm) checkpointWorkspace(ctx context.Context, id, sessionID, volume string, generation uint64,
+	commit func(id string, res checkpointResult) error) (checkpointResult, error) {
 	opts := m.ckpt
 	host := m.currentHost()
 	if host == nil {
@@ -229,13 +240,24 @@ func (m *Microvm) checkpointWorkspace(ctx context.Context, id, sessionID, volume
 		// wrote the checkpoint, so this hook has nothing to decide. It is not a
 		// loophole — the library cannot judge a policy, only guarantee the step
 		// exists — and a DESTINATION restoring somebody else's checkpoint puts
-		// its real check here (see restoreWorkspace, which is the same
+		// its real check here (see restoreWorkspaceDisk, which is the same
 		// principal on the same host).
 		Authorize: func(context.Context, checkpoint.Context, checkpoint.Manifest) error { return nil },
 	})
 	if err != nil {
 		return checkpointResult{}, m.checkpointErr(id, stageConfig, err)
 	}
+	// The generation this attempt actually takes, which is not always the one
+	// the record suggested. A manifest key has no attempt suffix and is never
+	// overwritten, so a generation whose manifest is already committed is spent
+	// — and the record can be behind the store: a host that died between the
+	// commit and its own saveRecord, a record recovered from an older copy.
+	// Asking costs one small GET before a copy measured in minutes, and not
+	// asking costs a session that can never be cold-parked again.
+	if c.Generation, err = m.freeGeneration(ctx, r, c); err != nil {
+		return checkpointResult{}, m.checkpointErr(id, stageConfig, err)
+	}
+	generation = c.Generation
 
 	// The stream, on its own goroutine, writing into a pipe the checkpoint
 	// writer reads. There is no buffer between them and no temporary file: the
@@ -288,23 +310,36 @@ func (m *Microvm) checkpointWorkspace(ctx context.Context, id, sessionID, volume
 	res, err := w.Write(ctx, c, checkpoint.Source{FS: fsys})
 	if err != nil {
 		// Before the manifest's put-if-absent, so there is no checkpoint at
-		// this generation and the counter does not advance.
+		// this generation and it stays free for the next attempt.
 		return fail(stageWrite, err)
 	}
+	// COMMITTED. From here the generation is spent whatever happens, so it is
+	// recorded and persisted before anything below can fail — see
+	// recordCheckpoint for the trap this avoids.
+	committed := checkpointResult{Generation: generation, ManifestKey: res.ManifestKey}
+	if commit != nil {
+		if err := commit(id, committed); err != nil {
+			return fail(stageWrite, err)
+		}
+	}
 
-	// The tar's trailing blocks, which the walk above never asked for. Drained
-	// rather than ignored: the guest is blocked writing them, and it cannot
-	// send the end marker the barrier is waiting for until they are gone.
-	if n, _ := io.Copy(io.Discard, io.LimitReader(pr, maxStreamTrailerBytes+1)); n > maxStreamTrailerBytes {
-		return fail(stageStream, fmt.Errorf("the guest sent more than %d bytes past the tree it described", maxStreamTrailerBytes))
+	// The rest of the stream: the tar's trailing blocks, which the walk above
+	// never asked for, and anything the host excluded that sorts after the last
+	// entry it read. Drained rather than ignored, because the guest is blocked
+	// writing them and cannot send the end marker this barrier is waiting for
+	// until they are gone — and drained through the stream's OWN byte limit, so
+	// a guest that keeps writing is stopped by the bound that already governs
+	// everything else it sends rather than by a second, smaller number.
+	if err := fsys.Drain(); err != nil {
+		return fail(stageStream, err)
 	}
 	_ = pr.Close()
 	out := <-done
 	if out.err != nil {
-		return checkpointResult{}, m.checkpointErr(id, stageStream, out.err)
+		return committed, m.checkpointErr(id, stageStream, out.err)
 	}
 	if out.rep.Entries != int64(fsys.Indexed()) {
-		return checkpointResult{}, m.checkpointErr(id, stageStream,
+		return committed, m.checkpointErr(id, stageStream,
 			fmt.Errorf("the guest reported %d entries and described %d", out.rep.Entries, fsys.Indexed()))
 	}
 
@@ -315,7 +350,7 @@ func (m *Microvm) checkpointWorkspace(ctx context.Context, id, sessionID, volume
 	defer cancel()
 	rep, err := r.Verify(verifyCtx, c)
 	if err != nil {
-		return checkpointResult{}, m.checkpointErr(id, stageVerify, err)
+		return committed, m.checkpointErr(id, stageVerify, err)
 	}
 	log.Printf("microvm: %s checkpointed its workspace at generation %d: %d entries, %d bytes of tree, %d frames",
 		id, generation, rep.Entries, rep.FileBytes, rep.Summary.Frames)
@@ -334,6 +369,38 @@ func (m *Microvm) checkpointWorkspace(ctx context.Context, id, sessionID, volume
 // than about what this host did with them. It is the whole of how the barrier
 // tells a sandbox that went away from a store that would not take an object,
 // which are the two failures with opposite operator actions.
+// maxGenerationProbe bounds the search for a free generation. Each step is one
+// small GET, and needing more than a handful means the record and the store
+// have drifted by more than any sequence of crashes explains — at which point
+// refusing is better than walking a counter up someone else's checkpoints.
+const maxGenerationProbe = 8
+
+// freeGeneration returns the first generation at or after c.Generation that has
+// no committed manifest.
+//
+// Anything but ErrNotFound counts as taken, deliberately: a manifest that is
+// there but cannot be authenticated, or is wrapped under a key this host cannot
+// reach, is still a manifest that put-if-absent will refuse to replace.
+func (m *Microvm) freeGeneration(ctx context.Context, r *checkpoint.Reader, c checkpoint.Context) (uint64, error) {
+	start := c.Generation
+	for gen := start; gen < start+maxGenerationProbe; gen++ {
+		c.Generation = gen
+		_, err := r.Preflight(ctx, c)
+		switch {
+		case errors.Is(err, checkpoint.ErrNotFound):
+			return gen, nil
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			return 0, err
+		case gen != start:
+			// Only worth a line when the record was actually behind; the first
+			// probe is the ordinary case and says nothing.
+			log.Printf("microvm: checkpoint generation %d is already committed for this session; trying the next", gen)
+		}
+	}
+	return 0, fmt.Errorf("the next %d checkpoint generations from %d are already committed; this session's record and its store have drifted",
+		maxGenerationProbe, start)
+}
+
 // The checkpoint sentinels are in the list beside this package's own, and they
 // have to be: the library reduces a file system's error to a CATEGORY rather
 // than wrapping it (checkpoint/tree.go's fsCategory, which exists so that no
@@ -464,7 +531,10 @@ func (m *Microvm) restoreWorkspaceDisk(ctx context.Context, id, sessionID, volum
 	// exactly the exposure this design says it does not add.
 	defer func() {
 		if err := os.RemoveAll(scratch); err != nil {
-			log.Printf("microvm: removing the restore scratch directory of %s: %v", id, err)
+			// Reduced to its cause, like every other error on this path: a
+			// RemoveAll failure is an *fs.PathError naming the entry it could
+			// not remove, which here is a path from inside the workspace.
+			log.Printf("microvm: removing the restore scratch directory of %s: %s", id, pathFreeCause(err))
 		}
 	}()
 
@@ -483,28 +553,52 @@ func (m *Microvm) restoreWorkspaceDisk(ctx context.Context, id, sessionID, volum
 	return nil
 }
 
-// formatRestored creates the image file and populates it from dir, removing a
-// half-built image rather than leaving one for a later boot to find with Stat
-// and attach as a filesystem — which is ensureDisk's rule, applied to the one
-// other place an image is made.
+// formatRestored builds the workspace image from dir and puts it at path, and
+// the image appears at that path only when it is a whole filesystem.
+//
+// It is built at a PARTIAL name and renamed, which is the same atomic-commit
+// discipline DirBlobStore uses one layer up, and here it is load-bearing for a
+// reason a comment has to state: the trigger for restoring at all is the
+// image's ABSENCE (ensureWorkspaceForResume). A 10 GiB file created at the
+// final path and then populated by a mkfs that takes minutes is, for those
+// minutes, a file a crash leaves behind — and the next resume would see it,
+// skip the restore, attach an unformatted image, and hand the guest a
+// filesystem its own /init would helpfully format and mount EMPTY. The
+// checkpoint would still be in the store, and nothing would ever consult it
+// again. A partial name is invisible to that Stat.
 func (m *Microvm) formatRestored(path, dir string) error {
 	if err := os.MkdirAll(filepath.Dir(path), microvmDirMode); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, microvmFileMode)
+	partial := path + ".partial"
+	// Whatever a previous attempt left at that name goes first: it is a
+	// half-built image of this same session's workspace and nothing reads it.
+	if err := os.Remove(partial); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	done := false
+	defer func() {
+		if !done {
+			_ = os.Remove(partial)
+		}
+	}()
+
+	f, err := os.OpenFile(partial, os.O_RDWR|os.O_CREATE|os.O_EXCL, microvmFileMode)
 	if err != nil {
 		return err
 	}
 	if err := f.Truncate(workspaceDiskBytes); err != nil {
 		f.Close()
-		_ = os.Remove(path)
 		return err
 	}
 	f.Close()
-	if err := m.format.FormatFromDir(path, dir); err != nil {
-		_ = os.Remove(path)
+	if err := m.format.FormatFromDir(partial, dir); err != nil {
 		return err
 	}
+	if err := os.Rename(partial, path); err != nil {
+		return err
+	}
+	done = true
 	return nil
 }
 
@@ -560,21 +654,40 @@ func chownTree(root string, uid, gid int) error {
 		return nil
 	}
 	return filepath.WalkDir(root, func(p string, _ fs.DirEntry, err error) error {
+		// Both branches are reduced to their cause, and for one reason: the
+		// path here is this host's scratch directory plus a name from inside
+		// the workspace, and a name is session content (tenancy §15.1). The
+		// walk's own error (an Lstat or a ReadDir that failed) carries it just
+		// as much as Lchown's does.
 		if err != nil {
-			return err
+			return fmt.Errorf("reading a restored entry: %s", pathFreeCause(err))
 		}
 		if err := os.Lchown(p, uid, gid); err != nil {
-			// The path is this host's scratch directory plus a name from inside
-			// the workspace, so the error is reduced to its cause: a name is
-			// session content (tenancy §15.1).
-			var pe *fs.PathError
-			if errors.As(err, &pe) && pe.Err != nil {
-				return fmt.Errorf("giving a restored entry to %d:%d: %w", uid, gid, pe.Err)
-			}
-			return fmt.Errorf("giving a restored entry to %d:%d", uid, gid)
+			return fmt.Errorf("giving a restored entry to %d:%d: %s", uid, gid, pathFreeCause(err))
 		}
 		return nil
 	})
+}
+
+// pathFreeCause reduces a file-system error to the part that is safe to print.
+// An *fs.PathError and an *os.LinkError both carry the path that failed —
+// which, on the restore path, is a name from inside a tenant's workspace —
+// wrapped around an errno that carries nothing.
+func pathFreeCause(err error) string {
+	var pe *fs.PathError
+	if errors.As(err, &pe) && pe.Err != nil {
+		return pe.Err.Error()
+	}
+	var le *os.LinkError
+	if errors.As(err, &le) && le.Err != nil {
+		return le.Err.Error()
+	}
+	if err == nil {
+		return "unknown error"
+	}
+	// Anything else is an error this package did not produce, whose text is not
+	// known to be path-free. Reduced rather than forwarded.
+	return "input/output error"
 }
 
 func (m *Microvm) restoreErr(id string, stage checkpointStage, err error) error {

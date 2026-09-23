@@ -411,6 +411,85 @@ func TestFSRefusesAReadAfterTheCursorMovedOn(t *testing.T) {
 	}
 }
 
+// TestFSRefusesAQuestionAboutAnEntryTheStreamHasPassed is the cursor's other
+// half, and the quietest way this design could go wrong: a caller that asked
+// about an earlier entry must not be answered from the CURRENT one. A ReadLink
+// served that way would checkpoint a symbolic link with somebody else's
+// destination, in a checkpoint that then verified.
+func TestFSRefusesAQuestionAboutAnEntryTheStreamHasPassed(t *testing.T) {
+	fsys := fstest.MapFS{
+		"a-link": &fstest.MapFile{Data: []byte("first-target"), Mode: fs.ModeSymlink | 0o777},
+		"b-link": &fstest.MapFile{Data: []byte("second-target"), Mode: fs.ModeSymlink | 0o777},
+		"c.txt":  &fstest.MapFile{Data: []byte("charlie"), Mode: 0o644},
+	}
+	raw := mustStream(t, fsys, Limits{})
+
+	t.Run("readlink", func(t *testing.T) {
+		f := newFS(t, raw, Limits{})
+		if target, err := fs.ReadLink(f, "b-link"); err != nil || target != "second-target" {
+			t.Fatalf("reading the second link gave %q, %v", target, err)
+		}
+		target, err := fs.ReadLink(f, "a-link")
+		if err == nil {
+			t.Fatalf("reading a passed link returned %q", target)
+		}
+		if !errors.Is(err, ErrFormat) {
+			t.Fatalf("reading a passed link gave %v, want ErrFormat", err)
+		}
+	})
+	t.Run("stat", func(t *testing.T) {
+		f := newFS(t, raw, Limits{})
+		if _, err := fs.Stat(f, "c.txt"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fs.Stat(f, "a-link"); !errors.Is(err, ErrFormat) {
+			t.Fatalf("stat of a passed entry gave %v, want ErrFormat", err)
+		}
+	})
+	t.Run("open", func(t *testing.T) {
+		f := newFS(t, raw, Limits{})
+		if _, err := fs.ReadFile(f, "c.txt"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Open("a-link"); !errors.Is(err, ErrFormat) {
+			t.Fatalf("opening a passed entry gave %v, want ErrFormat", err)
+		}
+	})
+}
+
+// TestFSDrainConsumesWhatTheWalkDidNotWant. A walk stops at the last entry it
+// was interested in, and the guest is blocked writing whatever follows — the
+// tar's trailing blocks at least, and everything the HOST excluded that sorts
+// after that. A guest blocked writing cannot send the marker that says its tree
+// was complete, so those bytes are not optional to consume.
+func TestFSDrainConsumesWhatTheWalkDidNotWant(t *testing.T) {
+	fsys := fstest.MapFS{
+		"a.txt":          &fstest.MapFile{Data: []byte("alpha"), Mode: 0o644},
+		"node_modules/x": &fstest.MapFile{Data: bytes.Repeat([]byte("x"), 128<<10), Mode: 0o644},
+	}
+	// The guest sends everything; this host excludes a directory the guest
+	// never heard of, and it is the LAST thing in the stream.
+	raw := mustStream(t, fsys, Limits{})
+	f := newFS(t, raw, Limits{Exclude: []string{"node_modules"}})
+	if err := walkLikeTheWriter(f); err != nil {
+		t.Fatalf("walking the stream: %v", err)
+	}
+	if err := f.Drain(); err != nil {
+		t.Fatalf("draining the rest of the stream: %v", err)
+	}
+	// And the drain is bounded by the stream's own byte limit rather than by a
+	// second, smaller number: the same stream against a total limit it exceeds
+	// is refused rather than silently half-read.
+	tight := newFS(t, raw, Limits{Exclude: []string{"node_modules"}, MaxTotalBytes: 64 << 10})
+	err := walkLikeTheWriter(tight)
+	if err == nil {
+		err = tight.Drain()
+	}
+	if !errors.Is(err, ErrLimit) {
+		t.Fatalf("draining past the total limit gave %v, want ErrLimit", err)
+	}
+}
+
 // TestFSRefusesAnEntryThatEndsEarly: a stream cut off inside a file's body.
 func TestFSRefusesABodyThatEndsEarly(t *testing.T) {
 	fsys := fstest.MapFS{"a.txt": &fstest.MapFile{Data: bytes.Repeat([]byte("x"), 4096), Mode: 0o644}}

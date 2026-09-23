@@ -282,6 +282,142 @@ func TestARestoreGivesTheTreeToTheGuestsUser(t *testing.T) {
 	}
 }
 
+// TestARestoreThatCannotGiveTheTreeAwayFailsClosed is the ownership step at its
+// CALL SITE rather than as a function: a restore that could not hand the files
+// to the guest's user would come back with a workspace the agent cannot write,
+// which is a session that looks resumed and is not. It refuses instead, and
+// leaves no image behind.
+func TestARestoreThatCannotGiveTheTreeAwayFailsClosed(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root, which can give a file to anybody; the refusal under test is EPERM")
+	}
+	store := checkpoint.NewMemoryStore()
+	keys, err := checkpoint.NewStaticKeyWrapper("selfhosted/checkpoint/v1", [32]byte{7, 8, 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateDir := shortTempDir(t)
+	m, _ := testMicrovm(t, MicrovmOpts{
+		TotalSlots: 4,
+		StateDir:   stateDir,
+		Checkpoint: &CheckpointOpts{
+			Store: store, Keys: keys, KeyRef: keys.Ref(),
+			// A uid this unprivileged test process is not and cannot give a
+			// file to. In production it is the session image's own user; what
+			// is under test is what happens when the chown is refused.
+			OwnerUID: otherUID(), OwnerGID: otherUID(),
+		},
+	})
+	m.SetHost(&streamingHost{root: guestWorkspace(t)})
+	ctx := context.Background()
+	h, err := m.Create(ctx, Spec{SessionID: "sess-ckpt", BootstrapToken: "token_example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Suspend(ctx, h.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RemoveWorkspace(ctx, "sess-ckpt"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = m.Resume(ctx, h.ID)
+	if err == nil {
+		t.Fatal("a restore that could not give the tree to the guest's user reported success")
+	}
+	if !strings.Contains(err.Error(), "checkpoint owner stage") {
+		t.Fatalf("the refusal does not name the stage: %v", err)
+	}
+	// And it says nothing about which file it was on: no name from inside the
+	// workspace, and no path at all — the scratch directory's own path would
+	// name the instance and then the tenant's tree.
+	for _, leak := range []string{"README", "main.go", "/"} {
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("the refusal carries %q, which is a path or a name from inside the workspace: %v", leak, err)
+		}
+	}
+	disk, err := m.workspaceDiskPath("sess-ckpt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(disk); !errors.Is(err, os.ErrNotExist) {
+		t.Error("a refused restore left a workspace image behind")
+	}
+	assertNoScratch(t, m, h.ID)
+}
+
+// otherUID is a uid this process is not, so that an Lchown to it is refused.
+func otherUID() int {
+	if os.Getuid() == 65534 {
+		return 65533
+	}
+	return 65534
+}
+
+// TestAHalfBuiltImageIsNeverAtTheFinalPath. The trigger for restoring at all is
+// the image's ABSENCE, so a 10 GiB file created at the final path and then
+// populated by a mkfs measured in minutes is, for those minutes, a file a crash
+// leaves behind — and the next resume would see it, skip the restore, and hand
+// the guest an unformatted disk its own /init would helpfully format EMPTY.
+func TestAHalfBuiltImageIsNeverAtTheFinalPath(t *testing.T) {
+	m, _, id, _ := suspendedWithCheckpoint(t)
+	ctx := context.Background()
+	if err := m.RemoveWorkspace(ctx, "sess-ckpt"); err != nil {
+		t.Fatal(err)
+	}
+	disk, err := m.workspaceDiskPath("sess-ckpt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A formatter that looks at the world from inside mkfs: the final path must
+	// not exist while the filesystem is still being built.
+	watching := &watchingFormatter{final: disk}
+	m.format = watching
+
+	if _, err := m.Resume(ctx, id); err != nil {
+		t.Fatalf("the cold resume failed: %v", err)
+	}
+	if watching.finalExisted {
+		t.Error("the workspace image was at its final path while mkfs was still populating it")
+	}
+	if _, err := os.Stat(disk); err != nil {
+		t.Errorf("the finished image is not at its final path: %v", err)
+	}
+	// And a mkfs that fails leaves neither the final name nor the partial one.
+	// The session is parked again first: a Resume of a RUNNING session restarts
+	// nothing and would prove nothing here.
+	if err := m.Suspend(ctx, id, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RemoveWorkspace(ctx, "sess-ckpt"); err != nil {
+		t.Fatal(err)
+	}
+	m.format = failingFormatter{}
+	if _, err := m.Resume(ctx, id); err == nil {
+		t.Fatal("a failed mkfs reported success")
+	}
+	for _, p := range []string{disk, disk + ".partial"} {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("a failed mkfs left %s behind", filepath.Base(p))
+		}
+	}
+}
+
+// watchingFormatter records whether the FINAL image path existed at the moment
+// the filesystem was being written.
+type watchingFormatter struct {
+	SimulatedDiskFormatter
+	final        string
+	finalExisted bool
+}
+
+func (w *watchingFormatter) FormatFromDir(path, dir string) error {
+	if _, err := os.Stat(w.final); err == nil {
+		w.finalExisted = true
+	}
+	return w.SimulatedDiskFormatter.FormatFromDir(path, dir)
+}
+
 // TestRemoveWorkspaceKeepsTheCheckpoint. Deleting a checkpoint is a retention
 // decision, and this driver does not have the policy: it does not know how old
 // the checkpoint is, whether a deep-dormant tier is relying on it, or whether

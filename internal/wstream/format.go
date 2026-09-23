@@ -33,9 +33,13 @@ const (
 	// and a refusal is better than a host that allocates until it is killed.
 	DefaultMaxEntries = 500_000
 	// DefaultMaxIndexBytes bounds the same structure by BYTES, because
-	// MaxEntries alone bounds it only if names are short. 16 MiB is 500,000
-	// names averaging 33 bytes.
-	DefaultMaxIndexBytes = 16 << 20
+	// MaxEntries alone bounds it only if names are short — and it is charged
+	// what the structure COSTS rather than only what it reads (see
+	// indexEntryOverhead). 64 MiB is 500,000 entries with names averaging 38
+	// bytes, and it is what one concurrent cold suspend may spend on this
+	// host: the design note's §10 keeps a host-wide bound on concurrent
+	// checkpoints open, and this number is why it matters.
+	DefaultMaxIndexBytes = 64 << 20
 	// DefaultMaxEntryBytes bounds one file. 8 GiB is under the workspace disk
 	// (10 GiB) and over any plausible single artifact in one.
 	DefaultMaxEntryBytes = 8 << 30
@@ -50,6 +54,12 @@ const (
 	// maxRecordLen bounds ONE index record before its name is even looked at,
 	// so a malformed length prefix cannot make a reader allocate.
 	maxRecordLen = 1 + maxNameLen
+	// indexEntryOverhead is what the host pays to HOLD one entry, beyond its
+	// name: a stream record, a tree node, a map entry and a slot in its
+	// parent's child list. It is a deliberate over-estimate — the point is that
+	// MaxIndexBytes bounds memory rather than bounding a number that correlates
+	// with memory.
+	indexEntryOverhead = 96
 )
 
 // Limits is what both ends enforce. A zero value means every default; a field

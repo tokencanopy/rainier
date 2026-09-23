@@ -193,9 +193,12 @@ func (s *Server) StreamWorkspace(ctx context.Context, sessionID string, dst io.W
 	}
 	if !ww.ok {
 		// The guest's own refusal, in the stage_failed shape: a stage and a
-		// tail, with counts and no path.
+		// tail, with counts and no path. Both strings are the SANDBOX's, so
+		// both are bounded here before they travel any further — sessiond is
+		// careful about what it puts in them (see its streamFailureTail), and
+		// this hop is where that stops being something to rely on.
 		return none, fmt.Errorf("session %s could not stream its workspace (stage %s, %d entries and %d bytes in): %s",
-			sessionID, ww.stage, ww.entries, ww.bytes, ww.tail)
+			sessionID, clampGuestText(ww.stage), ww.entries, ww.bytes, clampGuestText(ww.tail))
 	}
 	if got := received.Load(); ww.bytes != got {
 		// The one check only this hop can make: the guest says how much it
@@ -224,6 +227,19 @@ func (s *Server) StreamWorkspace(ctx context.Context, sessionID string, dst io.W
 			sessionID, s.coldSuspendReadyWait)
 	}
 	return driver.WorkspaceStream{Entries: ww.entries, Bytes: received.Load(), Nonce: nonce}, nil
+}
+
+// maxGuestText bounds a string the sandbox chose before this runner puts it in
+// an error. The frame limit above it is 16 MiB, which is not a bound for
+// something that reaches an operator's log and a session's error column.
+const maxGuestText = 512
+
+// clampGuestText truncates a sandbox-supplied string and says that it did.
+func clampGuestText(s string) string {
+	if len(s) <= maxGuestText {
+		return s
+	}
+	return s[:maxGuestText] + "… (truncated)"
 }
 
 // readStream waits for the end marker under the three budgets: one for the

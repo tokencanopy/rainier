@@ -45,6 +45,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tokencanopy/rainier/checkpoint"
 	"github.com/tokencanopy/rainier/internal/driver/netslot"
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
@@ -536,7 +537,7 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 
 	// The environment images themselves live under "images", by digest, and
 	// are never opened for writing after they land; see image.go.
-	for _, dir := range []string{"workspaces", "homes", "instances", "rootfs"} {
+	for _, dir := range []string{"workspaces", "homes", "instances", "rootfs", "restore"} {
 		if err := os.MkdirAll(filepath.Join(opts.StateDir, dir), microvmDirMode); err != nil {
 			return nil, fmt.Errorf("microvm: create state directory: %w", err)
 		}
@@ -579,7 +580,36 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 	m.recoverDiskInstances()
 	m.reclaimNetworkSlots()
 	m.reclaimOrphanRootfs()
+	m.reclaimRestoreScratch()
 	return m, nil
+}
+
+// reclaimRestoreScratch removes whatever a previous run's checkpoint restores
+// left under "restore".
+//
+// Every ordinary path removes its own scratch directory with a defer, but a
+// host that is powered off or a runnerd that is killed mid-restore removes
+// nothing — and what is in there is a tenant's whole workspace in PLAINTEXT,
+// which the design note's §7 is only allowed to call "no new exposure" because
+// it is removed before the guest boots. A tree that outlives the process that
+// made it is a different claim, and not one this design makes.
+//
+// The whole directory goes, not one instance's: a restore in flight is a
+// restore this process is running, and this runs before anything is served.
+func (m *Microvm) reclaimRestoreScratch() {
+	dir := filepath.Join(m.opts.StateDir, "restore")
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) == 0 {
+		return
+	}
+	log.Printf("microvm: removing %d restore scratch tree(s) a previous run left behind", len(entries))
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			// The name is an instance id and the cause is reduced, because what
+			// is under it is a path from inside a workspace.
+			log.Printf("microvm: removing the restore scratch tree of %s: %s", e.Name(), pathFreeCause(err))
+		}
+	}
 }
 
 // reclaimOrphanRootfs removes per-session root filesystems left by a previous
@@ -1457,6 +1487,24 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 
 	workspaceDisk := ""
 	if spec.SessionID != "" {
+		// Whether this session can ever be CHECKPOINTED is decided here, at the
+		// create, rather than at its first cold suspend. The checkpoint format's
+		// identifier rule is stricter than this driver's path-segment one — it
+		// wants a leading alphanumeric and caps the length — so a session id
+		// that passes one and not the other would create happily and then fail
+		// every cold suspend at the configuration stage, which is precisely the
+		// "discover it at the worst possible moment" this driver's other
+		// preflights exist to prevent.
+		if m.ckpt != nil {
+			c := checkpoint.Context{
+				Workspace:  workspaceVolume(spec.SessionID),
+				Session:    spec.SessionID,
+				Generation: 1,
+			}
+			if err := c.Validate(); err != nil {
+				return nil, fmt.Errorf("microvm: this session id cannot be carried in a workspace checkpoint, so the session could never be cold suspended: %w", err)
+			}
+		}
 		path, err := m.workspaceDiskPath(spec.SessionID)
 		if err != nil {
 			return nil, err
@@ -2514,11 +2562,20 @@ func (e *Ext4Formatter) Format(path string) error {
 func (e *Ext4Formatter) FormatFromDir(path, dir string) error {
 	out, err := exec.Command(e.mkfs, "-F", "-q", "-m", "0", "-d", dir, path).CombinedOutput()
 	if err != nil {
-		// The tree's path is this host's own scratch directory, not a name from
-		// inside the workspace, so it is safe to print — and mke2fs's own
-		// message is the only thing that says WHY (no space, too many files for
-		// the inode table, a name it cannot represent).
-		return fmt.Errorf("mkfs.ext4 -d %s: %w: %s", path, err, strings.TrimSpace(string(out)))
+		// mke2fs's own output is deliberately NOT in the error, which is the
+		// one way this differs from Format above. `-d` copies a tenant's tree,
+		// and create_inode.c reports a per-file failure by naming the file it
+		// was copying ("while opening \"<scratch>/src/secret-project/key.pem\"
+		// to copy") — a path from inside a workspace, on an error that travels
+		// to a session's error column, which the tenancy specification's §15.1
+		// prohibits. `-q` suppresses progress, not that.
+		//
+		// What is left is the exit status and the count of output bytes, which
+		// says "it failed and it had something to say" without saying it. An
+		// operator who needs the text runs the same command by hand against a
+		// tree of their own.
+		return fmt.Errorf("mkfs.ext4 -d %s: %w (%d bytes of output withheld: it names files inside the tenant's tree)",
+			path, err, len(strings.TrimSpace(string(out))))
 	}
 	return nil
 }

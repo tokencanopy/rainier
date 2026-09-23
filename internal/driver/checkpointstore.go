@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -76,6 +77,20 @@ func NewDirBlobStore(dir string) (*DirBlobStore, error) {
 	}
 	if !info.IsDir() {
 		return nil, fmt.Errorf("microvm: the checkpoint store path %s is not a directory", abs)
+	}
+	// A directory that was already there keeps whatever mode it was made with —
+	// MkdirAll is a no-op on one — and the default umask makes that 0755. It is
+	// tightened rather than refused: this directory is the runner's own by
+	// definition, the layout inside it names a workspace and a session for
+	// every checkpoint on this host (see checkpointDirMode), and an operator who
+	// mkdir'd it before starting the runner has made an ordinary mistake rather
+	// than a decision.
+	if info.Mode().Perm()&0o077 != 0 {
+		log.Printf("microvm: the checkpoint store directory %s was mode %04o; tightening it to 0700, because its layout names every session this host has checkpointed",
+			abs, info.Mode().Perm())
+		if err := os.Chmod(abs, checkpointDirMode); err != nil {
+			return nil, fmt.Errorf("microvm: tightening the checkpoint store directory's mode: %w", err)
+		}
 	}
 	return &DirBlobStore{root: abs}, nil
 }
@@ -269,6 +284,9 @@ func LoadCheckpointKey(path string) ([32]byte, error) {
 	if info.Mode().Perm()&0o077 != 0 {
 		return key, fmt.Errorf("microvm: the checkpoint key file %s is mode %04o; it must not be readable by group or other (0600)",
 			path, info.Mode().Perm())
+	}
+	if err := checkKeyOwner(path, info); err != nil {
+		return key, err
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
