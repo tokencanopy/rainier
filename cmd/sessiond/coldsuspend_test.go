@@ -13,13 +13,17 @@ import (
 // what is exercised is the frame's whole journey — OnControl's kind
 // dispatch, the `cold` flag, the handler, and the two answers — rather than
 // quiesceCold called directly.
-func coldWired(execs execKiller, boots *bootstrapper) (*rpcDispatcher, *recordingSender) {
+// stream is the workspace streamer the handler runs before it answers ready; a
+// nil one is a sandbox that does not stream, which is what these two tests
+// want — the secrets and the execs are their subject, and the stream has a file
+// of its own (workspacestream_test.go).
+func coldWired(execs execKiller, boots *bootstrapper, stream workspaceStreamer) (*rpcDispatcher, *recordingSender) {
 	d := newRPCDispatcher()
 	sender := &recordingSender{}
 	d.online(sender)
 	d.RegisterEventHandler(relay.KindSuspending, func(ev relay.ControlEvent) {
 		if ev.Cold {
-			quiesceCold(execs, d, nil, boots, ev.ID)
+			quiesceCold(execs, d, nil, boots, ev.ID, stream)
 			return
 		}
 		quiesceExecs(execs, d, ev.ID)
@@ -50,7 +54,7 @@ func TestAColdSuspendForgetsTheDeliveredSecrets(t *testing.T) {
 	boots.remember([]string{"DEPLOY_KEY"})
 
 	execs := &recordingExecs{}
-	d, sender := coldWired(execs, boots)
+	d, sender := coldWired(execs, boots, nil)
 	d.OnControl(suspendingFrame(t, true, 91))
 
 	if _, set := os.LookupEnv("DEPLOY_KEY"); set {
@@ -85,7 +89,7 @@ func TestAWarmSuspendKeepsTheDeliveredSecrets(t *testing.T) {
 	boots.remember([]string{"DEPLOY_KEY"})
 
 	execs := &recordingExecs{}
-	d, sender := coldWired(execs, boots)
+	d, sender := coldWired(execs, boots, nil)
 	d.OnControl(suspendingFrame(t, false, 92))
 
 	if os.Getenv("DEPLOY_KEY") != "value_example" {

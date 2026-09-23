@@ -120,6 +120,18 @@ func (d *rpcDispatcher) Notify(ev relay.ControlEvent) error {
 	return conn.sender.Send(b)
 }
 
+// SendStream writes one chunk of stream id over the live connection, so that
+// the workspace stream travels on the same writer as the handshake it is part
+// of. Like Notify, no connection is an error rather than a silent drop: the
+// host is waiting for these bytes and a dropped chunk is a truncated workspace.
+func (d *rpcDispatcher) SendStream(id uint64, chunk []byte) error {
+	conn := d.conn.Load()
+	if conn == nil {
+		return errNoRPCConn
+	}
+	return conn.sender.SendStream(id, chunk)
+}
+
 var errNoRPCConn = errors.New("sessiond: no connection to runnerd")
 
 // online installs the sender for a freshly established connection. Any
