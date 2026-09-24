@@ -449,9 +449,10 @@ func (s *SessionService) reclaimWorkspace(ctx context.Context, row control.Sessi
 
 // DeleteSession applies the guarded delete state machine: queued cancels
 // outright, creating is refused, a placed session is destroyed on its runner
-// then destroyed in the store, a failed session is destroyed the same way, and
-// any other terminal state is row-idempotent. Every success wakes the row's
-// pool.
+// then destroyed in the store, a failed session is destroyed the same way, a
+// dead session reclaims its workspace and is destroyed without a runner
+// dispatch (the runner already dropped it), and canceled/destroyed is
+// row-idempotent. Every success wakes the row's pool.
 func (s *SessionService) DeleteSession(ctx context.Context, scope control.Scope, cmd control.DeleteSession) error {
 	if err := scope.Validate(); err != nil {
 		return control.ErrInvalid
@@ -468,8 +469,28 @@ func (s *SessionService) DeleteSession(ctx context.Context, scope control.Scope,
 	}
 
 	switch {
-	case row.State.Terminal() && row.State != control.StateFailed:
+	case row.State == control.StateCanceled || row.State == control.StateDestroyed:
 		s.reclaimWorkspace(ctx, row)
+		s.wake(row.PoolID)
+		return nil
+	case row.State == control.StateDead:
+		// The runner already dropped this session before it was marked dead
+		// (fleet reconcile's lost-at-announce path, or a runner-reported dead
+		// event), so there is no live container left to send a destroy to,
+		// only the workspace volume the crash kept.
+		s.reclaimWorkspace(ctx, row)
+		if err := s.uow.Run(ctx, func(ctx context.Context) error {
+			if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, []control.SessionState{control.StateDead}, control.StateDestroyed, control.TransitionOpts{}); err != nil {
+				if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
+					return control.ErrUnavailable
+				}
+				return nil
+			}
+			return recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionDelete,
+				sessionResource(row), row.PlacementGeneration)
+		}); err != nil {
+			return err
+		}
 		s.wake(row.PoolID)
 		return nil
 	case row.State == control.StateCreating:
