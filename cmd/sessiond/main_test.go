@@ -314,6 +314,13 @@ func (s *stubSender) Send(p []byte) error {
 	return nil
 }
 
+// SendStream is the other half of controlSender. serveConn never calls it —
+// only the cold suspend's workspace stream does — so this stub records the
+// chunks and nothing reads them; the streaming tests use recordingSender.
+func (s *stubSender) SendStream(_ uint64, chunk []byte) error {
+	return s.Send(chunk)
+}
+
 func (s *stubSender) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

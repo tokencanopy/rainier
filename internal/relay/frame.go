@@ -25,6 +25,26 @@ const (
 	// wire-visible: the two ends of a live conn can be different builds, so
 	// the numbers above must never renumber underneath it.
 	FrameControl FrameType = 4
+	// FrameStream carries one chunk of a BULK stream from the sandbox to the
+	// host — today there is exactly one, the workspace a cold suspend
+	// checkpoints — tagged in AttachID with the stream's id rather than an
+	// attachment's.
+	//
+	// It is its own type rather than a FrameServer on a reserved attachment id
+	// for two reasons. A reserved id is not reserved: Hub.next hands out
+	// 1, 2, 3… and a stream that collided with a live attachment would deliver
+	// a workspace's bytes into somebody's terminal. And the two have opposite
+	// routing — an attachment frame is forwarded to a client conn, a stream
+	// frame is consumed by the runner itself — so a type the demux can switch
+	// on is what keeps "forwarded to whoever is attached" from ever being the
+	// default for a stream.
+	//
+	// The stream id is the SUSPEND NONCE (see ControlEvent.ID), so a stream
+	// belonging to a suspend that already gave up is routed to nothing instead
+	// of into the one that replaced it.
+	//
+	// Its value is spelled out for the same reason FrameControl's is.
+	FrameStream FrameType = 5
 )
 
 type Frame struct {
@@ -182,6 +202,26 @@ const (
 	// publishing an image nobody can vouch for.
 	KindFlush   = "flush"
 	KindFlushed = "flushed"
+	// KindWorkspaceEnd ends the workspace stream a COLD suspend asks for: the
+	// sandbox saying it has written the whole tree (OK, with Entries and Bytes)
+	// or that it could not (OK false, with Stage and Tail). It travels upward
+	// only, carries the suspend's nonce in ID, and is the only thing that tells
+	// the host the stream it is reading is complete rather than truncated —
+	// a conn that simply stopped producing bytes is indistinguishable from a
+	// guest that finished, and a checkpoint of a truncated tree that VERIFIES
+	// is the one failure the durability barrier must not have.
+	//
+	// It precedes KindSuspendReady, because the tree has to be out of the guest
+	// before the guest declares itself ready to be terminated.
+	KindWorkspaceEnd = "workspace_end"
+	// KindCheckpointCommitted is the host telling the guest that its workspace
+	// is durable: the manifest is committed and verified. It travels downward
+	// only, carries the same nonce, and is best effort — the guest acts on
+	// nothing and answers nothing, and the VM is terminated immediately after.
+	// It exists so a session's own log says whether the work made it out,
+	// which is the one question a person asks about a suspend that ended
+	// badly.
+	KindCheckpointCommitted = "checkpoint_committed"
 )
 
 type ControlEvent struct {
@@ -250,6 +290,15 @@ type ControlEvent struct {
 	// field reads a plain "suspending", quiesces its execs, and answers; the
 	// host-side unmount still happens, the guest simply did not help.
 	Cold bool `json:"cold,omitempty"`
+	// Entries and Bytes are KindWorkspaceEnd's counts: how many tree entries
+	// the sandbox streamed and how many bytes it wrote. The host compares Bytes
+	// against what it actually received, which is what turns "the conn went
+	// quiet" into a refused suspend rather than a checkpoint of half a tree.
+	//
+	// They are counts and never names: a path is session content (tenancy
+	// §15.1) and this channel's events reach an operator's log.
+	Entries int64 `json:"entries,omitempty"`
+	Bytes   int64 `json:"bytes,omitempty"`
 }
 
 func Encode(f Frame) ([]byte, error) { return json.Marshal(f) }

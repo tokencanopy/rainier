@@ -25,7 +25,9 @@ everything not on this list.
 | A writable cgroup v2 parent | The jailer creates one cgroup per VM under it; ADR-0003 §4.6 meters each session from `cpu.stat` and `memory.current` there. |
 | `ip` (iproute2), `nft` (nftables) and `sysctl` on `PATH` | The network slot, its firewall, and turning forwarding on inside its namespace — a fresh namespace starts with `net.ipv4.ip_forward=0`, and a guest's packet leaves on a different interface from the one it arrived on. |
 | `firecracker` and `jailer` on `PATH` | There is no unjailed launch path. |
-| `mkfs.ext4` on `PATH` | Session workspace and agent-home images are formatted before a guest is handed them. |
+| `mkfs.ext4` on `PATH` | Session workspace and agent-home images are formatted before a guest is handed them, and a deep-dormant resume builds one from a restored tree with `mkfs.ext4 -d`. |
+| `--checkpoint-store-dir`, a writable directory | Every cold suspend turns the session's workspace into a portable checkpoint before the VM is terminated (ADR-0003 §4.4); this is where one checkpoint's two objects go. There is deliberately no default — a temp-directory one would put a tenant's only durable copy somewhere the host reaps. |
+| `--checkpoint-key-file`, mode `0600` or tighter and owned by the runner | The 32 bytes (64 hex characters, or 32 raw) every checkpoint is wrapped under. Without it the objects in the store directory would be a tenant's files in the clear on this host; with it, losing this one file loses every checkpoint it wrapped. A file that is missing, the wrong size, all zeros, readable by group or other, or owned by somebody else is a refusal to start. |
 
 One thing is **not** on that list and should be, on a production host: a state
 directory on a filesystem that can **reflink** — XFS formatted with
@@ -41,6 +43,13 @@ driver at all.
 The runner's startup error names the first item it is missing and what that
 item is for. `driver.MicrovmHostRequirements()` prints the whole list; it is
 generated from the same table the check reads, so the two cannot drift.
+
+The last two rows are the exception to "generated from the same table": they are
+flags rather than host state, so they are checked in `cmd/runnerd` before the
+driver is built (and the key file's own checks in `driver.LoadCheckpointKey`).
+They are on this list because they belong to the same promise — a runner that
+starts without them is one whose cold suspends cannot satisfy §4.4, which is a
+thing to discover at startup and not at the first suspend.
 
 ## A systemd unit
 

@@ -28,7 +28,7 @@ func flushWired(execs execKiller, boots *bootstrapper, agents agentFlusher) (*rp
 	})
 	d.RegisterEventHandler(relay.KindSuspending, func(ev relay.ControlEvent) {
 		if ev.Cold {
-			quiesceCold(execs, d, nil, boots, ev.ID)
+			quiesceCold(execs, d, nil, boots, ev.ID, nil)
 			return
 		}
 		quiesceExecs(execs, d, ev.ID)

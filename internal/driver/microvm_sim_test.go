@@ -18,8 +18,11 @@
 package driver
 
 import (
+	"archive/tar"
 	"context"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,9 +30,66 @@ import (
 )
 
 // SimulatedDiskFormatter is the formatting half of the seam.
+//
+// FormatFromDir writes the tree it was given into the image file as a TAR,
+// which is not an ext4 and does not pretend to be one — the point is that a
+// test can read back what a restore put in, and that a fixture which never
+// looked at the directory would be a fixture that passed while the restore was
+// empty. What a real host does is mkfs.ext4 -d (Ext4Formatter), and only a real
+// host can evidence that.
 type SimulatedDiskFormatter struct{}
 
 func (SimulatedDiskFormatter) Format(string) error { return nil }
+
+func (SimulatedDiskFormatter) FormatFromDir(path, dir string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	tw := tar.NewWriter(f)
+	err = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || p == dir {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		link := ""
+		if info.Mode()&fs.ModeSymlink != 0 {
+			if link, err = os.Readlink(p); err != nil {
+				return err
+			}
+		}
+		hdr, err := tar.FileInfoHeader(info, link)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		hdr.Name = filepath.ToSlash(rel)
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		src, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+		_, err = io.Copy(tw, src)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	return tw.Close()
+}
 
 // ---------------------------------------------------------------------------
 // Simulated Engine (test seam)

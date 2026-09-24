@@ -122,6 +122,16 @@ type stubMicrovmHost struct {
 	// flushErr, when set, is what a snapshot's flush reports — the state a
 	// guest that cannot be asked, or will not answer, leaves the runner in.
 	flushErr error
+
+	// stream is the workspace a cold suspend's guest "streams", and streamErr
+	// is what that handshake reports instead. Both are nil here — this stub is
+	// for the tests whose subject is something else, and a driver with no
+	// checkpoint configuration never calls either — and the checkpoint tests
+	// use a host of their own (see microvm_checkpoint_test.go).
+	stream    func(io.Writer) (WorkspaceStream, error)
+	streamErr error
+	// committed records the suspends the runner was told had committed.
+	committed []uint64
 }
 
 func (h *stubMicrovmHost) GuestConnected(sessionID string, conn relay.Conn) {
@@ -151,6 +161,27 @@ func (h *stubMicrovmHost) FlushGuest(_ context.Context, sessionID string) error 
 	}
 	h.flushed = append(h.flushed, sessionID)
 	return nil
+}
+
+// StreamWorkspace is the runner running the cold-suspend handshake and copying
+// the workspace the guest streams back.
+func (h *stubMicrovmHost) StreamWorkspace(_ context.Context, _ string, dst io.Writer) (WorkspaceStream, error) {
+	h.mu.Lock()
+	stream, err := h.stream, h.streamErr
+	h.mu.Unlock()
+	if err != nil {
+		return WorkspaceStream{}, err
+	}
+	if stream == nil {
+		return WorkspaceStream{}, errors.New("this stub has no workspace to stream")
+	}
+	return stream(dst)
+}
+
+func (h *stubMicrovmHost) CheckpointCommitted(_ string, nonce uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.committed = append(h.committed, nonce)
 }
 
 // flushCount is how many times a guest was asked to flush. A snapshot that
@@ -689,6 +720,10 @@ func TestMicrovmCreateFailsClosedWithoutAFormatter(t *testing.T) {
 type failingFormatter struct{}
 
 func (failingFormatter) Format(string) error { return errors.New("mkfs.ext4 is not on PATH") }
+
+func (failingFormatter) FormatFromDir(string, string) error {
+	return errors.New("mkfs.ext4 is not on PATH")
+}
 
 func TestMicrovmSnapshotRefAssociationAndStrip(t *testing.T) {
 	m, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4})

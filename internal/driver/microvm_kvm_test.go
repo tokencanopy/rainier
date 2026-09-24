@@ -81,6 +81,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -432,7 +433,27 @@ type kvmGuest struct {
 	exchangedToken string
 	exchanged      chan struct{}
 	flushes        map[uint64]chan struct{}
-	dead           chan struct{}
+	// suspends is the cold-suspend handshakes in flight on this guest, keyed by
+	// nonce — which is also the id of the workspace stream that answers each
+	// one. At most one is ever live; the map is what keeps a late answer from
+	// a suspend that gave up out of the next one's, exactly as the runner's own
+	// nonce matching does.
+	suspends map[uint64]*kvmSuspend
+	dead     chan struct{}
+}
+
+// kvmSuspend is one cold suspend's three answers on this harness: the
+// acknowledgement, the workspace stream, and the end marker. The runner's own
+// version of this is internal/runnerd/workspacestream.go; this one is the same
+// shape with the budgets the harness already uses.
+type kvmSuspend struct {
+	dst   io.Writer
+	n     int64
+	werr  error
+	ack   chan struct{}
+	end   chan relay.ControlEvent
+	ready chan struct{}
+	once  sync.Once
 }
 
 func newKVMRunner(connectWait time.Duration) *kvmRunner {
@@ -460,6 +481,7 @@ func (r *kvmRunner) GuestConnected(sessionID string, conn relay.Conn) {
 		at:        time.Now(),
 		exchanged: make(chan struct{}),
 		flushes:   map[uint64]chan struct{}{},
+		suspends:  map[uint64]*kvmSuspend{},
 		dead:      make(chan struct{}),
 	}
 	r.mu.Lock()
@@ -607,7 +629,29 @@ func (r *kvmRunner) readGuest(sessionID string, g *kvmGuest) {
 			return
 		}
 		f, err := relay.Decode(raw)
-		if err != nil || f.Type != relay.FrameControl {
+		if err != nil {
+			continue
+		}
+		if f.Type == relay.FrameStream {
+			// One chunk of a workspace. Written straight through, the way the
+			// runner writes it into the checkpoint writer's pipe: a harness
+			// that buffered the tree would be measuring something production
+			// does not do.
+			g.mu.Lock()
+			s := g.suspends[f.AttachID]
+			g.mu.Unlock()
+			if s != nil {
+				n, werr := s.dst.Write(f.Payload)
+				g.mu.Lock()
+				s.n += int64(n)
+				if werr != nil && s.werr == nil {
+					s.werr = werr
+				}
+				g.mu.Unlock()
+			}
+			continue
+		}
+		if f.Type != relay.FrameControl {
 			continue
 		}
 		var ev relay.ControlEvent
@@ -625,8 +669,115 @@ func (r *kvmRunner) readGuest(sessionID string, g *kvmGuest) {
 			if ok {
 				close(done)
 			}
+		case ev.Kind == relay.KindSuspendAck, ev.Kind == relay.KindWorkspaceEnd, ev.Kind == relay.KindSuspendReady:
+			g.mu.Lock()
+			s := g.suspends[ev.ID]
+			g.mu.Unlock()
+			if s == nil {
+				continue
+			}
+			switch ev.Kind {
+			case relay.KindSuspendAck:
+				s.once.Do(func() { close(s.ack) })
+			case relay.KindWorkspaceEnd:
+				select {
+				case s.end <- ev:
+				default:
+				}
+			case relay.KindSuspendReady:
+				close(s.ready)
+			}
 		}
 	}
+}
+
+// StreamWorkspace is the harness's cold-suspend handshake: tell the guest, read
+// the workspace it streams back into dst, and return when its end marker says
+// the tree is complete.
+//
+// It is the same shape as (*runnerd.Server).StreamWorkspace, with this
+// harness's single patience budget in place of the runner's three. It exists so
+// that a run on a real KVM host exercises the whole barrier — a real guest, a
+// real workspace, a real ext4 underneath it — which is the one thing no fake
+// on a developer machine can evidence.
+func (r *kvmRunner) StreamWorkspace(ctx context.Context, sessionID string, dst io.Writer) (WorkspaceStream, error) {
+	var none WorkspaceStream
+	g, err := r.awaitGuest(ctx, sessionID, r.connectWait)
+	if err != nil {
+		return none, fmt.Errorf("session %s has no sandbox connection to stream its workspace over: %w", sessionID, err)
+	}
+
+	r.mu.Lock()
+	r.nonce++
+	nonce := r.nonce
+	r.mu.Unlock()
+
+	s := &kvmSuspend{
+		dst:   dst,
+		ack:   make(chan struct{}),
+		end:   make(chan relay.ControlEvent, 1),
+		ready: make(chan struct{}),
+	}
+	g.mu.Lock()
+	g.suspends[nonce] = s
+	g.mu.Unlock()
+	defer func() {
+		g.mu.Lock()
+		delete(g.suspends, nonce)
+		g.mu.Unlock()
+	}()
+
+	if err := g.send(relay.ControlEvent{Kind: relay.KindSuspending, ID: nonce, Cold: true}); err != nil {
+		return none, fmt.Errorf("asking session %s to cold suspend: %w", sessionID, err)
+	}
+
+	timer := time.NewTimer(r.connectWait)
+	defer timer.Stop()
+	var end relay.ControlEvent
+	select {
+	case end = <-s.end:
+	case <-g.dead:
+		return none, fmt.Errorf("session %s lost its sandbox connection part way through its workspace stream", sessionID)
+	case <-ctx.Done():
+		return none, fmt.Errorf("streaming session %s's workspace: %w", sessionID, ctx.Err())
+	case <-timer.C:
+		return none, fmt.Errorf("session %s did not finish streaming its workspace within %s", sessionID, r.connectWait)
+	}
+
+	g.mu.Lock()
+	received, werr := s.n, s.werr
+	g.mu.Unlock()
+	switch {
+	case werr != nil:
+		return none, fmt.Errorf("session %s: the workspace stream could not be taken: %w", sessionID, werr)
+	case !end.OK:
+		return none, fmt.Errorf("session %s could not stream its workspace (stage %s, %d entries and %d bytes in): %s",
+			sessionID, end.Stage, end.Entries, end.Bytes, end.Tail)
+	case end.Bytes != received:
+		return none, fmt.Errorf("session %s streamed %d bytes of workspace and %d arrived", sessionID, end.Bytes, received)
+	}
+
+	ready := time.NewTimer(r.connectWait)
+	defer ready.Stop()
+	select {
+	case <-s.ready:
+	case <-g.dead:
+	case <-ready.C:
+	}
+	return WorkspaceStream{Entries: end.Entries, Bytes: received, Nonce: nonce}, nil
+}
+
+// CheckpointCommitted is the harness's half of the "your work is durable"
+// event. The guest logs it and answers nothing, so there is nothing for this to
+// wait on.
+func (r *kvmRunner) CheckpointCommitted(sessionID string, nonce uint64) {
+	r.mu.Lock()
+	g := r.guests[sessionID]
+	r.mu.Unlock()
+	if g == nil {
+		return
+	}
+	_ = g.send(relay.ControlEvent{Kind: relay.KindCheckpointCommitted, ID: nonce})
 }
 
 // answerSecrets plays the control plane's half of the bootstrap exchange.

@@ -352,3 +352,11 @@ func (s *Server) driverCapabilities() []string {
 func (s *Server) withholdsSecrets() bool {
 	return slices.Contains(s.driverCapabilities(), runner.CapabilityMicrovmV1)
 }
+
+// driverCheckpointsColdSuspend reports whether this runner's driver runs the
+// cold-suspend workspace handshake itself, in which case this runner does not
+// send a notice of its own. See driver.CheckpointingDriver.
+func (s *Server) driverCheckpointsColdSuspend() bool {
+	cd, ok := s.drv.(driver.CheckpointingDriver)
+	return ok && cd.CheckpointsColdSuspend()
+}

@@ -303,16 +303,29 @@ func main() {
 		rpc.RegisterEventHandler(relay.KindFlush, func(ev relay.ControlEvent) {
 			flushDisks(rpc, agentFlush, ev.ID)
 		})
+		// The workspace this session's cold suspend checkpoints. It is built
+		// here, beside the handler that uses it, because it needs the same
+		// dispatcher: the stream shares the handshake's writer, so that a chunk
+		// cannot interleave with the end marker that closes it.
+		streamer := streamWorkspaceFn(rpc, workspaceRoot)
 		rpc.RegisterEventHandler(relay.KindSuspending, func(ev relay.ControlEvent) {
 			if ev.Cold {
 				// Not a freeze: this VM is ending, with no memory image
 				// written anywhere. Everything that has to survive has to be
-				// on a disk by the time this answers, and everything that
-				// must not survive has to be gone.
-				quiesceCold(execs, rpc, agents, boots, ev.ID)
+				// on a disk — or, for the workspace, on the wire — by the time
+				// this answers, and everything that must not survive has to be
+				// gone.
+				quiesceCold(execs, rpc, agents, boots, ev.ID, streamer)
 				return
 			}
 			quiesceExecs(execs, rpc, ev.ID)
+		})
+		// The host saying the checkpoint is committed and verified. Nothing is
+		// done with it and nothing is answered: the VM is about to be
+		// terminated, and the value of the event is that this session's own log
+		// says whether its work made it out.
+		rpc.RegisterEventHandler(relay.KindCheckpointCommitted, func(ev relay.ControlEvent) {
+			log.Printf("the runner reports this workspace's checkpoint committed and verified (suspend %d)", ev.ID)
 		})
 	}
 
@@ -648,12 +661,23 @@ const agentHomeMount = "/rainier/agents"
 //     is what makes the home's filesystem consistent before the block device
 //     goes away under it; forgetting is belt and braces beside a VM that is
 //     about to cease to exist, and it costs nothing.
+//  4. STREAM the workspace to the host, which is the only copy of the user's
+//     work that survives this VM (ADR-0003 §2.3's deep-dormant tier). It runs
+//     LAST of the four, after the flush that put the agent's pending write on
+//     a disk and after the kill that stopped anything still writing, and before
+//     the answer, because the host may not terminate this VM until the tree is
+//     out of it.
 //
-// Every step is best effort and the answer goes out regardless, for the same
-// reason the warm path's does: the host terminates the VM when it hears
-// nothing, so staying silent would only make the stop slower and put the
-// reason nowhere.
-func quiesceCold(execs execKiller, notifier eventNotifier, agents *agentSync, boots *bootstrapper, nonce uint64) {
+// The first three steps are best effort and the answer goes out regardless, for
+// the same reason the warm path's does: the host terminates the VM when it
+// hears nothing, so staying silent would only make the stop slower and put the
+// reason nowhere. The stream is best effort in the same sense and in no other:
+// a failure is REPORTED, in the end marker, with counts and a stage — and it is
+// the host that then refuses the suspend and keeps this VM alive. A guest
+// cannot make that decision for itself, because a guest does not know whether
+// its checkpoint committed.
+func quiesceCold(execs execKiller, notifier eventNotifier, agents *agentSync, boots *bootstrapper,
+	nonce uint64, stream workspaceStreamer) {
 	if err := notifier.Notify(relay.ControlEvent{Kind: relay.KindSuspendAck, ID: nonce}); err != nil {
 		log.Printf("acknowledging the cold suspend notice: %v", err)
 	}
@@ -667,6 +691,13 @@ func quiesceCold(execs execKiller, notifier eventNotifier, agents *agentSync, bo
 	unmountAgentHome(agentHomeMount)
 	if n := boots.forget(); n > 0 {
 		log.Printf("forgot %d delivered environment secret(s) before this VM ends", n)
+	}
+	if stream != nil {
+		rep, err := stream(nonce)
+		logWorkspaceEnd(rep, err)
+		if err := notifier.Notify(workspaceEnd(nonce, rep, err)); err != nil {
+			log.Printf("reporting the end of the workspace stream: %v", err)
+		}
 	}
 	if err := notifier.Notify(relay.ControlEvent{Kind: relay.KindSuspendReady, ID: nonce}); err != nil {
 		log.Printf("reporting the cold suspend ready: %v", err)
@@ -778,6 +809,12 @@ func (m *execCountMailbox) c() <-chan []byte { return m.ch }
 // can be tested without standing up a conn to have a sender for.
 type controlSender interface {
 	Send(payload []byte) error
+	// SendStream is the second thing a connection carries: one chunk of the
+	// workspace a cold suspend is checkpointing. It is on this interface rather
+	// than on a second one because it goes through the same writer as Send —
+	// see relay.ControlSender.SendStream — and a type that could do one without
+	// the other would be a type that could interleave them.
+	SendStream(id uint64, chunk []byte) error
 }
 
 // pendingCap bounds the queue of control payloads waiting for a connection,

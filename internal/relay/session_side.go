@@ -166,6 +166,23 @@ func (c *ControlSender) Send(payload []byte) error {
 	return c.w.write(Frame{Type: FrameControl, AttachID: 0, Payload: payload})
 }
 
+// SendStream writes one chunk of stream id — today the workspace a cold
+// suspend checkpoints (see FrameStream).
+//
+// It goes through the SAME writer as Send and as every attachment's forwarder,
+// which is the whole reason it is a method here rather than a second writer on
+// the conn: a workspace chunk interleaved with a control frame would corrupt
+// both, and the end marker must not be able to overtake the last chunk it is
+// marking the end of.
+//
+// It blocks while another frame is mid-write, and on a stalled conn it blocks
+// until the context ServeSessionWithControl was given is cancelled. That is the
+// right bound for this caller: the host is waiting for these bytes, and a
+// chunk this end gave up on is a suspend that fails with no checkpoint.
+func (c *ControlSender) SendStream(id uint64, chunk []byte) error {
+	return c.w.write(Frame{Type: FrameStream, AttachID: id, Payload: chunk})
+}
+
 // ServeSession runs on the sessiond side: it reads Frames off conn (an
 // already-established outbound conn to runnerd) and demultiplexes them onto
 // s by AttachID — FrameOpen calls s.Attach and starts a per-attachment

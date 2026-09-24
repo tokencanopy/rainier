@@ -419,11 +419,21 @@ func (r *recordingExecs) state() (int, time.Duration) {
 	return r.calls, r.budget
 }
 
-// recordingSender records the payloads a dispatcher sends upstream.
+// recordingSender records the payloads a dispatcher sends upstream: control
+// frames in `sent`, and the chunks of a workspace stream in `chunks`, keyed by
+// the stream id so a test can prove the stream travelled under the suspend's
+// own nonce.
 type recordingSender struct {
-	mu   sync.Mutex
-	sent [][]byte
-	err  error
+	mu     sync.Mutex
+	sent   [][]byte
+	chunks map[uint64][]byte
+	err    error
+	// streamErr, when set, fails every chunk — a runner that has stopped
+	// taking the workspace stream.
+	streamErr error
+	// afterChunks, when positive, is how many chunks succeed before streamErr
+	// starts: a conn that dies MID-stream rather than before it.
+	afterChunks int
 }
 
 func (s *recordingSender) Send(p []byte) error {
@@ -434,6 +444,29 @@ func (s *recordingSender) Send(p []byte) error {
 	}
 	s.sent = append(s.sent, append([]byte(nil), p...))
 	return nil
+}
+
+func (s *recordingSender) SendStream(id uint64, chunk []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.streamErr != nil {
+		if s.afterChunks <= 0 {
+			return s.streamErr
+		}
+		s.afterChunks--
+	}
+	if s.chunks == nil {
+		s.chunks = map[uint64][]byte{}
+	}
+	s.chunks[id] = append(s.chunks[id], chunk...)
+	return nil
+}
+
+// stream returns everything sent under one stream id.
+func (s *recordingSender) stream(id uint64) []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.chunks[id]...)
 }
 
 func (s *recordingSender) events() []relay.ControlEvent {

@@ -45,6 +45,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tokencanopy/rainier/checkpoint"
 	"github.com/tokencanopy/rainier/internal/driver/netslot"
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
@@ -165,6 +166,14 @@ type MicrovmOpts struct {
 	// slow copy, not a simulation — so a test that injects one is asking to
 	// OBSERVE the clones, not to substitute for a missing host capability.
 	Clone Cloner
+
+	// Checkpoint is what a cold suspend turns this session's workspace into: a
+	// portable workspace checkpoint, committed and verified before the VM is
+	// terminated (ADR-0003 §4.4). nil is a driver that does not checkpoint —
+	// the local dev surface and the contract suite, which have no store and no
+	// key — and runnerd requires both for --driver=microvm, so no production
+	// path reaches that state. See microvm_checkpoint.go.
+	Checkpoint *CheckpointOpts
 
 	Engine MicrovmEngine // test seam; nil in production
 	Net    netslot.Host  // test seam; nil in production
@@ -294,6 +303,19 @@ type MicrovmEngine interface {
 // attach a 10 GiB file of zeroes to the guest as though it were a filesystem.
 type DiskFormatter interface {
 	Format(path string) error
+	// FormatFromDir is Format with the filesystem POPULATED from dir, which is
+	// how a deep-dormant resume turns a restored checkpoint back into a block
+	// device (ADR-0003 §2.3). `mkfs.ext4 -d` needs no loop device, no
+	// CAP_SYS_ADMIN and no mount — it is the same call the environment-image
+	// build uses (rainier-cloud infra/scripts/build-env-image.sh), for the same
+	// reason: this host must never MOUNT a filesystem it is about to hand a
+	// tenant, and it must never mount one a tenant handed it.
+	//
+	// It is on this interface rather than beside it because the two are one
+	// capability — putting a filesystem on an image — and a driver that could
+	// do one without the other would be a driver that can suspend a session it
+	// cannot resume.
+	FormatFromDir(path, dir string) error
 }
 
 // instanceRecord is the persistent metadata stored on disk for each microVM
@@ -306,6 +328,26 @@ type instanceRecord struct {
 	Volume    string    `json:"volume"`
 	PID       int       `json:"pid"`
 	Cfg       VMMConfig `json:"cfg"`
+
+	// The portable workspace checkpoint this session has, if any. All three are
+	// PERSISTED, and they have to be: a cold resume after a runnerd restart is
+	// exactly the case where the workspace image may be gone and the checkpoint
+	// is the only copy left, and a generation this process forgot would be one
+	// a retry overwrote or one a restore could not name.
+	//
+	// None of them is secret. A generation is a counter, a manifest key is
+	// derived from the workspace and session ids this record already carries,
+	// and the checkpoint itself is unreadable without a key that lives nowhere
+	// near this file.
+	//
+	// CheckpointGeneration is the count of COMMITTED checkpoints, which is the
+	// generation of the newest one and the number the next one is taken at plus
+	// one. It advances only on a commit, so a suspend that failed before the
+	// manifest's put-if-absent leaves the next attempt the same number — which
+	// is what makes a retry a retry rather than a hole in the sequence.
+	CheckpointGeneration uint64 `json:"checkpoint_generation,omitempty"`
+	CheckpointKey        string `json:"checkpoint_key,omitempty"`
+	CheckpointAt         string `json:"checkpoint_at,omitempty"`
 
 	// boot is the configuration the guest is handed over vsock, and channel
 	// is the host end of that conn. Both are unexported and therefore never
@@ -345,6 +387,14 @@ type instanceRecord struct {
 	// beside it: see Resume for what two concurrent cold ones would do to
 	// each other's socket.
 	resuming bool
+
+	// checkpointing is the same kind of claim for the workspace checkpoint a
+	// cold suspend takes. Two of them on one instance would each send the guest
+	// a cold suspend notice with a nonce of its own, each arm a waiter that
+	// replaces the other's, and each read part of one stream — producing two
+	// checkpoints of two halves of a workspace, both committed and both wrong.
+	// The second is refused rather than queued.
+	checkpointing bool
 
 	// snapshotting is the same kind of claim for a Snapshot, and it does one
 	// more thing: it says that the VM is paused BY THIS DRIVER for a copy, so
@@ -424,6 +474,11 @@ type Microvm struct {
 	// connection goes, and who asks the control plane for a fresh bootstrap
 	// token on a cold resume. nil is a real state — see MicrovmHost.
 	host MicrovmHost
+
+	// ckpt is the portable workspace checkpoint's configuration, or nil for a
+	// driver that does not checkpoint. It is read on every cold suspend and
+	// every cold resume; it is written once, by NewMicrovm.
+	ckpt *CheckpointOpts
 }
 
 // NewMicrovm creates a new microVM driver, or fails.
@@ -482,7 +537,7 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 
 	// The environment images themselves live under "images", by digest, and
 	// are never opened for writing after they land; see image.go.
-	for _, dir := range []string{"workspaces", "homes", "instances", "rootfs"} {
+	for _, dir := range []string{"workspaces", "homes", "instances", "rootfs", "restore"} {
 		if err := os.MkdirAll(filepath.Join(opts.StateDir, dir), microvmDirMode); err != nil {
 			return nil, fmt.Errorf("microvm: create state directory: %w", err)
 		}
@@ -496,6 +551,19 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 		cloner = NewFileCloner()
 	}
 
+	// The checkpoint's configuration is validated HERE, once, rather than on
+	// the first cold suspend — which is the worst possible moment to discover
+	// that a store or a key was missing, because by then a guest has been told
+	// its VM is ending.
+	if opts.Checkpoint != nil {
+		if opts.Checkpoint.Store == nil {
+			return nil, errors.New("microvm: a checkpoint configuration needs a blob store (--checkpoint-store-dir): a cold suspend has nowhere to put a workspace without one")
+		}
+		if opts.Checkpoint.Keys == nil {
+			return nil, errors.New("microvm: a checkpoint configuration needs a key wrapper (--checkpoint-key-file): an unencrypted workspace checkpoint is not one")
+		}
+	}
+
 	m := &Microvm{
 		opts:      opts,
 		engine:    engine,
@@ -503,6 +571,7 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 		format:    format,
 		images:    images,
 		cloner:    cloner,
+		ckpt:      opts.Checkpoint,
 		instances: make(map[string]*instanceRecord),
 	}
 	// Records first, leftovers second, and never the other way round: a
@@ -511,7 +580,36 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 	m.recoverDiskInstances()
 	m.reclaimNetworkSlots()
 	m.reclaimOrphanRootfs()
+	m.reclaimRestoreScratch()
 	return m, nil
+}
+
+// reclaimRestoreScratch removes whatever a previous run's checkpoint restores
+// left under "restore".
+//
+// Every ordinary path removes its own scratch directory with a defer, but a
+// host that is powered off or a runnerd that is killed mid-restore removes
+// nothing — and what is in there is a tenant's whole workspace in PLAINTEXT,
+// which the design note's §7 is only allowed to call "no new exposure" because
+// it is removed before the guest boots. A tree that outlives the process that
+// made it is a different claim, and not one this design makes.
+//
+// The whole directory goes, not one instance's: a restore in flight is a
+// restore this process is running, and this runs before anything is served.
+func (m *Microvm) reclaimRestoreScratch() {
+	dir := filepath.Join(m.opts.StateDir, "restore")
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) == 0 {
+		return
+	}
+	log.Printf("microvm: removing %d restore scratch tree(s) a previous run left behind", len(entries))
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			// The name is an instance id and the cause is reduced, because what
+			// is under it is a path from inside a workspace.
+			log.Printf("microvm: removing the restore scratch tree of %s: %s", e.Name(), pathFreeCause(err))
+		}
+	}
 }
 
 // reclaimOrphanRootfs removes per-session root filesystems left by a previous
@@ -1389,6 +1487,24 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 
 	workspaceDisk := ""
 	if spec.SessionID != "" {
+		// Whether this session can ever be CHECKPOINTED is decided here, at the
+		// create, rather than at its first cold suspend. The checkpoint format's
+		// identifier rule is stricter than this driver's path-segment one — it
+		// wants a leading alphanumeric and caps the length — so a session id
+		// that passes one and not the other would create happily and then fail
+		// every cold suspend at the configuration stage, which is precisely the
+		// "discover it at the worst possible moment" this driver's other
+		// preflights exist to prevent.
+		if m.ckpt != nil {
+			c := checkpoint.Context{
+				Workspace:  workspaceVolume(spec.SessionID),
+				Session:    spec.SessionID,
+				Generation: 1,
+			}
+			if err := c.Validate(); err != nil {
+				return nil, fmt.Errorf("microvm: this session id cannot be carried in a workspace checkpoint, so the session could never be cold suspended: %w", err)
+			}
+		}
 		path, err := m.workspaceDiskPath(spec.SessionID)
 		if err != nil {
 			return nil, err
@@ -1529,6 +1645,22 @@ func (m *Microvm) Suspend(ctx context.Context, id string, warm bool) error {
 	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("no such id %s", id)
+	}
+
+	// THE DURABILITY BARRIER (ADR-0003 §4.4). A cold suspend ends this VM and
+	// keeps only the workspace, so the workspace becomes a committed, verified
+	// checkpoint FIRST — before the engine is stopped, before the rootfs is
+	// discarded, before the slot goes back to the pool. Every failure below
+	// returns with the VM untouched and running.
+	//
+	// It runs with the driver mutex released: it is a copy of a filesystem
+	// across a socket and can take minutes, and holding the mutex across it
+	// would freeze Inspect, List, Capacity, Create and Destroy for every other
+	// session on this host.
+	if !warm && m.ckpt != nil {
+		if err := m.checkpointOnSuspend(ctx, id); err != nil {
+			return err
+		}
 	}
 
 	if warm {
@@ -1717,8 +1849,21 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		// everything else, and persisting THAT is what this design rules out.
 		// Rebuilding it from the control plane on a resume is the follow-up
 		// (a create-shaped resume, ADR-0003 §2.3's portable checkpoint).
+		//
+		// This refusal sits ABOVE the deep-dormant restore below it, and the
+		// order is deliberate rather than incidental — see deepDormantNote,
+		// which is what makes a recovered session whose workspace is also gone
+		// say WHICH of the two things it is waiting for.
 		if !bootLive {
-			return false, fmt.Errorf("cold resume of %s: this session's guest configuration was held in memory only (ADR-0003 §2.7 item 1) and did not survive a runnerd restart; a clean relaunch needs the control plane to re-resolve it, which is the portable-checkpoint work and not this change", id)
+			return false, m.coldResumeNeedsGuestConfig(id)
+		}
+		// The DEEP-DORMANT case (ADR-0003 §2.3): the workspace image is gone
+		// and the checkpoint is the only copy of this session's work. Rebuilt
+		// before anything else is allocated, because a resume that cannot
+		// produce a workspace should spend no token, no slot and no rootfs on
+		// finding that out.
+		if err := m.ensureWorkspaceForResume(ctx, id); err != nil {
+			return false, err
 		}
 		// A new VM gets a new token and a new socket. The token because the
 		// old one is single-use and fenced by a placement generation the
@@ -2401,6 +2546,41 @@ func (e *Ext4Formatter) Format(path string) error {
 	out, err := exec.Command(e.mkfs, "-F", "-q", "-m", "0", path).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("mkfs.ext4 %s: %w: %s", path, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// FormatFromDir is Format with `-d`, which populates the new filesystem from a
+// directory tree without mounting anything.
+//
+// The flags are Format's, plus the tree. Two things are deliberately NOT here:
+//
+//   - no `-N`. mke2fs sizes the inode table from the image's size, which for a
+//     10 GiB workspace is about 655,000 inodes — above wstream's default entry
+//     ceiling, so a restored tree fits. Deriving the count from the tree
+//     instead would size the table for what is being restored rather than for
+//     what the session will write next, and a resumed session that runs out of
+//     inodes is a worse failure than a restore that refuses.
+//   - no `-U`/`-E hash_seed`. An environment image is built reproducibly
+//     because it is published by digest; a workspace image is one session's and
+//     is never addressed by its bytes.
+func (e *Ext4Formatter) FormatFromDir(path, dir string) error {
+	out, err := exec.Command(e.mkfs, "-F", "-q", "-m", "0", "-d", dir, path).CombinedOutput()
+	if err != nil {
+		// mke2fs's own output is deliberately NOT in the error, which is the
+		// one way this differs from Format above. `-d` copies a tenant's tree,
+		// and create_inode.c reports a per-file failure by naming the file it
+		// was copying ("while opening \"<scratch>/src/secret-project/key.pem\"
+		// to copy") — a path from inside a workspace, on an error that travels
+		// to a session's error column, which the tenancy specification's §15.1
+		// prohibits. `-q` suppresses progress, not that.
+		//
+		// What is left is the exit status and the count of output bytes, which
+		// says "it failed and it had something to say" without saying it. An
+		// operator who needs the text runs the same command by hand against a
+		// tree of their own.
+		return fmt.Errorf("mkfs.ext4 -d %s: %w (%d bytes of output withheld: it names files inside the tenant's tree)",
+			path, err, len(strings.TrimSpace(string(out))))
 	}
 	return nil
 }

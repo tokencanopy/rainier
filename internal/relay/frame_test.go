@@ -46,7 +46,7 @@ func TestControlEventWireShape(t *testing.T) {
 	if string(ev) != `{"kind":"setup_done"}` {
 		t.Fatalf("plain event on the wire = %s, want {\"kind\":\"setup_done\"}", ev)
 	}
-	for _, tag := range []string{"id", "ok", "payload", "stage", "rc", "tail", "live", "seq"} {
+	for _, tag := range []string{"id", "ok", "payload", "stage", "rc", "tail", "live", "seq", "entries", "bytes"} {
 		if strings.Contains(string(ev), `"`+tag+`"`) {
 			t.Fatalf("empty event leaked %q: %s", tag, ev)
 		}
