@@ -223,6 +223,12 @@ kernels need `CONFIG_VIRTIO_VSOCKETS=y` and `/dev/vsock`; the host needs
 `CONFIG_VHOST_VSOCK=m`. The doc warns that one `uds_path` cannot be multiplexed across
 VMs, which is why the path is per-session inside the jail and a resume gets a fresh one.
 
+The Linux guest uses `github.com/mdlayher/socket` for descriptor ownership,
+context-aware connection establishment and poller-backed I/O deadlines.
+`net.FileConn` cannot adopt an `AF_VSOCK` descriptor: its address conversion
+rejects that family even after the kernel connection succeeds. A small
+`net.Conn` adapter supplies the local and remote vsock addresses.
+
 ### The port plan: one port
 
 `<uds_path>_1024`, and nothing else. The host never sends `CONNECT`.
