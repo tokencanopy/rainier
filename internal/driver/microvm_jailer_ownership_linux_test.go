@@ -6,8 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // Exercise actual Linux ownership checks: CAP_CHOWN does not imply CAP_FOWNER.
@@ -32,6 +34,34 @@ func TestMicrovmJailOwnershipWithoutFownerOnLinux(t *testing.T) {
 				t.Fatalf("wrong final ownership or permissions: %+v", st)
 			}
 		}
+
+		// Same-creator sessions may reach one home inode through separate links.
+		other := filepath.Join(dir, "linked-home")
+		if err := os.Link(path, other); err != nil {
+			t.Fatal(err)
+		}
+		f.chown = func(path string, uid, gid int) error {
+			err := os.Chown(path, uid, gid)
+			// Widen the actual reclaim/chmod race without bypassing either syscall.
+			if err == nil && uid == os.Geteuid() {
+				time.Sleep(time.Millisecond)
+			}
+			return err
+		}
+		var wg sync.WaitGroup
+		for i, link := range []string{path, other} {
+			wg.Add(1)
+			go func(uid int, link string) {
+				defer wg.Done()
+				for n := 0; n < 100; n++ {
+					if err := f.chownJailPath(link, uid, os.Getgid(), 0660); err != nil {
+						t.Error(err)
+						return
+					}
+				}
+			}(200001+i, link)
+		}
+		wg.Wait()
 		return
 	}
 	if os.Getenv("RAINIER_MICROVM_KVM_TEST") != "1" || os.Geteuid() != 0 {

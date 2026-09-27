@@ -456,6 +456,10 @@ func copyFileInto(src, dst string) error {
 // lets a test on an ordinary machine watch a jail be given to a uid that
 // machine does not have.
 func (f *FirecrackerEngine) chownJailPath(path string, uid, gid int, mode os.FileMode) error {
+	// Different jail paths can name the same home inode. Keep another launch
+	// from transferring it away between our reclaim and chmod.
+	f.ownershipMu.Lock()
+	defer f.ownershipMu.Unlock()
 	// CAP_CHOWN does not grant chmod on somebody else's inode. Reclaim it
 	// first (a resumed jail already belongs to its previous VM), set its
 	// permissions as owner, then hand it to the VM. This needs no CAP_FOWNER.
