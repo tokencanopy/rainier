@@ -337,3 +337,66 @@ func TestCrashPathTeardownRemovesTheCgroupOfARecordItNeverAdopted(t *testing.T) 
 		t.Fatalf("the cgroup of a record this process never adopted survived at %s (stat err = %v)", dir, err)
 	}
 }
+
+// cgroupCreateEngine models the kernel object the jailer leaves behind, even
+// when the VMM fails during configuration.
+type cgroupCreateEngine struct {
+	MicrovmEngine
+	launch func(context.Context, VMMConfig) error
+	stop   func(context.Context, string) error
+}
+
+func (e cgroupCreateEngine) Launch(ctx context.Context, cfg VMMConfig) error {
+	return e.launch(ctx, cfg)
+}
+func (e cgroupCreateEngine) Stop(ctx context.Context, id string) error { return e.stop(ctx, id) }
+
+func TestFailedCreateRemovesCgroupAfterStoppingVMM(t *testing.T) {
+	for _, stage := range []string{"launch", "record"} {
+		t.Run(stage, func(t *testing.T) {
+			root := t.TempDir()
+			m, sim, _ := testMicrovmNet(t, MicrovmOpts{TotalSlots: 2, CgroupRoot: root})
+			var child string
+			stopped := false
+			m.engine = cgroupCreateEngine{
+				MicrovmEngine: sim,
+				launch: func(ctx context.Context, cfg VMMConfig) error {
+					child = cfg.CgroupPath
+					if err := os.MkdirAll(child, 0o755); err != nil {
+						return err
+					}
+					if stage == "launch" {
+						return errors.New("synthetic launch failure")
+					}
+					if err := sim.Launch(ctx, cfg); err != nil {
+						return err
+					}
+					// A directory at the record filename rejects the atomic rename.
+					return os.MkdirAll(m.instanceMetaPath(cfg.ID), 0o755)
+				},
+				stop: func(ctx context.Context, id string) error {
+					stopped = true
+					if _, err := os.Stat(child); err != nil {
+						t.Errorf("cgroup removed before Stop: %v", err)
+					}
+					return sim.Stop(ctx, id)
+				},
+			}
+			if _, err := m.Create(context.Background(), Spec{SessionID: "synthetic-cgroup-failure"}); err == nil {
+				t.Fatal("Create succeeded")
+			}
+			if child == "" {
+				t.Fatal("Launch was not reached")
+			}
+			if _, err := os.Stat(child); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("failed create left cgroup: %v", err)
+			}
+			if _, err := os.Stat(filepath.Dir(child)); err != nil {
+				t.Fatalf("parent removed: %v", err)
+			}
+			if stage == "record" && !stopped {
+				t.Fatal("successful launch was not stopped")
+			}
+		})
+	}
+}

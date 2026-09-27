@@ -1613,6 +1613,10 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 	}
 	applySlot(&cfg, slot)
 
+	// The jailer may create the child before Launch fails. Register this
+	// first so a later rollback stops a successfully launched VMM before
+	// removing its cgroup; failed Launch already reaps its own process.
+	undo = append(undo, func() { m.removeCgroup(id, cfg.CgroupPath) })
 	if err := m.engine.Launch(ctx, cfg); err != nil {
 		return nil, fmt.Errorf("launch microvm %s: %w", id, err)
 	}
