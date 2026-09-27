@@ -1227,6 +1227,13 @@ func TestMicrovmBootSmokeOnKVM(t *testing.T) {
 	}
 
 	workspaceInode := kvmInode(t, cfg.WorkspaceDiskPath)
+	// Keep the old inode allocated across unlink, or XFS may legitimately
+	// recycle its number for the fresh resume clone and fail this assertion.
+	oldRootfs, err := os.Open(cfg.RootfsPath)
+	if err != nil {
+		t.Fatalf("hold the old rootfs inode: %v", err)
+	}
+	defer oldRootfs.Close()
 	rootfsInode := kvmInode(t, cfg.RootfsPath)
 	jailDir := jailInstanceDir(stateDir, h.ID)
 	if _, err := os.Stat(jailDir); err != nil {

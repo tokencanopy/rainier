@@ -218,6 +218,9 @@ func TestJailerArgvIsExactlyWhatADRRequires(t *testing.T) {
 		"--chroot-base-dir", "/var/lib/rainier/j",
 		"--cgroup-version", "2",
 		"--parent-cgroup", "rainier",
+		// A v2 parent alone means join the parent, not create a VM child.
+		// Keep the kernel default weight while requesting child creation.
+		"--cgroup", "cpu.weight=100",
 		"--netns", "/var/run/netns/rnr-ns-3",
 		"--", "--api-sock", "/run/firecracker.socket",
 	}

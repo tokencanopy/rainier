@@ -22,7 +22,7 @@ everything not on this list.
 | `CAP_SYS_ADMIN` | Enter a session's network namespace, and the mount work the jailer does inside the chroot. |
 | `CAP_MKNOD` | Let the jailer create `/dev/kvm` and `/dev/net/tun` inside each VM's chroot. |
 | `/dev/kvm`, read and write | A microVM session is a hardware-isolated VM. There is no software fallback. Usually the `kvm` group. |
-| A writable cgroup v2 parent | The jailer creates one cgroup per VM under it; ADR-0003 §4.6 meters each session from `cpu.stat` and `memory.current` there. |
+| A writable cgroup v2 parent | The jailer creates one cgroup per VM under it (the driver explicitly supplies `cpu.weight=100`, the kernel default, to request child creation on cgroup v2); ADR-0003 §4.6 meters each session from `cpu.stat` and `memory.current` there. |
 | `ip` (iproute2), `nft` (nftables) and `sysctl` on `PATH` | The network slot, its firewall, and turning forwarding on inside its namespace — a fresh namespace starts with `net.ipv4.ip_forward=0`, and a guest's packet leaves on a different interface from the one it arrived on. |
 | `firecracker` and `jailer` on `PATH` | There is no unjailed launch path. |
 | `mkfs.ext4` on `PATH` | Session workspace and agent-home images are formatted before a guest is handed them, and a deep-dormant resume builds one from a restored tree with `mkfs.ext4 -d`. |

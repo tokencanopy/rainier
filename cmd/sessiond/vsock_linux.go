@@ -6,51 +6,69 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"os"
+	"time"
 
+	"github.com/mdlayher/socket"
 	"golang.org/x/sys/unix"
 )
 
-// dialVsock opens an AF_VSOCK stream to (cid, port).
-//
-// There is no net.Dial("vsock", …): the address family is not in the
-// standard library, so the socket is made by hand and handed to net.FileConn,
-// which gives back an ordinary net.Conn with the runtime's poller behind it
-// — deadlines, cancellation and all, which relay.NetConn relies on.
-//
-// The guest needs CONFIG_VIRTIO_VSOCKETS and /dev/vsock for this to work at
-// all, and whether the session image's kernel has them is one of the things
-// only a real host can answer (design note §7).
+// dialVsock opens an AF_VSOCK stream to (cid, port). net.FileConn cannot
+// adopt this address family. socket.Conn registers the descriptor with Go's
+// poller without net's address-family conversion and supports cancellation
+// during Connect as well as the I/O deadlines relay.NetConn requires.
 func dialVsock(ctx context.Context, cid, port uint32) (net.Conn, error) {
-	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c, err := socket.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0, "vsock", nil)
 	if err != nil {
 		return nil, fmt.Errorf("vsock socket: %w", err)
 	}
-	// From here on the fd is owned by this function until os.NewFile takes
-	// it: every failure below closes it, or a guest that retries its dial
-	// leaks one per attempt for the life of the session.
-	if err := unix.Connect(fd, &unix.SockaddrVM{CID: cid, Port: port}); err != nil {
-		_ = unix.Close(fd)
+	ok := false
+	defer func() {
+		if !ok {
+			_ = c.Close()
+		}
+	}()
+	remote := vsockAddr{cid, port}
+	if _, err := c.Connect(vsockDialContext{ctx}, &unix.SockaddrVM{CID: cid, Port: port}); err != nil {
 		return nil, fmt.Errorf("vsock connect to (%d,%d): %w", cid, port, err)
 	}
-	f := os.NewFile(uintptr(fd), fmt.Sprintf("vsock:%d:%d", cid, port))
-	if f == nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("vsock: fd %d is not a file", fd)
-	}
-	// FileConn DUPLICATES the descriptor, so the original is closed here
-	// whether it succeeded or not.
-	conn, err := net.FileConn(f)
-	_ = f.Close()
+	sa, err := c.Getsockname()
 	if err != nil {
-		return nil, fmt.Errorf("vsock: adopting the connection: %w", err)
+		return nil, fmt.Errorf("vsock local address: %w", err)
 	}
-	// A context that is already done must not leave a live connection
-	// behind; there is nothing to cancel mid-connect, because unix.Connect
-	// on a blocking socket does not take one.
+	local, valid := sa.(*unix.SockaddrVM)
+	if !valid {
+		return nil, fmt.Errorf("vsock local address has unexpected type %T", sa)
+	}
 	if err := ctx.Err(); err != nil {
-		_ = conn.Close()
 		return nil, err
 	}
-	return conn, nil
+	ok = true
+	return &vsockConn{Conn: c, local: vsockAddr{local.CID, local.Port}, remote: remote}, nil
 }
+
+type vsockAddr struct{ cid, port uint32 }
+
+func (a vsockAddr) Network() string { return "vsock" }
+func (a vsockAddr) String() string  { return fmt.Sprintf("%d:%d", a.cid, a.port) }
+
+// Only address reporting is ours; the socket library owns descriptor lifetime,
+// concurrent I/O, EOF handling and deadlines.
+type vsockConn struct {
+	*socket.Conn
+	local, remote vsockAddr
+}
+
+func (c *vsockConn) LocalAddr() net.Addr  { return c.local }
+func (c *vsockConn) RemoteAddr() net.Addr { return c.remote }
+
+var _ net.Conn = (*vsockConn)(nil)
+
+// socket v0.6.1 watches Done only when Deadline is absent; with a deadline
+// it otherwise ignores an earlier cancellation. Keep the original Done/Err
+// (including deadline expiry), and select its cancellation-aware poller path.
+type vsockDialContext struct{ context.Context }
+
+func (vsockDialContext) Deadline() (time.Time, bool) { return time.Time{}, false }
