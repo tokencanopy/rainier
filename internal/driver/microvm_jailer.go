@@ -215,6 +215,12 @@ func jailerArgs(spec jailSpec) []string {
 		"--chroot-base-dir", spec.Base,
 		"--cgroup-version", "2",
 		"--parent-cgroup", spec.Cgroup,
+		// On cgroup v2, the jailer only creates <parent>/<id> when a
+		// --cgroup parameter is present. Otherwise it joins the parent,
+		// which fails when that parent delegates domain controllers.
+		// Explicitly retain the kernel's default CPU weight so this asks
+		// for a per-VM child without introducing a new scheduling policy.
+		"--cgroup", "cpu.weight=100",
 	}
 	if spec.Netns != "" {
 		args = append(args, "--netns", spec.Netns)
