@@ -22,6 +22,11 @@ jobs:
           go-version-file: go.mod
       - name: Static checks, tests, build, and vet
         run: make verify
+      - name: Non-root jail ownership regression
+        run: |
+          go test -c -o /tmp/rainier-driver-ownership.test ./internal/driver
+          sudo env RAINIER_MICROVM_KVM_TEST=1 /tmp/rainier-driver-ownership.test \
+            -test.run '^TestMicrovmJailOwnershipWithoutFownerOnLinux$' -test.v
       - name: CLI and client race checks
         run: go test -race -count=1 ./cmd/rainier/ ./internal/cli/
       - name: Fleet script syntax

@@ -10,6 +10,25 @@ checks for `euid 0`. Running as root satisfies the check — root holds every
 capability — but it is the worst way to satisfy it, because it also grants
 everything not on this list.
 
+## Hardware qualification limitation
+
+The capability list below is the intended non-root contract, not proof that the
+upstream jailer can run with it. Firecracker jailer 1.17.0 unconditionally writes
+`cgroup.subtree_control` in every ancestor up to the host cgroup root when a
+`--cgroup` property is supplied. A systemd-delegated subtree does not authorize
+those ancestor writes, so the non-root launch fails before the API socket opens.
+Do not grant the runner write access to the host cgroup root to work around it.
+A scoped privileged launch path or a jailer change needs separate qualification.
+Root-run Phase A feasibility tests do not establish this non-root contract.
+
+The host must also prepare `/run/netns` for namespace mount-point creation:
+root-owned, runner-group-writable, mode `0770` on a host dedicated to that
+runner. Network capabilities do not grant filesystem write access to `/run`.
+
+Jail file permissions are set while the runner owns the inode, then ownership
+is transferred to the VM. A resume temporarily reclaims the inode using
+`CAP_CHOWN` before setting its mode; `CAP_FOWNER` is not required.
+
 ## The list
 
 | | What it is for |
