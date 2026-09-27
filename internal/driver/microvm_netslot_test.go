@@ -9,6 +9,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -238,7 +240,7 @@ func TestMicrovmResumeOntoAVanishedRecordLeavesNothingRunning(t *testing.T) {
 		entered:         make(chan struct{}, 1),
 		release:         make(chan struct{}),
 	}
-	m, _, net := testMicrovmNet(t, MicrovmOpts{TotalSlots: 2, Engine: engine})
+	m, _, net := testMicrovmNet(t, MicrovmOpts{TotalSlots: 2, Engine: engine, CgroupRoot: t.TempDir()})
 	m.SetHost(&stubMicrovmHost{})
 	ctx := context.Background()
 
@@ -263,12 +265,24 @@ func TestMicrovmResumeOntoAVanishedRecordLeavesNothingRunning(t *testing.T) {
 	m.mu.Lock()
 	delete(m.instances, h.ID)
 	m.mu.Unlock()
+	// The resumed jailer creates a child after the destroy removed the old
+	// one; it must be reclaimed once the now-orphan VMM has stopped.
+	child := m.cgroupPathFor(h.ID)
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	close(engine.release)
 
 	if err := <-done; err == nil {
 		t.Fatal("a resume onto a record that no longer exists reported success")
 	}
 
+	if _, err := os.Stat(child); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("orphan cgroup remains: %v", err)
+	}
+	if _, err := os.Stat(filepath.Dir(child)); err != nil {
+		t.Errorf("cgroup parent removed: %v", err)
+	}
 	if st, _ := engine.State(ctx, h.ID); st == VMMStateRunning {
 		t.Error("the VM the resume started is still running with nothing naming it")
 	}

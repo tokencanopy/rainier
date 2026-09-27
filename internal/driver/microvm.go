@@ -1946,6 +1946,8 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		if restarted {
 			if err := m.engine.Stop(context.WithoutCancel(ctx), id); err != nil {
 				log.Printf("microvm: %s was resumed onto a record that no longer exists and could not be stopped: %v", id, err)
+			} else {
+				m.removeCgroup(id, cfg.CgroupPath)
 			}
 		}
 		return restarted, fmt.Errorf("no such id %s", id)

@@ -382,11 +382,12 @@ func TestFailedCreateRemovesCgroupAfterStoppingVMM(t *testing.T) {
 					return sim.Stop(ctx, id)
 				},
 			}
-			if _, err := m.Create(context.Background(), Spec{SessionID: "synthetic-cgroup-failure"}); err == nil {
+			_, createErr := m.Create(context.Background(), Spec{SessionID: "synthetic-cgroup-failure"})
+			if createErr == nil {
 				t.Fatal("Create succeeded")
 			}
 			if child == "" {
-				t.Fatal("Launch was not reached")
+				t.Fatalf("Launch was not reached: %v", createErr)
 			}
 			if _, err := os.Stat(child); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("failed create left cgroup: %v", err)
