@@ -82,3 +82,53 @@ func TestVsockConnStreamAndDeadlines(t *testing.T) {
 		t.Fatal("write after close succeeded")
 	}
 }
+
+func TestVsockDialContextInterruptsPolling(t *testing.T) {
+	for _, cancelEarly := range []bool{true, false} {
+		name := "deadline"
+		if cancelEarly {
+			name = "early-cancel-with-deadline"
+		}
+		t.Run(name, func(t *testing.T) {
+			fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer unix.Close(fds[1])
+			c, err := socket.New(fds[0], "vsock-cancel-test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			duration := 50 * time.Millisecond
+			want := context.DeadlineExceeded
+			if cancelEarly {
+				duration = 2 * time.Second
+				want = context.Canceled
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), duration)
+			defer cancel()
+			if cancelEarly {
+				timer := time.AfterFunc(50*time.Millisecond, cancel)
+				defer timer.Stop()
+			}
+			result := make(chan error, 1)
+			go func() {
+				// Recvfrom and Connect share the socket library's context
+				// poller. A quiet socket pair makes the wait deterministic.
+				_, _, err := c.Recvfrom(vsockDialContext{ctx}, make([]byte, 1), 0)
+				result <- err
+			}()
+			select {
+			case err := <-result:
+				if !errors.Is(err, want) {
+					t.Fatalf("poll=%v, want %v", err, want)
+				}
+			case <-time.After(time.Second):
+				c.Close()
+				<-result
+				t.Fatal("poll ignored cancellation until original deadline")
+			}
+		})
+	}
+}

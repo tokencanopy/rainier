@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/mdlayher/socket"
 	"golang.org/x/sys/unix"
@@ -30,7 +31,7 @@ func dialVsock(ctx context.Context, cid, port uint32) (net.Conn, error) {
 		}
 	}()
 	remote := vsockAddr{cid, port}
-	if _, err := c.Connect(ctx, &unix.SockaddrVM{CID: cid, Port: port}); err != nil {
+	if _, err := c.Connect(vsockDialContext{ctx}, &unix.SockaddrVM{CID: cid, Port: port}); err != nil {
 		return nil, fmt.Errorf("vsock connect to (%d,%d): %w", cid, port, err)
 	}
 	sa, err := c.Getsockname()
@@ -64,3 +65,10 @@ func (c *vsockConn) LocalAddr() net.Addr  { return c.local }
 func (c *vsockConn) RemoteAddr() net.Addr { return c.remote }
 
 var _ net.Conn = (*vsockConn)(nil)
+
+// socket v0.6.1 watches Done only when Deadline is absent; with a deadline
+// it otherwise ignores an earlier cancellation. Keep the original Done/Err
+// (including deadline expiry), and select its cancellation-aware poller path.
+type vsockDialContext struct{ context.Context }
+
+func (vsockDialContext) Deadline() (time.Time, bool) { return time.Time{}, false }
