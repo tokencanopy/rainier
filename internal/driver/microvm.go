@@ -2596,12 +2596,14 @@ func (e *Ext4Formatter) FormatFromDir(path, dir string) error {
 // ---------------------------------------------------------------------------
 
 type FirecrackerEngine struct {
-	mu         sync.Mutex
-	vmmPath    string
-	jailerPath string
-	stateDir   string
-	netnsDir   string
-	jail       JailOpts
+	// ownershipMu serializes permission setup across hard links to shared home inodes.
+	ownershipMu sync.Mutex
+	mu          sync.Mutex
+	vmmPath     string
+	jailerPath  string
+	stateDir    string
+	netnsDir    string
+	jail        JailOpts
 	// uids maps a session's network slot to the uid and gid its VMM runs as.
 	// It is a VALUE and not a pointer: an engine that failed to construct
 	// carries the zero range, whose forSlot answers an error for every index,
