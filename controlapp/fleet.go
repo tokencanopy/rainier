@@ -212,7 +212,21 @@ func (s *FleetService) knownPools() map[control.PoolID]struct{} {
 // and upserted. The claimed session list is deliberately not applied here:
 // ReconcileRunner owns that behavior and may run immediately after.
 func (s *FleetService) RegisterRunner(ctx context.Context, r control.RunnerRegistration) (control.RunnerRegistrationResult, error) {
-	if err := validateRegistration(r); err != nil {
+	return s.registerRunner(ctx, r, false)
+}
+
+// RegisterPoolRunner registers a host explicitly authorized for its entire pool.
+// The caller must authenticate that authority; WorkspaceID must be empty.
+// The legacy RegisterRunner entry point continues to require a workspace.
+func (s *FleetService) RegisterPoolRunner(ctx context.Context, r control.RunnerRegistration) (control.RunnerRegistrationResult, error) {
+	if r.WorkspaceID != "" {
+		return control.RunnerRegistrationResult{}, control.ErrInvalid
+	}
+	return s.registerRunner(ctx, r, true)
+}
+
+func (s *FleetService) registerRunner(ctx context.Context, r control.RunnerRegistration, poolScoped bool) (control.RunnerRegistrationResult, error) {
+	if err := validateRegistration(r, poolScoped); err != nil {
 		return control.RunnerRegistrationResult{}, err
 	}
 	runners, err := s.fleet.ListRunners(ctx, r.PoolID)
@@ -275,8 +289,8 @@ func (s *FleetService) authoritativeGeneration(ctx context.Context, pool control
 
 // validateRegistration rejects a malformed or contradictory claim before any
 // port is touched.
-func validateRegistration(r control.RunnerRegistration) error {
-	if r.WorkspaceID == "" || r.PoolID == "" || r.RunnerID == "" || r.Generation == 0 ||
+func validateRegistration(r control.RunnerRegistration, poolScoped bool) error {
+	if (!poolScoped && r.WorkspaceID == "") || r.PoolID == "" || r.RunnerID == "" || r.Generation == 0 ||
 		r.CapacityUsed < 0 || r.CapacityTotal < 0 || r.CapacityUsed > r.CapacityTotal {
 		return control.ErrInvalid
 	}
@@ -415,7 +429,24 @@ const lostAtAnnounce = "lost at announce"
 // authoritative generation; the result's generation is always the
 // store-authoritative one, never merely the generation the caller sent.
 func (s *FleetService) ReconcileRunner(ctx context.Context, snap control.RunnerSnapshot) (control.ReconcileResult, error) {
-	if err := validateSnapshot(snap); err != nil {
+	return s.reconcileRunner(ctx, snap, false)
+}
+
+// ReconcilePoolRunner reconciles a host explicitly authorized for its whole
+// pool. WorkspaceID must be empty. Each assigned row supplies its workspace;
+// unknown reports are destroyed, never adopted across a workspace boundary.
+// The caller must authenticate pool-wide authority before calling this method.
+// Ambiguous session IDs return ErrConflict before any session mutation. Runner
+// generation fencing and capacity validation are identical to ReconcileRunner.
+func (s *FleetService) ReconcilePoolRunner(ctx context.Context, snap control.RunnerSnapshot) (control.ReconcileResult, error) {
+	if snap.WorkspaceID != "" {
+		return control.ReconcileResult{}, control.ErrInvalid
+	}
+	return s.reconcileRunner(ctx, snap, true)
+}
+
+func (s *FleetService) reconcileRunner(ctx context.Context, snap control.RunnerSnapshot, poolScoped bool) (control.ReconcileResult, error) {
+	if err := validateSnapshot(snap, poolScoped); err != nil {
 		return control.ReconcileResult{}, err
 	}
 	runners, err := s.fleet.ListRunners(ctx, snap.PoolID)
@@ -452,7 +483,7 @@ func (s *FleetService) ReconcileRunner(ctx context.Context, snap control.RunnerS
 		return control.ReconcileResult{Generation: gen, Fenced: true}, nil
 	}
 
-	destroy, err := s.reconcileSessions(ctx, snap)
+	destroy, err := s.reconcileSessions(ctx, snap, poolScoped)
 	if err != nil {
 		return control.ReconcileResult{}, err
 	}
@@ -468,8 +499,8 @@ func (s *FleetService) ReconcileRunner(ctx context.Context, snap control.RunnerS
 
 // validateSnapshot rejects a malformed snapshot, including one that names a
 // session twice, before any port is touched.
-func validateSnapshot(snap control.RunnerSnapshot) error {
-	if snap.WorkspaceID == "" || snap.PoolID == "" || snap.RunnerID == "" || snap.Generation == 0 {
+func validateSnapshot(snap control.RunnerSnapshot, poolScoped bool) error {
+	if (!poolScoped && snap.WorkspaceID == "") || snap.PoolID == "" || snap.RunnerID == "" || snap.Generation == 0 {
 		return control.ErrInvalid
 	}
 	if snap.CapacityUsed < 0 || snap.CapacityTotal < 0 || snap.CapacityUsed > snap.CapacityTotal {
@@ -529,7 +560,7 @@ func (s *FleetService) recordSnapshotAuthority(ctx context.Context, snap control
 // reconcileSessions settles the stored live sessions against the reported set
 // and collects orphans for teardown. It is idempotent: repeat calls with the
 // same snapshot produce the same Destroy list and no additional mutation.
-func (s *FleetService) reconcileSessions(ctx context.Context, snap control.RunnerSnapshot) ([]control.SessionID, error) {
+func (s *FleetService) reconcileSessions(ctx context.Context, snap control.RunnerSnapshot, poolScoped bool) ([]control.SessionID, error) {
 	states := []control.SessionState{
 		control.StateCreating, control.StateRunning,
 		control.StateSuspendedWarm, control.StateSuspendedCold,
@@ -542,6 +573,11 @@ func (s *FleetService) reconcileSessions(ctx context.Context, snap control.Runne
 	storedByID := make(map[control.SessionID]control.Session, len(stored))
 	reportedByID := make(map[control.SessionID]control.RunnerSession, len(snap.Sessions))
 	for _, row := range stored {
+		if poolScoped {
+			if _, duplicate := storedByID[row.ID]; duplicate {
+				return nil, control.ErrConflict
+			}
+		}
 		storedByID[row.ID] = row
 	}
 	for _, r := range snap.Sessions {
@@ -552,7 +588,7 @@ func (s *FleetService) reconcileSessions(ctx context.Context, snap control.Runne
 
 	for _, row := range stored {
 		reported, present := reportedByID[row.ID]
-		if row.WorkspaceID != snap.WorkspaceID {
+		if !poolScoped && row.WorkspaceID != snap.WorkspaceID {
 			// A session another workspace still owns, held on this runner. When
 			// this snapshot reports it, it is an orphan here; either way this
 			// snapshot is not authoritative for it, so it is never mutated.
@@ -600,6 +636,10 @@ func (s *FleetService) reconcileSessions(ctx context.Context, snap control.Runne
 
 	for _, reported := range snap.Sessions {
 		if _, isStored := storedByID[reported.SessionID]; isStored {
+			continue
+		}
+		if poolScoped {
+			destroy = append(destroy, reported.SessionID)
 			continue
 		}
 		row, err := s.sessions.GetSession(ctx, snap.WorkspaceID, reported.SessionID)
