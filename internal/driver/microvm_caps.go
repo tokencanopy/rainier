@@ -51,6 +51,10 @@ type hostCapability struct {
 // <linux/capability.h>'s.
 var microvmCapabilities = []hostCapability{
 	{
+		Name: "CAP_KILL", Bit: 5,
+		Why: "signal and reap VMM processes running as distinct per-VM uids",
+	},
+	{
 		Name: "CAP_CHOWN", Bit: 0,
 		Why: "give each VM's jail directory, control socket and disk images to that VM's own uid (chownJailPath)",
 	},
@@ -111,7 +115,7 @@ func capabilityNames() string {
 //
 // It fails closed and names the FIRST thing that is missing rather than
 // summarising: an operator fixing a unit file wants the next thing to add,
-// and a list of seven is a list nobody reads to the end.
+// and a list of eight is a list nobody reads to the end.
 func checkMicrovmPrivileges(opts MicrovmOpts) error {
 	effective, err := effectiveCapabilities()
 	if err != nil {

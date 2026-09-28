@@ -9,7 +9,7 @@
 // namespace and no jailer on a Mac either. Running these there would assert
 // that a capability check fails for the reason the platform does not have
 // capabilities, which is not what any of them is about, and it is what made
-// seven subtests fail on every developer machine. The portable half — the
+// eight subtests fail on every developer machine. The portable half — the
 // requirements text, the host preparation — is in microvm_caps_test.go and
 // runs everywhere.
 package driver

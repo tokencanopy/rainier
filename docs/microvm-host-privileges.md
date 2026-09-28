@@ -12,14 +12,14 @@ everything not on this list.
 
 ## Hardware qualification limitation
 
-The capability list below is the intended non-root contract, not proof that the
-upstream jailer can run with it. Firecracker jailer 1.17.0 unconditionally writes
-`cgroup.subtree_control` in every ancestor up to the host cgroup root when a
-`--cgroup` property is supplied. A systemd-delegated subtree does not authorize
-those ancestor writes, so the non-root launch fails before the API socket opens.
-Do not grant the runner write access to the host cgroup root to work around it.
-A scoped privileged launch path or a jailer change needs separate qualification.
-Root-run Phase A feasibility tests do not establish this non-root contract.
+The capability list below requires a separately qualified jailer. Stock
+Firecracker jailer 1.17.0 writes outside a delegated cgroup subtree, gives
+away directory ownership before device setup is complete, and retains ambient
+capabilities across a non-root-to-non-root UID change. The Rainier Cloud
+`infra/microvm/jailer` patch addresses these boundaries and carries its own
+source/compiler/binary pins and real launcher tests. Use the reviewed pin;
+do not grant global cgroup write access or broad DAC powers as a workaround.
+Root-run feasibility alone does not establish this non-root contract.
 
 The host must also prepare `/run/netns` for namespace mount-point creation:
 root-owned, runner-group-writable, mode `0770` on a host dedicated to that
@@ -34,6 +34,7 @@ is transferred to the VM. A resume temporarily reclaims the inode using
 | | What it is for |
 |---|---|
 | `CAP_CHOWN` | Give each VM's jail directory, control socket and disk images to that VM's own uid. |
+| `CAP_KILL` | Signal and reap VMM processes owned by different per-VM uids during stop, failed launch and delete. |
 | `CAP_SETGID` | Let the jailer drop the VMM to its per-VM gid. |
 | `CAP_SETUID` | Let the jailer drop the VMM to its per-VM uid. |
 | `CAP_NET_ADMIN` | Create each session's network namespace, veth pair and TAP device, and install its `nftables` ruleset. |
@@ -77,8 +78,8 @@ thing to discover at startup and not at the first suspend.
 User=rainier
 Group=rainier
 SupplementaryGroups=kvm
-AmbientCapabilities=CAP_CHOWN CAP_SETGID CAP_SETUID CAP_NET_ADMIN CAP_SYS_CHROOT CAP_SYS_ADMIN CAP_MKNOD
-CapabilityBoundingSet=CAP_CHOWN CAP_SETGID CAP_SETUID CAP_NET_ADMIN CAP_SYS_CHROOT CAP_SYS_ADMIN CAP_MKNOD
+AmbientCapabilities=CAP_CHOWN CAP_KILL CAP_SETGID CAP_SETUID CAP_NET_ADMIN CAP_SYS_CHROOT CAP_SYS_ADMIN CAP_MKNOD
+CapabilityBoundingSet=CAP_CHOWN CAP_KILL CAP_SETGID CAP_SETUID CAP_NET_ADMIN CAP_SYS_CHROOT CAP_SYS_ADMIN CAP_MKNOD
 Delegate=yes
 ExecStart=/usr/local/bin/runnerd --driver=microvm ...
 ```
@@ -163,3 +164,11 @@ whichever filesystem `/tmp` happens to be. That a create on XFS with
 `reflink=1` takes microseconds and shares the image's extents — and that a
 guest writing to its root leaves the shared image untouched on a real block
 device rather than on a test's byte comparison — is host qualification too.
+
+## Non-root hardware tests
+
+The opt-in KVM harness accepts `RAINIER_MICROVM_TEST_CGROUP_PARENT` for the
+service's delegated cgroup path (relative to `/sys/fs/cgroup`). Keep the test
+process in a child leaf before enabling controllers, exactly as the runner's
+service launcher does. The default remains `rainier-kvmtest` for existing
+root-operated probes. No global cgroup write grant is needed.

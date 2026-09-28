@@ -97,3 +97,12 @@ func TestTheHostPreparationTextNamesBothHalves(t *testing.T) {
 		}
 	}
 }
+
+func TestMicrovmRequiresCrossUIDSignalCapability(t *testing.T) {
+	for _, capability := range microvmCapabilities {
+		if capability.Name == "CAP_KILL" && capability.Bit == 5 {
+			return
+		}
+	}
+	t.Fatal("runner must require CAP_KILL before accepting VMs it cannot stop")
+}
