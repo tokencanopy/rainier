@@ -57,6 +57,12 @@ type Options struct {
 	Logf func(string, ...any)
 }
 
+// runnerKey matches the store and transport identity, including the pool.
+type runnerKey struct {
+	pool control.PoolID
+	name string
+}
+
 // Plane is one replica's runner plane: the endpoint, the connections it
 // holds, and the transport over them. Its zero value is not usable —
 // construct it with New.
@@ -70,11 +76,11 @@ type Plane struct {
 	// writes, never across a store call or a socket write, so a slow runner
 	// can't stall registration for the rest of the fleet.
 	mu      sync.Mutex
-	runners map[string]*runnerConn
+	runners map[runnerKey]*runnerConn
 	// runnerLocks serializes the store writes that describe one runner
-	// (connected flag and capacity) — see nameLock. Keyed by runner name,
+	// (connected flag and capacity) — see nameLock. Keyed by pool and runner name,
 	// never held while mu is.
-	runnerLocks map[string]*sync.Mutex
+	runnerLocks map[runnerKey]*sync.Mutex
 }
 
 // New returns a plane over h.
@@ -93,8 +99,8 @@ func New(h Host, o Options) *Plane {
 		opTimeout:   o.OpTimeout,
 		readLimit:   o.ReadLimit,
 		logf:        o.Logf,
-		runners:     map[string]*runnerConn{},
-		runnerLocks: map[string]*sync.Mutex{},
+		runners:     map[runnerKey]*runnerConn{},
+		runnerLocks: map[runnerKey]*sync.Mutex{},
 	}
 }
 
@@ -133,8 +139,8 @@ func (p *Plane) Send(pool control.PoolID, id control.RunnerID, m runner.ToRunner
 func (p *Plane) Broadcast(pool control.PoolID, m runner.ToRunner, except control.RunnerID) {
 	p.mu.Lock()
 	conns := make([]*runnerConn, 0, len(p.runners))
-	for name, rc := range p.runners {
-		if rc.binding.PoolID == pool && name != string(except) {
+	for _, rc := range p.runners {
+		if rc.binding.PoolID == pool && rc.name != string(except) {
 			conns = append(conns, rc)
 		}
 	}
@@ -166,25 +172,17 @@ func (p *Plane) Close() {
 // the connection registry
 // ---------------------------------------------------------------------------
 
-func (p *Plane) conn(name string) *runnerConn {
+// connIn resolves the full authenticated runner identity.
+func (p *Plane) connIn(pool control.PoolID, name string) *runnerConn {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.runners[name]
-}
-
-// connIn is conn, scoped: a connection answers for its own pool and no other.
-func (p *Plane) connIn(pool control.PoolID, name string) *runnerConn {
-	rc := p.conn(name)
-	if rc == nil || rc.binding.PoolID != pool {
-		return nil
-	}
-	return rc
+	return p.runners[runnerKey{pool, name}]
 }
 
 func (p *Plane) isCurrentConn(rc *runnerConn) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.runners[rc.name] == rc
+	return p.runners[runnerKey{rc.binding.PoolID, rc.name}] == rc
 }
 
 // nameLock returns the mutex serializing the store writes that describe one
@@ -198,17 +196,18 @@ func (p *Plane) isCurrentConn(rc *runnerConn) bool {
 // writes a runner row therefore takes this lock, re-checks the registered
 // conn under it, and only then writes.
 //
-// Entries are never removed: the key set is runner names, one small mutex per
+// Entries are never removed: the key set is pool/runner pairs, one small mutex per
 // fleet member, and removing one safely would need refcounting for no
 // practical gain. p.mu is released before the lock is taken, so the two never
 // nest the wrong way round.
-func (p *Plane) nameLock(name string) *sync.Mutex {
+func (p *Plane) nameLock(pool control.PoolID, name string) *sync.Mutex {
+	key := runnerKey{pool, name}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	mu, ok := p.runnerLocks[name]
+	mu, ok := p.runnerLocks[key]
 	if !ok {
 		mu = &sync.Mutex{}
-		p.runnerLocks[name] = mu
+		p.runnerLocks[key] = mu
 	}
 	return mu
 }
@@ -219,8 +218,8 @@ func (p *Plane) nameLock(name string) *sync.Mutex {
 // closed after it. Callers hold the runner's name lock.
 func (p *Plane) registerRunner(rc *runnerConn) {
 	p.mu.Lock()
-	old := p.runners[rc.name]
-	p.runners[rc.name] = rc
+	old := p.runners[runnerKey{rc.binding.PoolID, rc.name}]
+	p.runners[runnerKey{rc.binding.PoolID, rc.name}] = rc
 	p.mu.Unlock()
 
 	if old != nil && old != rc {
@@ -239,14 +238,14 @@ func (p *Plane) registerRunner(rc *runnerConn) {
 func (p *Plane) retireRunner(rc *runnerConn) {
 	rc.shutdown()
 
-	nl := p.nameLock(rc.name)
+	nl := p.nameLock(rc.binding.PoolID, rc.name)
 	nl.Lock()
 	defer nl.Unlock()
 
 	p.mu.Lock()
-	current := p.runners[rc.name] == rc
+	current := p.runners[runnerKey{rc.binding.PoolID, rc.name}] == rc
 	if current {
-		delete(p.runners, rc.name)
+		delete(p.runners, runnerKey{rc.binding.PoolID, rc.name})
 	}
 	p.mu.Unlock()
 	if !current {

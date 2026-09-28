@@ -21,3 +21,9 @@ adapter can expose these methods through its own authenticated composition;
 self-hosted callers retain the existing path. Credential issuance, pool audit,
 tenant resolution for events and RPCs, and Linux hardware qualification belong
 to the host integration and are not enabled by adding these methods.
+
+The runner plane registry and its serialization locks use `(pool, runner)` as
+their key. Equal runner names in different pools can coexist; registration or
+retirement in one pool cannot evict another pool's transport. Reconnecting the
+same runner within its pool retains the existing replacement and retirement
+fences. Outbound dispatch and terminal dial-back commands use that same key.
