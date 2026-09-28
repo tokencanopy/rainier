@@ -121,6 +121,8 @@ const (
 	// kvmTimingsEnv, when set, is a file the harness writes its measurements
 	// to as JSON, for the runbook's evidence table to cite.
 	kvmTimingsEnv = "RAINIER_MICROVM_TEST_TIMINGS"
+	// Optional delegated parent for a non-root systemd test service.
+	kvmCgroupEnv = "RAINIER_MICROVM_TEST_CGROUP_PARENT"
 
 	kvmDefaultKernel = "vmlinux"
 	kvmDefaultRootfs = "rootfs.ext4"
@@ -148,13 +150,14 @@ const (
 
 // kvmFixture is the host, resolved, once every precondition has held.
 type kvmFixture struct {
-	images      string
-	kernel      string
-	rootfs      string
-	stateParent string
-	connectWait time.Duration
-	proxyAddr   string
-	proxyPort   int
+	images       string
+	kernel       string
+	rootfs       string
+	stateParent  string
+	connectWait  time.Duration
+	proxyAddr    string
+	proxyPort    int
+	cgroupParent string
 }
 
 // requireKVMHost skips unless this machine can actually boot a microVM, and
@@ -241,6 +244,10 @@ func requireKVMHost(t *testing.T) kvmFixture {
 		rootfs:      rootfs,
 		stateParent: os.Getenv(kvmStateParentEnv),
 		connectWait: kvmConnectWait,
+	}
+	fx.cgroupParent = os.Getenv(kvmCgroupEnv)
+	if fx.cgroupParent == "" {
+		fx.cgroupParent = kvmCgroupChild
 	}
 	if raw := os.Getenv(kvmConnectEnv); raw != "" {
 		d, err := time.ParseDuration(raw)
@@ -351,7 +358,7 @@ func newKVMMicrovm(t *testing.T, fx kvmFixture) (*Microvm, *kvmRunner, CloneMeth
 		EgressProxyAddr: fx.proxyAddr,
 		EgressProxyPort: fx.proxyPort,
 
-		Jail: JailOpts{CgroupParent: kvmCgroupChild},
+		Jail: JailOpts{CgroupParent: fx.cgroupParent},
 	})
 	if err != nil {
 		// A Fatal and not a Skip: every precondition this constructor checks
@@ -1222,7 +1229,7 @@ func TestMicrovmBootSmokeOnKVM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read /proc/%d/cgroup: %v", pid, err)
 	}
-	if want := "/" + kvmCgroupChild + "/" + h.ID; !strings.Contains(string(procCgroup), want) {
+	if want := "/" + fx.cgroupParent + "/" + h.ID; !strings.Contains(string(procCgroup), want) {
 		t.Fatalf("ADR-0003 §4.6: the VMM is not in its own cgroup (%q is not in %q)", want, strings.TrimSpace(string(procCgroup)))
 	}
 

@@ -29,6 +29,8 @@
 #                                 Put it on a filesystem that reflinks (XFS) or
 #                                 the harness logs that every create is a full
 #                                 copy of the environment image.
+#   RAINIER_MICROVM_TEST_CGROUP_PARENT  optional delegated service cgroup;
+#                            default rainier-kvmtest (root-operated harness).
 #   RAINIER_MICROVM_TEST_PROXY    ip:port of the egress proxy, the one
 #                                 host-side destination a slot's firewall
 #                                 allows. Empty means no exception, which is a
@@ -140,7 +142,7 @@ BINS
 command -v "$go_bin" >/dev/null 2>&1 ||
   note_missing "\`$go_bin\` is not on PATH. Set GO to the go binary, or install one."
 
-# The capability set, from the same seven bits internal/driver checks. A host
+# The capability set, from the same eight bits internal/driver checks. A host
 # with no /proc is not a microVM host and will have failed above; the guard is
 # here so this script's own test can run somewhere else.
 if [[ -r "$proc_status" ]]; then
@@ -150,6 +152,7 @@ if [[ -r "$proc_status" ]]; then
       if (( ( 0x$capeff >> bit ) & 1 )); then continue; fi
       note_missing "this process does not hold $name, needed to ${why}. Re-run under \`sudo -E\`, or give runnerd's user the ambient set (see MicrovmHostRequirements)."
     done <<'CAPS'
+5 CAP_KILL signal VMM processes owned by per-VM uids
 0 CAP_CHOWN give each VM's jail, control socket and disk images to that VM's own uid
 6 CAP_SETGID let the jailer drop the VMM to its per-VM gid
 7 CAP_SETUID let the jailer drop the VMM to its per-VM uid
