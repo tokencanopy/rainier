@@ -885,7 +885,7 @@ func TestConnectRunnerRefusalDoesNotCloseTheWinningConn(t *testing.T) {
 	})
 	drainAccept(t, f2)
 
-	live := p.conn("runner-a")
+	live := p.connIn(testPool, "runner-a")
 	if live == nil {
 		t.Fatal("runner-a has no live connection")
 	}
@@ -910,7 +910,7 @@ func TestConnectRunnerRefusalDoesNotCloseTheWinningConn(t *testing.T) {
 		t.Fatal("the live (accepted, generation 2) connection was closed by a reconnect attempt the fleet service went on to refuse")
 	default:
 	}
-	if got := p.conn("runner-a"); got != live {
+	if got := p.connIn(testPool, "runner-a"); got != live {
 		t.Fatalf("conn(runner-a) = %p, want the still-live connection %p: a refused reconnect replaced it in the registry", got, live)
 	}
 }
@@ -1244,7 +1244,7 @@ func transportFixture(t *testing.T, name string) (*Plane, *runnerConn) {
 	p := New(h, Options{OpTimeout: 200 * time.Millisecond, Logf: func(string, ...any) {}})
 	rc := newRunnerConn(Binding{WorkspaceID: testWorkspace, PoolID: testPool, RunnerID: control.RunnerID(name)}, nil)
 	p.mu.Lock()
-	p.runners[name] = rc
+	p.runners[runnerKey{rc.binding.PoolID, name}] = rc
 	p.mu.Unlock()
 	return p, rc
 }
@@ -1489,7 +1489,7 @@ func TestDestroyOrphanRetriesAfterLiveQueueSaturation(t *testing.T) {
 	p := New(h, Options{OpTimeout: time.Second, Logf: func(string, ...any) {}})
 	rc := newRunnerConn(Binding{WorkspaceID: testWorkspace, PoolID: testPool, RunnerID: "vm1"}, nil)
 	p.mu.Lock()
-	p.runners[rc.name] = rc
+	p.runners[runnerKey{rc.binding.PoolID, rc.name}] = rc
 	p.mu.Unlock()
 
 	// Hold the writer still with a completely full live queue. The first
@@ -1710,7 +1710,7 @@ func TestOrphanSessionRPCResponseIsDropped(t *testing.T) {
 	if err := json.Unmarshal(res.RPC.Payload, &got); err != nil || got.Pong != "yes" {
 		t.Fatalf("payload = %s (%v), want the sandbox's own answer", res.RPC.Payload, err)
 	}
-	rc := p.conn("vm1")
+	rc := p.connIn(testPool, "vm1")
 	if rc == nil {
 		t.Fatal("vm1 has no connection")
 	}

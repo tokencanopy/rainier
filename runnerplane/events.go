@@ -30,7 +30,7 @@ const (
 // happen under the runner's name lock, so a reconnect can neither slip between
 // them nor have its own row write overtaken by this one.
 func (p *Plane) touchRunner(ctx context.Context, rc *runnerConn, m runner.FromRunner) bool {
-	nl := p.nameLock(rc.name)
+	nl := p.nameLock(rc.binding.PoolID, rc.name)
 	nl.Lock()
 	defer nl.Unlock()
 

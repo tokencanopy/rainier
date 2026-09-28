@@ -193,7 +193,7 @@ func (p *Plane) connectRunner(ctx context.Context, rc *runnerConn, ann runner.Fr
 		return fmt.Errorf("%w: %v", errRegistrationRefused, err)
 	}
 
-	nl := p.nameLock(rc.name)
+	nl := p.nameLock(rc.binding.PoolID, rc.name)
 	nl.Lock()
 	defer nl.Unlock()
 
