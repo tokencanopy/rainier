@@ -172,3 +172,10 @@ service's delegated cgroup path (relative to `/sys/fs/cgroup`). Keep the test
 process in a child leaf before enabling controllers, exactly as the runner's
 service launcher does. The default remains `rainier-kvmtest` for existing
 root-operated probes. No global cgroup write grant is needed.
+
+Select `TestMicrovmSatisfiesContractOnKVM` for the non-root contract run. The
+separate `TestMicrovmBootSmokeOnKVM` also reads another UID's
+`/proc/<pid>/ns/net`, which requires a root observer on the qualified host.
+Keep that observer evidence separate; do not add tracing capabilities to the
+production runner just to satisfy the test. Real non-root dev-cell lifecycle
+checks and externally observed namespace/capability checks cover that boundary.
