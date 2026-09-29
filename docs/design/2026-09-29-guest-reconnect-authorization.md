@@ -18,6 +18,11 @@ not add authorization to existing session RPC methods.
 creation. The optional `control.GuestReconnectStore` owns enrollment, challenge
 state and transactional consumption. Hosted adapters must hold current membership
 and policy authorization in addition to implementing the placement/runner fences.
+The reusable `controlapp/repotest.RunGuestReconnect` contract covers concurrency,
+replay, scope, lifecycle, pending replacement and bootstrap preservation. The
+PostgreSQL suite additionally exercises adapter reopen and expiry during lock
+waits. Hosted qualification must run the same contract against its own adapter.
+
 No guest input selects the workspace, session, runner or placement scope.
 
 Enrollment spends the initial bootstrap token and pins a public Ed25519 key and

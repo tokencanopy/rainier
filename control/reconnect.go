@@ -8,7 +8,7 @@ import (
 
 // GuestReconnectScope is host-authenticated authority, never a guest request.
 // The store must lock and compare BOTH current placement and runner connection
-// generation, including connected/lifecycle state, throughout each operation.
+// generation, including connected/lifecycle state, throughout each mutation.
 // Hosted adapters additionally hold current membership/policy authorization.
 type GuestReconnectScope struct {
 	WorkspaceID          WorkspaceID
@@ -56,7 +56,9 @@ type GuestReconnectStore interface {
 	// this exact scope. No enrollment means refusal, never legacy fallback.
 	BeginGuestReconnect(context.Context, GuestReconnectScope, GuestReconnectAttempt, time.Time) (GuestReconnectIdentity, error)
 	// ReadGuestReconnect reads only the named pending attempt for proof
-	// verification. Consume rechecks every field under a transaction.
+	// verification. This preliminary read does not authorize the connection or
+	// guarantee current runner/lifecycle authority; Consume rechecks every field
+	// under a transaction before granting a token or connection epoch.
 	ReadGuestReconnect(context.Context, GuestReconnectScope, string) (GuestReconnectIdentity, GuestReconnectAttempt, error)
 	// ConsumeGuestReconnect is a single-use compare-and-swap after proof
 	// verification. It increments and returns a connection epoch and replaces

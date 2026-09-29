@@ -6,143 +6,21 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"github.com/tokencanopy/rainier/controlapp"
-	"sync"
-	"sync/atomic"
+	"github.com/tokencanopy/rainier/controlapp/repotest"
 	"testing"
 	"time"
 
 	"github.com/tokencanopy/rainier/control"
 )
 
-func TestGuestReconnectDurableAuthorization(t *testing.T) {
-	ctx := context.Background()
+func TestGuestReconnectStoreContract(t *testing.T) {
 	dsn := startPostgres(t)
-	st := freshStore(t, dsn, t.Name())
-	scope := control.GuestReconnectScope{WorkspaceID: "ws_self_hosted", PoolID: "pool_self_hosted", SessionID: "session.test", RunnerID: "runner.test", PlacementGeneration: 1, ConnectionGeneration: 7}
-	_, err := st.Sessions().CreateSession(ctx, scope.WorkspaceID, control.Session{ID: scope.SessionID, CreatorID: "actor.test", PoolID: scope.PoolID, RunnerID: scope.RunnerID, State: control.StateRunning, Spec: control.PortableSpec{Image: "image.test"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.Fleet().UpsertRunner(ctx, scope.PoolID, control.Runner{ID: scope.RunnerID, Generation: 7, Connected: true}); err != nil {
-		t.Fatal(err)
-	}
-	now := time.Now().UTC().Truncate(time.Microsecond)
-	token := control.SessionBootstrap{Hash: "bootstrap.test", PlacementGeneration: 1, ExpiresAt: now.Add(time.Minute)}
-	if err := st.Bootstraps().PutSessionBootstrap(ctx, scope.WorkspaceID, scope.SessionID, token); err != nil {
-		t.Fatal(err)
-	}
-	identity := control.GuestReconnectIdentity{BootEpoch: "boot.test", PublicKey: "public-key.test"}
-	r := st.GuestReconnects()
-	bad := scope
-	bad.ConnectionGeneration = 6
-	if err := r.EnrollGuest(ctx, bad, token.Hash, identity, now); !errors.Is(err, control.ErrReconnectFenced) {
-		t.Fatalf("stale enrollment: %v", err)
-	}
-	if err := r.EnrollGuest(ctx, scope, token.Hash, identity, now); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.EnrollGuest(ctx, scope, token.Hash, identity, now); err == nil {
-		t.Fatal("bootstrap replay enrolled")
-	}
-	attempt := control.GuestReconnectAttempt{ID: "attempt.test", Challenge: "nonce.test", ExpiresAt: now.Add(5 * time.Second)}
-	enrolled, err := r.BeginGuestReconnect(ctx, scope, attempt, now)
-	if err != nil || enrolled != identity {
-		t.Fatalf("begin: %+v %v", enrolled, err)
-	}
-	fresh := control.SessionBootstrap{Hash: "fresh.test", PlacementGeneration: 1, ExpiresAt: now.Add(time.Minute)}
-	for name, changed := range map[string]control.GuestReconnectScope{
-		"workspace": {WorkspaceID: "ws_other", PoolID: scope.PoolID, SessionID: scope.SessionID, RunnerID: scope.RunnerID, PlacementGeneration: 1, ConnectionGeneration: 7},
-		"pool":      {WorkspaceID: scope.WorkspaceID, PoolID: "pool_other", SessionID: scope.SessionID, RunnerID: scope.RunnerID, PlacementGeneration: 1, ConnectionGeneration: 7},
-		"runner":    {WorkspaceID: scope.WorkspaceID, PoolID: scope.PoolID, SessionID: scope.SessionID, RunnerID: "other.test", PlacementGeneration: 1, ConnectionGeneration: 7},
-		"placement": {WorkspaceID: scope.WorkspaceID, PoolID: scope.PoolID, SessionID: scope.SessionID, RunnerID: scope.RunnerID, PlacementGeneration: 2, ConnectionGeneration: 7},
-	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := r.ConsumeGuestReconnect(ctx, changed, identity, attempt, fresh, now); err == nil {
-				t.Fatal("foreign authority accepted")
-			}
-		})
-	}
-	wrongIdentity := identity
-	wrongIdentity.BootEpoch = "other-boot.test"
-	if _, err := r.ConsumeGuestReconnect(ctx, scope, wrongIdentity, attempt, fresh, now); err == nil {
-		t.Fatal("wrong boot accepted")
-	}
-	wrongIdentity = identity
-	wrongIdentity.PublicKey = "other-key.test"
-	if _, err := r.ConsumeGuestReconnect(ctx, scope, wrongIdentity, attempt, fresh, now); err == nil {
-		t.Fatal("wrong pinned key accepted")
-	}
-	wrong := attempt
-	wrong.Challenge = "wrong.test"
-	if _, err := r.ConsumeGuestReconnect(ctx, scope, identity, wrong, fresh, now); err == nil {
-		t.Fatal("wrong challenge accepted")
-	}
-	var wins atomic.Int32
-	var wg sync.WaitGroup
-	for i := 0; i < 12; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			epoch, err := r.ConsumeGuestReconnect(ctx, scope, identity, attempt, fresh, now)
-			if err == nil {
-				if epoch != 1 {
-					t.Errorf("epoch %d", epoch)
-				}
-				wins.Add(1)
-			}
-		}()
-	}
-	wg.Wait()
-	if wins.Load() != 1 {
-		t.Fatalf("concurrent successes: %d", wins.Load())
-	}
-	if err := st.Bootstraps().ConsumeSessionBootstrap(ctx, scope.WorkspaceID, scope.SessionID, fresh.Hash, 1, now); err != nil {
-		t.Fatal(err)
-	}
-	// Reopen the durable adapter: neither a process restart nor a lost reply
-	// makes the accepted proof spendable again.
-	reopened := reopen(t, st.pool.Config().ConnString())
-	if _, err := reopened.GuestReconnects().ConsumeGuestReconnect(ctx, scope, identity, attempt, fresh, now); err == nil {
-		t.Fatal("replay after restart")
-	}
-	attempt.ID = "second.test"
-	if _, err := r.BeginGuestReconnect(ctx, scope, attempt, now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.ConsumeGuestReconnect(ctx, scope, identity, attempt, fresh, attempt.ExpiresAt); !errors.Is(err, control.ErrReconnectExpired) {
-		t.Fatalf("expiry boundary: %v", err)
-	}
-	attempt.ID = "third.test"
-	if _, err := r.BeginGuestReconnect(ctx, scope, attempt, now); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.Fleet().UpsertRunner(ctx, scope.PoolID, control.Runner{ID: scope.RunnerID, Generation: 8, Connected: true}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.ConsumeGuestReconnect(ctx, scope, identity, attempt, fresh, now); !errors.Is(err, control.ErrReconnectFenced) {
-		t.Fatalf("superseded runner: %v", err)
-	}
-	scope.ConnectionGeneration = 8
-	attempt.ID = "fourth.test"
-	if _, err := r.BeginGuestReconnect(ctx, scope, attempt, now); err != nil {
-		t.Fatal(err)
-	}
-	if epoch, err := r.ConsumeGuestReconnect(ctx, scope, identity, attempt, fresh, now); err != nil || epoch != 2 {
-		t.Fatalf("next epoch: %d %v", epoch, err)
-	}
-	// A stale caller clock cannot stretch a five-second attempt indefinitely.
-	expiredAttempt := control.GuestReconnectAttempt{ID: "old-clock.test", Challenge: "nonce.test", ExpiresAt: now.Add(-time.Minute)}
-	if _, err := r.BeginGuestReconnect(ctx, scope, expiredAttempt, now.Add(-time.Minute-5*time.Second)); !errors.Is(err, control.ErrReconnectExpired) {
-		t.Fatalf("stale issuance clock: %v", err)
-	}
-	// A cold boot invalidates enrollment, pending attempts, and old proof state.
-	if err := st.Bootstraps().PutSessionBootstrap(ctx, scope.WorkspaceID, scope.SessionID, token); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.BeginGuestReconnect(ctx, scope, attempt, now); err == nil {
-		t.Fatal("cold mint retained enrollment")
-	}
+	repotest.RunGuestReconnect(t, func(t *testing.T) repotest.GuestReconnectStores {
+		st := freshStore(t, dsn, t.Name())
+		return repotest.GuestReconnectStores{Stores: repotest.Stores{Sessions: st.Sessions(), Fleet: st.Fleet(), Bootstraps: st.Bootstraps(), Provision: st.EnsureWorkspace}, Reconnects: st.GuestReconnects()}
+	})
 }
 
 func TestGuestReconnectProofWithPostgres(t *testing.T) {
@@ -191,6 +69,9 @@ func TestGuestReconnectProofWithPostgres(t *testing.T) {
 	if err != nil || epoch != 1 || fresh == "" || fresh == token {
 		t.Fatalf("accept: epoch=%d token-present=%t err=%v", epoch, fresh != "", err)
 	}
+	// Reopening the durable adapter cannot make a lost acceptance replayable.
+	reopened := reopen(t, st.pool.Config().ConnString())
+	service.Store = reopened.GuestReconnects()
 	if epoch, token, err := service.Accept(ctx, b, challenge.AttemptID, signature); err == nil || epoch != 0 || token != "" {
 		t.Fatal("replay returned authority")
 	}
@@ -202,3 +83,84 @@ func TestGuestReconnectProofWithPostgres(t *testing.T) {
 type reconnectClock struct{ now time.Time }
 
 func (c reconnectClock) Now() time.Time { return c.now }
+
+// A request can wait behind a lifecycle transaction longer than its challenge
+// lives. The store must check database time AFTER that wait, not reuse the
+// caller's timestamp or PostgreSQL's transaction-start timestamp.
+func TestGuestReconnectExpiresWhileWaitingForAuthorityLock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	st := freshStore(t, startPostgres(t), t.Name())
+	b := control.GuestReconnectScope{WorkspaceID: "ws_self_hosted", PoolID: "pool_self_hosted", SessionID: "lock.test", RunnerID: "runner.test", PlacementGeneration: 1, ConnectionGeneration: 1}
+	if _, err := st.Sessions().CreateSession(ctx, b.WorkspaceID, control.Session{ID: b.SessionID, CreatorID: "actor.test", PoolID: b.PoolID, RunnerID: b.RunnerID, State: control.StateRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Fleet().UpsertRunner(ctx, b.PoolID, control.Runner{ID: b.RunnerID, Generation: 1, Connected: true}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	token := control.SessionBootstrap{Hash: "old-hash.test", PlacementGeneration: 1, ExpiresAt: now.Add(time.Minute)}
+	if err := st.Bootstraps().PutSessionBootstrap(ctx, b.WorkspaceID, b.SessionID, token); err != nil {
+		t.Fatal(err)
+	}
+	id := control.GuestReconnectIdentity{BootEpoch: "boot.test", PublicKey: "public-key.test"}
+	r := st.GuestReconnects()
+	if err := r.EnrollGuest(ctx, b, token.Hash, id, now); err != nil {
+		t.Fatal(err)
+	}
+	now = time.Now().UTC().Truncate(time.Microsecond)
+	a := control.GuestReconnectAttempt{ID: "attempt.test", Challenge: "nonce.test", ExpiresAt: now.Add(2 * time.Second)}
+	if _, err := r.BeginGuestReconnect(ctx, b, a, now); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := st.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM sessions WHERE workspace_id=$1 AND id=$2 FOR UPDATE`, string(b.WorkspaceID), string(b.SessionID)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		fresh := token
+		fresh.Hash = "new-hash.test"
+		epoch, err := r.ConsumeGuestReconnect(ctx, b, id, a, fresh, now)
+		if epoch != 0 {
+			err = fmt.Errorf("unexpected epoch %d", epoch)
+		}
+		done <- err
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var waiting bool
+		err := st.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE 'SELECT 1 FROM sessions%')`).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("consume did not wait on authority lock")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if wait := time.Until(a.ExpiresAt.Add(20 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, control.ErrReconnectExpired) {
+		t.Fatalf("expired during lock wait: %v", err)
+	}
+	var hash string
+	var epoch int64
+	if err := st.pool.QueryRow(ctx, `SELECT token_hash,guest_connection_epoch FROM session_bootstraps WHERE workspace_id=$1 AND session_id=$2`, string(b.WorkspaceID), string(b.SessionID)).Scan(&hash, &epoch); err != nil {
+		t.Fatal(err)
+	}
+	if hash != token.Hash || epoch != 0 {
+		t.Fatal("expired request changed capability or epoch")
+	}
+}
