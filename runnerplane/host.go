@@ -15,6 +15,11 @@ type Binding struct {
 	WorkspaceID control.WorkspaceID
 	PoolID      control.PoolID
 	RunnerID    control.RunnerID
+	// ConnectionGeneration is assigned by the plane for SessionRequest from
+	// this connection's registration. Hosts must compare it with durable fleet
+	// state when authorizing generation-sensitive operations. It is never
+	// taken from an announce or request body; zero means no such binding.
+	ConnectionGeneration uint64
 }
 
 // Host is what a plane needs from its host. Every method is one dependency.

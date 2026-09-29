@@ -41,6 +41,10 @@ func (r pgBootstraps) PutSessionBootstrap(ctx context.Context, ws control.Worksp
 			placement_generation = EXCLUDED.placement_generation,
 			expires_at = EXCLUDED.expires_at,
 			consumed_at = NULL,
+			guest_boot_epoch = NULL, guest_public_key = NULL,
+			reconnect_attempt = NULL, reconnect_challenge = NULL,
+			reconnect_expires_at = NULL, reconnect_runner_generation = NULL,
+			guest_connection_epoch = 0,
 			created_at = now()`,
 		string(id), string(ws), rec.Hash, int64(rec.PlacementGeneration), rec.ExpiresAt)
 	if err != nil {
