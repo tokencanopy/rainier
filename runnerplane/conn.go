@@ -377,7 +377,9 @@ func (p *Plane) routeSessionReq(ctx context.Context, rc *runnerConn, m runner.Fr
 // the sandbox is holding a pending entry (and, for a credential mint, a git
 // process) until one arrives.
 func (p *Plane) answerSessionRequest(ctx context.Context, rc *runnerConn, sessionID string, env runner.RPCEnvelope) {
-	ans := p.host.SessionRequest(ctx, rc.binding, control.SessionID(sessionID), env)
+	binding := rc.binding
+	binding.ConnectionGeneration = rc.gen
+	ans := p.host.SessionRequest(ctx, binding, control.SessionID(sessionID), env)
 	// The id and the method are this layer's to set, never the host's: the id
 	// is what the sandbox correlates against, and every answer is a "resp".
 	ans.ID = env.ID
