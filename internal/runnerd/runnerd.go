@@ -26,6 +26,12 @@ import (
 )
 
 type Server struct {
+	// reconnectControl is a connection-scoped view of the same agent RPC queue.
+	// A handshake captures it once; reconnecting never migrates a pending proof.
+	reconnectControl atomic.Pointer[reconnectControl]
+	reconnectMu      sync.Mutex
+	reconnecting     map[string]struct{}
+
 	drv         driver.Driver
 	reg         *registry
 	dialBase    string // e.g. ws://runnerd:8080 — what sessiond dials to register

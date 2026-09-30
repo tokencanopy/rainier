@@ -258,6 +258,10 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 
 	ag := &agentSessionState{}
 	out := make(chan runner.FromRunner, 64)
+	rc := &reconnectControl{ctx: connCtx, state: ag, out: out}
+	s.reconnectControl.Store(rc)
+	defer s.reconnectControl.CompareAndSwap(rc, nil)
+
 	send := func(m runner.FromRunner) {
 		cctx, ccancel := context.WithTimeout(ctx, 5*time.Second)
 		m.Used, m.Total, _ = s.drv.Capacity(cctx) // best-effort; piggybacked on every message
@@ -607,8 +611,8 @@ func (s *Server) forwardSessionRPC(m runner.ToRunner, send func(runner.FromRunne
 		return
 	}
 	// A response to a request this RUNNER originated stops here: the runner
-	// is a pure forwarder for everything a sandbox asked, and the one thing
-	// it asks for itself (a bootstrap token on a cold resume) is answered to
+	// is a pure forwarder for everything a sandbox asked; cold bootstrap and
+	// reconnect authorization requested by the runner are answered to
 	// a caller inside this process, not to the guest. The id spaces are
 	// disjoint so the two can share one connection — see
 	// runnerOriginatedIDBase.
