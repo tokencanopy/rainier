@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/tokencanopy/rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/sandboxexec"
 	"github.com/tokencanopy/rainier/internal/session"
 	"github.com/tokencanopy/rainier/protocol/runner"
+	"github.com/tokencanopy/rainier/protocol/terminal"
 )
 
 // A separately executed guest uses the production boot/preamble and PTY code
@@ -56,7 +58,7 @@ func TestGuestReconnectExecutable(t *testing.T) {
 	}
 	initial := accept()
 	token := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
-	cfg := runner.BootConfig{Protocol: 1, GuestReconnect: 1, SessionID: "process-test", BootstrapToken: token, Env: map[string]string{"RECONNECT_PROCESS_TEST": "initial"}}
+	cfg := runner.BootConfig{Protocol: 1, GuestReconnect: 1, SessionID: "process-test", BootstrapToken: token, Env: map[string]string{"RECONNECT_PROCESS_TEST": "initial", "RECONNECT_REMOVED_TEST": "old"}}
 	sendReconnectConfig(t, ctx, initial, cfg)
 	raw, err := initial.Read(ctx)
 	if err != nil {
@@ -177,16 +179,50 @@ func TestGuestReconnectProcessGuest(t *testing.T) {
 		t.Fatalf("missing shell response: %s", output)
 		return ""
 	}
+
+	extra := []string{"CHAIN_TEST=retained"}
+	execs := sandboxexec.NewRunner(t.TempDir(), sandboxexec.SessionEnv(os.Environ(), extra), sandboxexec.NewSpawner().Start)
+	b.bindExecEnvironment(execs, extra)
+	execTurn := func(want string) {
+		t.Helper()
+		a := execs.OpenExec(runner.ExecSpec{Argv: []string{"/bin/sh", "-c", `printf '%s:%s:%s' "$RECONNECT_PROCESS_TEST" "$CHAIN_TEST" "${RECONNECT_REMOVED_TEST-unset}"`}})
+		defer a.Close()
+		var output string
+		for {
+			select {
+			case m, ok := <-a.Msgs():
+				if !ok {
+					t.Fatal("exec closed without exit")
+				}
+				switch m.Type {
+				case terminal.TypeExecStdout:
+					output += string(m.Data)
+				case terminal.TypeExecError:
+					t.Fatal(m.Reason)
+				case terminal.TypeExecExit:
+					if m.ExitCode != 0 || m.Signal != "" || output != want {
+						t.Fatalf("future exec environment=%q, want %q", output, want)
+					}
+					return
+				}
+			case <-ctx.Done():
+				t.Fatal("exec turn timeout")
+			}
+		}
+	}
+	execTurn("initial:retained:old")
 	before := turn("before")
 	tr := sessionTransport{dial: dial, preamble: func(ctx context.Context, c relay.Conn) error { return reBootstrap(ctx, c, b) }}
 	if c, err := tr.connect(ctx); err == nil || c != nil {
 		t.Fatal("refused connection became ready")
 	}
+	execTurn("initial:retained:old")
 	c, err = tr.connect(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
+	execTurn("refreshed:retained:unset")
 	after := turn("after")
 	if strings.TrimSuffix(before, ":before") != strings.TrimSuffix(after, ":after") {
 		t.Fatalf("shell restarted or inherited environment changed: %s / %s", before, after)

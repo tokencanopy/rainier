@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/tokencanopy/rainier/internal/relay"
+	"github.com/tokencanopy/rainier/internal/sandboxexec"
 	"github.com/tokencanopy/rainier/protocol/runner"
 )
 
@@ -123,7 +124,7 @@ func (b *bootstrapper) reconnectGuest(ctx context.Context, c relay.Conn) error {
 	if err != nil || delivery.Err() != nil {
 		return errGuestReconnect
 	}
-	if err = b.refreshConfiguration(cfg, env); err != nil {
+	if err = b.refreshConfiguration(delivery, cfg, env); err != nil {
 		return errGuestReconnect
 	}
 	return nil
@@ -252,10 +253,10 @@ func validGuestEnv(k, v string) bool {
 // empty proxy/script/secret setting must remove its old process value as well.
 // Existing children keep their inherited environments; this updates sessiond
 // and future children, not an already running coding agent's credentials.
-func (b *bootstrapper) refreshConfiguration(cfg runner.BootConfig, secrets map[string]string) error {
+func (b *bootstrapper) refreshConfiguration(ctx context.Context, cfg runner.BootConfig, secrets map[string]string) error {
 	env := map[string]string{}
 	if visitBootConfig(cfg, secrets, func(k, v string) error {
-		if !validGuestEnv(k, v) {
+		if ctx.Err() != nil || !validGuestEnv(k, v) {
 			return errGuestReconnect
 		}
 		env[k] = v
@@ -265,6 +266,9 @@ func (b *bootstrapper) refreshConfiguration(cfg runner.BootConfig, secrets map[s
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if ctx.Err() != nil {
+		return errGuestReconnect
+	}
 	for _, k := range b.configured {
 		if _, ok := env[k]; !ok {
 			if os.Unsetenv(k) != nil {
@@ -279,5 +283,33 @@ func (b *bootstrapper) refreshConfiguration(cfg runner.BootConfig, secrets map[s
 	}
 	b.configured = namesOf(env)
 	b.delivered = namesOf(secrets)
+	if b.configurationApplied != nil {
+		if b.configurationApplied(ctx) != nil {
+			return errGuestReconnect
+		}
+	}
+	if ctx.Err() != nil {
+		return errGuestReconnect
+	}
 	return nil
+}
+
+// bindExecEnvironment is installed before dialLoop begins. Refresh the runner's
+// immutable launch snapshot before the preamble can publish readiness. Existing
+// execs and the agent retain their environments; boot-chain exports stay intact.
+func (b *bootstrapper) bindExecEnvironment(execs *sandboxexec.Runner, extra []string) {
+	extra = append([]string(nil), extra...)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.configurationApplied = func(ctx context.Context) error {
+		if ctx.Err() != nil {
+			return errGuestReconnect
+		}
+		env := sandboxexec.SessionEnv(os.Environ(), extra)
+		if ctx.Err() != nil {
+			return errGuestReconnect
+		}
+		execs.ReplaceEnvironment(env)
+		return ctx.Err()
+	}
 }

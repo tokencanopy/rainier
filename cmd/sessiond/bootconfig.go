@@ -78,10 +78,11 @@ const (
 // exactly "at boot and again after every resume", with no second signal
 // needed.
 type bootstrapper struct {
-	mu           sync.Mutex
-	guest        *guestReconnectIdentity
-	reconnecting bool
-	configured   []string
+	mu                   sync.Mutex
+	guest                *guestReconnectIdentity
+	reconnecting         bool
+	configured           []string
+	configurationApplied func(context.Context) error
 	// attempted is the last token this session sent a request for, whatever
 	// the answer was.
 	//
@@ -439,7 +440,9 @@ func bootOverVsock(ctx context.Context, dial dialSession, b *bootstrapper) (rela
 	}
 	apply := applyBootConfig
 	if cfg.GuestReconnect != 0 {
-		apply = b.refreshConfiguration
+		apply = func(cfg runner.BootConfig, secrets map[string]string) error {
+			return b.refreshConfiguration(ctx, cfg, secrets)
+		}
 	}
 	if err := apply(cfg, secrets); err != nil {
 		if conn != nil {

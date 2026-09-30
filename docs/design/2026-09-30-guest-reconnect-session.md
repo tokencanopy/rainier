@@ -68,9 +68,18 @@ updates non-secret settings even for an empty secret response, and removes keys
 previously owned by this configuration when they disappear. Unowned inherited
 variables remain untouched. The legacy boot path keeps its existing behavior.
 
-This updates sessiond and future children. An already-running child retains its
+This updates sessiond and atomically replaces the exec runner environment before
+readiness, preserving boot-chain exports. New `rainier exec` children receive the
+current settings; removed secrets are absent. A refused reconnect does not update
+that snapshot. The delivery context is checked during validation and after all
+configuration consumers complete, so expiry during application refuses readiness.
+An already-running child retains its
 inherited environment; this is not live credential rotation inside a coding
 agent. Reconnect does not execute setup/init, start an agent or replace a PTY.
+Repository diff registration, generated git configuration and agent-sync entries
+remain boot-time artifacts. This slice does not rebuild them. Future host
+configuration delivery must preserve those launch invariants or explicitly
+reconcile them before enabling changes to those fields.
 
 ## Verification and remaining gates
 
@@ -83,7 +92,8 @@ concurrent attempts, connection closure and configuration replacement.
 against a real TCP protocol fixture, using the production bootstrap/preamble and
 PTY implementation. It verifies enrollment, a refused connection, a signed new
 connection, fresh token redemption and the same shell PID on the same PTY before
-and after, including the child-versus-parent environment distinction. This is the
+and after, including the child-versus-parent environment distinction, refreshed
+real exec children, removed values and preserved boot-chain exports. This is the
 closest executable check for an unenabled guest path; the shipping host has no
 caller yet. It is not AF_VSOCK/KVM or a hosted authorization/relay takeover test.
 

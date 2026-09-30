@@ -133,7 +133,7 @@ func TestReconnectRefreshEmptySecretsRemovesOldConfiguration(t *testing.T) {
 		t.Setenv(k, "")
 	}
 	t.Setenv("UNOWNED_TEST", "keep")
-	if err := b.refreshConfiguration(runner.BootConfig{SessionID: "session-test", ProxyURL: "http://proxy.invalid", NoProxy: "localhost", Env: map[string]string{"OLD_TEST_CONFIG": "old"}}, map[string]string{"OLD_TEST_SECRET": "synthetic"}); err != nil {
+	if err := b.refreshConfiguration(context.Background(), runner.BootConfig{SessionID: "session-test", ProxyURL: "http://proxy.invalid", NoProxy: "localhost", Env: map[string]string{"OLD_TEST_CONFIG": "old"}}, map[string]string{"OLD_TEST_SECRET": "synthetic"}); err != nil {
 		t.Fatal(err)
 	}
 	guest, host, ctx := reconnectPair(t)
@@ -291,7 +291,7 @@ func TestGuestConfigurationValidationBeforeMutation(t *testing.T) {
 	b, _ := reconnectFixture(t)
 	t.Setenv("RETAIN_TEST", "original")
 	b.configured = []string{"RETAIN_TEST"}
-	if err := b.refreshConfiguration(runner.BootConfig{Env: map[string]string{"INVALID=KEY": "x"}}, nil); err == nil {
+	if err := b.refreshConfiguration(context.Background(), runner.BootConfig{Env: map[string]string{"INVALID=KEY": "x"}}, nil); err == nil {
 		t.Fatal("accepted invalid environment")
 	}
 	if os.Getenv("RETAIN_TEST") != "original" {
@@ -410,5 +410,18 @@ func TestEnrollmentEnvironmentAboveHandshakeLimit(t *testing.T) {
 	controlWrite(t, ctx, host, relay.ControlEvent{Kind: "resp", ID: secretsRequestID, OK: true, Payload: payload})
 	if err := <-done; err != nil {
 		t.Fatal("authorized environment incorrectly bounded by handshake limit")
+	}
+}
+
+func TestConfigurationDeadlineAfterApplication(t *testing.T) {
+	b, _ := reconnectFixture(t)
+	t.Setenv("DEADLINE_TEST", "")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Deterministically expire while the post-application consumer runs, after
+	// the pre-application check. A preamble must not publish readiness afterward.
+	b.configurationApplied = func(context.Context) error { cancel(); return nil }
+	if err := b.refreshConfiguration(ctx, runner.BootConfig{Env: map[string]string{"DEADLINE_TEST": "new"}}, nil); err != errGuestReconnect {
+		t.Fatalf("expired delivery returned ready: %v", err)
 	}
 }
