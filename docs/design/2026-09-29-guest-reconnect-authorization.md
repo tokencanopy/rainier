@@ -37,10 +37,15 @@ the connection epoch, consumes the attempt and installs a new bootstrap hash in
 one transaction. Concurrent consumers produce one success. A lost response cannot
 be replayed; the caller must start a new attempt.
 
-The PostgreSQL adapter holds runner and session row locks until commit, checks
-connected/live state and uses database time after acquiring authorization locks
-for expiry. The caller's clock cannot extend a five-second challenge. Database
-clock skew can cause a closed refusal; it must never extend validity. No failed
+The PostgreSQL adapter holds runner, session and bootstrap row locks until commit,
+checks connected/live state and uses database time after acquiring those locks
+for expiry. All three mutations also acquire ROW EXCLUSIVE on the bootstrap
+table before evaluating expiry, so a maintenance SHARE lock cannot delay the
+subsequent UPDATE past that check. ROW EXCLUSIVE remains compatible with other
+ordinary writers. Enrollment and challenge issuance explicitly lock the bootstrap
+row: an UPDATE predicate alone can be evaluated before a lock-only transaction
+releases that row. The caller's clock cannot extend a
+five-second challenge. Database clock skew can cause a closed refusal; it must never extend validity. No failed
 operation returns a token or an epoch. Database errors are fixed sentinels.
 
 The connection epoch is scoped to an enrolled boot. It is not the placement
