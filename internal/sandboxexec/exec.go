@@ -243,6 +243,16 @@ func NewRunner(root string, env []string, start Starter) *Runner {
 		live: map[*attachment]struct{}{}}
 }
 
+// ReplaceEnvironment installs the authorized launch environment for future execs.
+// It does not mutate a request already composed or a process already running.
+// Callers retain boot-chain exports and fence old relay admission separately.
+func (r *Runner) ReplaceEnvironment(env []string) {
+	snapshot := append([]string(nil), env...)
+	r.mu.Lock()
+	r.env = snapshot
+	r.mu.Unlock()
+}
+
 // OpenExec starts one exec and returns its live attachment. It never returns
 // an error: every refusal is an `exec_error` the caller has to see and map to
 // an exit code, so a refused exec is an attachment that emits its reason and
@@ -746,7 +756,9 @@ func (r *Runner) validate(spec runner.ExecSpec) (Request, string) {
 // the agent, then TERM under --tty (matching session.StartProc), then the
 // caller's own additions, each checked by name.
 func (r *Runner) composeEnv(spec runner.ExecSpec) ([]string, string) {
+	r.mu.Lock()
 	env := append([]string(nil), r.env...)
+	r.mu.Unlock()
 	if spec.TTY {
 		env = append(env, "TERM=xterm-256color")
 	}

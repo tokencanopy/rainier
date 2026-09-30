@@ -412,6 +412,11 @@ type Spec struct {
 // writes no part of this to disk, and the values SecretNames names arrive in
 // the guest over the token exchange, from the control plane, never from here.
 type BootConfig struct {
+	// GuestReconnect opts a fresh guest into protocol-1 key enrollment. Zero
+	// preserves legacy boot. Hosts must leave this absent until end-to-end
+	// capability negotiation, lifecycle and relay fencing are implemented.
+	GuestReconnect uint64 `json:"guest_reconnect,omitempty"`
+
 	// Protocol is SessionBootstrapProtocolVersion. A guest that reads a
 	// version it does not speak fails its boot chain rather than booting on a
 	// configuration it has half understood.

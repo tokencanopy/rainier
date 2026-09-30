@@ -148,3 +148,32 @@ func (n *netConn) Write(ctx context.Context, b []byte) error {
 }
 
 func (n *netConn) Close() error { return n.c.Close() }
+
+// ReadLimited reads one stream frame with a caller-selected bound before
+// decoding it. It preserves buffered bytes for the following normal Read.
+// Only one reader may use a Conn at a time. Oversize closes the connection.
+func (n *netConn) ReadLimited(ctx context.Context, limit int) ([]byte, error) {
+	if limit < 1 || limit > maxFrameBytes {
+		return nil, ErrFrameTooLarge
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	stop := context.AfterFunc(ctx, func() { _ = n.c.Close() })
+	defer stop()
+	line := make([]byte, 0, min(limit, 4096))
+	for {
+		b, err := n.r.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		if b == '\n' {
+			return bytes.TrimRight(line, "\r"), nil
+		}
+		if len(line) == limit {
+			_ = n.c.Close()
+			return nil, ErrFrameTooLarge
+		}
+		line = append(line, b)
+	}
+}

@@ -251,6 +251,9 @@ func main() {
 	execs := sandboxexec.NewRunner(workspaceRoot,
 		sandboxexec.SessionEnv(os.Environ(), envAssignments(chainVars)),
 		sandboxexec.NewSpawner().Start)
+	if overVsock {
+		boots.bindExecEnvironment(execs, envAssignments(chainVars))
+	}
 
 	// What the RUNNER needs to know about those commands, and the only thing
 	// it needs: how many are running. runnerd's idle auto-stop stops a session

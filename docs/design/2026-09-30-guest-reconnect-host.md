@@ -48,8 +48,13 @@ redial. A built execution probe calls the port through real runnerd/RunAgent wit
 a synthetic driver and proof provider. No shipping CLI or listener invokes this
 port yet, so this is executable port coverage, not VM or guest continuity evidence.
 
-Depends on OSS PR113. Before enablement: guest key custody/enrollment, negotiated
-capability, strict 4 KiB/five-second guest handshake, bounded peer acceptance,
+Depends on OSS PR113. Guest key custody and the guest half of the bounded
+handshake are supplied by the follow-on slice linked below. Before enablement:
+negotiated capability, host handshake integration, bounded peer acceptance,
 current configuration delivery, cold lifecycle ordering, relay fencing and real
 PID/PTY/agent qualification. Hosted deployment additionally depends on Cloud
 PR146/147/148. No RAM persistence is introduced.
+
+Guest identity and preamble implementation are described in
+[the guest-side slice](2026-09-30-guest-reconnect-session.md). Host listener
+integration and capability enablement remain separate gates.
