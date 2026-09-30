@@ -53,3 +53,7 @@ capability, strict 4 KiB/five-second guest handshake, bounded peer acceptance,
 current configuration delivery, cold lifecycle ordering, relay fencing and real
 PID/PTY/agent qualification. Hosted deployment additionally depends on Cloud
 PR146/147/148. No RAM persistence is introduced.
+
+Guest identity and preamble implementation are described in
+[the guest-side slice](2026-09-30-guest-reconnect-session.md). Host listener
+integration and capability enablement remain separate gates.
