@@ -46,10 +46,15 @@ func (r pgGuestReconnects) lockScope(ctx context.Context, b control.GuestReconne
 	return nil
 }
 
-// lockBootstrap must precede expiry evaluation. UPDATE predicates can be
+// lockBootstrap obtains the table write lock and row lock before expiry evaluation. UPDATE predicates can be
 // evaluated before a lock-only transaction releases the tuple, so a timestamp
 // predicate in that UPDATE alone does not enforce expiry after a lock wait.
 func (r pgGuestReconnects) lockBootstrap(ctx context.Context, b control.GuestReconnectScope) error {
+	// SELECT FOR UPDATE takes only ROW SHARE on the relation. A maintenance
+	// SHARE lock would still make the later UPDATE wait past its expiry check.
+	if _, err := r.s.q(ctx).Exec(ctx, `LOCK TABLE session_bootstraps IN ROW EXCLUSIVE MODE`); err != nil {
+		return control.ErrUnavailable
+	}
 	var found int
 	err := r.s.q(ctx).QueryRow(ctx, `SELECT 1 FROM session_bootstraps WHERE workspace_id=$1 AND session_id=$2 FOR UPDATE`, string(b.WorkspaceID), string(b.SessionID)).Scan(&found)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -131,6 +136,9 @@ func (r pgGuestReconnects) ConsumeGuestReconnect(ctx context.Context, b control.
 	}
 	err := r.s.Run(ctx, func(ctx context.Context) error {
 		if err := r.lockScope(ctx, b); err != nil {
+			return err
+		}
+		if err := r.lockBootstrap(ctx, b); err != nil {
 			return err
 		}
 		var expiry time.Time
