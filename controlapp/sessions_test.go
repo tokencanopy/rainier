@@ -1021,7 +1021,9 @@ func TestDeleteSessionStateTable(t *testing.T) {
 		{"delete creating", control.StateCreating, "", "", control.ErrConflict},
 		{"delete running", control.StateRunning, control.StateDestroyed, "destroy", nil},
 		{"delete failed", control.StateFailed, control.StateDestroyed, "destroy", nil},
+		{"delete dead", control.StateDead, control.StateDestroyed, "", nil},
 		{"delete destroyed idempotent", control.StateDestroyed, control.StateDestroyed, "", nil},
+		{"delete canceled idempotent", control.StateCanceled, control.StateCanceled, "", nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
