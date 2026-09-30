@@ -46,12 +46,30 @@ func (r pgGuestReconnects) lockScope(ctx context.Context, b control.GuestReconne
 	return nil
 }
 
+// lockBootstrap must precede expiry evaluation. UPDATE predicates can be
+// evaluated before a lock-only transaction releases the tuple, so a timestamp
+// predicate in that UPDATE alone does not enforce expiry after a lock wait.
+func (r pgGuestReconnects) lockBootstrap(ctx context.Context, b control.GuestReconnectScope) error {
+	var found int
+	err := r.s.q(ctx).QueryRow(ctx, `SELECT 1 FROM session_bootstraps WHERE workspace_id=$1 AND session_id=$2 FOR UPDATE`, string(b.WorkspaceID), string(b.SessionID)).Scan(&found)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return control.ErrReconnectInvalid
+	}
+	if err != nil {
+		return control.ErrUnavailable
+	}
+	return nil
+}
+
 func (r pgGuestReconnects) EnrollGuest(ctx context.Context, b control.GuestReconnectScope, hash string, id control.GuestReconnectIdentity, now time.Time) error {
 	if hash == "" || len(id.BootEpoch) == 0 || len(id.BootEpoch) > 256 || len(id.PublicKey) == 0 || len(id.PublicKey) > 256 || now.IsZero() {
 		return control.ErrReconnectInvalid
 	}
 	return r.s.Run(ctx, func(ctx context.Context) error {
 		if err := r.lockScope(ctx, b); err != nil {
+			return err
+		}
+		if err := r.lockBootstrap(ctx, b); err != nil {
 			return err
 		}
 		ct, err := r.s.q(ctx).Exec(ctx, `UPDATE session_bootstraps SET consumed_at=$1,guest_boot_epoch=$2,guest_public_key=$3 WHERE workspace_id=$4 AND session_id=$5 AND token_hash=$6 AND placement_generation=$7 AND expires_at>$1 AND expires_at>clock_timestamp() AND consumed_at IS NULL AND guest_public_key IS NULL`, now, id.BootEpoch, id.PublicKey, string(b.WorkspaceID), string(b.SessionID), hash, int64(b.PlacementGeneration))
@@ -76,6 +94,9 @@ func (r pgGuestReconnects) BeginGuestReconnect(ctx context.Context, b control.Gu
 	}
 	err := r.s.Run(ctx, func(ctx context.Context) error {
 		if err := r.lockScope(ctx, b); err != nil {
+			return err
+		}
+		if err := r.lockBootstrap(ctx, b); err != nil {
 			return err
 		}
 		var databaseNow time.Time

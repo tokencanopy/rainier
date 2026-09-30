@@ -164,3 +164,93 @@ func TestGuestReconnectExpiresWhileWaitingForAuthorityLock(t *testing.T) {
 		t.Fatal("expired request changed capability or epoch")
 	}
 }
+
+// Expiry must be checked after waiting on the capability row itself, not just
+// after runner/session locks. A lock-only transaction need not change its tuple.
+func TestGuestReconnectExpiryAfterBootstrapRowLock(t *testing.T) {
+	dsn := startPostgres(t)
+	for _, operation := range []string{"enroll", "begin"} {
+		t.Run(operation, func(t *testing.T) {
+			st := freshStore(t, dsn, t.Name())
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			b := control.GuestReconnectScope{WorkspaceID: "ws_self_hosted", PoolID: "pool_self_hosted", SessionID: "expiry.test", RunnerID: "runner.test", PlacementGeneration: 1, ConnectionGeneration: 1}
+			if _, err := st.Sessions().CreateSession(ctx, "ws_self_hosted", control.Session{ID: b.SessionID, CreatorID: "actor.test", PoolID: "pool_self_hosted", RunnerID: b.RunnerID, State: control.StateRunning}); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.Fleet().UpsertRunner(ctx, "pool_self_hosted", control.Runner{ID: b.RunnerID, Generation: 1, Connected: true}); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			token := control.SessionBootstrap{Hash: "hash.test", PlacementGeneration: 1, ExpiresAt: now.Add(2 * time.Second)}
+			if err := st.Bootstraps().PutSessionBootstrap(ctx, "ws_self_hosted", b.SessionID, token); err != nil {
+				t.Fatal(err)
+			}
+			id := control.GuestReconnectIdentity{BootEpoch: "boot.test", PublicKey: "key.test"}
+			r := st.GuestReconnects()
+			if operation == "begin" {
+				if err := r.EnrollGuest(ctx, b, token.Hash, id, now); err != nil {
+					t.Fatal(err)
+				}
+			}
+			tx, err := st.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(context.Background())
+			var holder int
+			if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&holder); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `SELECT 1 FROM session_bootstraps WHERE workspace_id=$1 AND session_id=$2 FOR UPDATE`, string(b.WorkspaceID), string(b.SessionID)); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() {
+				if operation == "enroll" {
+					done <- r.EnrollGuest(ctx, b, token.Hash, id, now)
+					return
+				}
+				_, err := r.BeginGuestReconnect(ctx, b, control.GuestReconnectAttempt{ID: "attempt.test", Challenge: "nonce.test", ExpiresAt: token.ExpiresAt}, now)
+				done <- err
+			}()
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				var waiting bool
+				if err := st.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND $1=ANY(pg_blocking_pids(pid)))`, holder).Scan(&waiting); err != nil {
+					t.Fatal(err)
+				}
+				if waiting {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("request did not wait on bootstrap row")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if wait := time.Until(token.ExpiresAt.Add(20 * time.Millisecond)); wait > 0 {
+				time.Sleep(wait)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			err = <-done
+			want := control.ErrReconnectInvalid
+			if operation == "begin" {
+				want = control.ErrReconnectExpired
+			}
+			if !errors.Is(err, want) {
+				t.Fatalf("expired %s: %v", operation, err)
+			}
+			var enrolled, pending, consumed bool
+			var hash string
+			var epoch int64
+			if err := st.pool.QueryRow(ctx, `SELECT guest_public_key IS NOT NULL,reconnect_attempt IS NOT NULL,consumed_at IS NOT NULL,token_hash,guest_connection_epoch FROM session_bootstraps WHERE workspace_id=$1 AND session_id=$2`, string(b.WorkspaceID), string(b.SessionID)).Scan(&enrolled, &pending, &consumed, &hash, &epoch); err != nil {
+				t.Fatal(err)
+			}
+			if enrolled != (operation == "begin") || consumed != (operation == "begin") || pending || hash != token.Hash || epoch != 0 {
+				t.Fatal("expired operation changed authorization")
+			}
+		})
+	}
+}
