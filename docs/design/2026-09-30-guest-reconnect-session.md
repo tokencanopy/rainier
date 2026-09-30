@@ -70,8 +70,10 @@ variables remain untouched. The legacy boot path keeps its existing behavior.
 
 This updates sessiond and atomically replaces the exec runner environment before
 readiness, preserving boot-chain exports. New `rainier exec` children receive the
-current settings; removed secrets are absent. A refused reconnect does not update
-that snapshot. The delivery context is checked during validation and after all
+current settings; removed secrets are absent. A proof or authorization refusal
+does not update that snapshot. Expiry during application can leave settings
+applied, but the preamble returns failure and does not publish readiness.
+The delivery context is checked during validation and after all
 configuration consumers complete, so expiry during application refuses readiness.
 An already-running child retains its
 inherited environment; this is not live credential rotation inside a coding
