@@ -235,9 +235,8 @@ func (s *EnvironmentService) UpdateEnvironment(ctx context.Context, scope contro
 }
 
 // DeleteEnvironment reads and authorizes the environment, then refuses the
-// delete while any non-terminal session still references it. A repository
-// ErrNotFound remains ErrNotFound even if another workspace holds the same
-// opaque ID.
+// delete while any non-terminal session still references it, in one
+// repository call. ErrNotFound persists even under another workspace's ID.
 func (s *EnvironmentService) DeleteEnvironment(ctx context.Context, scope control.Scope, cmd control.DeleteEnvironment) error {
 	if err := scope.Validate(); err != nil {
 		return control.ErrInvalid
@@ -253,17 +252,13 @@ func (s *EnvironmentService) DeleteEnvironment(ctx context.Context, scope contro
 		return control.ErrDenied
 	}
 
-	n, err := s.environments.CountSessionsByEnvironment(ctx, scope.WorkspaceID, cmd.ID, control.NonTerminal)
-	if err != nil {
-		return control.ErrUnavailable
-	}
-	if n != 0 {
-		return control.ErrConflict
-	}
 	return s.uow.Run(ctx, func(ctx context.Context) error {
-		if err := s.environments.DeleteEnvironment(ctx, scope.WorkspaceID, cmd.ID); err != nil {
+		if err := s.environments.DeleteEnvironmentUnlessReferenced(ctx, scope.WorkspaceID, cmd.ID, control.NonTerminal); err != nil {
 			if errors.Is(err, control.ErrNotFound) {
 				return control.ErrNotFound
+			}
+			if errors.Is(err, control.ErrConflict) {
+				return control.ErrConflict
 			}
 			return control.ErrUnavailable
 		}

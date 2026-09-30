@@ -286,8 +286,8 @@ func TestDeleteEnvironmentGuard(t *testing.T) {
 	if err := f.svc.DeleteEnvironment(context.Background(), sessionTestScope(), control.DeleteEnvironment{ID: "env_example"}); !errors.Is(err, control.ErrConflict) {
 		t.Fatalf("delete with live session: got %v, want ErrConflict", err)
 	}
-	if f.log.has("environments:delete") {
-		t.Fatalf("delete reached the repository despite a live session: %v", f.log.snapshot())
+	if _, ok := f.repo.rows["env_example"]; !ok {
+		t.Fatalf("environment removed despite a live session")
 	}
 
 	// No live session deletes and records an event.
