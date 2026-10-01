@@ -158,6 +158,7 @@ func TestReconnectRefreshEmptySecretsRemovesOldConfiguration(t *testing.T) {
 		t.Fatal("stale token")
 	}
 	controlWrite(t, ctx, host, relay.ControlEvent{Kind: "resp", ID: request.ID, OK: true, Payload: json.RawMessage(`{"env":{}}`)})
+	acknowledgeGuestReady(t, ctx, host, accepted.Epoch)
 	if err = <-done; err != nil {
 		t.Fatal(err)
 	}
