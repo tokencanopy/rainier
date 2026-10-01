@@ -58,3 +58,7 @@ PR146/147/148. No RAM persistence is introduced.
 Guest identity and preamble implementation are described in
 [the guest-side slice](2026-09-30-guest-reconnect-session.md). Host listener
 integration and capability enablement remain separate gates.
+
+The [host stream transport](2026-10-01-guest-reconnect-transport.md) supplies
+the bounded proof callback and moves legacy listener admission before worker
+creation. Live listener integration remains gated on the complete handoff.
