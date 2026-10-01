@@ -127,7 +127,7 @@ func (b *bootstrapper) reconnectGuest(ctx context.Context, c relay.Conn) error {
 	if err = b.refreshConfiguration(delivery, cfg, env); err != nil {
 		return errGuestReconnect
 	}
-	return nil
+	return guestReady(delivery, c, accepted.Epoch)
 }
 
 func guestProof(ctx context.Context, c relay.Conn, session, boot string, key ed25519.PrivateKey, epoch uint64) (runner.GuestReconnectAcceptResponse, error) {
@@ -312,4 +312,26 @@ func (b *bootstrapper) bindExecEnvironment(execs *sandboxexec.Runner, extra []st
 		execs.ReplaceEnvironment(env)
 		return ctx.Err()
 	}
+}
+
+// guestReady keeps terminal/exec and credential RPC offline after applying
+// configuration until the host acknowledges this exact accepted epoch. A lost
+// acknowledgment requires a new signed attempt, never replay of a spent token.
+func guestReady(ctx context.Context, c relay.Conn, epoch uint64) error {
+	ctx, cancel := context.WithTimeout(ctx, guestHandshakeWait)
+	defer cancel()
+	ready := runner.GuestReconnectReady{Protocol: runner.GuestReconnectProtocol, Epoch: epoch}
+	body, _ := json.Marshal(ready)
+	if ctx.Err() != nil || relay.WriteGuestReconnectFrame(ctx, c, relay.KindGuestReconnectReady, body) != nil {
+		return errGuestReconnect
+	}
+	event, err := relay.ReadGuestReconnectFrame(ctx, c)
+	if err != nil || event.Kind != relay.KindGuestReconnectReadyAck {
+		return errGuestReconnect
+	}
+	acknowledgment, err := runner.DecodeGuestReconnectReady(event.Payload)
+	if err != nil || acknowledgment.Epoch != epoch || ctx.Err() != nil {
+		return errGuestReconnect
+	}
+	return nil
 }
