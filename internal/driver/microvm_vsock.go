@@ -368,15 +368,10 @@ func (m *Microvm) openGuestChannel(sessionID, udsPath, listenPath string, cfg ru
 	return g, nil
 }
 
-// acceptGuests keeps accepting for the life of the instance.
-//
-// It keeps accepting even though exactly one connection is ever SERVED,
-// because the alternative is worse in both directions: an accept loop that
-// stopped would leave later dials queued in the kernel with nobody to refuse
-// them, and a loop that served inline would be wedged for good by the first
-// guest that connected and did not read (the boot config can exceed a
-// megabyte — see bootConfigWriteTimeout). So each connection gets a goroutine
-// of its own, and all but the first are refused in it.
+// acceptGuests keeps accepting for the life of the instance. Admission happens
+// inline before starting a worker: only the one claimed boot connection may
+// allocate a serving goroutine. Refused peers receive no bytes and no per-peer
+// log line. A blocked boot write cannot prevent rejection of later peers.
 func (m *Microvm) acceptGuests(sessionID string, g *guestChannel) {
 	for {
 		c, err := g.listener.Accept()
@@ -386,11 +381,16 @@ func (m *Microvm) acceptGuests(sessionID string, g *guestChannel) {
 			}
 			return
 		}
+		if !g.claim(c) {
+			_ = c.Close()
+			continue
+		}
 		go m.serveGuest(sessionID, g, c)
 	}
 }
 
-// serveGuest hands ONE guest connection its configuration and then hands the
+// serveGuest handles the ONE connection already claimed by acceptGuests.
+// It sends that guest its configuration and then hands the
 // connection to the runner.
 //
 // The boot configuration is the FIRST frame on the conn, written here before
@@ -407,15 +407,6 @@ func (m *Microvm) acceptGuests(sessionID string, g *guestChannel) {
 // holding it. There is nothing to attach it to, and the claim stays spent:
 // this boot has had its one connection.
 func (m *Microvm) serveGuest(sessionID string, g *guestChannel, c net.Conn) {
-	if !g.claim(c) {
-		// Not an error the operator can act on and not a rarity worth a
-		// line per occurrence — but it IS somebody in the guest dialling a
-		// socket that is not theirs, so it is said once per attempt and
-		// names nothing about the session but its id.
-		log.Printf("microvm: session %s: refusing a second connection on a control channel that serves one guest per boot", sessionID)
-		_ = c.Close()
-		return
-	}
 	conn := relay.NetConn(c)
 	ctx, cancel := context.WithTimeout(context.Background(), bootConfigWriteTimeout)
 	defer cancel()
