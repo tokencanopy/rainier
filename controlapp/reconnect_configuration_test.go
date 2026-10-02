@@ -66,6 +66,7 @@ func TestGuestReconnectSpecFailureReturnsNoConfiguration(t *testing.T) {
 func TestGuestReconnectCreateRequiresNegotiatedCapability(t *testing.T) {
 	for _, enabled := range []bool{false, true} {
 		fx := newFleetFixture(t)
+		fx.service.guestReconnect = true
 		caps := []string{runner.CapabilityMicrovmV1}
 		if enabled {
 			caps = append(caps, runner.CapabilityGuestReconnectV1)
@@ -77,5 +78,16 @@ func TestGuestReconnectCreateRequiresNegotiatedCapability(t *testing.T) {
 		if (spec.GuestReconnect == 1) != enabled {
 			t.Fatal("guest opt-in does not match negotiation")
 		}
+	}
+}
+
+func TestGuestReconnectCreateRequiresHostSupport(t *testing.T) {
+	fx := newFleetFixture(t)
+	spec, fail := fx.service.createSpec(fleetCtx, bootstrapRow(), nil, []string{runner.CapabilityMicrovmV1, runner.CapabilityGuestReconnectV1}, 3)
+	if fail != "" {
+		t.Fatal(fail)
+	}
+	if spec.GuestReconnect != 0 {
+		t.Fatal("negotiated reconnect without host authority support")
 	}
 }

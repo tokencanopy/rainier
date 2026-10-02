@@ -423,7 +423,7 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 	if fail != "" {
 		return nil, fail
 	}
-	if withheld && slices.Contains(runnerCaps, runner.CapabilityGuestReconnectV1) {
+	if s.guestReconnect && withheld && slices.Contains(runnerCaps, runner.CapabilityGuestReconnectV1) {
 		spec.GuestReconnect = runner.GuestReconnectProtocol
 	}
 	if withheld {

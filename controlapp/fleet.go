@@ -61,6 +61,11 @@ type FleetOptions struct {
 	// the exposure this whole design removes.
 	Bootstraps control.SessionBootstrapStore
 
+	// GuestReconnect enables negotiation only when the host composes the
+	// transactional current-authority dispatcher. Driver capability alone
+	// cannot establish that its peer implements enrollment and recovery.
+	GuestReconnect bool
+
 	// DefaultEgress replaces the built-in developer egress baseline
 	// (DefaultDeveloperEgressHosts) that every dispatched session's allowlist
 	// is unioned with. It is a POINTER because "leave it alone" and "make it
@@ -108,7 +113,8 @@ type FleetService struct {
 	// bootstraps mints and records a microVM session's bootstrap token
 	// (FleetOptions.Bootstraps), composed once here over the same clock every
 	// other decision in this service reads.
-	bootstraps SessionBootstrapMinter
+	bootstraps     SessionBootstrapMinter
+	guestReconnect bool
 
 	// defaultEgress is the host's developer egress baseline, resolved once at
 	// construction (FleetOptions.DefaultEgress). Held as a plain slice because
@@ -160,6 +166,7 @@ func NewFleetService(opts FleetOptions) (*FleetService, error) {
 		uow:                 opts.UnitOfWork,
 		checkpoints:         opts.Checkpoints,
 		bootstraps:          SessionBootstrapMinter{Store: opts.Bootstraps, Clock: opts.Clock},
+		guestReconnect:      opts.GuestReconnect,
 		defaultEgress:       resolveDefaultEgress(opts.DefaultEgress),
 		wake:                make(chan control.PoolID, 64),
 		known:               make(map[control.PoolID]struct{}),
