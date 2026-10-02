@@ -63,6 +63,7 @@ func testMicrovmNet(t *testing.T, opts MicrovmOpts) (*Microvm, *SimulatedEngine,
 	if err != nil {
 		t.Fatalf("NewMicrovm: %v", err)
 	}
+	t.Cleanup(func() { m.stateLock.Close() })
 	return m, sim, net
 }
 
@@ -301,6 +302,7 @@ func TestMicrovmColdSuspendedSessionIsNotGone(t *testing.T) {
 
 	// And after a restart: a new driver over the same state directory, with a
 	// new engine that has no memory of the VM at all.
+	stopTestMicrovmRunner(t, m)
 	m2, _ := testMicrovm(t, MicrovmOpts{
 		TotalSlots: 4,
 		StateDir:   stateDir,
@@ -363,6 +365,7 @@ func TestMicrovmRestartRecovery(t *testing.T) {
 
 	// A complete runner restart: a new engine AND a new driver over the same
 	// state directory.
+	stopTestMicrovmRunner(t, m1)
 	m2, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
 
 	listed, err := m2.List(ctx)
@@ -649,6 +652,7 @@ func TestMicrovmColdResumeAfterRestartRefuses(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	stopTestMicrovmRunner(t, m1)
 	m2, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
 	m2.SetHost(&stubMicrovmHost{})
 	if _, err := m2.Resume(ctx, h.ID); err == nil {
@@ -1574,5 +1578,37 @@ func TestFirecrackerStopDoesNotHangOnAnUnidentifiableChild(t *testing.T) {
 	// And it was left alone rather than signalled in the VM's name.
 	if err := syscall.Kill(pid, 0); err != nil {
 		t.Errorf("Stop signalled a process it could not identify as this VM's VMM: %v", err)
+	}
+}
+
+// Simulate process exit without stopping surviving VMs or deleting their UDS.
+// A second fixture is a restart, never a concurrent writer of the same state.
+func stopTestMicrovmRunner(t *testing.T, m *Microvm) {
+	t.Helper()
+	m.mu.Lock()
+	var channels []*guestChannel
+	for _, rec := range m.instances {
+		if rec.channel != nil {
+			channels = append(channels, rec.channel)
+		}
+	}
+	m.mu.Unlock()
+	for _, g := range channels {
+		g.mu.Lock()
+		g.closed = true
+		conns := make([]net.Conn, 0, len(g.conns))
+		for c := range g.conns {
+			conns = append(conns, c)
+		}
+		g.mu.Unlock()
+		if g.listener != nil {
+			g.listener.Close()
+		}
+		for _, c := range conns {
+			g.drop(c)
+		}
+	}
+	if err := m.stateLock.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

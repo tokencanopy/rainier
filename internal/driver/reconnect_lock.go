@@ -8,7 +8,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// lockGuestState excludes another reconnect-capable runner before discovery or
+// lockGuestState excludes another current-version microVM runner before discovery or
 // cleanup can touch surviving VMs. Keep the file in place: unlinking it would
 // permit a second owner to lock a different inode at the same path.
 func lockGuestState(dir string) (*os.File, error) {

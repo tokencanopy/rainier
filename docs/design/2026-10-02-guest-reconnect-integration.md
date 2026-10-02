@@ -29,8 +29,9 @@ as part of reconnect.
 
 ## Runner restart candidate
 
-An opted-in driver holds an exclusive state-directory lock before discovery and
-cleanup. Fresh launches persist non-secret process identity: host boot ID,
+Every current-version microVM driver holds an exclusive state-directory lock
+before discovery and cleanup, including when reconnect is disabled. Older
+binaries do not participate in this lock and must be drained before rollout. Fresh launches persist non-secret process identity: host boot ID,
 process start time, and network namespace inode/device. Recovery requires current
 control-plane placement authorization before binding a listener. Local checks
 verify exact process arguments and UID/GID, persisted identity, jail and VMM

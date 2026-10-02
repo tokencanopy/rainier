@@ -41,3 +41,17 @@ func TestGuestStateOwnershipRejectsSymlink(t *testing.T) {
 		t.Fatal("altered symlink target")
 	}
 }
+
+func TestGuestStateOwnershipCannotBeBypassedByDisablingReconnect(t *testing.T) {
+	m, _ := testMicrovm(t, MicrovmOpts{GuestReconnect: true})
+	defer m.stateLock.Close()
+	opts := m.opts
+	opts.GuestReconnect = false
+	other, err := NewMicrovm(opts)
+	if err == nil {
+		if other.stateLock != nil {
+			other.stateLock.Close()
+		}
+		t.Fatal("capability-off driver bypassed active ownership")
+	}
+}

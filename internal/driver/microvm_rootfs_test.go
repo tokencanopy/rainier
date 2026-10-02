@@ -273,6 +273,7 @@ func TestMicrovmReclaimsOrphanRootfsOnStart(t *testing.T) {
 	}
 
 	// A new runner over the same state directory: the restart.
+	stopTestMicrovmRunner(t, m)
 	restarted, _, _ := testMicrovmCloning(t, MicrovmOpts{
 		TotalSlots: 4, StateDir: stateDir, BaseRootfs: m.opts.BaseRootfs,
 	})

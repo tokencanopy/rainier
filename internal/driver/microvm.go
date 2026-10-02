@@ -499,7 +499,7 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 	}
 	var stateLock *os.File
 	constructed := false
-	if opts.GuestReconnect {
+	{ // Every current-version writer participates, independent of capability.
 		if err := os.MkdirAll(opts.StateDir, microvmDirMode); err != nil {
 			return nil, err
 		}
