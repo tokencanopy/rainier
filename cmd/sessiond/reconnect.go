@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,7 @@ type guestReconnectIdentity struct {
 	key           ed25519.PrivateKey
 	enrolled      bool
 	epoch         uint64
+	launch        [32]byte
 }
 
 func (b *bootstrapper) enrollGuest(ctx context.Context, c relay.Conn, cfg runner.BootConfig) (map[string]string, error) {
@@ -38,7 +40,7 @@ func (b *bootstrapper) enrollGuest(ctx context.Context, c relay.Conn, cfg runner
 		return nil, errGuestReconnect
 	}
 	// A failed or unsupported opt-in is sticky: later dials cannot downgrade.
-	g := &guestReconnectIdentity{session: cfg.SessionID}
+	g := &guestReconnectIdentity{session: cfg.SessionID, launch: guestLaunchIdentity(cfg)}
 	b.guest = g
 	b.mu.Unlock()
 	if cfg.GuestReconnect != runner.GuestReconnectProtocol || !guestID(cfg.SessionID) {
@@ -106,7 +108,7 @@ func (b *bootstrapper) reconnectGuest(ctx context.Context, c relay.Conn) error {
 	delivery, cancel := context.WithTimeout(ctx, time.Duration(accepted.ExpiresInSec)*time.Second)
 	defer cancel()
 	cfg, err := readBootConfig(delivery, c)
-	if err != nil || cfg.SessionID != session || cfg.GuestReconnect != 1 || cfg.BootstrapToken != accepted.Token {
+	if err != nil || cfg.SessionID != session || cfg.GuestReconnect != 1 || cfg.BootstrapToken != accepted.Token || guestLaunchIdentity(cfg) != g.launch {
 		return errGuestReconnect
 	}
 	b.mu.Lock()
@@ -334,4 +336,23 @@ func guestReady(ctx context.Context, c relay.Conn, epoch uint64) error {
 		return errGuestReconnect
 	}
 	return nil
+}
+
+// The live boot retains only a digest of fields whose consumers run once.
+// Repositories, git attribution, setup, proxy policy and agent custody paths
+// cannot be refreshed merely by changing sessiond's environment. A changed
+// launch requires a new boot; ordinary environment values and secret names may
+// still refresh. The digest never reaches the host or durable storage.
+func guestLaunchIdentity(cfg runner.BootConfig) [32]byte {
+	cfg.BootstrapToken = ""
+	cfg.SecretNames = nil
+	launchEnv := map[string]string{}
+	for key, value := range cfg.Env {
+		if key == "RAINIER_AGENTS_B64" || strings.HasPrefix(value, "/rainier/agents/") {
+			launchEnv[key] = value
+		}
+	}
+	cfg.Env = launchEnv
+	body, _ := json.Marshal(cfg)
+	return sha256.Sum256(body)
 }

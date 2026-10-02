@@ -417,6 +417,42 @@ func (s *FleetService) placedGeneration(ctx context.Context, row control.Session
 // Spec.Env, as they always have, or stay behind a single-use token the guest
 // exchanges for them after it boots (see §3 of the design note).
 func (s *FleetService) createSpec(ctx context.Context, row control.Session, env *control.Environment, runnerCaps []string, gen uint64) (*runner.Spec, string) {
+	withheld := slices.Contains(runnerCaps, runner.CapabilityMicrovmV1)
+	spec, fail := s.launchSpec(ctx, row, env, withheld)
+	if fail != "" {
+		return nil, fail
+	}
+	if withheld && slices.Contains(runnerCaps, runner.CapabilityGuestReconnectV1) {
+		spec.GuestReconnect = runner.GuestReconnectProtocol
+	}
+	if withheld {
+		token, err := s.bootstraps.Mint(ctx, row.WorkspaceID, row.ID, gen)
+		if err != nil {
+			return nil, "could not mint this session's bootstrap token"
+		}
+		spec.BootstrapToken = token
+	}
+	return spec, ""
+}
+
+// ResolveGuestReconnectSpec resolves current non-secret launch configuration
+// without minting or spending bootstrap authority. The caller must authorize
+// current membership, policy and the exact runner placement before calling and
+// before delivery. This is not authorization or a cache; the accepted proof's
+// fresh token is supplied separately. Launch invariants must be checked against
+// the live guest before applying changes. Failure returns nil and a fixed error.
+func (s *FleetService) ResolveGuestReconnectSpec(ctx context.Context, row control.Session, env *control.Environment) (*runner.Spec, error) {
+	if ctx.Err() != nil {
+		return nil, control.ErrUnavailable
+	}
+	spec, fail := s.launchSpec(ctx, row, env, true)
+	if fail != "" || ctx.Err() != nil {
+		return nil, control.ErrUnavailable
+	}
+	return spec, nil
+}
+
+func (s *FleetService) launchSpec(ctx context.Context, row control.Session, env *control.Environment, withheld bool) (*runner.Spec, string) {
 	spec := runner.Spec{
 		Name:        row.Name,
 		Image:       row.Spec.Image,
@@ -456,7 +492,6 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 	// ends in a file; so the values stay here and the create carries their
 	// NAMES and a token instead (ADR-0003 §2.7 item 1). Every other runner —
 	// which is every runner today — is dispatched exactly what it always was.
-	withheld := slices.Contains(runnerCaps, runner.CapabilityMicrovmV1)
 	if !withheld {
 		spec.Env = cloneMap(material.Environment)
 	}
@@ -484,7 +519,7 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 		}
 		spec.Env = agentEnv
 	}
-	// The names, and then the token, in that order: the names are derived
+	// Withhold values before a caller adds its separately authorized token. Names are derived
 	// from the material this function already holds, and they are computed
 	// AFTER the agent-home block so that the one rule that block states —
 	// agent paths and the manifest are launch invariants a workspace's own
@@ -494,15 +529,6 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 	// guest then applies over its own agent home.
 	if withheld {
 		spec.SecretNames = withholdableNames(material.Environment, spec.Env)
-		token, err := s.bootstraps.Mint(ctx, row.WorkspaceID, row.ID, gen)
-		if err != nil {
-			// Fail closed. The alternative to refusing here is a session
-			// dispatched with neither its secrets nor a way to ask for them,
-			// which boots, reports healthy, and fails at whatever the first
-			// credential-shaped thing it does is.
-			return nil, "could not mint this session's bootstrap token"
-		}
-		spec.BootstrapToken = token
 	}
 	// Either the values or the token, never both — stated as a check rather
 	// than as a comment, because it is the whole security claim of §3 and it
@@ -514,7 +540,7 @@ func (s *FleetService) createSpec(ctx context.Context, row control.Session, env 
 	// spec.Env below the withholding branch, or reorders the two — at which
 	// point a failed create is a much better answer than a secret on a
 	// shared host's disk.
-	if spec.BootstrapToken != "" {
+	if withheld {
 		for _, name := range spec.SecretNames {
 			if _, both := spec.Env[name]; both {
 				return nil, "could not resolve launch material"

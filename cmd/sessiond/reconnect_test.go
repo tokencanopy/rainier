@@ -75,7 +75,7 @@ func reconnectFixture(t *testing.T) (*bootstrapper, runner.GuestReconnectChallen
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &bootstrapper{guest: &guestReconnectIdentity{session: "session-test", boot: "boot-test", key: key, enrolled: true}}, runner.GuestReconnectChallenge{Protocol: 1, SessionID: "session-test", BootEpoch: "boot-test", HostIncarnation: "host-test", AttemptID: "attempt-test", PlacementGeneration: 1, Challenge: base64.RawURLEncoding.EncodeToString(make([]byte, 32))}
+	return &bootstrapper{guest: &guestReconnectIdentity{session: "session-test", boot: "boot-test", key: key, enrolled: true, launch: guestLaunchIdentity(runner.BootConfig{Protocol: 1, GuestReconnect: 1, SessionID: "session-test"})}}, runner.GuestReconnectChallenge{Protocol: 1, SessionID: "session-test", BootEpoch: "boot-test", HostIncarnation: "host-test", AttemptID: "attempt-test", PlacementGeneration: 1, Challenge: base64.RawURLEncoding.EncodeToString(make([]byte, 32))}
 }
 func writeReconnect(t *testing.T, ctx context.Context, c relay.Conn, kind string, v any) {
 	t.Helper()

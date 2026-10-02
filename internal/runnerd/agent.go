@@ -137,7 +137,8 @@ func (cfg AgentConfig) resetsBackoff(establishedAt time.Time) bool {
 // runner sends afterwards. Atomic because the accept is handled on the
 // reader while events fire from session goroutines.
 type agentSessionState struct {
-	generation atomic.Uint64
+	recoveryStarted atomic.Bool
+	generation      atomic.Uint64
 }
 
 // jitter returns a random duration in [0, d/2) — timing spread, not security.
@@ -434,6 +435,14 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 		// informational — the set controld will schedule on, which is this
 		// runner's own claims minus anything it refused.
 		ag.generation.Store(m.Generation)
+		for _, capability := range m.Capabilities {
+			if capability == runner.CapabilityGuestReconnectV1 && ag.recoveryStarted.CompareAndSwap(false, true) {
+				if rc := s.reconnectControl.Load(); rc != nil && rc.state == ag {
+					go s.recoverGuests(rc)
+				}
+				break
+			}
+		}
 		log.Printf("agent: accepted at generation %d with %d capabilities", m.Generation, len(m.Capabilities))
 	case "create":
 		var spec driver.Spec
@@ -446,22 +455,7 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 			// carry — and this runner's only job is to hand it to the
 			// container. Nothing here logs Env; its values are secrets as
 			// often as not.
-			spec = driver.Spec{
-				Name: m.Spec.Name, Image: m.Spec.Image, Cmd: m.Spec.Cmd, EgressAllow: m.Spec.EgressAllow,
-				Setup: m.Spec.Setup, SetupTimeoutSec: m.Spec.SetupTimeoutSec, Env: m.Spec.Env,
-				Repos: driverRepos(m.Spec.Repos),
-				Init:  m.Spec.Init, InitTimeoutSec: m.Spec.InitTimeoutSec,
-				GitAuthorName: m.Spec.GitAuthorName, GitAuthorEmail: m.Spec.GitAuthorEmail,
-				Home: driverHome(m.Spec.Home),
-				// The microVM bootstrap pair, carried through like
-				// everything else. This runner does not read the token — it
-				// goes into the guest's boot configuration and is dropped —
-				// and it does not check the names against Env. The DRIVER
-				// decides what an unwithheld create means, because the answer
-				// is different for each one: Docker has always accepted the
-				// values and still does.
-				BootstrapToken: m.Spec.BootstrapToken, SecretNames: m.Spec.SecretNames,
-			}
+			spec = guestDriverSpec(*m.Spec)
 			allow = m.Spec.EgressAllow
 		}
 		// Idempotency lives inside CreateWithID's own putIfAbsent now, not a
@@ -915,4 +909,23 @@ func driverHome(h *runner.HomeMount) *driver.HomeMount {
 		return nil
 	}
 	return &driver.HomeMount{Volume: h.Volume, Path: h.Path}
+}
+
+func guestDriverSpec(spec runner.Spec) driver.Spec {
+	return driver.Spec{
+		GuestReconnect: spec.GuestReconnect, Name: spec.Name, Image: spec.Image, Cmd: spec.Cmd, EgressAllow: spec.EgressAllow,
+		Setup: spec.Setup, SetupTimeoutSec: spec.SetupTimeoutSec, Env: spec.Env,
+		Repos: driverRepos(spec.Repos),
+		Init:  spec.Init, InitTimeoutSec: spec.InitTimeoutSec,
+		GitAuthorName: spec.GitAuthorName, GitAuthorEmail: spec.GitAuthorEmail,
+		Home: driverHome(spec.Home),
+		// The microVM bootstrap pair, carried through like
+		// everything else. This runner does not read the token — it
+		// goes into the guest's boot configuration and is dropped —
+		// and it does not check the names against Env. The DRIVER
+		// decides what an unwithheld create means, because the answer
+		// is different for each one: Docker has always accepted the
+		// values and still does.
+		BootstrapToken: spec.BootstrapToken, SecretNames: spec.SecretNames,
+	}
 }

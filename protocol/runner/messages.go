@@ -103,6 +103,10 @@ const SessionBootstrapProtocolVersion = 1
 // Spec, byte for byte.
 const CapabilityMicrovmV1 = "microvm.v1"
 
+// CapabilityGuestReconnectV1 negotiates fresh guest enrollment and authenticated
+// live reconnect. It requires both the microVM driver and control-plane handlers.
+const CapabilityGuestReconnectV1 = "guest_reconnect.v1"
+
 // HomeMount is the agent home a create mounts into a sandbox: one writable
 // volume per (creator, workspace), landing at Path, inside which each coding
 // agent gets its own subdirectory. It is what makes "log in once" true across
@@ -328,10 +332,12 @@ type RepoSpec struct {
 // passes only the pieces that apply; Env values are secrets as often as not
 // and never logged verbatim.
 type Spec struct {
-	Name        string   `json:"name,omitempty"`
-	Image       string   `json:"image,omitempty"`
-	Cmd         []string `json:"cmd,omitempty"`
-	EgressAllow []string `json:"egress_allow,omitempty"`
+	// GuestReconnect opts a fresh guest into authenticated reconnect enrollment.
+	GuestReconnect uint64   `json:"guest_reconnect,omitempty"`
+	Name           string   `json:"name,omitempty"`
+	Image          string   `json:"image,omitempty"`
+	Cmd            []string `json:"cmd,omitempty"`
+	EgressAllow    []string `json:"egress_allow,omitempty"`
 	// Setup is the environment's setup script, run once inside the fresh
 	// container; the runner reports its outcome as a "setup_done" /
 	// "setup_failed" event. SetupTimeoutSec bounds that run (0 = the

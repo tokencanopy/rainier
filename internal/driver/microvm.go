@@ -96,13 +96,15 @@ const (
 // simulated engine reports every session as running while nothing executes,
 // which is the single worst failure mode this component has.
 type MicrovmOpts struct {
-	BaseRootfs string // default base ext4 rootfs image path (required in production)
-	KernelPath string // guest vmlinux kernel path (required in production)
-	StateDir   string // directory holding instance sockets, metadata, and disks (always required)
-	TotalSlots int    // maximum simultaneous active slot capacity
-	VCPU       int    // vCPUs per session; 0 means defaultMicrovmVCPU
-	MemoryMiB  int    // memory per session in MiB; 0 means defaultMicrovmMemoryMiB
-	VMMPath    string // path to the Firecracker executable; empty means "firecracker" on PATH
+	// GuestReconnect enables the negotiated live-recovery capability; default off.
+	GuestReconnect bool
+	BaseRootfs     string // default base ext4 rootfs image path (required in production)
+	KernelPath     string // guest vmlinux kernel path (required in production)
+	StateDir       string // directory holding instance sockets, metadata, and disks (always required)
+	TotalSlots     int    // maximum simultaneous active slot capacity
+	VCPU           int    // vCPUs per session; 0 means defaultMicrovmVCPU
+	MemoryMiB      int    // memory per session in MiB; 0 means defaultMicrovmMemoryMiB
+	VMMPath        string // path to the Firecracker executable; empty means "firecracker" on PATH
 
 	// SlotGuestCIDR and SlotUplinkCIDR are the two host-local ranges a
 	// session's addresses are carved from, one /30 per slot (ADR-0003 §5.2).
@@ -321,13 +323,15 @@ type DiskFormatter interface {
 // instanceRecord is the persistent metadata stored on disk for each microVM
 // instance.
 type instanceRecord struct {
-	ID        string    `json:"id"`
-	SessionID string    `json:"session_id"`
-	State     State     `json:"state"`
-	Cold      bool      `json:"cold"`
-	Volume    string    `json:"volume"`
-	PID       int       `json:"pid"`
-	Cfg       VMMConfig `json:"cfg"`
+	Identity  guestHostIdentity `json:"guest_host_identity,omitempty"`
+	Reconnect bool              `json:"guest_reconnect,omitempty"`
+	ID        string            `json:"id"`
+	SessionID string            `json:"session_id"`
+	State     State             `json:"state"`
+	Cold      bool              `json:"cold"`
+	Volume    string            `json:"volume"`
+	PID       int               `json:"pid"`
+	Cfg       VMMConfig         `json:"cfg"`
 
 	// The portable workspace checkpoint this session has, if any. All three are
 	// PERSISTED, and they have to be: a cold resume after a runnerd restart is
@@ -456,6 +460,7 @@ func (rec *instanceRecord) bump() { rec.epoch++ }
 
 // Microvm implements driver.Driver for hardware-isolated microVMs.
 type Microvm struct {
+	stateLock *os.File // held until process exit; never unlink its inode
 	mu        sync.Mutex
 	opts      MicrovmOpts
 	engine    MicrovmEngine
@@ -491,6 +496,23 @@ type Microvm struct {
 func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 	if opts.StateDir == "" {
 		return nil, errors.New("microvm: a state directory is required (--microvm-state-dir / RAINIER_MICROVM_STATE_DIR): it holds every session's workspace and agent-home disk image, and a temp-directory default puts a tenant's files somewhere the host reaps")
+	}
+	var stateLock *os.File
+	constructed := false
+	if opts.GuestReconnect {
+		if err := os.MkdirAll(opts.StateDir, microvmDirMode); err != nil {
+			return nil, err
+		}
+		var err error
+		stateLock, err = lockGuestState(opts.StateDir)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if !constructed {
+				stateLock.Close()
+			}
+		}()
 	}
 	if opts.TotalSlots <= 0 {
 		opts.TotalSlots = 16
@@ -565,6 +587,7 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 	}
 
 	m := &Microvm{
+		stateLock: stateLock,
 		opts:      opts,
 		engine:    engine,
 		slots:     slots,
@@ -581,6 +604,7 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 	m.reclaimNetworkSlots()
 	m.reclaimOrphanRootfs()
 	m.reclaimRestoreScratch()
+	constructed = true
 	return m, nil
 }
 
@@ -955,7 +979,9 @@ func (m *Microvm) reassociateSlot(rec *instanceRecord) {
 		return
 	}
 	rec.slot = slot
-	applySlot(&rec.Cfg, slot)
+	if !rec.Reconnect {
+		applySlot(&rec.Cfg, slot)
+	}
 }
 
 // detachIdleSlot takes the network slot off a record that has stopped
@@ -1455,6 +1481,14 @@ func (m *Microvm) Create(ctx context.Context, spec Spec) (Handle, error) {
 	// Before anything with a side effect, and before a slot is even
 	// reserved: a create this host must not perform is refused rather than
 	// half-performed. See refuseUnwithheldEnv.
+	if spec.GuestReconnect != 0 && (spec.GuestReconnect != runner.GuestReconnectProtocol || !m.opts.GuestReconnect) {
+		return Handle{}, errors.New("microvm: guest reconnect is not enabled")
+	}
+	if spec.GuestReconnect != 0 {
+		if _, ok := m.engine.(guestIdentityVerifier); !ok {
+			return Handle{}, errors.New("microvm: guest reconnect requires local VM identity verification")
+		}
+	}
 	if err := refuseUnwithheldEnv(spec); err != nil {
 		return Handle{}, err
 	}
@@ -1628,12 +1662,20 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 		State:     StateRunning,
 		Volume:    workspaceVolume(spec.SessionID),
 		PID:       m.engine.PID(id),
+		Reconnect: spec.GuestReconnect == runner.GuestReconnectProtocol,
 		Cfg:       cfg,
 		slot:      slot,
 		boot:      bootCfg,
 		channel:   channel,
 		bootLive:  true,
 		boots:     1,
+	}
+	if rec.Reconnect {
+		identity, err := m.engine.(guestIdentityVerifier).guestIdentity(cfg, rec.PID)
+		if err != nil {
+			return nil, err
+		}
+		rec.Identity = identity
 	}
 	if err := m.saveRecord(persistable(rec)); err != nil {
 		return nil, fmt.Errorf("save instance metadata %s: %w", id, err)
@@ -2516,8 +2558,9 @@ func (m *Microvm) List(ctx context.Context) ([]Listed, error) {
 			}
 		}
 		out = append(out, Listed{
-			SessionID: inst.SessionID,
-			Handle:    Handle{ID: id, State: inst.State},
+			SessionID:      inst.SessionID,
+			GuestReconnect: inst.Reconnect,
+			Handle:         Handle{ID: id, State: inst.State},
 		})
 	}
 	m.mu.Unlock()
