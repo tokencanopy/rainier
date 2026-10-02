@@ -44,6 +44,20 @@ and retries failed candidates with fresh authorization. Failed, replaced or
 canceled authority cannot install a placement. A recovered listener starts with
 its initial delivery consumed, so every peer must prove its enrolled key.
 
+## Interrupted launches
+
+Fresh creation and cold resume durably own their namespace, disks and placement
+before launch. An uncertain result retains a blocked record and consumes capacity;
+retry and workspace deletion cannot reuse or remove that record's disks.
+
+The engine writes a synced launch marker before starting the jailer and publishes
+its PID atomically. A missing or invalid PID on the same host boot is unknown,
+not proof of exit. Recovery and teardown retain the jail and network resources
+until the child is confirmed exited. If the process identity was lost in that
+window, host inspection or a confirmed host reboot is required; an empty cgroup
+or missing API socket cannot prove that a jailer has exited. Failed Stop keeps
+process ownership and its single reaper for a later teardown attempt.
+
 ## Remaining qualification gates
 
 - Complete cold-boot lifecycle ordering and recovery identity refresh before

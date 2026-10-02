@@ -903,30 +903,7 @@ func (m *Microvm) saveRecord(rec instanceRecord) error {
 	if err != nil {
 		return fmt.Errorf("marshal instance record: %w", err)
 	}
-	// A crash may leave either complete version, never a truncated authority
-	// record that startup would skip before reclaiming resources.
-	tmp, err := os.CreateTemp(dir, ".instance-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if err = tmp.Chmod(microvmFileMode); err == nil {
-		_, err = tmp.Write(data)
-	}
-	if err == nil {
-		err = tmp.Sync()
-	}
-	closeErr := tmp.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	if err = os.Rename(tmp.Name(), m.instanceMetaPath(rec.ID)); err != nil {
-		return err
-	}
-	return syncDir(dir)
+	return atomicMetadata(m.instanceMetaPath(rec.ID), data)
 }
 
 func (m *Microvm) deleteInstanceRecord(id string) {
@@ -1480,9 +1457,15 @@ func buildGuestEnv(spec Spec) map[string]string {
 // runs with the mutex RELEASED. Holding it across engine.Launch froze
 // Inspect, List, Capacity and Destroy for every session on the host behind
 // one Firecracker that had not yet opened its socket.
-func (m *Microvm) reserveSlot() (string, error) {
+func (m *Microvm) reserveSlot(sessionID string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	for _, rec := range m.instances {
+		if sessionID != "" && rec.SessionID == sessionID && rec.RecoveryBlocked {
+			return "", errors.New("microvm: workspace retained by an uncertain launch")
+		}
+	}
+
 	if used := m.usedLocked(); used >= m.opts.TotalSlots {
 		return "", fmt.Errorf("no capacity: %d/%d", used, m.opts.TotalSlots)
 	}
@@ -1524,7 +1507,7 @@ func (m *Microvm) Create(ctx context.Context, spec Spec) (Handle, error) {
 		return Handle{}, err
 	}
 
-	id, err := m.reserveSlot()
+	id, err := m.reserveSlot(spec.SessionID)
 	if err != nil {
 		return Handle{}, err
 	}
@@ -1678,39 +1661,49 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 	}
 	applySlot(&cfg, slot)
 
-	// The jailer may create the child before Launch fails. Register this
-	// first so a later rollback stops a successfully launched VMM before
-	// removing its cgroup; failed Launch already reaps its own process.
-	undo = append(undo, func() { m.removeCgroup(id, cfg.CgroupPath) })
-	if err := m.engine.Launch(ctx, cfg); err != nil {
-		return nil, fmt.Errorf("launch microvm %s: %w", id, err)
-	}
-	undo = append(undo, func() { _ = m.engine.Stop(context.WithoutCancel(ctx), id) })
-
 	rec := &instanceRecord{
-		ID:                  id,
-		SessionID:           spec.SessionID,
-		PlacementGeneration: spec.PlacementGeneration,
-		State:               StateRunning,
-		Volume:              workspaceVolume(spec.SessionID),
-		PID:                 m.engine.PID(id),
-		Reconnect:           spec.GuestReconnect == runner.GuestReconnectProtocol,
-		Cfg:                 cfg,
-		slot:                slot,
-		boot:                bootCfg,
-		channel:             channel,
-		bootLive:            true,
-		boots:               1,
+		ID: id, SessionID: spec.SessionID, PlacementGeneration: spec.PlacementGeneration,
+		State: StateRunning, Volume: workspaceVolume(spec.SessionID), RecoveryBlocked: true,
+		Reconnect: spec.GuestReconnect == runner.GuestReconnectProtocol, Cfg: cfg,
+		slot: slot, boot: bootCfg, channel: channel, bootLive: true, boots: 1,
 	}
+	// Own every resource before a child can exist. Any uncertain rollback
+	// returns a blocked record alongside its error; Create accounts for it.
+	if err := m.saveRecord(persistable(rec)); err != nil {
+		return nil, err
+	}
+	refuse := func(cause error) (*instanceRecord, error) {
+		channel.close()
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := m.engine.Stop(stopCtx, id); err != nil {
+			state, stateErr := m.engine.State(stopCtx, id)
+			if stateErr != nil || (state != VMMStateGone && state != VMMStateStopped) {
+				rec.PID, rec.Identity, rec.channel = m.engine.PID(id), guestHostIdentity{}, nil
+				rec.RecoveryBlocked = true
+				// The committed prelaunch intent remains safe if this write fails.
+				_ = m.saveRecord(persistable(rec))
+				done = true
+				return rec, errors.New("microvm: uncertain create retained for cleanup")
+			}
+		}
+		m.removeCgroup(id, cfg.CgroupPath)
+		return nil, cause
+	}
+	if err := m.engine.Launch(ctx, cfg); err != nil {
+		return refuse(fmt.Errorf("launch microvm %s: %w", id, err))
+	}
+	rec.PID = m.engine.PID(id)
 	if rec.Reconnect {
 		identity, err := m.engine.(guestIdentityVerifier).guestIdentity(cfg, rec.PID)
 		if err != nil {
-			return nil, err
+			return refuse(err)
 		}
 		rec.Identity = identity
 	}
+	rec.RecoveryBlocked = false
 	if err := m.saveRecord(persistable(rec)); err != nil {
-		return nil, fmt.Errorf("save instance metadata %s: %w", id, err)
+		return refuse(fmt.Errorf("save instance metadata %s: %w", id, err))
 	}
 
 	done = true
@@ -2613,6 +2606,15 @@ func (m *Microvm) RemoveWorkspace(_ context.Context, sessionID string) error {
 	if sessionID == "" {
 		return nil
 	}
+	m.mu.Lock()
+	for _, rec := range m.instances {
+		if rec.SessionID == sessionID && (rec.RecoveryBlocked || rec.resuming || rec.State == StateRunning || (rec.State == StateSuspended && !rec.Cold)) {
+			m.mu.Unlock()
+			return errors.New("microvm: workspace is still owned by a live or uncertain VM")
+		}
+	}
+	m.mu.Unlock()
+
 	// A teardown is the one path where an unchecked id does real damage:
 	// os.Remove of whatever "../../something" resolved to. An id that cannot
 	// name a workspace is an error, not a removal.
@@ -2805,6 +2807,7 @@ type FirecrackerEngine struct {
 	chown   func(path string, uid, gid int) error
 	link    func(oldname, newname string) error
 	procs   map[string]vmmProcess
+	waits   map[string]chan error
 	initErr error
 	// kvm is the "can this host run a VM at all" check, as a field so the
 	// jail tests can run on a machine without /dev/kvm. Production never
@@ -3082,6 +3085,10 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		return errors.New("rootfs image path is required for Firecracker launch")
 	}
 
+	if _, err := os.Stat(f.launchMarkerPath(cfg.ID)); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("microvm: prior launch must be settled before starting another process")
+	}
+
 	// The jail, built before anything is started: a chrooted Firecracker can
 	// only see what is already inside it.
 	spec, err := f.jailSpecFor(cfg)
@@ -3102,37 +3109,31 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	// enters the session's network namespace (`--netns`), which is where the
 	// slot's TAP device is — the device does not exist in the host's
 	// namespace at all.
+	if err := atomicMetadata(f.launchMarkerPath(cfg.ID), []byte(hostLaunchBoot())); err != nil {
+		return err
+	}
 	proc, err := f.starter.Start(f.jailerPath, jailerArgs(spec))
 	if err != nil {
 		_ = f.removeJail(cfg.ID)
+		_ = f.removeLaunchEvidence(cfg.ID)
 		return fmt.Errorf("start jailed firecracker %s: %w", cfg.ID, err)
 	}
-
-	if pid := proc.Pid(); pid > 0 {
-		pidDir := filepath.Join(f.stateDir, "instances", cfg.ID)
-		_ = os.MkdirAll(pidDir, microvmDirMode)
-		_ = os.WriteFile(f.pidFilePath(cfg.ID), []byte(strconv.Itoa(pid)), microvmFileMode)
-	}
-
+	f.mu.Lock()
+	f.procs[cfg.ID] = proc
+	f.mu.Unlock()
 	var initSuccess bool
 	defer func() {
-		if initSuccess {
-			return
+		if !initSuccess {
+			f.finishFailedLaunch(cfg.ID, proc)
 		}
-		// A launch that got part-way leaves a live VMM and a jail full of
-		// hard links. Both go, in that order: the process first, because
-		// removing the jail under a running Firecracker is how a VMM ends up
-		// writing into a directory that has been unlinked. The uid needs no
-		// undoing — it is the slot's, and the slot is the caller's to give
-		// back (see uidRange).
-		_ = proc.Kill()
-		_ = proc.Wait()
-		_ = f.removeJail(cfg.ID)
-		// And the pid file this launch wrote, which outlives the jail
-		// because it is not in it. A stale one is what State and PID read on
-		// the next boot.
-		_ = os.Remove(f.pidFilePath(cfg.ID))
 	}()
+	if pid := proc.Pid(); pid > 0 {
+		if err := atomicMetadata(f.pidFilePath(cfg.ID), []byte(strconv.Itoa(pid))); err != nil {
+			return err
+		}
+	} else {
+		return errors.New("microvm: launched child has no process identity")
+	}
 
 	fcClient := newFirecrackerClient(sockPath)
 	if err := waitForSocket(ctx, sockPath, firecrackerSocketTimeout); err != nil {
@@ -3300,7 +3301,6 @@ func (f *FirecrackerEngine) Resume(ctx context.Context, id string) error {
 func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 	f.mu.Lock()
 	proc, tracked := f.procs[id]
-	delete(f.procs, id)
 	f.mu.Unlock()
 
 	var pid int
@@ -3308,6 +3308,14 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 		pid = proc.Pid()
 	} else if data, err := os.ReadFile(f.pidFilePath(id)); err == nil {
 		pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+	}
+
+	gone, evidenceErr := f.launchEvidence(id, pid)
+	if evidenceErr != nil && !tracked {
+		return evidenceErr
+	}
+	if gone {
+		pid = 0
 	}
 
 	// waited is the channel this process's own Wait reports on. A VMM this
@@ -3320,8 +3328,7 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 	// already reparented it to init, which reaps it.
 	var waited chan error
 	if tracked && pid > 0 {
-		waited = make(chan error, 1)
-		go func() { waited <- proc.Wait() }()
+		waited = f.waitChild(id, proc)
 	}
 
 	var stopErr error
@@ -3359,6 +3366,11 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 		}
 	}
 
+	if stopErr != nil {
+		return stopErr
+	}
+	f.forgetExited(id)
+
 	// The jail goes with the VM, and only AFTER it: removing a chroot out
 	// from under a live Firecracker is how a VMM ends up writing into
 	// unlinked files. What is removed is the directory and the hard links in
@@ -3386,8 +3398,8 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 	// exists. It lives outside the jail, so removeJail does not take it, and
 	// a stale one is the input to State's and PID's identity check on the
 	// next boot.
-	if err := os.Remove(f.pidFilePath(id)); err != nil && !errors.Is(err, os.ErrNotExist) && stopErr == nil {
-		stopErr = fmt.Errorf("remove the pid file for %s: %w", id, err)
+	if err := f.removeLaunchEvidence(id); err != nil && stopErr == nil {
+		stopErr = err
 	}
 	return stopErr
 }
@@ -3427,7 +3439,7 @@ func awaitExit(ctx context.Context, waited chan error, pid int, timeout time.Dur
 	poll := time.NewTicker(50 * time.Millisecond)
 	defer poll.Stop()
 	for {
-		if err := syscall.Kill(pid, 0); err != nil {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
 			return true
 		}
 		select {
@@ -3463,6 +3475,14 @@ func (f *FirecrackerEngine) State(ctx context.Context, id string) (VMMState, err
 		pid = proc.Pid()
 	} else if data, err := os.ReadFile(f.pidFilePath(id)); err == nil {
 		pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+	}
+
+	gone, evidenceErr := f.launchEvidence(id, pid)
+	if evidenceErr != nil {
+		return "", evidenceErr
+	}
+	if gone {
+		return VMMStateGone, nil
 	}
 
 	// A terminated Firecracker leaves no process to ask, so this engine never

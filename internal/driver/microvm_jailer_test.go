@@ -919,3 +919,65 @@ func writeJailImage(t *testing.T, dir, name string, mode os.FileMode) string {
 	}
 	return path
 }
+
+// A crash can happen after Start but before the PID is durably published.
+func TestPendingLaunchWithoutPIDRetainsJail(t *testing.T) {
+	fc, dir, _ := jailTestEngine(t, &fakeStarter{})
+	id := "mvm-9"
+	marker := filepath.Join(dir, "instances", id, "launch.pending")
+	if err := os.MkdirAll(filepath.Dir(marker), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte("unknown"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	jail := jailInstanceDir(dir, id)
+	if err := os.MkdirAll(jail, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, pidText := range []string{"", "not-a-pid", strconv.Itoa(os.Getpid())} {
+		if pidText != "" {
+			if err := os.WriteFile(fc.pidFilePath(id), []byte(pidText), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := fc.State(context.Background(), id); err == nil {
+			t.Error("missing PID was treated as proof of exit")
+		}
+		if err := fc.Stop(context.Background(), id); err == nil {
+			t.Error("uncertain launch teardown succeeded")
+		}
+		if _, err := os.Stat(jail); err != nil {
+			t.Error("uncertain launch lost its jail")
+		}
+	}
+}
+
+type observingStarter struct {
+	check func()
+	fakeStarter
+}
+
+func (s *observingStarter) Start(name string, args []string) (vmmProcess, error) {
+	s.check()
+	return s.fakeStarter.Start(name, args)
+}
+func TestLaunchPublishesIntentBeforeStartingChild(t *testing.T) {
+	starter := &observingStarter{}
+	fc, dir, _ := jailTestEngine(t, starter)
+	starter.check = func() {
+		data, err := os.ReadFile(fc.launchMarkerPath("mvm-7"))
+		if err != nil || len(data) == 0 {
+			t.Fatal("child started without durable launch evidence")
+		}
+	}
+	cfg := VMMConfig{ID: "mvm-7", SlotIndex: 7, KernelPath: writeJailImage(t, dir, "kernel", 0644), RootfsPath: writeJailImage(t, dir, "rootfs", 0644)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := fc.Launch(ctx, cfg); err == nil {
+		t.Fatal("expected unreachable API")
+	}
+	if _, err := os.Stat(fc.launchMarkerPath(cfg.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("confirmed child exit did not clear launch intent")
+	}
+}

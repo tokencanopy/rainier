@@ -266,3 +266,77 @@ func TestColdResumeInterruptedLaunchWithoutVMCanSettle(t *testing.T) {
 		t.Fatal("canceled placement was replayable after restart")
 	}
 }
+
+func TestInitialCreateRetainsUnstoppableVM(t *testing.T) {
+	ctx := context.Background()
+	engine := &coldIdentityEngine{SimulatedEngine: NewSimulatedEngine(), failIdentity: true, failStop: true}
+	m, _, network := testMicrovmNet(t, MicrovmOpts{Engine: engine, GuestReconnect: true, TotalSlots: 2})
+	m.SetHost(&stubMicrovmHost{})
+	if _, err := m.Create(ctx, Spec{SessionID: "session_test", PlacementGeneration: 1, GuestReconnect: 1}); err == nil {
+		t.Fatal("expected identity refusal")
+	}
+	if state, _ := engine.State(ctx, "mvm-1"); state != VMMStateRunning {
+		t.Fatal("fixture lost live VM")
+	}
+	names, err := network.ListNetns(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) == 0 {
+		t.Fatal("Create rollback released namespace despite Stop failure and surviving VM")
+	}
+	if rec := m.instances["mvm-1"]; rec == nil || !rec.RecoveryBlocked {
+		t.Fatal("surviving failed Create has no blocked ownership record")
+	}
+	if err := m.RemoveWorkspace(ctx, "session_test"); err == nil {
+		t.Error("workspace removed under uncertain VM")
+	}
+	if _, err := m.Create(ctx, Spec{SessionID: "session_test", PlacementGeneration: 1, GuestReconnect: 1}); err == nil {
+		t.Error("uncertain workspace reused by another create")
+	}
+	if state, _ := engine.State(ctx, "mvm-2"); state == VMMStateRunning {
+		t.Error("retry launched another VM on an uncertain workspace")
+	}
+	engine.failStop = false
+	_ = m.Destroy(ctx, "mvm-1")
+}
+
+func TestInitialCreateCrashBeforeMetadataRetainsResources(t *testing.T) {
+	ctx := context.Background()
+	engine := &crashWindowEngine{SimulatedEngine: NewSimulatedEngine()}
+	m, _, network := testMicrovmNet(t, MicrovmOpts{Engine: engine})
+	m.SetHost(&stubMicrovmHost{})
+	var intent []byte
+	engine.before = func(cfg VMMConfig) {
+		var err error
+		intent, err = os.ReadFile(m.instanceMetaPath(cfg.ID))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	h, err := m.Create(ctx, Spec{SessionID: "create_test", PlacementGeneration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns := m.instances[h.ID].Cfg.Netns
+	if err := os.WriteFile(m.instanceMetaPath(h.ID), intent, 0600); err != nil {
+		t.Fatal(err)
+	}
+	stopTestMicrovmRunner(t, m)
+	recovered, _, _ := testMicrovmNet(t, MicrovmOpts{StateDir: m.opts.StateDir, BaseRootfs: m.opts.BaseRootfs, Engine: engine, Net: network, Format: m.opts.Format})
+	defer recovered.Destroy(ctx, h.ID)
+	if rec := recovered.instances[h.ID]; rec == nil || !rec.RecoveryBlocked || rec.slot == nil {
+		t.Fatal("initial launch lost blocked ownership on restart")
+	}
+	names, err := network.ListNetns(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, name := range names {
+		found = found || name == ns
+	}
+	if !found {
+		t.Fatal("live initial namespace reclaimed")
+	}
+}

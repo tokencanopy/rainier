@@ -1555,6 +1555,10 @@ func TestFirecrackerStopDoesNotHangOnAnUnidentifiableChild(t *testing.T) {
 	fc.procs["mvm-stuck"] = proc
 	fc.mu.Unlock()
 
+	jail := jailInstanceDir(dir, "mvm-stuck")
+	if err := os.MkdirAll(jail, 0700); err != nil {
+		t.Fatal(err)
+	}
 	// A caller whose context is already cut short must be answered at once.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -1579,6 +1583,16 @@ func TestFirecrackerStopDoesNotHangOnAnUnidentifiableChild(t *testing.T) {
 	if err := syscall.Kill(pid, 0); err != nil {
 		t.Errorf("Stop signalled a process it could not identify as this VM's VMM: %v", err)
 	}
+	if _, err := os.Stat(jail); err != nil {
+		t.Fatal("failed stop removed a live child's jail")
+	}
+	fc.mu.Lock()
+	retained := fc.procs["mvm-stuck"] == proc
+	fc.mu.Unlock()
+	if !retained {
+		t.Fatal("failed stop lost process ownership")
+	}
+
 }
 
 // Simulate process exit without stopping surviving VMs or deleting their UDS.
