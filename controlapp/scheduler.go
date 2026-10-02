@@ -140,7 +140,7 @@ func (s *FleetService) freeCapacity(ctx context.Context, pool control.PoolID) ([
 		}
 		views = append(views, runnerView{
 			id:   r.ID,
-			free: availableRunnerSlots(r, creating),
+			free: control.AvailableRunnerSlots(r, creating),
 			caps: r.Capabilities,
 		})
 	}
@@ -659,16 +659,4 @@ func cloneMap(m map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
-}
-
-// Reservations already present in this exact aggregate sample occupy one slot,
-// not two. An old placement or a legacy sample cannot cancel a reservation.
-func availableRunnerSlots(host control.Runner, pending []control.Session) int {
-	reserved := 0
-	for _, row := range pending {
-		if row.PlacementGeneration == 0 || host.CapacityPlacements[row.ID] != row.PlacementGeneration {
-			reserved++
-		}
-	}
-	return host.CapacityTotal - host.CapacityUsed - reserved
 }

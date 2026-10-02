@@ -219,3 +219,15 @@ func ValidateCapacityPlacements(used int, placements map[SessionID]uint64) error
 	}
 	return nil
 }
+
+// AvailableRunnerSlots subtracts pending create/resume reservations. Reservations already present in this exact aggregate sample occupy one slot,
+// not two. An old placement or a legacy sample cannot cancel a reservation.
+func AvailableRunnerSlots(host Runner, pending []Session) int {
+	reserved := 0
+	for _, row := range pending {
+		if row.PlacementGeneration == 0 || host.CapacityPlacements[row.ID] != row.PlacementGeneration {
+			reserved++
+		}
+	}
+	return host.CapacityTotal - host.CapacityUsed - reserved
+}
