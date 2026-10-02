@@ -316,7 +316,7 @@ func (s *Server) Recover(ctx context.Context) error {
 		// running nor that it has finished. It says so — the entry is in
 		// neither capacity count — until a child_exited or a cold resume
 		// tells it. See sessionEntry.recovered.
-		e := &sessionEntry{id: l.SessionID, handle: l.Handle.ID, state: state, recovered: true, guestReconnect: l.GuestReconnect}
+		e := &sessionEntry{id: l.SessionID, handle: l.Handle.ID, state: state, recovered: true, guestReconnect: l.GuestReconnect, placementGen: l.PlacementGeneration}
 		s.reg.put(l.SessionID, e)
 	}
 	// The exemption is worth saying out loud where an operator will see it: a
@@ -454,6 +454,7 @@ func (s *Server) createWithID(ctx context.Context, id string, spec driver.Spec, 
 		return &egressError{err: err}
 	}
 	spec.SessionID = id
+	spec.PlacementGeneration = placementGen
 	spec.DialURL = s.dialBase + "/register"
 	spec.ProxyURL = s.proxyURL
 	if s.withholdsSecrets() {
@@ -711,6 +712,10 @@ func envKeys(env map[string]string) []string {
 // this function has no business knowing about. Snapshot has its own entry
 // point — see OpSnapshot.
 func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
+	return s.opAtPlacement(ctx, id, op, warm, 0)
+}
+
+func (s *Server) opAtPlacement(ctx context.Context, id, op string, warm bool, generation uint64) error {
 	// Marked before the handle is even read, so there is no gap between the
 	// guard and the mark for a sweep to land in: from here on this session is
 	// not idle, whatever this op turns out to be. An unknown or still-starting
@@ -820,8 +825,27 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 			// edge-case table names.
 			return errSuspendInFlight
 		}
-		restarted, err := s.drv.Resume(ctx, handle)
+		if generation != 0 {
+			if err := s.claimResumePlacement(id, generation); err != nil {
+				return err
+			}
+		}
+		var restarted bool
+		var err error
+		if placementDriver, ok := s.drv.(interface {
+			ResumePlacement(context.Context, string, uint64) (bool, error)
+		}); ok && generation != 0 {
+			restarted, err = placementDriver.ResumePlacement(ctx, handle, generation)
+		} else {
+			restarted, err = s.drv.Resume(ctx, handle)
+		}
+		if err == nil && generation != 0 && !restarted {
+			err = errResumePlacement
+		}
 		if err != nil {
+			if generation != 0 {
+				s.failResumePlacement(context.WithoutCancel(ctx), id, handle, generation)
+			}
 			return err
 		}
 		// Lands on "running" and, for a sandbox the driver actually RESTARTED,

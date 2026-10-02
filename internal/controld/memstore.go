@@ -397,7 +397,7 @@ func (r memSessions) Transition(ctx context.Context, ws control.WorkspaceID, id 
 	if !ok {
 		return control.ErrNotFound
 	}
-	if !slices.Contains(from, s.State) {
+	if !slices.Contains(from, s.State) || (opts.ExpectedPlacementGeneration != nil && s.PlacementGeneration != *opts.ExpectedPlacementGeneration) {
 		return control.ErrConflict
 	}
 	s.State = to

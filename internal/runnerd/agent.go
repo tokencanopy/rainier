@@ -422,6 +422,10 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 			go s.execute(connCtx, m, send, cfg, ag, target)
 			continue
 		}
+		if m.Type == "resume" || m.Type == "resume_status" {
+			go s.execute(connCtx, m, send, cfg, ag)
+			continue
+		}
 		go s.execute(ctx, m, send, cfg, ag) // ops are slow (docker); never block the reader
 	}
 }
@@ -488,8 +492,14 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 			// controld settles the dispatch before it sees the state.
 			s.reannounce(m.Session, send)
 		}
+	case "resume_status":
+		send(s.resumeStatus(ctx, m))
 	case "suspend", "resume":
-		err := s.Op(ctx, m.Session, m.Type, m.Warm)
+		if ctx.Err() != nil {
+			send(runner.FromRunner{Type: "result", ReqID: m.ReqID})
+			return
+		}
+		err := s.opAtPlacement(ctx, m.Session, m.Type, m.Warm, m.PlacementGeneration)
 		// Conflict is what tells controld apart the two ways this can be
 		// not-ok: a command that failed, and one the runner refused because
 		// it is already stopping (or still creating) this sandbox. Without

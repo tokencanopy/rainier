@@ -2190,16 +2190,15 @@ func TestResumeSession(t *testing.T) {
 			t.Errorf("the runner's own words reached the client: %s", raw)
 		}
 
-		// And the row is left exactly where it was: the refusal moves
-		// nothing, so the session is not left claiming to run on a container
-		// that is stopping.
+		// A refusal preserves the claimed placement for reconciliation; it
+		// must not advertise the session as running.
 		after := doRequest(t, ts, http.MethodGet, "/v0/sessions/sess_res_stopping", tok, nil, nil)
 		var body v0wire.SessionEnvelope
 		if err := json.Unmarshal([]byte(readBody(t, after)), &body); err != nil {
 			t.Fatalf("decode: %v", err)
 		}
-		if body.Session.State != string(control.StateSuspendedCold) {
-			t.Errorf("state after the refused resume = %q, want suspended_cold", body.Session.State)
+		if body.Session.State != string(control.StateResuming) {
+			t.Errorf("state after the refused resume = %q, want resuming", body.Session.State)
 		}
 	})
 

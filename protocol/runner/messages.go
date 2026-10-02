@@ -270,7 +270,7 @@ type ToRunner struct {
 	// "accept" is controld's answer to an announce, sent before any command:
 	// the generation this connection acts under and the announced
 	// capabilities controld will schedule on.
-	Type    string  `json:"type"` // "accept"|"create"|"destroy"|"remove_workspace"|"suspend"|"resume"|"snapshot"|"prepull"|"dial_attach"|"session_rpc"
+	Type    string  `json:"type"` // "accept"|"create"|"destroy"|"remove_workspace"|"suspend"|"resume"|"resume_status"|"snapshot"|"prepull"|"dial_attach"|"session_rpc"
 	ReqID   uint64  `json:"req_id,omitempty"`
 	Session string  `json:"session,omitempty"`
 	Spec    *Spec   `json:"spec,omitempty"`   // create

@@ -72,6 +72,7 @@ type runnerView struct {
 // runs sequentially here; only the create dispatch that follows a successful
 // placement runs concurrently.
 func (s *FleetService) drainPool(ctx context.Context, pool control.PoolID) {
+	s.reconcileResumes(ctx, pool)
 	rows, err := s.fleet.OldestQueued(ctx, pool)
 	if err != nil {
 		return
@@ -133,7 +134,7 @@ func (s *FleetService) freeCapacity(ctx context.Context, pool control.PoolID) ([
 		if !r.Connected {
 			continue
 		}
-		creating, err := s.fleet.SessionsOnRunner(ctx, pool, r.ID, []control.SessionState{control.StateCreating})
+		creating, err := s.fleet.SessionsOnRunner(ctx, pool, r.ID, []control.SessionState{control.StateCreating, control.StateResuming})
 		if err != nil {
 			return nil, err
 		}

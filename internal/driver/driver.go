@@ -6,6 +6,8 @@ import (
 )
 
 type Spec struct {
+	PlacementGeneration uint64
+
 	GuestReconnect uint64   // negotiated guest reconnect protocol; zero keeps legacy boot
 	Name           string   // human label
 	Image          string   // OCI ref (v0 default a bash image)
@@ -196,6 +198,8 @@ type Snapshot struct {
 // Listed pairs a driver handle with the session id it belongs to, for List's
 // bulk view of every rainier-managed resource.
 type Listed struct {
+	PlacementGeneration uint64
+
 	GuestReconnect bool
 	SessionID      string
 	Handle         Handle

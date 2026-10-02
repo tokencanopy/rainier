@@ -323,6 +323,9 @@ type DiskFormatter interface {
 // instanceRecord is the persistent metadata stored on disk for each microVM
 // instance.
 type instanceRecord struct {
+	PlacementGeneration uint64 `json:"placement_generation,omitempty"`
+	RecoveryBlocked     bool   `json:"recovery_blocked,omitempty"`
+
 	Identity  guestHostIdentity `json:"guest_host_identity,omitempty"`
 	Reconnect bool              `json:"guest_reconnect,omitempty"`
 	ID        string            `json:"id"`
@@ -390,7 +393,9 @@ type instanceRecord struct {
 	// in flight. A second Resume for the same id is refused rather than run
 	// beside it: see Resume for what two concurrent cold ones would do to
 	// each other's socket.
-	resuming bool
+	resuming   bool
+	resumeDone chan struct{}
+	destroying bool
 
 	// checkpointing is the same kind of claim for the workspace checkpoint a
 	// cold suspend takes. Two of them on one instance would each send the guest
@@ -1657,18 +1662,19 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 	undo = append(undo, func() { _ = m.engine.Stop(context.WithoutCancel(ctx), id) })
 
 	rec := &instanceRecord{
-		ID:        id,
-		SessionID: spec.SessionID,
-		State:     StateRunning,
-		Volume:    workspaceVolume(spec.SessionID),
-		PID:       m.engine.PID(id),
-		Reconnect: spec.GuestReconnect == runner.GuestReconnectProtocol,
-		Cfg:       cfg,
-		slot:      slot,
-		boot:      bootCfg,
-		channel:   channel,
-		bootLive:  true,
-		boots:     1,
+		ID:                  id,
+		SessionID:           spec.SessionID,
+		PlacementGeneration: spec.PlacementGeneration,
+		State:               StateRunning,
+		Volume:              workspaceVolume(spec.SessionID),
+		PID:                 m.engine.PID(id),
+		Reconnect:           spec.GuestReconnect == runner.GuestReconnectProtocol,
+		Cfg:                 cfg,
+		slot:                slot,
+		boot:                bootCfg,
+		channel:             channel,
+		bootLive:            true,
+		boots:               1,
 	}
 	if rec.Reconnect {
 		identity, err := m.engine.(guestIdentityVerifier).guestIdentity(cfg, rec.PID)
@@ -1786,12 +1792,29 @@ func (m *Microvm) Suspend(ctx context.Context, id string, warm bool) error {
 	return nil
 }
 
-func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
+func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) { return m.resume(ctx, id, 0) }
+
+func (m *Microvm) ResumePlacement(ctx context.Context, id string, generation uint64) (bool, error) {
+	if generation == 0 {
+		return false, errors.New("microvm: invalid resume placement")
+	}
+	return m.resume(ctx, id, generation)
+}
+
+func (m *Microvm) resume(ctx context.Context, id string, generation uint64) (bool, error) {
 	m.mu.Lock()
 	inst, ok := m.instances[id]
 	if !ok {
 		m.mu.Unlock()
 		return false, fmt.Errorf("no such id %s", id)
+	}
+	if inst.RecoveryBlocked || inst.destroying {
+		m.mu.Unlock()
+		return false, errors.New("microvm: unverified VM requires cleanup")
+	}
+	if generation != 0 && (generation < inst.PlacementGeneration || (generation == inst.PlacementGeneration && inst.Cold)) {
+		m.mu.Unlock()
+		return false, errors.New("microvm: stale resume placement")
 	}
 	running := inst.State == StateRunning
 	cold, bootLive, cfg := inst.Cold, inst.bootLive, inst.Cfg
@@ -1822,7 +1845,18 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		m.mu.Unlock()
 		return false, fmt.Errorf("resume of %s: a resume is already in flight for this instance", id)
 	}
+	if generation != 0 {
+		before := inst.PlacementGeneration
+		inst.PlacementGeneration = generation
+		if err := m.saveRecord(persistable(inst)); err != nil {
+			inst.PlacementGeneration = before
+			m.mu.Unlock()
+			return false, err
+		}
+	}
 	inst.resuming = true
+	inst.resumeDone = make(chan struct{})
+	claimed := inst
 	// The boot number is taken HERE, under the same lock, and it advances
 	// even for an attempt that fails: a failed launch may have left a socket
 	// behind at that path, and an attempt that reuses a number is an attempt
@@ -1850,13 +1884,14 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 	}
 	defer func() {
 		m.mu.Lock()
-		if e, ok := m.instances[id]; ok {
-			e.resuming = false
-		}
+		claimed.resuming = false
+		close(claimed.resumeDone)
+		claimed.resumeDone = nil
 		m.mu.Unlock()
 	}()
 
 	restarted := false
+	var identity guestHostIdentity
 	var (
 		channel *guestChannel
 		slot    *netslot.Slot
@@ -1967,6 +2002,36 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 			channel.close()
 			return false, fmt.Errorf("relaunch cold microvm %s: %w", id, err)
 		}
+		if inst.Reconnect {
+			var err error
+			identity, err = m.engine.(guestIdentityVerifier).guestIdentity(cfg, m.engine.PID(id))
+			if err != nil {
+				channel.close()
+				stopErr := m.engine.Stop(context.WithoutCancel(ctx), id)
+				if stopErr == nil {
+					m.removeCgroup(id, cfg.CgroupPath)
+					return false, errors.New("microvm: new guest identity verification failed")
+				}
+				// A possibly live VM keeps every resource, even if Delete raced
+				// the launch. Its blocked record permits cleanup, never admission.
+				m.mu.Lock()
+				inst.State = StateRunning
+				inst.Cold = false
+				inst.RecoveryBlocked = true
+				inst.Identity = guestHostIdentity{}
+				inst.PID = m.engine.PID(id)
+				inst.Cfg = cfg
+				inst.slot = slot
+				inst.channel = nil
+				m.instances[id] = inst
+				rec := persistable(inst)
+				slot = nil
+				clonedRootfs = false
+				m.mu.Unlock()
+				_ = m.saveRecord(rec)
+				return false, errors.New("microvm: unverified VM retained for cleanup")
+			}
+		}
 		restarted = true
 	} else if err := m.engine.Resume(ctx, id); err != nil {
 		return false, err
@@ -1998,6 +2063,7 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 	inst.Cold = false
 	if restarted {
 		inst.PID = m.engine.PID(id)
+		inst.Identity = identity
 		if inst.channel != nil {
 			inst.channel.close()
 		}
@@ -2392,12 +2458,32 @@ func (m *Microvm) destroyUnrecorded(ctx context.Context, id string) error {
 }
 
 func (m *Microvm) DestroyContainer(ctx context.Context, id string) error {
+	// A launch owns disks and a new namespace before it publishes them on the
+	// record. Wait for that handoff before stopping or releasing anything.
 	m.mu.Lock()
 	inst, ok := m.instances[id]
+	for ok && inst.resuming {
+		done := inst.resumeDone
+		m.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-done:
+		}
+		m.mu.Lock()
+		inst, ok = m.instances[id]
+	}
 	if !ok {
 		m.mu.Unlock()
 		return m.destroyUnrecorded(ctx, id)
 	}
+	if inst.destroying {
+		m.mu.Unlock()
+		return errors.New("microvm: teardown already in flight")
+	}
+	inst.destroying = true
+	defer func() { m.mu.Lock(); inst.destroying = false; m.mu.Unlock() }()
+
 	slot := inst.slot
 	inst.slot = nil
 	channel := inst.channel
@@ -2502,7 +2588,7 @@ func (m *Microvm) Inspect(ctx context.Context, id string) (Handle, error) {
 		return Handle{ID: id, State: StateGone}, nil
 	}
 	var idle *netslot.Slot
-	if stErr == nil && inst.epoch == epoch {
+	if stErr == nil && inst.epoch == epoch && !inst.resuming && !inst.destroying {
 		reconcileState(inst, st)
 		// A VM that went away without this driver parking it has stopped
 		// occupying the host, and its slot has to go back with it.
@@ -2551,16 +2637,17 @@ func (m *Microvm) List(ctx context.Context) ([]Listed, error) {
 	out := make([]Listed, 0, len(m.instances))
 	var idle []*netslot.Slot
 	for id, inst := range m.instances {
-		if st, ok := observed[id]; ok && inst.epoch == epochs[id] {
+		if st, ok := observed[id]; ok && inst.epoch == epochs[id] && !inst.resuming && !inst.destroying {
 			reconcileState(inst, st)
 			if s := detachIdleSlot(inst); s != nil {
 				idle = append(idle, s)
 			}
 		}
 		out = append(out, Listed{
-			SessionID:      inst.SessionID,
-			GuestReconnect: inst.Reconnect,
-			Handle:         Handle{ID: id, State: inst.State},
+			SessionID:           inst.SessionID,
+			GuestReconnect:      inst.Reconnect,
+			PlacementGeneration: inst.PlacementGeneration,
+			Handle:              Handle{ID: id, State: inst.State},
 		})
 	}
 	m.mu.Unlock()
@@ -3433,4 +3520,40 @@ func isFirecrackerPID(pid int, marker string) bool {
 	}
 
 	return false
+}
+
+// ResumeStatus observes a claim without launching. If its command never reached
+// a cold VM, persisting the requested generation fences that delayed command:
+// ResumePlacement refuses an already-recorded cold generation.
+func (m *Microvm) ResumeStatus(ctx context.Context, id string, generation uint64) (string, uint64, error) {
+	if _, err := m.Inspect(ctx, id); err != nil {
+		return "", 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inst, ok := m.instances[id]
+	if !ok || generation == 0 || generation < inst.PlacementGeneration {
+		return "", 0, errors.New("microvm: stale resume status")
+	}
+	if inst.resuming || inst.RecoveryBlocked {
+		return "resuming", inst.PlacementGeneration, nil
+	}
+	if generation > inst.PlacementGeneration {
+		if !inst.Cold {
+			return "", 0, errors.New("microvm: resume placement is not recorded")
+		}
+		before := inst.PlacementGeneration
+		inst.PlacementGeneration = generation
+		if err := m.saveRecord(persistable(inst)); err != nil {
+			inst.PlacementGeneration = before
+			return "", 0, err
+		}
+	}
+	if inst.Cold {
+		return "suspended_cold", generation, nil
+	}
+	if inst.State == StateRunning {
+		return "running", generation, nil
+	}
+	return "resuming", generation, nil
 }

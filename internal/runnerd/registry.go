@@ -30,6 +30,7 @@ type sessionEntry struct {
 	// carried none" — an old controld — and fences nothing.
 	placementGen   uint64
 	guestEpoch     uint64
+	resumePending  bool
 	guestReconnect bool
 	relayAuthority *guestRelayAuthority
 	hub            *relay.Hub // set when sessiond registers; nil until then
@@ -1013,6 +1014,10 @@ func (r *registry) resumed(id string, restarted bool) {
 	// the new one. The register that is about to arrive opens the next
 	// epoch; until it does, frames from either side of the restart match
 	// nothing. See sessionEntry.boot.
-	r.nextBoot++
-	e.boot = r.nextBoot
+	if e.resumePending {
+		e.resumePending = false // claim already opened this boot before launch
+	} else {
+		r.nextBoot++
+		e.boot = r.nextBoot
+	}
 }

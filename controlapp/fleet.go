@@ -562,7 +562,7 @@ func (s *FleetService) recordSnapshotAuthority(ctx context.Context, snap control
 // same snapshot produce the same Destroy list and no additional mutation.
 func (s *FleetService) reconcileSessions(ctx context.Context, snap control.RunnerSnapshot, poolScoped bool) ([]control.SessionID, error) {
 	states := []control.SessionState{
-		control.StateCreating, control.StateRunning,
+		control.StateCreating, control.StateResuming, control.StateRunning,
 		control.StateSuspendedWarm, control.StateSuspendedCold,
 	}
 	stored, err := s.fleet.SessionsOnRunner(ctx, snap.PoolID, snap.RunnerID, states)
@@ -595,6 +595,11 @@ func (s *FleetService) reconcileSessions(ctx context.Context, snap control.Runne
 			if present {
 				destroy = append(destroy, row.ID)
 			}
+			continue
+		}
+		// An unversioned inventory cannot settle a pending cold boot. It may
+		// predate dispatch, and absence never permits fresh-create requeue.
+		if row.State == control.StateResuming {
 			continue
 		}
 		if !present {
@@ -775,7 +780,7 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 	// placement generation the row has moved past comes from a sandbox this
 	// session no longer has, even when it arrives on the current connection.
 	// Zero is "not carried" (an old runner) and fences nothing.
-	if event.PlacementGeneration != 0 && event.PlacementGeneration != row.PlacementGeneration {
+	if (row.State == control.StateResuming && event.PlacementGeneration == 0) || (event.PlacementGeneration != 0 && event.PlacementGeneration != row.PlacementGeneration) {
 		return control.ErrStale
 	}
 
@@ -816,7 +821,7 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 		// Already-applied identical event; idempotent success, no record.
 		return nil
 	}
-	var opts control.TransitionOpts
+	opts := control.TransitionOpts{ExpectedPlacementGeneration: &row.PlacementGeneration}
 	if target == control.StateFailed {
 		detail := boundDetail(event.Detail)
 		opts.Error = &detail

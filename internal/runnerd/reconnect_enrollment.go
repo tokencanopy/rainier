@@ -33,7 +33,7 @@ func (s *Server) enrollGuestConnection(ctx context.Context, id string, conn rela
 		if !exists || current.boot != original.boot {
 			return errReconnectFenced
 		}
-		if current.handle != "" {
+		if current.handle != "" && !current.resumePending {
 			break
 		}
 		select {
