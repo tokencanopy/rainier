@@ -292,10 +292,12 @@ func (s *Server) compose() error {
 		events control.EventRecorder = s.st
 		uow    control.UnitOfWork    = s.st
 	)
+	_, guestReconnect := s.st.(GuestReconnectAuthorityStore)
 	fleetSvc, err := controlapp.NewFleetService(controlapp.FleetOptions{
 		Authorizer: auth, Sessions: sessions, Environments: envs, Fleet: fleet, Pools: pools,
 		Transport: s.transport, Events: events, Clock: clock, IDs: ids,
 		SafetyInterval: fleetSafetyInterval,
+		GuestReconnect: guestReconnect,
 		LaunchMaterial: launchMaterial{st: s.st, key: s.cfg.SecretsKey},
 		// The self-hosted bounds for a hook whose environment declares none,
 		// exactly as the old scheduler applied them (api.go).

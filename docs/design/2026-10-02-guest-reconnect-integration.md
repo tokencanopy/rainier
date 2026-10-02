@@ -1,8 +1,10 @@
 # Guest reconnect integration candidate
 
 This connects the shared reconnect protocol, runner admission, guest readiness,
-and hosted authorization. It remains off by default. B1 is not qualified and
-this candidate does not enable the capability in the runner CLI.
+and hosted and standalone authorization. B1 remains unqualified. The runner
+opt-in is `--microvm-guest-reconnect` (or `RAINIER_MICROVM_GUEST_RECONNECT=1`),
+disabled by default. Only a matching host dispatcher plus both runner capabilities
+can negotiate enrollment. Volatile standalone stores never enable it.
 
 ## Ownership and delivery
 
@@ -52,8 +54,10 @@ retry and workspace deletion cannot reuse or remove that record's disks.
 
 The engine writes a synced launch marker before starting the jailer and publishes
 its PID and process start time atomically. Signal authorization requires exact
-native argv and the original process start time; a name prefix or recycled PID
-is never sufficient. A missing or invalid PID on the same host boot is unknown,
+native argv and the original process start time before every signal, including
+shutdown escalation. Recovered-process waits recheck that lifetime. These checks
+do not provide a Linux pidfd guarantee: numeric PID check/signal has an immediate
+race window, though the delayed escalation window is closed. A missing or invalid PID on the same host boot is unknown,
 not proof of exit. Recovery and teardown retain the jail and network resources
 until the child is confirmed exited. If the process identity was lost in that
 window, host inspection or a confirmed host reboot is required; an empty cgroup
@@ -62,8 +66,8 @@ process ownership and its single reaper for a later teardown attempt.
 
 ## Remaining qualification gates
 
-- Complete cold-boot lifecycle ordering and recovery identity refresh before
-  exposing the opt-in CLI capability.
+- Qualify cold resume followed by runner restart against the explicit resuming
+  lifecycle, durable launch ownership and refreshed recovery identity.
 - Exercise the built processes over real transports and review the integrated
   branches independently and adversarially.
 - Run the bounded B1 harness on a disposable KVM host: relay loss, gateway
@@ -73,3 +77,20 @@ process ownership and its single reaper for a later teardown attempt.
   teardown. No RAM snapshot is part of this capability.
 
 Unit/race results and cross-compilation do not constitute that live qualification.
+
+## Standalone authority
+
+The PostgreSQL dispatcher locks the accepted runner generation, current placement,
+bootstrap record and current owner before checking the configured allowlist and
+resume policy. Enrollment/proof/token mutations commit with closed audit events.
+Secrets are resolved after commit; resolution failure never restores a capability.
+All responses fit a bounded 4 MiB budget, including JSON expansion of secret values.
+The authority boundary refuses a caller's existing transaction so a successful
+return really commits before delivery.
+
+Begin, accept, configuration and mint are runner-origin only. Legacy guest token
+redemption remains guest-origin only at epoch zero; proof-issued redemption is
+runner-origin only at a positive epoch. PostgreSQL bootstrap RPCs receive these
+current-authority checks even before negotiation; this intentionally prevents a
+legacy path from bypassing owner revocation or spending a proof-issued token.
+The other legacy RPC methods retain their existing handlers.
