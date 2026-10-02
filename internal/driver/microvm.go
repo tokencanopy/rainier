@@ -3357,11 +3357,13 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 		// kernel rather than assuming it, so a pid recovered across a
 		// runnerd restart — whose group this process knows nothing about —
 		// is only ever signalled on its own.
-		if err := killProcessTree(f.signals, pid, syscall.SIGTERM); err != nil {
+		if err := f.signalVM(id, pid, syscall.SIGTERM); err != nil {
 			stopErr = fmt.Errorf("sigterm pid %d: %w", pid, err)
-		} else if !awaitExit(ctx, waited, pid, firecrackerTermTimeout) {
-			_ = killProcessTree(f.signals, pid, syscall.SIGKILL)
-			if !awaitExit(ctx, waited, pid, firecrackerKillTimeout) && stopErr == nil {
+		} else if !f.awaitVMExit(ctx, id, waited, pid, firecrackerTermTimeout) {
+			if err := f.signalVM(id, pid, syscall.SIGKILL); err != nil {
+				return err
+			}
+			if !f.awaitVMExit(ctx, id, waited, pid, firecrackerKillTimeout) && stopErr == nil {
 				stopErr = notExitedErr(ctx, pid)
 			}
 		}
@@ -3376,7 +3378,7 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 		// live process that failed the identity check will never exit on its
 		// own, so Stop — and with it Destroy, Suspend and every caller
 		// holding a session's teardown — waited forever.
-		if !awaitExit(ctx, waited, pid, firecrackerKillTimeout) {
+		if !f.awaitVMExit(ctx, id, waited, pid, firecrackerKillTimeout) {
 			stopErr = fmt.Errorf("firecracker %s: pid %d is still running but does not identify as this VM's VMM, so it was left alone", id, pid)
 		}
 	}

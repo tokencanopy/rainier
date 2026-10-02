@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // atomicMetadata publishes a complete, durable version in the same directory.
@@ -164,4 +165,48 @@ func (f *FirecrackerEngine) saveProcessIdentity(id string, pid int) error {
 		return err
 	}
 	return atomicMetadata(f.processIdentityPath(id), data)
+}
+
+// Every signal requires current authority, including escalation after waiting.
+// A changed or unreadable lifetime retains the jail for later reconciliation.
+func (f *FirecrackerEngine) signalVM(id string, pid int, signal syscall.Signal) error {
+	gone, err := f.launchEvidence(id, pid)
+	if err != nil {
+		return err
+	}
+	if gone {
+		return nil
+	}
+	if !isFirecrackerPID(pid, id) {
+		return errors.New("microvm: signal target identity is uncertain")
+	}
+	return killProcessTree(f.signals, pid, signal)
+}
+
+// Recovered VMs have no child Wait handle. Observe their durable lifetime on
+// every poll so a replacement PID cannot extend the original VM's wait.
+func (f *FirecrackerEngine) awaitVMExit(ctx context.Context, id string, waited chan error, pid int, timeout time.Duration) bool {
+	if waited != nil {
+		return awaitExit(ctx, waited, pid, timeout)
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	poll := time.NewTicker(50 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		gone, err := f.launchEvidence(id, pid)
+		if err != nil {
+			return false
+		}
+		if gone || errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+			return true
+		}
+		select {
+		case <-poll.C:
+		case <-timer.C:
+			return false
+		case <-ctx.Done():
+			return false
+		}
+	}
 }

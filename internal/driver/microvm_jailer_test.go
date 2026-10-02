@@ -14,6 +14,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // fakeStarter is the exec seam: it records the argv a host would be asked to
@@ -1050,4 +1051,44 @@ func TestLaunchEvidenceRequiresOriginalProcessLifetime(t *testing.T) {
 		t.Fatal("recycled process received a signal")
 	}
 
+}
+
+type lifetimeChangeSignal struct {
+	onTerm func()
+	kills  int
+}
+
+func (s *lifetimeChangeSignal) Getpgid(pid int) (int, error) { return pid + 1, nil }
+func (s *lifetimeChangeSignal) Kill(_ int, sig syscall.Signal) error {
+	if sig == syscall.SIGTERM {
+		s.onTerm()
+	}
+	if sig == syscall.SIGKILL {
+		s.kills++
+	}
+	return nil
+}
+func TestStopRechecksLifetimeBeforeEscalation(t *testing.T) {
+	fc, _, _ := jailTestEngine(t, &fakeStarter{})
+	proc, pid := fakeFirecracker(t, "mvm-12")
+	defer func() { _ = proc.Kill(); _ = proc.Wait() }()
+	fc.startTime = processStartTime
+	if err := atomicMetadata(fc.launchMarkerPath("mvm-12"), []byte(hostLaunchBoot())); err != nil {
+		t.Fatal(err)
+	}
+	if err := fc.saveProcessIdentity("mvm-12", pid); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicMetadata(fc.pidFilePath("mvm-12"), []byte(strconv.Itoa(pid))); err != nil {
+		t.Fatal(err)
+	}
+	originalStart := fc.startTime
+	sig := &lifetimeChangeSignal{onTerm: func() { fc.startTime = func(pid int) (uint64, error) { v, e := originalStart(pid); return v + 1, e } }}
+	fc.signals = sig
+	c, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_ = fc.Stop(c, "mvm-12")
+	if sig.kills != 0 {
+		t.Fatal("SIGKILL authorized after original birth identity changed during wait")
+	}
 }
