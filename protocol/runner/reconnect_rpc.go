@@ -197,7 +197,11 @@ func reconnectID(id string) bool {
 // Check the flat object before typed decoding: encoding/json alone folds field
 // case and accepts duplicate keys. No raw decoder error may escape this boundary.
 func decodeReconnectObject(payload []byte, out any, names ...string) error {
-	if len(payload) > GuestReconnectPayloadLimit {
+	return decodeReconnectObjectLimit(payload, out, GuestReconnectPayloadLimit, names...)
+}
+
+func decodeReconnectObjectLimit(payload []byte, out any, limit int, names ...string) error {
+	if len(payload) > limit {
 		return errGuestReconnectMessage
 	}
 	d := json.NewDecoder(bytes.NewReader(payload))

@@ -30,6 +30,9 @@ const (
 // happen under the runner's name lock, so a reconnect can neither slip between
 // them nor have its own row write overtaken by this one.
 func (p *Plane) touchRunner(ctx context.Context, rc *runnerConn, m runner.FromRunner) bool {
+	if control.ValidateCapacityPlacements(m.Used, capacityPlacements(m.CapacityPlacements)) != nil {
+		return false
+	}
 	nl := p.nameLock(rc.binding.PoolID, rc.name)
 	nl.Lock()
 	defer nl.Unlock()
@@ -38,14 +41,15 @@ func (p *Plane) touchRunner(ctx context.Context, rc *runnerConn, m runner.FromRu
 		return false
 	}
 	err := p.host.FleetRepository().UpsertRunner(ctx, rc.binding.PoolID, control.Runner{
-		ID:            rc.binding.RunnerID,
-		PoolID:        rc.binding.PoolID,
-		CapacityUsed:  m.Used,
-		CapacityTotal: m.Total,
-		Connected:     true,
-		Generation:    rc.gen,
-		Capabilities:  rc.caps,
-		LastSeenAt:    time.Now(),
+		ID:                 rc.binding.RunnerID,
+		PoolID:             rc.binding.PoolID,
+		CapacityUsed:       m.Used,
+		CapacityTotal:      m.Total,
+		CapacityPlacements: capacityPlacements(m.CapacityPlacements),
+		Connected:          true,
+		Generation:         rc.gen,
+		Capabilities:       rc.caps,
+		LastSeenAt:         time.Now(),
 	})
 	switch {
 	case errors.Is(err, control.ErrStale):
@@ -206,4 +210,15 @@ func stageFailure(stage, detail string) string {
 		return clip(stage) + " failed"
 	}
 	return clip(stage) + " failed: " + detail
+}
+
+func capacityPlacements(wire map[string]uint64) map[control.SessionID]uint64 {
+	if len(wire) == 0 {
+		return nil
+	}
+	out := make(map[control.SessionID]uint64, len(wire))
+	for id, generation := range wire {
+		out[control.SessionID(id)] = generation
+	}
+	return out
 }

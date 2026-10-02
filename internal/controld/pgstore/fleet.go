@@ -16,17 +16,18 @@ import (
 // workspace that pool serves.
 type pgFleet struct{ s *Store }
 
-const runnerCols = `name, pool_id, capacity_used, capacity_total, connected, generation, capabilities, last_seen_at`
+const runnerCols = `name, pool_id, capacity_used, capacity_total, connected, generation, capabilities, last_seen_at, capacity_placements`
 
 func scanControlRunner(row rowScanner) (control.Runner, error) {
 	var (
-		r          control.Runner
-		id, pool   string
-		generation int64
-		capBytes   []byte
-		lastSeen   *time.Time
+		r              control.Runner
+		id, pool       string
+		generation     int64
+		capBytes       []byte
+		placementBytes []byte
+		lastSeen       *time.Time
 	)
-	if err := row.Scan(&id, &pool, &r.CapacityUsed, &r.CapacityTotal, &r.Connected, &generation, &capBytes, &lastSeen); err != nil {
+	if err := row.Scan(&id, &pool, &r.CapacityUsed, &r.CapacityTotal, &r.Connected, &generation, &capBytes, &lastSeen, &placementBytes); err != nil {
 		return control.Runner{}, err
 	}
 	r.ID = control.RunnerID(id)
@@ -34,6 +35,11 @@ func scanControlRunner(row rowScanner) (control.Runner, error) {
 	r.Generation = uint64(generation)
 	if len(capBytes) > 0 {
 		if err := json.Unmarshal(capBytes, &r.Capabilities); err != nil {
+			return control.Runner{}, err
+		}
+	}
+	if len(placementBytes) > 0 {
+		if err := json.Unmarshal(placementBytes, &r.CapacityPlacements); err != nil {
 			return control.Runner{}, err
 		}
 	}
@@ -48,6 +54,14 @@ func scanControlRunner(row rowScanner) (control.Runner, error) {
 // rather than half-overwriting the current connection's view of its own
 // capacity.
 func (r pgFleet) UpsertRunner(ctx context.Context, pool control.PoolID, run control.Runner) error {
+	if err := control.ValidateCapacityPlacements(run.CapacityUsed, run.CapacityPlacements); err != nil {
+		return err
+	}
+	placements, err := json.Marshal(run.CapacityPlacements)
+	if err != nil {
+		return control.ErrInvalid
+	}
+
 	if pool == "" {
 		return control.ErrInvalid
 	}
@@ -60,15 +74,15 @@ func (r pgFleet) UpsertRunner(ctx context.Context, pool control.PoolID, run cont
 		lastSeen = &run.LastSeenAt
 	}
 	ct, err := r.s.q(ctx).Exec(ctx, `
-		INSERT INTO runners (pool_id, name, capacity_used, capacity_total, connected, generation, capabilities, last_seen_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		INSERT INTO runners (pool_id, name, capacity_used, capacity_total, connected, generation, capabilities, last_seen_at, capacity_placements)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (pool_id, name) DO UPDATE SET
 			capacity_used = EXCLUDED.capacity_used, capacity_total = EXCLUDED.capacity_total,
 			connected = EXCLUDED.connected, generation = EXCLUDED.generation,
-			capabilities = EXCLUDED.capabilities, last_seen_at = EXCLUDED.last_seen_at
+			capabilities = EXCLUDED.capabilities, last_seen_at = EXCLUDED.last_seen_at, capacity_placements=EXCLUDED.capacity_placements
 		WHERE runners.generation <= EXCLUDED.generation`,
 		string(pool), string(run.ID), run.CapacityUsed, run.CapacityTotal, run.Connected,
-		int64(run.Generation), caps, lastSeen)
+		int64(run.Generation), caps, lastSeen, placements)
 	if err != nil {
 		return unavailable("upsert runner", err)
 	}

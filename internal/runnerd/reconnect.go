@@ -38,27 +38,25 @@ func (s *Server) AuthorizeGuestReconnect(ctx context.Context, id string, prove d
 	if prove == nil {
 		return zero, errReconnectInvalid
 	}
-	row, ok := s.reg.snapshot(id)
-	if !ok || row.placementGen == 0 || (row.state != "running" && row.state != "starting") {
-		return zero, errReconnectFenced
+	lease, err := s.acquireGuestReconnect(id)
+	if err != nil {
+		return zero, err
 	}
-	rc := s.reconnectControl.Load()
-	if rc == nil || rc.ctx.Err() != nil || rc.state.generation.Load() == 0 {
-		return zero, errReconnectUnavailable
+	defer lease.close()
+	return lease.authorize(ctx, prove)
+}
+
+func (lease *guestReconnectLease) authorize(ctx context.Context, prove driver.GuestReconnectProof) (runner.GuestReconnectAcceptResponse, error) {
+	var zero runner.GuestReconnectAcceptResponse
+	if prove == nil {
+		return zero, errReconnectInvalid
 	}
-	generation := rc.state.generation.Load()
-	if !s.claimReconnect(id) {
-		return zero, errReconnectUnavailable
-	}
-	defer s.releaseReconnect(id)
+	s, id, row, rc, generation := lease.server, lease.row.id, lease.row, lease.control, lease.generation
 	ctx, cancel := context.WithTimeout(ctx, reconnectBudget)
 	defer cancel()
 	stop := context.AfterFunc(rc.ctx, cancel)
 	defer stop()
-	valid := func() bool {
-		current, exists := s.reg.snapshot(id)
-		return ctx.Err() == nil && rc.ctx.Err() == nil && s.reconnectControl.Load() == rc && rc.state.generation.Load() == generation && exists && current.placementGen == row.placementGen && current.boot == row.boot && current.handle == row.handle && (current.state == "running" || current.state == "starting")
-	}
+	valid := func() bool { return lease.valid(ctx) }
 	if !valid() {
 		return zero, errReconnectFenced
 	}
@@ -128,8 +126,6 @@ func (s *Server) reconnectCall(ctx context.Context, rc *reconnectControl, sessio
 	id, ch := s.runnerRPC.begin(session)
 	defer s.runnerRPC.end(id)
 	msg := runner.FromRunner{Type: "session_req", Session: session, RPC: &runner.RPCEnvelope{ID: id, Method: method, Payload: body}}
-	msg.Used, msg.Total, _ = s.drv.Capacity(ctx)
-	msg.Active, msg.IdleExited = s.reg.counts()
 	if ctx.Err() != nil || rc.ctx.Err() != nil {
 		return nil, errReconnectUnavailable
 	}
