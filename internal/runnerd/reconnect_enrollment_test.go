@@ -81,7 +81,7 @@ func TestColdGuestEnrollmentWaitsForClaimedDriverResult(t *testing.T) {
 	row.state = "suspended"
 	generation := row.placementGen + 1
 	s.reg.mu.Unlock()
-	if err := s.claimResumePlacement("session_test", generation); err != nil {
+	if _, err := s.claimResumePlacement("session_test", row.handle, generation); err != nil {
 		t.Fatal(err)
 	}
 	claimed, _ := s.reg.snapshot("session_test")

@@ -966,6 +966,10 @@ func (r *registry) resumed(id string, restarted bool) {
 	if !ok {
 		return
 	}
+	r.resumedLocked(e, restarted)
+}
+
+func (r *registry) resumedLocked(e *sessionEntry, restarted bool) {
 	// Read before it is overwritten: only the resume that actually brings a
 	// PARKED entry back can be the one that restarted it. `docker start` on an
 	// an already-started container exits 0, so a second resume reports a

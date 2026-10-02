@@ -122,3 +122,21 @@ func TestColdResumeRequiresActualRestart(t *testing.T) {
 		t.Fatal("refused cold resume published running or kept in-flight claim")
 	}
 }
+func TestColdResumeCompletionPreservesDeletionOwnership(t *testing.T) {
+	h := newIdleHarness(t)
+	if err := h.rd.Op(context.Background(), h.id, "suspend", false); err != nil {
+		t.Fatal(err)
+	}
+	h.rd.reg.mu.Lock()
+	h.rd.reg.items[h.id].placementGen = 1
+	h.rd.reg.mu.Unlock()
+	h.rd.drv = &observedResumeDriver{Fake: h.fd, before: func() {
+		// Delete sets this before waiting for the driver-owned resume to finish.
+		h.rd.reg.setState(h.id, "destroying")
+	}}
+	_ = h.rd.opAtPlacement(context.Background(), h.id, "resume", false, 2)
+	row, _ := h.rd.reg.snapshot(h.id)
+	if row.state != "destroying" {
+		t.Fatalf("BUG: late resume changed deletion-owned state to %s", row.state)
+	}
+}

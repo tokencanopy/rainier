@@ -825,8 +825,10 @@ func (s *Server) opAtPlacement(ctx context.Context, id, op string, warm bool, ge
 			// edge-case table names.
 			return errSuspendInFlight
 		}
+		var claimedBoot uint64
 		if generation != 0 {
-			if err := s.claimResumePlacement(id, generation); err != nil {
+			claimedBoot, err = s.claimResumePlacement(id, handle, generation)
+			if err != nil {
 				return err
 			}
 		}
@@ -844,7 +846,7 @@ func (s *Server) opAtPlacement(ctx context.Context, id, op string, warm bool, ge
 		}
 		if err != nil {
 			if generation != 0 {
-				s.failResumePlacement(context.WithoutCancel(ctx), id, handle, generation)
+				s.failResumePlacement(context.WithoutCancel(ctx), id, handle, generation, claimedBoot)
 			}
 			return err
 		}
@@ -854,6 +856,9 @@ func (s *Server) opAtPlacement(ctx context.Context, id, op string, warm bool, ge
 		// child that is running now. Only the driver can tell that from an
 		// unpause — Inspect folds paused and exited into one state — which is
 		// why it says so. See registry.resumed.
+		if generation != 0 {
+			return s.completeResumePlacement(id, handle, generation, claimedBoot)
+		}
 		s.reg.resumed(id, restarted)
 		return nil
 	default:

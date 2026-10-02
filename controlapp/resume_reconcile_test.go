@@ -36,3 +36,46 @@ func TestSchedulerReconcilesOnlyExactResumePlacement(t *testing.T) {
 		})
 	}
 }
+
+func TestResumingAcceptsOnlyCurrentFailureEvidence(t *testing.T) {
+	for _, target := range []control.SessionState{control.StateFailed, control.StateDead} {
+		for _, generation := range []uint64{0, 1, 2} {
+			fx := newFleetFixture(t)
+			fx.st.seedRunner(fleetEventRunner(1))
+			fx.st.seedSession(control.Session{ID: "sess_example", WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example", State: control.StateResuming, PlacementGeneration: 2})
+			err := fx.service.ApplyRunnerEvent(context.Background(), control.RunnerEvent{WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example", SessionID: "sess_example", Generation: 1, PlacementGeneration: generation, State: target})
+			row := fleetGetSessionState(t, fx, "ws_example", "sess_example")
+			if generation == 2 {
+				if err != nil || row.State != target {
+					t.Fatalf("current %s lost: %v state=%s", target, err, row.State)
+				}
+			} else if err == nil || row.State != control.StateResuming {
+				t.Fatal("stale failure changed pending boot")
+			}
+		}
+	}
+}
+
+func TestPendingResumeCapacityCountsEachPlacementOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		observed uint64
+		want     int
+	}{{"same", 2, 1}, {"old", 1, 0}, {"absent", 0, 0}} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFleetFixture(t)
+			host := fleetReconcileRunnerRow()
+			host.CapacityTotal = 2
+			host.CapacityUsed = 1
+			if tc.observed != 0 {
+				host.CapacityPlacements = map[control.SessionID]uint64{"sess_example": tc.observed}
+			}
+			fx.st.seedRunner(host)
+			fx.st.seedSession(control.Session{ID: "sess_example", WorkspaceID: "ws_example", PoolID: "pool_example", RunnerID: "runner_example", State: control.StateResuming, PlacementGeneration: 2})
+			views, err := fx.service.freeCapacity(context.Background(), "pool_example")
+			if err != nil || len(views) != 1 || views[0].free != tc.want {
+				t.Fatalf("capacity=%+v err=%v want free=%d", views, err, tc.want)
+			}
+		})
+	}
+}

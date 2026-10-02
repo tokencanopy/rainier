@@ -108,11 +108,12 @@ func (p *Plane) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// this very connection.
 	res, err := p.host.Fleet().ReconcileRunner(connCtx, control.RunnerSnapshot{
 		WorkspaceID: b.WorkspaceID, PoolID: b.PoolID,
-		RunnerID:      b.RunnerID,
-		Generation:    rc.gen,
-		CapacityUsed:  ann.Used,
-		CapacityTotal: ann.Total,
-		Sessions:      announcedSessions(ann.Sessions),
+		RunnerID:           b.RunnerID,
+		Generation:         rc.gen,
+		CapacityUsed:       ann.Used,
+		CapacityTotal:      ann.Total,
+		CapacityPlacements: capacityPlacements(ann.CapacityPlacements),
+		Sessions:           announcedSessions(ann.Sessions),
 	})
 	if err != nil {
 		p.logf("reconciling runner %s (generation %d): %v", name, rc.gen, err)
@@ -205,12 +206,13 @@ func (p *Plane) connectRunner(ctx context.Context, rc *runnerConn, ann runner.Fr
 
 	reg, err := p.host.Fleet().RegisterRunner(ctx, control.RunnerRegistration{
 		WorkspaceID: rc.binding.WorkspaceID, PoolID: rc.binding.PoolID,
-		RunnerID:      rc.binding.RunnerID,
-		Generation:    rc.gen,
-		CapacityUsed:  ann.Used,
-		CapacityTotal: ann.Total,
-		Capabilities:  rc.caps,
-		Sessions:      announcedSessions(ann.Sessions),
+		RunnerID:           rc.binding.RunnerID,
+		Generation:         rc.gen,
+		CapacityUsed:       ann.Used,
+		CapacityTotal:      ann.Total,
+		CapacityPlacements: capacityPlacements(ann.CapacityPlacements),
+		Capabilities:       rc.caps,
+		Sessions:           announcedSessions(ann.Sessions),
 	})
 	switch {
 	case err != nil:

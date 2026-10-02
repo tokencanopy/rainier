@@ -903,10 +903,30 @@ func (m *Microvm) saveRecord(rec instanceRecord) error {
 	if err != nil {
 		return fmt.Errorf("marshal instance record: %w", err)
 	}
-	if err := os.WriteFile(m.instanceMetaPath(rec.ID), data, microvmFileMode); err != nil {
-		return fmt.Errorf("write instance record: %w", err)
+	// A crash may leave either complete version, never a truncated authority
+	// record that startup would skip before reclaiming resources.
+	tmp, err := os.CreateTemp(dir, ".instance-*")
+	if err != nil {
+		return err
 	}
-	return nil
+	defer os.Remove(tmp.Name())
+	if err = tmp.Chmod(microvmFileMode); err == nil {
+		_, err = tmp.Write(data)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	closeErr := tmp.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if err = os.Rename(tmp.Name(), m.instanceMetaPath(rec.ID)); err != nil {
+		return err
+	}
+	return syncDir(dir)
 }
 
 func (m *Microvm) deleteInstanceRecord(id string) {
@@ -940,6 +960,12 @@ func (m *Microvm) recoverDiskInstances() {
 			continue
 		}
 		if st, err := m.engine.State(context.Background(), id); err == nil {
+			if rec.RecoveryBlocked && (st == VMMStateGone || st == VMMStateStopped) {
+				// An interrupted launch with no surviving process is cold,
+				// not a lost workspace. Keep the recorded placement fence.
+				rec.Cold, rec.RecoveryBlocked = true, false
+				rec.PID, rec.Identity = 0, guestHostIdentity{}
+			}
 			reconcileState(&rec, st)
 		}
 		m.reassociateSlot(&rec)
@@ -1326,7 +1352,7 @@ func sanitizeRef(ref string) (string, error) {
 func (m *Microvm) usedLocked() int {
 	used := m.pending
 	for _, inst := range m.instances {
-		if inst.State == StateRunning || (inst.State == StateSuspended && !inst.Cold) {
+		if inst.resuming || inst.State == StateRunning || (inst.State == StateSuspended && !inst.Cold) {
 			used++
 		}
 	}
@@ -1854,6 +1880,10 @@ func (m *Microvm) resume(ctx context.Context, id string, generation uint64) (boo
 			return false, err
 		}
 	}
+	if cold && m.usedLocked() >= m.opts.TotalSlots {
+		m.mu.Unlock()
+		return false, errors.New("microvm: no capacity for cold resume")
+	}
 	inst.resuming = true
 	inst.resumeDone = make(chan struct{})
 	claimed := inst
@@ -1906,12 +1936,47 @@ func (m *Microvm) resume(ctx context.Context, id string, generation uint64) (boo
 	// given back when it does not get there.
 	defer func() {
 		if slot != nil {
+			m.mu.Lock()
+			current, owned := m.instances[id]
+			owned = owned && current == claimed
+			rec := persistable(claimed)
+			m.mu.Unlock()
+			// Failure retains the conservative blocked launch intent on disk.
+			// Recovered engine evidence may release it only after observing exit.
+			if owned {
+				_ = m.saveRecord(rec)
+			}
 			_ = m.slots.Release(context.WithoutCancel(ctx), slot)
 		}
 		if clonedRootfs {
 			m.removeSessionRootfs(id)
 		}
 	}()
+	stopUnverified := func() bool {
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		stopErr := m.engine.Stop(stopCtx, id)
+		if stopErr != nil {
+			state, stateErr := m.engine.State(stopCtx, id)
+			if stateErr != nil || (state != VMMStateGone && state != VMMStateStopped) {
+				m.mu.Lock()
+				claimed.State, claimed.Cold, claimed.RecoveryBlocked = StateRunning, false, true
+				claimed.Identity = guestHostIdentity{}
+				claimed.PID, claimed.Cfg, claimed.slot, claimed.channel = m.engine.PID(id), cfg, slot, nil
+				claimed.bump()
+				m.instances[id] = claimed
+				rec := persistable(claimed)
+				slot, clonedRootfs = nil, false
+				m.mu.Unlock()
+				// If this write fails, the earlier blocked launch intent still
+				// owns the new namespace and forbids guest admission on restart.
+				_ = m.saveRecord(rec)
+				return false
+			}
+		}
+		m.removeCgroup(id, cfg.CgroupPath)
+		return true
+	}
 	if cold {
 		// A cold resume is a fresh boot, and a fresh boot needs the session's
 		// whole configuration. This driver holds that in memory only
@@ -1998,8 +2063,24 @@ func (m *Microvm) resume(ctx context.Context, id string, generation uint64) (boo
 			return false, fmt.Errorf("cold resume of %s: allocating a network slot: %w", id, err)
 		}
 		applySlot(&cfg, slot)
+		// Persist ownership BEFORE the engine can start a process. On a crash
+		// during Launch, startup must retain this namespace and rootfs even
+		// though no verified process identity has been published yet.
+		m.mu.Lock()
+		intent := persistable(inst)
+		intent.State, intent.Cold, intent.RecoveryBlocked = StateRunning, false, true
+		intent.Cfg, intent.PID, intent.Identity = cfg, 0, guestHostIdentity{}
+		intent = persistable(&intent)
+		m.mu.Unlock()
+		if err := m.saveRecord(intent); err != nil {
+			channel.close()
+			return false, err
+		}
 		if err := m.engine.Launch(ctx, cfg); err != nil {
 			channel.close()
+			if !stopUnverified() {
+				return false, errors.New("microvm: uncertain launch retained for cleanup")
+			}
 			return false, fmt.Errorf("relaunch cold microvm %s: %w", id, err)
 		}
 		if inst.Reconnect {
@@ -2007,29 +2088,10 @@ func (m *Microvm) resume(ctx context.Context, id string, generation uint64) (boo
 			identity, err = m.engine.(guestIdentityVerifier).guestIdentity(cfg, m.engine.PID(id))
 			if err != nil {
 				channel.close()
-				stopErr := m.engine.Stop(context.WithoutCancel(ctx), id)
-				if stopErr == nil {
-					m.removeCgroup(id, cfg.CgroupPath)
-					return false, errors.New("microvm: new guest identity verification failed")
+				if !stopUnverified() {
+					return false, errors.New("microvm: unverified VM retained for cleanup")
 				}
-				// A possibly live VM keeps every resource, even if Delete raced
-				// the launch. Its blocked record permits cleanup, never admission.
-				m.mu.Lock()
-				inst.State = StateRunning
-				inst.Cold = false
-				inst.RecoveryBlocked = true
-				inst.Identity = guestHostIdentity{}
-				inst.PID = m.engine.PID(id)
-				inst.Cfg = cfg
-				inst.slot = slot
-				inst.channel = nil
-				m.instances[id] = inst
-				rec := persistable(inst)
-				slot = nil
-				clonedRootfs = false
-				m.mu.Unlock()
-				_ = m.saveRecord(rec)
-				return false, errors.New("microvm: unverified VM retained for cleanup")
+				return false, errors.New("microvm: new guest identity verification failed")
 			}
 		}
 		restarted = true
@@ -2050,17 +2112,14 @@ func (m *Microvm) resume(ctx context.Context, id string, generation uint64) (boo
 		// and a network slot; and the deferred release is about to take that
 		// slot back out from under it. So it is stopped here rather than
 		// left running, and only then does the slot go.
-		if restarted {
-			if err := m.engine.Stop(context.WithoutCancel(ctx), id); err != nil {
-				log.Printf("microvm: %s was resumed onto a record that no longer exists and could not be stopped: %v", id, err)
-			} else {
-				m.removeCgroup(id, cfg.CgroupPath)
-			}
+		if restarted && !stopUnverified() {
+			return restarted, errors.New("microvm: orphaned launch retained for cleanup")
 		}
 		return restarted, fmt.Errorf("no such id %s", id)
 	}
 	inst.State = StateRunning
 	inst.Cold = false
+	inst.RecoveryBlocked = false
 	if restarted {
 		inst.PID = m.engine.PID(id)
 		inst.Identity = identity
@@ -3556,4 +3615,21 @@ func (m *Microvm) ResumeStatus(ctx context.Context, id string, generation uint64
 		return "running", generation, nil
 	}
 	return "resuming", generation, nil
+}
+
+// CapacitySnapshot captures the aggregate and its known placements under the
+// same driver lock. Pending creates without a published record remain unnamed.
+func (m *Microvm) CapacitySnapshot(ctx context.Context) (int, int, map[string]uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	placements := map[string]uint64{}
+	for _, inst := range m.instances {
+		if inst.PlacementGeneration > 0 && (inst.resuming || inst.State == StateRunning || (inst.State == StateSuspended && !inst.Cold)) {
+			placements[inst.SessionID] = inst.PlacementGeneration
+		}
+	}
+	return m.usedLocked(), m.opts.TotalSlots, placements, nil
 }

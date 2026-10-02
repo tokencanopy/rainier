@@ -1407,7 +1407,7 @@ func caseRunnerRoundTrip(t *testing.T, s Stores) {
 	for _, id := range []control.RunnerID{"runner_b", "runner_a"} {
 		if err := s.Fleet.UpsertRunner(ctx, PoolA, control.Runner{
 			ID: id, PoolID: PoolA, CapacityUsed: 1, CapacityTotal: 4, Connected: true,
-			Generation: 1, Capabilities: caps, LastSeenAt: baseTime(),
+			Generation: 1, CapacityPlacements: map[control.SessionID]uint64{"sess_capacity_test": 2}, Capabilities: caps, LastSeenAt: baseTime(),
 		}); err != nil {
 			t.Fatalf("upsert %s: %v", id, err)
 		}
@@ -1426,6 +1426,8 @@ func caseRunnerRoundTrip(t *testing.T, s Stores) {
 		t.Fatalf("PoolID = %q, want %q", got.PoolID, PoolA)
 	case got.CapacityUsed != 1 || got.CapacityTotal != 4:
 		t.Fatalf("capacity = %d/%d, want 1/4", got.CapacityUsed, got.CapacityTotal)
+	case got.CapacityPlacements["sess_capacity_test"] != 2:
+		t.Fatal("exact capacity placement missing from aggregate observation")
 	case !got.Connected:
 		t.Fatalf("connected = false, want true")
 	case got.Generation != 1:

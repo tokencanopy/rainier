@@ -264,16 +264,6 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 	defer s.reconnectControl.CompareAndSwap(rc, nil)
 
 	send := func(m runner.FromRunner) {
-		cctx, ccancel := context.WithTimeout(ctx, 5*time.Second)
-		m.Used, m.Total, _ = s.drv.Capacity(cctx) // best-effort; piggybacked on every message
-		ccancel()
-		// The two counts that turn "no free capacity" into something a person
-		// can act on: how much of `used` is a working agent and how much is a
-		// sandbox whose agent has finished. They ride the same message the
-		// used/total pair already does, from the registry rather than the
-		// driver — docker cannot say whether a container's child is still
-		// running; only sessiond's report can, and this runner keeps it.
-		m.Active, m.IdleExited = s.reg.counts()
 		// The two generations every report carries (D19), stamped in the one
 		// place every report passes through. The runner's own is whatever
 		// controld granted this connection; the session's is the one its
@@ -282,29 +272,9 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 		switch m.Type {
 		case "event":
 			m.Generation = ag.generation.Load()
-			// Every event about a session echoes the placement generation its
-			// create carried — except the runner's own idle auto-stop, which
-			// must carry NONE. A cold resume opens a new placement generation
-			// on the control plane's row but sends the runner no new value, so
-			// this entry's is stale by construction from the first resume on;
-			// stamping it would guarantee the report is fenced as stale, and a
-			// fenced auto-stop leaves the row reading "running" over a
-			// container that is stopped — a session `rainier attach` then
-			// refuses to resume and cannot reach, until the runner happens to
-			// reconnect. Zero means "not carried" and fences nothing, which is
-			// safe here specifically because the report is about the sandbox
-			// this runner holds right now, and a session re-placed onto a
-			// DIFFERENT runner is still fenced by the runner identity the
-			// service checks first. Carrying the generation on `resume` is the
-			// real fix and is a separate change (protocol + control plane).
-			//
-			// The test is on the state rather than on which call site
-			// produced it, and that is right for both producers: reannounce
-			// renders the same word for the same registry state, and it is
-			// equally a report about the sandbox this runner holds right
-			// now, whose generation is equally unknowable to it. Anything
-			// NEW that fires this state would have to be one too.
-			if m.Session != "" && m.State != "suspended_cold" {
+			// Create and cold resume both install the committed placement
+			// before launch; every lifecycle event can retain that fence.
+			if m.Session != "" {
 				m.PlacementGeneration = s.reg.placementGeneration(m.Session)
 			}
 		case "result":
@@ -333,11 +303,9 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 	})
 	defer s.SetOnSessionRPC(nil)
 
-	used, total, _ := s.drv.Capacity(ctx)
-	active, idleExited := s.reg.counts()
-	ann := runner.FromRunner{Type: "announce", Proto: runner.ProtocolVersion, Runner: cfg.RunnerName,
-		Sessions: s.Announce(), Used: used, Total: total, Active: active, IdleExited: idleExited,
-		Capabilities: buildCapabilities(cfg.Capabilities, s.driverCapabilities()...)}
+	ann := runner.FromRunner{Type: "announce", Proto: runner.ProtocolVersion, Runner: cfg.RunnerName, Sessions: s.Announce(), Capabilities: buildCapabilities(cfg.Capabilities, s.driverCapabilities()...)}
+	s.stampCapacity(connCtx, &ann)
+
 	if err := wsjson.Write(connCtx, c, ann); err != nil {
 		return false, err // nothing can have been accepted before the announce
 	}
@@ -357,6 +325,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 		for {
 			select {
 			case m := <-out:
+				s.stampCapacity(connCtx, &m)
 				if err := wsjson.Write(connCtx, c, m); err != nil {
 					cancel() // a dead write direction means this connection
 					// is done; unblock the reader below too, not just this
@@ -981,4 +950,20 @@ func guestDriverSpec(spec runner.Spec) driver.Spec {
 		// values and still does.
 		BootstrapToken: spec.BootstrapToken, SecretNames: spec.SecretNames,
 	}
+}
+
+// Stamp at the single writer, so every origin (including runner-local RPCs)
+// has one ordered capacity sample and cannot overwrite a newer observation.
+func (s *Server) stampCapacity(parent context.Context, m *runner.FromRunner) {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	if d, ok := s.drv.(interface {
+		CapacitySnapshot(context.Context) (int, int, map[string]uint64, error)
+	}); ok {
+		m.Used, m.Total, m.CapacityPlacements, _ = d.CapacitySnapshot(ctx)
+	} else {
+		m.Used, m.Total, _ = s.drv.Capacity(ctx)
+		m.CapacityPlacements = nil
+	}
+	m.Active, m.IdleExited = s.reg.counts()
 }

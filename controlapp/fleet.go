@@ -247,14 +247,15 @@ func (s *FleetService) registerRunner(ctx context.Context, r control.RunnerRegis
 	}
 
 	runner := control.Runner{
-		ID:            r.RunnerID,
-		PoolID:        r.PoolID,
-		CapacityUsed:  r.CapacityUsed,
-		CapacityTotal: r.CapacityTotal,
-		Connected:     true,
-		Generation:    r.Generation,
-		Capabilities:  slices.Clone(r.Capabilities),
-		LastSeenAt:    s.clock.Now(),
+		ID:                 r.RunnerID,
+		PoolID:             r.PoolID,
+		CapacityUsed:       r.CapacityUsed,
+		CapacityTotal:      r.CapacityTotal,
+		CapacityPlacements: r.CapacityPlacements,
+		Connected:          true,
+		Generation:         r.Generation,
+		Capabilities:       slices.Clone(r.Capabilities),
+		LastSeenAt:         s.clock.Now(),
 	}
 	if err := s.fleet.UpsertRunner(ctx, r.PoolID, runner); err != nil {
 		if errors.Is(err, control.ErrStale) {
@@ -290,6 +291,9 @@ func (s *FleetService) authoritativeGeneration(ctx context.Context, pool control
 // validateRegistration rejects a malformed or contradictory claim before any
 // port is touched.
 func validateRegistration(r control.RunnerRegistration, poolScoped bool) error {
+	if err := control.ValidateCapacityPlacements(r.CapacityUsed, r.CapacityPlacements); err != nil {
+		return err
+	}
 	if (!poolScoped && r.WorkspaceID == "") || r.PoolID == "" || r.RunnerID == "" || r.Generation == 0 ||
 		r.CapacityUsed < 0 || r.CapacityTotal < 0 || r.CapacityUsed > r.CapacityTotal {
 		return control.ErrInvalid
@@ -500,6 +504,9 @@ func (s *FleetService) reconcileRunner(ctx context.Context, snap control.RunnerS
 // validateSnapshot rejects a malformed snapshot, including one that names a
 // session twice, before any port is touched.
 func validateSnapshot(snap control.RunnerSnapshot, poolScoped bool) error {
+	if err := control.ValidateCapacityPlacements(snap.CapacityUsed, snap.CapacityPlacements); err != nil {
+		return err
+	}
 	if (!poolScoped && snap.WorkspaceID == "") || snap.PoolID == "" || snap.RunnerID == "" || snap.Generation == 0 {
 		return control.ErrInvalid
 	}
@@ -527,14 +534,15 @@ func (s *FleetService) upsertSnapshotRunner(ctx context.Context, snap control.Ru
 		caps = slices.Clone(existing.Capabilities)
 	}
 	return s.fleet.UpsertRunner(ctx, snap.PoolID, control.Runner{
-		ID:            snap.RunnerID,
-		PoolID:        snap.PoolID,
-		CapacityUsed:  snap.CapacityUsed,
-		CapacityTotal: snap.CapacityTotal,
-		Connected:     true,
-		Generation:    snap.Generation,
-		Capabilities:  caps,
-		LastSeenAt:    s.clock.Now(),
+		ID:                 snap.RunnerID,
+		PoolID:             snap.PoolID,
+		CapacityUsed:       snap.CapacityUsed,
+		CapacityTotal:      snap.CapacityTotal,
+		CapacityPlacements: snap.CapacityPlacements,
+		Connected:          true,
+		Generation:         snap.Generation,
+		Capabilities:       caps,
+		LastSeenAt:         s.clock.Now(),
 	})
 }
 
@@ -719,8 +727,8 @@ var eventTransitions = map[control.SessionState][]control.SessionState{
 	control.StateRunning:       {control.StateCreating, control.StateRunning},
 	control.StateSuspendedWarm: {control.StateRunning, control.StateSuspendedWarm},
 	control.StateSuspendedCold: {control.StateRunning, control.StateSuspendedCold},
-	control.StateFailed:        {control.StateCreating, control.StateRunning},
-	control.StateDead:          {control.StateCreating, control.StateRunning, control.StateSuspendedWarm, control.StateSuspendedCold},
+	control.StateFailed:        {control.StateCreating, control.StateResuming, control.StateRunning},
+	control.StateDead:          {control.StateCreating, control.StateResuming, control.StateRunning, control.StateSuspendedWarm, control.StateSuspendedCold},
 }
 
 // runnerReportedDead is the safe reason recorded when a runner reports a

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -249,6 +250,7 @@ func cloneControlEnvironment(e control.Environment) control.Environment {
 func cloneControlRunner(r control.Runner) control.Runner {
 	cp := r
 	cp.Capabilities = slices.Clone(r.Capabilities)
+	cp.CapacityPlacements = maps.Clone(r.CapacityPlacements)
 	return cp
 }
 
@@ -793,6 +795,9 @@ type memFleet struct{ m *memStore }
 // connection changes nothing at all, rather than half-overwriting the
 // current one's view of its own capacity.
 func (r memFleet) UpsertRunner(ctx context.Context, pool control.PoolID, run control.Runner) error {
+	if err := control.ValidateCapacityPlacements(run.CapacityUsed, run.CapacityPlacements); err != nil {
+		return err
+	}
 	if pool == "" {
 		return control.ErrInvalid
 	}

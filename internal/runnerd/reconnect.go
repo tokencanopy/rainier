@@ -126,8 +126,6 @@ func (s *Server) reconnectCall(ctx context.Context, rc *reconnectControl, sessio
 	id, ch := s.runnerRPC.begin(session)
 	defer s.runnerRPC.end(id)
 	msg := runner.FromRunner{Type: "session_req", Session: session, RPC: &runner.RPCEnvelope{ID: id, Method: method, Payload: body}}
-	msg.Used, msg.Total, _ = s.drv.Capacity(ctx)
-	msg.Active, msg.IdleExited = s.reg.counts()
 	if ctx.Err() != nil || rc.ctx.Err() != nil {
 		return nil, errReconnectUnavailable
 	}

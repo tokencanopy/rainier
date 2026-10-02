@@ -13,12 +13,12 @@ var errResumePlacement = errors.New("resume placement is not current")
 
 // claimResumePlacement opens the local boot before driver launch can expose a
 // fresh guest. Only the authenticated control command supplies generation.
-func (s *Server) claimResumePlacement(id string, generation uint64) error {
+func (s *Server) claimResumePlacement(id, handle string, generation uint64) (uint64, error) {
 	s.reg.mu.Lock()
 	row, ok := s.reg.items[id]
-	if !ok || generation == 0 || generation <= row.placementGen || row.resumePending || row.state == "running" || row.state == "starting" || row.state == "destroying" || row.stopsInFlight > 0 {
+	if !ok || row.handle != handle || generation == 0 || generation <= row.placementGen || row.resumePending || row.state == "running" || row.state == "starting" || row.state == "destroying" || row.stopsInFlight > 0 {
 		s.reg.mu.Unlock()
-		return errResumePlacement
+		return 0, errResumePlacement
 	}
 	old, authority := row.hub, row.relayAuthority
 	row.hub, row.relayAuthority = nil, nil
@@ -28,6 +28,7 @@ func (s *Server) claimResumePlacement(id string, generation uint64) error {
 	row.state = "resuming"
 	s.reg.nextBoot++
 	row.boot = s.reg.nextBoot
+	boot := row.boot
 	s.reg.mu.Unlock()
 	if old != nil {
 		s.guestForwards.discard(old)
@@ -36,10 +37,10 @@ func (s *Server) claimResumePlacement(id string, generation uint64) error {
 	if authority != nil {
 		authority.fence()
 	}
-	return nil
+	return boot, nil
 }
 
-func (s *Server) failResumePlacement(ctx context.Context, id, handle string, generation uint64) {
+func (s *Server) failResumePlacement(ctx context.Context, id, handle string, generation, boot uint64) {
 	// Only observed suspension proves a failed boot can be retried. Inspection
 	// errors or a live VM retain an unresolved state and all resource ownership.
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -48,11 +49,11 @@ func (s *Server) failResumePlacement(ctx context.Context, id, handle string, gen
 	s.reg.mu.Lock()
 	defer s.reg.mu.Unlock()
 	row, ok := s.reg.items[id]
-	if !ok || row.handle != handle || row.placementGen != generation {
+	if !ok || row.handle != handle || row.placementGen != generation || row.boot != boot {
 		return
 	}
 	row.resumePending = false
-	if err == nil && observed.State == driver.StateSuspended {
+	if row.state == "resuming" && err == nil && observed.State == driver.StateSuspended {
 		row.state = "suspended"
 	}
 }
@@ -110,4 +111,21 @@ func (s *Server) resumeStatus(ctx context.Context, m runner.ToRunner) runner.Fro
 		state = "resuming"
 	}
 	return runner.FromRunner{Type: "result", ReqID: m.ReqID, OK: true, State: state, PlacementGeneration: generation}
+}
+
+// Only the command that claimed this boot may complete it. Deletion keeps
+// state ownership, even when the driver finishes while teardown waits for it.
+func (s *Server) completeResumePlacement(id, handle string, generation, boot uint64) error {
+	s.reg.mu.Lock()
+	defer s.reg.mu.Unlock()
+	row, ok := s.reg.items[id]
+	if !ok || row.handle != handle || row.placementGen != generation || row.boot != boot || !row.resumePending {
+		return errResumePlacement
+	}
+	if row.state != "resuming" {
+		row.resumePending = false
+		return errResumePlacement
+	}
+	s.reg.resumedLocked(row, true)
+	return nil
 }

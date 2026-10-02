@@ -168,12 +168,13 @@ type RPCEnvelope struct {
 // a clean exit). That last one moves no state machine: the container stays up
 // for viewers, so it is an observation controld records against the session.
 type FromRunner struct {
-	Type     string        `json:"type"`               // "announce" | "result" | "event" | "session_req"
-	Proto    int           `json:"proto,omitempty"`    // announce
-	Runner   string        `json:"runner,omitempty"`   // announce
-	Sessions []SessionInfo `json:"sessions,omitempty"` // announce
-	Used     int           `json:"used"`
-	Total    int           `json:"total"`
+	CapacityPlacements map[string]uint64 `json:"capacity_placements,omitempty"`
+	Type               string            `json:"type"`               // "announce" | "result" | "event" | "session_req"
+	Proto              int               `json:"proto,omitempty"`    // announce
+	Runner             string            `json:"runner,omitempty"`   // announce
+	Sessions           []SessionInfo     `json:"sessions,omitempty"` // announce
+	Used               int               `json:"used"`
+	Total              int               `json:"total"`
 	// Active and IdleExited split Used by whether the sandbox has WORK in it:
 	// Active counts sandboxes that are up with their child process still
 	// running OR with a `rainier exec` command running (a detached run on a

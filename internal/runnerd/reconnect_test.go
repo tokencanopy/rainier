@@ -48,6 +48,9 @@ func TestReconnectHostRoundTrip(t *testing.T) {
 		done <- err
 	}()
 	req := conn.readMsg(t)
+	if req.Total != 4 {
+		t.Fatalf("host-originated reconnect RPC lost capacity snapshot: total=%d", req.Total)
+	}
 	if req.Type != "session_req" || req.Session != "session_test" || req.RPC == nil || req.RPC.Method != runner.MethodBeginGuestReconnect || !isRunnerOriginated(req.RPC.ID) {
 		t.Fatal("wrong begin request")
 	}

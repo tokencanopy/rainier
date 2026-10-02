@@ -688,7 +688,7 @@ func (s *SessionService) coldResumeFree(ctx context.Context, row control.Session
 		if err != nil {
 			return 0, err
 		}
-		return r.CapacityTotal - r.CapacityUsed - len(creating), nil
+		return availableRunnerSlots(r, creating), nil
 	}
 	return 0, nil
 }
