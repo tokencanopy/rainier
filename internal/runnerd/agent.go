@@ -417,6 +417,11 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 			s.execute(ctx, m, send, cfg, ag)
 			continue
 		}
+		if m.Type == "session_rpc" {
+			target := s.guestRPCTarget(connCtx, m.Session, ag)
+			go s.execute(connCtx, m, send, cfg, ag, target)
+			continue
+		}
 		go s.execute(ctx, m, send, cfg, ag) // ops are slow (docker); never block the reader
 	}
 }
@@ -426,7 +431,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 // slow docker op never blocks the next command from being read — except for
 // the "accept", which the reader runs inline because it is negotiation, not
 // work, and everything read after it depends on it having happened.
-func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runner.FromRunner), cfg AgentConfig, ag *agentSessionState) {
+func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runner.FromRunner), cfg AgentConfig, ag *agentSessionState, received ...*guestRPCTarget) {
 	switch m.Type {
 	case "accept":
 		// controld's answer to the announce, and the first thing it sends.
@@ -571,7 +576,19 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 		// one) comes from inside that container, not from here. So there is no
 		// result to send — m.ReqID is zero on this type — and correlation
 		// lives entirely in the envelope's own id.
-		s.forwardSessionRPC(m, send)
+		if ctx.Err() != nil {
+			return
+		}
+		if rc := s.reconnectControl.Load(); rc != nil && (rc.state != ag || rc.ctx.Err() != nil) {
+			return
+		}
+		var target *guestRPCTarget
+		if len(received) > 0 {
+			target = received[0]
+		} else {
+			target = s.guestRPCTarget(ctx, m.Session, ag)
+		}
+		s.forwardSessionRPC(m, send, target)
 	case "dial_attach":
 		// Deliberately not in a goroutine of its own: agentSession's read
 		// loop already runs one execute per inbound command precisely so a
@@ -594,7 +611,7 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 // answer that was never coming. A RESPONSE that cannot be delivered is only
 // logged: answering an answer is meaningless, and the sandbox that asked has
 // already lost its own pending entry along with the conn.
-func (s *Server) forwardSessionRPC(m runner.ToRunner, send func(runner.FromRunner)) {
+func (s *Server) forwardSessionRPC(m runner.ToRunner, send func(runner.FromRunner), received ...*guestRPCTarget) {
 	if m.RPC == nil {
 		log.Printf("agent: session_rpc for %s carried no envelope; ignoring", m.Session)
 		return
@@ -622,7 +639,33 @@ func (s *Server) forwardSessionRPC(m runner.ToRunner, send func(runner.FromRunne
 		}
 		return
 	}
-	err := s.sendSessionRPC(m.Session, env)
+	var err error
+	row, exists := s.reg.snapshot(m.Session)
+	var pending guestRPCPending
+	correlated := false
+	if env.Method == "resp" {
+		pending, correlated = s.guestForwards.take(env.ID, m.Session)
+	}
+	if correlated {
+		env.ID = pending.guestID
+		err = s.sendGuestRPC(&pending.target, env)
+	} else if exists && row.guestReconnect {
+		if env.Method == "resp" {
+			return
+		}
+		var target *guestRPCTarget
+		if len(received) > 0 {
+			target = received[0]
+		}
+		err = s.sendGuestRPC(target, env)
+	} else {
+		// A command captured for a negotiated guest never falls back to a
+		// replacement legacy entry or waits for a different hub.
+		if len(received) > 0 && received[0] != nil {
+			return
+		}
+		err = s.sendSessionRPC(m.Session, env)
+	}
 	if err == nil {
 		return
 	}

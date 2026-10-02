@@ -67,6 +67,7 @@ func (lease *guestReconnectLease) fence(ctx context.Context, epoch uint64) error
 	row.relayAuthority = nil
 	s.reg.mu.Unlock()
 	if old != nil {
+		s.guestForwards.discard(old)
 		old.Close()
 	}
 	if authority != nil {

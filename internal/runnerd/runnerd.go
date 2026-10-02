@@ -26,6 +26,7 @@ import (
 )
 
 type Server struct {
+	guestForwards guestRPCForwards
 	// reconnectControl is a connection-scoped view of the same agent RPC queue.
 	// A handshake captures it once; reconnecting never migrates a pending proof.
 	reconnectControl atomic.Pointer[reconnectControl]
@@ -1119,6 +1120,7 @@ func (s *Server) serveSessionConn(ctx context.Context, id string, conn relay.Con
 }
 
 func (s *Server) monitorSessionHub(id string, hub *relay.Hub) {
+	defer s.guestForwards.discard(hub)
 	<-hub.Done()
 	handle, state, ok := s.reg.hubDied(id, hub)
 	hub.Close()

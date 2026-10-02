@@ -146,29 +146,15 @@ func (c *reconnectReadGate) Read(ctx context.Context) ([]byte, error) {
 func (lease *guestReconnectLease) redeem(ctx context.Context, c relay.Conn, token string) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	reader, ok := c.(interface {
-		ReadLimited(context.Context, int) ([]byte, error)
-	})
-	if !ok {
-		return errReconnectInvalid
-	}
-	raw, err := reader.ReadLimited(ctx, runner.GuestReconnectPayloadLimit)
+	event, err := readGuestBootstrapRequest(ctx, c, runner.MethodFetchSessionSecrets)
 	if err != nil {
-		return errReconnectUnavailable
+		return err
 	}
-	frame, err := relay.Decode(raw)
-	if err != nil || frame.Type != relay.FrameControl || frame.AttachID != 0 {
-		return errReconnectInvalid
+	req, err := decodeGuestRedemption(event.Payload)
+	if err != nil {
+		return err
 	}
-	var event relay.ControlEvent
-	if json.Unmarshal(frame.Payload, &event) != nil || event.Kind != "req:"+runner.MethodFetchSessionSecrets || event.ID == 0 || isRunnerOriginated(event.ID) {
-		return errReconnectInvalid
-	}
-	var req struct {
-		Protocol uint64 `json:"protocol"`
-		Token    string `json:"token"`
-	}
-	if json.Unmarshal(event.Payload, &req) != nil || req.Protocol != 1 || req.Token != token || !lease.valid(ctx) {
+	if req.Token != token || !lease.valid(ctx) {
 		return errReconnectFenced
 	}
 	payload, err := lease.server.reconnectCall(ctx, lease.control, lease.row.id, runner.MethodFetchSessionSecrets, req)
@@ -224,8 +210,23 @@ func (s *Server) sendOwnedGuestMessage(lease *guestReconnectLease, hub *relay.Hu
 		msg.Generation = lease.generation
 		msg.PlacementGeneration = lease.row.placementGen
 	}
+	var forwarded uint64
+	if msg.Type == "session_req" && msg.RPC != nil && msg.RPC.Method != "resp" {
+		target := guestRPCTarget{ctx: lease.control.ctx, row: *row, control: lease.control, generation: lease.generation}
+		var ok bool
+		forwarded, ok = s.guestForwards.begin(target, msg.RPC.ID)
+		if !ok {
+			return
+		}
+		rpc := *msg.RPC
+		rpc.ID = forwarded
+		msg.RPC = &rpc
+	}
 	select {
 	case lease.control.out <- msg:
 	default:
+		if forwarded != 0 {
+			s.guestForwards.take(forwarded, lease.row.id)
+		}
 	}
 }

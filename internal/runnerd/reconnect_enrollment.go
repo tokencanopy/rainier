@@ -2,10 +2,10 @@ package runnerd
 
 import (
 	"context"
-	"encoding/json"
+	"time"
+
 	"github.com/tokencanopy/rainier/internal/relay"
 	"github.com/tokencanopy/rainier/protocol/runner"
-	"time"
 )
 
 // Fresh opted-in boots cannot use the legacy environment exchange. Holding
@@ -90,9 +90,5 @@ func readGuestBootstrapRequest(ctx context.Context, conn relay.Conn, method stri
 	if err != nil || frame.Type != relay.FrameControl || frame.AttachID != 0 {
 		return zero, errReconnectInvalid
 	}
-	var event relay.ControlEvent
-	if json.Unmarshal(frame.Payload, &event) != nil || event.Kind != "req:"+method || event.ID == 0 || isRunnerOriginated(event.ID) {
-		return zero, errReconnectInvalid
-	}
-	return event, nil
+	return decodeGuestBootstrapEvent(frame.Payload, method)
 }
