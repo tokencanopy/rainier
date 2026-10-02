@@ -190,6 +190,7 @@ func jailTestEngineIn(t *testing.T, dir string, fs *jailFakeFS, starter processS
 	// machine has. Every test here is about what the engine WOULD run and
 	// what it puts on disk first; production never replaces this.
 	fc.kvm = func() bool { return true }
+	fc.startTime = func(pid int) (uint64, error) { return uint64(pid), nil }
 	return fc
 }
 
@@ -980,4 +981,73 @@ func TestLaunchPublishesIntentBeforeStartingChild(t *testing.T) {
 	if _, err := os.Stat(fc.launchMarkerPath(cfg.ID)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("confirmed child exit did not clear launch intent")
 	}
+}
+
+func TestLaunchEvidenceRejectsAnotherInstancePID(t *testing.T) {
+	fc, _, _ := jailTestEngine(t, &fakeStarter{})
+	proc, pid := fakeFirecracker(t, "mvm-10")
+	defer func() { _ = proc.Kill(); _ = proc.Wait() }()
+	if err := atomicMetadata(fc.launchMarkerPath("mvm-1"), []byte(hostLaunchBoot())); err != nil {
+		t.Fatal(err)
+	}
+	fc.startTime = processStartTime
+	if err := fc.saveProcessIdentity("mvm-1", pid); err != nil {
+		t.Fatal(err)
+	}
+	if gone, err := fc.launchEvidence("mvm-1", pid); err == nil {
+		t.Fatalf("another instance PID accepted as current launch evidence: gone=%v", gone)
+	}
+	if err := atomicMetadata(fc.pidFilePath("mvm-1"), []byte(strconv.Itoa(pid))); err != nil {
+		t.Fatal(err)
+	}
+	signals := &fakeSignaller{}
+	fc.signals = signals
+	if err := fc.Stop(context.Background(), "mvm-1"); err == nil {
+		t.Fatal("another VM accepted for teardown")
+	}
+	if len(signals.sent) != 0 {
+		t.Fatal("mismatched process received a signal")
+	}
+	if !isFirecrackerPID(pid, "mvm-10") {
+		t.Fatal("exact-ID positive control failed")
+	}
+
+}
+
+func TestLaunchEvidenceRequiresOriginalProcessLifetime(t *testing.T) {
+	fc, _, _ := jailTestEngine(t, &fakeStarter{})
+	proc, pid := fakeFirecracker(t, "mvm-11")
+	defer func() { _ = proc.Kill(); _ = proc.Wait() }()
+	if err := atomicMetadata(fc.launchMarkerPath("mvm-11"), []byte(hostLaunchBoot())); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicMetadata(fc.pidFilePath("mvm-11"), []byte(strconv.Itoa(pid))); err != nil {
+		t.Fatal(err)
+	}
+	// An exact command/instance ID alone does not prove this is the original
+	// process. Until its birth identity has been published, ownership is unknown.
+	if _, err := fc.launchEvidence("mvm-11", pid); err == nil {
+		t.Fatal("exact argv accepted without process lifetime evidence")
+	}
+	fc.startTime = processStartTime
+	if err := fc.saveProcessIdentity("mvm-11", pid); err != nil {
+		t.Fatal(err)
+	}
+	if gone, err := fc.launchEvidence("mvm-11", pid); err != nil || gone {
+		t.Fatal("original process positive control failed")
+	}
+	actual := fc.startTime
+	fc.startTime = func(pid int) (uint64, error) { v, err := actual(pid); return v + 1, err }
+	if _, err := fc.launchEvidence("mvm-11", pid); err == nil {
+		t.Fatal("reused process lifetime accepted")
+	}
+	signals := &fakeSignaller{}
+	fc.signals = signals
+	if err := fc.Stop(context.Background(), "mvm-11"); err == nil {
+		t.Fatal("recycled lifetime accepted for teardown")
+	}
+	if len(signals.sent) != 0 {
+		t.Fatal("recycled process received a signal")
+	}
+
 }

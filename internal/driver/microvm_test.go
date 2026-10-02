@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -1439,7 +1440,7 @@ func TestFirecrackerStateReadsInstanceInfo(t *testing.T) {
 // fakeFirecracker starts a child that passes isFirecrackerPID: a script named
 // `firecracker`, invoked with the same `--id` argument the jailer passes
 // through to the real one, so both the /proc cmdline and the `ps -o command=`
-// fallback see the binary name and the instance id the check looks for. It
+// native argv lookup see the binary name and exact instance ID. It
 // exits on SIGTERM within one tick of its loop.
 //
 // A stand-in that does NOT pass the check (plain `sleep`, say) exercises a
@@ -1453,9 +1454,9 @@ func fakeFirecracker(t *testing.T, id string) (vmmProcess, int) {
 	t.Helper()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "firecracker")
-	script := "#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do sleep 0.02; done\n"
-	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
+	build := exec.Command("go", "build", "-o", bin, "./testdata/fakefirecracker")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build native process fixture: %v %s", err, output)
 	}
 	proc, err := execStarter{}.Start(bin, []string{"--id", id, "--api-sock", jailAPISocketPath})
 	if err != nil {

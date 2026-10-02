@@ -2799,8 +2799,9 @@ type FirecrackerEngine struct {
 	// It is a VALUE and not a pointer: an engine that failed to construct
 	// carries the zero range, whose forSlot answers an error for every index,
 	// so no code path can reach a nil allocator — see uidRange.
-	uids    uidRange
-	starter processStarter
+	uids      uidRange
+	starter   processStarter
+	startTime func(int) (uint64, error)
 	// chown and link are the two filesystem operations the jail needs that an
 	// ordinary test process cannot perform. Production is os.Chown and
 	// os.Link; see FirecrackerOpts.
@@ -2938,6 +2939,7 @@ func NewFirecrackerEngine(opts FirecrackerOpts) *FirecrackerEngine {
 		jail:       jail,
 		uids:       uids,
 		starter:    starter,
+		startTime:  processStartTime,
 		chown:      chown,
 		link:       link,
 		procs:      make(map[string]vmmProcess),
@@ -3128,6 +3130,9 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		}
 	}()
 	if pid := proc.Pid(); pid > 0 {
+		if err := f.saveProcessIdentity(cfg.ID, pid); err != nil {
+			return err
+		}
 		if err := atomicMetadata(f.pidFilePath(cfg.ID), []byte(strconv.Itoa(pid))); err != nil {
 			return err
 		}
@@ -3311,8 +3316,18 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 	}
 
 	gone, evidenceErr := f.launchEvidence(id, pid)
-	if evidenceErr != nil && !tracked {
-		return evidenceErr
+	if evidenceErr != nil {
+		if !tracked {
+			return evidenceErr
+		}
+		// A completed Wait proves this original child exited, even if its
+		// numeric PID now names something else. Otherwise retain uncertainty.
+		select {
+		case <-f.waitChild(id, proc):
+			gone = true
+		default:
+			return evidenceErr
+		}
 	}
 	if gone {
 		pid = 0
@@ -3571,7 +3586,7 @@ func hasKVM() bool {
 // the jailer it is the instance id, and it is on the command line twice over:
 // the jailer passes its own `--id` through to Firecracker, and the binary it
 // execs lives at <chroot base>/firecracker/<id>/root/firecracker, so the
-// argv carries the id whichever way it is read. It used to be the API socket
+// argv carries an exact --id value; path substrings are never authority. It used to be the API socket
 // path, which no longer distinguishes anything — every jailed VMM serves
 // /run/firecracker.socket, because every one of them has a root of its own.
 func isFirecrackerPID(pid int, marker string) bool {
@@ -3582,23 +3597,8 @@ func isFirecrackerPID(pid int, marker string) bool {
 		return false
 	}
 
-	cmdlinePath := fmt.Sprintf("/proc/%d/cmdline", pid)
-	if data, err := os.ReadFile(cmdlinePath); err == nil {
-		// The cmdline is NUL-separated, so a substring search over it can
-		// match across argument boundaries. That is harmless here: both
-		// needles are whole arguments or parts of one path, and the check is
-		// "is this plausibly the VMM we started" rather than a parser.
-		cmdline := string(data)
-		return strings.Contains(cmdline, jailExecName) && strings.Contains(cmdline, marker)
-	}
-
-	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=")
-	if out, err := cmd.Output(); err == nil {
-		s := string(out)
-		return strings.Contains(s, jailExecName) && (marker == "" || strings.Contains(s, marker))
-	}
-
-	return false
+	args, err := processArguments(pid)
+	return err == nil && guestProcessArguments(args, marker)
 }
 
 // ResumeStatus observes a claim without launching. If its command never reached

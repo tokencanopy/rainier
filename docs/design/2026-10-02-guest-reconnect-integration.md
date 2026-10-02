@@ -51,7 +51,9 @@ before launch. An uncertain result retains a blocked record and consumes capacit
 retry and workspace deletion cannot reuse or remove that record's disks.
 
 The engine writes a synced launch marker before starting the jailer and publishes
-its PID atomically. A missing or invalid PID on the same host boot is unknown,
+its PID and process start time atomically. Signal authorization requires exact
+native argv and the original process start time; a name prefix or recycled PID
+is never sufficient. A missing or invalid PID on the same host boot is unknown,
 not proof of exit. Recovery and teardown retain the jail and network resources
 until the child is confirmed exited. If the process identity was lost in that
 window, host inspection or a confirmed host reboot is required; an empty cgroup

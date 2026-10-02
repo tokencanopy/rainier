@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -74,6 +75,19 @@ func (f *FirecrackerEngine) launchEvidence(id string, pid int) (gone bool, err e
 	if pid <= 0 {
 		return false, errors.New("microvm: launch lacks process evidence; retain resources for host inspection")
 	}
+	var birth launchProcessIdentity
+	data, err = os.ReadFile(f.processIdentityPath(id))
+	if err != nil || json.Unmarshal(data, &birth) != nil || birth.PID != pid || birth.StartTime == 0 {
+		return false, errors.New("microvm: launch process lifetime is unknown; retain resources")
+	}
+	if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+		return true, nil
+	}
+	start, err := f.startTime(pid)
+	if err != nil || start != birth.StartTime {
+		return false, errors.New("microvm: process lifetime no longer matches launch")
+	}
+
 	if !isFirecrackerPID(pid, id) {
 		if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
 			return true, nil
@@ -105,7 +119,7 @@ func (f *FirecrackerEngine) forgetExited(id string) {
 	f.mu.Unlock()
 }
 func (f *FirecrackerEngine) removeLaunchEvidence(id string) error {
-	for _, path := range []string{f.pidFilePath(id), f.launchMarkerPath(id)} {
+	for _, path := range []string{f.pidFilePath(id), f.processIdentityPath(id), f.launchMarkerPath(id)} {
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
@@ -128,4 +142,26 @@ func (f *FirecrackerEngine) finishFailedLaunch(id string, proc vmmProcess) {
 	f.forgetExited(id)
 	_ = f.removeJail(id)
 	_ = f.removeLaunchEvidence(id)
+}
+
+// The birth timestamp distinguishes a reused PID even when the next process
+// carries the same exact instance ID. The launch marker supplies host boot scope.
+type launchProcessIdentity struct {
+	PID       int    `json:"pid"`
+	StartTime uint64 `json:"start_time"`
+}
+
+func (f *FirecrackerEngine) processIdentityPath(id string) string {
+	return filepath.Join(f.stateDir, "instances", id, "process.json")
+}
+func (f *FirecrackerEngine) saveProcessIdentity(id string, pid int) error {
+	start, err := f.startTime(pid)
+	if err != nil || start == 0 {
+		return errors.New("microvm: cannot establish child birth identity")
+	}
+	data, err := json.Marshal(launchProcessIdentity{PID: pid, StartTime: start})
+	if err != nil {
+		return err
+	}
+	return atomicMetadata(f.processIdentityPath(id), data)
 }
