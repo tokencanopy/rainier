@@ -43,13 +43,18 @@ var _ driver.MicrovmHost = (*Server)(nil)
 // whole difference between this door and the WebSocket one, where `register`
 // believes a query parameter with no authentication on the hop at all.
 func (s *Server) GuestConnected(sessionID string, conn relay.Conn) {
-	if _, ok := s.reg.get(sessionID); !ok {
+	row, exists := s.reg.snapshot(sessionID)
+	if !exists {
 		// A guest for a session this runner no longer holds: a destroy that
 		// raced the boot. Closing it is what tells the guest to stop; leaving
 		// it open would leak the conn and its goroutine with no registry
 		// entry that could ever reap them.
 		log.Printf("microvm guest connected for unknown session %s; closing", sessionID)
 		_ = conn.Close()
+		return
+	}
+	if row.guestReconnect {
+		go func() { _ = s.enrollGuestConnection(context.Background(), sessionID, conn) }()
 		return
 	}
 	go s.serveSessionConn(context.Background(), sessionID, conn)
@@ -105,7 +110,7 @@ func isRunnerOriginated(id uint64) bool { return id&runnerOriginatedIDBase != 0 
 // waiting on that number.
 func refuseSandboxOrigin(method string, id uint64) string {
 	switch {
-	case method == runner.MethodBeginGuestReconnect || method == runner.MethodAcceptGuestReconnect:
+	case method == runner.MethodBeginGuestReconnect || method == runner.MethodAcceptGuestReconnect || method == runner.MethodGuestReconnectConfiguration:
 		return "fenced"
 	case method == runner.MethodMintSessionBootstrap:
 		return "a sandbox may not mint its own bootstrap token; a fresh one is minted by the runner on a cold resume"

@@ -461,6 +461,7 @@ func TestMicrovmARecoveredSessionsUIDIsNotHandedToTheNextCreate(t *testing.T) {
 
 	// The restart: a second driver over the same state directory and the same
 	// host, as a restarted runnerd would be.
+	stopTestMicrovmRunner(t, first)
 	second, _, _ := testMicrovmNet(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir, Net: net})
 	fresh, err := second.Create(ctx, Spec{SessionID: "beta"})
 	if err != nil {
@@ -558,6 +559,7 @@ func TestMicrovmRecoveryReassociatesLiveSlotsAndReclaimsTheRest(t *testing.T) {
 	// A second driver over the same state directory, as a restarted runnerd
 	// would be. The simulated engine is rebuilt from the same directory so
 	// the recovered record still reads as running.
+	stopTestMicrovmRunner(t, first)
 	second, _, _ := testMicrovmNet(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir, Net: net})
 
 	if got := net.Namespaces(); len(got) != 1 || got[0] != liveCfg.Netns {
@@ -596,6 +598,7 @@ func TestMicrovmRecoveryDropsAColdSessionsSlotClaim(t *testing.T) {
 		t.Fatalf("cold Suspend: %v", err)
 	}
 
+	stopTestMicrovmRunner(t, first)
 	second, _, _ := testMicrovmNet(t, MicrovmOpts{TotalSlots: 1, StateDir: stateDir, Net: net})
 	if _, err := second.Create(ctx, Spec{SessionID: "beta"}); err != nil {
 		t.Fatalf("Create after recovery: %v; the parked session's slot claim was never dropped", err)
