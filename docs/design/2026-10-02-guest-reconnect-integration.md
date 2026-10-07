@@ -119,3 +119,12 @@ whole-process exit; timeout or cancellation returns failure, and any subsequent
 signal still requires a fresh lifetime and argv check. The native pthread
 regression holds a worker alive, verifies the wait remains pending, then ends
 the worker and verifies completion.
+
+### Recovered cold configuration
+
+A negotiated versioned cold resume whose in-memory boot configuration was lost
+on restart re-resolves it through the existing runner-only current-authority RPC.
+The pending claim, boot, handle, placement and control connection are fenced
+before returning configuration; a new bootstrap token is minted afterward.
+See [the configuration design](b1-recovered-cold-configuration.md). Legacy and
+unversioned recovered resumes retain their refusal; no configuration is persisted.

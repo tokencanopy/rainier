@@ -362,12 +362,10 @@ type instanceRecord struct {
 	// bootstrap token and ADR-0003 §2.7 item 1 keeps every part of it off a
 	// shared host's disk.
 	//
-	// bootLive says the pair is this process's own. A record recovered from
-	// disk after a runnerd restart has no configuration behind it, and a cold
-	// resume must say so rather than boot a guest that will never be told
-	// what it is. (The bootstrap token would survive such a restart — the
-	// runner can mint a fresh one — but the rest of the configuration would
-	// not, and persisting it is precisely what this design does not do.)
+	// bootLive says this process owns the configuration. A recovered record
+	// has none: negotiated versioned cold resumes must re-resolve it through
+	// current control-plane authority; other recovered resumes refuse. The
+	// fresh bootstrap token is minted separately. Neither is persisted here.
 	boot     runner.BootConfig
 	channel  *guestChannel
 	bootLive bool
@@ -1837,6 +1835,7 @@ func (m *Microvm) resume(ctx context.Context, id string, generation uint64) (boo
 	}
 	running := inst.State == StateRunning
 	cold, bootLive, cfg := inst.Cold, inst.bootLive, inst.Cfg
+	reconnect := inst.Reconnect
 	bootCfg, sessionID := inst.boot, inst.SessionID
 
 	// Resuming a session that is already running restarts nothing, and says
@@ -1971,30 +1970,19 @@ func (m *Microvm) resume(ctx context.Context, id string, generation uint64) (boo
 		return true
 	}
 	if cold {
-		// A cold resume is a fresh boot, and a fresh boot needs the session's
-		// whole configuration. This driver holds that in memory only
-		// (ADR-0003 §2.7 item 1), so a record recovered from disk after a
-		// runnerd restart has none — including the case where the original
-		// session carried nothing secret at all, which the driver
-		// deliberately cannot tell apart, having refused to write the
-		// evidence down.
-		//
-		// The honest answer is to refuse. Relaunching would boot a guest that
-		// is never told what it is: no session id, no proxy, no boot chain,
-		// no secrets, and an agent that reports itself healthy.
-		//
-		// The bootstrap token is not what is missing here — the runner can
-		// mint a fresh one, and does, three lines below. What is missing is
-		// everything else, and persisting THAT is what this design rules out.
-		// Rebuilding it from the control plane on a resume is the follow-up
-		// (a create-shaped resume, ADR-0003 §2.3's portable checkpoint).
-		//
-		// This refusal sits ABOVE the deep-dormant restore below it, and the
-		// order is deliberate rather than incidental — see deepDormantNote,
-		// which is what makes a recovered session whose workspace is also gone
-		// say WHICH of the two things it is waiting for.
+		// Recovery never reloads a boot configuration from disk. A negotiated
+		// placement may resolve it through current control-plane authority;
+		// legacy/unversioned resumes retain their existing refusal.
 		if !bootLive {
-			return false, m.coldResumeNeedsGuestConfig(id)
+			resolver, ok := m.currentHost().(GuestResumeConfigurationHost)
+			if !ok || !reconnect || !m.opts.GuestReconnect || generation == 0 {
+				return false, m.coldResumeNeedsGuestConfig(id)
+			}
+			fresh, err := resolver.GuestResumeConfiguration(ctx, sessionID, generation)
+			if err != nil || ctx.Err() != nil || fresh.SessionID != sessionID || fresh.Protocol != runner.SessionBootstrapProtocolVersion || fresh.GuestReconnect != runner.GuestReconnectProtocol || fresh.BootstrapToken != "" {
+				return false, errors.New("microvm: current resume configuration unavailable")
+			}
+			bootCfg = fresh
 		}
 		// The DEEP-DORMANT case (ADR-0003 §2.3): the workspace image is gone
 		// and the checkpoint is the only copy of this session's work. Rebuilt
@@ -2121,6 +2109,7 @@ func (m *Microvm) resume(ctx context.Context, id string, generation uint64) (boo
 		}
 		inst.channel = channel
 		inst.boot = bootCfg
+		inst.bootLive = true
 		inst.Cfg.VsockUDSPath = cfg.VsockUDSPath
 		inst.Cfg.CgroupPath = cfg.CgroupPath
 		inst.slot = slot

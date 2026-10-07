@@ -139,6 +139,14 @@ type MicrovmHost interface {
 	CheckpointCommitted(sessionID string, nonce uint64)
 }
 
+// GuestResumeConfigurationHost resolves configuration lost on runner restart.
+// The host must authorize the exact pending placement on its current control
+// connection. Returned configuration is in-memory only and carries no token;
+// the existing bootstrap mint follows successful resolution.
+type GuestResumeConfigurationHost interface {
+	GuestResumeConfiguration(context.Context, string, uint64) (runner.BootConfig, error)
+}
+
 // WorkspaceStream is what one cold suspend's stream carried, as the guest
 // counted it and as the runner received it. It holds counts and a nonce and
 // nothing else — a name or a path from inside a workspace is session content
