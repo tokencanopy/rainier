@@ -61,6 +61,11 @@ type FleetOptions struct {
 	// the exposure this whole design removes.
 	Bootstraps control.SessionBootstrapStore
 
+	// GuestReconnect enables negotiation only when the host composes the
+	// transactional current-authority dispatcher. Driver capability alone
+	// cannot establish that its peer implements enrollment and recovery.
+	GuestReconnect bool
+
 	// DefaultEgress replaces the built-in developer egress baseline
 	// (DefaultDeveloperEgressHosts) that every dispatched session's allowlist
 	// is unioned with. It is a POINTER because "leave it alone" and "make it
@@ -108,7 +113,8 @@ type FleetService struct {
 	// bootstraps mints and records a microVM session's bootstrap token
 	// (FleetOptions.Bootstraps), composed once here over the same clock every
 	// other decision in this service reads.
-	bootstraps SessionBootstrapMinter
+	bootstraps     SessionBootstrapMinter
+	guestReconnect bool
 
 	// defaultEgress is the host's developer egress baseline, resolved once at
 	// construction (FleetOptions.DefaultEgress). Held as a plain slice because
@@ -160,6 +166,7 @@ func NewFleetService(opts FleetOptions) (*FleetService, error) {
 		uow:                 opts.UnitOfWork,
 		checkpoints:         opts.Checkpoints,
 		bootstraps:          SessionBootstrapMinter{Store: opts.Bootstraps, Clock: opts.Clock},
+		guestReconnect:      opts.GuestReconnect,
 		defaultEgress:       resolveDefaultEgress(opts.DefaultEgress),
 		wake:                make(chan control.PoolID, 64),
 		known:               make(map[control.PoolID]struct{}),
@@ -247,14 +254,15 @@ func (s *FleetService) registerRunner(ctx context.Context, r control.RunnerRegis
 	}
 
 	runner := control.Runner{
-		ID:            r.RunnerID,
-		PoolID:        r.PoolID,
-		CapacityUsed:  r.CapacityUsed,
-		CapacityTotal: r.CapacityTotal,
-		Connected:     true,
-		Generation:    r.Generation,
-		Capabilities:  slices.Clone(r.Capabilities),
-		LastSeenAt:    s.clock.Now(),
+		ID:                 r.RunnerID,
+		PoolID:             r.PoolID,
+		CapacityUsed:       r.CapacityUsed,
+		CapacityTotal:      r.CapacityTotal,
+		CapacityPlacements: r.CapacityPlacements,
+		Connected:          true,
+		Generation:         r.Generation,
+		Capabilities:       slices.Clone(r.Capabilities),
+		LastSeenAt:         s.clock.Now(),
 	}
 	if err := s.fleet.UpsertRunner(ctx, r.PoolID, runner); err != nil {
 		if errors.Is(err, control.ErrStale) {
@@ -290,6 +298,9 @@ func (s *FleetService) authoritativeGeneration(ctx context.Context, pool control
 // validateRegistration rejects a malformed or contradictory claim before any
 // port is touched.
 func validateRegistration(r control.RunnerRegistration, poolScoped bool) error {
+	if err := control.ValidateCapacityPlacements(r.CapacityUsed, r.CapacityPlacements); err != nil {
+		return err
+	}
 	if (!poolScoped && r.WorkspaceID == "") || r.PoolID == "" || r.RunnerID == "" || r.Generation == 0 ||
 		r.CapacityUsed < 0 || r.CapacityTotal < 0 || r.CapacityUsed > r.CapacityTotal {
 		return control.ErrInvalid
@@ -500,6 +511,9 @@ func (s *FleetService) reconcileRunner(ctx context.Context, snap control.RunnerS
 // validateSnapshot rejects a malformed snapshot, including one that names a
 // session twice, before any port is touched.
 func validateSnapshot(snap control.RunnerSnapshot, poolScoped bool) error {
+	if err := control.ValidateCapacityPlacements(snap.CapacityUsed, snap.CapacityPlacements); err != nil {
+		return err
+	}
 	if (!poolScoped && snap.WorkspaceID == "") || snap.PoolID == "" || snap.RunnerID == "" || snap.Generation == 0 {
 		return control.ErrInvalid
 	}
@@ -527,14 +541,15 @@ func (s *FleetService) upsertSnapshotRunner(ctx context.Context, snap control.Ru
 		caps = slices.Clone(existing.Capabilities)
 	}
 	return s.fleet.UpsertRunner(ctx, snap.PoolID, control.Runner{
-		ID:            snap.RunnerID,
-		PoolID:        snap.PoolID,
-		CapacityUsed:  snap.CapacityUsed,
-		CapacityTotal: snap.CapacityTotal,
-		Connected:     true,
-		Generation:    snap.Generation,
-		Capabilities:  caps,
-		LastSeenAt:    s.clock.Now(),
+		ID:                 snap.RunnerID,
+		PoolID:             snap.PoolID,
+		CapacityUsed:       snap.CapacityUsed,
+		CapacityTotal:      snap.CapacityTotal,
+		CapacityPlacements: snap.CapacityPlacements,
+		Connected:          true,
+		Generation:         snap.Generation,
+		Capabilities:       caps,
+		LastSeenAt:         s.clock.Now(),
 	})
 }
 
@@ -562,7 +577,7 @@ func (s *FleetService) recordSnapshotAuthority(ctx context.Context, snap control
 // same snapshot produce the same Destroy list and no additional mutation.
 func (s *FleetService) reconcileSessions(ctx context.Context, snap control.RunnerSnapshot, poolScoped bool) ([]control.SessionID, error) {
 	states := []control.SessionState{
-		control.StateCreating, control.StateRunning,
+		control.StateCreating, control.StateResuming, control.StateRunning,
 		control.StateSuspendedWarm, control.StateSuspendedCold,
 	}
 	stored, err := s.fleet.SessionsOnRunner(ctx, snap.PoolID, snap.RunnerID, states)
@@ -595,6 +610,11 @@ func (s *FleetService) reconcileSessions(ctx context.Context, snap control.Runne
 			if present {
 				destroy = append(destroy, row.ID)
 			}
+			continue
+		}
+		// An unversioned inventory cannot settle a pending cold boot. It may
+		// predate dispatch, and absence never permits fresh-create requeue.
+		if row.State == control.StateResuming {
 			continue
 		}
 		if !present {
@@ -714,8 +734,8 @@ var eventTransitions = map[control.SessionState][]control.SessionState{
 	control.StateRunning:       {control.StateCreating, control.StateRunning},
 	control.StateSuspendedWarm: {control.StateRunning, control.StateSuspendedWarm},
 	control.StateSuspendedCold: {control.StateRunning, control.StateSuspendedCold},
-	control.StateFailed:        {control.StateCreating, control.StateRunning},
-	control.StateDead:          {control.StateCreating, control.StateRunning, control.StateSuspendedWarm, control.StateSuspendedCold},
+	control.StateFailed:        {control.StateCreating, control.StateResuming, control.StateRunning},
+	control.StateDead:          {control.StateCreating, control.StateResuming, control.StateRunning, control.StateSuspendedWarm, control.StateSuspendedCold},
 }
 
 // runnerReportedDead is the safe reason recorded when a runner reports a
@@ -775,7 +795,7 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 	// placement generation the row has moved past comes from a sandbox this
 	// session no longer has, even when it arrives on the current connection.
 	// Zero is "not carried" (an old runner) and fences nothing.
-	if event.PlacementGeneration != 0 && event.PlacementGeneration != row.PlacementGeneration {
+	if (row.State == control.StateResuming && event.PlacementGeneration == 0) || (event.PlacementGeneration != 0 && event.PlacementGeneration != row.PlacementGeneration) {
 		return control.ErrStale
 	}
 
@@ -816,7 +836,7 @@ func (s *FleetService) ApplyRunnerEvent(ctx context.Context, event control.Runne
 		// Already-applied identical event; idempotent success, no record.
 		return nil
 	}
-	var opts control.TransitionOpts
+	opts := control.TransitionOpts{ExpectedPlacementGeneration: &row.PlacementGeneration}
 	if target == control.StateFailed {
 		detail := boundDetail(event.Detail)
 		opts.Error = &detail

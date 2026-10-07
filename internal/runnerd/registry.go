@@ -28,8 +28,12 @@ type sessionEntry struct {
 	// echoes it, which is what lets controld fence a report from a sandbox
 	// the session has since been re-placed away from. Zero is "the create
 	// carried none" — an old controld — and fences nothing.
-	placementGen uint64
-	hub          *relay.Hub // set when sessiond registers; nil until then
+	placementGen   uint64
+	guestEpoch     uint64
+	resumePending  bool
+	guestReconnect bool
+	relayAuthority *guestRelayAuthority
+	hub            *relay.Hub // set when sessiond registers; nil until then
 	// attachments is the number of attachments currently open over this
 	// session's hub — viewers and controllers alike, since a runner neither
 	// knows nor needs to know which of them holds the controller lease.
@@ -352,6 +356,10 @@ func (r *registry) list() []sessionEntry {
 // registry is not where a hub's lifetime is decided and because a displaced
 // hub is not immediately useless: see retireDisplacedHub.
 func (r *registry) setHub(id string, h *relay.Hub) (displaced *relay.Hub, ok bool) {
+	return r.setHubAuthority(id, h, nil)
+}
+
+func (r *registry) setHubAuthority(id string, h *relay.Hub, authority *guestRelayAuthority) (displaced *relay.Hub, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.items[id]
@@ -360,6 +368,7 @@ func (r *registry) setHub(id string, h *relay.Hub) (displaced *relay.Hub, ok boo
 	}
 	displaced = e.hub
 	e.hub = h
+	e.relayAuthority = authority
 	if displaced == h {
 		displaced = nil
 	}
@@ -957,6 +966,10 @@ func (r *registry) resumed(id string, restarted bool) {
 	if !ok {
 		return
 	}
+	r.resumedLocked(e, restarted)
+}
+
+func (r *registry) resumedLocked(e *sessionEntry, restarted bool) {
 	// Read before it is overwritten: only the resume that actually brings a
 	// PARKED entry back can be the one that restarted it. `docker start` on an
 	// an already-started container exits 0, so a second resume reports a
@@ -1005,6 +1018,10 @@ func (r *registry) resumed(id string, restarted bool) {
 	// the new one. The register that is about to arrive opens the next
 	// epoch; until it does, frames from either side of the restart match
 	// nothing. See sessionEntry.boot.
-	r.nextBoot++
-	e.boot = r.nextBoot
+	if e.resumePending {
+		e.resumePending = false // claim already opened this boot before launch
+	} else {
+		r.nextBoot++
+		e.boot = r.nextBoot
+	}
 }

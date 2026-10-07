@@ -112,7 +112,7 @@ func main() {
 	if *transport == transportVsock {
 		dialer = vsockTransport()
 		preamble = func(ctx context.Context, c relay.Conn) error { return reBootstrap(ctx, c, boots) }
-		conn, cfg, failure, err := bootOverVsock(context.Background(), dialer, boots)
+		boot, err := bootGuest(context.Background(), dialer, boots, argv)
 		if err != nil {
 			// Deliberately fatal, and the same judgement prepareBoot's own
 			// failure gets: a guest that could not read its configuration
@@ -120,12 +120,13 @@ func main() {
 			// egress goes. Dying is what makes the runner notice.
 			log.Fatalf("microvm boot: %v", err)
 		}
-		firstConn, overVsock = conn, true
+		firstConn, overVsock = boot.conn, true
+		argv = boot.argv
 		if *sessionID == "" {
-			*sessionID = cfg.SessionID
+			*sessionID = boot.config.SessionID
 		}
-		if failure != nil {
-			secretsFailure = failure.Error()
+		if boot.failure != nil {
+			secretsFailure = boot.failure.Error()
 		}
 	} else if *transport != transportWebSocket {
 		log.Fatalf("unknown --transport %q (valid: %s, %s)", *transport, transportWebSocket, transportVsock)
@@ -251,6 +252,9 @@ func main() {
 	execs := sandboxexec.NewRunner(workspaceRoot,
 		sandboxexec.SessionEnv(os.Environ(), envAssignments(chainVars)),
 		sandboxexec.NewSpawner().Start)
+	if overVsock {
+		boots.bindExecEnvironment(execs, envAssignments(chainVars))
+	}
 
 	// What the RUNNER needs to know about those commands, and the only thing
 	// it needs: how many are running. runnerd's idle auto-stop stops a session

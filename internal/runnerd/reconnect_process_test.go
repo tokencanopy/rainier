@@ -16,8 +16,8 @@ import (
 )
 
 // No shipping command invokes the optional callback yet. Build its public call
-// site and exercise that artifact across a real agent WebSocket; do not imply
-// that a live VM, guest key owner or relay takeover was exercised.
+// site and bounded guest transport across real agent WebSocket and guest TCP
+// streams. No live VM, enrolled guest key owner or relay takeover is exercised.
 func TestReconnectHostBuiltExecution(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	t.Cleanup(cancel)
@@ -74,9 +74,13 @@ func TestReconnectHostBuiltExecution(t *testing.T) {
 	if result := conn.readMsg(t); result.Type != "result" || !result.OK {
 		t.Fatal("probe placement failed")
 	}
-	for _, tc := range []struct{ name, want string }{{"valid", "accepted"}, {"wrong_scope", "invalid"}, {"revoked", "fenced"}} {
+	for _, tc := range []struct{ name, want string }{{"valid", "accepted"}, {"wrong_scope", "invalid"}, {"revoked", "fenced"}, {"wrong_attempt", "unavailable"}, {"oversize", "unavailable"}} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := io.WriteString(input, "authorize\n"); err != nil {
+			command := "authorize"
+			if tc.name == "wrong_attempt" || tc.name == "oversize" {
+				command = tc.name
+			}
+			if _, err := io.WriteString(input, command+"\n"); err != nil {
 				t.Fatal(err)
 			}
 			req := conn.readMsg(t)
@@ -86,6 +90,8 @@ func TestReconnectHostBuiltExecution(t *testing.T) {
 			switch tc.name {
 			case "revoked":
 				replyReconnect(t, conn, req, false, []byte(`{"error":"fenced"}`))
+			case "wrong_attempt", "oversize":
+				replyReconnect(t, conn, req, true, reconnectChallengeJSON())
 			case "wrong_scope":
 				replyReconnect(t, conn, req, true, []byte(strings.Replace(string(reconnectChallengeJSON()), "session_test", "wrong_test", 1)))
 			default:
@@ -109,5 +115,5 @@ func TestReconnectHostBuiltExecution(t *testing.T) {
 			}
 		})
 	}
-	t.Log("built host callback: accepted proof, wrong-scope and revoked authority paths passed; synthetic driver/guest, real agent WebSocket")
+	t.Log("built host/stream bridge: accepted proof, wrong-scope, revoked, wrong-attempt and oversized guest paths passed; synthetic driver/guest, real WebSocket and TCP streams")
 }

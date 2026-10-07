@@ -451,31 +451,13 @@ const (
 	stageMkfs    checkpointStage = "mkfs"
 )
 
-// coldResumeNeedsGuestConfig is the refusal a cold resume gets when the record
-// it is resuming was recovered from disk: the guest configuration this driver
-// holds in memory only (ADR-0003 §2.7 item 1) did not survive the restart.
-//
-// It is stated here, beside the restore, because of what the review found: a
-// session dormant long enough for the deep-dormant tier to have deleted its
-// workspace image has almost certainly outlived the runnerd that created it, so
-// this refusal is the gate the restore path below is actually behind, and the
-// ORDER is not what puts it there. Running the restore first would not change
-// the outcome by one call — it would spend minutes of copying and a plaintext
-// scratch tree on a resume that is certain to fail three lines later, and widen
-// the very exposure window §7 bounds by removing the tree before the guest
-// boots. So the refusal stays first, and it says what it is waiting for.
-//
-// The precondition, written down rather than implied: THE DEEP-DORMANT RESTORE
-// IS REACHABLE ONLY FROM A RECORD THIS PROCESS STILL HAS THE GUEST
-// CONFIGURATION FOR. Making it reachable after a restart is not a change to
-// this barrier; it is the create-shaped resume in which the control plane
-// re-resolves the session's configuration (ADR-0003 §2.3, §2.7 item 1), which
-// is rainier-cloud's and is listed as owed in the note's §9. Persisting the
-// configuration here instead is the one answer this design rules out, and
-// booting a guest that was never told what it is — no session id, no proxy, no
-// boot chain — is what the refusal exists to prevent.
+// coldResumeNeedsGuestConfig refuses a recovered cold resume without a
+// negotiated, versioned configuration resolver. Configuration stays in memory
+// (ADR-0003 §2.7 item 1); the B1 resolver authorizes it for the current placement.
+// This gate remains above deep-dormant restore so a resume that cannot boot does
+// not first expose a restored plaintext tree. Legacy callers retain the refusal.
 func (m *Microvm) coldResumeNeedsGuestConfig(id string) error {
-	msg := fmt.Sprintf("cold resume of %s: this session's guest configuration was held in memory only (ADR-0003 §2.7 item 1) and did not survive a runnerd restart; a clean relaunch needs the control plane to re-resolve it, which is the portable-checkpoint work and not this change", id)
+	msg := fmt.Sprintf("cold resume of %s: this session's guest configuration was held in memory only (ADR-0003 §2.7 item 1) and did not survive a runnerd restart; a clean relaunch needs the control plane to re-resolve it, which requires a negotiated versioned resume", id)
 	if note := m.deepDormantNote(id); note != "" {
 		return errors.New(msg + "; " + note)
 	}

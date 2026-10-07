@@ -230,7 +230,7 @@ func (r *sessionStubSessionRepo) Transition(ctx context.Context, ws control.Work
 	if !ok || s.WorkspaceID != ws {
 		return control.ErrNotFound
 	}
-	if !slices.Contains(from, s.State) {
+	if !slices.Contains(from, s.State) || (opts.ExpectedPlacementGeneration != nil && s.PlacementGeneration != *opts.ExpectedPlacementGeneration) {
 		return control.ErrConflict
 	}
 	s.State = to
@@ -415,6 +415,8 @@ func (r *sessionStubEventRecorder) Record(ctx context.Context, e control.Event) 
 }
 
 type sessionStubTransport struct {
+	onDispatch func(runner.ToRunner)
+
 	log          *sessionCallLog
 	res          runner.FromRunner
 	err          error
@@ -424,6 +426,9 @@ type sessionStubTransport struct {
 
 func (t *sessionStubTransport) Dispatch(ctx context.Context, pool control.PoolID, id control.RunnerID, m runner.ToRunner) (runner.FromRunner, error) {
 	t.log.add("transport:dispatch:" + m.Type)
+	if t.onDispatch != nil {
+		t.onDispatch(m)
+	}
 	if t.err != nil {
 		return runner.FromRunner{}, t.err
 	}
@@ -1693,7 +1698,7 @@ func TestARunnerSConflictIsAConflictNotAnOutage(t *testing.T) {
 		}
 	})
 
-	t.Run("the row is left exactly where it was", func(t *testing.T) {
+	t.Run("the cold claim remains pending for reconciliation", func(t *testing.T) {
 		f := newSessionFixtureFull(t)
 		f.transport.res = runner.FromRunner{OK: false, Conflict: true}
 		f.fleet.runners = coldResumeCapacity()
@@ -1706,12 +1711,11 @@ func TestARunnerSConflictIsAConflictNotAnOutage(t *testing.T) {
 		if err != nil {
 			t.Fatalf("re-read: %v", err)
 		}
-		if row.State != control.StateSuspendedCold {
-			t.Fatalf("state after a refused resume = %q, want suspended_cold — the refusal must not "+
-				"move the row, or the session is left claiming to run on a container that is stopping", row.State)
+		if row.State != control.StateResuming || row.PlacementGeneration != 2 {
+			t.Fatal("refusal lost the committed cold-resume claim")
 		}
-		if f.log.hasPrefix("sessions:transition") {
-			t.Fatal("a refused resume transitioned the row")
+		if f.log.hasPrefix("sessions:transition:running") {
+			t.Fatal("refusal marked the session running")
 		}
 	})
 

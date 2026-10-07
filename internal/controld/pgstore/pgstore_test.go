@@ -272,14 +272,14 @@ func TestMigrate0003To0004AddsColumnsToLegacyRows(t *testing.T) {
 	if want := embeddedMigrationVersions(t); !slices.Equal(applied, want) {
 		t.Fatalf("schema_migrations = %v, want every embedded migration in order %v", applied, want)
 	}
-	// This release's head is 16: a database that stopped at 0003 runs the
+	// This release's head is 17: a database that stopped at 0003 runs the
 	// expand step (0007), the contract step (0008), the events table
 	// (0009), the agent credentials table (0010), the tombstone (0011), the
 	// durable revoke fence (0012), the controller lease (0013), the exec
 	// event's command name (0014), the session bootstrap token (0015), and
 	// guest reconnect authorization (0016) in the same start.
-	if head := applied[len(applied)-1]; head != 16 {
-		t.Fatalf("head migration = %d, want 16", head)
+	if head := applied[len(applied)-1]; head != 17 {
+		t.Fatalf("head migration = %d, want 17", head)
 	}
 
 	// The legacy session survived, and its new columns read as "never exited"

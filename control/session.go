@@ -16,6 +16,7 @@ const (
 	StateQueued        SessionState = "queued"
 	StateCreating      SessionState = "creating"
 	StateRunning       SessionState = "running"
+	StateResuming      SessionState = "resuming"
 	StateSuspendedWarm SessionState = "suspended_warm"
 	StateSuspendedCold SessionState = "suspended_cold"
 	StateCanceled      SessionState = "canceled"
@@ -35,10 +36,10 @@ func (s SessionState) Terminal() bool {
 }
 
 // OccupiesSlot reports whether a session in state s counts against a
-// runner's capacity: creating, running, or suspended_warm.
+// runner's capacity: creating, resuming, running, or suspended_warm.
 func (s SessionState) OccupiesSlot() bool {
 	switch s {
-	case StateCreating, StateRunning, StateSuspendedWarm:
+	case StateCreating, StateResuming, StateRunning, StateSuspendedWarm:
 		return true
 	}
 	return false
@@ -47,11 +48,15 @@ func (s SessionState) OccupiesSlot() bool {
 // NonTerminal lists every non-terminal state, in the order a session
 // normally progresses through them. Callers pass it as the from-list of a
 // guarded transition when any live state should be accepted.
-var NonTerminal = []SessionState{StateQueued, StateCreating, StateRunning, StateSuspendedWarm, StateSuspendedCold}
+var NonTerminal = []SessionState{StateQueued, StateCreating, StateResuming, StateRunning, StateSuspendedWarm, StateSuspendedCold}
 
 // TransitionOpts carries the columns a guarded session transition may update
 // alongside state. A nil field leaves that column unchanged.
 type TransitionOpts struct {
+	// ExpectedPlacementGeneration, when non-nil, makes the state transition a
+	// compare-and-swap against this exact placement, including lifecycle retries.
+	ExpectedPlacementGeneration *uint64
+
 	RunnerID *RunnerID
 	Error    *string
 	// Image, when non-nil, records the image this placement resolved for the

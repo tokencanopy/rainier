@@ -28,6 +28,7 @@ func TestThreeDimensions(t *testing.T) {
 			"creating", session{State: "creating", Reachable: true},
 			lifecycleStarting, processNone, connectionAvailable,
 		},
+		{"resuming", session{State: "resuming", Reachable: true}, lifecycleStarting, processNone, connectionAvailable},
 		{
 			"running with a live child", session{State: "running", Reachable: true},
 			lifecycleRunning, processRunning, connectionAvailable,
@@ -159,6 +160,7 @@ func TestActionEligibilityFollowsRawStates(t *testing.T) {
 			// it with a conflict because a dispatch may be in flight.
 			"creating", session{State: "creating"}, eligibleYes, eligibleNo, eligibleNo,
 		},
+		{"resuming", session{State: "resuming"}, eligibleYes, eligibleNo, eligibleYes},
 		{"suspended warm", session{State: "suspended_warm"}, eligibleYes, eligibleNo, eligibleYes},
 		{"suspended cold", session{State: "suspended_cold"}, eligibleYes, eligibleNo, eligibleYes},
 		{

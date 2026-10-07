@@ -76,6 +76,7 @@ func cases() []suiteCase {
 		{"S11 a placement transition records the resolved image", caseTransitionImage},
 		{"S12 exactly one of two claims from one generation wins", caseControllerClaimRace},
 		{"S13 the controller lease is fenced by its generation and its holder", caseControllerLease},
+		{"S14 cold resume claims and completions compare placement generation", caseResumePlacementClaim},
 
 		{"E1 environment round trip", caseEnvironmentRoundTrip},
 		{"E2 an environment name is unique per workspace", caseEnvironmentName},
@@ -1406,7 +1407,7 @@ func caseRunnerRoundTrip(t *testing.T, s Stores) {
 	for _, id := range []control.RunnerID{"runner_b", "runner_a"} {
 		if err := s.Fleet.UpsertRunner(ctx, PoolA, control.Runner{
 			ID: id, PoolID: PoolA, CapacityUsed: 1, CapacityTotal: 4, Connected: true,
-			Generation: 1, Capabilities: caps, LastSeenAt: baseTime(),
+			Generation: 1, CapacityPlacements: map[control.SessionID]uint64{"sess_capacity_test": 2}, Capabilities: caps, LastSeenAt: baseTime(),
 		}); err != nil {
 			t.Fatalf("upsert %s: %v", id, err)
 		}
@@ -1425,6 +1426,8 @@ func caseRunnerRoundTrip(t *testing.T, s Stores) {
 		t.Fatalf("PoolID = %q, want %q", got.PoolID, PoolA)
 	case got.CapacityUsed != 1 || got.CapacityTotal != 4:
 		t.Fatalf("capacity = %d/%d, want 1/4", got.CapacityUsed, got.CapacityTotal)
+	case got.CapacityPlacements["sess_capacity_test"] != 2:
+		t.Fatal("exact capacity placement missing from aggregate observation")
 	case !got.Connected:
 		t.Fatalf("connected = false, want true")
 	case got.Generation != 1:
@@ -1642,5 +1645,41 @@ func caseFleetEmptyPool(t *testing.T, s Stores) {
 		if err := tc.call(); !errors.Is(err, control.ErrInvalid) {
 			t.Errorf("%s with an empty pool: err = %v, want ErrInvalid", tc.name, err)
 		}
+	}
+}
+
+func caseResumePlacementClaim(t *testing.T, s Stores) {
+	ctx := context.Background()
+	row := mustCreate(t, s, Alpha, control.Session{ID: "sess_resume", CreatorID: "act_a", State: control.StateSuspendedCold, PoolID: PoolA, RunnerID: "runner_a"})
+	expected := row.PlacementGeneration
+	opts := control.TransitionOpts{RunnerID: &row.RunnerID, ExpectedPlacementGeneration: &expected}
+	results := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			results <- s.Sessions.Transition(ctx, Alpha, row.ID, []control.SessionState{control.StateSuspendedCold}, control.StateResuming, opts)
+		}()
+	}
+	wins := 0
+	for i := 0; i < 2; i++ {
+		err := <-results
+		if err == nil {
+			wins++
+		} else if !errors.Is(err, control.ErrConflict) {
+			t.Fatal(err)
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("claim winners=%d", wins)
+	}
+	current, err := s.Sessions.GetSession(ctx, Alpha, row.ID)
+	if err != nil || current.PlacementGeneration != expected+1 || current.State != control.StateResuming {
+		t.Fatal("claim did not preserve its generation")
+	}
+	if err := s.Sessions.Transition(ctx, Alpha, row.ID, []control.SessionState{control.StateResuming}, control.StateRunning, control.TransitionOpts{ExpectedPlacementGeneration: &expected}); !errors.Is(err, control.ErrConflict) {
+		t.Fatal("stale completion was accepted")
+	}
+	expected = current.PlacementGeneration
+	if err := s.Sessions.Transition(ctx, Alpha, row.ID, []control.SessionState{control.StateResuming}, control.StateRunning, control.TransitionOpts{ExpectedPlacementGeneration: &expected}); err != nil {
+		t.Fatal(err)
 	}
 }

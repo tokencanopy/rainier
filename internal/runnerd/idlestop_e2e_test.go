@@ -338,16 +338,9 @@ func TestAttachCountsBeforeTheFirstClientFrame(t *testing.T) {
 	}
 }
 
-// TestIdleStopEventCarriesNoPlacementGeneration is the review's other severe
-// finding. A cold resume opens a NEW placement generation on the control
-// plane's row but sends the runner no new value, so this runner's is stale
-// from the first resume on — and the control plane fences an event whose
-// placement generation is not the row's. A fenced auto-stop would leave the
-// row reading "running" over a container that is stopped: a session `rainier
-// attach` refuses to resume and cannot reach. So this one event carries none,
-// where every other event about a session still carries the one its create
-// did.
-func TestIdleStopEventCarriesNoPlacementGeneration(t *testing.T) {
+// Cold resume now carries the committed placement to the runner, so idle
+// stop must preserve that fence rather than sending an unversioned event.
+func TestIdleStopEventCarriesCurrentPlacementGeneration(t *testing.T) {
 	const placementGen = 7
 	clk := newFakeClock()
 	rd, srv, conn := runnerWithControld(t, func(s *Server) { s.now = clk.now })
@@ -385,9 +378,8 @@ func TestIdleStopEventCarriesNoPlacementGeneration(t *testing.T) {
 	if ev.Session != id {
 		t.Fatalf("suspended_cold for %q, want %q", ev.Session, id)
 	}
-	if ev.PlacementGeneration != 0 {
-		t.Fatalf("suspended_cold placement generation = %d, want 0 — a stale generation would fence the park",
-			ev.PlacementGeneration)
+	if ev.PlacementGeneration != placementGen {
+		t.Fatalf("suspended_cold placement generation = %d, want %d", ev.PlacementGeneration, placementGen)
 	}
 }
 

@@ -121,7 +121,7 @@ session over a network blip.
 
 | API `state` | Displayed |
 | --- | --- |
-| `queued`, `creating` | Starting |
+| `queued`, `creating`, `resuming` | Starting |
 | `running` | Running — **regardless of `child_exit_code`** |
 | `suspended_warm`, `suspended_cold` | Stopped |
 | `failed`, `dead` | Failed |
@@ -978,3 +978,12 @@ server event separately from creation time and process state. A last event is
 not proof that an agent is actively working. Status compute checks include
 `facts.status` and `facts.health` verbatim. Missing required facts (including
 an unresolved default environment or a failed workspace lookup) fail readiness.
+
+Cold resume commits `resuming` and its new placement generation before dispatch.
+Concurrent resume requests return conflict. A lost or refused reply retains that
+claim until exact-generation runner status resolves it; unversioned inventory
+cannot requeue it as a fresh create. After a two-minute dispatch grace, the
+existing scheduler safety pass checks status without launching a VM. A cold
+status durably fences any delayed command for that generation. The existing
+runner and workspace remain attached to the session throughout. Deletion is
+allowed while resuming; attach waits for readiness and stop is unavailable.

@@ -238,8 +238,8 @@ func (r *sessionRenderer) runnerHasRoom(name string) bool {
 }
 
 // freeSlots is free capacity per connected runner: its reported total less
-// its reported use less the sessions it is currently creating, whose slots
-// the runner has not counted yet. A store that cannot answer any part of it
+// its reported use less pending creates/resumes absent from that same usage
+// observation. A store that cannot answer any part of it
 // yields an empty map rather than a partial one — half a capacity picture is
 // not a smaller truth, it is a different fleet.
 func (r *sessionRenderer) freeSlots() map[string]int {
@@ -254,12 +254,12 @@ func (r *sessionRenderer) freeSlots() map[string]int {
 		if !row.Connected {
 			continue
 		}
-		creating, err := fleet.SessionsOnRunner(r.ctx, installPool, row.ID, []control.SessionState{control.StateCreating})
+		creating, err := fleet.SessionsOnRunner(r.ctx, installPool, row.ID, []control.SessionState{control.StateCreating, control.StateResuming})
 		if err != nil {
 			log.Printf("controld: rendering a session view: sessions creating on a runner: %v", err)
 			return map[string]int{}
 		}
-		free[string(row.ID)] = row.CapacityTotal - row.CapacityUsed - len(creating)
+		free[string(row.ID)] = control.AvailableRunnerSlots(row, creating)
 	}
 	return free
 }

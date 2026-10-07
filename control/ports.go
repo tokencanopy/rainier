@@ -20,15 +20,22 @@ import (
 type Action string
 
 const (
-	ActionCreate   Action = "create"
-	ActionGet      Action = "get"
-	ActionList     Action = "list"
-	ActionUpdate   Action = "update"
-	ActionDelete   Action = "delete"
-	ActionSuspend  Action = "suspend"
-	ActionResume   Action = "resume"
-	ActionSnapshot Action = "snapshot"
-	ActionAttach   Action = "attach"
+	// These are audit labels; reconnect is authorized as ActionResume.
+	ActionGuestEnroll             Action = "guest_enroll"
+	ActionGuestReconnectBegin     Action = "guest_reconnect_begin"
+	ActionGuestReconnectAccept    Action = "guest_reconnect_accept"
+	ActionGuestReconnectConfigure Action = "guest_reconnect_configure"
+	ActionGuestBootstrapMint      Action = "guest_bootstrap_mint"
+	ActionGuestBootstrapRedeem    Action = "guest_bootstrap_redeem"
+	ActionCreate                  Action = "create"
+	ActionGet                     Action = "get"
+	ActionList                    Action = "list"
+	ActionUpdate                  Action = "update"
+	ActionDelete                  Action = "delete"
+	ActionSuspend                 Action = "suspend"
+	ActionResume                  Action = "resume"
+	ActionSnapshot                Action = "snapshot"
+	ActionAttach                  Action = "attach"
 	// ActionExec is the audit label for one command run inside a session's
 	// sandbox. It is deliberately an EVENT label and not an authorization
 	// verb: exec is authorized as ActionAttach, because it grants nothing a

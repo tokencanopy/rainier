@@ -215,9 +215,13 @@ func TestPlacementPinQueuesWhenTheRunnerHasNoRoom(t *testing.T) {
 
 		// The unpinned session behind it places on vm1...
 		wantState(t, st, "sess_behind", control.StateCreating)
-		if got := rec.snapshot(); !sameSet(got, []string{"sess_behind"}) {
-			t.Fatalf("vm1 received creates for %v, want only sess_behind", got)
-		}
+		// Creating is committed before asynchronous dispatch reaches the runner.
+		eventually(t, 3*time.Second, func() error {
+			if got := rec.snapshot(); !sameSet(got, []string{"sess_behind"}) {
+				return fmt.Errorf("vm1 received creates for %v, want only sess_behind", got)
+			}
+			return nil
+		})
 		// ...while the pinned one stays queued and unplaced.
 		got := getSession(t, st, "sess_blocked")
 		if got.State != control.StateQueued || got.RunnerID != "" {
@@ -238,9 +242,13 @@ func TestPlacementPinQueuesWhenTheRunnerHasNoRoom(t *testing.T) {
 		startRun(t, s)
 
 		wantState(t, st, "sess_any", control.StateCreating)
-		if got := rec.snapshot(); !sameSet(got, []string{"sess_any"}) {
-			t.Fatalf("vm1 received creates for %v, want only sess_any", got)
-		}
+		// Creating is committed before asynchronous dispatch reaches the runner.
+		eventually(t, 3*time.Second, func() error {
+			if got := rec.snapshot(); !sameSet(got, []string{"sess_any"}) {
+				return fmt.Errorf("vm1 received creates for %v, want only sess_any", got)
+			}
+			return nil
+		})
 		if got := getSession(t, st, "sess_hw"); got.State != control.StateQueued || got.RunnerID != "" {
 			t.Fatalf("pinned session = %q on %q, want still queued and unplaced", got.State, got.RunnerID)
 		}
