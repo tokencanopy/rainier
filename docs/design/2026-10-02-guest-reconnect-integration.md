@@ -111,3 +111,11 @@ recovered process, tracked-child reaping, mismatched-birth rejection, and a
 zombie leader with a surviving pthread worker.
 The [Linux pidfd contract](https://man7.org/linux/man-pages/man2/pidfd_open.2.html)
 is the whole-thread-group exit witness.
+
+Recovered-process waits retain their full bounded budget when the group leader
+has exited but another thread remains. An intermediate unreadable argv does not
+prove exit and does not trigger early escalation. Each poll must still prove
+whole-process exit; timeout or cancellation returns failure, and any subsequent
+signal still requires a fresh lifetime and argv check. The native pthread
+regression holds a worker alive, verifies the wait remains pending, then ends
+the worker and verifies completion.

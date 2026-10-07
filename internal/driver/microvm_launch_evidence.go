@@ -206,12 +206,13 @@ func (f *FirecrackerEngine) awaitVMExit(ctx context.Context, id string, waited c
 	defer poll.Stop()
 	for {
 		gone, err := f.launchEvidence(id, pid)
-		if err != nil {
-			return false
-		}
-		if gone || errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+		if err == nil && (gone || errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)) {
 			return true
 		}
+		// The group leader can lose its argv while other threads are still
+		// exiting. Uncertainty is not an exit witness, but it must not cut
+		// short this bounded wait. Recheck until whole-process exit is proven
+		// or the budget expires; any later signal still needs fresh authority.
 		select {
 		case <-poll.C:
 		case <-timer.C:

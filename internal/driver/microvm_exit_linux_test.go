@@ -187,4 +187,34 @@ int main(void) { pthread_t thread; if (pthread_create(&thread, 0, worker, 0)) re
 	if gone, _ := fc.launchEvidence("mvm-threads", pid); gone {
 		t.Fatal("live thread group accepted as gone")
 	}
+	if fc.awaitVMExit(context.Background(), "mvm-threads", nil, pid, 20*time.Millisecond) {
+		t.Fatal("expired wait accepted a surviving worker")
+	}
+	canceled, stop := context.WithCancel(context.Background())
+	stop()
+	if fc.awaitVMExit(canceled, "mvm-threads", nil, pid, time.Second) {
+		t.Fatal("canceled wait accepted a surviving worker")
+	}
+	// A terminating group can lose its leader's argv before its last worker
+	// exits. The recovered-process wait must keep its budget at this boundary.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	finished := make(chan bool, 1)
+	go func() { finished <- fc.awaitVMExit(ctx, "mvm-threads", nil, pid, 2*time.Second) }()
+	select {
+	case <-finished:
+		t.Fatal("recovered wait returned before the surviving worker exited")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := child.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case exited := <-finished:
+		if !exited {
+			t.Fatal("recovered wait did not recognize whole-process exit")
+		}
+	case <-ctx.Done():
+		t.Fatal("recovered wait did not finish within its deadline")
+	}
 }
