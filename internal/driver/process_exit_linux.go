@@ -1,22 +1,21 @@
 package driver
 
-import (
-	"fmt"
-	"os"
-	"strings"
-)
+import "golang.org/x/sys/unix"
 
-// processExited binds a terminal kernel state to the recorded process birth.
-// Zombies cannot execute or retain the VM's resources, but still answer kill(0).
+// processExited requires whole-thread-group exit, not just a zombie leader.
+// A process pidfd becomes readable only after its last thread exits. Recheck
+// birth after opening it so a PID reused during inspection cannot grant cleanup.
 func processExited(pid int, birth uint64) bool {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	fd, err := unix.PidfdOpen(pid, 0)
 	if err != nil {
 		return false
 	}
-	start, err := guestProcessStart(data, pid)
+	defer unix.Close(fd)
+	start, err := processStartTime(pid)
 	if err != nil || start != birth {
 		return false
 	}
-	fields := strings.Fields(string(data)[strings.LastIndex(string(data), ") ")+2:])
-	return fields[0] == "Z" || fields[0] == "X"
+	fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	n, err := unix.Poll(fds, 0)
+	return err == nil && n == 1 && fds[0].Revents&unix.POLLIN != 0
 }

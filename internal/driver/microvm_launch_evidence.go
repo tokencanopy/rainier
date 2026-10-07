@@ -94,7 +94,7 @@ func (f *FirecrackerEngine) launchEvidence(id string, pid int) (gone bool, err e
 		return false, errors.New("microvm: process lifetime no longer matches launch")
 	}
 	// An exited Linux process has no argv while its parent is reaping it.
-	// Its same-boot birth and terminal kernel state prove the original VM
+	// Its same-boot birth and whole-process exit notification prove the VM
 	// ended; empty argv alone never grants teardown authority.
 	if boot == current && boot != "unknown" && processExited(pid, birth.StartTime) {
 		return true, nil

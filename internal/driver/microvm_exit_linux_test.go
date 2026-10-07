@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -124,5 +125,66 @@ func TestVMMStopRecognizesAlreadyExitedOriginalProcess(t *testing.T) {
 				t.Fatal("tracked child was not reaped")
 			}
 		})
+	}
+}
+
+// A dead group leader is not proof that the other VMM threads have exited.
+func TestVMMExitRequiresEntireThreadGroup(t *testing.T) {
+	cc, err := exec.LookPath("cc")
+	if err != nil {
+		t.Skip("native pthread regression requires a C compiler")
+	}
+	dir := t.TempDir()
+	source := filepath.Join(dir, "leader.c")
+	binary := filepath.Join(dir, "firecracker")
+	program := `#include <pthread.h>
+#include <unistd.h>
+static void *worker(void *unused) { for (;;) pause(); return 0; }
+int main(void) { pthread_t thread; if (pthread_create(&thread, 0, worker, 0)) return 2; pthread_exit(0); }
+`
+	if err := os.WriteFile(source, []byte(program), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(cc, "-pthread", source, "-o", binary).CombinedOutput(); err != nil {
+		t.Fatalf("compile pthread witness: %v %s", err, out)
+	}
+	child := exec.Command(binary, "--id", "mvm-threads")
+	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = child.Process.Kill(); _ = child.Wait() }()
+	pid := child.Process.Pid
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fields := strings.Fields(strings.SplitN(string(data), ") ", 2)[1])
+		if fields[0] == "Z" && fields[17] == "2" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("leader did not exit with its worker still alive")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	birth, err := processStartTime(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processExited(pid, birth) {
+		t.Fatal("zombie leader granted teardown while a worker remained alive")
+	}
+	fc := NewFirecrackerEngine(FirecrackerOpts{StateDir: dir})
+	if err := atomicMetadata(fc.launchMarkerPath("mvm-threads"), []byte(hostLaunchBoot())); err != nil {
+		t.Fatal(err)
+	}
+	if err := fc.saveProcessIdentity("mvm-threads", pid); err != nil {
+		t.Fatal(err)
+	}
+	if gone, _ := fc.launchEvidence("mvm-threads", pid); gone {
+		t.Fatal("live thread group accepted as gone")
 	}
 }
