@@ -43,13 +43,18 @@ var _ driver.MicrovmHost = (*Server)(nil)
 // whole difference between this door and the WebSocket one, where `register`
 // believes a query parameter with no authentication on the hop at all.
 func (s *Server) GuestConnected(sessionID string, conn relay.Conn) {
-	if _, ok := s.reg.get(sessionID); !ok {
+	row, exists := s.reg.snapshot(sessionID)
+	if !exists {
 		// A guest for a session this runner no longer holds: a destroy that
 		// raced the boot. Closing it is what tells the guest to stop; leaving
 		// it open would leak the conn and its goroutine with no registry
 		// entry that could ever reap them.
 		log.Printf("microvm guest connected for unknown session %s; closing", sessionID)
 		_ = conn.Close()
+		return
+	}
+	if row.guestReconnect {
+		go func() { _ = s.enrollGuestConnection(context.Background(), sessionID, conn) }()
 		return
 	}
 	go s.serveSessionConn(context.Background(), sessionID, conn)
@@ -82,7 +87,9 @@ func isRunnerOriginated(id uint64) bool { return id&runnerOriginatedIDBase != 0 
 // rather than answering it there. `method` is the envelope's method, which
 // is "resp" for a response, so both arms consult the same fence.
 //
-// Two things are refused, and only this hop can refuse either of them.
+// Runner-only methods and runner-owned IDs are refused at this hop.
+// Reconnect begin/accept are also runner-only: a guest may enroll its fresh
+// boot but may not originate the host's later authorization flow.
 //
 // A sandbox may not mint its own bootstrap token. The design's whole point
 // is that the token is SINGLE-USE and lives 120 seconds: a guest that could
@@ -103,6 +110,8 @@ func isRunnerOriginated(id uint64) bool { return id&runnerOriginatedIDBase != 0 
 // waiting on that number.
 func refuseSandboxOrigin(method string, id uint64) string {
 	switch {
+	case method == runner.MethodBeginGuestReconnect || method == runner.MethodAcceptGuestReconnect || method == runner.MethodGuestReconnectConfiguration:
+		return "fenced"
 	case method == runner.MethodMintSessionBootstrap:
 		return "a sandbox may not mint its own bootstrap token; a fresh one is minted by the runner on a cold resume"
 	case isRunnerOriginated(id):
@@ -114,8 +123,8 @@ func refuseSandboxOrigin(method string, id uint64) string {
 // runnerRPCTable is the pending table for requests this runner originated.
 //
 // It is deliberately tiny and deliberately separate from the sandbox's: the
-// runner asks the control plane exactly one thing (a bootstrap token, on a
-// cold resume), and a table shared with the forwarding path would make the
+// runner asks for cold bootstrap and guest reconnect authorization, and a
+// table shared with the forwarding path would make the
 // forwarder a participant in the conversation it is supposed to be a pipe
 // for.
 type runnerRPCTable struct {
@@ -191,7 +200,7 @@ const mintBootstrapTimeout = 10 * time.Second
 // MintSessionBootstrap asks the control plane for a fresh single-use token
 // for sessionID, on the runner's own control connection.
 //
-// It is the one request this runner originates on the session RPC. The
+// This cold-resume request originates inside the runner. The
 // message carries no session id of its own — FromRunner.Session is the id,
 // and the control plane answers from the row its placement guard read — which
 // is what stops a runner holding session A from minting for session B.

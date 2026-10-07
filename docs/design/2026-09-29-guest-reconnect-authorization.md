@@ -64,6 +64,9 @@ and nonces use canonical unpadded base64url. Golden-vector tests pin the format.
 Signature verification alone is not authorization: the corresponding pending
 store row must still exist and be consumed under current authority.
 
+The follow-on [session-RPC contract](2026-09-30-guest-reconnect-rpc.md) defines
+shared method names, payloads and bounded strict decoders without enabling routes.
+
 ## Integration work required before enabling
 
 - Atomically enroll through the guest bootstrap exchange with capability

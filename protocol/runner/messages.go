@@ -103,6 +103,10 @@ const SessionBootstrapProtocolVersion = 1
 // Spec, byte for byte.
 const CapabilityMicrovmV1 = "microvm.v1"
 
+// CapabilityGuestReconnectV1 negotiates fresh guest enrollment and authenticated
+// live reconnect. It requires both the microVM driver and control-plane handlers.
+const CapabilityGuestReconnectV1 = "guest_reconnect.v1"
+
 // HomeMount is the agent home a create mounts into a sandbox: one writable
 // volume per (creator, workspace), landing at Path, inside which each coding
 // agent gets its own subdirectory. It is what makes "log in once" true across
@@ -164,12 +168,13 @@ type RPCEnvelope struct {
 // a clean exit). That last one moves no state machine: the container stays up
 // for viewers, so it is an observation controld records against the session.
 type FromRunner struct {
-	Type     string        `json:"type"`               // "announce" | "result" | "event" | "session_req"
-	Proto    int           `json:"proto,omitempty"`    // announce
-	Runner   string        `json:"runner,omitempty"`   // announce
-	Sessions []SessionInfo `json:"sessions,omitempty"` // announce
-	Used     int           `json:"used"`
-	Total    int           `json:"total"`
+	CapacityPlacements map[string]uint64 `json:"capacity_placements,omitempty"`
+	Type               string            `json:"type"`               // "announce" | "result" | "event" | "session_req"
+	Proto              int               `json:"proto,omitempty"`    // announce
+	Runner             string            `json:"runner,omitempty"`   // announce
+	Sessions           []SessionInfo     `json:"sessions,omitempty"` // announce
+	Used               int               `json:"used"`
+	Total              int               `json:"total"`
 	// Active and IdleExited split Used by whether the sandbox has WORK in it:
 	// Active counts sandboxes that are up with their child process still
 	// running OR with a `rainier exec` command running (a detached run on a
@@ -266,7 +271,7 @@ type ToRunner struct {
 	// "accept" is controld's answer to an announce, sent before any command:
 	// the generation this connection acts under and the announced
 	// capabilities controld will schedule on.
-	Type    string  `json:"type"` // "accept"|"create"|"destroy"|"remove_workspace"|"suspend"|"resume"|"snapshot"|"prepull"|"dial_attach"|"session_rpc"
+	Type    string  `json:"type"` // "accept"|"create"|"destroy"|"remove_workspace"|"suspend"|"resume"|"resume_status"|"snapshot"|"prepull"|"dial_attach"|"session_rpc"
 	ReqID   uint64  `json:"req_id,omitempty"`
 	Session string  `json:"session,omitempty"`
 	Spec    *Spec   `json:"spec,omitempty"`   // create
@@ -328,10 +333,12 @@ type RepoSpec struct {
 // passes only the pieces that apply; Env values are secrets as often as not
 // and never logged verbatim.
 type Spec struct {
-	Name        string   `json:"name,omitempty"`
-	Image       string   `json:"image,omitempty"`
-	Cmd         []string `json:"cmd,omitempty"`
-	EgressAllow []string `json:"egress_allow,omitempty"`
+	// GuestReconnect opts a fresh guest into authenticated reconnect enrollment.
+	GuestReconnect uint64   `json:"guest_reconnect,omitempty"`
+	Name           string   `json:"name,omitempty"`
+	Image          string   `json:"image,omitempty"`
+	Cmd            []string `json:"cmd,omitempty"`
+	EgressAllow    []string `json:"egress_allow,omitempty"`
 	// Setup is the environment's setup script, run once inside the fresh
 	// container; the runner reports its outcome as a "setup_done" /
 	// "setup_failed" event. SetupTimeoutSec bounds that run (0 = the
@@ -412,6 +419,11 @@ type Spec struct {
 // writes no part of this to disk, and the values SecretNames names arrive in
 // the guest over the token exchange, from the control plane, never from here.
 type BootConfig struct {
+	// GuestReconnect opts a fresh guest into protocol-1 key enrollment. Zero
+	// preserves legacy boot. Hosts must leave this absent until end-to-end
+	// capability negotiation, lifecycle and relay fencing are implemented.
+	GuestReconnect uint64 `json:"guest_reconnect,omitempty"`
+
 	// Protocol is SessionBootstrapProtocolVersion. A guest that reads a
 	// version it does not speak fails its boot chain rather than booting on a
 	// configuration it has half understood.

@@ -96,13 +96,15 @@ const (
 // simulated engine reports every session as running while nothing executes,
 // which is the single worst failure mode this component has.
 type MicrovmOpts struct {
-	BaseRootfs string // default base ext4 rootfs image path (required in production)
-	KernelPath string // guest vmlinux kernel path (required in production)
-	StateDir   string // directory holding instance sockets, metadata, and disks (always required)
-	TotalSlots int    // maximum simultaneous active slot capacity
-	VCPU       int    // vCPUs per session; 0 means defaultMicrovmVCPU
-	MemoryMiB  int    // memory per session in MiB; 0 means defaultMicrovmMemoryMiB
-	VMMPath    string // path to the Firecracker executable; empty means "firecracker" on PATH
+	// GuestReconnect enables the negotiated live-recovery capability; default off.
+	GuestReconnect bool
+	BaseRootfs     string // default base ext4 rootfs image path (required in production)
+	KernelPath     string // guest vmlinux kernel path (required in production)
+	StateDir       string // directory holding instance sockets, metadata, and disks (always required)
+	TotalSlots     int    // maximum simultaneous active slot capacity
+	VCPU           int    // vCPUs per session; 0 means defaultMicrovmVCPU
+	MemoryMiB      int    // memory per session in MiB; 0 means defaultMicrovmMemoryMiB
+	VMMPath        string // path to the Firecracker executable; empty means "firecracker" on PATH
 
 	// SlotGuestCIDR and SlotUplinkCIDR are the two host-local ranges a
 	// session's addresses are carved from, one /30 per slot (ADR-0003 §5.2).
@@ -321,13 +323,18 @@ type DiskFormatter interface {
 // instanceRecord is the persistent metadata stored on disk for each microVM
 // instance.
 type instanceRecord struct {
-	ID        string    `json:"id"`
-	SessionID string    `json:"session_id"`
-	State     State     `json:"state"`
-	Cold      bool      `json:"cold"`
-	Volume    string    `json:"volume"`
-	PID       int       `json:"pid"`
-	Cfg       VMMConfig `json:"cfg"`
+	PlacementGeneration uint64 `json:"placement_generation,omitempty"`
+	RecoveryBlocked     bool   `json:"recovery_blocked,omitempty"`
+
+	Identity  guestHostIdentity `json:"guest_host_identity,omitempty"`
+	Reconnect bool              `json:"guest_reconnect,omitempty"`
+	ID        string            `json:"id"`
+	SessionID string            `json:"session_id"`
+	State     State             `json:"state"`
+	Cold      bool              `json:"cold"`
+	Volume    string            `json:"volume"`
+	PID       int               `json:"pid"`
+	Cfg       VMMConfig         `json:"cfg"`
 
 	// The portable workspace checkpoint this session has, if any. All three are
 	// PERSISTED, and they have to be: a cold resume after a runnerd restart is
@@ -355,12 +362,10 @@ type instanceRecord struct {
 	// bootstrap token and ADR-0003 §2.7 item 1 keeps every part of it off a
 	// shared host's disk.
 	//
-	// bootLive says the pair is this process's own. A record recovered from
-	// disk after a runnerd restart has no configuration behind it, and a cold
-	// resume must say so rather than boot a guest that will never be told
-	// what it is. (The bootstrap token would survive such a restart — the
-	// runner can mint a fresh one — but the rest of the configuration would
-	// not, and persisting it is precisely what this design does not do.)
+	// bootLive says this process owns the configuration. A recovered record
+	// has none: negotiated versioned cold resumes must re-resolve it through
+	// current control-plane authority; other recovered resumes refuse. The
+	// fresh bootstrap token is minted separately. Neither is persisted here.
 	boot     runner.BootConfig
 	channel  *guestChannel
 	bootLive bool
@@ -386,7 +391,9 @@ type instanceRecord struct {
 	// in flight. A second Resume for the same id is refused rather than run
 	// beside it: see Resume for what two concurrent cold ones would do to
 	// each other's socket.
-	resuming bool
+	resuming   bool
+	resumeDone chan struct{}
+	destroying bool
 
 	// checkpointing is the same kind of claim for the workspace checkpoint a
 	// cold suspend takes. Two of them on one instance would each send the guest
@@ -456,6 +463,7 @@ func (rec *instanceRecord) bump() { rec.epoch++ }
 
 // Microvm implements driver.Driver for hardware-isolated microVMs.
 type Microvm struct {
+	stateLock *os.File // held until process exit; never unlink its inode
 	mu        sync.Mutex
 	opts      MicrovmOpts
 	engine    MicrovmEngine
@@ -491,6 +499,23 @@ type Microvm struct {
 func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 	if opts.StateDir == "" {
 		return nil, errors.New("microvm: a state directory is required (--microvm-state-dir / RAINIER_MICROVM_STATE_DIR): it holds every session's workspace and agent-home disk image, and a temp-directory default puts a tenant's files somewhere the host reaps")
+	}
+	var stateLock *os.File
+	constructed := false
+	{ // Every current-version writer participates, independent of capability.
+		if err := os.MkdirAll(opts.StateDir, microvmDirMode); err != nil {
+			return nil, err
+		}
+		var err error
+		stateLock, err = lockGuestState(opts.StateDir)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if !constructed {
+				stateLock.Close()
+			}
+		}()
 	}
 	if opts.TotalSlots <= 0 {
 		opts.TotalSlots = 16
@@ -565,6 +590,7 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 	}
 
 	m := &Microvm{
+		stateLock: stateLock,
 		opts:      opts,
 		engine:    engine,
 		slots:     slots,
@@ -581,6 +607,7 @@ func NewMicrovm(opts MicrovmOpts) (*Microvm, error) {
 	m.reclaimNetworkSlots()
 	m.reclaimOrphanRootfs()
 	m.reclaimRestoreScratch()
+	constructed = true
 	return m, nil
 }
 
@@ -874,10 +901,7 @@ func (m *Microvm) saveRecord(rec instanceRecord) error {
 	if err != nil {
 		return fmt.Errorf("marshal instance record: %w", err)
 	}
-	if err := os.WriteFile(m.instanceMetaPath(rec.ID), data, microvmFileMode); err != nil {
-		return fmt.Errorf("write instance record: %w", err)
-	}
-	return nil
+	return atomicMetadata(m.instanceMetaPath(rec.ID), data)
 }
 
 func (m *Microvm) deleteInstanceRecord(id string) {
@@ -911,6 +935,12 @@ func (m *Microvm) recoverDiskInstances() {
 			continue
 		}
 		if st, err := m.engine.State(context.Background(), id); err == nil {
+			if rec.RecoveryBlocked && (st == VMMStateGone || st == VMMStateStopped) {
+				// An interrupted launch with no surviving process is cold,
+				// not a lost workspace. Keep the recorded placement fence.
+				rec.Cold, rec.RecoveryBlocked = true, false
+				rec.PID, rec.Identity = 0, guestHostIdentity{}
+			}
 			reconcileState(&rec, st)
 		}
 		m.reassociateSlot(&rec)
@@ -955,7 +985,9 @@ func (m *Microvm) reassociateSlot(rec *instanceRecord) {
 		return
 	}
 	rec.slot = slot
-	applySlot(&rec.Cfg, slot)
+	if !rec.Reconnect {
+		applySlot(&rec.Cfg, slot)
+	}
 }
 
 // detachIdleSlot takes the network slot off a record that has stopped
@@ -1295,7 +1327,7 @@ func sanitizeRef(ref string) (string, error) {
 func (m *Microvm) usedLocked() int {
 	used := m.pending
 	for _, inst := range m.instances {
-		if inst.State == StateRunning || (inst.State == StateSuspended && !inst.Cold) {
+		if inst.resuming || inst.State == StateRunning || (inst.State == StateSuspended && !inst.Cold) {
 			used++
 		}
 	}
@@ -1423,9 +1455,15 @@ func buildGuestEnv(spec Spec) map[string]string {
 // runs with the mutex RELEASED. Holding it across engine.Launch froze
 // Inspect, List, Capacity and Destroy for every session on the host behind
 // one Firecracker that had not yet opened its socket.
-func (m *Microvm) reserveSlot() (string, error) {
+func (m *Microvm) reserveSlot(sessionID string) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	for _, rec := range m.instances {
+		if sessionID != "" && rec.SessionID == sessionID && rec.RecoveryBlocked {
+			return "", errors.New("microvm: workspace retained by an uncertain launch")
+		}
+	}
+
 	if used := m.usedLocked(); used >= m.opts.TotalSlots {
 		return "", fmt.Errorf("no capacity: %d/%d", used, m.opts.TotalSlots)
 	}
@@ -1455,11 +1493,19 @@ func (m *Microvm) Create(ctx context.Context, spec Spec) (Handle, error) {
 	// Before anything with a side effect, and before a slot is even
 	// reserved: a create this host must not perform is refused rather than
 	// half-performed. See refuseUnwithheldEnv.
+	if spec.GuestReconnect != 0 && (spec.GuestReconnect != runner.GuestReconnectProtocol || !m.opts.GuestReconnect) {
+		return Handle{}, errors.New("microvm: guest reconnect is not enabled")
+	}
+	if spec.GuestReconnect != 0 {
+		if _, ok := m.engine.(guestIdentityVerifier); !ok {
+			return Handle{}, errors.New("microvm: guest reconnect requires local VM identity verification")
+		}
+	}
 	if err := refuseUnwithheldEnv(spec); err != nil {
 		return Handle{}, err
 	}
 
-	id, err := m.reserveSlot()
+	id, err := m.reserveSlot(spec.SessionID)
 	if err != nil {
 		return Handle{}, err
 	}
@@ -1613,30 +1659,49 @@ func (m *Microvm) launch(ctx context.Context, id string, spec Spec) (*instanceRe
 	}
 	applySlot(&cfg, slot)
 
-	// The jailer may create the child before Launch fails. Register this
-	// first so a later rollback stops a successfully launched VMM before
-	// removing its cgroup; failed Launch already reaps its own process.
-	undo = append(undo, func() { m.removeCgroup(id, cfg.CgroupPath) })
-	if err := m.engine.Launch(ctx, cfg); err != nil {
-		return nil, fmt.Errorf("launch microvm %s: %w", id, err)
-	}
-	undo = append(undo, func() { _ = m.engine.Stop(context.WithoutCancel(ctx), id) })
-
 	rec := &instanceRecord{
-		ID:        id,
-		SessionID: spec.SessionID,
-		State:     StateRunning,
-		Volume:    workspaceVolume(spec.SessionID),
-		PID:       m.engine.PID(id),
-		Cfg:       cfg,
-		slot:      slot,
-		boot:      bootCfg,
-		channel:   channel,
-		bootLive:  true,
-		boots:     1,
+		ID: id, SessionID: spec.SessionID, PlacementGeneration: spec.PlacementGeneration,
+		State: StateRunning, Volume: workspaceVolume(spec.SessionID), RecoveryBlocked: true,
+		Reconnect: spec.GuestReconnect == runner.GuestReconnectProtocol, Cfg: cfg,
+		slot: slot, boot: bootCfg, channel: channel, bootLive: true, boots: 1,
 	}
+	// Own every resource before a child can exist. Any uncertain rollback
+	// returns a blocked record alongside its error; Create accounts for it.
 	if err := m.saveRecord(persistable(rec)); err != nil {
-		return nil, fmt.Errorf("save instance metadata %s: %w", id, err)
+		return nil, err
+	}
+	refuse := func(cause error) (*instanceRecord, error) {
+		channel.close()
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := m.engine.Stop(stopCtx, id); err != nil {
+			state, stateErr := m.engine.State(stopCtx, id)
+			if stateErr != nil || (state != VMMStateGone && state != VMMStateStopped) {
+				rec.PID, rec.Identity, rec.channel = m.engine.PID(id), guestHostIdentity{}, nil
+				rec.RecoveryBlocked = true
+				// The committed prelaunch intent remains safe if this write fails.
+				_ = m.saveRecord(persistable(rec))
+				done = true
+				return rec, errors.New("microvm: uncertain create retained for cleanup")
+			}
+		}
+		m.removeCgroup(id, cfg.CgroupPath)
+		return nil, cause
+	}
+	if err := m.engine.Launch(ctx, cfg); err != nil {
+		return refuse(fmt.Errorf("launch microvm %s: %w", id, err))
+	}
+	rec.PID = m.engine.PID(id)
+	if rec.Reconnect {
+		identity, err := m.engine.(guestIdentityVerifier).guestIdentity(cfg, rec.PID)
+		if err != nil {
+			return refuse(err)
+		}
+		rec.Identity = identity
+	}
+	rec.RecoveryBlocked = false
+	if err := m.saveRecord(persistable(rec)); err != nil {
+		return refuse(fmt.Errorf("save instance metadata %s: %w", id, err))
 	}
 
 	done = true
@@ -1744,15 +1809,33 @@ func (m *Microvm) Suspend(ctx context.Context, id string, warm bool) error {
 	return nil
 }
 
-func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
+func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) { return m.resume(ctx, id, 0) }
+
+func (m *Microvm) ResumePlacement(ctx context.Context, id string, generation uint64) (bool, error) {
+	if generation == 0 {
+		return false, errors.New("microvm: invalid resume placement")
+	}
+	return m.resume(ctx, id, generation)
+}
+
+func (m *Microvm) resume(ctx context.Context, id string, generation uint64) (bool, error) {
 	m.mu.Lock()
 	inst, ok := m.instances[id]
 	if !ok {
 		m.mu.Unlock()
 		return false, fmt.Errorf("no such id %s", id)
 	}
+	if inst.RecoveryBlocked || inst.destroying {
+		m.mu.Unlock()
+		return false, errors.New("microvm: unverified VM requires cleanup")
+	}
+	if generation != 0 && (generation < inst.PlacementGeneration || (generation == inst.PlacementGeneration && inst.Cold)) {
+		m.mu.Unlock()
+		return false, errors.New("microvm: stale resume placement")
+	}
 	running := inst.State == StateRunning
 	cold, bootLive, cfg := inst.Cold, inst.bootLive, inst.Cfg
+	reconnect := inst.Reconnect
 	bootCfg, sessionID := inst.boot, inst.SessionID
 
 	// Resuming a session that is already running restarts nothing, and says
@@ -1780,7 +1863,22 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		m.mu.Unlock()
 		return false, fmt.Errorf("resume of %s: a resume is already in flight for this instance", id)
 	}
+	if generation != 0 {
+		before := inst.PlacementGeneration
+		inst.PlacementGeneration = generation
+		if err := m.saveRecord(persistable(inst)); err != nil {
+			inst.PlacementGeneration = before
+			m.mu.Unlock()
+			return false, err
+		}
+	}
+	if cold && m.usedLocked() >= m.opts.TotalSlots {
+		m.mu.Unlock()
+		return false, errors.New("microvm: no capacity for cold resume")
+	}
 	inst.resuming = true
+	inst.resumeDone = make(chan struct{})
+	claimed := inst
 	// The boot number is taken HERE, under the same lock, and it advances
 	// even for an attempt that fails: a failed launch may have left a socket
 	// behind at that path, and an attempt that reuses a number is an attempt
@@ -1808,13 +1906,14 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 	}
 	defer func() {
 		m.mu.Lock()
-		if e, ok := m.instances[id]; ok {
-			e.resuming = false
-		}
+		claimed.resuming = false
+		close(claimed.resumeDone)
+		claimed.resumeDone = nil
 		m.mu.Unlock()
 	}()
 
 	restarted := false
+	var identity guestHostIdentity
 	var (
 		channel *guestChannel
 		slot    *netslot.Slot
@@ -1829,37 +1928,61 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 	// given back when it does not get there.
 	defer func() {
 		if slot != nil {
+			m.mu.Lock()
+			current, owned := m.instances[id]
+			owned = owned && current == claimed
+			rec := persistable(claimed)
+			m.mu.Unlock()
+			// Failure retains the conservative blocked launch intent on disk.
+			// Recovered engine evidence may release it only after observing exit.
+			if owned {
+				_ = m.saveRecord(rec)
+			}
 			_ = m.slots.Release(context.WithoutCancel(ctx), slot)
 		}
 		if clonedRootfs {
 			m.removeSessionRootfs(id)
 		}
 	}()
+	stopUnverified := func() bool {
+		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		stopErr := m.engine.Stop(stopCtx, id)
+		if stopErr != nil {
+			state, stateErr := m.engine.State(stopCtx, id)
+			if stateErr != nil || (state != VMMStateGone && state != VMMStateStopped) {
+				m.mu.Lock()
+				claimed.State, claimed.Cold, claimed.RecoveryBlocked = StateRunning, false, true
+				claimed.Identity = guestHostIdentity{}
+				claimed.PID, claimed.Cfg, claimed.slot, claimed.channel = m.engine.PID(id), cfg, slot, nil
+				claimed.bump()
+				m.instances[id] = claimed
+				rec := persistable(claimed)
+				slot, clonedRootfs = nil, false
+				m.mu.Unlock()
+				// If this write fails, the earlier blocked launch intent still
+				// owns the new namespace and forbids guest admission on restart.
+				_ = m.saveRecord(rec)
+				return false
+			}
+		}
+		m.removeCgroup(id, cfg.CgroupPath)
+		return true
+	}
 	if cold {
-		// A cold resume is a fresh boot, and a fresh boot needs the session's
-		// whole configuration. This driver holds that in memory only
-		// (ADR-0003 §2.7 item 1), so a record recovered from disk after a
-		// runnerd restart has none — including the case where the original
-		// session carried nothing secret at all, which the driver
-		// deliberately cannot tell apart, having refused to write the
-		// evidence down.
-		//
-		// The honest answer is to refuse. Relaunching would boot a guest that
-		// is never told what it is: no session id, no proxy, no boot chain,
-		// no secrets, and an agent that reports itself healthy.
-		//
-		// The bootstrap token is not what is missing here — the runner can
-		// mint a fresh one, and does, three lines below. What is missing is
-		// everything else, and persisting THAT is what this design rules out.
-		// Rebuilding it from the control plane on a resume is the follow-up
-		// (a create-shaped resume, ADR-0003 §2.3's portable checkpoint).
-		//
-		// This refusal sits ABOVE the deep-dormant restore below it, and the
-		// order is deliberate rather than incidental — see deepDormantNote,
-		// which is what makes a recovered session whose workspace is also gone
-		// say WHICH of the two things it is waiting for.
+		// Recovery never reloads a boot configuration from disk. A negotiated
+		// placement may resolve it through current control-plane authority;
+		// legacy/unversioned resumes retain their existing refusal.
 		if !bootLive {
-			return false, m.coldResumeNeedsGuestConfig(id)
+			resolver, ok := m.currentHost().(GuestResumeConfigurationHost)
+			if !ok || !reconnect || !m.opts.GuestReconnect || generation == 0 {
+				return false, m.coldResumeNeedsGuestConfig(id)
+			}
+			fresh, err := resolver.GuestResumeConfiguration(ctx, sessionID, generation)
+			if err != nil || ctx.Err() != nil || fresh.SessionID != sessionID || fresh.Protocol != runner.SessionBootstrapProtocolVersion || fresh.GuestReconnect != runner.GuestReconnectProtocol || fresh.BootstrapToken != "" {
+				return false, errors.New("microvm: current resume configuration unavailable")
+			}
+			bootCfg = fresh
 		}
 		// The DEEP-DORMANT case (ADR-0003 §2.3): the workspace image is gone
 		// and the checkpoint is the only copy of this session's work. Rebuilt
@@ -1921,9 +2044,36 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 			return false, fmt.Errorf("cold resume of %s: allocating a network slot: %w", id, err)
 		}
 		applySlot(&cfg, slot)
+		// Persist ownership BEFORE the engine can start a process. On a crash
+		// during Launch, startup must retain this namespace and rootfs even
+		// though no verified process identity has been published yet.
+		m.mu.Lock()
+		intent := persistable(inst)
+		intent.State, intent.Cold, intent.RecoveryBlocked = StateRunning, false, true
+		intent.Cfg, intent.PID, intent.Identity = cfg, 0, guestHostIdentity{}
+		intent = persistable(&intent)
+		m.mu.Unlock()
+		if err := m.saveRecord(intent); err != nil {
+			channel.close()
+			return false, err
+		}
 		if err := m.engine.Launch(ctx, cfg); err != nil {
 			channel.close()
+			if !stopUnverified() {
+				return false, errors.New("microvm: uncertain launch retained for cleanup")
+			}
 			return false, fmt.Errorf("relaunch cold microvm %s: %w", id, err)
+		}
+		if inst.Reconnect {
+			var err error
+			identity, err = m.engine.(guestIdentityVerifier).guestIdentity(cfg, m.engine.PID(id))
+			if err != nil {
+				channel.close()
+				if !stopUnverified() {
+					return false, errors.New("microvm: unverified VM retained for cleanup")
+				}
+				return false, errors.New("microvm: new guest identity verification failed")
+			}
 		}
 		restarted = true
 	} else if err := m.engine.Resume(ctx, id); err != nil {
@@ -1943,24 +2093,23 @@ func (m *Microvm) Resume(ctx context.Context, id string) (bool, error) {
 		// and a network slot; and the deferred release is about to take that
 		// slot back out from under it. So it is stopped here rather than
 		// left running, and only then does the slot go.
-		if restarted {
-			if err := m.engine.Stop(context.WithoutCancel(ctx), id); err != nil {
-				log.Printf("microvm: %s was resumed onto a record that no longer exists and could not be stopped: %v", id, err)
-			} else {
-				m.removeCgroup(id, cfg.CgroupPath)
-			}
+		if restarted && !stopUnverified() {
+			return restarted, errors.New("microvm: orphaned launch retained for cleanup")
 		}
 		return restarted, fmt.Errorf("no such id %s", id)
 	}
 	inst.State = StateRunning
 	inst.Cold = false
+	inst.RecoveryBlocked = false
 	if restarted {
 		inst.PID = m.engine.PID(id)
+		inst.Identity = identity
 		if inst.channel != nil {
 			inst.channel.close()
 		}
 		inst.channel = channel
 		inst.boot = bootCfg
+		inst.bootLive = true
 		inst.Cfg.VsockUDSPath = cfg.VsockUDSPath
 		inst.Cfg.CgroupPath = cfg.CgroupPath
 		inst.slot = slot
@@ -2350,12 +2499,32 @@ func (m *Microvm) destroyUnrecorded(ctx context.Context, id string) error {
 }
 
 func (m *Microvm) DestroyContainer(ctx context.Context, id string) error {
+	// A launch owns disks and a new namespace before it publishes them on the
+	// record. Wait for that handoff before stopping or releasing anything.
 	m.mu.Lock()
 	inst, ok := m.instances[id]
+	for ok && inst.resuming {
+		done := inst.resumeDone
+		m.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-done:
+		}
+		m.mu.Lock()
+		inst, ok = m.instances[id]
+	}
 	if !ok {
 		m.mu.Unlock()
 		return m.destroyUnrecorded(ctx, id)
 	}
+	if inst.destroying {
+		m.mu.Unlock()
+		return errors.New("microvm: teardown already in flight")
+	}
+	inst.destroying = true
+	defer func() { m.mu.Lock(); inst.destroying = false; m.mu.Unlock() }()
+
 	slot := inst.slot
 	inst.slot = nil
 	channel := inst.channel
@@ -2426,6 +2595,15 @@ func (m *Microvm) RemoveWorkspace(_ context.Context, sessionID string) error {
 	if sessionID == "" {
 		return nil
 	}
+	m.mu.Lock()
+	for _, rec := range m.instances {
+		if rec.SessionID == sessionID && (rec.RecoveryBlocked || rec.resuming || rec.State == StateRunning || (rec.State == StateSuspended && !rec.Cold)) {
+			m.mu.Unlock()
+			return errors.New("microvm: workspace is still owned by a live or uncertain VM")
+		}
+	}
+	m.mu.Unlock()
+
 	// A teardown is the one path where an unchecked id does real damage:
 	// os.Remove of whatever "../../something" resolved to. An id that cannot
 	// name a workspace is an error, not a removal.
@@ -2460,7 +2638,7 @@ func (m *Microvm) Inspect(ctx context.Context, id string) (Handle, error) {
 		return Handle{ID: id, State: StateGone}, nil
 	}
 	var idle *netslot.Slot
-	if stErr == nil && inst.epoch == epoch {
+	if stErr == nil && inst.epoch == epoch && !inst.resuming && !inst.destroying {
 		reconcileState(inst, st)
 		// A VM that went away without this driver parking it has stopped
 		// occupying the host, and its slot has to go back with it.
@@ -2509,15 +2687,17 @@ func (m *Microvm) List(ctx context.Context) ([]Listed, error) {
 	out := make([]Listed, 0, len(m.instances))
 	var idle []*netslot.Slot
 	for id, inst := range m.instances {
-		if st, ok := observed[id]; ok && inst.epoch == epochs[id] {
+		if st, ok := observed[id]; ok && inst.epoch == epochs[id] && !inst.resuming && !inst.destroying {
 			reconcileState(inst, st)
 			if s := detachIdleSlot(inst); s != nil {
 				idle = append(idle, s)
 			}
 		}
 		out = append(out, Listed{
-			SessionID: inst.SessionID,
-			Handle:    Handle{ID: id, State: inst.State},
+			SessionID:           inst.SessionID,
+			GuestReconnect:      inst.Reconnect,
+			PlacementGeneration: inst.PlacementGeneration,
+			Handle:              Handle{ID: id, State: inst.State},
 		})
 	}
 	m.mu.Unlock()
@@ -2608,14 +2788,16 @@ type FirecrackerEngine struct {
 	// It is a VALUE and not a pointer: an engine that failed to construct
 	// carries the zero range, whose forSlot answers an error for every index,
 	// so no code path can reach a nil allocator — see uidRange.
-	uids    uidRange
-	starter processStarter
+	uids      uidRange
+	starter   processStarter
+	startTime func(int) (uint64, error)
 	// chown and link are the two filesystem operations the jail needs that an
 	// ordinary test process cannot perform. Production is os.Chown and
 	// os.Link; see FirecrackerOpts.
 	chown   func(path string, uid, gid int) error
 	link    func(oldname, newname string) error
 	procs   map[string]vmmProcess
+	waits   map[string]chan error
 	initErr error
 	// kvm is the "can this host run a VM at all" check, as a field so the
 	// jail tests can run on a machine without /dev/kvm. Production never
@@ -2746,6 +2928,7 @@ func NewFirecrackerEngine(opts FirecrackerOpts) *FirecrackerEngine {
 		jail:       jail,
 		uids:       uids,
 		starter:    starter,
+		startTime:  processStartTime,
 		chown:      chown,
 		link:       link,
 		procs:      make(map[string]vmmProcess),
@@ -2893,6 +3076,10 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 		return errors.New("rootfs image path is required for Firecracker launch")
 	}
 
+	if _, err := os.Stat(f.launchMarkerPath(cfg.ID)); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("microvm: prior launch must be settled before starting another process")
+	}
+
 	// The jail, built before anything is started: a chrooted Firecracker can
 	// only see what is already inside it.
 	spec, err := f.jailSpecFor(cfg)
@@ -2913,37 +3100,34 @@ func (f *FirecrackerEngine) Launch(ctx context.Context, cfg VMMConfig) error {
 	// enters the session's network namespace (`--netns`), which is where the
 	// slot's TAP device is — the device does not exist in the host's
 	// namespace at all.
+	if err := atomicMetadata(f.launchMarkerPath(cfg.ID), []byte(hostLaunchBoot())); err != nil {
+		return err
+	}
 	proc, err := f.starter.Start(f.jailerPath, jailerArgs(spec))
 	if err != nil {
 		_ = f.removeJail(cfg.ID)
+		_ = f.removeLaunchEvidence(cfg.ID)
 		return fmt.Errorf("start jailed firecracker %s: %w", cfg.ID, err)
 	}
-
-	if pid := proc.Pid(); pid > 0 {
-		pidDir := filepath.Join(f.stateDir, "instances", cfg.ID)
-		_ = os.MkdirAll(pidDir, microvmDirMode)
-		_ = os.WriteFile(f.pidFilePath(cfg.ID), []byte(strconv.Itoa(pid)), microvmFileMode)
-	}
-
+	f.mu.Lock()
+	f.procs[cfg.ID] = proc
+	f.mu.Unlock()
 	var initSuccess bool
 	defer func() {
-		if initSuccess {
-			return
+		if !initSuccess {
+			f.finishFailedLaunch(cfg.ID, proc)
 		}
-		// A launch that got part-way leaves a live VMM and a jail full of
-		// hard links. Both go, in that order: the process first, because
-		// removing the jail under a running Firecracker is how a VMM ends up
-		// writing into a directory that has been unlinked. The uid needs no
-		// undoing — it is the slot's, and the slot is the caller's to give
-		// back (see uidRange).
-		_ = proc.Kill()
-		_ = proc.Wait()
-		_ = f.removeJail(cfg.ID)
-		// And the pid file this launch wrote, which outlives the jail
-		// because it is not in it. A stale one is what State and PID read on
-		// the next boot.
-		_ = os.Remove(f.pidFilePath(cfg.ID))
 	}()
+	if pid := proc.Pid(); pid > 0 {
+		if err := f.saveProcessIdentity(cfg.ID, pid); err != nil {
+			return err
+		}
+		if err := atomicMetadata(f.pidFilePath(cfg.ID), []byte(strconv.Itoa(pid))); err != nil {
+			return err
+		}
+	} else {
+		return errors.New("microvm: launched child has no process identity")
+	}
 
 	fcClient := newFirecrackerClient(sockPath)
 	if err := waitForSocket(ctx, sockPath, firecrackerSocketTimeout); err != nil {
@@ -3111,7 +3295,6 @@ func (f *FirecrackerEngine) Resume(ctx context.Context, id string) error {
 func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 	f.mu.Lock()
 	proc, tracked := f.procs[id]
-	delete(f.procs, id)
 	f.mu.Unlock()
 
 	var pid int
@@ -3119,6 +3302,24 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 		pid = proc.Pid()
 	} else if data, err := os.ReadFile(f.pidFilePath(id)); err == nil {
 		pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+	}
+
+	gone, evidenceErr := f.launchEvidence(id, pid)
+	if evidenceErr != nil {
+		if !tracked {
+			return evidenceErr
+		}
+		// A completed Wait proves this original child exited, even if its
+		// numeric PID now names something else. Otherwise retain uncertainty.
+		select {
+		case <-f.waitChild(id, proc):
+			gone = true
+		default:
+			return evidenceErr
+		}
+	}
+	if gone {
+		pid = 0
 	}
 
 	// waited is the channel this process's own Wait reports on. A VMM this
@@ -3130,9 +3331,9 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 	// belongs to no child of this process, and for that one the kernel has
 	// already reparented it to init, which reaps it.
 	var waited chan error
-	if tracked && pid > 0 {
-		waited = make(chan error, 1)
-		go func() { waited <- proc.Wait() }()
+	if tracked {
+		// Even conclusive exit evidence can describe an unreaped child.
+		waited = f.waitChild(id, proc)
 	}
 
 	var stopErr error
@@ -3146,11 +3347,13 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 		// kernel rather than assuming it, so a pid recovered across a
 		// runnerd restart — whose group this process knows nothing about —
 		// is only ever signalled on its own.
-		if err := killProcessTree(f.signals, pid, syscall.SIGTERM); err != nil {
+		if err := f.signalVM(id, pid, syscall.SIGTERM); err != nil {
 			stopErr = fmt.Errorf("sigterm pid %d: %w", pid, err)
-		} else if !awaitExit(ctx, waited, pid, firecrackerTermTimeout) {
-			_ = killProcessTree(f.signals, pid, syscall.SIGKILL)
-			if !awaitExit(ctx, waited, pid, firecrackerKillTimeout) && stopErr == nil {
+		} else if !f.awaitVMExit(ctx, id, waited, pid, firecrackerTermTimeout) {
+			if err := f.signalVM(id, pid, syscall.SIGKILL); err != nil {
+				return err
+			}
+			if !f.awaitVMExit(ctx, id, waited, pid, firecrackerKillTimeout) && stopErr == nil {
 				stopErr = notExitedErr(ctx, pid)
 			}
 		}
@@ -3165,10 +3368,15 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 		// live process that failed the identity check will never exit on its
 		// own, so Stop — and with it Destroy, Suspend and every caller
 		// holding a session's teardown — waited forever.
-		if !awaitExit(ctx, waited, pid, firecrackerKillTimeout) {
+		if !f.awaitVMExit(ctx, id, waited, pid, firecrackerKillTimeout) {
 			stopErr = fmt.Errorf("firecracker %s: pid %d is still running but does not identify as this VM's VMM, so it was left alone", id, pid)
 		}
 	}
+
+	if stopErr != nil {
+		return stopErr
+	}
+	f.forgetExited(id)
 
 	// The jail goes with the VM, and only AFTER it: removing a chroot out
 	// from under a live Firecracker is how a VMM ends up writing into
@@ -3197,8 +3405,8 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 	// exists. It lives outside the jail, so removeJail does not take it, and
 	// a stale one is the input to State's and PID's identity check on the
 	// next boot.
-	if err := os.Remove(f.pidFilePath(id)); err != nil && !errors.Is(err, os.ErrNotExist) && stopErr == nil {
-		stopErr = fmt.Errorf("remove the pid file for %s: %w", id, err)
+	if err := f.removeLaunchEvidence(id); err != nil && stopErr == nil {
+		stopErr = err
 	}
 	return stopErr
 }
@@ -3238,7 +3446,7 @@ func awaitExit(ctx context.Context, waited chan error, pid int, timeout time.Dur
 	poll := time.NewTicker(50 * time.Millisecond)
 	defer poll.Stop()
 	for {
-		if err := syscall.Kill(pid, 0); err != nil {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
 			return true
 		}
 		select {
@@ -3274,6 +3482,14 @@ func (f *FirecrackerEngine) State(ctx context.Context, id string) (VMMState, err
 		pid = proc.Pid()
 	} else if data, err := os.ReadFile(f.pidFilePath(id)); err == nil {
 		pid, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+	}
+
+	gone, evidenceErr := f.launchEvidence(id, pid)
+	if evidenceErr != nil {
+		return "", evidenceErr
+	}
+	if gone {
+		return VMMStateGone, nil
 	}
 
 	// A terminated Firecracker leaves no process to ask, so this engine never
@@ -3362,7 +3578,7 @@ func hasKVM() bool {
 // the jailer it is the instance id, and it is on the command line twice over:
 // the jailer passes its own `--id` through to Firecracker, and the binary it
 // execs lives at <chroot base>/firecracker/<id>/root/firecracker, so the
-// argv carries the id whichever way it is read. It used to be the API socket
+// argv carries an exact --id value; path substrings are never authority. It used to be the API socket
 // path, which no longer distinguishes anything — every jailed VMM serves
 // /run/firecracker.socket, because every one of them has a root of its own.
 func isFirecrackerPID(pid int, marker string) bool {
@@ -3373,21 +3589,59 @@ func isFirecrackerPID(pid int, marker string) bool {
 		return false
 	}
 
-	cmdlinePath := fmt.Sprintf("/proc/%d/cmdline", pid)
-	if data, err := os.ReadFile(cmdlinePath); err == nil {
-		// The cmdline is NUL-separated, so a substring search over it can
-		// match across argument boundaries. That is harmless here: both
-		// needles are whole arguments or parts of one path, and the check is
-		// "is this plausibly the VMM we started" rather than a parser.
-		cmdline := string(data)
-		return strings.Contains(cmdline, jailExecName) && strings.Contains(cmdline, marker)
-	}
+	args, err := processArguments(pid)
+	return err == nil && guestProcessArguments(args, marker)
+}
 
-	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=")
-	if out, err := cmd.Output(); err == nil {
-		s := string(out)
-		return strings.Contains(s, jailExecName) && (marker == "" || strings.Contains(s, marker))
+// ResumeStatus observes a claim without launching. If its command never reached
+// a cold VM, persisting the requested generation fences that delayed command:
+// ResumePlacement refuses an already-recorded cold generation.
+func (m *Microvm) ResumeStatus(ctx context.Context, id string, generation uint64) (string, uint64, error) {
+	if _, err := m.Inspect(ctx, id); err != nil {
+		return "", 0, err
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inst, ok := m.instances[id]
+	if !ok || generation == 0 || generation < inst.PlacementGeneration {
+		return "", 0, errors.New("microvm: stale resume status")
+	}
+	if inst.resuming || inst.RecoveryBlocked {
+		return "resuming", inst.PlacementGeneration, nil
+	}
+	if generation > inst.PlacementGeneration {
+		if !inst.Cold {
+			return "", 0, errors.New("microvm: resume placement is not recorded")
+		}
+		before := inst.PlacementGeneration
+		inst.PlacementGeneration = generation
+		if err := m.saveRecord(persistable(inst)); err != nil {
+			inst.PlacementGeneration = before
+			return "", 0, err
+		}
+	}
+	if inst.Cold {
+		return "suspended_cold", generation, nil
+	}
+	if inst.State == StateRunning {
+		return "running", generation, nil
+	}
+	return "resuming", generation, nil
+}
 
-	return false
+// CapacitySnapshot captures the aggregate and its known placements under the
+// same driver lock. Pending creates without a published record remain unnamed.
+func (m *Microvm) CapacitySnapshot(ctx context.Context) (int, int, map[string]uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	placements := map[string]uint64{}
+	for _, inst := range m.instances {
+		if inst.PlacementGeneration > 0 && (inst.resuming || inst.State == StateRunning || (inst.State == StateSuspended && !inst.Cold)) {
+			placements[inst.SessionID] = inst.PlacementGeneration
+		}
+	}
+	return m.usedLocked(), m.opts.TotalSlots, placements, nil
 }
