@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -63,6 +64,7 @@ func testMicrovmNet(t *testing.T, opts MicrovmOpts) (*Microvm, *SimulatedEngine,
 	if err != nil {
 		t.Fatalf("NewMicrovm: %v", err)
 	}
+	t.Cleanup(func() { m.stateLock.Close() })
 	return m, sim, net
 }
 
@@ -301,6 +303,7 @@ func TestMicrovmColdSuspendedSessionIsNotGone(t *testing.T) {
 
 	// And after a restart: a new driver over the same state directory, with a
 	// new engine that has no memory of the VM at all.
+	stopTestMicrovmRunner(t, m)
 	m2, _ := testMicrovm(t, MicrovmOpts{
 		TotalSlots: 4,
 		StateDir:   stateDir,
@@ -363,6 +366,7 @@ func TestMicrovmRestartRecovery(t *testing.T) {
 
 	// A complete runner restart: a new engine AND a new driver over the same
 	// state directory.
+	stopTestMicrovmRunner(t, m1)
 	m2, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
 
 	listed, err := m2.List(ctx)
@@ -649,6 +653,7 @@ func TestMicrovmColdResumeAfterRestartRefuses(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	stopTestMicrovmRunner(t, m1)
 	m2, _ := testMicrovm(t, MicrovmOpts{TotalSlots: 4, StateDir: stateDir})
 	m2.SetHost(&stubMicrovmHost{})
 	if _, err := m2.Resume(ctx, h.ID); err == nil {
@@ -1435,7 +1440,7 @@ func TestFirecrackerStateReadsInstanceInfo(t *testing.T) {
 // fakeFirecracker starts a child that passes isFirecrackerPID: a script named
 // `firecracker`, invoked with the same `--id` argument the jailer passes
 // through to the real one, so both the /proc cmdline and the `ps -o command=`
-// fallback see the binary name and the instance id the check looks for. It
+// native argv lookup see the binary name and exact instance ID. It
 // exits on SIGTERM within one tick of its loop.
 //
 // A stand-in that does NOT pass the check (plain `sleep`, say) exercises a
@@ -1449,9 +1454,9 @@ func fakeFirecracker(t *testing.T, id string) (vmmProcess, int) {
 	t.Helper()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "firecracker")
-	script := "#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do sleep 0.02; done\n"
-	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
+	build := exec.Command("go", "build", "-o", bin, "./testdata/fakefirecracker")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build native process fixture: %v %s", err, output)
 	}
 	proc, err := execStarter{}.Start(bin, []string{"--id", id, "--api-sock", jailAPISocketPath})
 	if err != nil {
@@ -1551,6 +1556,10 @@ func TestFirecrackerStopDoesNotHangOnAnUnidentifiableChild(t *testing.T) {
 	fc.procs["mvm-stuck"] = proc
 	fc.mu.Unlock()
 
+	jail := jailInstanceDir(dir, "mvm-stuck")
+	if err := os.MkdirAll(jail, 0700); err != nil {
+		t.Fatal(err)
+	}
 	// A caller whose context is already cut short must be answered at once.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -1574,5 +1583,47 @@ func TestFirecrackerStopDoesNotHangOnAnUnidentifiableChild(t *testing.T) {
 	// And it was left alone rather than signalled in the VM's name.
 	if err := syscall.Kill(pid, 0); err != nil {
 		t.Errorf("Stop signalled a process it could not identify as this VM's VMM: %v", err)
+	}
+	if _, err := os.Stat(jail); err != nil {
+		t.Fatal("failed stop removed a live child's jail")
+	}
+	fc.mu.Lock()
+	retained := fc.procs["mvm-stuck"] == proc
+	fc.mu.Unlock()
+	if !retained {
+		t.Fatal("failed stop lost process ownership")
+	}
+
+}
+
+// Simulate process exit without stopping surviving VMs or deleting their UDS.
+// A second fixture is a restart, never a concurrent writer of the same state.
+func stopTestMicrovmRunner(t *testing.T, m *Microvm) {
+	t.Helper()
+	m.mu.Lock()
+	var channels []*guestChannel
+	for _, rec := range m.instances {
+		if rec.channel != nil {
+			channels = append(channels, rec.channel)
+		}
+	}
+	m.mu.Unlock()
+	for _, g := range channels {
+		g.mu.Lock()
+		g.closed = true
+		conns := make([]net.Conn, 0, len(g.conns))
+		for c := range g.conns {
+			conns = append(conns, c)
+		}
+		g.mu.Unlock()
+		if g.listener != nil {
+			g.listener.Close()
+		}
+		for _, c := range conns {
+			g.drop(c)
+		}
+	}
+	if err := m.stateLock.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

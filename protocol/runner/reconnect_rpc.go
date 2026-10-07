@@ -71,6 +71,15 @@ type GuestReconnectAcceptResponse struct {
 	ExpiresInSec uint32 `json:"expires_in_sec"`
 }
 
+// GuestReconnectReady is the exact payload of both the guest readiness notice
+// and the host acknowledgment. Epoch must match the acceptance on this stream.
+// It reports completed configuration application, not durable authorization or
+// permission to bypass instance/placement fencing when installing the relay.
+type GuestReconnectReady struct {
+	Protocol uint64 `json:"protocol"`
+	Epoch    uint64 `json:"epoch"`
+}
+
 // GuestReconnectErrorResponse is the entire refusal payload. Error is one of
 // invalid, expired, fenced or unavailable; no peer, provider or database text may
 // be substituted. In session-RPC it accompanies an envelope with OK=false.
@@ -148,6 +157,17 @@ func DecodeGuestReconnectAcceptResponse(payload []byte) (GuestReconnectAcceptRes
 	return v, nil
 }
 
+// DecodeGuestReconnectReady applies the same strict bounded wire rules to a
+// readiness notice or acknowledgment. The receiver must also check the control
+// kind and compare Epoch with this connection's accepted epoch.
+func DecodeGuestReconnectReady(payload []byte) (GuestReconnectReady, error) {
+	var v GuestReconnectReady
+	if decodeReconnectObject(payload, &v, "protocol", "epoch") != nil || v.Protocol != GuestReconnectProtocol || v.Epoch == 0 {
+		return GuestReconnectReady{}, errGuestReconnectMessage
+	}
+	return v, nil
+}
+
 // DecodeGuestReconnectErrorResponse accepts only the four fixed reconnect
 // refusal codes, with the same size and exact-field checks as successful messages.
 func DecodeGuestReconnectErrorResponse(payload []byte) (GuestReconnectErrorResponse, error) {
@@ -177,7 +197,11 @@ func reconnectID(id string) bool {
 // Check the flat object before typed decoding: encoding/json alone folds field
 // case and accepts duplicate keys. No raw decoder error may escape this boundary.
 func decodeReconnectObject(payload []byte, out any, names ...string) error {
-	if len(payload) > GuestReconnectPayloadLimit {
+	return decodeReconnectObjectLimit(payload, out, GuestReconnectPayloadLimit, names...)
+}
+
+func decodeReconnectObjectLimit(payload []byte, out any, limit int, names ...string) error {
+	if len(payload) > limit {
 		return errGuestReconnectMessage
 	}
 	d := json.NewDecoder(bytes.NewReader(payload))

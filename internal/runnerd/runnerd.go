@@ -26,6 +26,13 @@ import (
 )
 
 type Server struct {
+	guestForwards guestRPCForwards
+	// reconnectControl is a connection-scoped view of the same agent RPC queue.
+	// A handshake captures it once; reconnecting never migrates a pending proof.
+	reconnectControl atomic.Pointer[reconnectControl]
+	reconnectMu      sync.Mutex
+	reconnecting     map[string]struct{}
+
 	drv         driver.Driver
 	reg         *registry
 	dialBase    string // e.g. ws://runnerd:8080 — what sessiond dials to register
@@ -309,7 +316,7 @@ func (s *Server) Recover(ctx context.Context) error {
 		// running nor that it has finished. It says so — the entry is in
 		// neither capacity count — until a child_exited or a cold resume
 		// tells it. See sessionEntry.recovered.
-		e := &sessionEntry{id: l.SessionID, handle: l.Handle.ID, state: state, recovered: true}
+		e := &sessionEntry{id: l.SessionID, handle: l.Handle.ID, state: state, recovered: true, guestReconnect: l.GuestReconnect, placementGen: l.PlacementGeneration}
 		s.reg.put(l.SessionID, e)
 	}
 	// The exemption is worth saying out loud where an operator will see it: a
@@ -439,7 +446,7 @@ func (s *Server) createWithID(ctx context.Context, id string, spec driver.Spec, 
 	// and nothing else in this process remembers what was injected. Keys only
 	// — see sessionEntry.envKeys.
 	if !s.reg.putIfAbsent(id, &sessionEntry{id: id, state: "starting", allow: allow,
-		envKeys: envKeys(spec.Env), placementGen: placementGen}) {
+		envKeys: envKeys(spec.Env), placementGen: placementGen, guestReconnect: spec.GuestReconnect == runner.GuestReconnectProtocol}) {
 		return errSessionExists
 	}
 	if err := s.pushEgress(id, allow); err != nil {
@@ -447,6 +454,7 @@ func (s *Server) createWithID(ctx context.Context, id string, spec driver.Spec, 
 		return &egressError{err: err}
 	}
 	spec.SessionID = id
+	spec.PlacementGeneration = placementGen
 	spec.DialURL = s.dialBase + "/register"
 	spec.ProxyURL = s.proxyURL
 	if s.withholdsSecrets() {
@@ -704,6 +712,10 @@ func envKeys(env map[string]string) []string {
 // this function has no business knowing about. Snapshot has its own entry
 // point — see OpSnapshot.
 func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
+	return s.opAtPlacement(ctx, id, op, warm, 0)
+}
+
+func (s *Server) opAtPlacement(ctx context.Context, id, op string, warm bool, generation uint64) error {
 	// Marked before the handle is even read, so there is no gap between the
 	// guard and the mark for a sweep to land in: from here on this session is
 	// not idle, whatever this op turns out to be. An unknown or still-starting
@@ -813,8 +825,29 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 			// edge-case table names.
 			return errSuspendInFlight
 		}
-		restarted, err := s.drv.Resume(ctx, handle)
+		var claimedBoot uint64
+		if generation != 0 {
+			claimedBoot, err = s.claimResumePlacement(id, handle, generation)
+			if err != nil {
+				return err
+			}
+		}
+		var restarted bool
+		var err error
+		if placementDriver, ok := s.drv.(interface {
+			ResumePlacement(context.Context, string, uint64) (bool, error)
+		}); ok && generation != 0 {
+			restarted, err = placementDriver.ResumePlacement(ctx, handle, generation)
+		} else {
+			restarted, err = s.drv.Resume(ctx, handle)
+		}
+		if err == nil && generation != 0 && !restarted {
+			err = errResumePlacement
+		}
 		if err != nil {
+			if generation != 0 {
+				s.failResumePlacement(context.WithoutCancel(ctx), id, handle, generation, claimedBoot)
+			}
 			return err
 		}
 		// Lands on "running" and, for a sandbox the driver actually RESTARTED,
@@ -823,6 +856,9 @@ func (s *Server) Op(ctx context.Context, id, op string, warm bool) error {
 		// child that is running now. Only the driver can tell that from an
 		// unpause — Inspect folds paused and exited into one state — which is
 		// why it says so. See registry.resumed.
+		if generation != 0 {
+			return s.completeResumePlacement(id, handle, generation, claimedBoot)
+		}
 		s.reg.resumed(id, restarted)
 		return nil
 	default:
@@ -1058,6 +1094,7 @@ func (s *Server) serveSessionConn(ctx context.Context, id string, conn relay.Con
 	// process on the other end may not be the one that numbered the last
 	// report. See sessionEntry.execReg.
 	reg := s.reg.registration()
+	authority := &guestRelayAuthority{}
 	hub := relay.NewHubWithControl(ctx, conn, func(payload []byte) {
 		// On its own goroutine, deliberately: this runs on the hub's read
 		// loop, the single goroutine demultiplexing every attachment
@@ -1077,9 +1114,9 @@ func (s *Server) serveSessionConn(ctx context.Context, id string, conn relay.Con
 		// that grows ORDERED events needs a queue here instead — and
 		// "exec_count" is one, which is why it carries a sequence number of
 		// its own and this hop stayed as it is.
-		go s.routeControl(id, boot, reg, payload)
+		go authority.run(func() { s.routeControl(id, boot, reg, payload) })
 	})
-	displaced, ok := s.reg.setHub(id, hub)
+	displaced, ok := s.reg.setHubAuthority(id, hub, authority)
 	if !ok {
 		// The entry vanished between our existence check above and now — a
 		// concurrent DELETE raced this dial-in (session torn down while its
@@ -1108,6 +1145,11 @@ func (s *Server) serveSessionConn(ctx context.Context, id string, conn relay.Con
 	// the now-dead entry and let this goroutine (and its fd) go — leaving
 	// this on r.Context() instead would leak both per session, forever, on
 	// every abrupt death or explicit rm.
+	s.monitorSessionHub(id, hub)
+}
+
+func (s *Server) monitorSessionHub(id string, hub *relay.Hub) {
+	defer s.guestForwards.discard(hub)
 	<-hub.Done()
 	handle, state, ok := s.reg.hubDied(id, hub)
 	hub.Close()
@@ -1192,6 +1234,10 @@ func (s *Server) RemoveWorkspace(ctx context.Context, id string) error {
 // carries every viewer's terminal traffic, and the one thing that must not
 // happen is a malformed frame taking the session down with it.
 func (s *Server) routeControl(id string, boot, reg uint64, payload []byte) {
+	s.routeControlWithEvents(id, boot, reg, payload, s.fireEventDetail)
+}
+
+func (s *Server) routeControlWithEvents(id string, boot, reg uint64, payload []byte, emit func(string, string, string)) {
 	var ev relay.ControlEvent
 	if err := json.Unmarshal(payload, &ev); err != nil {
 		log.Printf("session %s: undecodable control payload (%d bytes): %v", id, len(payload), err)
@@ -1199,7 +1245,7 @@ func (s *Server) routeControl(id string, boot, reg uint64, payload []byte) {
 	}
 	switch ev.Kind {
 	case "setup_done":
-		s.fireEventDetail(id, "setup_done", "")
+		emit(id, "setup_done", "")
 	case "setup_failed", "stage_failed":
 		// One event under two names. A session's boot is a chain of stages
 		// (setup, then clone, then init — see cmd/sessiond/gitchain.go), and
@@ -1228,10 +1274,10 @@ func (s *Server) routeControl(id string, boot, reg uint64, payload []byte) {
 		// (not resumable) can serve that. See sessionEntry.bootFailed.
 		s.reg.markBootFailed(id, boot)
 		if stage == "setup" {
-			s.fireEventDetail(id, "setup_failed", setupFailedDetail(ev.RC, ev.Tail))
+			emit(id, "setup_failed", setupFailedDetail(ev.RC, ev.Tail))
 			return
 		}
-		s.fireEventDetail(id, "stage_failed", stageFailedDetail(stage, ev.RC, ev.Tail))
+		emit(id, "stage_failed", stageFailedDetail(stage, ev.RC, ev.Tail))
 	case relay.KindSuspendAck:
 		// The sandbox heard the notice. It stays between this process and that
 		// sandbox: controld asked for a suspend and is waiting for THAT
@@ -1262,7 +1308,7 @@ func (s *Server) routeControl(id string, boot, reg uint64, payload []byte) {
 		// credential it minted for this session, and a token — or anything
 		// derived from one — has no business on this channel.
 		log.Printf("session %s: a git operation was refused by GitHub; reporting the credential", id)
-		s.fireEventDetail(id, "credential_rejected", "")
+		emit(id, "credential_rejected", "")
 	case "child_exited":
 		// The agent process inside the container ended. This is news, not a
 		// verdict: the session stays up (sessiond outlives its child so
@@ -1280,7 +1326,7 @@ func (s *Server) routeControl(id string, boot, reg uint64, payload []byte) {
 		// nothing else in this runner would remember it. It still changes no
 		// state here — see RunIdleStop for the timeout that does.
 		s.reg.childExited(id, boot, s.now())
-		s.fireEventDetail(id, "child_exited", strconv.Itoa(ev.RC))
+		emit(id, "child_exited", strconv.Itoa(ev.RC))
 	case relay.KindExecCount:
 		// How many commands `rainier exec` is running in there. Recorded and
 		// not reported: it is the runner's own fact, the way attachment

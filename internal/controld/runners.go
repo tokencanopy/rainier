@@ -108,6 +108,9 @@ func (h runnerHost) Aside(ctx context.Context, b runnerplane.Binding, gen uint64
 // owner's authority (srpc.go). The plane sets the answer's id and method and
 // sends it back down.
 func (h runnerHost) SessionRequest(ctx context.Context, b runnerplane.Binding, id control.SessionID, env runner.RPCEnvelope) runner.RPCEnvelope {
+	if host, ok := h.srv.st.(GuestReconnectAuthorityStore); ok && reconnectMethod(env.Method) {
+		return h.srv.answerGuestReconnect(ctx, host, b, id, env)
+	}
 	return h.srv.authorizeSessionRequest(ctx, string(b.RunnerID), string(id), env)
 }
 

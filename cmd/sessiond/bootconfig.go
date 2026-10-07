@@ -65,6 +65,10 @@ const (
 // each connection and, when that configuration brings a token it has not
 // already spent, exchanges it for the session's secrets.
 //
+// Opted-in fresh boots instead retain a signing identity and require the
+// fail-closed reconnect preamble in reconnect.go. The following describes the
+// unchanged legacy mode.
+//
 // It is stateful for one reason, and it is the reason a redial is not a
 // resume: a bootstrap token is SINGLE-USE. A sessiond that re-exchanged on
 // every connection would be refused on the first redial inside a live VM and
@@ -74,7 +78,11 @@ const (
 // exactly "at boot and again after every resume", with no second signal
 // needed.
 type bootstrapper struct {
-	mu sync.Mutex
+	mu                   sync.Mutex
+	guest                *guestReconnectIdentity
+	reconnecting         bool
+	configured           []string
+	configurationApplied func(context.Context) error
 	// attempted is the last token this session sent a request for, whatever
 	// the answer was.
 	//
@@ -161,6 +169,9 @@ func readBootConfig(ctx context.Context, conn relay.Conn) (runner.BootConfig, er
 // dispatcher because the dispatcher is not serving yet: the relay it rides on
 // is started later, by dialLoop, once there is a session to serve.
 func (b *bootstrapper) exchange(ctx context.Context, conn relay.Conn, cfg runner.BootConfig) (map[string]string, error) {
+	if cfg.GuestReconnect != 0 {
+		return b.enrollGuest(ctx, conn, cfg)
+	}
 	if len(cfg.SecretNames) == 0 {
 		// A clean boot. "No secrets declared" and "declared and never
 		// arrived" are different facts, and this is the first.
@@ -291,11 +302,16 @@ func (b *bootstrapper) forget() int {
 //
 // RAINIER_DIAL is deliberately NOT set. There is nothing to dial.
 func applyBootConfig(cfg runner.BootConfig, secrets map[string]string) error {
+	return visitBootConfig(cfg, secrets, os.Setenv)
+}
+
+// visitBootConfig shares the legacy precedence and encoding with reconnect.
+func visitBootConfig(cfg runner.BootConfig, secrets map[string]string, put func(string, string) error) error {
 	set := func(k, v string) error {
 		if v == "" {
 			return nil
 		}
-		return os.Setenv(k, v)
+		return put(k, v)
 	}
 	b64 := func(s string) string {
 		if s == "" {
@@ -312,7 +328,7 @@ func applyBootConfig(cfg runner.BootConfig, secrets map[string]string) error {
 	// either. (The plane also drops such a name from SecretNames, so this is
 	// the second of two fences rather than the only one.)
 	for k, v := range secrets {
-		if err := os.Setenv(k, v); err != nil {
+		if err := put(k, v); err != nil {
 			return fmt.Errorf("applying this session's environment: %w", err)
 		}
 	}
@@ -364,7 +380,7 @@ func applyBootConfig(cfg runner.BootConfig, secrets map[string]string) error {
 		return err
 	}
 	for k, v := range cfg.Env {
-		if err := os.Setenv(k, v); err != nil {
+		if err := put(k, v); err != nil {
 			return fmt.Errorf("applying this session's configuration: %w", err)
 		}
 	}
@@ -422,7 +438,13 @@ func bootOverVsock(ctx context.Context, dial dialSession, b *bootstrapper) (rela
 		_ = conn.Close()
 		conn = nil
 	}
-	if err := applyBootConfig(cfg, secrets); err != nil {
+	apply := applyBootConfig
+	if cfg.GuestReconnect != 0 {
+		apply = func(cfg runner.BootConfig, secrets map[string]string) error {
+			return b.refreshConfiguration(ctx, cfg, secrets)
+		}
+	}
+	if err := apply(cfg, secrets); err != nil {
 		if conn != nil {
 			_ = conn.Close()
 		}
@@ -434,7 +456,8 @@ func bootOverVsock(ctx context.Context, dial dialSession, b *bootstrapper) (rela
 	return conn, cfg, failure, nil
 }
 
-// reBootstrap is the preamble on every LATER connection: read the
+// reBootstrap selects authenticated reconnect for an opted-in guest. It never
+// downgrades that guest to legacy bootstrap. In legacy mode it reads the
 // configuration again, and exchange again when it brings a token this
 // session has not spent — which is what a cold resume brings and a redial
 // does not.
@@ -453,9 +476,19 @@ func bootOverVsock(ctx context.Context, dial dialSession, b *bootstrapper) (rela
 // which for a spent token is forever. So it is logged and the connection is
 // served.
 func reBootstrap(ctx context.Context, conn relay.Conn, b *bootstrapper) error {
+	b.mu.Lock()
+	guestMode := b.guest != nil
+	b.mu.Unlock()
+	if guestMode {
+		return b.reconnectGuest(ctx, conn)
+	}
 	cfg, err := readBootConfig(ctx, conn)
 	if err != nil {
 		return err
+	}
+	// Capability selection belongs to the first boot, never a legacy redial.
+	if cfg.GuestReconnect != 0 {
+		return errGuestReconnect
 	}
 	secrets, xerr := b.exchange(ctx, conn, cfg)
 	if xerr != nil {

@@ -137,7 +137,8 @@ func (cfg AgentConfig) resetsBackoff(establishedAt time.Time) bool {
 // runner sends afterwards. Atomic because the accept is handled on the
 // reader while events fire from session goroutines.
 type agentSessionState struct {
-	generation atomic.Uint64
+	recoveryStarted atomic.Bool
+	generation      atomic.Uint64
 }
 
 // jitter returns a random duration in [0, d/2) — timing spread, not security.
@@ -258,17 +259,11 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 
 	ag := &agentSessionState{}
 	out := make(chan runner.FromRunner, 64)
+	rc := &reconnectControl{ctx: connCtx, state: ag, out: out}
+	s.reconnectControl.Store(rc)
+	defer s.reconnectControl.CompareAndSwap(rc, nil)
+
 	send := func(m runner.FromRunner) {
-		cctx, ccancel := context.WithTimeout(ctx, 5*time.Second)
-		m.Used, m.Total, _ = s.drv.Capacity(cctx) // best-effort; piggybacked on every message
-		ccancel()
-		// The two counts that turn "no free capacity" into something a person
-		// can act on: how much of `used` is a working agent and how much is a
-		// sandbox whose agent has finished. They ride the same message the
-		// used/total pair already does, from the registry rather than the
-		// driver — docker cannot say whether a container's child is still
-		// running; only sessiond's report can, and this runner keeps it.
-		m.Active, m.IdleExited = s.reg.counts()
 		// The two generations every report carries (D19), stamped in the one
 		// place every report passes through. The runner's own is whatever
 		// controld granted this connection; the session's is the one its
@@ -277,29 +272,9 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 		switch m.Type {
 		case "event":
 			m.Generation = ag.generation.Load()
-			// Every event about a session echoes the placement generation its
-			// create carried — except the runner's own idle auto-stop, which
-			// must carry NONE. A cold resume opens a new placement generation
-			// on the control plane's row but sends the runner no new value, so
-			// this entry's is stale by construction from the first resume on;
-			// stamping it would guarantee the report is fenced as stale, and a
-			// fenced auto-stop leaves the row reading "running" over a
-			// container that is stopped — a session `rainier attach` then
-			// refuses to resume and cannot reach, until the runner happens to
-			// reconnect. Zero means "not carried" and fences nothing, which is
-			// safe here specifically because the report is about the sandbox
-			// this runner holds right now, and a session re-placed onto a
-			// DIFFERENT runner is still fenced by the runner identity the
-			// service checks first. Carrying the generation on `resume` is the
-			// real fix and is a separate change (protocol + control plane).
-			//
-			// The test is on the state rather than on which call site
-			// produced it, and that is right for both producers: reannounce
-			// renders the same word for the same registry state, and it is
-			// equally a report about the sandbox this runner holds right
-			// now, whose generation is equally unknowable to it. Anything
-			// NEW that fires this state would have to be one too.
-			if m.Session != "" && m.State != "suspended_cold" {
+			// Create and cold resume both install the committed placement
+			// before launch; every lifecycle event can retain that fence.
+			if m.Session != "" {
 				m.PlacementGeneration = s.reg.placementGeneration(m.Session)
 			}
 		case "result":
@@ -328,11 +303,9 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 	})
 	defer s.SetOnSessionRPC(nil)
 
-	used, total, _ := s.drv.Capacity(ctx)
-	active, idleExited := s.reg.counts()
-	ann := runner.FromRunner{Type: "announce", Proto: runner.ProtocolVersion, Runner: cfg.RunnerName,
-		Sessions: s.Announce(), Used: used, Total: total, Active: active, IdleExited: idleExited,
-		Capabilities: buildCapabilities(cfg.Capabilities, s.driverCapabilities()...)}
+	ann := runner.FromRunner{Type: "announce", Proto: runner.ProtocolVersion, Runner: cfg.RunnerName, Sessions: s.Announce(), Capabilities: buildCapabilities(cfg.Capabilities, s.driverCapabilities()...)}
+	s.stampCapacity(connCtx, &ann)
+
 	if err := wsjson.Write(connCtx, c, ann); err != nil {
 		return false, err // nothing can have been accepted before the announce
 	}
@@ -352,6 +325,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 		for {
 			select {
 			case m := <-out:
+				s.stampCapacity(connCtx, &m)
 				if err := wsjson.Write(connCtx, c, m); err != nil {
 					cancel() // a dead write direction means this connection
 					// is done; unblock the reader below too, not just this
@@ -412,6 +386,15 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 			s.execute(ctx, m, send, cfg, ag)
 			continue
 		}
+		if m.Type == "session_rpc" {
+			target := s.guestRPCTarget(connCtx, m.Session, ag)
+			go s.execute(connCtx, m, send, cfg, ag, target)
+			continue
+		}
+		if m.Type == "resume" || m.Type == "resume_status" {
+			go s.execute(connCtx, m, send, cfg, ag)
+			continue
+		}
 		go s.execute(ctx, m, send, cfg, ag) // ops are slow (docker); never block the reader
 	}
 }
@@ -421,7 +404,7 @@ func (s *Server) agentSession(ctx context.Context, cfg AgentConfig) (established
 // slow docker op never blocks the next command from being read — except for
 // the "accept", which the reader runs inline because it is negotiation, not
 // work, and everything read after it depends on it having happened.
-func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runner.FromRunner), cfg AgentConfig, ag *agentSessionState) {
+func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runner.FromRunner), cfg AgentConfig, ag *agentSessionState, received ...*guestRPCTarget) {
 	switch m.Type {
 	case "accept":
 		// controld's answer to the announce, and the first thing it sends.
@@ -430,6 +413,14 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 		// informational — the set controld will schedule on, which is this
 		// runner's own claims minus anything it refused.
 		ag.generation.Store(m.Generation)
+		for _, capability := range m.Capabilities {
+			if capability == runner.CapabilityGuestReconnectV1 && ag.recoveryStarted.CompareAndSwap(false, true) {
+				if rc := s.reconnectControl.Load(); rc != nil && rc.state == ag {
+					go s.recoverGuests(rc)
+				}
+				break
+			}
+		}
 		log.Printf("agent: accepted at generation %d with %d capabilities", m.Generation, len(m.Capabilities))
 	case "create":
 		var spec driver.Spec
@@ -442,22 +433,7 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 			// carry — and this runner's only job is to hand it to the
 			// container. Nothing here logs Env; its values are secrets as
 			// often as not.
-			spec = driver.Spec{
-				Name: m.Spec.Name, Image: m.Spec.Image, Cmd: m.Spec.Cmd, EgressAllow: m.Spec.EgressAllow,
-				Setup: m.Spec.Setup, SetupTimeoutSec: m.Spec.SetupTimeoutSec, Env: m.Spec.Env,
-				Repos: driverRepos(m.Spec.Repos),
-				Init:  m.Spec.Init, InitTimeoutSec: m.Spec.InitTimeoutSec,
-				GitAuthorName: m.Spec.GitAuthorName, GitAuthorEmail: m.Spec.GitAuthorEmail,
-				Home: driverHome(m.Spec.Home),
-				// The microVM bootstrap pair, carried through like
-				// everything else. This runner does not read the token — it
-				// goes into the guest's boot configuration and is dropped —
-				// and it does not check the names against Env. The DRIVER
-				// decides what an unwithheld create means, because the answer
-				// is different for each one: Docker has always accepted the
-				// values and still does.
-				BootstrapToken: m.Spec.BootstrapToken, SecretNames: m.Spec.SecretNames,
-			}
+			spec = guestDriverSpec(*m.Spec)
 			allow = m.Spec.EgressAllow
 		}
 		// Idempotency lives inside CreateWithID's own putIfAbsent now, not a
@@ -485,8 +461,14 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 			// controld settles the dispatch before it sees the state.
 			s.reannounce(m.Session, send)
 		}
+	case "resume_status":
+		send(s.resumeStatus(ctx, m))
 	case "suspend", "resume":
-		err := s.Op(ctx, m.Session, m.Type, m.Warm)
+		if ctx.Err() != nil {
+			send(runner.FromRunner{Type: "result", ReqID: m.ReqID})
+			return
+		}
+		err := s.opAtPlacement(ctx, m.Session, m.Type, m.Warm, m.PlacementGeneration)
 		// Conflict is what tells controld apart the two ways this can be
 		// not-ok: a command that failed, and one the runner refused because
 		// it is already stopping (or still creating) this sandbox. Without
@@ -573,7 +555,19 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 		// one) comes from inside that container, not from here. So there is no
 		// result to send — m.ReqID is zero on this type — and correlation
 		// lives entirely in the envelope's own id.
-		s.forwardSessionRPC(m, send)
+		if ctx.Err() != nil {
+			return
+		}
+		if rc := s.reconnectControl.Load(); rc != nil && (rc.state != ag || rc.ctx.Err() != nil) {
+			return
+		}
+		var target *guestRPCTarget
+		if len(received) > 0 {
+			target = received[0]
+		} else {
+			target = s.guestRPCTarget(ctx, m.Session, ag)
+		}
+		s.forwardSessionRPC(m, send, target)
 	case "dial_attach":
 		// Deliberately not in a goroutine of its own: agentSession's read
 		// loop already runs one execute per inbound command precisely so a
@@ -596,7 +590,7 @@ func (s *Server) execute(ctx context.Context, m runner.ToRunner, send func(runne
 // answer that was never coming. A RESPONSE that cannot be delivered is only
 // logged: answering an answer is meaningless, and the sandbox that asked has
 // already lost its own pending entry along with the conn.
-func (s *Server) forwardSessionRPC(m runner.ToRunner, send func(runner.FromRunner)) {
+func (s *Server) forwardSessionRPC(m runner.ToRunner, send func(runner.FromRunner), received ...*guestRPCTarget) {
 	if m.RPC == nil {
 		log.Printf("agent: session_rpc for %s carried no envelope; ignoring", m.Session)
 		return
@@ -607,8 +601,8 @@ func (s *Server) forwardSessionRPC(m runner.ToRunner, send func(runner.FromRunne
 		return
 	}
 	// A response to a request this RUNNER originated stops here: the runner
-	// is a pure forwarder for everything a sandbox asked, and the one thing
-	// it asks for itself (a bootstrap token on a cold resume) is answered to
+	// is a pure forwarder for everything a sandbox asked; cold bootstrap and
+	// reconnect authorization requested by the runner are answered to
 	// a caller inside this process, not to the guest. The id spaces are
 	// disjoint so the two can share one connection — see
 	// runnerOriginatedIDBase.
@@ -624,7 +618,33 @@ func (s *Server) forwardSessionRPC(m runner.ToRunner, send func(runner.FromRunne
 		}
 		return
 	}
-	err := s.sendSessionRPC(m.Session, env)
+	var err error
+	row, exists := s.reg.snapshot(m.Session)
+	var pending guestRPCPending
+	correlated := false
+	if env.Method == "resp" {
+		pending, correlated = s.guestForwards.take(env.ID, m.Session)
+	}
+	if correlated {
+		env.ID = pending.guestID
+		err = s.sendGuestRPC(&pending.target, env)
+	} else if exists && row.guestReconnect {
+		if env.Method == "resp" {
+			return
+		}
+		var target *guestRPCTarget
+		if len(received) > 0 {
+			target = received[0]
+		}
+		err = s.sendGuestRPC(target, env)
+	} else {
+		// A command captured for a negotiated guest never falls back to a
+		// replacement legacy entry or waits for a different hub.
+		if len(received) > 0 && received[0] != nil {
+			return
+		}
+		err = s.sendSessionRPC(m.Session, env)
+	}
 	if err == nil {
 		return
 	}
@@ -911,4 +931,39 @@ func driverHome(h *runner.HomeMount) *driver.HomeMount {
 		return nil
 	}
 	return &driver.HomeMount{Volume: h.Volume, Path: h.Path}
+}
+
+func guestDriverSpec(spec runner.Spec) driver.Spec {
+	return driver.Spec{
+		GuestReconnect: spec.GuestReconnect, Name: spec.Name, Image: spec.Image, Cmd: spec.Cmd, EgressAllow: spec.EgressAllow,
+		Setup: spec.Setup, SetupTimeoutSec: spec.SetupTimeoutSec, Env: spec.Env,
+		Repos: driverRepos(spec.Repos),
+		Init:  spec.Init, InitTimeoutSec: spec.InitTimeoutSec,
+		GitAuthorName: spec.GitAuthorName, GitAuthorEmail: spec.GitAuthorEmail,
+		Home: driverHome(spec.Home),
+		// The microVM bootstrap pair, carried through like
+		// everything else. This runner does not read the token — it
+		// goes into the guest's boot configuration and is dropped —
+		// and it does not check the names against Env. The DRIVER
+		// decides what an unwithheld create means, because the answer
+		// is different for each one: Docker has always accepted the
+		// values and still does.
+		BootstrapToken: spec.BootstrapToken, SecretNames: spec.SecretNames,
+	}
+}
+
+// Stamp at the single writer, so every origin (including runner-local RPCs)
+// has one ordered capacity sample and cannot overwrite a newer observation.
+func (s *Server) stampCapacity(parent context.Context, m *runner.FromRunner) {
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	if d, ok := s.drv.(interface {
+		CapacitySnapshot(context.Context) (int, int, map[string]uint64, error)
+	}); ok {
+		m.Used, m.Total, m.CapacityPlacements, _ = d.CapacitySnapshot(ctx)
+	} else {
+		m.Used, m.Total, _ = s.drv.Capacity(ctx)
+		m.CapacityPlacements = nil
+	}
+	m.Active, m.IdleExited = s.reg.counts()
 }

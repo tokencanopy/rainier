@@ -139,6 +139,14 @@ type MicrovmHost interface {
 	CheckpointCommitted(sessionID string, nonce uint64)
 }
 
+// GuestResumeConfigurationHost resolves configuration lost on runner restart.
+// The host must authorize the exact pending placement on its current control
+// connection. Returned configuration is in-memory only and carries no token;
+// the existing bootstrap mint follows successful resolution.
+type GuestResumeConfigurationHost interface {
+	GuestResumeConfiguration(context.Context, string, uint64) (runner.BootConfig, error)
+}
+
 // WorkspaceStream is what one cold suspend's stream carried, as the guest
 // counted it and as the runner received it. It holds counts and a nonce and
 // nothing else — a name or a path from inside a workspace is session content
@@ -165,7 +173,13 @@ var (
 // announced microvm.v1, and this driver refuses a create that carries them
 // anyway. The claim and the refusal are two halves of one promise, so they
 // are read from one place.
-func (m *Microvm) Capabilities() []string { return []string{runner.CapabilityMicrovmV1} }
+func (m *Microvm) Capabilities() []string {
+	caps := []string{runner.CapabilityMicrovmV1}
+	if m.opts.GuestReconnect {
+		caps = append(caps, runner.CapabilityGuestReconnectV1)
+	}
+	return caps
+}
 
 // SetHost installs the runner above this driver. It is a setter rather than a
 // field on MicrovmOpts because the runner is composed OVER the driver
@@ -247,20 +261,12 @@ type guestChannel struct {
 	// failure would put a line in an operator's log for every session that
 	// ends normally.
 	closed bool
-	// served records that this boot generation's ONE guest connection has
-	// been taken. /dev/vsock is world-accessible inside an ordinary guest,
-	// so every process in the sandbox can dial (2, 1024) — and what the
-	// first frame carries is the session's whole configuration and a LIVE
-	// bootstrap token. Serving every connection would hand that to whoever
-	// asked, as many times as they asked, and let the last one become the
-	// session's hub.
-	//
-	// So the model is the design note's: one guest-initiated connection per
-	// boot (§4). The first is sessiond; every later one is refused and closed
-	// having received nothing at all. A sessiond that crashed and came back
-	// is a NEW boot generation — a new VM, a new socket, a new mint (open
-	// question 2) — and not something to re-serve this token to.
-	served bool
+	// served permanently consumes the initial boot delivery. Legacy guests
+	// get no second connection. Negotiated guests may subsequently prove their
+	// enrolled key; that path never reads boot or replays its bootstrap token.
+	served    bool
+	reconnect bool
+	pending   bool
 	// conns are the connections this channel is still responsible for. It
 	// holds at most the one served guest, and it exists so close() can end
 	// it: a Destroy that closed only the listener would leave a wedged
@@ -270,22 +276,41 @@ type guestChannel struct {
 	conns map[net.Conn]struct{}
 }
 
-// claim reserves this boot generation's one guest connection for c and takes
-// responsibility for closing it. It reports false for a second connection and
-// for one that arrived after teardown — in both cases the caller closes c
-// without writing a byte to it.
-func (g *guestChannel) claim(c net.Conn) bool {
+// claim reserves one bounded admission and takes responsibility for c.
+// Legacy guests retain their one-connection limit; refused peers receive no bytes.
+func (g *guestChannel) claim(c net.Conn) bool { _, ok := g.admit(c); return ok }
+
+// admit reserves work inline, before any goroutine is launched. A reconnect
+// never reuses the first boot path, even when a previous delivery failed.
+func (g *guestChannel) admit(c net.Conn) (fresh, ok bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.closed || g.served {
-		return false
+	if g.closed || g.pending || (g.served && !g.reconnect) {
+		return false, false
 	}
+	fresh = !g.served
 	g.served = true
+	g.pending = true
 	if g.conns == nil {
 		g.conns = map[net.Conn]struct{}{}
 	}
 	g.conns[c] = struct{}{}
-	return true
+	return fresh, true
+}
+func (g *guestChannel) finishAdmission() { g.mu.Lock(); g.pending = false; g.mu.Unlock() }
+
+// Closing the relay drops its raw socket from listener ownership immediately.
+// Otherwise a long-lived guest would retain every past reconnect in this map.
+type guestTrackedConn struct {
+	net.Conn
+	channel *guestChannel
+}
+
+func (c *guestTrackedConn) Close() error {
+	c.channel.mu.Lock()
+	delete(c.channel.conns, c.Conn)
+	c.channel.mu.Unlock()
+	return c.Conn.Close()
 }
 
 // drop closes a claimed connection this channel will not be handing on, and
@@ -363,20 +388,15 @@ func (m *Microvm) openGuestChannel(sessionID, udsPath, listenPath string, cfg ru
 		_ = os.Remove(listenPath)
 		return nil, fmt.Errorf("restrict the guest control socket %s: %w", listenPath, err)
 	}
-	g := &guestChannel{listener: ln, listenPath: listenPath, udsPath: udsPath, boot: cfg}
+	g := &guestChannel{listener: ln, listenPath: listenPath, udsPath: udsPath, boot: cfg, reconnect: cfg.GuestReconnect == runner.GuestReconnectProtocol}
 	go m.acceptGuests(sessionID, g)
 	return g, nil
 }
 
-// acceptGuests keeps accepting for the life of the instance.
-//
-// It keeps accepting even though exactly one connection is ever SERVED,
-// because the alternative is worse in both directions: an accept loop that
-// stopped would leave later dials queued in the kernel with nobody to refuse
-// them, and a loop that served inline would be wedged for good by the first
-// guest that connected and did not read (the boot config can exceed a
-// megabyte — see bootConfigWriteTimeout). So each connection gets a goroutine
-// of its own, and all but the first are refused in it.
+// acceptGuests keeps accepting for the life of the instance. Admission happens
+// inline before starting a worker: only the one claimed boot connection may
+// allocate a serving goroutine. Refused peers receive no bytes and no per-peer
+// log line. A blocked boot write cannot prevent rejection of later peers.
 func (m *Microvm) acceptGuests(sessionID string, g *guestChannel) {
 	for {
 		c, err := g.listener.Accept()
@@ -386,11 +406,21 @@ func (m *Microvm) acceptGuests(sessionID string, g *guestChannel) {
 			}
 			return
 		}
-		go m.serveGuest(sessionID, g, c)
+		fresh, ok := g.admit(c)
+		if !ok {
+			_ = c.Close()
+			continue
+		}
+		if fresh {
+			go m.serveGuest(sessionID, g, c)
+		} else {
+			go m.serveReconnectingGuest(sessionID, g, c)
+		}
 	}
 }
 
-// serveGuest hands ONE guest connection its configuration and then hands the
+// serveGuest handles the ONE connection already claimed by acceptGuests.
+// It sends that guest its configuration and then hands the
 // connection to the runner.
 //
 // The boot configuration is the FIRST frame on the conn, written here before
@@ -398,25 +428,15 @@ func (m *Microvm) acceptGuests(sessionID string, g *guestChannel) {
 // the stream" true: the guest reads its whole configuration off the same
 // connection it will then serve its terminal and its RPC over.
 //
-// Every connection after the first is closed having received nothing — not
-// the configuration, not the token, not a byte. See guestChannel.served: the
-// socket is reachable by every process in the sandbox, and this is the one
-// place that decides the first dial is the session's and no other is.
+// Subsequent negotiated connections go through serveReconnectingGuest;
+// legacy peers are refused. This function is never used for reconnect.
 //
 // A host that has not been installed closes the connection rather than
 // holding it. There is nothing to attach it to, and the claim stays spent:
 // this boot has had its one connection.
 func (m *Microvm) serveGuest(sessionID string, g *guestChannel, c net.Conn) {
-	if !g.claim(c) {
-		// Not an error the operator can act on and not a rarity worth a
-		// line per occurrence — but it IS somebody in the guest dialling a
-		// socket that is not theirs, so it is said once per attempt and
-		// names nothing about the session but its id.
-		log.Printf("microvm: session %s: refusing a second connection on a control channel that serves one guest per boot", sessionID)
-		_ = c.Close()
-		return
-	}
-	conn := relay.NetConn(c)
+	defer g.finishAdmission()
+	conn := relay.NetConn(&guestTrackedConn{Conn: c, channel: g})
 	ctx, cancel := context.WithTimeout(context.Background(), bootConfigWriteTimeout)
 	defer cancel()
 	if err := writeBootConfig(ctx, conn, g.boot); err != nil {
@@ -462,7 +482,7 @@ func writeBootConfig(ctx context.Context, conn relay.Conn, cfg runner.BootConfig
 	return conn.Write(ctx, frame)
 }
 
-// bootConfigFor composes what a guest is told about itself.
+// GuestBootConfig composes what a guest is told about itself.
 //
 // Every field is one the create resolved, carried across unchanged. There are
 // two things deliberately NOT in it: any environment secret value (they are
@@ -474,9 +494,10 @@ func writeBootConfig(ctx context.Context, conn relay.Conn, cfg runner.BootConfig
 // The proxy URL carries the session's identity as URL userinfo, composed here
 // with the same helper the Docker driver uses, so egressd reads one thing
 // whichever driver the session is on.
-func bootConfigFor(spec Spec) runner.BootConfig {
+func GuestBootConfig(spec Spec) runner.BootConfig {
 	cfg := runner.BootConfig{
 		Protocol:        runner.SessionBootstrapProtocolVersion,
+		GuestReconnect:  spec.GuestReconnect,
 		SessionID:       spec.SessionID,
 		Cmd:             slices.Clone(spec.Cmd),
 		EgressAllow:     slices.Clone(spec.EgressAllow),
@@ -544,4 +565,28 @@ func refuseUnwithheldEnv(spec Spec) error {
 			"cannot tell them apart, has no argv to hand any of them to, and will not write one to disk. Upgrade the "+
 			"control plane to one that withholds them for a runner announcing %q",
 		spec.SessionID, len(spec.Env), runner.CapabilityMicrovmV1)
+}
+
+// bootConfigFor keeps the driver-internal call sites on the same constructor.
+func bootConfigFor(spec Spec) runner.BootConfig { return GuestBootConfig(spec) }
+
+// GuestReconnectHandoffHost owns the entire authenticated handoff. Unlike the
+// proof-only port, success transfers the admitted stream into a guarded relay.
+// The driver must validate local VM ownership and bound admission beforehand.
+type GuestReconnectHandoffHost interface {
+	ReconnectGuest(context.Context, string, relay.Conn) error
+}
+
+func (m *Microvm) serveReconnectingGuest(id string, g *guestChannel, c net.Conn) {
+	defer g.finishAdmission()
+	host, ok := m.currentHost().(GuestReconnectHandoffHost)
+	if !ok {
+		g.drop(c)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if host.ReconnectGuest(ctx, id, relay.NetConn(&guestTrackedConn{Conn: c, channel: g})) != nil {
+		g.drop(c)
+	}
 }

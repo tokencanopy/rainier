@@ -151,7 +151,7 @@ func (st *fleetFakeStore) transition(ws control.WorkspaceID, id control.SessionI
 	if !ok {
 		return control.ErrNotFound
 	}
-	if !fleetContainsState(from, s.State) {
+	if !fleetContainsState(from, s.State) || (opts.ExpectedPlacementGeneration != nil && s.PlacementGeneration != *opts.ExpectedPlacementGeneration) {
 		return control.ErrConflict
 	}
 	s.State = to
@@ -1150,6 +1150,8 @@ func TestReconcileRunnerMatrix(t *testing.T) {
 		wantDestroy bool
 	}{
 		{"creating adopted running", control.StateCreating, &control.RunnerSession{SessionID: "sess_example", State: control.StateRunning}, control.StateRunning, false},
+		{"resuming missing remains pending", control.StateResuming, nil, control.StateResuming, false},
+		{"resuming ignores old inventory", control.StateResuming, &control.RunnerSession{SessionID: "sess_example", State: control.StateRunning}, control.StateResuming, false},
 		{"running missing becomes dead", control.StateRunning, nil, control.StateDead, false},
 		{"creating missing requeues", control.StateCreating, nil, control.StateQueued, false},
 		{"terminal announced is orphan", control.StateDestroyed, &control.RunnerSession{SessionID: "sess_example", State: control.StateRunning}, control.StateDestroyed, true},

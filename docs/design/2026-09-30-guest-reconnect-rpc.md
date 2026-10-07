@@ -64,3 +64,6 @@ initial and cold-resume enrollment ordering, bounded guest peer handling,
 configuration refresh, and relay takeover. It must retain the five-second
 challenge/handshake budget and prove original-socket fencing, replay refusal,
 tenant isolation and real PID/PTY/agent continuity before advertising support.
+
+The follow-on [runner host callback](2026-09-30-guest-reconnect-host.md) now supplies
+connection-bound begin/proof/accept orchestration without enabling the listener.

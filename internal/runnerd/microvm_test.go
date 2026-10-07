@@ -265,6 +265,16 @@ func TestASandboxMayNotMintItsOwnBootstrapToken(t *testing.T) {
 		wantReason string
 	}{
 		{
+			name:       "guest begin reconnect",
+			ev:         relay.ControlEvent{Kind: "req:" + runner.MethodBeginGuestReconnect, ID: 5, Payload: []byte(`{"protocol":1}`)},
+			wantReason: "fenced",
+		},
+		{
+			name:       "guest accept reconnect",
+			ev:         relay.ControlEvent{Kind: "req:" + runner.MethodAcceptGuestReconnect, ID: 6, Payload: []byte(`{"protocol":1}`)},
+			wantReason: "fenced",
+		},
+		{
 			name:       "the mint method itself",
 			ev:         relay.ControlEvent{Kind: "req:" + runner.MethodMintSessionBootstrap, ID: 7, Payload: []byte(`{"protocol":1}`)},
 			wantReason: "may not mint its own bootstrap token",

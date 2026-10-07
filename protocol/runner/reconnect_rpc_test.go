@@ -105,6 +105,7 @@ func reconnectMessages() []reconnectMessageCase {
 
 		{"challenge", `{"protocol":1,"session_id":"session_test","boot_epoch":"boot_test","host_incarnation":"7","attempt_id":"attempt_test","placement_generation":3,"challenge":"` + token + `"}`, func(b []byte) (any, error) { return runner.DecodeGuestReconnectChallenge(b) }},
 		{"accepted", `{"epoch":2,"token":"` + token + `","expires_in_sec":120}`, func(b []byte) (any, error) { return runner.DecodeGuestReconnectAcceptResponse(b) }},
+		{"ready", `{"protocol":1,"epoch":2}`, func(b []byte) (any, error) { return runner.DecodeGuestReconnectReady(b) }},
 		{"refused", `{"error":"fenced"}`, func(b []byte) (any, error) { return runner.DecodeGuestReconnectErrorResponse(b) }},
 	}
 }

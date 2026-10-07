@@ -185,6 +185,7 @@ func TestSessionStateVocabulary(t *testing.T) {
 	values := map[control.SessionState]string{
 		control.StateQueued:        "queued",
 		control.StateCreating:      "creating",
+		control.StateResuming:      "resuming",
 		control.StateRunning:       "running",
 		control.StateSuspendedWarm: "suspended_warm",
 		control.StateSuspendedCold: "suspended_cold",
@@ -200,7 +201,7 @@ func TestSessionStateVocabulary(t *testing.T) {
 	}
 
 	terminalStates := map[control.SessionState]bool{
-		control.StateQueued: false, control.StateCreating: false, control.StateRunning: false,
+		control.StateQueued: false, control.StateCreating: false, control.StateResuming: false, control.StateRunning: false,
 		control.StateSuspendedWarm: false, control.StateSuspendedCold: false,
 		control.StateCanceled: true, control.StateFailed: true,
 		control.StateDead: true, control.StateDestroyed: true,
@@ -213,7 +214,7 @@ func TestSessionStateVocabulary(t *testing.T) {
 
 	slotStates := map[control.SessionState]bool{
 		control.StateQueued:   false,
-		control.StateCreating: true, control.StateRunning: true,
+		control.StateCreating: true, control.StateResuming: true, control.StateRunning: true,
 		control.StateSuspendedWarm: true, control.StateSuspendedCold: false,
 		control.StateCanceled: false, control.StateFailed: false,
 		control.StateDead: false, control.StateDestroyed: false,
@@ -225,7 +226,7 @@ func TestSessionStateVocabulary(t *testing.T) {
 	}
 
 	wantOrder := []control.SessionState{
-		control.StateQueued, control.StateCreating, control.StateRunning,
+		control.StateQueued, control.StateCreating, control.StateResuming, control.StateRunning,
 		control.StateSuspendedWarm, control.StateSuspendedCold,
 	}
 	if len(control.NonTerminal) != len(wantOrder) {

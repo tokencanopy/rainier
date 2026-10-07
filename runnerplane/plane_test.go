@@ -977,6 +977,7 @@ func TestRedialSurvivesStaleDisconnect(t *testing.T) {
 		entered      = make(chan struct{})
 		upserted     = make(chan struct{})
 		wrote        = make(chan struct{})
+		allowInstall = make(chan struct{})
 		enteredOnce  sync.Once
 		upsertedOnce sync.Once
 		wroteOnce    sync.Once
@@ -997,6 +998,7 @@ func TestRedialSurvivesStaleDisconnect(t *testing.T) {
 		case <-entered:
 			if r.Connected {
 				upsertedOnce.Do(func() { close(upserted) })
+				<-allowInstall
 			}
 		default:
 		}
@@ -1011,8 +1013,17 @@ func TestRedialSurvivesStaleDisconnect(t *testing.T) {
 
 	// The teardown is now inside its disconnect write; redial into that gap.
 	awaitChan(t, entered, "teardown's disconnect write")
-	startFakeRunner(t, ts, runnerScript{Name: "vm1", Used: 1, Total: 4})
+	second := startFakeRunner(t, ts, runnerScript{Name: "vm1", Used: 1, Total: 4})
 	awaitChan(t, wrote, "teardown's disconnect write returning")
+	awaitChan(t, upserted, "redial registration persisted")
+	// Persistence precedes socket installation. A connected database row is
+	// not a handshake barrier; hold that real gap open to exercise it.
+	installedEarly := p.Transport().Connected(testPool, "vm1")
+	close(allowInstall)
+	if installedEarly {
+		t.Fatal("replacement installed before its registration returned")
+	}
+	drainAccept(t, second)
 
 	eventually(t, 3*time.Second, func() error {
 		rows, err := h.repo.ListRunners(context.Background(), testPool)
