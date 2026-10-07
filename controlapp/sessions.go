@@ -608,18 +608,13 @@ func (s *SessionService) ResumeSession(ctx context.Context, scope control.Scope,
 		if free <= 0 {
 			return control.Session{}, control.ErrConflict
 		}
+		return s.resumeCold(ctx, scope, row)
 	}
 
 	if _, err := s.dispatch(ctx, row, runner.ToRunner{Type: "resume", Session: string(row.ID)}); err != nil {
 		return control.Session{}, err
 	}
-	// A cold resume starts a new sandbox on the runner that holds the volume,
-	// so its transition names that runner and the repository opens a new
-	// placement generation for it; a warm resume names none.
 	opts := control.TransitionOpts{}
-	if row.State == control.StateSuspendedCold {
-		opts.RunnerID = &row.RunnerID
-	}
 	if err := s.uow.Run(ctx, func(ctx context.Context) error {
 		if err := s.sessions.Transition(ctx, scope.WorkspaceID, cmd.ID, []control.SessionState{row.State}, control.StateRunning, opts); err != nil {
 			if !errors.Is(err, control.ErrConflict) && !errors.Is(err, control.ErrNotFound) {
@@ -627,18 +622,7 @@ func (s *SessionService) ResumeSession(ctx context.Context, scope control.Scope,
 			}
 			return nil
 		}
-		// A cold resume's transition named a runner, so the repository opened
-		// a new placement generation for the sandbox it starts. The event
-		// belongs to the generation the row has AFTER the mutation, which
-		// only a re-read inside this same unit knows.
 		recorded := row
-		if opts.RunnerID != nil {
-			cur, err := s.sessions.GetSession(ctx, scope.WorkspaceID, cmd.ID)
-			if err != nil {
-				return control.ErrUnavailable
-			}
-			recorded = cur
-		}
 		return recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionResume,
 			sessionResource(recorded), recorded.PlacementGeneration)
 	}); err != nil {
@@ -648,8 +632,48 @@ func (s *SessionService) ResumeSession(ctx context.Context, scope control.Scope,
 	return s.authoritative(ctx, scope.WorkspaceID, cmd.ID)
 }
 
-// coldResumeFree computes free capacity on the runner already holding a cold
-// session's volume: CapacityTotal - CapacityUsed - len(creating). A runner the
+// resumeCold claims a new placement before any VM or bootstrap side effect.
+// A lost dispatch reply retains the claim: only versioned runner evidence can
+// establish whether the VM started. Never enqueue this workspace as a create.
+func (s *SessionService) resumeCold(ctx context.Context, scope control.Scope, row control.Session) (control.Session, error) {
+	if !s.transport.Connected(row.PoolID, row.RunnerID) {
+		return control.Session{}, control.ErrUnavailable
+	}
+	var claimed control.Session
+	err := s.uow.Run(ctx, func(ctx context.Context) error {
+		opts := control.TransitionOpts{RunnerID: &row.RunnerID, ExpectedPlacementGeneration: &row.PlacementGeneration}
+		if err := s.sessions.Transition(ctx, scope.WorkspaceID, row.ID, []control.SessionState{control.StateSuspendedCold}, control.StateResuming, opts); err != nil {
+			return portError(err)
+		}
+		var err error
+		claimed, err = s.sessions.GetSession(ctx, scope.WorkspaceID, row.ID)
+		return portError(err)
+	})
+	if err != nil {
+		return control.Session{}, err
+	}
+	if _, err = s.dispatch(ctx, claimed, runner.ToRunner{Type: "resume", Session: string(row.ID), PlacementGeneration: claimed.PlacementGeneration}); err != nil {
+		return control.Session{}, err
+	}
+	err = s.uow.Run(ctx, func(ctx context.Context) error {
+		opts := control.TransitionOpts{ExpectedPlacementGeneration: &claimed.PlacementGeneration}
+		if err := s.sessions.Transition(ctx, scope.WorkspaceID, row.ID, []control.SessionState{control.StateResuming}, control.StateRunning, opts); err != nil {
+			if errors.Is(err, control.ErrConflict) || errors.Is(err, control.ErrNotFound) {
+				return nil
+			}
+			return control.ErrUnavailable
+		}
+		return recordEvent(ctx, s.ids, s.events, s.clock, scope, control.ActionResume, sessionResource(claimed), claimed.PlacementGeneration)
+	})
+	if err != nil {
+		return control.Session{}, err
+	}
+	s.wake(row.PoolID)
+	return s.authoritative(ctx, scope.WorkspaceID, row.ID)
+}
+
+// coldResumeFree computes conservative free capacity on the runner holding
+// the volume, including creating and pending-resume reservations. A runner the
 // pool no longer lists yields zero (no slot).
 func (s *SessionService) coldResumeFree(ctx context.Context, row control.Session) (int, error) {
 	runners, err := s.fleet.ListRunners(ctx, row.PoolID)
@@ -660,11 +684,11 @@ func (s *SessionService) coldResumeFree(ctx context.Context, row control.Session
 		if r.ID != row.RunnerID {
 			continue
 		}
-		creating, err := s.fleet.SessionsOnRunner(ctx, row.PoolID, row.RunnerID, []control.SessionState{control.StateCreating})
+		creating, err := s.fleet.SessionsOnRunner(ctx, row.PoolID, row.RunnerID, []control.SessionState{control.StateCreating, control.StateResuming})
 		if err != nil {
 			return 0, err
 		}
-		return r.CapacityTotal - r.CapacityUsed - len(creating), nil
+		return control.AvailableRunnerSlots(r, creating), nil
 	}
 	return 0, nil
 }

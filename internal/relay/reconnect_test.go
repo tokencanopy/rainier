@@ -31,7 +31,7 @@ func TestGuestHandshakeReadLimitBeforeNewline(t *testing.T) {
 }
 
 func TestGuestReconnectFrames(t *testing.T) {
-	for _, kind := range []string{KindGuestReconnectChallenge, KindGuestReconnectProof, KindGuestReconnectAccepted, KindGuestReconnectRefused} {
+	for _, kind := range []string{KindGuestReconnectChallenge, KindGuestReconnectProof, KindGuestReconnectAccepted, KindGuestReconnectRefused, KindGuestReconnectReady, KindGuestReconnectReadyAck} {
 		t.Run(kind, func(t *testing.T) {
 			a, b := net.Pipe()
 			defer a.Close()

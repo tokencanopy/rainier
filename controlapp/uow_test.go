@@ -294,8 +294,8 @@ func TestResumeSessionCommitsTransitionAndEventTogether(t *testing.T) {
 	if _, err := fx.svc.ResumeSession(uowCtx, sessionTestScope(), control.ResumeSession{ID: "sess_one"}); err != nil {
 		t.Fatal(err)
 	}
-	if fx.uow.runs != 1 || fx.repo.transitionDepth != 1 || fx.rec.recordDepth != 1 || fx.woke != 1 {
-		t.Fatalf("runs %d, transition at depth %d, record at depth %d, woke %d; want 1/1/1/1",
+	if fx.uow.runs != 2 || fx.repo.transitionDepth != 1 || fx.rec.recordDepth != 1 || fx.woke != 1 {
+		t.Fatalf("runs %d, transition at depth %d, record at depth %d, woke %d; want 2/1/1/1",
 			fx.uow.runs, fx.repo.transitionDepth, fx.rec.recordDepth, fx.woke)
 	}
 	if ev := fx.rec.last(t); ev.PlacementGeneration != 4 {

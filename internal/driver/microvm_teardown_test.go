@@ -74,6 +74,7 @@ func TestMicrovmDestroyRemovesTheWorkspaceOfARecordOnlyOnDisk(t *testing.T) {
 	}
 
 	// The restart proves it: nothing comes back.
+	stopTestMicrovmRunner(t, m)
 	restarted, _, _ := testMicrovmCloning(t, MicrovmOpts{
 		TotalSlots: 2, StateDir: m.opts.StateDir, BaseRootfs: m.opts.BaseRootfs,
 	})

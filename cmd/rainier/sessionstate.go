@@ -77,7 +77,7 @@ const (
 // exited would be the collapse this file exists to prevent.
 func lifecycleOf(s session) string {
 	switch s.State {
-	case "queued", "creating":
+	case "queued", "creating", "resuming":
 		return lifecycleStarting
 	case "running":
 		// Regardless of child_exit_code. The sandbox is up.
@@ -188,7 +188,7 @@ const (
 // Everything else is refused by the endpoint.
 func canAttach(s session) string {
 	switch s.State {
-	case "running", "queued", "creating", "suspended_warm", "suspended_cold":
+	case "running", "queued", "creating", "resuming", "suspended_warm", "suspended_cold":
 		return eligibleYes
 	case "failed":
 		if s.Reachable {
@@ -216,7 +216,7 @@ func canStop(s session) string {
 	switch s.State {
 	case "running":
 		return eligibleYes
-	case "queued", "creating", "suspended_warm", "suspended_cold",
+	case "queued", "creating", "resuming", "suspended_warm", "suspended_cold",
 		"failed", "dead", "canceled", "destroyed":
 		return eligibleNo
 	default:
@@ -231,7 +231,7 @@ func canStop(s session) string {
 // a live container and deleting it is the cleanup.
 func canDelete(s session) string {
 	switch s.State {
-	case "running", "queued", "suspended_warm", "suspended_cold",
+	case "running", "queued", "resuming", "suspended_warm", "suspended_cold",
 		"failed", "dead", "canceled":
 		return eligibleYes
 	case "creating":

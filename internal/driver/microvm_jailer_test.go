@@ -14,6 +14,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // fakeStarter is the exec seam: it records the argv a host would be asked to
@@ -190,6 +191,7 @@ func jailTestEngineIn(t *testing.T, dir string, fs *jailFakeFS, starter processS
 	// machine has. Every test here is about what the engine WOULD run and
 	// what it puts on disk first; production never replaces this.
 	fc.kvm = func() bool { return true }
+	fc.startTime = func(pid int) (uint64, error) { return uint64(pid), nil }
 	return fc
 }
 
@@ -918,4 +920,175 @@ func writeJailImage(t *testing.T, dir, name string, mode os.FileMode) string {
 		t.Fatalf("chmod %s: %v", path, err)
 	}
 	return path
+}
+
+// A crash can happen after Start but before the PID is durably published.
+func TestPendingLaunchWithoutPIDRetainsJail(t *testing.T) {
+	fc, dir, _ := jailTestEngine(t, &fakeStarter{})
+	id := "mvm-9"
+	marker := filepath.Join(dir, "instances", id, "launch.pending")
+	if err := os.MkdirAll(filepath.Dir(marker), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte("unknown"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	jail := jailInstanceDir(dir, id)
+	if err := os.MkdirAll(jail, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, pidText := range []string{"", "not-a-pid", strconv.Itoa(os.Getpid())} {
+		if pidText != "" {
+			if err := os.WriteFile(fc.pidFilePath(id), []byte(pidText), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := fc.State(context.Background(), id); err == nil {
+			t.Error("missing PID was treated as proof of exit")
+		}
+		if err := fc.Stop(context.Background(), id); err == nil {
+			t.Error("uncertain launch teardown succeeded")
+		}
+		if _, err := os.Stat(jail); err != nil {
+			t.Error("uncertain launch lost its jail")
+		}
+	}
+}
+
+type observingStarter struct {
+	check func()
+	fakeStarter
+}
+
+func (s *observingStarter) Start(name string, args []string) (vmmProcess, error) {
+	s.check()
+	return s.fakeStarter.Start(name, args)
+}
+func TestLaunchPublishesIntentBeforeStartingChild(t *testing.T) {
+	starter := &observingStarter{}
+	fc, dir, _ := jailTestEngine(t, starter)
+	starter.check = func() {
+		data, err := os.ReadFile(fc.launchMarkerPath("mvm-7"))
+		if err != nil || len(data) == 0 {
+			t.Fatal("child started without durable launch evidence")
+		}
+	}
+	cfg := VMMConfig{ID: "mvm-7", SlotIndex: 7, KernelPath: writeJailImage(t, dir, "kernel", 0644), RootfsPath: writeJailImage(t, dir, "rootfs", 0644)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := fc.Launch(ctx, cfg); err == nil {
+		t.Fatal("expected unreachable API")
+	}
+	if _, err := os.Stat(fc.launchMarkerPath(cfg.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("confirmed child exit did not clear launch intent")
+	}
+}
+
+func TestLaunchEvidenceRejectsAnotherInstancePID(t *testing.T) {
+	fc, _, _ := jailTestEngine(t, &fakeStarter{})
+	proc, pid := fakeFirecracker(t, "mvm-10")
+	defer func() { _ = proc.Kill(); _ = proc.Wait() }()
+	if err := atomicMetadata(fc.launchMarkerPath("mvm-1"), []byte(hostLaunchBoot())); err != nil {
+		t.Fatal(err)
+	}
+	fc.startTime = processStartTime
+	if err := fc.saveProcessIdentity("mvm-1", pid); err != nil {
+		t.Fatal(err)
+	}
+	if gone, err := fc.launchEvidence("mvm-1", pid); err == nil {
+		t.Fatalf("another instance PID accepted as current launch evidence: gone=%v", gone)
+	}
+	if err := atomicMetadata(fc.pidFilePath("mvm-1"), []byte(strconv.Itoa(pid))); err != nil {
+		t.Fatal(err)
+	}
+	signals := &fakeSignaller{}
+	fc.signals = signals
+	if err := fc.Stop(context.Background(), "mvm-1"); err == nil {
+		t.Fatal("another VM accepted for teardown")
+	}
+	if len(signals.sent) != 0 {
+		t.Fatal("mismatched process received a signal")
+	}
+	if !isFirecrackerPID(pid, "mvm-10") {
+		t.Fatal("exact-ID positive control failed")
+	}
+
+}
+
+func TestLaunchEvidenceRequiresOriginalProcessLifetime(t *testing.T) {
+	fc, _, _ := jailTestEngine(t, &fakeStarter{})
+	proc, pid := fakeFirecracker(t, "mvm-11")
+	defer func() { _ = proc.Kill(); _ = proc.Wait() }()
+	if err := atomicMetadata(fc.launchMarkerPath("mvm-11"), []byte(hostLaunchBoot())); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicMetadata(fc.pidFilePath("mvm-11"), []byte(strconv.Itoa(pid))); err != nil {
+		t.Fatal(err)
+	}
+	// An exact command/instance ID alone does not prove this is the original
+	// process. Until its birth identity has been published, ownership is unknown.
+	if _, err := fc.launchEvidence("mvm-11", pid); err == nil {
+		t.Fatal("exact argv accepted without process lifetime evidence")
+	}
+	fc.startTime = processStartTime
+	if err := fc.saveProcessIdentity("mvm-11", pid); err != nil {
+		t.Fatal(err)
+	}
+	if gone, err := fc.launchEvidence("mvm-11", pid); err != nil || gone {
+		t.Fatal("original process positive control failed")
+	}
+	actual := fc.startTime
+	fc.startTime = func(pid int) (uint64, error) { v, err := actual(pid); return v + 1, err }
+	if _, err := fc.launchEvidence("mvm-11", pid); err == nil {
+		t.Fatal("reused process lifetime accepted")
+	}
+	signals := &fakeSignaller{}
+	fc.signals = signals
+	if err := fc.Stop(context.Background(), "mvm-11"); err == nil {
+		t.Fatal("recycled lifetime accepted for teardown")
+	}
+	if len(signals.sent) != 0 {
+		t.Fatal("recycled process received a signal")
+	}
+
+}
+
+type lifetimeChangeSignal struct {
+	onTerm func()
+	kills  int
+}
+
+func (s *lifetimeChangeSignal) Getpgid(pid int) (int, error) { return pid + 1, nil }
+func (s *lifetimeChangeSignal) Kill(_ int, sig syscall.Signal) error {
+	if sig == syscall.SIGTERM {
+		s.onTerm()
+	}
+	if sig == syscall.SIGKILL {
+		s.kills++
+	}
+	return nil
+}
+func TestStopRechecksLifetimeBeforeEscalation(t *testing.T) {
+	fc, _, _ := jailTestEngine(t, &fakeStarter{})
+	proc, pid := fakeFirecracker(t, "mvm-12")
+	defer func() { _ = proc.Kill(); _ = proc.Wait() }()
+	fc.startTime = processStartTime
+	if err := atomicMetadata(fc.launchMarkerPath("mvm-12"), []byte(hostLaunchBoot())); err != nil {
+		t.Fatal(err)
+	}
+	if err := fc.saveProcessIdentity("mvm-12", pid); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicMetadata(fc.pidFilePath("mvm-12"), []byte(strconv.Itoa(pid))); err != nil {
+		t.Fatal(err)
+	}
+	originalStart := fc.startTime
+	sig := &lifetimeChangeSignal{onTerm: func() { fc.startTime = func(pid int) (uint64, error) { v, e := originalStart(pid); return v + 1, e } }}
+	fc.signals = sig
+	c, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_ = fc.Stop(c, "mvm-12")
+	if sig.kills != 0 {
+		t.Fatal("SIGKILL authorized after original birth identity changed during wait")
+	}
 }

@@ -45,7 +45,7 @@ func initialAttachGuidance(ctx context.Context, cfg cli.Config, id string, since
 	} else {
 		row := resp.Session
 		switch row.State {
-		case "queued", "creating":
+		case "queued", "creating", "resuming":
 			explanation = "session is " + row.State + " and not ready to attach"
 			if row.QueueReason != "" {
 				// Queue text is server-owned prose. Redact known credentials before

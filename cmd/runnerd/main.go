@@ -34,6 +34,8 @@ func main() {
 		"bearer token for the controld dial (required when --controld is set; or set RAINIER_RUNNER_TOKEN, which keeps it out of the process list)")
 	driverFlag := flag.String("driver", envDefault("RAINIER_RUNNER_DRIVER", "docker"),
 		"execution driver for session sandboxes: docker | microvm")
+	microvmGuestReconnect := flag.Bool("microvm-guest-reconnect", os.Getenv("RAINIER_MICROVM_GUEST_RECONNECT") == "1",
+		"opt in to authenticated recovery of surviving microVM guests after control connection or runner restart; requires a matching control plane and guest image")
 	kernelPath := flag.String("kernel", envDefault("RAINIER_KERNEL_PATH", ""),
 		"guest vmlinux kernel path for the microvm driver (required when --driver=microvm; the runner refuses to start without a readable one)")
 	rootfsPath := flag.String("rootfs", envDefault("RAINIER_ROOTFS_PATH", ""),
@@ -149,14 +151,15 @@ func main() {
 			log.Fatalf("--driver=microvm: %v", err)
 		}
 		mvm, err := driver.NewMicrovm(driver.MicrovmOpts{
-			Checkpoint:  ckpt,
-			KernelPath:  *kernelPath,
-			BaseRootfs:  *rootfsPath,
-			StateDir:    *microvmStateDir,
-			TotalSlots:  *slots,
-			VCPU:        *microvmVCPUs,
-			MemoryMiB:   *microvmMemoryMiB,
-			ImageSource: imageSource,
+			GuestReconnect: *microvmGuestReconnect,
+			Checkpoint:     ckpt,
+			KernelPath:     *kernelPath,
+			BaseRootfs:     *rootfsPath,
+			StateDir:       *microvmStateDir,
+			TotalSlots:     *slots,
+			VCPU:           *microvmVCPUs,
+			MemoryMiB:      *microvmMemoryMiB,
+			ImageSource:    imageSource,
 
 			SlotGuestCIDR:  *microvmGuestCIDR,
 			SlotUplinkCIDR: *microvmUplinkCIDR,

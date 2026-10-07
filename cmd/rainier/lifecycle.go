@@ -115,7 +115,7 @@ func eligibilityText(verdict, note string) string {
 // yet" from "never".
 func attachNote(s session) string {
 	switch s.State {
-	case "queued", "creating":
+	case "queued", "creating", "resuming":
 		return "waits for it to start"
 	case "suspended_warm", "suspended_cold":
 		return "resumes it first"
@@ -141,7 +141,7 @@ func stopNote(s session) string {
 		return "this build does not know this state; the server decides"
 	}
 	switch s.State {
-	case "queued", "creating":
+	case "queued", "creating", "resuming":
 		return "only a running session can be stopped"
 	case "suspended_warm", "suspended_cold":
 		return "already stopped"

@@ -315,8 +315,9 @@ func (r pgSessions) Transition(ctx context.Context, ws control.WorkspaceID, id c
 		    error = COALESCE($3::text, error),
 		    image = COALESCE($7::text, image),
 		    updated_at = now(), last_event_at = now()
-		WHERE workspace_id = $4 AND id = $5 AND state = ANY($6)`,
-		string(to), runner, opts.Error, string(ws), string(id), fromStrs, opts.Image)
+		WHERE workspace_id = $4 AND id = $5 AND state = ANY($6)
+ AND ($8::bigint IS NULL OR placement_generation = $8)`,
+		string(to), runner, opts.Error, string(ws), string(id), fromStrs, opts.Image, opts.ExpectedPlacementGeneration)
 	if err != nil {
 		return unavailable("transition", err)
 	}
