@@ -86,7 +86,18 @@ func (f *FirecrackerEngine) launchEvidence(id string, pid int) (gone bool, err e
 	}
 	start, err := f.startTime(pid)
 	if err != nil || start != birth.StartTime {
+		// Exit can race the preceding signal-0 probe. Absence is conclusive;
+		// an unreadable or different live lifetime still fails closed.
+		if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+			return true, nil
+		}
 		return false, errors.New("microvm: process lifetime no longer matches launch")
+	}
+	// An exited Linux process has no argv while its parent is reaping it.
+	// Its same-boot birth and terminal kernel state prove the original VM
+	// ended; empty argv alone never grants teardown authority.
+	if boot == current && boot != "unknown" && processExited(pid, birth.StartTime) {
+		return true, nil
 	}
 
 	if !isFirecrackerPID(pid, id) {

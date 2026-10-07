@@ -94,3 +94,16 @@ runner-origin only at a positive epoch. PostgreSQL bootstrap RPCs receive these
 current-authority checks even before negotiation; this intentionally prevents a
 legacy path from bypassing owner revocation or spending a proof-issued token.
 The other legacy RPC methods retain their existing handlers.
+
+
+### Recovered VM exit evidence
+
+A recovered VMM can exit between a successful signal and the next identity
+probe. Linux removes its argv before the parent reaps the zombie, so an empty
+command line alone cannot distinguish that exit from an unknown live process.
+Teardown accepts a terminal kernel state only when the recorded process birth
+matches and the launch marker names the current, known host boot. An unreadable
+or different live lifetime still refuses teardown. Tracked children are Waited
+even when exit evidence is already conclusive, so the host does not leak zombies.
+Native subprocess regressions cover exit after SIGTERM, an already-exited
+recovered process, tracked-child reaping, and mismatched-birth rejection.

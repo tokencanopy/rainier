@@ -3342,7 +3342,8 @@ func (f *FirecrackerEngine) Stop(ctx context.Context, id string) error {
 	// belongs to no child of this process, and for that one the kernel has
 	// already reparented it to init, which reaps it.
 	var waited chan error
-	if tracked && pid > 0 {
+	if tracked {
+		// Even conclusive exit evidence can describe an unreaped child.
 		waited = f.waitChild(id, proc)
 	}
 
