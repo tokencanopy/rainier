@@ -36,6 +36,8 @@ attachment ID zero and exactly `kind` and `payload` in their control event:
 | `guest_reconnect_proof` | Shared `GuestReconnectAcceptRequest` |
 | `guest_reconnect_accepted` | Shared `GuestReconnectAcceptResponse` |
 | `guest_reconnect_refused` | Shared fixed-code refusal |
+| `guest_reconnect_ready` | Shared `GuestReconnectReady`: `protocol`, `epoch` |
+| `guest_reconnect_ready_ack` | Same payload, matching the accepted epoch |
 
 The encoded outer frame is at most 4096 bytes, excluding its newline. `NetConn`
 retains its fixed 64 KiB read buffer but assembles no more than the selected
@@ -59,6 +61,29 @@ and exchange waits retain their existing 30-second bounds and are additionally
 bounded by the accepted token TTL. Failed proof, configuration, redemption or
 validation returns a fixed error; `sessionTransport.connect` closes the stream
 and does not make it available to the relay or credential dispatcher.
+
+After configuration application the guest sends `guest_reconnect_ready` and waits
+for `guest_reconnect_ready_ack` on the same stream before returning it to the
+transport. Both payloads contain exactly `{"protocol":1,"epoch":N}` with a positive
+accepted epoch. The strict shared decoder rejects unknown, duplicate, missing,
+null and invalid fields. Sending readiness and receiving its acknowledgment share
+a separate five-second ceiling, additionally bounded by delivery TTL and caller
+cancellation. A lost, late or malformed acknowledgment closes the stream; the
+already consumed epoch and token require a fresh signed attempt. Configuration
+may already have been applied, but no ordinary relay or credential traffic is
+served on the failed stream.
+
+Readiness reports configuration completion; it grants no host installation
+authority. The future host handoff must retain and revalidate the original
+instance, placement and connection ownership, fence the old relay, and serialize
+the acknowledgment before publishing the new relay or allowing ordinary frames
+to interleave. A successful acknowledgment write alone does not prove peer
+receipt. Neither this exchange nor proof acceptance permits an unguarded call to
+the existing `GuestConnected` publication path.
+
+This extends the disabled draft version-1 protocol: a reconnect-enabled guest
+requires a paired host that implements acknowledgment. No shipping listener
+advertises the opt-in, and legacy fresh boot is unchanged.
 
 ## Configuration and process continuity
 
@@ -95,7 +120,9 @@ against a real TCP protocol fixture, using the production bootstrap/preamble and
 PTY implementation. It verifies enrollment, a refused connection, a signed new
 connection, fresh token redemption and the same shell PID on the same PTY before
 and after, including the child-versus-parent environment distinction, refreshed
-real exec children, removed values and preserved boot-chain exports. This is the
+real exec children, removed values and preserved boot-chain exports. It also
+drops the first ready acknowledgment, verifies that epoch remains consumed, and
+reconnects using a fresh proof, token and epoch while retaining the same PTY shell. This is the
 closest executable check for an unenabled guest path; the shipping host has no
 caller yet. It is not AF_VSOCK/KVM or a hosted authorization/relay takeover test.
 

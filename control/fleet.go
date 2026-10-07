@@ -35,7 +35,11 @@ type Runner struct {
 	PoolID        PoolID
 	CapacityUsed  int
 	CapacityTotal int
-	Connected     bool
+	// CapacityPlacements identifies slots counted in the same CapacityUsed
+	// observation, by exact placement. Missing entries remain reservations.
+	CapacityPlacements map[SessionID]uint64
+
+	Connected bool
 	// Generation is monotonic per runner; a stale holder is rejected without
 	// replacing the event shapes (see RunnerEvent).
 	Generation   uint64
@@ -69,14 +73,15 @@ type RunnerSession struct {
 // and session bindings here rather than accepting a user-created Scope. Every
 // field is adapter-derived; none is decoded directly from client JSON.
 type RunnerRegistration struct {
-	WorkspaceID   WorkspaceID
-	PoolID        PoolID
-	RunnerID      RunnerID
-	Generation    uint64
-	CapacityUsed  int
-	CapacityTotal int
-	Capabilities  []string
-	Sessions      []RunnerSession
+	WorkspaceID        WorkspaceID
+	PoolID             PoolID
+	RunnerID           RunnerID
+	Generation         uint64
+	CapacityUsed       int
+	CapacityTotal      int
+	CapacityPlacements map[SessionID]uint64
+	Capabilities       []string
+	Sessions           []RunnerSession
 }
 
 // RunnerRegistrationResult is the application's answer to a registration.
@@ -92,13 +97,14 @@ type RunnerRegistrationResult struct {
 // reconciliation: its identity, generation, capacity, and the sessions it
 // holds.
 type RunnerSnapshot struct {
-	WorkspaceID   WorkspaceID
-	PoolID        PoolID
-	RunnerID      RunnerID
-	Generation    uint64
-	CapacityUsed  int
-	CapacityTotal int
-	Sessions      []RunnerSession
+	WorkspaceID        WorkspaceID
+	PoolID             PoolID
+	RunnerID           RunnerID
+	Generation         uint64
+	CapacityUsed       int
+	CapacityTotal      int
+	CapacityPlacements map[SessionID]uint64
+	Sessions           []RunnerSession
 }
 
 // ReconcileResult is the application's answer to a snapshot.
@@ -198,4 +204,30 @@ type Event struct {
 	// input or output — each of which is a secret as often as not, and none
 	// of which an audit reader needs to know that a command was run.
 	Command string
+}
+
+// ValidateCapacityPlacements rejects an observation that cannot describe its
+// aggregate. Keys come only from the authenticated runner's own inventory.
+func ValidateCapacityPlacements(used int, placements map[SessionID]uint64) error {
+	if used < 0 || len(placements) > used {
+		return ErrInvalid
+	}
+	for id, generation := range placements {
+		if id == "" || generation == 0 || generation > uint64(1<<63-1) {
+			return ErrInvalid
+		}
+	}
+	return nil
+}
+
+// AvailableRunnerSlots subtracts pending create/resume reservations. Reservations already present in this exact aggregate sample occupy one slot,
+// not two. An old placement or a legacy sample cannot cancel a reservation.
+func AvailableRunnerSlots(host Runner, pending []Session) int {
+	reserved := 0
+	for _, row := range pending {
+		if row.PlacementGeneration == 0 || host.CapacityPlacements[row.ID] != row.PlacementGeneration {
+			reserved++
+		}
+	}
+	return host.CapacityTotal - host.CapacityUsed - reserved
 }

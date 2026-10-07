@@ -68,8 +68,8 @@ func (h *heldColdSuspend) Suspend(ctx context.Context, id string, warm bool) err
 // dispatched into the window.
 //
 // What they get must be a CONFLICT: 409, code `conflict`, the handler's
-// sentence, the row untouched, and the very same command succeeding once the
-// stop lands. Before the fix it was 500 `internal`, "could not resume
+// sentence, a pending resume claim, and the same command succeeding after
+// versioned reconciliation proves the stop landed. Before the fix it was 500 `internal`, "could not resume
 // session", about a runner that was healthy and answering all along.
 func TestIdleAutoStopRefusesAResumeAsAConflict(t *testing.T) {
 	f := newFleet(t)
@@ -130,26 +130,18 @@ func TestIdleAutoStopRefusesAResumeAsAConflict(t *testing.T) {
 		t.Errorf("message = %q, want the handler's own sentence", api.Message)
 	}
 
-	// And nothing moved: the row still says stopped, so the session is not
-	// left claiming to run on a container that is being stopped.
+	// The committed claim stays pending until a versioned runner observation
+	// proves the refused command cannot launch later. An unversioned stop
+	// event cannot roll it back.
 	after := f.list()[created.ID]
-	if after.State != "suspended_cold" {
-		t.Errorf("state after the refused resume = %q, want suspended_cold", after.State)
+	if after.State != "resuming" {
+		t.Fatalf("state after refused resume = %q, want resuming", after.State)
 	}
 
-	// The stop lands, and the refusal proves to have meant "not yet": the same
-	// command, from the same client, brings the session back.
-	//
-	// Retried against the ROW rather than against the resume's own status,
-	// because two known races sit in this window and neither is what the scene
-	// is about. The resume can still arrive before `docker stop` has returned
-	// (refused again, correctly); and the auto-stop's own `suspended_cold`
-	// event — deliberately unfenced, since it carries no placement generation
-	// (internal/runnerd/agent.go, and the PR's follow-up 2) — can land AFTER
-	// the resume and put the row back to stopped over a container that is now
-	// running. Both converge: the event fires once, and the next pass resumes
-	// again.
 	close(held.release)
+	// Fake.Suspend changes container state only; explicitly model the cold
+	// stop's process/socket death before asking for evidence of a cold guest.
+	f.dropSessiond(created.ID)
 	resumed := func() bool {
 		if f.list()[created.ID].State == "running" {
 			return true
@@ -158,5 +150,5 @@ func TestIdleAutoStopRefusesAResumeAsAConflict(t *testing.T) {
 		_ = f.client().Do(http.MethodPost, "/v0/sessions/"+created.ID+"/resume", nil, nil)
 		return f.list()[created.ID].State == "running"
 	}
-	waitUntil(t, 60*time.Second, "the session to come back once the stop has landed", resumed)
+	waitUntil(t, 3*time.Minute, "versioned reconciliation to settle the refused claim and permit resume", resumed)
 }

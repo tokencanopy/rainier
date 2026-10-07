@@ -634,6 +634,7 @@ func TestAColdResumeAfterARestartSaysWhichThingItIsWaitingFor(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	stopTestMicrovmRunner(t, m)
 	again, format := restartedOver(t, stateDir, ckpt)
 	_, err = again.Resume(ctx, h.ID)
 	if err == nil {
@@ -683,6 +684,7 @@ func TestAColdResumeAfterARestartWithNoCheckpointSaysThatToo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	stopTestMicrovmRunner(t, m)
 	again, format := restartedOver(t, stateDir, &CheckpointOpts{
 		Store: checkpoint.NewMemoryStore(), Keys: keys, KeyRef: keys.Ref(),
 	})

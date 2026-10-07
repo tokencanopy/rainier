@@ -80,43 +80,56 @@ func TestGuestReconnectExecutable(t *testing.T) {
 	refused := accept()
 	writeReconnect(t, ctx, refused, relay.KindGuestReconnectRefused, runner.GuestReconnectErrorResponse{Error: "fenced"})
 	refused.Close()
-	host := accept()
-	challenge := runner.GuestReconnectChallenge{Protocol: 1, SessionID: cfg.SessionID, BootEpoch: enrolled.BootEpoch, HostIncarnation: "host-test", AttemptID: "process-attempt", PlacementGeneration: 1, Challenge: token}
-	writeReconnect(t, ctx, host, relay.KindGuestReconnectChallenge, challenge)
-	event, err = relay.ReadGuestReconnectFrame(ctx, host)
-	if err != nil {
-		t.Fatal(err)
+	var fresh string
+	for epoch := uint64(1); epoch <= 2; epoch++ {
+		host := accept()
+		challenge := runner.GuestReconnectChallenge{Protocol: 1, SessionID: cfg.SessionID, BootEpoch: enrolled.BootEpoch, HostIncarnation: "host-test", AttemptID: fmt.Sprintf("process-attempt-%d", epoch), PlacementGeneration: 1, Challenge: token}
+		writeReconnect(t, ctx, host, relay.KindGuestReconnectChallenge, challenge)
+		event, err = relay.ReadGuestReconnectFrame(ctx, host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof, err := runner.DecodeGuestReconnectAcceptRequest(event.Payload)
+		if err != nil || event.Kind != relay.KindGuestReconnectProof {
+			t.Fatal("invalid process proof")
+		}
+		if err = challenge.VerifyProof(enrolled.PublicKey, proof.Signature); err != nil {
+			t.Fatal(err)
+		}
+		tokenBytes := make([]byte, 32)
+		tokenBytes[0] = byte(6 + epoch)
+		fresh = base64.RawURLEncoding.EncodeToString(tokenBytes)
+		writeReconnect(t, ctx, host, relay.KindGuestReconnectAccepted, runner.GuestReconnectAcceptResponse{Epoch: epoch, Token: fresh, ExpiresInSec: 120})
+		cfg.BootstrapToken = fresh
+		cfg.Env = map[string]string{"RECONNECT_PROCESS_TEST": "refreshed"}
+		sendReconnectConfig(t, ctx, host, cfg)
+		raw, err = host.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		f, _ = relay.Decode(raw)
+		if json.Unmarshal(f.Payload, &event) != nil || event.Kind != "req:"+runner.MethodFetchSessionSecrets {
+			t.Fatal("missing fresh redemption")
+		}
+		var request struct {
+			Token string `json:"token"`
+		}
+		_ = json.Unmarshal(event.Payload, &request)
+		if request.Token != fresh {
+			t.Fatal("wrong process token")
+		}
+		controlWrite(t, ctx, host, relay.ControlEvent{Kind: "resp", ID: event.ID, OK: true, Payload: json.RawMessage(`{"env":{}}`)})
+		if epoch == 1 {
+			event, err = relay.ReadGuestReconnectFrame(ctx, host)
+			ready, decodeErr := runner.DecodeGuestReconnectReady(event.Payload)
+			if err != nil || decodeErr != nil || event.Kind != relay.KindGuestReconnectReady || ready.Epoch != epoch {
+				t.Fatal("missing ready before lost acknowledgment")
+			}
+			host.Close()
+		} else {
+			acknowledgeGuestReady(t, ctx, host, epoch)
+		}
 	}
-	proof, err := runner.DecodeGuestReconnectAcceptRequest(event.Payload)
-	if err != nil || event.Kind != relay.KindGuestReconnectProof {
-		t.Fatal("invalid process proof")
-	}
-	if err = challenge.VerifyProof(enrolled.PublicKey, proof.Signature); err != nil {
-		t.Fatal(err)
-	}
-	tokenBytes := make([]byte, 32)
-	tokenBytes[0] = 7
-	fresh := base64.RawURLEncoding.EncodeToString(tokenBytes)
-	writeReconnect(t, ctx, host, relay.KindGuestReconnectAccepted, runner.GuestReconnectAcceptResponse{Epoch: 1, Token: fresh, ExpiresInSec: 120})
-	cfg.BootstrapToken = fresh
-	cfg.Env = map[string]string{"RECONNECT_PROCESS_TEST": "refreshed"}
-	sendReconnectConfig(t, ctx, host, cfg)
-	raw, err = host.Read(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f, _ = relay.Decode(raw)
-	if json.Unmarshal(f.Payload, &event) != nil || event.Kind != "req:"+runner.MethodFetchSessionSecrets {
-		t.Fatal("missing fresh redemption")
-	}
-	var request struct {
-		Token string `json:"token"`
-	}
-	_ = json.Unmarshal(event.Payload, &request)
-	if request.Token != fresh {
-		t.Fatal("wrong process token")
-	}
-	controlWrite(t, ctx, host, relay.ControlEvent{Kind: "resp", ID: event.ID, OK: true, Payload: json.RawMessage(`{"env":{}}`)})
 	err = cmd.Wait()
 	waited = true
 	if err != nil {
@@ -128,7 +141,7 @@ func TestGuestReconnectExecutable(t *testing.T) {
 	if strings.Contains(output.String(), enrolled.PublicKey) || strings.Contains(output.String(), fresh) {
 		t.Fatal("guest logged credentials")
 	}
-	t.Log("separate guest process: enrollment, refused reconnect, verified proof, fresh redemption, same PTY shell across reconnect; no credential output")
+	t.Log("separate guest process: enrollment, refused reconnect, verified proof, fresh redemption, same PTY shell across lost acknowledgment and fresh-epoch reconnect; no credential output")
 }
 
 func TestGuestReconnectProcessGuest(t *testing.T) {
@@ -217,6 +230,12 @@ func TestGuestReconnectProcessGuest(t *testing.T) {
 		t.Fatal("refused connection became ready")
 	}
 	execTurn("initial:retained:old")
+	if c, err := tr.connect(ctx); err == nil || c != nil {
+		t.Fatal("lost ready acknowledgment made transport usable")
+	}
+	if b.guest.epoch != 1 {
+		t.Fatal("lost acknowledgment did not consume epoch")
+	}
 	c, err = tr.connect(ctx)
 	if err != nil {
 		t.Fatal(err)

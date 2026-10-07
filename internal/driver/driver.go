@@ -6,12 +6,15 @@ import (
 )
 
 type Spec struct {
-	Name        string   // human label
-	Image       string   // OCI ref (v0 default a bash image)
-	Cmd         []string // entrypoint override; empty = image default
-	DialURL     string   // runnerd URL the container's sessiond dials (relay)
-	SessionID   string   // stable id runnerd assigns; sessiond registers with it
-	EgressAllow []string // hostnames the session may reach
+	PlacementGeneration uint64
+
+	GuestReconnect uint64   // negotiated guest reconnect protocol; zero keeps legacy boot
+	Name           string   // human label
+	Image          string   // OCI ref (v0 default a bash image)
+	Cmd            []string // entrypoint override; empty = image default
+	DialURL        string   // runnerd URL the container's sessiond dials (relay)
+	SessionID      string   // stable id runnerd assigns; sessiond registers with it
+	EgressAllow    []string // hostnames the session may reach
 	// ProxyURL, when non-empty, is the egress proxy the session's outbound
 	// traffic must route through. Injected as both cases of HTTP_PROXY/
 	// HTTPS_PROXY (tools disagree on which they read: BusyBox wget and curl
@@ -195,8 +198,11 @@ type Snapshot struct {
 // Listed pairs a driver handle with the session id it belongs to, for List's
 // bulk view of every rainier-managed resource.
 type Listed struct {
-	SessionID string
-	Handle    Handle
+	PlacementGeneration uint64
+
+	GuestReconnect bool
+	SessionID      string
+	Handle         Handle
 }
 
 // CapabilityDriver is a driver that names portable capability tokens the

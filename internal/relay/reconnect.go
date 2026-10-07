@@ -15,6 +15,8 @@ const (
 	KindGuestReconnectProof     = "guest_reconnect_proof"
 	KindGuestReconnectAccepted  = "guest_reconnect_accepted"
 	KindGuestReconnectRefused   = "guest_reconnect_refused"
+	KindGuestReconnectReady     = "guest_reconnect_ready"
+	KindGuestReconnectReadyAck  = "guest_reconnect_ready_ack"
 	GuestReconnectFrameLimit    = 4096
 )
 
@@ -68,7 +70,7 @@ func WriteGuestReconnectFrame(ctx context.Context, c Conn, kind string, payload 
 }
 func reconnectKind(kind string) bool {
 	switch kind {
-	case KindGuestReconnectChallenge, KindGuestReconnectProof, KindGuestReconnectAccepted, KindGuestReconnectRefused:
+	case KindGuestReconnectChallenge, KindGuestReconnectProof, KindGuestReconnectAccepted, KindGuestReconnectRefused, KindGuestReconnectReady, KindGuestReconnectReadyAck:
 		return true
 	}
 	return false

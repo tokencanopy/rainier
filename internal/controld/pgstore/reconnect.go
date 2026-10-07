@@ -36,7 +36,7 @@ func (r pgGuestReconnects) lockScope(ctx context.Context, b control.GuestReconne
 	if err != nil {
 		return control.ErrUnavailable
 	}
-	err = r.s.q(ctx).QueryRow(ctx, `SELECT 1 FROM sessions WHERE workspace_id=$1 AND id=$2 AND pool_id=$3 AND runner=$4 AND placement_generation=$5 AND state IN ('creating','running') FOR UPDATE`, string(b.WorkspaceID), string(b.SessionID), string(b.PoolID), string(b.RunnerID), int64(b.PlacementGeneration)).Scan(&found)
+	err = r.s.q(ctx).QueryRow(ctx, `SELECT 1 FROM sessions WHERE workspace_id=$1 AND id=$2 AND pool_id=$3 AND runner=$4 AND placement_generation=$5 AND state IN ('creating','resuming','running') FOR UPDATE`, string(b.WorkspaceID), string(b.SessionID), string(b.PoolID), string(b.RunnerID), int64(b.PlacementGeneration)).Scan(&found)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return control.ErrReconnectFenced
 	}
