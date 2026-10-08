@@ -2119,14 +2119,15 @@ func TestCrashKeepsTheWorkspaceAndRmReclaimsIt(t *testing.T) {
 		t.Fatalf("the crash took %s with it; a crashed session's workspace is what a user comes back for", volume)
 	}
 
-	// The rm. The row is already terminal, so this is the idempotent 204 path
-	// — and it is the ONLY thing left that knows this volume exists.
+	// The rm. It is the ONLY thing left that knows this volume exists, and it
+	// also has to move the row: a dead session is exactly the one #86 named
+	// (repeated deletes reporting success while the row stays dead forever).
 	f.delete(created.ID)
 	waitUntil(t, 60*time.Second, "the explicit rm to reclaim the workspace", func() bool {
 		return !slices.Contains(rn.drv.Volumes(), volume)
 	})
-	if row := f.list()[created.ID]; row.State != "dead" {
-		t.Fatalf("session after the rm = %+v, want it still dead — reclaiming a volume is not a state change", row)
+	if row := f.list()[created.ID]; row.State != "destroyed" {
+		t.Fatalf("session after the rm = %+v, want destroyed: a dead session must transition on delete, not stay dead forever", row)
 	}
 }
 

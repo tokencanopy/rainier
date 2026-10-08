@@ -1640,7 +1640,9 @@ func TestDeleteSession(t *testing.T) {
 	// container is long gone — so nothing on the runner will ever name that
 	// volume again unless this delete does. Without this dispatch,
 	// "crash preserves the workspace" would mean "every crash leaks a
-	// workspace, forever".
+	// workspace, forever". The row has to move too (#86): a runner never
+	// re-learns about a session it already dropped, so nothing but this
+	// delete will ever take a dead row off the default listing.
 	t.Run("a dead session's rm reclaims the workspace the crash kept", func(t *testing.T) {
 		s, st, ts := newTestControld(t)
 		f := joinRunner(t, s, ts, runnerScript{Name: "vm1", Total: 4})
@@ -1661,10 +1663,11 @@ func TestDeleteSession(t *testing.T) {
 		if cmd.ReqID != 0 {
 			t.Fatalf("remove_workspace req_id = %d, want 0 — it is fire-and-forget", cmd.ReqID)
 		}
-		// The row is terminal and stays exactly as it was: a dead session's
-		// diagnosis is what the user came back for.
-		if got := getSession(t, st, "sess_del_dead"); got.State != control.StateDead || got.Error != reason {
-			t.Fatalf("row = %s / %q, want it unchanged", got.State, got.Error)
+		// The runner already dropped this session, so there is no destroy to
+		// send; only the store side moves. The diagnosis that made it dead
+		// survives the transition, same as a failed session's does.
+		if got := getSession(t, st, "sess_del_dead"); got.State != control.StateDestroyed || got.Error != reason {
+			t.Fatalf("row = %s / %q, want destroyed with the dead diagnosis preserved", got.State, got.Error)
 		}
 	})
 
